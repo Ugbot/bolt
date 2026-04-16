@@ -69,6 +69,27 @@ or plan prose. New topic → new file + add an entry below.
   SAX-style streaming. Reference material for the future
   `bolt::ingest::json` module.
 
+### Dataflow runtime (Wave 1)
+
+- [dataflow-operators.md](dataflow-operators.md) — operator algebra
+  (POD struct + fn ptr, push-stream, no vtable), fusion classes
+  (trivial / compute / pipeline-breaking), three-category pipeline
+  breaker classification driving edge buffer choice.
+- [tick-tock-buffering-protocol.md](tick-tock-buffering-protocol.md)
+  — per-edge ring of BoltBatch with epoch swap; N=2 default,
+  release/acquire visibility, three backpressure policies
+  (block / drop-newest / coalesce), arena-tied slot lifetime.
+- [push-vs-pull-dispatch.md](push-vs-pull-dispatch.md) — push with
+  N-slot edge ring as implicit credit; central executor walks topo
+  order each tick, scheduler fans morsels per operator; phase
+  barriers at pipeline breakers.
+- [gestalt-kernel-adapter.md](gestalt-kernel-adapter.md) — porting
+  shape for the 74 fintech kernels: Tier 1 mechanical, Tier 2
+  stateful (arena-pinned POD state), Tier 3 deferred until
+  event-time + keyed state primitives land. Worked EMA diff.
+
+Synthesized into the design doc [`../BOLT_DATAFLOW.md`](../BOLT_DATAFLOW.md).
+
 ## How to add a new entry
 
 1. Create `docs/research/<topic-slug>.md`.
