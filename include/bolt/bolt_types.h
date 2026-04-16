@@ -11,7 +11,8 @@
 #include <cstring>
 #include <cassert>
 
-namespace chukonu {
+#include "bolt/bolt_port.h"
+
 namespace bolt {
 
 // ============================================================================
@@ -334,4 +335,3 @@ struct ArrowArray {
 #endif  // ARROW_C_DATA_INTERFACE
 
 }  // namespace bolt
-}  // namespace chukonu

@@ -23,13 +23,24 @@
 
 using Clock = std::chrono::high_resolution_clock;
 using ns = std::chrono::nanoseconds;
-using namespace chukonu::bolt;
+using namespace bolt;
 
 template <typename T>
 inline void DoNotOptimize(T&& val) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    (void)val;
+    _ReadWriteBarrier();
+#else
     asm volatile("" : : "g"(val) : "memory");
+#endif
 }
-inline void ClobberMemory() { asm volatile("" ::: "memory"); }
+inline void ClobberMemory() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    _ReadWriteBarrier();
+#else
+    asm volatile("" ::: "memory");
+#endif
+}
 
 // ============================================================================
 
@@ -125,7 +136,7 @@ void bench_spsc_channel() {
         uint64_t count = 0, sum = 0;
         while (count < N) {
             uint64_t val;
-            if (ch.try_pop(val)) { sum += val; count++; }
+            if (ch.try_pop(&val)) { sum += val; count++; }
         }
         auto end = Clock::now();
         producer.join();
@@ -178,14 +189,8 @@ void bench_cow_memcpy() {
     };
 
     for (auto& s : specs) {
-        void *src, *dst;
-#ifdef _WIN32
-        src = _aligned_malloc(s.size, 64);
-        dst = _aligned_malloc(s.size, 64);
-#else
-        posix_memalign(&src, 64, s.size);
-        posix_memalign(&dst, 64, s.size);
-#endif
+        void* src = bolt_aligned_alloc(64, s.size);
+        void* dst = bolt_aligned_alloc(64, s.size);
         std::memset(src, 0xAB, s.size);
 
         constexpr size_t ITERS = 50000;
@@ -198,11 +203,8 @@ void bench_cow_memcpy() {
         double per_ns = (double)std::chrono::duration_cast<ns>(end - start).count() / ITERS;
         printf("  %s: %8.1f ns  (%.1f GB/s)\n", s.label, per_ns, s.size / per_ns);
 
-#ifdef _WIN32
-        _aligned_free(src); _aligned_free(dst);
-#else
-        std::free(src); std::free(dst);
-#endif
+        bolt_aligned_free(src);
+        bolt_aligned_free(dst);
     }
     printf("\n");
 }

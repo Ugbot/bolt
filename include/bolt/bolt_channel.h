@@ -13,19 +13,13 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace chukonu {
+#include "bolt/bolt_port.h"
+
 namespace bolt {
 
 static constexpr size_t kCacheLine = 64;
 
-// CPU pause hint for spin loops
-inline void cpu_pause() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    asm volatile("yield");
-#endif
-}
+inline void cpu_pause() noexcept { BOLT_PAUSE(); }
 
 /// SPSC ring buffer. Single producer, single consumer. No CAS needed.
 /// Use for linear pipeline stages (one operator → next operator).
@@ -127,4 +121,3 @@ private:
 };
 
 }  // namespace bolt
-}  // namespace chukonu

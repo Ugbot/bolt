@@ -9,15 +9,15 @@
 
 #pragma once
 
-#include "bolt_types.h"
-#include "bolt_arena.h"
+#include "bolt/bolt_types.h"
+#include "bolt/bolt_arena.h"
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <type_traits>
 
-namespace chukonu {
 namespace bolt {
 
 // ============================================================================
@@ -362,7 +362,6 @@ struct BoltColumn {
     /// Materialize non-Flat formats to Flat (arena-allocated)
     BoltColumn materialize(Arena* arena) const noexcept;
 
-private:
     static void noop_release_schema(ArrowSchema*) noexcept {}
     static void noop_release_array(ArrowArray*) noexcept {}
 };
@@ -401,14 +400,16 @@ struct alignas(64) BoltBatch {
     // Construction
     // =====================================================================
 
-    static BoltBatch make_empty() noexcept {
-        BoltBatch b;
-        memset(&b, 0, sizeof(b));
-        b.read_epoch = 0;
-        b.write_epoch = 1;
-        b.dirty_mask_lo.store(0, std::memory_order_relaxed);
-        b.dirty_mask_hi.store(0, std::memory_order_relaxed);
-        return b;
+    // Initialize an already-allocated BoltBatch in place. Returning by value
+    // is not possible: std::atomic members are non-copyable.
+    static void init_empty(BoltBatch* b) noexcept {
+        // zero all non-atomic fields; then explicitly init atomics
+        memset(reinterpret_cast<char*>(b) + offsetof(BoltBatch, read_epoch),
+               0, sizeof(BoltBatch) - offsetof(BoltBatch, read_epoch));
+        b->read_epoch  = 0;
+        b->write_epoch = 1;
+        b->dirty_mask_lo.store(0, std::memory_order_relaxed);
+        b->dirty_mask_hi.store(0, std::memory_order_relaxed);
     }
 
     // =====================================================================
@@ -519,5 +520,584 @@ struct BitmapIndex {
                       int32_t* out) const noexcept;
 };
 
+// ============================================================================
+// BoltColumn::compute_stats_numeric — one-pass min/max/null/distinct scan
+// ============================================================================
+
+namespace detail {
+
+// Distinct sketch: up to 16 values tracked exactly; overflow → distinct_count=17.
+template <typename T>
+inline void stats_scan_typed(const T* BOLT_RESTRICT data,
+                             const uint8_t* BOLT_RESTRICT validity,
+                             int64_t n, ColumnStats* out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out != nullptr);
+    assert(n >= 0);
+
+    constexpr int kSketchCap = 16;
+    T sketch[kSketchCap];
+    int sketch_n = 0;
+    bool overflow = false;
+
+    uint32_t null_count = 0;
+    bool first = true;
+    T mn = T{}, mx = T{};
+    bool monotonic_asc = true;
+    bool monotonic_desc = true;
+    T prev = T{};
+
+    for (int64_t i = 0; i < n; ++i) {
+        bool valid = true;
+        if (validity) {
+            valid = (validity[i >> 3] & (uint8_t)(1u << (i & 7))) != 0;
+        }
+        if (!valid) { null_count++; continue; }
+        T v = data[i];
+        if (first) { mn = v; mx = v; prev = v; first = false; }
+        else {
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            if (v < prev) monotonic_asc = false;
+            if (v > prev) monotonic_desc = false;
+            prev = v;
+        }
+        if (!overflow) {
+            bool seen = false;
+            for (int k = 0; k < sketch_n; ++k) {
+                if (sketch[k] == v) { seen = true; break; }
+            }
+            if (!seen) {
+                if (sketch_n < kSketchCap) sketch[sketch_n++] = v;
+                else overflow = true;
+            }
+        }
+    }
+
+    out->null_count = null_count;
+    out->all_valid = (null_count == 0);
+    if (first) {
+        out->distinct_count = 0;
+        out->cardinality = CardinalityClass::Unknown;
+        return;
+    }
+
+    // Type-pun min/max into the 64-bit slots (floating types overlay).
+    if constexpr (std::is_floating_point_v<T>) {
+        double dmn = (double)mn, dmx = (double)mx;
+        memcpy(&out->min_value, &dmn, sizeof(double));
+        memcpy(&out->max_value, &dmx, sizeof(double));
+    } else {
+        out->min_value = (int64_t)mn;
+        out->max_value = (int64_t)mx;
+    }
+
+    uint32_t dc = overflow ? (uint32_t)(kSketchCap + 1) : (uint32_t)sketch_n;
+    out->distinct_count = dc;
+    if (dc == 1)              out->cardinality = CardinalityClass::Constant;
+    else if (dc <= 8)         out->cardinality = CardinalityClass::Low;
+    else if (!overflow)       out->cardinality = CardinalityClass::Medium;
+    else                      out->cardinality = CardinalityClass::High;
+
+    out->is_monotonic = (monotonic_asc || monotonic_desc) && n > 1;
+    if (n > 1 && monotonic_asc)       out->sort_order = SortOrder::Ascending;
+    else if (n > 1 && monotonic_desc) out->sort_order = SortOrder::Descending;
+    else                              out->sort_order = SortOrder::Unsorted;
+}
+
+}  // namespace detail
+
+inline void BoltColumn::compute_stats_numeric() noexcept {
+    assert(format == ColumnFormat::Flat || format == ColumnFormat::View);
+    assert(length >= 0);
+
+    const uint8_t* v = validity;
+    // View columns with validity_offset != 0 are not supported here; fall back.
+    if (format == ColumnFormat::View && validity_offset != 0) v = nullptr;
+
+    switch (type) {
+#define X(NAME, CTYPE, ENUM_VAL)                                           \
+        case ENUM_VAL:                                                     \
+            detail::stats_scan_typed<CTYPE>(                               \
+                static_cast<const CTYPE*>(data), v, length, &stats);       \
+            break;
+        BOLT_NUMERIC_TYPES
+#undef X
+        default:
+            // Non-numeric type: leave stats untouched.
+            break;
+    }
+}
+
+// ============================================================================
+// BoltColumn::clone_into
+// ============================================================================
+
+inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
+    assert(arena_in != nullptr);
+    assert(length >= 0);
+    BoltColumn c = *this;
+    c.arena = arena_in;
+
+    switch (format) {
+        case ColumnFormat::Flat: {
+            if (length > 0 && type_size_bytes > 0 && data) {
+                size_t bytes = (size_t)length * (size_t)type_size_bytes;
+                void* ndata = arena_in->copy_into(data, bytes);
+                if (!ndata) return make_empty();
+                c.data = ndata;
+            } else {
+                c.data = nullptr;
+            }
+            if (validity && length > 0) {
+                size_t vbytes = ((size_t)length + 7) / 8;
+                void* nval = arena_in->copy_into(validity, vbytes);
+                if (!nval) return make_empty();
+                c.validity = static_cast<uint8_t*>(nval);
+                c.validity_offset = 0;
+            } else {
+                c.validity = nullptr;
+                c.validity_offset = 0;
+            }
+            break;
+        }
+        case ColumnFormat::Constant: {
+            // inline_value is part of the struct; the shallow copy already
+            // captured the 16 bytes. Repoint data → our own inline_value.
+            c.data = c.inline_value;
+            break;
+        }
+        case ColumnFormat::Sequence: {
+            // seq_offset/seq_step covered by shallow copy.
+            c.data = nullptr;
+            break;
+        }
+        case ColumnFormat::View: {
+            // Promote view → flat by materializing, then deep-copying.
+            // Caller semantics: clone should be self-contained.
+            if (length > 0 && type_size_bytes > 0 && data) {
+                size_t bytes = (size_t)length * (size_t)type_size_bytes;
+                void* ndata = arena_in->copy_into(data, bytes);
+                if (!ndata) return make_empty();
+                c.data = ndata;
+                c.format = ColumnFormat::Flat;
+            }
+            if (validity) {
+                // Shift bits so validity_offset becomes 0.
+                size_t vbytes = ((size_t)length + 7) / 8;
+                uint8_t* nval = static_cast<uint8_t*>(
+                    arena_in->allocate_zeroed(vbytes));
+                if (!nval) return make_empty();
+                for (int64_t i = 0; i < length; ++i) {
+                    int64_t srcbit = validity_offset + i;
+                    uint8_t bit = (validity[srcbit >> 3] >> (srcbit & 7)) & 1u;
+                    nval[i >> 3] |= (uint8_t)(bit << (i & 7));
+                }
+                c.validity = nval;
+                c.validity_offset = 0;
+            }
+            break;
+        }
+        case ColumnFormat::Dictionary: {
+            // Copy keys buffer (sizeof determined by type_size_bytes on the
+            // dictionary column's data field).
+            if (length > 0 && type_size_bytes > 0 && data) {
+                size_t bytes = (size_t)length * (size_t)type_size_bytes;
+                void* ndata = arena_in->copy_into(data, bytes);
+                if (!ndata) return make_empty();
+                c.data = ndata;
+            }
+            if (dict_child) {
+                BoltColumn* nc = arena_in->allocate_array<BoltColumn>(1);
+                if (!nc) return make_empty();
+                *nc = dict_child->clone_into(arena_in);
+                c.dict_child = nc;
+            }
+            break;
+        }
+    }
+    return c;
+}
+
+// ============================================================================
+// BoltColumn::materialize
+// ============================================================================
+
+inline BoltColumn BoltColumn::materialize(Arena* arena_in) const noexcept {
+    assert(arena_in != nullptr);
+    assert(length >= 0);
+
+    if (format == ColumnFormat::Flat) return clone_into(arena_in);
+
+    // For Dictionary the outer type_size_bytes is the key width, not the
+    // logical value width — consult the type-size table instead.
+    size_t tsz = (format == ColumnFormat::Dictionary)
+        ? bolt::type_size(type)
+        : (type_size_bytes ? (size_t)type_size_bytes : bolt::type_size(type));
+    if (tsz == 0) return make_empty();
+
+    BoltColumn out = make_empty();
+    out.type = type;
+    out.type_size_bytes = (uint16_t)tsz;
+    out.length = length;
+    out.format = ColumnFormat::Flat;
+    out.arena = arena_in;
+    out.stats = stats;
+
+    if (length == 0) { out.data = nullptr; return out; }
+
+    void* buf = arena_in->allocate((size_t)length * tsz);
+    if (!buf) return make_empty();
+    out.data = buf;
+
+    if (format == ColumnFormat::Constant) {
+        uint8_t* dst = static_cast<uint8_t*>(buf);
+        for (int64_t i = 0; i < length; ++i) {
+            memcpy(dst + (size_t)i * tsz, inline_value, tsz);
+        }
+    } else if (format == ColumnFormat::Sequence) {
+        // Only Int64 (or int-convertible) sequences are supported; dispatch.
+        if (tsz == 8) {
+            int64_t* dst = static_cast<int64_t*>(buf);
+            for (int64_t i = 0; i < length; ++i)
+                dst[i] = seq_offset + i * seq_step;
+        } else if (tsz == 4) {
+            int32_t* dst = static_cast<int32_t*>(buf);
+            for (int64_t i = 0; i < length; ++i)
+                dst[i] = (int32_t)(seq_offset + i * seq_step);
+        } else {
+            return make_empty();
+        }
+    } else if (format == ColumnFormat::View) {
+        memcpy(buf, data, (size_t)length * tsz);
+        if (validity) {
+            size_t vbytes = ((size_t)length + 7) / 8;
+            uint8_t* nval = static_cast<uint8_t*>(arena_in->allocate_zeroed(vbytes));
+            if (!nval) return make_empty();
+            for (int64_t i = 0; i < length; ++i) {
+                int64_t srcbit = validity_offset + i;
+                uint8_t bit = (validity[srcbit >> 3] >> (srcbit & 7)) & 1u;
+                nval[i >> 3] |= (uint8_t)(bit << (i & 7));
+            }
+            out.validity = nval;
+        }
+    } else if (format == ColumnFormat::Dictionary) {
+        // Expand keys → values via dict_child.
+        if (!dict_child || !data) return make_empty();
+        BoltColumn vals = dict_child->materialize(arena_in);
+        if (!vals.data) return make_empty();
+        const uint8_t* vals_bytes = static_cast<const uint8_t*>(vals.data);
+        uint8_t* dst = static_cast<uint8_t*>(buf);
+        // Key width determined by type_size_bytes of the dictionary column.
+        uint16_t key_w = type_size_bytes;
+        for (int64_t i = 0; i < length; ++i) {
+            uint32_t k = 0;
+            const uint8_t* kp = static_cast<const uint8_t*>(data) + (size_t)i * key_w;
+            if (key_w == 1)      k = kp[0];
+            else if (key_w == 2) { uint16_t t; memcpy(&t, kp, 2); k = t; }
+            else if (key_w == 4) { uint32_t t; memcpy(&t, kp, 4); k = t; }
+            memcpy(dst + (size_t)i * tsz, vals_bytes + (size_t)k * tsz, tsz);
+        }
+    }
+    return out;
+}
+
+// ============================================================================
+// BoltColumn::try_promote
+// ============================================================================
+
+inline bool BoltColumn::try_promote(Arena* arena_in) noexcept {
+    assert(arena_in != nullptr);
+    assert(length >= 0);
+
+    if (format != ColumnFormat::Flat) return false;
+    if (length <= 0) return false;
+    if (stats.distinct_count == 0) return false;
+
+    // Flat → Constant
+    if (stats.distinct_count == 1 && type_size_bytes > 0 &&
+        type_size_bytes <= 16 && data) {
+        memcpy(inline_value, data, type_size_bytes);
+        data = inline_value;
+        format = ColumnFormat::Constant;
+        stats.cardinality = CardinalityClass::Constant;
+        return true;
+    }
+
+    // Flat → Dictionary heuristic:
+    //   distinct * log2(distinct) + N * key_width < N * sizeof(T) * 0.7
+    // Only attempt when distinct_count is exact (no sketch overflow) and
+    // distinct <= 16 (sketch cap). Narrow niche but fits the X-macro scan.
+    if (stats.distinct_count > 1 && stats.distinct_count <= 16 &&
+        type_size_bytes >= 4 && data) {
+        uint32_t dc = stats.distinct_count;
+        double cost_dict = (double)dc * (double)type_size_bytes
+                         + (double)length * 1.0; // 1-byte key (dc<=16)
+        double cost_flat = (double)length * (double)type_size_bytes * 0.7;
+        if (cost_dict >= cost_flat) return false;
+
+        // Build dictionary: unique values + uint8 keys.
+        uint8_t  values_buf[16 * 16];  // up to 16 entries of ≤16 bytes each
+        uint32_t n_unique = 0;
+        uint16_t tw = type_size_bytes;
+        if (tw > 16) return false;
+
+        uint8_t* keys = arena_in->allocate_array<uint8_t>((size_t)length);
+        if (!keys) return false;
+
+        const uint8_t* src = static_cast<const uint8_t*>(data);
+        for (int64_t i = 0; i < length; ++i) {
+            const uint8_t* vp = src + (size_t)i * tw;
+            int found = -1;
+            for (uint32_t k = 0; k < n_unique; ++k) {
+                if (memcmp(values_buf + (size_t)k * tw, vp, tw) == 0) {
+                    found = (int)k; break;
+                }
+            }
+            if (found < 0) {
+                if (n_unique >= 16) return false; // sketch lied; bail
+                memcpy(values_buf + (size_t)n_unique * tw, vp, tw);
+                found = (int)n_unique++;
+            }
+            keys[i] = (uint8_t)found;
+        }
+
+        // Allocate and fill dict_child (Flat column of unique values).
+        BoltColumn* child = arena_in->allocate_array<BoltColumn>(1);
+        if (!child) return false;
+        *child = make_empty();
+        void* child_data = arena_in->copy_into(values_buf, (size_t)n_unique * tw);
+        if (!child_data) return false;
+        child->data = child_data;
+        child->length = (int64_t)n_unique;
+        child->format = ColumnFormat::Flat;
+        child->type = type;
+        child->type_size_bytes = tw;
+        child->arena = arena_in;
+        child->stats.all_valid = true;
+        child->stats.distinct_count = n_unique;
+
+        // Mutate self into Dictionary view.
+        data = keys;
+        dict_child = child;
+        format = ColumnFormat::Dictionary;
+        type_size_bytes = 1;  // key width
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// BoltBatch::fill_arrow_schema — struct schema with N children
+// ============================================================================
+
+inline void BoltBatch::fill_arrow_schema(ArrowSchema* out) const noexcept {
+    assert(out != nullptr);
+    assert(arena != nullptr);
+    assert(num_cols <= kMaxBatchColumns);
+
+    memset(out, 0, sizeof(ArrowSchema));
+    out->format = "+s";
+    out->name = "";
+    out->flags = 0;
+    out->n_children = (int64_t)num_cols;
+
+    if (num_cols == 0) {
+        out->children = nullptr;
+        out->release = &BoltColumn::noop_release_schema;
+        return;
+    }
+
+    // child pointer array + backing child structs
+    ArrowSchema** kids = arena->allocate_array<ArrowSchema*>(num_cols);
+    ArrowSchema*  bodies = arena->allocate_array<ArrowSchema>(num_cols);
+    assert(kids != nullptr);
+    assert(bodies != nullptr);
+    for (uint32_t i = 0; i < num_cols; ++i) {
+        const BoltField& f = schema.fields[i];
+        columns[read_epoch][i].fill_arrow_schema(&bodies[i], f.name);
+        kids[i] = &bodies[i];
+    }
+    out->children = kids;
+    out->dictionary = nullptr;
+    out->release = &BoltColumn::noop_release_schema;
+    out->private_data = nullptr;
+}
+
+// ============================================================================
+// BitmapIndex
+// ============================================================================
+
+inline BitmapIndex* BitmapIndex::build(const BoltColumn& col,
+                                       Arena* arena) noexcept {
+    assert(arena != nullptr);
+    assert(col.length >= 0);
+    if (col.format != ColumnFormat::Dictionary) return nullptr;
+    if (col.length == 0) return nullptr;
+    if (!col.data) return nullptr;
+
+    uint16_t key_w = col.type_size_bytes;
+    if (key_w != 1 && key_w != 2 && key_w != 4) return nullptr;
+
+    // K = number of distinct keys; derive from dict_child->length if available.
+    uint32_t K = 0;
+    if (col.dict_child && col.dict_child->length > 0) {
+        K = (uint32_t)col.dict_child->length;
+    } else {
+        // Scan keys to find max.
+        const uint8_t* kp = static_cast<const uint8_t*>(col.data);
+        uint32_t maxk = 0;
+        for (int64_t i = 0; i < col.length; ++i) {
+            uint32_t k = 0;
+            const uint8_t* p = kp + (size_t)i * key_w;
+            if (key_w == 1)      k = p[0];
+            else if (key_w == 2) { uint16_t t; memcpy(&t, p, 2); k = t; }
+            else                 { uint32_t t; memcpy(&t, p, 4); k = t; }
+            if (k > maxk) maxk = k;
+        }
+        K = maxk + 1;
+    }
+    if (K == 0) return nullptr;
+
+    uint32_t words = (uint32_t)(((uint64_t)col.length + 63) / 64);
+
+    BitmapIndex* idx = arena->allocate_array<BitmapIndex>(1);
+    if (!idx) return nullptr;
+    idx->num_keys = K;
+    idx->num_rows = (uint32_t)col.length;
+    idx->words_per_bitmap = words;
+
+    uint64_t** maps = arena->allocate_array<uint64_t*>(K);
+    if (!maps) return nullptr;
+    for (uint32_t k = 0; k < K; ++k) {
+        uint64_t* bm = static_cast<uint64_t*>(
+            arena->allocate_zeroed((size_t)words * sizeof(uint64_t)));
+        if (!bm) return nullptr;
+        maps[k] = bm;
+    }
+    idx->bitmaps = maps;
+
+    const uint8_t* kp = static_cast<const uint8_t*>(col.data);
+    for (int64_t i = 0; i < col.length; ++i) {
+        uint32_t k = 0;
+        const uint8_t* p = kp + (size_t)i * key_w;
+        if (key_w == 1)      k = p[0];
+        else if (key_w == 2) { uint16_t t; memcpy(&t, p, 2); k = t; }
+        else                 { uint32_t t; memcpy(&t, p, 4); k = t; }
+        if (k < K) {
+            maps[k][(uint64_t)i >> 6] |= (1ULL << ((uint64_t)i & 63));
+        }
+    }
+    return idx;
+}
+
+inline uint32_t BitmapIndex::count(uint32_t key) const noexcept {
+    assert(bitmaps != nullptr);
+    assert(words_per_bitmap > 0 || num_rows == 0);
+    if (key >= num_keys) return 0;
+    const uint64_t* bm = bitmaps[key];
+    uint32_t sum = 0;
+    for (uint32_t w = 0; w < words_per_bitmap; ++w) {
+        sum += bolt_popcount64(bm[w]);
+    }
+    return sum;
+}
+
+inline int64_t BitmapIndex::filter(uint32_t key, int32_t* out) const noexcept {
+    assert(out != nullptr);
+    assert(bitmaps != nullptr);
+    if (key >= num_keys) return 0;
+    const uint64_t* bm = bitmaps[key];
+    int64_t count = 0;
+    for (uint32_t w = 0; w < words_per_bitmap; ++w) {
+        uint64_t word = bm[w];
+        uint64_t base = (uint64_t)w << 6;
+        while (word) {
+            int b = bolt_ctz64(word);
+            int64_t row = (int64_t)(base + (uint64_t)b);
+            if (row >= (int64_t)num_rows) break;
+            out[count++] = (int32_t)row;
+            word &= word - 1;
+        }
+    }
+    return count;
+}
+
+inline int64_t BitmapIndex::filter_in(const uint32_t* keys, uint32_t nkeys,
+                                      int32_t* out) const noexcept {
+    assert(out != nullptr);
+    assert(bitmaps != nullptr);
+    assert(keys != nullptr || nkeys == 0);
+    if (nkeys == 0 || words_per_bitmap == 0) return 0;
+
+    Arena* a = tl_arena;
+    assert(a != nullptr && "filter_in requires tl_arena for temp OR buffer");
+    uint64_t* tmp = static_cast<uint64_t*>(
+        a->allocate_zeroed((size_t)words_per_bitmap * sizeof(uint64_t)));
+    if (!tmp) return 0;
+
+    for (uint32_t i = 0; i < nkeys; ++i) {
+        uint32_t k = keys[i];
+        if (k >= num_keys) continue;
+        const uint64_t* bm = bitmaps[k];
+        for (uint32_t w = 0; w < words_per_bitmap; ++w) tmp[w] |= bm[w];
+    }
+
+    int64_t count = 0;
+    for (uint32_t w = 0; w < words_per_bitmap; ++w) {
+        uint64_t word = tmp[w];
+        uint64_t base = (uint64_t)w << 6;
+        while (word) {
+            int b = bolt_ctz64(word);
+            int64_t row = (int64_t)(base + (uint64_t)b);
+            if (row >= (int64_t)num_rows) break;
+            out[count++] = (int32_t)row;
+            word &= word - 1;
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// gather_to_column<T> — materialize a selection of a Flat column into a new
+// arena-backed Flat column. Used by join probe paths that have (column +
+// selection vector) and need a compacted column for a downstream operator.
+//
+// Contract:
+//   - src must be Flat (for now). Other formats return an empty column and
+//     trip BOLT_NYI in debug builds.
+//   - sel must have `sel_n` valid int32 indices in [0, src.length).
+//   - arena must be non-null; result is arena-owned.
+//   - Validity is not propagated in this wave (TODO when needed).
+// ============================================================================
+template <typename T>
+inline BoltColumn gather_to_column(const BoltColumn& src,
+                                   const int32_t* BOLT_RESTRICT sel,
+                                   int64_t sel_n,
+                                   Arena* arena) noexcept {
+    assert(arena != nullptr);
+    assert(sel_n >= 0);
+    assert(sel != nullptr || sel_n == 0);
+
+    if (src.format != ColumnFormat::Flat) {
+        BOLT_NYI("gather_to_column: only Flat src supported");
+        return BoltColumn::make_empty();
+    }
+    assert(static_cast<size_t>(src.type_size_bytes) == sizeof(T));
+
+    BoltColumn out = BoltColumn::make_flat_alloc(sel_n, src.type, arena);
+    if (sel_n > 0 && out.data == nullptr) return out;  // OOM — empty result.
+
+    const T* BOLT_RESTRICT in = static_cast<const T*>(src.data);
+    T* BOLT_RESTRICT dst = static_cast<T*>(out.data);
+    const int64_t src_n = src.length;
+    for (int64_t i = 0; i < sel_n; ++i) {
+        const int32_t idx = sel[i];
+        assert(idx >= 0 && static_cast<int64_t>(idx) < src_n);
+        dst[i] = in[idx];
+    }
+    (void)src_n;
+    return out;
+}
+
 }  // namespace bolt
-}  // namespace chukonu

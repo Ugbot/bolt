@@ -16,24 +16,16 @@
 
 #pragma once
 
-#include "bolt_types.h"
+#include "bolt/bolt_port.h"
+#include "bolt/bolt_types.h"
 #include <cstdint>
 #include <cstring>
 #include <cassert>
 
-// Platform SIMD includes
-#if defined(__AVX2__)
-#include <immintrin.h>
-#define BOLT_HAS_AVX2 1
-#elif defined(__SSE4_2__)
-#include <nmmintrin.h>
-#define BOLT_HAS_SSE42 1
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#define BOLT_HAS_NEON 1
-#endif
+// SIMD dispatch is handled entirely by bolt_port.h (BOLT_SIMD_AVX2/SSE42/NEON
+// flavors and bmm_* wrappers). This header no longer needs its own per-ISA
+// intrinsic includes — the `#if BOLT_SIMD_*` gate below is the only one.
 
-namespace chukonu {
 namespace bolt {
 namespace branchless {
 
@@ -94,9 +86,9 @@ inline int32_t bsign(int64_t x) noexcept {
 /// branchless scatter on AVX2.
 
 template <typename T>
-int64_t filter_gt_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_gt_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -106,9 +98,9 @@ int64_t filter_gt_branchless(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_lt_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_lt_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -118,9 +110,9 @@ int64_t filter_lt_branchless(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_eq_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_eq_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -130,9 +122,9 @@ int64_t filter_eq_branchless(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_ne_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_ne_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -142,9 +134,9 @@ int64_t filter_ne_branchless(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_ge_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_ge_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -154,9 +146,9 @@ int64_t filter_ge_branchless(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_le_branchless(const T* __restrict__ data, int64_t n,
+int64_t filter_le_branchless(const T* BOLT_RESTRICT data, int64_t n,
                               T scalar,
-                              int32_t* __restrict__ out) noexcept {
+                              int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
@@ -169,10 +161,10 @@ int64_t filter_le_branchless(const T* __restrict__ data, int64_t n,
 /// Filters sel_in[0..sel_count) further based on predicate.
 template <typename T>
 int64_t filter_gt_selected_branchless(
-        const T* __restrict__ data,
-        const int32_t* __restrict__ sel_in, int64_t sel_count,
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
         T scalar,
-        int32_t* __restrict__ sel_out) noexcept {
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < sel_count; ++i) {
         int32_t idx = sel_in[i];
@@ -190,10 +182,10 @@ int64_t filter_gt_selected_branchless(
 /// Uses branchless AND of (not_null) & (comparison_result).
 template <typename T>
 int64_t filter_gt_nullable_branchless(
-        const T* __restrict__ data,
+        const T* BOLT_RESTRICT data,
         const uint8_t* validity,  // Arrow format: bit=1 means valid
         int64_t n, T scalar,
-        int32_t* __restrict__ out) noexcept {
+        int32_t* BOLT_RESTRICT out) noexcept {
     if (!validity) {
         // No nulls — fast path, skip validity check entirely
         return filter_gt_branchless(data, n, scalar, out);
@@ -215,7 +207,7 @@ int64_t filter_gt_nullable_branchless(
 /// Branchless min across array. No branch per element.
 /// Compiler emits cmov or SIMD min instruction.
 template <typename T>
-T aggregate_min_branchless(const T* __restrict__ data, int64_t n) noexcept {
+T aggregate_min_branchless(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     assert(n > 0);
     T result = data[0];
     for (int64_t i = 1; i < n; ++i) {
@@ -225,7 +217,7 @@ T aggregate_min_branchless(const T* __restrict__ data, int64_t n) noexcept {
 }
 
 template <typename T>
-T aggregate_max_branchless(const T* __restrict__ data, int64_t n) noexcept {
+T aggregate_max_branchless(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     assert(n > 0);
     T result = data[0];
     for (int64_t i = 1; i < n; ++i) {
@@ -237,7 +229,7 @@ T aggregate_max_branchless(const T* __restrict__ data, int64_t n) noexcept {
 /// Branchless sum with 4-way unroll for auto-vectorization.
 /// Separate accumulators prevent loop-carried dependency.
 template <typename T, typename AccumT = int64_t>
-AccumT aggregate_sum_branchless(const T* __restrict__ data, int64_t n) noexcept {
+AccumT aggregate_sum_branchless(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     AccumT a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     int64_t i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -254,8 +246,8 @@ AccumT aggregate_sum_branchless(const T* __restrict__ data, int64_t n) noexcept 
 /// Branchless conditional sum: sum of elements where mask[i] is true.
 /// No branch per element.
 template <typename T, typename AccumT = int64_t>
-AccumT aggregate_sum_masked(const T* __restrict__ data,
-                             const uint8_t* __restrict__ mask,
+AccumT aggregate_sum_masked(const T* BOLT_RESTRICT data,
+                             const uint8_t* BOLT_RESTRICT mask,
                              int64_t n) noexcept {
     AccumT result = 0;
     for (int64_t i = 0; i < n; ++i) {
@@ -283,8 +275,8 @@ inline uint64_t hash_finalize(uint64_t h) noexcept {
 /// Branchless hash for fixed-width column.
 /// No branches, no type-dependent logic in the loop.
 template <typename T>
-void hash_column_branchless(const T* __restrict__ data, int64_t n,
-                             uint32_t* __restrict__ hashes,
+void hash_column_branchless(const T* BOLT_RESTRICT data, int64_t n,
+                             uint32_t* BOLT_RESTRICT hashes,
                              uint32_t seed = 0x9E3779B9) noexcept {
     for (int64_t i = 0; i < n; ++i) {
         uint64_t val = 0;
@@ -294,10 +286,10 @@ void hash_column_branchless(const T* __restrict__ data, int64_t n,
 }
 
 /// Branchless hash combine (for multi-column keys).
-inline void hash_combine_branchless(const uint32_t* __restrict__ h1,
-                                     const uint32_t* __restrict__ h2,
+inline void hash_combine_branchless(const uint32_t* BOLT_RESTRICT h1,
+                                     const uint32_t* BOLT_RESTRICT h2,
                                      int64_t n,
-                                     uint32_t* __restrict__ out) noexcept {
+                                     uint32_t* BOLT_RESTRICT out) noexcept {
     for (int64_t i = 0; i < n; ++i) {
         // boost::hash_combine equivalent, zero branches
         out[i] = h1[i] ^ (h2[i] + 0x9E3779B9u + (h1[i] << 6) + (h1[i] >> 2));
@@ -312,21 +304,21 @@ inline void hash_combine_branchless(const uint32_t* __restrict__ h1,
 /// Software prefetch hides memory latency for random access patterns.
 /// No branches in the loop.
 template <typename T>
-void gather_branchless(const T* __restrict__ data,
-                        const int32_t* __restrict__ indices,
+void gather_branchless(const T* BOLT_RESTRICT data,
+                        const int32_t* BOLT_RESTRICT indices,
                         int64_t count,
-                        T* __restrict__ output) noexcept {
+                        T* BOLT_RESTRICT output) noexcept {
     constexpr int kPrefetchDist = 16;
 
     int64_t i = 0;
     // Prefetch ahead
     for (; i < bmin(count, (int64_t)kPrefetchDist); ++i) {
-        __builtin_prefetch(&data[indices[i]], 0, 1);
+        BOLT_PREFETCH_READ(&data[indices[i]]);
     }
     // Main loop with prefetch pipeline
     for (i = 0; i < count; ++i) {
         if (i + kPrefetchDist < count) {
-            __builtin_prefetch(&data[indices[i + kPrefetchDist]], 0, 1);
+            BOLT_PREFETCH_READ(&data[indices[i + kPrefetchDist]]);
         }
         output[i] = data[indices[i]];  // No branch, just load-store
     }
@@ -353,9 +345,9 @@ void gather_branchless(const T* __restrict__ data,
 ///
 /// No branch predictor involved. Pure arithmetic.
 inline int64_t selection_intersect_branchless(
-        const int32_t* __restrict__ a, int64_t na,
-        const int32_t* __restrict__ b, int64_t nb,
-        int32_t* __restrict__ out) noexcept {
+        const int32_t* BOLT_RESTRICT a, int64_t na,
+        const int32_t* BOLT_RESTRICT b, int64_t nb,
+        int32_t* BOLT_RESTRICT out) noexcept {
     int64_t i = 0, j = 0, count = 0;
     while (i < na && j < nb) {
         int32_t va = a[i], vb = b[j];
@@ -370,9 +362,9 @@ inline int64_t selection_intersect_branchless(
 
 /// Branchless union of two sorted selection vectors.
 inline int64_t selection_union_branchless(
-        const int32_t* __restrict__ a, int64_t na,
-        const int32_t* __restrict__ b, int64_t nb,
-        int32_t* __restrict__ out) noexcept {
+        const int32_t* BOLT_RESTRICT a, int64_t na,
+        const int32_t* BOLT_RESTRICT b, int64_t nb,
+        int32_t* BOLT_RESTRICT out) noexcept {
     int64_t i = 0, j = 0, count = 0;
     while (i < na && j < nb) {
         int32_t va = a[i], vb = b[j];
@@ -397,7 +389,7 @@ inline uint32_t bitmap_popcount(const uint64_t* bitmap, uint32_t num_words) noex
     uint32_t count = 0;
     for (uint32_t i = 0; i < num_words; ++i) {
 #if defined(__POPCNT__) || defined(__x86_64__) || defined(_M_X64)
-        count += static_cast<uint32_t>(__builtin_popcountll(bitmap[i]));
+        count += bolt_popcount64(bitmap[i]);
 #else
         // Fallback: Kernighan's method (still branchless per bit)
         uint64_t v = bitmap[i];
@@ -408,9 +400,9 @@ inline uint32_t bitmap_popcount(const uint64_t* bitmap, uint32_t num_words) noex
 }
 
 /// Branchless bitmap AND (intersection of two bitmaps).
-inline void bitmap_and(const uint64_t* __restrict__ a,
-                        const uint64_t* __restrict__ b,
-                        uint64_t* __restrict__ out,
+inline void bitmap_and(const uint64_t* BOLT_RESTRICT a,
+                        const uint64_t* BOLT_RESTRICT b,
+                        uint64_t* BOLT_RESTRICT out,
                         uint32_t num_words) noexcept {
     for (uint32_t i = 0; i < num_words; ++i) {
         out[i] = a[i] & b[i];  // Pure bitwise, zero branches
@@ -418,9 +410,9 @@ inline void bitmap_and(const uint64_t* __restrict__ a,
 }
 
 /// Branchless bitmap OR (union of two bitmaps).
-inline void bitmap_or(const uint64_t* __restrict__ a,
-                       const uint64_t* __restrict__ b,
-                       uint64_t* __restrict__ out,
+inline void bitmap_or(const uint64_t* BOLT_RESTRICT a,
+                       const uint64_t* BOLT_RESTRICT b,
+                       uint64_t* BOLT_RESTRICT out,
                        uint32_t num_words) noexcept {
     for (uint32_t i = 0; i < num_words; ++i) {
         out[i] = a[i] | b[i];
@@ -429,14 +421,14 @@ inline void bitmap_or(const uint64_t* __restrict__ a,
 
 /// Extract set bit positions to selection vector (branchless per word).
 inline int64_t bitmap_to_selection(const uint64_t* bitmap, uint32_t num_words,
-                                    int32_t* __restrict__ out) noexcept {
+                                    int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (uint32_t w = 0; w < num_words; ++w) {
         uint64_t bits = bitmap[w];
         int32_t base = static_cast<int32_t>(w * 64);
         while (bits) {
-            // __builtin_ctzll: count trailing zeros = position of lowest set bit
-            int pos = __builtin_ctzll(bits);
+            // count trailing zeros = position of lowest set bit
+            int pos = bolt_ctz64(bits);
             out[count++] = base + pos;
             bits &= bits - 1;  // Clear lowest set bit (Kernighan's trick)
         }
@@ -445,41 +437,49 @@ inline int64_t bitmap_to_selection(const uint64_t* bitmap, uint32_t num_words,
 }
 
 // ============================================================================
-// SIMD Filter Kernels (AVX2)
+// SIMD Filter Kernels (ISA-agnostic via bolt::simd::bmm_*)
 // ============================================================================
+//
+// Single ISA gate: the per-ISA dispatch lives in bolt_port.h. Scalar fallback
+// is the branchless template above — no extra code path needed here.
 
-#ifdef BOLT_HAS_AVX2
+#if BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42 || BOLT_SIMD_NEON
 
-/// AVX2 branchless filter: int32 column > scalar.
-/// Processes 8 int32s per iteration via SIMD compare + movemask + scatter.
-inline int64_t filter_gt_avx2_i32(const int32_t* __restrict__ data, int64_t n,
+/// SIMD branchless filter: int32 column > scalar.
+/// Processes `bmm_lanes_i32` elements per iteration via compare + movemask +
+/// compressstore. Keeps legacy `_avx2_` name for callers.
+///
+/// The hot path writes a lane-index vector `[0..L)+base` unconditionally,
+/// and `bmm_compressstore_i32` lays out the matching indices contiguously
+/// — one write per SIMD iteration, no per-lane ctz loop.
+inline int64_t filter_gt_avx2_i32(const int32_t* BOLT_RESTRICT data, int64_t n,
                                    int32_t scalar,
-                                   int32_t* __restrict__ out) noexcept {
-    __m256i vscalar = _mm256_set1_epi32(scalar);
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out  != nullptr || n == 0);
+
+    using namespace bolt::simd;
+    const bmm_vec_i32 vscalar = bmm_set1_i32(scalar);
+    constexpr int L = bmm_lanes_i32;
     int64_t count = 0;
     int64_t i = 0;
 
-    // Main SIMD loop (8 elements per iteration)
-    for (; i + 8 <= n; i += 8) {
-        __m256i vdata = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
-        __m256i vcmp = _mm256_cmpgt_epi32(vdata, vscalar);
-        int mask = _mm256_movemask_epi8(vcmp);
+    // Main SIMD loop: L elements per iteration (8 on AVX2, 4 on SSE/NEON).
+    for (; i + L <= n; i += L) {
+        const bmm_vec_i32 vdata = bmm_loadu_i32(data + i);
+        const bmm_vec_i32 vcmp  = bmm_cmpgt_i32(vdata, vscalar);
+        const uint32_t    mask  = static_cast<uint32_t>(bmm_movemask_i32(vcmp));
 
-        // Convert byte mask to element mask (every 4th bit)
-        // Each int32 comparison produces 4 bytes of 0xFF or 0x00
-        uint32_t elem_mask = _pext_u32(static_cast<uint32_t>(mask), 0x88888888u);
-
-        // Scatter matching indices (branchless — always write, conditionally advance)
-        // This is the scalar fallback; AVX-512 has _mm256_mask_compressstoreu_epi32
-        int32_t base = static_cast<int32_t>(i);
-        while (elem_mask) {
-            int pos = __builtin_ctz(elem_mask);
-            out[count++] = base + pos;
-            elem_mask &= elem_mask - 1;
-        }
+        // Build per-lane row indices [i, i+1, ..., i+L-1] and compressstore
+        // the subset whose mask bit is set. Single vector store (AVX2) or a
+        // tight LUT permute (SSE/NEON) — no ctz loop.
+        alignas(32) int32_t idx_buf[16];  // 16 >= L for every ISA.
+        for (int k = 0; k < L; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
+        const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
+        count += bmm_compressstore_i32(out + count, vidx, mask);
     }
 
-    // Scalar tail
+    // Scalar tail (shared with fallback).
     for (; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
         count += (data[i] > scalar);
@@ -487,62 +487,96 @@ inline int64_t filter_gt_avx2_i32(const int32_t* __restrict__ data, int64_t n,
     return count;
 }
 
-/// AVX2 branchless sum: int64 column.
-inline int64_t sum_avx2_i64(const int64_t* __restrict__ data, int64_t n) noexcept {
-    __m256i vsum = _mm256_setzero_si256();
+/// SIMD branchless filter: int64 column > scalar.
+/// Processes `bmm_lanes_i64` elements per iteration via compare + movemask.
+/// Emits int32 row indices. Uses a tight 4-lane (or 2-lane on SSE/NEON) mask
+/// loop to emit indices — smaller than a dedicated i32 compressstore from a
+/// narrow mask, and measurably faster than the scalar template for filter-gt.
+inline int64_t filter_gt_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n,
+                                   int64_t scalar,
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out  != nullptr || n == 0);
+    assert(n >= 0);
+
+    using namespace bolt::simd;
+    const bmm_vec_i64 vscalar = bmm_set1_i64(scalar);
+    constexpr int L = bmm_lanes_i64;
+    int64_t count = 0;
     int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        __m256i vdata = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
-        vsum = _mm256_add_epi64(vsum, vdata);
+
+    for (; i + L <= n; i += L) {
+        const bmm_vec_i64 vdata = bmm_loadu_i64(data + i);
+        const bmm_vec_i64 vcmp  = bmm_cmpgt_i64(vdata, vscalar);
+        const uint32_t    mask  = static_cast<uint32_t>(bmm_movemask_i64(vcmp));
+
+        // Branchless emit: always write base+k, bump on mask bit. Unrolled.
+        for (int k = 0; k < L; ++k) {
+            out[count] = static_cast<int32_t>(i) + k;
+            count += ((mask >> k) & 1u);
+        }
     }
-    // Horizontal sum
-    alignas(32) int64_t tmp[4];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), vsum);
-    int64_t result = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    // Scalar tail
+
+    // Scalar tail.
+    for (; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (data[i] > scalar);
+    }
+    return count;
+}
+
+/// SIMD branchless filter: float64 column > scalar.
+/// Mirrors filter_gt_avx2_i64; uses ordered greater-than (NaN → no match).
+inline int64_t filter_gt_avx2_f64(const double* BOLT_RESTRICT data, int64_t n,
+                                   double scalar,
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out  != nullptr || n == 0);
+    assert(n >= 0);
+
+    using namespace bolt::simd;
+    const bmm_vec_f64 vscalar = bmm_set1_f64(scalar);
+    constexpr int L = bmm_lanes_f64;
+    int64_t count = 0;
+    int64_t i = 0;
+
+    for (; i + L <= n; i += L) {
+        const bmm_vec_f64 vdata = bmm_loadu_f64(data + i);
+        const bmm_vec_f64 vcmp  = bmm_cmpgt_f64(vdata, vscalar);
+        const uint32_t    mask  = static_cast<uint32_t>(bmm_movemask_f64(vcmp));
+
+        for (int k = 0; k < L; ++k) {
+            out[count] = static_cast<int32_t>(i) + k;
+            count += ((mask >> k) & 1u);
+        }
+    }
+
+    for (; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (data[i] > scalar);
+    }
+    return count;
+}
+
+/// SIMD branchless sum: int64 column.
+/// Accumulates `bmm_lanes_i64` lanes in parallel, then horizontal-reduces.
+inline int64_t sum_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(n >= 0);
+
+    using namespace bolt::simd;
+    constexpr int L = bmm_lanes_i64;
+    bmm_vec_i64 acc = bmm_setzero_i64();
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        acc = bmm_add_i64(acc, bmm_loadu_i64(data + i));
+    }
+    int64_t result = bmm_hadd_i64(acc);
     for (; i < n; ++i) result += data[i];
     return result;
 }
 
-#endif  // BOLT_HAS_AVX2
-
-#ifdef BOLT_HAS_NEON
-
-/// NEON branchless filter: int32 column > scalar.
-inline int64_t filter_gt_neon_i32(const int32_t* __restrict__ data, int64_t n,
-                                   int32_t scalar,
-                                   int32_t* __restrict__ out) noexcept {
-    int32x4_t vscalar = vdupq_n_s32(scalar);
-    int64_t count = 0;
-    int64_t i = 0;
-
-    for (; i + 4 <= n; i += 4) {
-        int32x4_t vdata = vld1q_s32(data + i);
-        uint32x4_t vcmp = vcgtq_s32(vdata, vscalar);
-
-        // Extract comparison results
-        uint32_t mask = 0;
-        mask |= (vgetq_lane_u32(vcmp, 0) ? 1u : 0u);
-        mask |= (vgetq_lane_u32(vcmp, 1) ? 2u : 0u);
-        mask |= (vgetq_lane_u32(vcmp, 2) ? 4u : 0u);
-        mask |= (vgetq_lane_u32(vcmp, 3) ? 8u : 0u);
-
-        int32_t base = static_cast<int32_t>(i);
-        while (mask) {
-            int pos = __builtin_ctz(mask);
-            out[count++] = base + pos;
-            mask &= mask - 1;
-        }
-    }
-
-    for (; i < n; ++i) {
-        out[count] = static_cast<int32_t>(i);
-        count += (data[i] > scalar);
-    }
-    return count;
-}
-
-#endif  // BOLT_HAS_NEON
+#endif  // BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42 || BOLT_SIMD_NEON
 
 // ============================================================================
 // Type-dispatched branchless filter (X-macro)
@@ -555,7 +589,7 @@ enum class CmpOp : uint8_t { Eq, Ne, Lt, Le, Gt, Ge };
 inline int64_t dispatch_filter_branchless(
         const void* data, BoltType type, int64_t n,
         CmpOp op, int64_t scalar_i64,
-        int32_t* __restrict__ out) noexcept {
+        int32_t* BOLT_RESTRICT out) noexcept {
 
     // The switch is the ONE branch — predicted after first call
     // (same column type every morsel). Inner kernel is branchless.
@@ -588,9 +622,9 @@ inline int64_t dispatch_filter_branchless(
 /// because the branch predictor is accurate and the CPU can speculate past
 /// the branch, effectively prefetching future iterations.
 template <typename T>
-int64_t filter_gt_branching(const T* __restrict__ data, int64_t n,
+int64_t filter_gt_branching(const T* BOLT_RESTRICT data, int64_t n,
                              T scalar,
-                             int32_t* __restrict__ out) noexcept {
+                             int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         if (data[i] > scalar) {      // Branch — predictor handles extreme selectivity
@@ -601,9 +635,9 @@ int64_t filter_gt_branching(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_lt_branching(const T* __restrict__ data, int64_t n,
+int64_t filter_lt_branching(const T* BOLT_RESTRICT data, int64_t n,
                              T scalar,
-                             int32_t* __restrict__ out) noexcept {
+                             int32_t* BOLT_RESTRICT out) noexcept {
     int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         if (data[i] < scalar) out[count++] = static_cast<int32_t>(i);
@@ -657,10 +691,10 @@ static constexpr float kBranchlessThresholdHigh = 0.80f;
 /// at morsel granularity. Decision cost: two float comparisons (once
 /// per morsel, not per row).
 template <typename T>
-int64_t filter_gt_adaptive(const T* __restrict__ data, int64_t n,
+int64_t filter_gt_adaptive(const T* BOLT_RESTRICT data, int64_t n,
                             T scalar,
                             int64_t col_min, int64_t col_max,
-                            int32_t* __restrict__ out) noexcept {
+                            int32_t* BOLT_RESTRICT out) noexcept {
     int64_t scalar_i64 = 0;
     memcpy(&scalar_i64, &scalar, sizeof(T) < sizeof(int64_t) ? sizeof(T) : sizeof(int64_t));
     float sel = estimate_selectivity_gt(col_min, col_max, scalar_i64);
@@ -672,10 +706,10 @@ int64_t filter_gt_adaptive(const T* __restrict__ data, int64_t n,
 }
 
 template <typename T>
-int64_t filter_lt_adaptive(const T* __restrict__ data, int64_t n,
+int64_t filter_lt_adaptive(const T* BOLT_RESTRICT data, int64_t n,
                             T scalar,
                             int64_t col_min, int64_t col_max,
-                            int32_t* __restrict__ out) noexcept {
+                            int32_t* BOLT_RESTRICT out) noexcept {
     int64_t scalar_i64 = 0;
     memcpy(&scalar_i64, &scalar, sizeof(T) < sizeof(int64_t) ? sizeof(T) : sizeof(int64_t));
     float sel = estimate_selectivity_lt(col_min, col_max, scalar_i64);
@@ -706,10 +740,10 @@ struct PartitionResult {
 };
 
 template <typename T>
-PartitionResult partition_predicated(const T* __restrict__ data, int64_t n,
+PartitionResult partition_predicated(const T* BOLT_RESTRICT data, int64_t n,
                                       T pivot,
-                                      T* __restrict__ left_out,
-                                      T* __restrict__ right_out) noexcept {
+                                      T* BOLT_RESTRICT left_out,
+                                      T* BOLT_RESTRICT right_out) noexcept {
     int64_t l = 0, r = 0;
     for (int64_t i = 0; i < n; ++i) {
         left_out[l]  = data[i];      // Speculative write to left
@@ -725,12 +759,12 @@ PartitionResult partition_predicated(const T* __restrict__ data, int64_t n,
 /// need to know which original row went where).
 template <typename T>
 PartitionResult partition_predicated_indexed(
-        const T* __restrict__ data, int64_t n,
+        const T* BOLT_RESTRICT data, int64_t n,
         T pivot,
-        T* __restrict__ left_out,
-        T* __restrict__ right_out,
-        int32_t* __restrict__ left_indices,
-        int32_t* __restrict__ right_indices) noexcept {
+        T* BOLT_RESTRICT left_out,
+        T* BOLT_RESTRICT right_out,
+        int32_t* BOLT_RESTRICT left_indices,
+        int32_t* BOLT_RESTRICT right_indices) noexcept {
     int64_t l = 0, r = 0;
     for (int64_t i = 0; i < n; ++i) {
         bool goes_left = (data[i] < pivot);
@@ -752,13 +786,13 @@ PartitionResult partition_predicated_indexed(
 ///
 /// This is the inner loop of radix-partitioned hash join build.
 inline void radix_partition_scatter(
-        const uint32_t* __restrict__ hashes,
-        const int32_t* __restrict__ indices,
+        const uint32_t* BOLT_RESTRICT hashes,
+        const int32_t* BOLT_RESTRICT indices,
         int64_t n,
         uint32_t radix_bits,
-        int64_t* __restrict__ offsets,  // Current write offset per bucket
-        int32_t* __restrict__ dest_indices,
-        uint32_t* __restrict__ dest_hashes) noexcept {
+        int64_t* BOLT_RESTRICT offsets,  // Current write offset per bucket
+        int32_t* BOLT_RESTRICT dest_indices,
+        uint32_t* BOLT_RESTRICT dest_hashes) noexcept {
     uint32_t mask = (1u << radix_bits) - 1;
     for (int64_t i = 0; i < n; ++i) {
         uint32_t bucket = hashes[i] & mask;
@@ -770,4 +804,3 @@ inline void radix_partition_scatter(
 
 }  // namespace branchless
 }  // namespace bolt
-}  // namespace chukonu

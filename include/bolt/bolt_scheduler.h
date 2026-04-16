@@ -8,24 +8,18 @@
 
 #pragma once
 
-#include "bolt_arena.h"
-#include "bolt_channel.h"
+#include "bolt/bolt_arena.h"
+#include "bolt/bolt_channel.h"
+#include "bolt/bolt_config.h"
+#include "bolt/bolt_port.h"
+#include "bolt/bolt_topology.h"
 
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
-// Platform threads (no libuv dependency)
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
-#endif
-
-namespace chukonu {
 namespace bolt {
 
 // ============================================================================
@@ -38,7 +32,7 @@ enum class SpinPolicy : uint8_t {
     ParkWait,     // futex/condvar. I/O-bound or infrequent work.
 };
 
-static constexpr uint32_t kDefaultSpinCount = 1000;
+static constexpr uint32_t kDefaultSpinCount = config::kDefaultSpinCount;
 
 inline void spin_wait(SpinPolicy policy, uint32_t& spin_count, uint32_t max_spins) noexcept {
     switch (policy) {
@@ -47,11 +41,7 @@ inline void spin_wait(SpinPolicy policy, uint32_t& spin_count, uint32_t max_spin
             break;
         case SpinPolicy::SpinYield:
             if (++spin_count > max_spins) {
-#ifdef _WIN32
-                SwitchToThread();
-#else
-                sched_yield();
-#endif
+                std::this_thread::yield();
                 spin_count = 0;
             } else {
                 cpu_pause();
@@ -59,15 +49,77 @@ inline void spin_wait(SpinPolicy policy, uint32_t& spin_count, uint32_t max_spin
             break;
         case SpinPolicy::ParkWait:
             // For proper park/unpark we'd use futex or condition_variable.
-            // Fallback to yield for now — ParkWait workers should use
-            // the IOBridge path with FasterAPI's event loop instead.
-#ifdef _WIN32
-            Sleep(0);
-#else
-            usleep(0);
-#endif
+            // Fallback to yield for now.
+            std::this_thread::yield();
             break;
     }
+}
+
+// ============================================================================
+// Tuning Profiles & SchedulerConfig
+// ============================================================================
+
+enum class TuneProfile : uint8_t {
+    Latency,     // HFT / streaming: lowest tail; burn CPU to get it.
+    Balanced,    // Default. Analytics-friendly, predictable.
+    Throughput,  // Bulk analytics: biggest grain, coop scheduling.
+};
+
+/// Compute the number of rows that fit into a grain of `grain_bytes`, given
+/// per-row element size. Never returns 0 (element > budget collapses to 1 row).
+BOLT_FORCE_INLINE uint32_t bolt_grain_rows(uint32_t grain_bytes, size_t elem_size) noexcept {
+    assert(elem_size > 0);
+    assert(grain_bytes > 0);
+    if (elem_size == 0) return 1;
+    uint32_t g = static_cast<uint32_t>(grain_bytes / elem_size);
+    if (g == 0) g = 1;
+    return g;
+}
+
+struct SchedulerConfig {
+    TuneProfile tune           = TuneProfile::Balanced;
+    uint32_t    num_workers    = 0;              // 0 -> bolt_get_hardware_concurrency()
+    SpinPolicy  spin           = SpinPolicy::SpinYield;
+    bool        pin_workers    = false;
+    bool        numa_bind      = false;
+    bool        prefer_p_cores = true;
+    uint32_t    grain_bytes    = 256u * 1024u;   // morsel = 256 KB of column payload
+    uint32_t    dispatch_batch = 1;              // reserved for coalesced submit (Wave G)
+
+    // Factory: return a config populated from a TuneProfile preset.
+    static SchedulerConfig with_profile(TuneProfile p) noexcept;
+};
+
+inline SchedulerConfig SchedulerConfig::with_profile(TuneProfile p) noexcept {
+    SchedulerConfig c{};
+    c.tune = p;
+    switch (p) {
+        case TuneProfile::Latency:
+            c.spin           = SpinPolicy::BusySpin;
+            c.pin_workers    = true;
+            c.numa_bind      = true;
+            c.prefer_p_cores = true;
+            c.grain_bytes    = config::kLatencyGrainBytes;
+            c.dispatch_batch = config::kLatencyDispatchBatch;
+            break;
+        case TuneProfile::Balanced:
+            c.spin           = SpinPolicy::SpinYield;
+            c.pin_workers    = false;
+            c.numa_bind      = false;
+            c.prefer_p_cores = true;
+            c.grain_bytes    = config::kBalancedGrainBytes;
+            c.dispatch_batch = config::kBalancedDispatchBatch;
+            break;
+        case TuneProfile::Throughput:
+            c.spin           = SpinPolicy::SpinYield;
+            c.pin_workers    = false;
+            c.numa_bind      = true;
+            c.prefer_p_cores = false;
+            c.grain_bytes    = config::kThroughputGrainBytes;
+            c.dispatch_batch = config::kThroughputDispatchBatch;
+            break;
+    }
+    return c;
 }
 
 // ============================================================================
@@ -163,7 +215,7 @@ private:
 // Task Ring — SPMC ring buffer (same pattern as Venus jobs.c)
 // ============================================================================
 
-static constexpr uint32_t kTaskRingSize = 16384;  // 2^14, same as Venus
+static constexpr uint32_t kTaskRingSize = config::kTaskRingSize;
 static constexpr uint32_t kTaskRingMask = kTaskRingSize - 1;
 
 struct alignas(64) TaskRing {
@@ -213,7 +265,9 @@ struct alignas(64) TaskRing {
                 std::memory_order_release, std::memory_order_relaxed))
             return false;  // Another worker claimed it
 
-        Task task = ring[next & kTaskRingMask];
+        // Read the slot at the claimed sequence (t), not t+1.
+        Task task = ring[t & kTaskRingMask];
+        (void)next;
         if (task.fn) task.fn(task.arg);
         return true;
     }
@@ -239,7 +293,7 @@ struct WorkerConfig {
     uint32_t   spin_count;      // Max spins before escalation
 };
 
-static constexpr uint32_t kMaxWorkers = 64;
+static constexpr uint32_t kMaxWorkers = config::kMaxWorkers;
 
 // ============================================================================
 // Scheduler — owns workers, ring, pools, arenas
@@ -260,13 +314,9 @@ static constexpr uint32_t kMaxWorkers = 64;
 struct Scheduler {
     TaskRing ring;
 
-    // Worker threads
-#ifdef _WIN32
-    HANDLE     workers[kMaxWorkers];
-#else
-    pthread_t  workers[kMaxWorkers];
-#endif
-    uint32_t   num_workers;
+    // Worker threads (std::thread — portable across MSVC / gcc / clang).
+    std::thread workers[kMaxWorkers];
+    uint32_t    num_workers;
     std::atomic<bool> shutdown_flag;
 
     // Per-worker arenas
@@ -274,6 +324,13 @@ struct Scheduler {
 
     // Per-worker config
     WorkerConfig worker_configs[kMaxWorkers];
+
+    // Applied scheduler-level config (from init()).
+    SchedulerConfig cfg;
+
+    // Observed placement: UINT32_MAX means floating / not bound.
+    uint32_t worker_cpus[kMaxWorkers];
+    uint32_t worker_numa[kMaxWorkers];
 
     // Task pools for range/column tasks
     TaskPool*  range_task_pool;
@@ -290,6 +347,7 @@ struct Scheduler {
     // =====================================================================
 
     bool init(uint32_t num_threads, SpinPolicy default_policy = SpinPolicy::SpinYield) noexcept;
+    bool init(const SchedulerConfig& cfg) noexcept;
     void shutdown() noexcept;
 
     // =====================================================================
@@ -311,8 +369,17 @@ struct Scheduler {
                             void* write_batch, uint32_t entity_count,
                             float delta_time, uint32_t grain_size = 512) noexcept;
 
-    /// Wait for all submitted tasks to complete.
+    /// Wait for all submitted tasks to complete. Uses the tasks_submitted /
+    /// tasks_completed counters (incremented by the range/column trampolines)
+    /// for a precise post-execution barrier — ring tail advances at claim time,
+    /// which is not sufficient to guarantee the task body has finished.
     void wait_all() noexcept {
+        const uint64_t target = stats.tasks_submitted.load(std::memory_order_acquire);
+        uint32_t spins = 0;
+        while (stats.tasks_completed.load(std::memory_order_acquire) < target) {
+            spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
+        }
+        // Also fence the ring to be safe for raw submit() consumers.
         ring.wait_all(SpinPolicy::SpinYield);
     }
 
@@ -323,7 +390,322 @@ struct Scheduler {
     }
 
     uint32_t thread_count() const noexcept { return num_workers; }
+
+    uint32_t worker_cpu (uint32_t worker_id) const noexcept {
+        assert(worker_id < num_workers);
+        return worker_cpus[worker_id];
+    }
+    uint32_t worker_node(uint32_t worker_id) const noexcept {
+        assert(worker_id < num_workers);
+        return worker_numa[worker_id];
+    }
+    uint32_t grain_bytes() const noexcept { return cfg.grain_bytes; }
+    const SchedulerConfig& config() const noexcept { return cfg; }
 };
+
+// ============================================================================
+// Scheduler implementation
+// ============================================================================
+
+/// Payload stored in range_task_pool. Also reused by submit_column_task via a
+/// discriminated layout — column tasks carry extra pointers but fit in the
+/// same pool node size (128 bytes). We keep two pools to avoid cross-type
+/// contention on the Treiber stack.
+struct RangeTaskPayload {
+    // First field must be TaskPool::Node-compatible (pointer-sized) for pool reuse.
+    void*         pool_next_slot;  // Unused after acquire; preserved for layout.
+    RangeTaskFn   fn;
+    void*         user_data;
+    uint32_t      start;
+    uint32_t      end;
+    uint32_t      thread_id;
+    uint32_t      _pad0;
+    TaskPool*     owning_pool;
+    Scheduler*    owning_sched;
+};
+static_assert(sizeof(RangeTaskPayload) <= 128, "RangeTaskPayload must fit pool slot");
+
+struct ColumnTaskPayload {
+    void*         pool_next_slot;
+    ColumnTaskFn  fn;
+    const void*   read_batch;
+    void*         write_batch;
+    uint32_t      start;
+    uint32_t      end;
+    float         delta_time;
+    uint32_t      thread_id;
+    TaskPool*     owning_pool;
+    Scheduler*    owning_sched;
+};
+static_assert(sizeof(ColumnTaskPayload) <= 128, "ColumnTaskPayload must fit pool slot");
+
+static constexpr size_t   kSchedulerPoolSlot     = config::kSchedulerPoolSlotBytes;
+static constexpr uint32_t kSchedulerPoolCapacity = config::kSchedulerPoolCapacity;
+
+inline void scheduler_range_trampoline(void* arg) noexcept {
+    assert(arg != nullptr);
+    RangeTaskPayload* p = static_cast<RangeTaskPayload*>(arg);
+    assert(p->fn != nullptr);
+    assert(p->end >= p->start);
+    p->fn(p->user_data, p->start, p->end, p->thread_id);
+    Scheduler* sched = p->owning_sched;
+    TaskPool* pool = p->owning_pool;
+    pool->release(p);
+    if (sched) {
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void scheduler_column_trampoline(void* arg) noexcept {
+    assert(arg != nullptr);
+    ColumnTaskPayload* p = static_cast<ColumnTaskPayload*>(arg);
+    assert(p->fn != nullptr);
+    assert(p->end >= p->start);
+    p->fn(p->read_batch, p->write_batch, p->start, p->end, p->delta_time, p->thread_id);
+    Scheduler* sched = p->owning_sched;
+    TaskPool* pool = p->owning_pool;
+    pool->release(p);
+    if (sched) {
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept {
+    assert(sched != nullptr);
+    assert(worker_id < kMaxWorkers);
+
+    // ------------------------------------------------------------------------
+    // Pinning + NUMA binding: MUST happen before tl_arena is set so that the
+    // arena's first-touch pages land on the correct NUMA node (first-touch
+    // policy on Linux; Windows uses the preferred node hint for VirtualAlloc).
+    // ------------------------------------------------------------------------
+    const uint32_t intended_cpu = sched->worker_cpus[worker_id];
+    if (intended_cpu != UINT32_MAX) {
+        if (!bolt_pin_current_thread(intended_cpu)) {
+            // Honest diagnostics: record the failure.
+            sched->worker_cpus[worker_id] = UINT32_MAX;
+        } else if (sched->cfg.numa_bind) {
+            uint32_t node = 0;
+            if (intended_cpu < kTopologyMaxCpus) {
+                // cpu_to_node was captured into worker_numa during init as a
+                // pre-computed hint; fall back to 0 if unset.
+                uint32_t n = sched->worker_numa[worker_id];
+                if (n != UINT32_MAX) node = n;
+            }
+            if (!bolt_set_numa_preferred(static_cast<int>(node))) {
+                sched->worker_numa[worker_id] = UINT32_MAX;
+            }
+        }
+    }
+
+    tl_arena = sched->worker_arenas[worker_id];
+    const SpinPolicy policy = sched->worker_configs[worker_id].spin_policy;
+    const uint32_t max_spins = sched->worker_configs[worker_id].spin_count;
+    uint32_t spins = 0;
+
+    while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
+        if (sched->ring.try_claim_and_execute()) {
+            spins = 0;
+        } else {
+            spin_wait(policy, spins, max_spins);
+        }
+    }
+
+    // Drain any remaining tasks so wait_all() callers see completion even if
+    // shutdown races with submission. Bounded drain; no new work can land after
+    // shutdown_flag observe because callers must quiesce before shutdown().
+    while (sched->ring.try_claim_and_execute()) { /* drain */ }
+
+    tl_arena = nullptr;
+}
+
+// Build the CPU assignment list: prefer P-cores first when requested, then
+// E-cores, then any remaining logical CPU. Unused slots are UINT32_MAX.
+// Writes exactly `want` entries into `out[0..want)`.
+inline void scheduler_assign_cpus(const CpuTopology& topo,
+                                  uint32_t want, bool prefer_p_cores,
+                                  uint32_t* out) noexcept {
+    assert(out != nullptr);
+    assert(want <= kMaxWorkers);
+
+    const uint32_t ncpu = (topo.logical_cpus < kTopologyMaxCpus)
+        ? topo.logical_cpus : kTopologyMaxCpus;
+    uint32_t filled = 0;
+
+    if (prefer_p_cores && topo.performance_cores > 0) {
+        for (uint32_t c = 0; c < ncpu && filled < want; ++c) {
+            if (topo.cpu_is_perf[c]) out[filled++] = c;
+        }
+        for (uint32_t c = 0; c < ncpu && filled < want; ++c) {
+            if (!topo.cpu_is_perf[c]) out[filled++] = c;
+        }
+    } else {
+        for (uint32_t c = 0; c < ncpu && filled < want; ++c) {
+            out[filled++] = c;
+        }
+    }
+    while (filled < want) out[filled++] = UINT32_MAX;
+}
+
+inline bool Scheduler::init(uint32_t num_threads, SpinPolicy default_policy) noexcept {
+    assert(num_threads > 0);
+    SchedulerConfig c{};
+    c.num_workers = num_threads;
+    c.spin        = default_policy;
+    return init(c);
+}
+
+inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
+    assert(in_cfg.grain_bytes > 0);
+    assert(in_cfg.dispatch_batch > 0);
+
+    cfg = in_cfg;
+
+    uint32_t num_threads = cfg.num_workers;
+    if (num_threads == 0) num_threads = bolt_get_hardware_concurrency();
+    if (num_threads == 0) num_threads = 1;
+    if (num_threads > kMaxWorkers) num_threads = kMaxWorkers;
+
+    // Defensive: clear owned pointers in case caller didn't value-init.
+    range_task_pool = nullptr;
+    column_task_pool = nullptr;
+    for (uint32_t i = 0; i < kMaxWorkers; ++i) {
+        worker_arenas[i] = nullptr;
+        worker_cpus[i]   = UINT32_MAX;
+        worker_numa[i]   = UINT32_MAX;
+    }
+
+    ring.init();
+    shutdown_flag.store(false, std::memory_order_relaxed);
+    stats.tasks_submitted.store(0, std::memory_order_relaxed);
+    stats.tasks_completed.store(0, std::memory_order_relaxed);
+    num_workers = 0;
+
+    // Detect topology on the stack (~2KB): not persisted after init.
+    CpuTopology topo;
+    bolt_detect_topology(&topo);
+
+    // Pre-compute CPU assignments.
+    uint32_t planned_cpus[kMaxWorkers];
+    for (uint32_t i = 0; i < kMaxWorkers; ++i) planned_cpus[i] = UINT32_MAX;
+    if (cfg.pin_workers) {
+        scheduler_assign_cpus(topo, num_threads, cfg.prefer_p_cores, planned_cpus);
+    }
+
+    // Allocate per-worker arenas (startup allocation — permitted).
+    for (uint32_t i = 0; i < num_threads; ++i) {
+        worker_arenas[i] = new (std::nothrow) Arena();
+        if (!worker_arenas[i]) {
+            for (uint32_t j = 0; j < i; ++j) { delete worker_arenas[j]; worker_arenas[j] = nullptr; }
+            return false;
+        }
+        worker_configs[i] = WorkerConfig{ i, -1, cfg.spin, kDefaultSpinCount };
+
+        // Stamp intended placement. The worker thread will attempt to apply it
+        // and overwrite with UINT32_MAX on failure for honest diagnostics.
+        worker_cpus[i] = planned_cpus[i];
+        if (cfg.numa_bind && planned_cpus[i] != UINT32_MAX
+                          && planned_cpus[i] < kTopologyMaxCpus) {
+            worker_numa[i] = topo.cpu_to_node[planned_cpus[i]];
+        } else {
+            worker_numa[i] = UINT32_MAX;
+        }
+    }
+
+    range_task_pool  = TaskPool::create(kSchedulerPoolSlot, kSchedulerPoolCapacity);
+    column_task_pool = TaskPool::create(kSchedulerPoolSlot, kSchedulerPoolCapacity);
+    if (!range_task_pool || !column_task_pool) {
+        if (range_task_pool)  { range_task_pool->destroy();  range_task_pool  = nullptr; }
+        if (column_task_pool) { column_task_pool->destroy(); column_task_pool = nullptr; }
+        for (uint32_t i = 0; i < num_threads; ++i) { delete worker_arenas[i]; worker_arenas[i] = nullptr; }
+        return false;
+    }
+
+    // Spawn workers last so they see fully-initialised state.
+    num_workers = num_threads;
+    for (uint32_t i = 0; i < num_threads; ++i) {
+        workers[i] = std::thread(scheduler_worker_loop, this, i);
+    }
+    return true;
+}
+
+inline void Scheduler::shutdown() noexcept {
+    assert(num_workers <= kMaxWorkers);
+
+    shutdown_flag.store(true, std::memory_order_release);
+    for (uint32_t i = 0; i < num_workers; ++i) {
+        if (workers[i].joinable()) workers[i].join();
+    }
+    num_workers = 0;
+
+    if (range_task_pool)  { range_task_pool->destroy();  range_task_pool  = nullptr; }
+    if (column_task_pool) { column_task_pool->destroy(); column_task_pool = nullptr; }
+
+    for (uint32_t i = 0; i < kMaxWorkers; ++i) {
+        if (worker_arenas[i]) { delete worker_arenas[i]; worker_arenas[i] = nullptr; }
+    }
+}
+
+inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
+                                    uint32_t count, uint32_t grain_size) noexcept {
+    assert(fn != nullptr);
+    assert(grain_size > 0);
+    assert(range_task_pool != nullptr);
+
+    if (count == 0) return;
+
+    for (uint32_t start = 0; start < count; start += grain_size) {
+        uint32_t end = start + grain_size;
+        if (end > count) end = count;
+
+        void* slot = range_task_pool->acquire();
+        if (!slot) return;  // Pool & fallback exhausted; caller's count stats will diverge.
+
+        RangeTaskPayload* p = static_cast<RangeTaskPayload*>(slot);
+        p->fn            = fn;
+        p->user_data     = user_data;
+        p->start         = start;
+        p->end           = end;
+        p->thread_id     = 0;  // Set by worker via tl_arena; not per-worker yet.
+        p->owning_pool   = range_task_pool;
+        p->owning_sched  = this;
+
+        ring.submit_wait(&scheduler_range_trampoline, p, SpinPolicy::SpinYield);
+        stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void Scheduler::submit_column_task(ColumnTaskFn fn, const void* read_batch,
+                                          void* write_batch, uint32_t entity_count,
+                                          float delta_time, uint32_t grain_size) noexcept {
+    assert(fn != nullptr);
+    assert(grain_size > 0);
+    assert(column_task_pool != nullptr);
+
+    if (entity_count == 0) return;
+
+    for (uint32_t start = 0; start < entity_count; start += grain_size) {
+        uint32_t end = start + grain_size;
+        if (end > entity_count) end = entity_count;
+
+        void* slot = column_task_pool->acquire();
+        if (!slot) return;
+
+        ColumnTaskPayload* p = static_cast<ColumnTaskPayload*>(slot);
+        p->fn            = fn;
+        p->read_batch    = read_batch;
+        p->write_batch   = write_batch;
+        p->start         = start;
+        p->end           = end;
+        p->delta_time    = delta_time;
+        p->thread_id     = 0;
+        p->owning_pool   = column_task_pool;
+        p->owning_sched  = this;
+
+        ring.submit_wait(&scheduler_column_trampoline, p, SpinPolicy::SpinYield);
+        stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 // ============================================================================
 // Phase Barrier — multi-phase execution (Venus pattern)
@@ -376,4 +758,3 @@ struct PhaseBarrier {
 };
 
 }  // namespace bolt
-}  // namespace chukonu

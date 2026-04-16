@@ -12,13 +12,15 @@ Total: ~2,600 lines of header-only C++20. Compiles in seconds.
 
 ```
 chukonu/
-├── include/chukonu/bolt/           ← Headers (the library)
+├── include/bolt/           ← Headers (the library)
 │   ├── bolt_types.h                   Type enum, StringView, Schema, Arrow C Data ABI
 │   ├── bolt_arena.h                   Per-thread bump allocator (9,600x faster than malloc)
 │   ├── bolt_channel.h                 Lock-free SPSC/MPSC ring buffers (25x faster than mutex)
 │   ├── bolt_column.h                  Adaptive column + BoltBatch + BitmapIndex
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
 │   ├── bolt_scheduler.h               Task ring, worker pool, phase barriers
+│   ├── kernels/
+│   │   └── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
 │   └── README.md                      Full project documentation
 │
 ├── src/bolt/                        ← Implementation notes
@@ -35,7 +37,16 @@ chukonu/
     ├── BOLT_COLUMN_FORMAT.md          Phase 2: stats, sidecars, adaptive encoding
     ├── BOLT_INDEPENDENCE.md           Zero-dependency architecture + interop matrix
     ├── BOLT_ACERO_COMPONENTS.md       What Acero provides, what Bolt replaces
-    └── BOLT_RESEARCH_NOTES.md         Pirk et al. technique catalogue (14 papers)
+    ├── BOLT_RESEARCH_NOTES.md         Thin pointer to research/
+    └── research/                      Per-topic research notes:
+        ├── README.md                    Index
+        ├── pirk-techniques.md           Pirk et al. (14 papers)
+        ├── cglm.md                      SIMD/portability patterns
+        ├── scheduler-design.md          DuckDB / Polars / Seastar
+        ├── cpu-topology.md              OS topology APIs
+        ├── avx512-status.md             AVX-512 dispatch stub + plan
+        ├── 1brc.md                      1 Billion Row Challenge
+        └── json-fionn.md                fionn vs simdjson
 ```
 
 ## Design Principles

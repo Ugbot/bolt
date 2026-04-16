@@ -15,7 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace chukonu {
+#include "bolt/bolt_port.h"
+
 namespace bolt {
 
 struct ArenaConfig {
@@ -143,21 +144,11 @@ public:
 
 private:
     static void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
-#ifdef _WIN32
-        return _aligned_malloc(size, alignment);
-#else
-        void* p = nullptr;
-        if (posix_memalign(&p, alignment, size) != 0) return nullptr;
-        return p;
-#endif
+        return bolt_aligned_alloc(alignment, size);
     }
 
     static void aligned_free(void* p) noexcept {
-#ifdef _WIN32
-        _aligned_free(p);
-#else
-        free(p);
-#endif
+        bolt_aligned_free(p);
     }
 
     bool grow(size_t min_size) noexcept {
@@ -226,9 +217,24 @@ inline Arena& current_arena() noexcept {
 }
 
 /// RAII guard. No heap. No exceptions.
+///
+/// Contract: swaps `tl_arena` to the supplied arena for the guard's lifetime
+/// and restores the previous value on destruction. The pointer-accepting
+/// overload treats `nullptr` as "no-op": `tl_arena` is left untouched, and
+/// the dtor still restores `prev_` (which equals the entry value of
+/// `tl_arena`). This lets call sites pass an optional arena without branching.
 class ArenaGuard {
 public:
     explicit ArenaGuard(Arena& arena) noexcept : prev_(tl_arena) { tl_arena = &arena; }
+
+    // Pointer overload — tolerates nullptr (leaves tl_arena unchanged).
+    // Not delegated to the reference ctor because *nullptr is UB.
+    explicit ArenaGuard(Arena* arena) noexcept : prev_(tl_arena) {
+        assert(prev_ == tl_arena);       // Precondition: captured entry value.
+        if (arena != nullptr) tl_arena = arena;
+        assert(arena == nullptr || tl_arena == arena);  // Postcondition.
+    }
+
     ~ArenaGuard() noexcept { tl_arena = prev_; }
     ArenaGuard(const ArenaGuard&) = delete;
     ArenaGuard& operator=(const ArenaGuard&) = delete;
@@ -237,4 +243,3 @@ private:
 };
 
 }  // namespace bolt
-}  // namespace chukonu

@@ -124,7 +124,10 @@ MIT CSAIL, and Imperial College London. Key papers:
 - Kersten et al. "Compiled and Vectorized Queries" (VLDB 2018)
   → Vectorized vs compiled: <2x difference, vectorized is simpler
 
-See `docs/BOLT_RESEARCH_NOTES.md` for the full technique catalogue.
+See `docs/research/` (indexed by `docs/research/README.md`) for the full
+technique catalogue, organised one file per topic — Pirk et al., cglm,
+DuckDB/Polars/Seastar scheduler design, CPU topology, AVX-512, 1BRC,
+fionn JSON.
 
 ## Building
 

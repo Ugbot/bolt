@@ -1,0 +1,421 @@
+// bolt_wire.h — Self-describing flat serialization for BoltBatch.
+//
+// RULES: No exceptions. No RTTI. No smart pointers. No std::string. No std::vector.
+// All functions noexcept. Fixed caps, >=2 asserts per function, functions <=70 lines.
+//
+// Scope (Phase 1):
+//   - Only Flat-format columns are supported. Constant/Sequence/Dictionary/View
+//     columns must be materialized by the caller before serialize — otherwise
+//     serialize returns 0.
+//   - Only the numeric types in BOLT_NUMERIC_TYPES plus Bool and Utf8 are
+//     supported. Other types cause serialize to return 0.
+//   - Little-endian target only (x86 / ARM64). Flag bit 0 records this.
+//   - Deserialize copies each column buffer into the caller-provided Arena.
+//     Zero-copy-over-mmap is a future goal; the 64-byte alignment in the blob
+//     already makes every buffer pointer-aligned for future mmap paths.
+//
+// Binary layout:
+//   +------------------------------------------------+ offset 0
+//   |  magic[4]       = "BOLT"                       |
+//   |  version        = u32 (1)                      |
+//   |  flags          = u32 (bit0=LE, bit1=aligned64)|
+//   |  num_rows       = i64                          |
+//   |  num_cols       = u32                          |
+//   |  schema_offset  = u32                          |
+//   |  data_offset    = u32                          |
+//   |  header_pad     -> total 32 bytes              |
+//   +------------------------------------------------+
+//   | Schema block (num_cols * kWireSchemaEntrySize) |
+//   |   per col: { name[64], type u8, format u8,     |
+//   |              nullable u8, pad -> 72 bytes }    |
+//   +------------------------------------------------+
+//   | Column descriptors (num_cols * kWireDescSize)  |
+//   |   per col: { b0_off u64, b0_len u64,           |
+//   |              b1_off u64, b1_len u64,           |
+//   |              b2_off u64, b2_len u64,           |
+//   |              format u8, pad -> 56 bytes }      |
+//   +------------------------------------------------+
+//   | Data region (64-byte aligned per buffer)       |
+//   |   b0 = validity bitmap (may be empty)          |
+//   |   b1 = primitive data / utf8 offsets           |
+//   |   b2 = utf8 data (string columns only)         |
+//   +------------------------------------------------+
+
+#pragma once
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include "bolt/bolt_arena.h"
+#include "bolt/bolt_column.h"
+#include "bolt/bolt_port.h"
+#include "bolt/bolt_types.h"
+
+namespace bolt {
+namespace wire {
+
+// ===========================================================================
+// Constants
+// ===========================================================================
+
+inline constexpr uint32_t kWireMagic    = 0x544C4F42u;  // 'BOLT' LE
+inline constexpr uint32_t kWireVersion  = 1u;
+inline constexpr uint32_t kWireFlagLE   = 1u << 0;
+inline constexpr uint32_t kWireFlagAln  = 1u << 1;
+
+inline constexpr size_t kWireHeaderSize      = 32;
+inline constexpr size_t kWireSchemaEntrySize = 72;
+inline constexpr size_t kWireDescSize        = 56;
+inline constexpr size_t kWireAlign           = 64;
+
+// Hard cap mirrors kMaxBatchColumns so we never underestimate bounds.
+inline constexpr uint32_t kWireMaxCols = kMaxBatchColumns;
+
+// ===========================================================================
+// Internal helpers
+// ===========================================================================
+
+namespace detail {
+
+BOLT_FORCE_INLINE size_t align_up(size_t x, size_t a) noexcept {
+    assert(a > 0);
+    assert((a & (a - 1)) == 0);
+    return (x + a - 1) & ~(a - 1);
+}
+
+BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
+    if (t == BoltType::Bool) return true;
+    if (t == BoltType::Utf8) return true;
+    auto v = static_cast<uint8_t>(t);
+    return v >= static_cast<uint8_t>(BoltType::Int8)
+        && v <= static_cast<uint8_t>(BoltType::Float64);
+}
+
+// Byte length of the data buffer (buffer1) for a Flat column of the given
+// type and row count. Utf8 is handled separately (returns 0 here).
+BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
+    assert(n >= 0);
+    if (t == BoltType::Utf8) return 0;
+    if (t == BoltType::Bool) return static_cast<size_t>((n + 7) / 8);
+    size_t tsz = type_size(t);
+    return tsz * static_cast<size_t>(n);
+}
+
+BOLT_FORCE_INLINE size_t validity_bytes(int64_t n) noexcept {
+    assert(n >= 0);
+    return static_cast<size_t>((n + 7) / 8);
+}
+
+BOLT_FORCE_INLINE void write_u32_le(uint8_t* p, uint32_t v) noexcept {
+    assert(p != nullptr);
+    memcpy(p, &v, sizeof(v));
+}
+BOLT_FORCE_INLINE void write_u64_le(uint8_t* p, uint64_t v) noexcept {
+    assert(p != nullptr);
+    memcpy(p, &v, sizeof(v));
+}
+BOLT_FORCE_INLINE void write_i64_le(uint8_t* p, int64_t v) noexcept {
+    assert(p != nullptr);
+    memcpy(p, &v, sizeof(v));
+}
+
+BOLT_FORCE_INLINE uint32_t read_u32_le(const uint8_t* p) noexcept {
+    assert(p != nullptr);
+    uint32_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+BOLT_FORCE_INLINE uint64_t read_u64_le(const uint8_t* p) noexcept {
+    assert(p != nullptr);
+    uint64_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+BOLT_FORCE_INLINE int64_t read_i64_le(const uint8_t* p) noexcept {
+    assert(p != nullptr);
+    int64_t v; memcpy(&v, p, sizeof(v)); return v;
+}
+
+// Compute the total buffer-region size (summed, each aligned to 64) and
+// report per-column buffer lengths. Returns 0 on unsupported column.
+inline size_t collect_column_sizes(const BoltBatch* b,
+                                   size_t* out_b0_len,
+                                   size_t* out_b1_len,
+                                   size_t* out_b2_len) noexcept {
+    assert(b != nullptr);
+    assert(out_b0_len != nullptr);
+
+    size_t total = 0;
+    const uint32_t n = b->num_cols;
+    for (uint32_t i = 0; i < n && i < kWireMaxCols; ++i) {
+        const BoltColumn& c = b->col(i);
+        if (c.format != ColumnFormat::Flat) return 0;
+        if (!is_supported_type(c.type))     return 0;
+
+        const size_t v_len = c.validity ? validity_bytes(c.length) : 0;
+        size_t d_len = 0;
+        size_t s_len = 0;
+        if (c.type == BoltType::Utf8) {
+            // Utf8 unsupported end-to-end in Phase 1: we don't have enough
+            // metadata on a Flat BoltColumn to reconstruct offsets + data.
+            // Caller should materialize into a primitive form first.
+            return 0;
+        } else {
+            d_len = data_buffer_size(c.type, c.length);
+        }
+
+        out_b0_len[i] = v_len;
+        out_b1_len[i] = d_len;
+        out_b2_len[i] = s_len;
+
+        total += detail::align_up(v_len, kWireAlign);
+        total += detail::align_up(d_len, kWireAlign);
+        total += detail::align_up(s_len, kWireAlign);
+    }
+    return total;
+}
+
+}  // namespace detail
+
+// ===========================================================================
+// Public C++ API
+// ===========================================================================
+
+/// Exact byte size the serialized form needs, or 0 if batch is not
+/// serializable (unsupported column format / type, too many columns).
+inline size_t bolt_wire_size(const BoltBatch* b) noexcept {
+    assert(b != nullptr);
+    assert(b->num_cols <= kWireMaxCols);
+
+    if (b->num_cols > kWireMaxCols) return 0;
+
+    size_t b0[kWireMaxCols], b1[kWireMaxCols], b2[kWireMaxCols];
+    memset(b0, 0, sizeof(b0));
+    memset(b1, 0, sizeof(b1));
+    memset(b2, 0, sizeof(b2));
+
+    const size_t data_bytes = detail::collect_column_sizes(b, b0, b1, b2);
+    if (data_bytes == 0 && b->num_cols > 0) {
+        // Only "no supported columns" is an error here. A legitimately
+        // empty (zero-row, zero-byte) set of columns would still produce
+        // data_bytes == 0 but should succeed — so additionally verify
+        // that every column is supported.
+        for (uint32_t i = 0; i < b->num_cols; ++i) {
+            const BoltColumn& c = b->col(i);
+            if (c.format != ColumnFormat::Flat) return 0;
+            if (!detail::is_supported_type(c.type)) return 0;
+            if (c.type == BoltType::Utf8) return 0;
+        }
+    }
+
+    size_t off = kWireHeaderSize;
+    off += static_cast<size_t>(b->num_cols) * kWireSchemaEntrySize;
+    off += static_cast<size_t>(b->num_cols) * kWireDescSize;
+    off = detail::align_up(off, kWireAlign);
+    off += data_bytes;
+    return off;
+}
+
+/// Serialize into out_buf. Returns bytes written, or 0 on failure.
+inline size_t bolt_wire_serialize(const BoltBatch* b,
+                                  void* out_buf,
+                                  size_t buf_capacity) noexcept {
+    assert(b != nullptr);
+    assert(out_buf != nullptr || buf_capacity == 0);
+
+    if (out_buf == nullptr) return 0;
+    if (b->num_cols > kWireMaxCols) return 0;
+
+    size_t b0[kWireMaxCols], b1[kWireMaxCols], b2[kWireMaxCols];
+    memset(b0, 0, sizeof(b0));
+    memset(b1, 0, sizeof(b1));
+    memset(b2, 0, sizeof(b2));
+
+    // Collect sizes + validate supported formats.
+    for (uint32_t i = 0; i < b->num_cols; ++i) {
+        const BoltColumn& c = b->col(i);
+        if (c.format != ColumnFormat::Flat)        return 0;
+        if (!detail::is_supported_type(c.type))    return 0;
+        if (c.type == BoltType::Utf8)              return 0;
+        b0[i] = c.validity ? detail::validity_bytes(c.length) : 0;
+        b1[i] = detail::data_buffer_size(c.type, c.length);
+        b2[i] = 0;
+    }
+
+    const size_t total = bolt_wire_size(b);
+    if (total == 0 || total > buf_capacity) return 0;
+
+    uint8_t* buf = static_cast<uint8_t*>(out_buf);
+    memset(buf, 0, total);
+
+    // --- Header ---
+    memcpy(buf + 0, "BOLT", 4);
+    detail::write_u32_le(buf + 4,  kWireVersion);
+    detail::write_u32_le(buf + 8,  kWireFlagLE | kWireFlagAln);
+    detail::write_i64_le(buf + 12, b->num_rows);
+    detail::write_u32_le(buf + 20, b->num_cols);
+    const uint32_t schema_off = static_cast<uint32_t>(kWireHeaderSize);
+    const uint32_t desc_off   = schema_off +
+        static_cast<uint32_t>(b->num_cols) * kWireSchemaEntrySize;
+    const uint32_t data_off_u = static_cast<uint32_t>(
+        detail::align_up(desc_off + b->num_cols * kWireDescSize, kWireAlign));
+    detail::write_u32_le(buf + 24, schema_off);
+    detail::write_u32_le(buf + 28, data_off_u);
+
+    // --- Schema entries ---
+    for (uint32_t i = 0; i < b->num_cols; ++i) {
+        uint8_t* e = buf + schema_off + i * kWireSchemaEntrySize;
+        const BoltField& f = b->schema.fields[i];
+        memcpy(e, f.name, kMaxFieldName + 1);
+        e[64] = static_cast<uint8_t>(f.type);
+        e[65] = static_cast<uint8_t>(b->col(i).format);
+        e[66] = f.nullable ? 1u : 0u;
+        // bytes 67..71 remain zero padding.
+    }
+
+    // --- Column descriptors + data copy ---
+    size_t cursor = data_off_u;
+    for (uint32_t i = 0; i < b->num_cols; ++i) {
+        uint8_t* d = buf + desc_off + i * kWireDescSize;
+        const BoltColumn& c = b->col(i);
+
+        const size_t off0 = cursor;                      cursor += detail::align_up(b0[i], kWireAlign);
+        const size_t off1 = cursor;                      cursor += detail::align_up(b1[i], kWireAlign);
+        const size_t off2 = cursor;                      cursor += detail::align_up(b2[i], kWireAlign);
+        assert(cursor <= total);
+
+        detail::write_u64_le(d +  0, off0); detail::write_u64_le(d +  8, b0[i]);
+        detail::write_u64_le(d + 16, off1); detail::write_u64_le(d + 24, b1[i]);
+        detail::write_u64_le(d + 32, off2); detail::write_u64_le(d + 40, b2[i]);
+        d[48] = static_cast<uint8_t>(c.format);
+
+        if (b0[i] && c.validity) memcpy(buf + off0, c.validity, b0[i]);
+        if (b1[i] && c.data)     memcpy(buf + off1, c.data,     b1[i]);
+    }
+
+    return total;
+}
+
+/// Parse a wire blob into out + arena. Returns false on any validation error.
+inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
+                                  BoltBatch* out, Arena* arena) noexcept {
+    assert(out != nullptr);
+    assert(arena != nullptr);
+
+    if (buf == nullptr || buf_len < kWireHeaderSize) return false;
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+
+    // --- Header validation ---
+    if (memcmp(p, "BOLT", 4) != 0) return false;
+    const uint32_t version = detail::read_u32_le(p + 4);
+    if (version != kWireVersion) return false;
+    const uint32_t flags = detail::read_u32_le(p + 8);
+    if (!(flags & kWireFlagLE)) return false;
+    const int64_t  num_rows     = detail::read_i64_le(p + 12);
+    const uint32_t num_cols     = detail::read_u32_le(p + 20);
+    const uint32_t schema_off   = detail::read_u32_le(p + 24);
+    const uint32_t data_off     = detail::read_u32_le(p + 28);
+    if (num_cols > kWireMaxCols)            return false;
+    if (num_rows < 0)                       return false;
+    if (schema_off != kWireHeaderSize)      return false;
+    if ((data_off & (kWireAlign - 1)) != 0) return false;
+
+    const size_t desc_off = static_cast<size_t>(schema_off) +
+        static_cast<size_t>(num_cols) * kWireSchemaEntrySize;
+    if (desc_off + static_cast<size_t>(num_cols) * kWireDescSize > buf_len) return false;
+    if (data_off > buf_len) return false;
+
+    BoltBatch::init_empty(out);
+    out->num_rows = num_rows;
+    out->num_cols = num_cols;
+    out->arena    = arena;
+    out->schema.num_fields = num_cols;
+
+    // --- Per-column parse ---
+    for (uint32_t i = 0; i < num_cols; ++i) {
+        const uint8_t* e = p + schema_off + i * kWireSchemaEntrySize;
+        BoltField& f = out->schema.fields[i];
+        memset(&f, 0, sizeof(f));
+        memcpy(f.name, e, kMaxFieldName);
+        f.name[kMaxFieldName] = '\0';
+        f.type     = static_cast<BoltType>(e[64]);
+        f.nullable = (e[66] != 0);
+        if (!detail::is_supported_type(f.type)) return false;
+        if (f.type == BoltType::Utf8)           return false;
+
+        const uint8_t* d = p + desc_off + i * kWireDescSize;
+        const uint64_t o0 = detail::read_u64_le(d +  0);
+        const uint64_t l0 = detail::read_u64_le(d +  8);
+        const uint64_t o1 = detail::read_u64_le(d + 16);
+        const uint64_t l1 = detail::read_u64_le(d + 24);
+        const uint8_t  fm = d[48];
+        if (fm != static_cast<uint8_t>(ColumnFormat::Flat)) return false;
+        if (o0 + l0 > buf_len || o1 + l1 > buf_len)         return false;
+
+        BoltColumn c = BoltColumn::make_empty();
+        c.length  = num_rows;
+        c.format  = ColumnFormat::Flat;
+        c.type    = f.type;
+        c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
+        c.arena   = arena;
+
+        if (l0) {
+            void* v = arena->copy_into(p + o0, l0, kWireAlign);
+            if (!v) return false;
+            c.validity = static_cast<uint8_t*>(v);
+            c.stats.all_valid = false;
+        } else {
+            c.validity = nullptr;
+            c.stats.all_valid = true;
+        }
+        if (l1) {
+            c.data = arena->copy_into(p + o1, l1, kWireAlign);
+            if (!c.data) return false;
+        } else {
+            c.data = nullptr;
+        }
+
+        // Install in both epochs so reads work regardless of read_epoch.
+        out->columns[0][i] = c;
+        out->columns[1][i] = c;
+    }
+    return true;
+}
+
+}  // namespace wire
+}  // namespace bolt
+
+// ===========================================================================
+// extern "C" surface (FFI / lakehouse interop). Thin wrappers.
+// ===========================================================================
+
+BOLT_C_API size_t bolt_wire_size_c(const void* batch) noexcept;
+BOLT_C_API size_t bolt_wire_serialize_c(const void* batch,
+                                        void* out_buf,
+                                        size_t cap) noexcept;
+BOLT_C_API int    bolt_wire_deserialize_c(const void* buf, size_t len,
+                                          void* out_batch, void* arena) noexcept;
+
+// Header-only inline definitions for the C shim (safe: header is single-TU
+// per consumer; BOLT_C_API gives external linkage but these are marked inline
+// so the ODR is satisfied when included in multiple TUs).
+inline size_t bolt_wire_size_c(const void* batch) noexcept {
+    assert(batch != nullptr);
+    return bolt::wire::bolt_wire_size(
+        static_cast<const bolt::BoltBatch*>(batch));
+}
+inline size_t bolt_wire_serialize_c(const void* batch,
+                                    void* out_buf,
+                                    size_t cap) noexcept {
+    assert(batch != nullptr);
+    assert(out_buf != nullptr || cap == 0);
+    return bolt::wire::bolt_wire_serialize(
+        static_cast<const bolt::BoltBatch*>(batch), out_buf, cap);
+}
+inline int bolt_wire_deserialize_c(const void* buf, size_t len,
+                                   void* out_batch, void* arena) noexcept {
+    assert(out_batch != nullptr);
+    assert(arena != nullptr);
+    return bolt::wire::bolt_wire_deserialize(
+        buf, len,
+        static_cast<bolt::BoltBatch*>(out_batch),
+        static_cast<bolt::Arena*>(arena)) ? 1 : 0;
+}

@@ -1,0 +1,88 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {"major": 3, "minor": 21, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "BOLT_BUILD_TESTS":      "ON",
+        "BOLT_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug (host toolchain)",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (host toolchain)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":   "Release",
+        "BOLT_ENABLE_NATIVE": "ON",
+        "BOLT_SIMD_TIER":     "NATIVE"
+      }
+    },
+    {
+      "name": "release-portable",
+      "inherits": "base",
+      "displayName": "Release (portable — no host-specific SIMD)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BOLT_SIMD_TIER":   "PORTABLE"
+      }
+    },
+    {
+      "name": "msvc",
+      "inherits": "base",
+      "displayName": "MSVC (Visual Studio 2022)",
+      "generator": "Visual Studio 17 2022",
+      "cacheVariables": {
+        "BOLT_SIMD_TIER": "AVX2"
+      }
+    },
+    {
+      "name": "ninja-msvc",
+      "inherits": "base",
+      "displayName": "Ninja + cl.exe",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":   "Release",
+        "CMAKE_C_COMPILER":   "cl",
+        "CMAKE_CXX_COMPILER": "cl",
+        "BOLT_SIMD_TIER":     "AVX2"
+      }
+    },
+    {
+      "name": "clang-cl",
+      "inherits": "base",
+      "displayName": "Ninja + clang-cl",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":   "Release",
+        "CMAKE_C_COMPILER":   "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "debug",            "configurePreset": "debug"},
+    {"name": "release",          "configurePreset": "release"},
+    {"name": "release-portable", "configurePreset": "release-portable"},
+    {"name": "msvc",             "configurePreset": "msvc",       "configuration": "Release"},
+    {"name": "ninja-msvc",       "configurePreset": "ninja-msvc"},
+    {"name": "clang-cl",         "configurePreset": "clang-cl"}
+  ],
+  "testPresets": [
+    {"name": "debug",            "configurePreset": "debug",            "output": {"outputOnFailure": true}},
+    {"name": "release",          "configurePreset": "release",          "output": {"outputOnFailure": true}},
+    {"name": "release-portable", "configurePreset": "release-portable", "output": {"outputOnFailure": true}},
+    {"name": "msvc",             "configurePreset": "msvc",             "configuration": "Release", "output": {"outputOnFailure": true}},
+    {"name": "ninja-msvc",       "configurePreset": "ninja-msvc",       "output": {"outputOnFailure": true}},
+    {"name": "clang-cl",         "configurePreset": "clang-cl",         "output": {"outputOnFailure": true}}
+  ]
+}

@@ -15,7 +15,7 @@
 #include <cstring>
 #include <atomic>
 
-using namespace chukonu::bolt;
+using namespace bolt;
 
 // ============================================================================
 // Type System Tests
@@ -224,6 +224,29 @@ TEST(BoltArena, ArenaGuardSetsAndRestores) {
     EXPECT_EQ(tl_arena, nullptr);
 }
 
+TEST(BoltArena, ArenaGuardPointerCtor) {
+    Arena a;
+    EXPECT_EQ(tl_arena, nullptr);
+    {
+        ArenaGuard g(&a);
+        EXPECT_EQ(tl_arena, &a);
+    }
+    EXPECT_EQ(tl_arena, nullptr);
+
+    // nullptr path: tl_arena must remain unchanged inside the guard, and be
+    // restored to its entry value on exit.
+    {
+        ArenaGuard outer(a);
+        EXPECT_EQ(tl_arena, &a);
+        {
+            ArenaGuard inner(static_cast<Arena*>(nullptr));
+            EXPECT_EQ(tl_arena, &a);  // unchanged
+        }
+        EXPECT_EQ(tl_arena, &a);
+    }
+    EXPECT_EQ(tl_arena, nullptr);
+}
+
 TEST(BoltArena, PerformanceSanity) {
     Arena arena;
     constexpr size_t N = 100000;
@@ -400,6 +423,193 @@ TEST(BoltArrowExport, SchemaFill) {
     EXPECT_STREQ(schema.format, "l");  // int64 → "l"
     EXPECT_STREQ(schema.name, "price");
     EXPECT_EQ(schema.n_children, 0);
+}
+
+// ============================================================================
+// compute_stats_numeric / clone_into / materialize / try_promote
+// ============================================================================
+
+TEST(BoltColumnStats, ComputeStatsInt32) {
+    Arena arena;
+    auto col = BoltColumn::make_flat_alloc(10, BoltType::Int32, &arena);
+    auto* d = col.typed_mutable<int32_t>();
+    int32_t vals[] = {5, -3, 7, 5, 0, 42, 5, 1, 2, 7};
+    for (int i = 0; i < 10; ++i) d[i] = vals[i];
+    col.compute_stats_numeric();
+    EXPECT_EQ(col.stats.min_value, -3);
+    EXPECT_EQ(col.stats.max_value, 42);
+    EXPECT_EQ(col.stats.null_count, 0);
+    EXPECT_TRUE(col.stats.all_valid);
+    // 7 distinct values {5,-3,7,0,42,1,2} — under sketch cap
+    EXPECT_EQ(col.stats.distinct_count, 7u);
+}
+
+TEST(BoltColumnStats, ComputeStatsFloat64) {
+    Arena arena;
+    auto col = BoltColumn::make_flat_alloc(5, BoltType::Float64, &arena);
+    auto* d = col.typed_mutable<double>();
+    d[0] = 1.5; d[1] = -2.25; d[2] = 3.75; d[3] = 1.5; d[4] = 100.0;
+    col.compute_stats_numeric();
+    double mn, mx;
+    memcpy(&mn, &col.stats.min_value, sizeof(double));
+    memcpy(&mx, &col.stats.max_value, sizeof(double));
+    EXPECT_DOUBLE_EQ(mn, -2.25);
+    EXPECT_DOUBLE_EQ(mx, 100.0);
+    EXPECT_EQ(col.stats.distinct_count, 4u);
+}
+
+TEST(BoltColumnStats, SketchOverflow) {
+    Arena arena;
+    auto col = BoltColumn::make_flat_alloc(100, BoltType::Int64, &arena);
+    auto* d = col.typed_mutable<int64_t>();
+    for (int i = 0; i < 100; ++i) d[i] = i;  // 100 distinct
+    col.compute_stats_numeric();
+    EXPECT_EQ(col.stats.distinct_count, 17u);
+    EXPECT_EQ(col.stats.min_value, 0);
+    EXPECT_EQ(col.stats.max_value, 99);
+}
+
+TEST(BoltColumn, CloneIntoFlat) {
+    Arena a1, a2;
+    auto col = BoltColumn::make_flat_alloc(16, BoltType::Int64, &a1);
+    auto* d = col.typed_mutable<int64_t>();
+    for (int i = 0; i < 16; ++i) d[i] = i * 11;
+
+    auto c2 = col.clone_into(&a2);
+    ASSERT_NE(c2.data, nullptr);
+    EXPECT_NE(c2.data, col.data);
+    EXPECT_EQ(c2.length, 16);
+    for (int i = 0; i < 16; ++i) {
+        EXPECT_EQ(c2.typed_data<int64_t>()[i], i * 11);
+    }
+    // Mutating original doesn't touch clone
+    d[0] = 999;
+    EXPECT_EQ(c2.typed_data<int64_t>()[0], 0);
+}
+
+TEST(BoltColumn, CloneIntoConstant) {
+    Arena a;
+    auto col = BoltColumn::make_constant<int64_t>(77, 500, BoltType::Int64);
+    auto c2 = col.clone_into(&a);
+    EXPECT_EQ(c2.format, ColumnFormat::Constant);
+    EXPECT_EQ(c2.length, 500);
+    EXPECT_EQ(c2.get_constant<int64_t>(), 77);
+}
+
+TEST(BoltColumn, MaterializeConstant) {
+    Arena a;
+    auto col = BoltColumn::make_constant<int32_t>(9, 64, BoltType::Int32);
+    auto m = col.materialize(&a);
+    EXPECT_EQ(m.format, ColumnFormat::Flat);
+    EXPECT_EQ(m.length, 64);
+    for (int i = 0; i < 64; ++i) EXPECT_EQ(m.typed_data<int32_t>()[i], 9);
+}
+
+TEST(BoltColumn, MaterializeSequence) {
+    Arena a;
+    auto col = BoltColumn::make_sequence(10, 2, 50, BoltType::Int64);
+    auto m = col.materialize(&a);
+    EXPECT_EQ(m.format, ColumnFormat::Flat);
+    for (int i = 0; i < 50; ++i) {
+        EXPECT_EQ(m.typed_data<int64_t>()[i], 10 + i * 2);
+    }
+}
+
+TEST(BoltColumn, TryPromoteToConstant) {
+    Arena a;
+    auto col = BoltColumn::make_flat_alloc(100, BoltType::Int64, &a);
+    auto* d = col.typed_mutable<int64_t>();
+    for (int i = 0; i < 100; ++i) d[i] = 42;
+    col.compute_stats_numeric();
+    EXPECT_EQ(col.stats.distinct_count, 1u);
+    EXPECT_TRUE(col.try_promote(&a));
+    EXPECT_EQ(col.format, ColumnFormat::Constant);
+    EXPECT_EQ(col.get_constant<int64_t>(), 42);
+}
+
+TEST(BoltColumn, TryPromoteToDictionary) {
+    Arena a;
+    auto col = BoltColumn::make_flat_alloc(1000, BoltType::Int64, &a);
+    auto* d = col.typed_mutable<int64_t>();
+    int64_t vals[] = {10, 20, 30, 40};
+    for (int i = 0; i < 1000; ++i) d[i] = vals[i % 4];
+    col.compute_stats_numeric();
+    EXPECT_EQ(col.stats.distinct_count, 4u);
+    EXPECT_TRUE(col.try_promote(&a));
+    EXPECT_EQ(col.format, ColumnFormat::Dictionary);
+    ASSERT_NE(col.dict_child, nullptr);
+    EXPECT_EQ(col.dict_child->length, 4);
+
+    auto m = col.materialize(&a);
+    for (int i = 0; i < 1000; ++i) {
+        EXPECT_EQ(m.typed_data<int64_t>()[i], vals[i % 4]);
+    }
+}
+
+TEST(BitmapIndex, BuildAndCount) {
+    Arena a;
+    // Build a dictionary column manually.
+    auto dict = BoltColumn::make_flat_alloc(3, BoltType::Int32, &a);
+    auto* dv = dict.typed_mutable<int32_t>();
+    dv[0] = 100; dv[1] = 200; dv[2] = 300;
+
+    BoltColumn col = BoltColumn::make_empty();
+    col.format = ColumnFormat::Dictionary;
+    col.type = BoltType::Int32;
+    col.type_size_bytes = 1;
+    col.length = 10;
+    uint8_t* keys = a.allocate_array<uint8_t>(10);
+    uint8_t seq[] = {0,1,2,0,1,2,0,1,2,0};
+    memcpy(keys, seq, 10);
+    col.data = keys;
+    BoltColumn* child = a.allocate_array<BoltColumn>(1);
+    *child = dict;
+    col.dict_child = child;
+    col.arena = &a;
+
+    BitmapIndex* idx = BitmapIndex::build(col, &a);
+    ASSERT_NE(idx, nullptr);
+    EXPECT_EQ(idx->num_keys, 3u);
+    EXPECT_EQ(idx->num_rows, 10u);
+    EXPECT_EQ(idx->count(0), 4u);  // positions 0,3,6,9
+    EXPECT_EQ(idx->count(1), 3u);
+    EXPECT_EQ(idx->count(2), 3u);
+
+    int32_t out[16];
+    int64_t n = idx->filter(0, out);
+    EXPECT_EQ(n, 4);
+    EXPECT_EQ(out[0], 0);
+    EXPECT_EQ(out[1], 3);
+    EXPECT_EQ(out[2], 6);
+    EXPECT_EQ(out[3], 9);
+
+    ArenaGuard g(a);
+    uint32_t kq[] = {0, 2};
+    int64_t n2 = idx->filter_in(kq, 2, out);
+    EXPECT_EQ(n2, 7);  // 4 + 3
+}
+
+TEST(BoltBatchArrow, FillSchemaStruct) {
+    Arena a;
+    alignas(64) static BoltBatch b;
+    BoltBatch::init_empty(&b);
+    b.arena = &a;
+    b.num_rows = 0;
+    b.num_cols = 2;
+    b.schema.add_field("x", BoltType::Int32);
+    b.schema.add_field("y", BoltType::Float64);
+    b.columns[0][0] = BoltColumn::make_flat(nullptr, nullptr, 0, BoltType::Int32);
+    b.columns[0][1] = BoltColumn::make_flat(nullptr, nullptr, 0, BoltType::Float64);
+
+    ArrowSchema out;
+    b.fill_arrow_schema(&out);
+    EXPECT_STREQ(out.format, "+s");
+    EXPECT_EQ(out.n_children, 2);
+    ASSERT_NE(out.children, nullptr);
+    EXPECT_STREQ(out.children[0]->format, "i");
+    EXPECT_STREQ(out.children[0]->name, "x");
+    EXPECT_STREQ(out.children[1]->format, "g");
+    EXPECT_STREQ(out.children[1]->name, "y");
 }
 
 TEST(BoltArrowExport, ArrayFill) {

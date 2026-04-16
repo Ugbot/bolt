@@ -6,3 +6,8 @@ cmake-build-*/
 .DS_Store
 *.o
 *.obj
+build/
+build-*/
+.cache/
+CMakeUserPresets.json
+.claude/
