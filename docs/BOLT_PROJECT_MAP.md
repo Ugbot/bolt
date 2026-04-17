@@ -20,7 +20,22 @@ chukonu/
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
 │   ├── bolt_scheduler.h               Task ring, worker pool, phase barriers
 │   ├── kernels/
-│   │   └── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
+│   │   ├── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
+│   │   └── fintech/
+│   │       ├── column_primitives.h   Phase 1: diff/lag/log/sum_of_squares/running_max_drawdown
+│   │       ├── state.h               Phase 2: RollingRing / WelfordAccumulator / EmaState
+│   │       ├── midprice.h            Phase 4a: (bid+ask)/2
+│   │       ├── microprice.h          Phase 4a: size-weighted midprice
+│   │       ├── l1_imbalance.h        Phase 4a: order-book imbalance
+│   │       ├── quoted_spread.h       Phase 4a: ask - bid
+│   │       ├── effective_spread.h    Phase 4a: 2·|exec - mid|
+│   │       ├── signed_volume.h       Phase 4a: int64 side · double qty
+│   │       ├── arrival_price_impact.h Phase 4a: TCA bps vs arrival mid
+│   │       ├── forward_points.h      Phase 4a: FX IRP forward - spot
+│   │       ├── funding_cost.h        Phase 4a: position · price · rate
+│   │       ├── cip_basis.h           Phase 4a: CIP basis (log-form)
+│   │       ├── funding_apr.h         Phase 4a: rate · periods · 100
+│   │       └── perp_fair_price.h     Phase 4a: spot · (1 + fr·h/8)
 │   └── README.md                      Full project documentation
 │
 ├── src/bolt/                        ← Implementation notes

@@ -1551,6 +1551,42 @@ default**: the one that wins on the broadest workload class.
   cardinality, embedded targets with strict footprint budgets, NUMA
   hosts with cross-socket scatter pressure, etc.).
 
+## Welford online (count, mean, m2) — default variance choice for rolling fintech stats  (P2.2)
+
+**Context:** Phase 2 of the fintech kernel port (docs/BOLT_FINTECH_PORT.md)
+needed a single online-variance primitive to back RollingStd / RollingZScore
+/ Sharpe / Sortino / RollingCorr / RollingSkew / RollingKurt. Three
+candidates:
+
+1. **Naive** `E[x²] − E[x]²` — one running `sum` plus one running
+   `sum_sq`, then subtract. Fast, one MUL and one SUB at read-out, no
+   per-sample division. **Rejected:** catastrophic cancellation when
+   variance ≪ mean² (the exact regime for intraday price returns).
+2. **Welford's online** `(count, mean, m2)` with
+   `delta = x − mean; mean += delta/count; m2 += delta*(x − mean)`.
+   One DIV per update, numerically stable down to machine epsilon.
+3. **Neumaier/Kahan-corrected sum of squares.** Stabilises the naive
+   form but still requires a large subtraction at read-out.
+
+**Kept:** Welford. The per-update DIV is free next to the memory traffic
+of a fintech morsel (one cache line per sample dominates), and it's the
+textbook-standard primitive (Knuth TAOCP vol. 2 §4.2.2) — reviewers
+recognise it instantly.
+
+**Default surface:** both `variance_pop()` (÷ N) and `variance_sample()`
+(÷ N−1) are exposed. Tier-2 kernel bodies pick the Bessel-corrected
+`variance_sample()` as the default for vol / Sharpe / Sortino because
+tick data is modelled as a sample drawn from an unknown underlying
+process, which is the statistical convention for those measures. The
+pop form stays available for Tier-2 kernels that work on a closed set
+(e.g. a fixed-window population over a batch with no implied wider
+distribution).
+
+**Open question:** rolling-window Welford (drop oldest + add newest)
+needs the Welford-decrement formula. We haven't picked between the
+symmetric "West/Chan two-pass" approach and a separate streaming
+variant — that decision lands with RollingStd (P5.W.2).
+
 ## How to add an entry
 
 1. Run the change. Capture before/after numbers (≥3 runs each).

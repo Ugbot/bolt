@@ -63,6 +63,45 @@ bolt_apply_hardening(test_bolt_mergejoin)
 
 add_test(NAME test_bolt_mergejoin COMMAND test_bolt_mergejoin)
 
+add_executable(test_bolt_fintech_phase1 test_bolt_fintech_phase1.cpp)
+
+target_link_libraries(test_bolt_fintech_phase1
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase1)
+
+add_test(NAME test_bolt_fintech_phase1 COMMAND test_bolt_fintech_phase1)
+
+add_executable(test_bolt_fintech_phase2 test_bolt_fintech_phase2.cpp)
+
+target_link_libraries(test_bolt_fintech_phase2
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase2)
+
+add_test(NAME test_bolt_fintech_phase2 COMMAND test_bolt_fintech_phase2)
+
+add_executable(test_bolt_fintech_phase4a test_bolt_fintech_phase4a.cpp)
+
+target_link_libraries(test_bolt_fintech_phase4a
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase4a)
+
+add_test(NAME test_bolt_fintech_phase4a COMMAND test_bolt_fintech_phase4a)
+
 add_executable(test_bolt_wave2 test_bolt_wave2.cpp)
 
 target_link_libraries(test_bolt_wave2
