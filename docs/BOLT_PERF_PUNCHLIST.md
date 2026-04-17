@@ -401,6 +401,63 @@ Tick a box only when **all seven DoD criteria** below are met.
   - Design-log: [`design-log.md` → "Fused filter+aggregate kernels —
     count + minmax added (F1)"](research/design-log.md).
 
+## Track H — SYMBOL-shape upgrades (Wave 2)
+
+Scoped from `docs/research/questdb-symbol-code-audit.md`. Brings
+`ColumnFormat::Dictionary` + `BitmapIndex` to QuestDB SYMBOL parity
+(H1, H2) and past it (H3 — popcount miss-accelerator QuestDB lacks).
+
+- [x] **H1. Literal-resolve-once `filter_eq_dict` — P0**
+  - Shape: `filter_eq_dict(col, scalar, out)` resolves scalar →
+    dict code ONCE, then does `keys[i] == code` over the data buffer.
+    Mirrors QuestDB `EqSymStrFunctionFactory.ConstSymIntCheckFunc`.
+  - Files: `include/bolt/kernels/bolt_dict_filter.h` (new).
+  - Test: 10-key dict, 10K rows, filter matches materialise+filter.
+  - Bench: add dict-filter case to `bench_kernels`.
+- [x] **H2. `DictionaryPool` — global-across-morsels dict API — P0**
+  - Shape: arena-backed `DictionaryPool` with `intern(str) → code`
+    and `resolve(code) → StringView`. Codes stable across the
+    pool's lifetime; morsels encoded against the same pool compare
+    codes directly. Mirrors QuestDB `SymbolMapWriter`.
+  - Files: `include/bolt/bolt_dictionary.h` (new).
+  - Test: intern same string twice → same code; 1000 distinct keys
+    across two batches → codes reusable in `filter_eq_dict`.
+- [x] **H3. Per-ID popcount miss-accelerator on `BitmapIndex` — P1**
+  - Shape: precompute `popcount[num_keys]` at build time; new
+    `BitmapIndex::probably_absent(key)` returns `true` in O(1) when
+    the key was never seen. `BitmapIndex::filter` / `count` short-
+    circuit when absent. **QuestDB has no equivalent.**
+  - Files: extend `bolt_column.h`.
+  - Test: build index from 10 keys of which 3 are unused; absent
+    keys return `count == 0` without scanning.
+- [ ] **H4. Lock-free append-only dict — P2** *(deferred to Wave 3)*
+  - Shape: tick-tock-published dict for streaming ingest. Atomic
+    next-code, SwissTable keyed on StringView for intern.
+  - Gate: lands when a streaming-ingest caller asks.
+
+## Track I — Run-native B-format kernels (Wave 2)
+
+Lifts `BitPacked` / `FrameOfRef` (B3/B4) from materialise-first to
+native kernels so the storage compression turns into a compute win.
+
+- [x] **I1. `filter_gt_bitpacked` / `filter_eq_bitpacked` — P1**
+  - Shape: unpack 16 values at a time into a stack buffer, compare
+    via SIMD, compressstore indices. Avoids the full-column
+    materialize pass.
+  - Files: `include/bolt/bolt_branchless.h` (alongside `filter_eq_rle`).
+  - Test: packed 3-bit and 17-bit inputs; results match unpack+filter.
+  - Bench: add bitpacked-vs-materialize case.
+- [x] **I2. `sum_frame_of_ref` — P1**
+  - Shape: `base * n + Σ(decoded_deltas)`. Base-add hoisted out of
+    the hot loop.
+  - Files: `bolt_branchless.h`.
+  - Test: round-trip against `materialize + sum_avx2_i64`.
+- [ ] **I3. Dict + BitmapIndex auto-dispatch in `filter_eq` — P0**
+  - Shape: `filter_eq` on a Dictionary column routes through H1
+    (linear scan on keys) or through `BitmapIndex::filter(code)`
+    when the sidecar exists. Ties H1 + C5.
+  - Files: `bolt_column.h` filter helper.
+
 ## Track G — Infra
 
 - [ ] **G1. CI perf regression gate**

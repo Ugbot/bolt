@@ -63,6 +63,19 @@ bolt_apply_hardening(test_bolt_mergejoin)
 
 add_test(NAME test_bolt_mergejoin COMMAND test_bolt_mergejoin)
 
+add_executable(test_bolt_wave2 test_bolt_wave2.cpp)
+
+target_link_libraries(test_bolt_wave2
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_wave2)
+
+add_test(NAME test_bolt_wave2 COMMAND test_bolt_wave2)
+
 add_executable(test_bolt_wire test_bolt_wire.cpp)
 
 target_link_libraries(test_bolt_wire

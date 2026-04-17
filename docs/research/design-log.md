@@ -70,6 +70,80 @@ Both warrant their own dedicated session with proper benchmarking.
 
 ---
 
+## Wave 2 — SYMBOL-shape upgrades + B-format run-native kernels  (H1-H3, I1-I2)
+
+**Context.** QuestDB source audit
+(`docs/research/questdb-symbol-code-audit.md`) confirmed that
+`Dictionary + BitmapIndex` already covers the SYMBOL shape 1:1.
+Four upgrades scoped: global dict (H2), literal-resolve-once filter
+(H1), per-ID popcount miss-accelerator (H3 — QuestDB lacks this),
+lock-free append (H4 — deferred). Plus Track I lifting B3/B4 column
+formats from materialise-first to run-native kernels.
+
+**Landed.**
+
+- **H1** `bolt/kernels/bolt_dict_filter.h` — `dict_resolve_code<T>`
+  (linear-scan the dict_child once; returns -1 → caller short-
+  circuits without touching the column), `filter_eq_dict_keys<KT>`
+  (branchless scan over the narrow key buffer). Mirrors QuestDB
+  `EqSymStrFunctionFactory.ConstSymIntCheckFunc.init()` verbatim.
+- **H2** `bolt/bolt_dictionary.h` — `DictionaryPool` with arena-
+  backed char store, offsets, and a SwissTable keyed on
+  FNV-1a(string). `intern/find/resolve` surface. Codes stable
+  across batches; collision check on content-equality keeps
+  `find()` sound even if two inputs share a hash.
+- **H3** `BitmapIndex::popcounts[num_keys]` + `probably_absent(key)`
+  O(1) fast path. `count()` now reads the popcount sidecar directly
+  (no bitmap scan); `filter()` short-circuits to 0 for absent keys.
+  Build cost: one extra uint32 increment per row. QuestDB SYMBOL
+  has no equivalent.
+- **I1** `filter_gt_bitpacked` / `filter_eq_bitpacked` — unpack
+  64 values into a stack scratch buffer, scalar branchless compare,
+  emit indices. Saves the full-column materialise traffic when
+  callers only need a selection vector.
+- **I2** `sum_frame_of_ref` — base-add hoisted out of the hot loop;
+  pure delta sum + `base * n` on exit.
+
+Shared helper `bolt_bitpacked_unpack_range` factors the LSB-first
+bit-unpack used by both the column `materialize` path and the new
+run-native kernels.
+
+**Measured.** Correctness only this wave — 14 new tests in
+`tests/test_bolt_wave2.cpp`:
+
+- H1: resolve-present, resolve-missing, filter-eq-matches-
+  materialise, filter-eq-no-match, end-to-end literal-resolve-once.
+- H2: intern-and-resolve, codes-stable-across-batches,
+  find-missing-returns-invalid, overflow-returns-invalid.
+- H3: `ProbablyAbsentForUnusedKeys` — 5-key dict with keys {1, 3}
+  unused; `probably_absent` true for those, false for {0, 2, 4};
+  `count` + `filter` short-circuit without scanning the bitmap.
+- I1: 5-bit random + 3-bit hand-picked round-trips against unpack+filter.
+- I2: 4-bit deltas + int64 base matches the materialised sum
+  element-by-element; zero-length returns 0.
+
+Full `ctest --preset msvc`: 17/17 green (new `test_bolt_wave2`
+binary).
+
+**Kept.** Additive across the board — no existing kernel changes
+shape. The `popcounts` sidecar is nullable so any legacy path that
+skipped the build can still read via the bitmap-scan fallback.
+
+**Open questions.**
+- Wire `filter_eq` dispatch on `BoltColumn::Dictionary` to pick
+  H1 (linear-scan) vs. `BitmapIndex::filter` (sidecar lookup) vs.
+  short-circuit via H3's `probably_absent`. Today callers name
+  the kernel explicitly — I3 is that dispatcher, queued in the
+  punchlist but not yet wired.
+- `DictionaryPool` is SPSC in this drop (single ingest worker,
+  single planner). H4 (lock-free MPSC intern + tick-tock publish)
+  lands when a streaming-ingest caller asks.
+- BitPacked unpack is scalar; AVX2 `_mm256_srlv_epi32` + constant
+  masks could do 8 lanes per iteration on fixed bit-widths. Defer
+  until a run-native filter is on a headline bench.
+
+---
+
 ## Phase 2a scatter — atomic-free via per-morsel prefix offsets  (C1)
 
 **Context.** `BOLT_PERFORMANCE.md:735-737` documented the 8-core

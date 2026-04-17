@@ -650,6 +650,108 @@ inline int64_t sum_rle_i64(const T* BOLT_RESTRICT values,
     return acc;
 }
 
+// ============================================================================
+// Run-native kernels for BitPacked + FrameOfRef (I1 / I2) — decode on the
+// fly into a stack scratch buffer, compare/aggregate, emit.  Avoids the
+// full-column materialise traffic that a materialise-then-filter path
+// would pay when the caller only needs a selection vector or a sum.
+// ============================================================================
+
+// Internal helper: unpack `count` values (≤ stride_max) from the packed
+// buffer starting at logical index `start` into `out[]`. Caller ensures
+// `out` is sized to `count`. Same bit-unpack shape used in
+// BoltColumn::materialize's BitPacked branch.
+BOLT_FORCE_INLINE void bolt_bitpacked_unpack_range(
+        const uint64_t* BOLT_RESTRICT words, int64_t start, int64_t count,
+        uint8_t bit_width, int32_t* BOLT_RESTRICT out) noexcept {
+    assert(words != nullptr || count == 0);
+    assert(out   != nullptr || count == 0);
+    assert(bit_width >= 1 && bit_width <= 32);
+    const uint64_t mask = (bit_width == 64) ? ~uint64_t{0}
+                                            : ((uint64_t{1} << bit_width) - 1u);
+    for (int64_t i = 0; i < count; ++i) {
+        const uint64_t bit_off     = static_cast<uint64_t>(start + i)
+                                   * static_cast<uint64_t>(bit_width);
+        const uint64_t word_off    = bit_off >> 6;
+        const uint64_t bit_in_word = bit_off & 63u;
+        uint64_t v = words[word_off] >> bit_in_word;
+        if (bit_in_word + static_cast<uint64_t>(bit_width) > 64u) {
+            v |= words[word_off + 1] << (64u - bit_in_word);
+        }
+        out[i] = static_cast<int32_t>(v & mask);
+    }
+}
+
+/// Run-native `filter_gt` over a BitPacked uint32-shaped column.
+/// Unpacks 64 values at a time into a stack buffer, compares scalar-
+/// branchless, emits indices. Emitted indices are absolute (0..length).
+inline int64_t filter_gt_bitpacked(const uint64_t* BOLT_RESTRICT words,
+                                   int64_t length, uint8_t bit_width,
+                                   int32_t scalar,
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(words != nullptr || length == 0);
+    assert(out   != nullptr || length == 0);
+    assert(length >= 0);
+    assert(bit_width >= 1 && bit_width <= 32);
+    constexpr int64_t kChunk = 64;
+    alignas(64) int32_t scratch[kChunk];
+    int64_t count = 0;
+    for (int64_t s = 0; s < length; s += kChunk) {
+        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
+        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
+        for (int64_t i = 0; i < n; ++i) {
+            out[count] = static_cast<int32_t>(s + i);
+            count += (scratch[i] > scalar);
+        }
+    }
+    return count;
+}
+
+/// Run-native `filter_eq` over a BitPacked column.
+inline int64_t filter_eq_bitpacked(const uint64_t* BOLT_RESTRICT words,
+                                   int64_t length, uint8_t bit_width,
+                                   int32_t scalar,
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(words != nullptr || length == 0);
+    assert(out   != nullptr || length == 0);
+    assert(length >= 0);
+    assert(bit_width >= 1 && bit_width <= 32);
+    constexpr int64_t kChunk = 64;
+    alignas(64) int32_t scratch[kChunk];
+    int64_t count = 0;
+    for (int64_t s = 0; s < length; s += kChunk) {
+        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
+        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
+        for (int64_t i = 0; i < n; ++i) {
+            out[count] = static_cast<int32_t>(s + i);
+            count += (scratch[i] == scalar);
+        }
+    }
+    return count;
+}
+
+/// Run-native `sum` over a FrameOfRef column: base * n + Σ(deltas).
+/// Unpacks deltas in 64-value chunks; scalar add hoisted, so the hot
+/// loop is a straight `acc += scratch[i]`.
+inline int64_t sum_frame_of_ref(const uint64_t* BOLT_RESTRICT words,
+                                int64_t length, uint8_t bit_width,
+                                int64_t base) noexcept {
+    assert(words != nullptr || length == 0);
+    assert(length >= 0);
+    assert(bit_width >= 1 && bit_width <= 32);
+    constexpr int64_t kChunk = 64;
+    alignas(64) int32_t scratch[kChunk];
+    int64_t delta_sum = 0;
+    for (int64_t s = 0; s < length; s += kChunk) {
+        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
+        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
+        for (int64_t i = 0; i < n; ++i) {
+            delta_sum += static_cast<int64_t>(scratch[i]);
+        }
+    }
+    return base * length + delta_sum;
+}
+
 /// Extract set bit positions to selection vector (branchless per word).
 inline int64_t bitmap_to_selection(const uint64_t* bitmap, uint32_t num_words,
                                     int32_t* BOLT_RESTRICT out) noexcept {

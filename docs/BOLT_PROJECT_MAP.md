@@ -46,7 +46,12 @@ chukonu/
         ├── cpu-topology.md              OS topology APIs
         ├── avx512-status.md             AVX-512 dispatch stub + plan
         ├── 1brc.md                      1 Billion Row Challenge
-        └── json-fionn.md                fionn vs simdjson
+        ├── json-fionn.md                fionn vs simdjson
+        ├── questdb-symbol-vs-fsst.md    SYMBOL layout + cardinality wall;
+        │                                 FSST disjoint, Bolt Dict+Bitmap covers SYMBOL
+        └── questdb-symbol-code-audit.md source-code audit of the SYMBOL claims
+                                          (questdb/questdb@master): 7/8 confirmed,
+                                          .c/.o dict vs .k/.v index correction
 ```
 
 ## Design Principles

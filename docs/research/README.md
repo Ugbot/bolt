@@ -112,6 +112,25 @@ Comparative analysis (validates the choices above):
   QuestDB time-partitioned column files, symbol type, O3 ingest,
   JIT filters. The continuous-query shape these model is the same
   shape bolt::dataflow's push dispatch produces.
+- [questdb-symbol-vs-fsst.md](questdb-symbol-vs-fsst.md) — SYMBOL
+  physical layout (`.d` per-partition + `.c`/`.o` table-global dict
+  + optional `.k`/`.v` bitmap-index sidecar), ID-first operators,
+  measured cardinality wall (1k fine, 10k → 15–25 s on 300M rows per
+  issue #6246). FSST (Boncz/Neumann VLDB 2020) solves a disjoint
+  problem (substring-redundant high-card strings). Bolt's
+  `Dictionary + BitmapIndex` already covers the SYMBOL shape; FSST
+  deferred. Quick wins enumerated: global dict, literal-resolve-once,
+  per-ID popcount sidecar, lock-free append, sorted-ID invariant.
+- [questdb-symbol-code-audit.md](questdb-symbol-code-audit.md) —
+  source-code audit of the claims in `questdb-symbol-vs-fsst.md`
+  against `questdb/questdb@master`. Eight claims verified; seven
+  CONFIRMED, one PARTIALLY CONFIRMED (`.v` was conflated with `.c`
+  in the dictionary layout — `.v` is actually the index row-list
+  file; fixed inline in the original note). File-path + line-range
+  citations for every claim. Bolt recommendation unchanged:
+  Dictionary + BitmapIndex covers SYMBOL, FSST deferred. Side
+  finding: QuestDB VARCHAR uses a Umbra-style 6-byte-prefix +
+  inline-or-offset layout (not FSST, not plain length-prefixed).
 
 Synthesized into the design doc [`../BOLT_DATAFLOW.md`](../BOLT_DATAFLOW.md).
 

@@ -618,6 +618,7 @@ private:
 
 struct BitmapIndex {
     uint64_t** bitmaps;     // K bitmaps, each ceil(N/64) words
+    uint32_t*  popcounts;   // K entries (H3 — miss-accelerator); 0 = key absent
     uint32_t   num_keys;
     uint32_t   num_rows;
     uint32_t   words_per_bitmap;
@@ -626,8 +627,18 @@ struct BitmapIndex {
     /// Arena-allocated. Returns nullptr on failure.
     static BitmapIndex* build(const BoltColumn& col, Arena* arena) noexcept;
 
-    /// Count rows with value == key
+    /// Count rows with value == key. O(1) after build via the `popcounts`
+    /// sidecar — no bitmap scan.
     uint32_t count(uint32_t key) const noexcept;
+
+    /// H3 — O(1) "key was never seen" check. Returns true iff the key is
+    /// out of range OR its popcount is 0. Lets filter dispatchers short-
+    /// circuit the full bitmap walk for definitively-absent keys.
+    /// QuestDB SYMBOL has no equivalent.
+    BOLT_FORCE_INLINE bool probably_absent(uint32_t key) const noexcept {
+        if (key >= num_keys) return true;
+        return popcounts == nullptr ? false : (popcounts[key] == 0u);
+    }
 
     /// Write matching row indices. Returns count written.
     int64_t filter(uint32_t key, int32_t* out) const noexcept;
@@ -1137,14 +1148,17 @@ inline BitmapIndex* BitmapIndex::build(const BoltColumn& col,
     idx->words_per_bitmap = words;
 
     uint64_t** maps = arena->allocate_array<uint64_t*>(K);
-    if (!maps) return nullptr;
+    uint32_t*  pc   = arena->allocate_array<uint32_t>(K);
+    if (!maps || !pc) return nullptr;
+    memset(pc, 0, (size_t)K * sizeof(uint32_t));
     for (uint32_t k = 0; k < K; ++k) {
         uint64_t* bm = static_cast<uint64_t*>(
             arena->allocate_zeroed((size_t)words * sizeof(uint64_t)));
         if (!bm) return nullptr;
         maps[k] = bm;
     }
-    idx->bitmaps = maps;
+    idx->bitmaps   = maps;
+    idx->popcounts = pc;
 
     const uint8_t* kp = static_cast<const uint8_t*>(col.data);
     for (int64_t i = 0; i < col.length; ++i) {
@@ -1155,6 +1169,7 @@ inline BitmapIndex* BitmapIndex::build(const BoltColumn& col,
         else                 { uint32_t t; memcpy(&t, p, 4); k = t; }
         if (k < K) {
             maps[k][(uint64_t)i >> 6] |= (1ULL << ((uint64_t)i & 63));
+            pc[k]++;
         }
     }
     return idx;
@@ -1164,6 +1179,9 @@ inline uint32_t BitmapIndex::count(uint32_t key) const noexcept {
     assert(bitmaps != nullptr);
     assert(words_per_bitmap > 0 || num_rows == 0);
     if (key >= num_keys) return 0;
+    // H3 — O(1) via the precomputed popcount sidecar. Falls back to a
+    // full bitmap scan only if popcounts wasn't built (legacy callers).
+    if (popcounts != nullptr) return popcounts[key];
     const uint64_t* bm = bitmaps[key];
     uint32_t sum = 0;
     for (uint32_t w = 0; w < words_per_bitmap; ++w) {
@@ -1176,6 +1194,8 @@ inline int64_t BitmapIndex::filter(uint32_t key, int32_t* out) const noexcept {
     assert(out != nullptr);
     assert(bitmaps != nullptr);
     if (key >= num_keys) return 0;
+    // H3 — skip the whole bitmap walk for keys that were never observed.
+    if (popcounts != nullptr && popcounts[key] == 0u) return 0;
     const uint64_t* bm = bitmaps[key];
     int64_t count = 0;
     for (uint32_t w = 0; w < words_per_bitmap; ++w) {
