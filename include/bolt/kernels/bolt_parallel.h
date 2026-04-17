@@ -339,32 +339,52 @@ BOLT_FORCE_INLINE uint32_t groupby_merge_shard(uint64_t key, uint32_t p_mask) no
     return static_cast<uint32_t>(h >> 32) & p_mask;
 }
 
-// Scatter-phase context. One shard_bufs[s] buffer per shard, each pre-sized
-// exactly via shard_counts[s] from the counting pre-pass. shard_heads[s] is an
-// atomic claim index used by workers to carve out contiguous write slots.
+// Scatter-phase context.  Per-morsel-per-shard write offsets are computed
+// in the counting pre-pass via prefix sum, so scatter writes land at
+// `shard_bufs[s] + morsel_shard_offset[m * P + s] + local_cursor[s]`
+// with NO atomic operations.  This removes the Phase 2a scaling wall
+// documented in BOLT_PERFORMANCE.md:735-737 (atomic shard cursors cap
+// at memory bandwidth beyond ~4 cores).
+//
+// Memory cost: same total `sum(shard_sizes[s])` MergeTriples as before,
+// plus `num_morsels * P` uint32 offset slots (≈1 MB overhead for a 1K
+// morsel × 64 shard workload — trivial compared to the triple buffer).
 struct ParallelGroupByScatterCtx {
-    const GroupByTable*    partials;
-    uint32_t               num_morsels;
-    uint32_t               p_mask;        // P - 1
-    MergeTriple**          shard_bufs;    // size = P
-    std::atomic<uint32_t>* shard_heads;   // size = P; claim cursors
+    const GroupByTable* partials;
+    uint32_t            num_morsels;
+    uint32_t            P;              // shard count (power of two)
+    uint32_t            p_mask;         // P - 1
+    MergeTriple**       shard_bufs;     // size = P
+    const uint32_t*     morsel_shard_offset;  // size = num_morsels * P
 };
 
-// Scatter one partial (one "morsel" in [start, end) with end == start + 1).
+// Scatter one or more morsels.  For each morsel, `morsel_shard_offset
+// [m * P + s]` is the pre-computed starting write index into
+// `shard_bufs[s]` for morsel m; a local per-shard cursor then advances
+// sequentially.  Zero atomic contention across workers.
 inline void parallel_groupby_scatter_morsel(void* user_data, uint32_t start,
                                             uint32_t end,
                                             uint32_t /*thread_id*/) noexcept {
     assert(user_data != nullptr);
     assert(end >= start);
     auto* ctx = static_cast<ParallelGroupByScatterCtx*>(user_data);
+
+    // Stack-local per-shard cursor; P is bounded by kGroupbyMergeRadixMax
+    // (currently 64).  Reset at the start of every morsel.
+    uint32_t local_cursor[kGroupbyMergeRadixMax];
+
     for (uint32_t m = start; m < end; ++m) {
         assert(m < ctx->num_morsels);
+        const uint32_t P = ctx->P;
+        for (uint32_t s = 0; s < P; ++s) local_cursor[s] = 0;
+
         const GroupByTable& p = ctx->partials[m];
+        const uint32_t* moffsets = ctx->morsel_shard_offset + m * P;
+
         for (uint32_t g = 0; g < p.num_groups; ++g) {
             const uint64_t k = p.group_keys[g];
             const uint32_t s = groupby_merge_shard(k, ctx->p_mask);
-            const uint32_t slot = ctx->shard_heads[s].fetch_add(
-                1u, std::memory_order_relaxed);
+            const uint32_t slot = moffsets[s] + local_cursor[s]++;
             MergeTriple& t = ctx->shard_bufs[s][slot];
             t.key   = k;
             t.sum   = p.payload[g].sum;
@@ -444,25 +464,45 @@ inline bool parallel_groupby_radix_merge(Scheduler* sched,
 
     const uint32_t p_mask = P - 1;
 
-    // ---- Counting pre-pass: exact shard sizes (no slack) -----------------
+    // ---- Counting pre-pass: per-morsel-per-shard counts ------------------
+    // `per_mc[m * P + s]` = number of triples morsel m contributes to shard s.
+    // Prefix-summed in place per shard to yield each morsel's write offset
+    // into the shard buffer — no atomics in Phase 2a.
+    uint32_t* per_mc = arena->allocate_array<uint32_t>(
+        static_cast<uint64_t>(num_morsels) * P);
     uint32_t* shard_sizes = arena->allocate_array<uint32_t>(P);
-    if (!shard_sizes) return false;
-    memset(shard_sizes, 0, P * sizeof(uint32_t));
+    if (!per_mc || !shard_sizes) return false;
+    memset(per_mc,       0, static_cast<size_t>(num_morsels) * P * sizeof(uint32_t));
+    memset(shard_sizes,  0, P * sizeof(uint32_t));
+
     uint64_t total_triples = 0;
     for (uint32_t m = 0; m < num_morsels; ++m) {
         const GroupByTable& p = partials[m];
+        uint32_t* row = per_mc + static_cast<uint64_t>(m) * P;
         for (uint32_t g = 0; g < p.num_groups; ++g) {
             const uint32_t s = groupby_merge_shard(p.group_keys[g], p_mask);
-            ++shard_sizes[s];
+            ++row[s];
         }
         total_triples += p.num_groups;
     }
 
-    // ---- Allocate per-shard buffers + atomic head cursors ----------------
+    // Per-shard prefix sum over morsels: morsel m's write offset for shard s
+    // becomes `sum(per_mc[0..m][s])` and is written back into per_mc in place.
+    // After the sweep, shard_sizes[s] holds the total for shard s.
+    for (uint32_t s = 0; s < P; ++s) {
+        uint32_t acc = 0;
+        for (uint32_t m = 0; m < num_morsels; ++m) {
+            uint32_t* cell = per_mc + static_cast<uint64_t>(m) * P + s;
+            const uint32_t count = *cell;
+            *cell = acc;            // becomes the write offset for (m, s)
+            acc  += count;
+        }
+        shard_sizes[s] = acc;
+    }
+
+    // ---- Allocate per-shard buffers --------------------------------------
     MergeTriple** shard_bufs = arena->allocate_array<MergeTriple*>(P);
-    std::atomic<uint32_t>* shard_heads =
-        arena->allocate_array<std::atomic<uint32_t>>(P);
-    if (!shard_bufs || !shard_heads) return false;
+    if (!shard_bufs) return false;
     for (uint32_t s = 0; s < P; ++s) {
         if (shard_sizes[s] == 0) {
             shard_bufs[s] = nullptr;
@@ -470,21 +510,15 @@ inline bool parallel_groupby_radix_merge(Scheduler* sched,
             shard_bufs[s] = arena->allocate_array<MergeTriple>(shard_sizes[s]);
             if (!shard_bufs[s]) return false;
         }
-        shard_heads[s].store(0, std::memory_order_relaxed);
     }
 
-    // ---- Phase 2a: parallel scatter --------------------------------------
+    // ---- Phase 2a: parallel scatter (atomic-free) ------------------------
     ParallelGroupByScatterCtx sctx{
-        partials, num_morsels, p_mask, shard_bufs, shard_heads
+        partials, num_morsels, P, p_mask, shard_bufs, per_mc
     };
     sched->submit_range(&parallel_groupby_scatter_morsel, &sctx,
                         num_morsels, /*grain=*/1);
     sched->wait_all();
-
-    // Sanity: every shard filled to its counted size.
-    for (uint32_t s = 0; s < P; ++s) {
-        assert(shard_heads[s].load(std::memory_order_relaxed) == shard_sizes[s]);
-    }
 
     // ---- Build per-shard final tables ------------------------------------
     // Capacity hint = shard_sizes[s]; worst case every triple is a new key.

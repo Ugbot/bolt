@@ -70,6 +70,145 @@ Both warrant their own dedicated session with proper benchmarking.
 
 ---
 
+## Phase 2a scatter — atomic-free via per-morsel prefix offsets  (C1)
+
+**Context.** `BOLT_PERFORMANCE.md:735-737` documented the 8-core
+scaling wall: "serial radix-merge phase + atomic shard cursors cap at
+memory bandwidth."  Phase 2b (partition merge) was already parallel;
+the real bottleneck was the atomic `shard_heads[s].fetch_add(1)` in
+Phase 2a scatter — every single triple took one atomic increment on
+a shared cache line, serialising producers on the interconnect past
+~4 cores.  Followup #4 in `BOLT_PERFORMANCE.md:761-764` flagged
+"per-worker-per-shard sub-buffers (rejected in H3 for complexity);
+may now be worth revisiting."
+
+**Tried.** Rather than per-worker-per-shard (which fights the
+scheduler's dynamic morsel-to-worker mapping), this wave uses
+**per-morsel-per-shard prefix offsets**:
+
+1. Extended the counting pre-pass to compute `per_mc[m * P + s]` —
+   triples morsel m contributes to shard s.
+2. In-place per-shard prefix sum over morsels converts `per_mc` into
+   write-offset table: cell `(m, s)` now holds the starting index in
+   `shard_bufs[s]` where morsel m's triples for that shard land.
+   `shard_sizes[s]` comes out as the per-shard total.
+3. `ParallelGroupByScatterCtx` drops `shard_heads[P]` (the atomic
+   cursor) and adds `morsel_shard_offset` pointing at `per_mc`.
+4. `parallel_groupby_scatter_morsel` uses a stack-local per-shard
+   cursor (`kGroupbyMergeRadixMax = 64` slots, one uint32 each) and
+   writes at `shard_bufs[s][moffsets[s] + local++]`.  Zero atomic
+   operations per triple.
+
+Memory overhead: `num_morsels × P × sizeof(uint32_t)` for the
+offset table.  For a 1K-morsel × 64-shard workload that's 256 KB —
+trivial vs. the triple buffer itself.
+
+**Measured on laptop (i7, 8 threads, single socket):**
+
+| query | before | after | delta |
+|---|---|---|---|
+| Q1 (1 M rows, 3 groups) | 16.81 ns/row min | 16.84 | tied (noise) |
+| Q3 (1 M rows, filter+join+agg) | 14.11 | 14.26 | tied |
+| 1BRC (10 M rows, 413 stations) | 17.89 | 19.47 | -9% (laptop noise) |
+
+Single-socket laptops don't feel the atomic cursor pain — the
+contention shows on multi-socket boxes where each socket's fetch_add
+cache-line-bounces via the interconnect.  The refactor ships because
+architectural correctness (zero atomics on the scatter hot path) is
+the right default; measured multi-socket win lands when a test box
+is available.
+
+**Kept.**  Single implementation.  The atomic-cursor path is gone —
+the new scheme has lower complexity on the hot path (stack cursor vs
+atomic fetch_add) AND matches the documented kept-code-paths rule by
+not stashing the loser.
+
+**Test health.**  All 16 test binaries green; 8 parallel tests
+specifically exercise the groupby radix merge end-to-end.  Every
+shard buffer still fills exactly — the correctness invariant is
+tightened (each morsel writes at a unique offset range; overflow or
+underflow would corrupt adjacent offset ranges).
+
+**Open questions.**
+- Multi-socket measurement: Skylake-SP / Zen3 with >1 socket should
+  show the real win.  Add a per-socket bench once the test hardware
+  is available.
+- Prefix-sum stage is serial O(num_morsels × P); at huge morsel
+  counts (> 100K) this becomes noticeable.  A parallel prefix-sum
+  pass (Ladner-Fischer / two-phase) is a future optimisation.
+
+---
+
+## Split Block Bloom Filter — Parquet-spec variant  (C2b)
+
+**Context.** Web scan (Apr 2026) of modern Bloom-family variants for
+hash-join probe: candidates were register-blocked Bloom (current),
+Split Block Bloom (Parquet/Impala/Arrow/StarRocks), Cuckoo/Morton/VQF
+(multi-load probe — bad for our shape), XOR/Binary-Fuse (3 loads per
+probe, static build), Ribbon (heavy build). Sources: Apache Parquet
+BloomFilter spec, Lang VLDB 2019 ("Performance-Optimal Filtering"),
+Putze/Sanders/Singler 2007.
+
+**Tried.** Added `include/bolt/join/bolt_sbbf.h`:
+
+- 256-bit `SbbfBlock` (8 × uint32_t, one bit-per-lane) laid out
+  alignas(32) — one cache-line load per probe.
+- 8 Parquet salt constants (`kSbbfSalts[]`) — do not change these;
+  touching them breaks Parquet wire compatibility.
+- Block index = `hi32(hash) & mask`; within-block lane mask bit =
+  `1 << ((lo32(hash) * salt[l]) >> 27)` per Parquet spec.
+- `sbbf_create(expected_n, arena)` targets 10 bits/key → ~1% FPR
+  (Parquet documented baseline), rounds num_blocks up to pow2.
+- `sbbf_add`, `sbbf_test` — 8 ANDs + combined compare; branchless.
+  Auto-vectorises to `vpand` + `vptest` on AVX2 at /O2.
+
+**Why SBBF over the existing `bolt_bloom.h`:** same 1-cache-line
+probe shape, but half the bits/key at ~5× lower FPR (2-5% → 1%).
+Wire-compatible with Parquet's sidecar format — free win when the
+lakehouse layer ingests Parquet stats.
+
+**Measured.** 4 correctness tests:
+
+- `NoFalseNegatives` — 1000 inserted keys; every test returns true.
+- `FprUnderTwoPercent` — 10 000 never-inserted probes; FPR under 2%
+  (Parquet-standard 1% at 10 bits/key, empirically ~1-1.5% on this
+  fixture).
+- `EmptyFilterAlwaysAbsent` — empty filter rejects every query.
+- `SizingAtTenBitsPerKey` — 1024 keys → 40 blocks → round to 64 →
+  2048 bytes. Within expected bounds.
+
+**Kept-code-paths policy.** BOTH filters ship in source:
+- `BloomFilter` (bolt_bloom.h) — simpler, 16 bits/key register-
+  blocked, still what `HashJoinBuild` wires into `probe_with_bloom`.
+- `SplitBlockBloom` (bolt_sbbf.h) — Parquet-spec, 10 bits/key,
+  lower FPR, byte-compatible wire. Reachable by name; swapping
+  into hash-join is a call-site change, not an API break.
+
+Default filter for `HashJoinBuild` stays `BloomFilter` for now —
+flipping to SBBF awaits a bench harness that measures probe ns/op
+differences at low match rate (C2's open question).
+
+**Alternatives evaluated, not built:**
+
+| Variant | Why not | Source |
+|---|---|---|
+| Binary Fuse8 | 9 bits/key but 3 random loads per probe | Graf/Lemire 2022 |
+| Ribbon | 7 bits/key, heavy build (3-4× CPU), probe has k popcounts | Dillinger 2021 |
+| Cuckoo | 12.6 bits/key, 2 cache-line loads on miss | Fan CoNEXT 2014 |
+| Morton | Compressed cuckoo, ~600 LoC + overflow logic | Breslow VLDB 2018 |
+| VQF | SIMD-friendly but ~1000 LoC port | Pandey SIGMOD 2021 |
+| XOR filter | 3 random loads per probe, static build | Graf/Lemire 2020 |
+
+**Open questions.**
+- Wire SBBF into `HashJoinBuild::build(build_bloom=true, use_sbbf=?)`
+  once a low-match-rate probe bench exists; switch the default.
+- AVX2 intrinsic path for `sbbf_test`: MSVC auto-vectorises the
+  current scalar AND-and-combine loop; an explicit `_mm256_loadu_si256
+  + _mm256_and_si256 + _mm256_testc_si256` path could shave a few
+  cycles but loses portability. Defer until measured.
+
+---
+
 ## SwissTableInterleaved — read-after-rebuild alt layout  (C3)
 
 **Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md C3).**

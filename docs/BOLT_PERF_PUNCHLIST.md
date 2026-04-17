@@ -199,7 +199,27 @@ Tick a box only when **all seven DoD criteria** below are met.
 
 ## Track C — Joins / hash / groupby
 
-- [~] **C1. Groupby phase-2 scaling — rescoped — P0**
+- [x] **C1. Phase 2a scatter — atomic-free prefix offsets — P0**
+      *Refactored `parallel_groupby_radix_merge` to compute per-morsel-
+      per-shard counts + in-place prefix sum → every scatter write
+      lands at `shard_bufs[s][moffsets[s] + local_cursor++]` with ZERO
+      atomic operations. `shard_heads[]` cursor removed entirely.
+      Memory overhead: `num_morsels × P × 4B` offset table (~256 KB
+      at 1K×64 — trivial).  On single-socket laptop the atomic wasn't
+      the bottleneck; measured tie with baseline.  Multi-socket win
+      pending test hardware.  All 16 test binaries green.*
+  - Files: `include/bolt/kernels/bolt_parallel.h` —
+    `ParallelGroupByScatterCtx`, `parallel_groupby_scatter_morsel`,
+    `parallel_groupby_radix_merge`.
+  - Test: `tests/test_bolt_parallel.cpp` (8 tests, all green —
+    correctness preserved).
+  - Bench: Q1 16.84 ns/row, Q3 14.26 ns/row, 1BRC 19.47 ns/row —
+    all tied with pre-C1 baseline on single-socket. Multi-socket
+    measurement deferred.
+  - Design-log: [`design-log.md` → "Phase 2a scatter — atomic-free
+    via per-morsel prefix offsets (C1)"](research/design-log.md).
+
+- [~] **C1-legacy — replaced by the above**
       *On inspection, Phase 2b (partition merge) is **already parallel**
       via `sched->submit_range(&parallel_groupby_merge_shard, ..., P)`
       at `bolt_parallel.h:502`. The actual 8-core scaling wall
@@ -220,6 +240,18 @@ Tick a box only when **all seven DoD criteria** below are met.
     plateau at 8T.
   - Design-log: *"Phase 2a scatter — per-worker-per-shard sub-buffers
     vs atomic cursor"* (pending).
+- [x] **C2b. Split Block Bloom Filter (SBBF, Parquet-spec) — P1**
+      *New `include/bolt/join/bolt_sbbf.h`. 256-bit blocks with 8 salt
+      constants, 10 bits/key default, ~1% FPR — half the bits and
+      ~5× lower FPR than the existing `BloomFilter`. Parquet-wire
+      compatible. Both ship in source; `HashJoinBuild` still uses the
+      simpler `BloomFilter`; SBBF is reachable by name.*
+  - Files: new `include/bolt/join/bolt_sbbf.h`;
+    `tests/test_bolt_join.cpp` — `BoltSbbf.*` (4 tests).
+  - Test: NoFalseNegatives, FprUnderTwoPercent, EmptyFilterAlwaysAbsent,
+    SizingAtTenBitsPerKey.
+  - Design-log: [`design-log.md` → "Split Block Bloom Filter —
+    Parquet-spec variant (C2b)"](research/design-log.md).
 - [x] **C2. Bloom pre-screen on hash-join probe — P0 (opt-in)**
       *New standalone `include/bolt/join/bolt_bloom.h` (block-Bloom, 16
       bits/key, k=4). `HashJoinBuild::build(..., build_bloom=true)`

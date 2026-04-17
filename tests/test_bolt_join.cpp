@@ -5,6 +5,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
+#include "bolt/join/bolt_sbbf.h"
 #include "bolt/join/bolt_swiss.h"
 #include "bolt/join/bolt_hashjoin.h"
 #include "bolt/join/bolt_groupby.h"
@@ -607,6 +608,70 @@ TEST(BoltSwiss, InterleavedHighCardinalityMatchesFlat) {
         ASSERT_GE(g, 0) << "missing key " << k;
         EXPECT_EQ(flat.find(k), g);
     }
+}
+
+// ---------- Split Block Bloom (C2b / Parquet-spec) -----------------------
+// Zero false-negatives: every key ever added must test true.
+TEST(BoltSbbf, NoFalseNegatives) {
+    Arena arena;
+    SplitBlockBloom sbf{};
+    ASSERT_TRUE(sbbf_create(&sbf, /*expected_n=*/1000, &arena));
+
+    std::mt19937_64 rng(0xB10C);
+    std::vector<uint64_t> keys;
+    keys.reserve(1000);
+    for (int i = 0; i < 1000; ++i) {
+        uint64_t k = rng();
+        sbbf_add(sbf, swiss_mix(k));
+        keys.push_back(k);
+    }
+    for (uint64_t k : keys) {
+        EXPECT_TRUE(sbbf_test(sbf, swiss_mix(k))) << "false negative for " << k;
+    }
+}
+
+// FPR sanity: Parquet SBBF targets ~1% at 8 bits/key. Budget 2% to stay
+// well inside the tolerance band on 10 000 never-inserted probes.
+TEST(BoltSbbf, FprUnderTwoPercent) {
+    Arena arena;
+    SplitBlockBloom sbf{};
+    ASSERT_TRUE(sbbf_create(&sbf, /*expected_n=*/1000, &arena));
+
+    std::mt19937_64 rng(0x5BBF);
+    std::vector<uint64_t> keys;
+    keys.reserve(1000);
+    for (int i = 0; i < 1000; ++i) {
+        uint64_t k = rng() | 1ULL;  // low bit set — distinguishes from probes below
+        sbbf_add(sbf, swiss_mix(k));
+        keys.push_back(k);
+    }
+
+    constexpr int PN = 10000;
+    int fps = 0;
+    for (int i = 0; i < PN; ++i) {
+        uint64_t probe = (rng() & ~1ULL);    // low bit clear — never in build
+        if (sbbf_test(sbf, swiss_mix(probe))) ++fps;
+    }
+    EXPECT_LT(fps * 100 / PN, 2) << "SBBF FPR too high: " << fps << "/" << PN;
+}
+
+TEST(BoltSbbf, EmptyFilterAlwaysAbsent) {
+    Arena arena;
+    SplitBlockBloom sbf{};
+    ASSERT_TRUE(sbbf_create(&sbf, /*expected_n=*/64, &arena));
+    for (uint64_t k : {1ULL, 42ULL, 0xDEADBEEFULL, ~uint64_t{0}}) {
+        EXPECT_FALSE(sbbf_test(sbf, swiss_mix(k)));
+    }
+}
+
+TEST(BoltSbbf, SizingAtTenBitsPerKey) {
+    Arena arena;
+    SplitBlockBloom sbf{};
+    ASSERT_TRUE(sbbf_create(&sbf, /*expected_n=*/1024, &arena));
+    // 1024 keys × 10 bits/key = 10240 bits = 40 blocks → round up to 64
+    // blocks (next pow2) × 32 bytes = 2048 bytes.
+    EXPECT_GE(sbbf_size_bytes(sbf), 2048u);
+    EXPECT_LE(sbbf_size_bytes(sbf), 4096u);
 }
 
 // Collision-heavy stress — hash_mix is deterministic, but we can force
