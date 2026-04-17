@@ -285,5 +285,69 @@ RollingRing, Welford, EMA, and specialised groups — see tables above.
 - [x] P5.E.5 RSI  (`include/bolt/kernels/fintech/rsi.h`; Wilder smoothing
   α = 1/period — see design-log entry "RSI Wilder vs classical EMA alpha")
 
+#### P5.S (specialised — subset: sorted-window kernels)
+- [x] P5.S.4 HistoricalVaR  (`include/bolt/kernels/fintech/historical_var.h`;
+  SortedRing-backed rolling quantile; `var_index = floor((1-conf)*nw)`;
+  partial-window VaR from row 0 — chukonu parity, no NaN warmup)
+- [x] P5.S.5 HistoricalCVaR  (`include/bolt/kernels/fintech/historical_cvar.h`;
+  mean of `sorted[0..var_index)` tail; 0.0 when `var_index == 0`)
+- [x] P5.S.8 MedRV  (`include/bolt/kernels/fintech/med_rv.h`;
+  batch-scalar broadcast, not rolling — chukonu's shape;
+  scale = π/(6 - 4√3 + π), bias = n/(n-2), median-of-three via branchless
+  sorting network)
+- [x] P5.S.14 OutlierFlagMAD  (`include/bolt/kernels/fintech/outlier_flag_mad.h`;
+  two SortedRings; MAD scaled by 1.4826; emits int64_t flag — matches
+  chukonu's output type; scaled_mad ≤ 1e-15 → flag = 0)
+
+#### P5.S (specialised — subset: simple POD-state kernels)
+- [x] P5.S.1 MaxDrawdown  (`include/bolt/kernels/fintech/max_drawdown.h`;
+  streaming peak + absolute per-row drawdown `peak - x[i]`; deviates from
+  chukonu's broadcast-scalar fraction — Bolt uses per-row absolute form
+  (matches P1.5 primitive); cross-batch peak persists)
+- [x] P5.S.2 Drawdown  (`include/bolt/kernels/fintech/drawdown.h`;
+  streaming peak + fractional per-row drawdown `(peak - x) / peak`;
+  peak ≤ 1e-15 → 0.0 guard, chukonu parity)
+- [x] P5.S.3 CUSUM  (`include/bolt/kernels/fintech/cusum.h`;
+  two-sided Page CUSUM with symmetric threshold reset; deviates from
+  chukonu's one-sided + warmup-mean variant — caller supplies target,
+  no embedded statistics; emits two columns (cp, cn) pre-reset)
+- [x] P5.S.13 AlmgrenChriss  (`include/bolt/kernels/fintech/almgren_chriss.h`;
+  schedule precomputed at make-time into fixed array[4096 max];
+  per-row emit is `schedule[row_count % n_slices]`; row_count persists
+  across batches for seamless cyclic wrap)
+- [x] P5.S.15 ThrottleCheck  (`include/bolt/kernels/fintech/throttle_check.h`;
+  single-global sliding-window tripwire; fixed-capacity int64 timestamp
+  ring; amortised O(1) eviction; unit-agnostic timestamps;
+  keyed/per-symbol throttle deferred to Phase 6 when `bolt::dataflow`
+  keyed state lands)
+
+#### P5.S (specialised — subset: Kalman + rolling regression)
+- [x] P5.S.6 Kalman1D  (`include/bolt/kernels/fintech/kalman1d.h`;
+  seed `x_hat = obs[0]`, `P = p_init` — matches chukonu's hard-coded
+  `P=1.0`; straight-line recurrence, no per-row branch; state persists
+  across calls)
+- [x] P5.S.7 KalmanHedgeRatio  (`include/bolt/kernels/fintech/kalman_hedge_ratio.h`;
+  `beta_init = 1`, `P_init = 1` — chukonu parity; `|pb| <= 1e-15`
+  fallback compiles to cmov; emits two columns (hedge ratio, Kalman spread))
+- [x] P5.S.9 CornishFisherVaR  (`include/bolt/kernels/fintech/cornish_fisher_var.h`;
+  scalar broadcast; POPULATION moments (`/n` — chukonu parity);
+  A&S 26.2.3 normal-quantile approximation; CF expansion
+  `z + (z²-1)s/6 + (z³-3z)k/24 - (2z³-5z)s²/36`; `m2 <= 1e-15` guards
+  skew and kurt to 0.0; one-shot quantile branches hoisted out of loop)
+- [x] P5.S.10 Amihud  (`include/bolt/kernels/fintech/amihud.h`;
+  per-row `|r|/v`, not rolling mean — chukonu shape; `v > 0` cmov guard;
+  `denom = v>0 ? v : 1.0` dodge avoids MSVC C4723; plan doc's
+  "rolling mean" wording deviates from chukonu — we follow chukonu)
+- [x] P5.S.11 KyleLambda  (`include/bolt/kernels/fintech/kyle_lambda.h`;
+  rolling OLS slope of Δp on signed-volume; two RollingRings + rescan
+  (design-log "Rolling-window Welford — rescan vs decrement" applies);
+  warmup-split at `need=2`; `var_sv <= 1e-15` cmov guard)
+- [x] P5.S.12 RollSpread  (`include/bolt/kernels/fintech/roll_spread.h`;
+  POPULATION `cov(Δp_i, Δp_{i-1})` over window; two RollingRings +
+  rescan; warmup-split at `need_seen=4` (combines stream-index `i<2`
+  no-push AND `w<2` no-output into one up-front deficit); `cov >= 0`
+  cmov clamps spread to 0; state carries `prev_price`, `prev_diff`,
+  `seen` across calls)
+
 ### Phase 6 (Tier 3 — DEFERRED)
 Waits for event-time + keyed state; not in this plan.

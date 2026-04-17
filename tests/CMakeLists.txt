@@ -167,6 +167,45 @@ bolt_apply_hardening(test_bolt_fintech_phase5w)
 
 add_test(NAME test_bolt_fintech_phase5w COMMAND test_bolt_fintech_phase5w)
 
+add_executable(test_bolt_fintech_phase5s_sorted test_bolt_fintech_phase5s_sorted.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5s_sorted
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5s_sorted)
+
+add_test(NAME test_bolt_fintech_phase5s_sorted COMMAND test_bolt_fintech_phase5s_sorted)
+
+add_executable(test_bolt_fintech_phase5s_core test_bolt_fintech_phase5s_core.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5s_core
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5s_core)
+
+add_test(NAME test_bolt_fintech_phase5s_core COMMAND test_bolt_fintech_phase5s_core)
+
+add_executable(test_bolt_fintech_phase5s_kalman test_bolt_fintech_phase5s_kalman.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5s_kalman
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5s_kalman)
+
+add_test(NAME test_bolt_fintech_phase5s_kalman COMMAND test_bolt_fintech_phase5s_kalman)
+
 add_executable(test_bolt_wave2 test_bolt_wave2.cpp)
 
 target_link_libraries(test_bolt_wave2

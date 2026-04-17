@@ -1723,6 +1723,67 @@ compensation on the subtraction, gated behind a compile-time
 `BOLT_WELFORD_DECREMENT` flag in `bolt_config.h` (default off).
 Chukonu-parity tests would need a looser tolerance in that mode.
 
+## Rolling quantile — SortedRing vs streaming approximations
+
+**Context / date.** Phase 5.S fintech port, Apr 2026. HistoricalVaR,
+HistoricalCVaR, MedRV, and OutlierFlagMAD need a rolling quantile /
+rolling median primitive. Chukonu (the Arrow-based reference)
+allocates a fresh `std::vector` per row, copies the window in,
+sorts it, and throws it away. Every row: one malloc, one free, a
+cache-cold sort of `w` doubles. For a 10-row-per-tick stream at 10k
+ticks/s that's 100k mallocs/s of pure overhead.
+
+**What we evaluated.**
+
+1. **SortedRing<T, kCap>** (chosen, default).
+   Fixed-capacity insertion-sort under eviction: two parallel arrays
+   (`raw[]` in insertion order, `sorted[]` ascending). Push = one
+   `std::lower_bound` + one `memmove` to close the evicted slot +
+   one `lower_bound` + one `memmove` to open the insertion slot.
+   No heap, no branch on data in the hot loop body.
+   - Cost: **O(w) per push**, O(1) quantile / O(1) median / O(k)
+     tail-sum for CVaR.
+   - Memory: `2 * kCap * sizeof(T)` bytes, pinned in graph arena once.
+2. **Tukey's two-heap median** (rejected).
+   `std::priority_queue`-based two-heap (max-heap for the lower half,
+   min-heap for the upper) gets O(log w) push but: (a) heap
+   allocation under the std containers, (b) lazy-delete eviction
+   leaves tombstones, (c) only solves the *median* cleanly —
+   arbitrary quantile and tail-sum both need a sorted linearisation
+   anyway. We'd need a second data structure for CVaR regardless.
+3. **P² / GK / t-digest streaming approximations** (rejected, deferred).
+   O(1) push, O(1) quantile. Approximate: can be 1–5% off on heavy
+   tails, which is exactly where VaR / CVaR live. Accuracy bound is
+   distribution-dependent; reproducing chukonu's numerics for the
+   round-trip tests would need a loose tolerance. Revisit only if
+   a workload forces us off SortedRing.
+
+**Why SortedRing wins as the default.**
+- **Exact.** Bit-for-bit agreement with chukonu's
+  sort-then-index-the-vector reference, modulo the floor-on-fp
+  boundary. Enables tight `EXPECT_NEAR(..., 1e-9)` test tolerances.
+- **Zero allocation.** The kCap arrays are graph-lifetime-pinned.
+  No per-row heap churn; deterministic tail latency.
+- **Cache-friendly.** Both arrays are contiguous; the memmove tails
+  stream through a single L1 line for typical w ≤ 64.
+- **Acceptable asymptotic.** Tier-2 fintech windows are small:
+  ATR 14, Bollinger 20, RSI 14, HistoricalVaR typically 250, MedRV
+  is batch-wide. O(w) per push is fine at w ≤ 512; the SortedRing
+  hard cap at `kCap` is a template parameter the caller picks.
+
+**Alternatives kept compile-accessible.** The header comments in
+`sorted_ring.h` spell out where P²/GK/t-digest would slot in if a
+future workload changes the trade-off. Per Bolt's "multiple impls,
+one default" rule, we don't ship the alternatives today — they live
+in the log as an open question so future tuning starts from
+measured-not-remembered.
+
+**Open question.** For `w > 1024` the O(w) memmove dominates and a
+piecewise-linear skiplist (or GK summary with 1% ε) would overtake.
+If a user ships VaR with a 10-year rolling window of minute bars
+(~5M samples), revisit and add a second impl behind
+`BOLT_SORTED_RING_APPROX` in `bolt_config.h`.
+
 ## How to add an entry
 
 1. Run the change. Capture before/after numbers (≥3 runs each).

@@ -72,7 +72,24 @@ chukonu/
 │   │       ├── rolling_skew.h       Phase 5.W.7: rolling raw skewness (pop moments)
 │   │       ├── rolling_kurt.h       Phase 5.W.8: rolling EXCESS kurtosis
 │   │       ├── autocorr.h           Phase 5.W.9: rolling Pearson autocorr at lag k
-│   │       └── risk_metrics_vol.h   Phase 5.W.10: EWMA of r² (RiskMetrics'94), emits stddev
+│   │       ├── risk_metrics_vol.h   Phase 5.W.10: EWMA of r² (RiskMetrics'94), emits stddev
+│   │       ├── sorted_ring.h        Phase 5.S primitive: fixed-cap rolling sorted window
+│   │       │                         (O(w) push, O(1) quantile/median; no heap)
+│   │       ├── historical_var.h     Phase 5.S.4: rolling (1-conf) quantile VaR
+│   │       ├── historical_cvar.h    Phase 5.S.5: mean of sorted-tail (Expected Shortfall)
+│   │       ├── med_rv.h             Phase 5.S.8: batch-scalar median realised volatility
+│   │       ├── outlier_flag_mad.h   Phase 5.S.14: rolling median + 1.4826·MAD flag (int64)
+│   │       ├── max_drawdown.h       Phase 5.S.1: streaming peak, per-row absolute drawdown
+│   │       ├── drawdown.h           Phase 5.S.2: streaming peak, per-row fractional drawdown
+│   │       ├── cusum.h              Phase 5.S.3: two-sided Page CUSUM with threshold reset
+│   │       ├── almgren_chriss.h     Phase 5.S.13: optimal-execution schedule (cyclic emit)
+│   │       ├── throttle_check.h    Phase 5.S.15: sliding-window event-count tripwire
+│   │       ├── kalman1d.h           Phase 5.S.6: scalar 1-D Kalman filter (seed x=obs[0])
+│   │       ├── kalman_hedge_ratio.h Phase 5.S.7: Kalman hedge ratio (emits ratio + spread)
+│   │       ├── kyle_lambda.h        Phase 5.S.11: rolling OLS slope of Δp on signed volume
+│   │       ├── roll_spread.h        Phase 5.S.12: 2·sqrt(-cov(Δp, Δp_{-1})), clamped ≥0
+│   │       ├── cornish_fisher_var.h Phase 5.S.9: batch-scalar VaR with skew/kurt correction
+│   │       └── amihud.h             Phase 5.S.10: per-row |r|/v with v>0 cmov guard
 │   └── README.md                      Full project documentation
 │
 ├── src/bolt/                        ← Implementation notes
