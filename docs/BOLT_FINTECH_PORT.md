@@ -351,3 +351,67 @@ RollingRing, Welford, EMA, and specialised groups — see tables above.
 
 ### Phase 6 (Tier 3 — DEFERRED)
 Waits for event-time + keyed state; not in this plan.
+
+---
+
+## Unfinished kernels — explicit status
+
+**Landed: 67 of 74 chukonu kernels** (plus 2 chukonu kernels covered
+directly by Phase-1 primitives: `CreateDiffProcessor` → `diff_column`,
+`CreateLagProcessor` → `lag_column`).
+
+The 7 remaining kernels are all **Phase 6 Tier-3**. Each is blocked
+on the same two `bolt::dataflow` primitives (event-time windowing +
+keyed state) that Wave 3 will ship. NOT blocked on chukonu math or
+on any Bolt kernel primitive — the math is understood; the framework
+hook is not there yet.
+
+| Kernel | chukonu line | Why it's Tier-3 | What unblocks it |
+|---|---:|---|---|
+| **PairsSpread** | 776 | Needs per-pair keyed state (one spread state per instrument pair); batch-scoped implementation would conflate pairs. | `bolt::dataflow` keyed-state primitive keyed on `(symbol_a, symbol_b)`. |
+| **TriangularArb** | 1535 | Needs **synchronised** event-time join across 3 FX legs (e.g. EURUSD, USDJPY, EURJPY); batch-local math only catches ticks that happen to co-arrive within the morsel. | Event-time synchronisation window with watermarks, plus 3-way keyed join on currency triangle. |
+| **HayashiYoshidaCov** | 1711 | Non-synchronous covariance estimator for tick data; requires pairing trades by overlapping tick timestamps from two irregular series. Native event-time semantics. | Event-time windowing with per-series cursors + overlap detection. |
+| **HayashiYoshidaCorr** | 1798 | Correlation form of HayashiYoshidaCov. Same framework blocker. | Same as HayashiYoshidaCov. |
+| **XCorrLeadLag** | 1896 | Cross-correlation at arbitrary lags between two series; needs alignable event-time indices, not row indices. | Event-time primitive + per-series ring that indexes by timestamp, not position. |
+| **LeadLag** | 3240 | Cross-series lead/lag estimation; needs event-time aligned pairs (distinct from P1.2 `lag_column` which is in-series row-lag). | Same as XCorrLeadLag. |
+| **VPIN** | 3743 | Volume-synchronised Probability of Informed Trading; partitions the tick stream into equal-volume buckets, not equal-time or equal-row. Requires volume-bucket windowing, a fundamentally different morsel shape than row-count or wall-clock. | Volume-bucket window primitive in `bolt::dataflow` (new window type alongside row-count / event-time). |
+
+When Wave 3 lands event-time + keyed state, the port template is
+clear:
+
+1. Each Tier-3 kernel becomes `<Name>State` (per-key) + `execute_<name>`.
+2. Keyed state lookup replaces the single-state pointer.
+3. Event-time primitives (watermark, `TimestampRing`, volume-bucket
+   window) are consumed like today's `RollingRing` but indexed by a
+   non-row domain.
+4. Math copies chukonu verbatim exactly as Phase 4/5 did — the port
+   risk is framework plumbing, not numerics.
+
+**Other possible follow-ups** (not Tier-3, but spotted during the port
+and worth tracking for a future minor wave):
+
+- **ATR — Wilder smoothing variant.** Shipped as rolling-mean TR per
+  plan; chukonu uses Wilder EMA. A second header `atr_wilder.h`
+  composes `EmaState` (α=1/period) over TR.
+- **VWAP/TWAP — batch-aggregate variant.** Shipped as per-row
+  rolling; chukonu also has a batch-aggregate broadcast form. Trivial
+  to add as `vwap_batch.h` alongside the rolling version.
+- **DonchianChannel mid column.** Chukonu emits 3 columns (upper,
+  lower, mid); Bolt ships 2 (upper, lower). Mid is `(upper+lower)/2`
+  downstream — add iff a caller wants it without the compose step.
+- **StochasticOsc %D.** Chukonu emits both %K and %D (= SMA of %K);
+  Bolt ships %K only. Caller composes %D via `execute_sma` on the %K
+  output. Add iff a caller wants the fused version.
+- **CUSUM — chukonu parity variant.** Current `cusum.h` is two-sided
+  Page with caller-supplied target; chukonu's one-sided warmup-mean
+  variant could ship as `cusum_chukonu.h` if a caller needs bit-for-
+  bit parity on historical runs.
+- **MaxDrawdown — scalar-broadcast variant.** Current `max_drawdown.h`
+  is per-row absolute (streaming-friendly, matches P1.5). Chukonu's
+  scalar-max-fraction form could ship as `max_drawdown_batch.h` for
+  callers that work offline.
+- **ArrayKalman / MultiDimKalman.** Chukonu has Kalman1D; a 2-D or
+  n-D variant with matrix state is natural but not in the original 74.
+
+None of these are blocking; each is a single-header add when a
+downstream caller surfaces demand.
