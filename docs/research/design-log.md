@@ -70,6 +70,70 @@ Both warrant their own dedicated session with proper benchmarking.
 
 ---
 
+## Wave 2 follow-ups — I3 dispatch + bench harness + perf baselines
+
+**Context.** End-of-wave-2 gap list called for four items:
+
+1. I3 auto-dispatch on Dictionary columns (ties H1 + C5 + H3).
+2. Record CI perf baselines so the regression gate actually fires.
+3. Low-match-rate Q3 bench to measure the Bloom pre-screen (C2).
+4. Merge-join bench case to measure C4 vs hash-join on sorted input.
+
+All four landed in this drop.
+
+**I3 — `filter_eq_dict_column<T>`** (`bolt/kernels/bolt_dict_filter.h`).
+Decision tree: resolve scalar → dict code (H1); if -1, return 0
+without touching the column. If the column has an auto-built
+`BitmapIndex`, use `probably_absent(code)` for O(1) short-circuit
+(H3), else `filter(code)` via the sidecar (C5). Otherwise fall
+through to `filter_eq_dict_keys` on the narrow key buffer (H1).
+5 new tests cover every branch (linear-scan-no-sidecar,
+auto-build-sidecar, literal-not-in-dict, probably-absent-short-
+circuits, unsupported-shape → -1).
+
+**Bench harness — Q3b + merge-join A/B** (`benchmarks/bench_tpch_lite.cpp`).
+Two new functions reporting both variants side-by-side:
+
+- `run_q3b_bloom_ab` — build 1 K × probe 1 M at ~10 % match rate;
+  measures default `HashJoinProbe::probe` vs
+  `probe_with_bloom` (same build).
+- `run_mergejoin_ab` — sorted 500 K × 500 K with 50 % match;
+  measures `mergejoin_inner_i64` vs hash-join probe over the
+  same data.
+
+**Measured (laptop i7, MSVC Release, min-of-25 per variant):**
+
+| workload | default | Bloom / MJ | ratio |
+|---|---|---|---|
+| Q3b hash-join probe, ~10 % match | 17.17 ns/row | **5.04** ns/row (probe_with_bloom) | **3.41×** |
+| 500 K × 500 K sorted join | 32.59 ns/row (hash) | **2.27** ns/row (mergejoin) | **14.38×** |
+
+Both far exceed the expected wins — the Bloom pre-screen at 10 %
+hit rate pays for its build cost 3 × over, and merge-join on sorted
+input is over an order of magnitude faster than hash-join probe.
+These numbers now commit a strong case for planner-level auto-
+selection (future chukonu work).
+
+**Perf baselines — `ci/perf_baselines.json` populated**. `perf_check.py`
+upgraded to best-of-N sampling (`--samples` flag, default 5) for
+both `--mode record` and `--mode check` so single-run variance no
+longer throws the 5 % gate. Recorded 22 metrics across the 4 bench
+binaries on the current laptop. Real CI baselines should be
+re-recorded on the Linux runner that will run the gate — the
+laptop numbers are here as a working reference and will be
+overwritten by a CI-leg record step when that lands.
+
+Also fixed: `perf_check.py` subprocess capture forced utf-8 with
+`errors="replace"` so the box-drawing characters in `bench_bolt`'s
+banner don't blow up cp1252-defaulted Windows runs.
+
+**Kept.** All additions are additive — no existing kernel changed
+shape. Default `HashJoinProbe::probe` stays Bloom-free (keep-code-
+paths); the measured 3.41 × win documents when callers should
+opt in.
+
+---
+
 ## Wave 2 — SYMBOL-shape upgrades + B-format run-native kernels  (H1-H3, I1-I2)
 
 **Context.** QuestDB source audit

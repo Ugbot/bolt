@@ -281,3 +281,122 @@ TEST(FrameOfRefKernel, ZeroLengthIsBase) {
     // Empty input: base * 0 + 0 = 0. Even though base is non-zero.
     EXPECT_EQ(branchless::sum_frame_of_ref(nullptr, 0, /*bw=*/8, 42), 0);
 }
+
+// ============================================================================
+// I3 — filter_eq_dict_column auto-dispatch
+// ============================================================================
+
+// Build a small Dictionary column {100,200,300} with 12 rows repeating
+// [0,1,2,0,1,2,...]. Shared fixture for the three dispatch-path tests.
+namespace {
+struct DictCol {
+    BoltColumn col;
+    BoltColumn dict;
+    BoltColumn* child;
+    uint8_t* keys;
+    int32_t* dv;
+};
+inline DictCol make_i32_dict(Arena& a) {
+    DictCol d{};
+    d.dict = BoltColumn::make_flat_alloc(3, BoltType::Int32, &a);
+    d.dv = d.dict.typed_mutable<int32_t>();
+    d.dv[0] = 100; d.dv[1] = 200; d.dv[2] = 300;
+
+    d.col = BoltColumn::make_empty();
+    d.col.format = ColumnFormat::Dictionary;
+    d.col.type = BoltType::Int32;
+    d.col.type_size_bytes = 1;
+    d.col.length = 12;
+    d.keys = a.allocate_array<uint8_t>(12);
+    const uint8_t pattern[12] = {0,1,2, 0,1,2, 0,1,2, 0,1,2};
+    memcpy(d.keys, pattern, 12);
+    d.col.data = d.keys;
+    d.child = a.allocate_array<BoltColumn>(1);
+    *d.child = d.dict;
+    d.col.dict_child = d.child;
+    d.col.arena = &a;
+    return d;
+}
+}  // namespace
+
+// Path 4: no BitmapIndex, no arena → narrow-key branchless scan (H1).
+TEST(FilterEqDictColumn, PathLinearScanNoSidecar) {
+    Arena a;
+    DictCol d = make_i32_dict(a);
+    int32_t out[12] = {};
+    int64_t n = kernels::filter_eq_dict_column<int32_t>(
+        d.col, /*scalar=*/200, out, /*arena=*/nullptr);
+    ASSERT_EQ(n, 4);
+    const int32_t expected[4] = {1, 4, 7, 10};
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(out[i], expected[i]);
+    // No sidecar was built (arena was null).
+    EXPECT_EQ(d.col.sidecars.bitmap_index, nullptr);
+}
+
+// Path 3: arena provided → auto-build BitmapIndex, use filter(code).
+TEST(FilterEqDictColumn, PathAutoBuildsBitmapIndex) {
+    Arena a;
+    DictCol d = make_i32_dict(a);
+    int32_t out[12] = {};
+    int64_t n = kernels::filter_eq_dict_column<int32_t>(
+        d.col, /*scalar=*/300, out, &a);
+    ASSERT_EQ(n, 4);
+    EXPECT_EQ(out[0], 2);
+    EXPECT_EQ(out[1], 5);
+    EXPECT_EQ(out[2], 8);
+    EXPECT_EQ(out[3], 11);
+    // Side-effect: sidecar is now populated.
+    EXPECT_NE(d.col.sidecars.bitmap_index, nullptr);
+}
+
+// Path 1: scalar not in dict_child → 0 rows, no scan.
+TEST(FilterEqDictColumn, LiteralNotInDictReturnsZero) {
+    Arena a;
+    DictCol d = make_i32_dict(a);
+    int32_t out[12] = {};
+    // 999 is not in {100, 200, 300}.
+    int64_t n = kernels::filter_eq_dict_column<int32_t>(
+        d.col, /*scalar=*/999, out, &a);
+    EXPECT_EQ(n, 0);
+}
+
+// Path 2: BitmapIndex built, but popcount[code] == 0 (key never used).
+// Build a dict where key 1 is present in the dict_child but no row uses it.
+TEST(FilterEqDictColumn, ProbablyAbsentShortCircuits) {
+    Arena a;
+    auto dict = BoltColumn::make_flat_alloc(3, BoltType::Int32, &a);
+    auto* dv = dict.typed_mutable<int32_t>();
+    dv[0] = 100; dv[1] = 222; dv[2] = 300;  // code 1 = 222
+
+    BoltColumn col = BoltColumn::make_empty();
+    col.format = ColumnFormat::Dictionary;
+    col.type = BoltType::Int32;
+    col.type_size_bytes = 1;
+    col.length = 9;
+    uint8_t* keys = a.allocate_array<uint8_t>(9);
+    const uint8_t pattern[9] = {0,2,0, 2,0,2, 0,2,0};  // code 1 unused
+    memcpy(keys, pattern, 9);
+    col.data = keys;
+    BoltColumn* child = a.allocate_array<BoltColumn>(1);
+    *child = dict;
+    col.dict_child = child;
+    col.arena = &a;
+
+    int32_t out[9] = {};
+    int64_t n = kernels::filter_eq_dict_column<int32_t>(
+        col, /*scalar=*/222, out, &a);
+    EXPECT_EQ(n, 0);  // short-circuit via probably_absent
+    // Index was built; popcount[1] = 0 confirms the short-circuit.
+    auto* idx = static_cast<BitmapIndex*>(col.sidecars.bitmap_index);
+    ASSERT_NE(idx, nullptr);
+    EXPECT_TRUE(idx->probably_absent(1));
+}
+
+// Non-Dictionary column → -1 (unsupported shape).
+TEST(FilterEqDictColumn, UnsupportedShapeReturnsNegative) {
+    int32_t flat_data[4] = {1, 2, 3, 4};
+    BoltColumn flat = BoltColumn::make_flat(flat_data, nullptr, 4, BoltType::Int32);
+    int32_t out[4] = {};
+    int64_t n = kernels::filter_eq_dict_column<int32_t>(flat, 2, out, nullptr);
+    EXPECT_EQ(n, -1);
+}

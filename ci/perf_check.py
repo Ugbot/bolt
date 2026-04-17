@@ -86,10 +86,14 @@ def find_bench(build_dir: Path, name: str) -> Optional[Path]:
 
 def run_bench(binary: Path, extra_args: List[str]) -> str:
     assert binary.is_file(), f"bench binary missing: {binary}"
+    # Force utf-8 decode with replacement so box-drawing chars in
+    # the bench banner don't blow up cp1252-defaulted Windows hosts.
     result = subprocess.run(
         [str(binary), *extra_args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         timeout=600,
     )
@@ -213,6 +217,12 @@ def main() -> int:
         help="Regression budget in percent (default 5.0)",
     )
     parser.add_argument(
+        "--samples",
+        type=int,
+        default=5,
+        help="Best-of-N samples per metric (default 5). Kills single-run variance.",
+    )
+    parser.add_argument(
         "--skip",
         action="append",
         default=[],
@@ -223,8 +233,10 @@ def main() -> int:
     print(f"[perf_check] build_dir = {args.build_dir}")
     print(f"[perf_check] mode      = {args.mode}")
     print(f"[perf_check] threshold = {args.threshold_pct:.1f}%")
+    print(f"[perf_check] samples   = {args.samples} (best-of-N per metric)")
 
-    all_metrics: List[Metric] = []
+    # Merge best-of-N: keep the minimum value observed for each (bench, name, unit).
+    best: Dict[Tuple[str, str, str], float] = {}
     missing: List[str] = []
     for name, extra in BENCHES:
         if name in args.skip:
@@ -234,11 +246,21 @@ def main() -> int:
         if binary is None:
             missing.append(name)
             continue
-        print(f"[perf_check] running {binary.name} {' '.join(extra)}")
-        stdout = run_bench(binary, extra)
-        metrics = parse_metrics(name, stdout)
-        print(f"[perf_check]   parsed {len(metrics)} metrics")
-        all_metrics.extend(metrics)
+        print(f"[perf_check] running {binary.name} {' '.join(extra)} × {args.samples}")
+        for run_i in range(args.samples):
+            stdout = run_bench(binary, extra)
+            metrics = parse_metrics(name, stdout)
+            for m in metrics:
+                k = (m.bench, m.name, m.unit)
+                if k not in best or m.value < best[k]:
+                    best[k] = m.value
+        sample_count = sum(1 for k in best if k[0] == name)
+        print(f"[perf_check]   best-of-{args.samples} across {sample_count} metrics")
+
+    all_metrics: List[Metric] = [
+        Metric(bench=k[0], name=k[1], unit=k[2], value=v)
+        for k, v in best.items()
+    ]
 
     if missing:
         sys.stderr.write(

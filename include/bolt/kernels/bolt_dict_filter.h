@@ -26,6 +26,7 @@
 #pragma once
 
 #include "bolt/bolt_branchless.h"
+#include "bolt/bolt_column.h"
 #include "bolt/bolt_port.h"
 
 #include <cassert>
@@ -75,6 +76,74 @@ inline int64_t filter_eq_dict_keys(const KT* BOLT_RESTRICT keys, int64_t n,
         count += (keys[i] == code_kt);
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// I3 — auto-dispatch `filter_eq` on Dictionary columns.
+//
+// Ties H1 (literal resolve) + H3 (popcount miss-accelerator) + C5
+// (BitmapIndex sidecar). Decision tree:
+//
+//   1. Resolve the typed scalar against the dict_child (H1). If the
+//      code is -1, return 0 — no row could possibly match.
+//   2. If the column has a BitmapIndex with popcounts built (H3), and
+//      `probably_absent(code)` is true, return 0 without scanning.
+//   3. If the column has a BitmapIndex (C5), use `filter(code)` —
+//      O(selectivity) in output cost, not O(length).
+//   4. Otherwise fall through to `filter_eq_dict_keys` (H1) on the
+//      narrow key buffer — O(length / key_width).
+//
+// `arena` may be null; without it, step 3 cannot auto-build a missing
+// index and step 4 runs. Caller retains ownership of `out`; no arena
+// allocation happens in this helper itself beyond the optional
+// `ensure_bitmap_index`.
+//
+// Returns the number of matching rows, or -1 on unsupported shape
+// (non-Dictionary column, type mismatch, or dict_child not Flat).
+// ---------------------------------------------------------------------------
+template <typename T>
+inline int64_t filter_eq_dict_column(BoltColumn& col, T scalar,
+                                     int32_t* BOLT_RESTRICT out,
+                                     Arena* arena /* may be null */) noexcept {
+    assert(out != nullptr || col.length == 0);
+    if (col.format != ColumnFormat::Dictionary) return -1;
+    if (col.dict_child == nullptr) return -1;
+    if (col.dict_child->format != ColumnFormat::Flat) return -1;
+    if (static_cast<size_t>(col.dict_child->type_size_bytes) != sizeof(T)) return -1;
+
+    // Step 1 — literal resolve once.
+    const T* child_values = static_cast<const T*>(col.dict_child->data);
+    const int32_t code = dict_resolve_code<T>(child_values,
+                                              col.dict_child->length, scalar);
+    if (code < 0) return 0;
+
+    // Step 2 + 3 — sidecar-driven dispatch.
+    BitmapIndex* idx = static_cast<BitmapIndex*>(col.sidecars.bitmap_index);
+    if (idx == nullptr && arena != nullptr) {
+        idx = col.ensure_bitmap_index(arena);
+    }
+    if (idx != nullptr) {
+        if (idx->probably_absent(static_cast<uint32_t>(code))) return 0;
+        return idx->filter(static_cast<uint32_t>(code), out);
+    }
+
+    // Step 4 — narrow-key branchless scan.
+    const uint16_t kw = col.type_size_bytes;
+    const int64_t  n  = col.length;
+    if (kw == 1) {
+        return filter_eq_dict_keys<uint8_t>(
+            static_cast<const uint8_t*>(col.data), n,
+            static_cast<uint32_t>(code), out);
+    } else if (kw == 2) {
+        return filter_eq_dict_keys<uint16_t>(
+            static_cast<const uint16_t*>(col.data), n,
+            static_cast<uint32_t>(code), out);
+    } else if (kw == 4) {
+        return filter_eq_dict_keys<uint32_t>(
+            static_cast<const uint32_t*>(col.data), n,
+            static_cast<uint32_t>(code), out);
+    }
+    return -1;
 }
 
 }  // namespace kernels

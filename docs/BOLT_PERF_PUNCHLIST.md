@@ -452,7 +452,7 @@ native kernels so the storage compression turns into a compute win.
     the hot loop.
   - Files: `bolt_branchless.h`.
   - Test: round-trip against `materialize + sum_avx2_i64`.
-- [ ] **I3. Dict + BitmapIndex auto-dispatch in `filter_eq` — P0**
+- [x] **I3. Dict + BitmapIndex auto-dispatch in `filter_eq` — P0**
   - Shape: `filter_eq` on a Dictionary column routes through H1
     (linear scan on keys) or through `BitmapIndex::filter(code)`
     when the sidecar exists. Ties H1 + C5.

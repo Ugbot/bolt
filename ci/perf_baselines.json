@@ -1,1 +1,32 @@
-{}
+{
+  "bench_1brc": {
+    "row:per-row": 18.52
+  },
+  "bench_bolt": {
+    "alloc:arena+reset": 1.5,
+    "alloc:malloc+free": 2744.9,
+    "op:SPSC": 3.5,
+    "op:mutex": 44.2
+  },
+  "bench_kernels": {
+    "op:bmm_* SIMD kernel (compressstore)": 0.18,
+    "op:bmm_* SIMD reduce (bmm_add_i64+hadd)": 0.16,
+    "op:branchless scalar kernel": 0.48,
+    "op:gather_branchless (SIMD + prefetch)": 1.39,
+    "op:gather_simd_i64 (alternative, slower on client Intel)": 7.81,
+    "op:group-scanning find (bmm_cmpeq_i8)": 4.9,
+    "op:kernels::sum<int64_t> (scalar)": 0.14,
+    "op:parallel (4 workers, balanced)": 0.47,
+    "op:parallel groupby (radix merge)": 4.16,
+    "op:serial groupby_sum_int64": 15.87
+  },
+  "bench_tpch_lite": {
+    "row:Q1 (group-by agg)": 16.24,
+    "row:Q3 (filter+join+agg)": 14.45,
+    "row:Q6 (scan+filter+sum)": 1.76,
+    "row:default probe": 16.87,
+    "row:hash-join probe": 28.65,
+    "row:mergejoin_inner_i64": 2.27,
+    "row:probe_with_bloom": 4.97
+  }
+}

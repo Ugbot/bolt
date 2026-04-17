@@ -21,6 +21,7 @@
 #include "bolt/kernels/bolt_numeric.h"
 #include "bolt/join/bolt_hashjoin.h"
 #include "bolt/join/bolt_groupby.h"
+#include "bolt/join/bolt_mergejoin.h"
 
 #if __has_include("bolt/kernels/bolt_parallel.h")
   #include "bolt/kernels/bolt_parallel.h"
@@ -439,6 +440,161 @@ static void gen_q3(int64_t* custkey_build, int64_t cb,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Q3b — low match-rate hash-join: build = [0, 1K), probes drawn from
+// [0, 10K) so ~10% hit rate.  Measures the Bloom pre-screen (C2) payoff.
+// Runs two timings per iter: default probe (no Bloom) vs probe_with_bloom.
+// ---------------------------------------------------------------------------
+struct Q3bResult {
+    double default_ns_per_row;
+    double bloom_ns_per_row;
+};
+
+static Q3bResult run_q3b_bloom_ab(bolt::Arena* arena,
+                                   int64_t build_n, int64_t probe_n,
+                                   uint64_t seed) noexcept {
+    assert(arena != nullptr);
+    assert(build_n > 0 && probe_n > 0);
+
+    std::vector<int64_t> build_keys(build_n);
+    std::vector<int64_t> probe_keys(probe_n);
+    for (int64_t i = 0; i < build_n; ++i) build_keys[i] = i;
+    std::mt19937_64 rng(seed);
+    const int64_t probe_range = build_n * 10;  // 10% hit rate
+    for (int64_t i = 0; i < probe_n; ++i) {
+        probe_keys[i] = static_cast<int64_t>(rng() % static_cast<uint64_t>(probe_range));
+    }
+
+    bolt::BoltColumn bc = bolt::BoltColumn::make_flat(
+        build_keys.data(), nullptr, build_n, bolt::BoltType::Int64);
+    bolt::BoltColumn pc = bolt::BoltColumn::make_flat(
+        probe_keys.data(), nullptr, probe_n, bolt::BoltType::Int64);
+
+    constexpr int kIters = 25;
+    int64_t samples_default[kIters];
+    int64_t samples_bloom[kIters];
+    int32_t* out_b = arena->allocate_array<int32_t>(probe_n);
+    int32_t* out_p = arena->allocate_array<int32_t>(probe_n);
+
+    // Warm-up + default probe timing.
+    for (int it = -2; it < kIters; ++it) {
+        bolt::ArenaGuard g(*arena);
+        bolt::HashJoinBuild hb{};
+        bool ok = hb.build(bc, arena, /*build_bloom=*/false);
+        assert(ok); (void)ok;
+
+        auto t0 = Clock::now();
+        int64_t pairs = bolt::HashJoinProbe::probe(hb, pc, out_b, out_p);
+        auto t1 = Clock::now();
+        DoNotOptimize(pairs);
+        if (it >= 0) {
+            samples_default[it] = std::chrono::duration_cast<ns>(t1 - t0).count();
+        }
+    }
+
+    // Bloom-gated probe timing (builds filter once; probe uses it).
+    for (int it = -2; it < kIters; ++it) {
+        bolt::ArenaGuard g(*arena);
+        bolt::HashJoinBuild hb{};
+        bool ok = hb.build(bc, arena, /*build_bloom=*/true);
+        assert(ok); (void)ok;
+
+        auto t0 = Clock::now();
+        int64_t pairs = bolt::HashJoinProbe::probe_with_bloom(hb, pc, out_b, out_p);
+        auto t1 = Clock::now();
+        DoNotOptimize(pairs);
+        if (it >= 0) {
+            samples_bloom[it] = std::chrono::duration_cast<ns>(t1 - t0).count();
+        }
+    }
+
+    Q3bResult r{};
+    r.default_ns_per_row =
+        static_cast<double>(min_ns(samples_default, kIters)) /
+        static_cast<double>(probe_n);
+    r.bloom_ns_per_row =
+        static_cast<double>(min_ns(samples_bloom, kIters)) /
+        static_cast<double>(probe_n);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Merge-join sorted-input bench (C4 payoff measurement).
+// Both sides pre-sorted; match-rate varies with overlap. Reports
+// ns/row for merge-join vs hash-join over the same data.
+// ---------------------------------------------------------------------------
+struct MJResult {
+    double mergejoin_ns_per_row;
+    double hashjoin_ns_per_row;
+    int64_t pairs_mj;
+    int64_t pairs_hj;
+};
+
+static MJResult run_mergejoin_ab(bolt::Arena* arena,
+                                  int64_t build_n, int64_t probe_n,
+                                  uint64_t seed) noexcept {
+    assert(arena != nullptr);
+    std::vector<int64_t> build_keys(build_n);
+    std::vector<int64_t> probe_keys(probe_n);
+    // Sorted unique on both sides with ~50% overlap.
+    std::mt19937_64 rng(seed);
+    for (int64_t i = 0; i < build_n; ++i) {
+        build_keys[i] = 1000 + i * 2;  // even keys only, sorted
+    }
+    for (int64_t i = 0; i < probe_n; ++i) {
+        // Mix of evens (match) and odds (miss), sorted.
+        probe_keys[i] = 1000 + i;
+    }
+    std::sort(probe_keys.begin(), probe_keys.end());
+    (void)rng;
+
+    bolt::BoltColumn bc = bolt::BoltColumn::make_flat(
+        build_keys.data(), nullptr, build_n, bolt::BoltType::Int64);
+    bolt::BoltColumn pc = bolt::BoltColumn::make_flat(
+        probe_keys.data(), nullptr, probe_n, bolt::BoltType::Int64);
+
+    const int64_t out_cap = build_n + probe_n;
+    int32_t* ob = arena->allocate_array<int32_t>(out_cap);
+    int32_t* op = arena->allocate_array<int32_t>(out_cap);
+
+    constexpr int kIters = 25;
+    int64_t s_mj[kIters];
+    int64_t s_hj[kIters];
+    int64_t pairs_mj = 0, pairs_hj = 0;
+
+    for (int it = -2; it < kIters; ++it) {
+        auto t0 = Clock::now();
+        int64_t n = bolt::mergejoin_inner_i64(bc, pc, ob, op, out_cap);
+        auto t1 = Clock::now();
+        DoNotOptimize(n);
+        pairs_mj = n;
+        if (it >= 0) s_mj[it] = std::chrono::duration_cast<ns>(t1 - t0).count();
+    }
+
+    for (int it = -2; it < kIters; ++it) {
+        bolt::ArenaGuard g(*arena);
+        bolt::HashJoinBuild hb{};
+        bool ok = hb.build(bc, arena);
+        assert(ok); (void)ok;
+
+        auto t0 = Clock::now();
+        int64_t n = bolt::HashJoinProbe::probe(hb, pc, ob, op);
+        auto t1 = Clock::now();
+        DoNotOptimize(n);
+        pairs_hj = n;
+        if (it >= 0) s_hj[it] = std::chrono::duration_cast<ns>(t1 - t0).count();
+    }
+
+    MJResult r{};
+    r.mergejoin_ns_per_row =
+        static_cast<double>(min_ns(s_mj, kIters)) / static_cast<double>(probe_n);
+    r.hashjoin_ns_per_row =
+        static_cast<double>(min_ns(s_hj, kIters)) / static_cast<double>(probe_n);
+    r.pairs_mj = pairs_mj;
+    r.pairs_hj = pairs_hj;
+    return r;
+}
+
 static void gen_q6(int64_t* price, int64_t* discount, int64_t* shipdate,
                    int64_t n, uint64_t seed) noexcept {
     assert(price != nullptr);
@@ -648,12 +804,33 @@ int main(int argc, char** argv) {
     QueryResult q1 = run_q1(&arena, &q1_rflag_col, &q1_qty_col, &q1_price_col, sched_ptr);
     QueryResult q3 = run_q3(&arena, &q3_cb_col, &q3_cp_col, &q3_tp_col, sched_ptr);
     QueryResult q6 = run_q6(&arena, &q6_price_col, &q6_disc_col, &q6_date_col, sched_ptr);
+    Q3bResult   q3b = run_q3b_bloom_ab(&arena,
+                                       /*build_n=*/1000,
+                                       /*probe_n=*/1'000'000,
+                                       /*seed=*/0xB10CFEEEull);
+    MJResult    mj  = run_mergejoin_ab(&arena,
+                                       /*build_n=*/500'000,
+                                       /*probe_n=*/500'000,
+                                       /*seed=*/0xC4ull);
 
     printf("\n");
     printf("TPC-H-lite (N=1M rows, synthetic):\n");
     print_row(q1);
     print_row(q3);
     print_row(q6);
+    printf("\n");
+    printf("Q3b hash-join Bloom A/B (build=1K, probe=1M, ~10%% match):\n");
+    printf("  default probe        : %6.2f ns/row  (min)\n", q3b.default_ns_per_row);
+    printf("  probe_with_bloom     : %6.2f ns/row  (min)  ratio %.2fx\n",
+           q3b.bloom_ns_per_row,
+           q3b.default_ns_per_row / q3b.bloom_ns_per_row);
+    printf("\n");
+    printf("Merge-join vs hash-join (sorted inputs, build=500K, probe=500K):\n");
+    printf("  mergejoin_inner_i64  : %6.2f ns/row  (min)  (%lld pairs)\n",
+           mj.mergejoin_ns_per_row, static_cast<long long>(mj.pairs_mj));
+    printf("  hash-join probe      : %6.2f ns/row  (min)  (%lld pairs)  ratio %.2fx\n",
+           mj.hashjoin_ns_per_row, static_cast<long long>(mj.pairs_hj),
+           mj.hashjoin_ns_per_row / mj.mergejoin_ns_per_row);
     printf("\n");
     if (sched_ptr) {
         printf("Notes: %u-worker scheduler path. No heap allocation in timed regions.\n",
