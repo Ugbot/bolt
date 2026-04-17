@@ -20,6 +20,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_channel.h"
+#include "bolt/bolt_port.h"
 
 using Clock = std::chrono::high_resolution_clock;
 using ns = std::chrono::nanoseconds;
@@ -209,6 +210,47 @@ void bench_cow_memcpy() {
     printf("\n");
 }
 
+// D2 — non-temporal (streaming) store copy; wins when dst size > L3 and
+// the destination will not be re-read soon. Below L3 memcpy stays ahead
+// because its stores land in cache for the follow-up reader.
+void bench_nt_memcpy() {
+    printf("=== bolt_memcpy_nt vs memcpy (streaming NT stores) ===\n");
+    struct { const char* label; size_t size; } specs[] = {
+        {"256K×i64   (2MB)",   262144ull*8},
+        {"1M×i64     (8MB)",  1048576ull*8},
+        {"4M×i64    (32MB)",  4194304ull*8},
+        {"16M×i64  (128MB)", 16777216ull*8},
+    };
+
+    for (auto& s : specs) {
+        void* src = bolt_aligned_alloc(64, s.size);
+        void* dst = bolt_aligned_alloc(64, s.size);
+        std::memset(src, 0xAB, s.size);
+
+        // Fewer iters for big sizes to keep wall-time bounded.
+        size_t iters = s.size >= (16ull << 20) ? 200
+                    : s.size >= ( 8ull << 20) ? 1000
+                                              : 5000;
+
+        auto t0 = Clock::now();
+        for (size_t i = 0; i < iters; ++i) { std::memcpy(dst, src, s.size); ClobberMemory(); }
+        auto t1 = Clock::now();
+        double mc_ns = (double)std::chrono::duration_cast<ns>(t1 - t0).count() / iters;
+
+        auto t2 = Clock::now();
+        for (size_t i = 0; i < iters; ++i) { bolt::bolt_memcpy_nt(dst, src, s.size); ClobberMemory(); }
+        auto t3 = Clock::now();
+        double nt_ns = (double)std::chrono::duration_cast<ns>(t3 - t2).count() / iters;
+
+        printf("  %s: memcpy %7.0f ns (%.2f GB/s)  nt %7.0f ns (%.2f GB/s)  ratio %.2f×\n",
+               s.label, mc_ns, s.size / mc_ns, nt_ns, s.size / nt_ns, mc_ns / nt_ns);
+
+        bolt_aligned_free(src);
+        bolt_aligned_free(dst);
+    }
+    printf("\n");
+}
+
 int main() {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║  Bolt Primitives Benchmark                          ║\n");
@@ -219,6 +261,7 @@ int main() {
     bench_epoch_swap();
     bench_spsc_channel();
     bench_cow_memcpy();
+    bench_nt_memcpy();
 
     return 0;
 }

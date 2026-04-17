@@ -155,6 +155,109 @@ BOLT_FORCE_INLINE void bolt_aligned_free(void* p) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Huge-page aware allocator (D1).
+//
+// Opt-in via `BOLT_ENABLE_HUGE_PAGES` (see `BoltCompileOptions.cmake`).
+// Even when the macro is set, callers should reserve these for *large*
+// buffers (≥ 16 MB) where TLB pressure matters — a typical page is 4 KB
+// so a 16 MB buffer spans 4096 TLB entries.  2 MB pages cut that to 8.
+//
+// Per-platform behaviour:
+//   * Windows: `VirtualAlloc(MEM_LARGE_PAGES | MEM_COMMIT | MEM_RESERVE)`.
+//     Requires the `SeLockMemoryPrivilege` privilege on the process
+//     token — NOT granted by default; admin needs to add the user via
+//     secpol.msc → "Lock pages in memory".  Without the privilege the
+//     call fails and we fall back to `bolt_aligned_alloc`.
+//   * Linux: `mmap(..., MAP_HUGETLB)` — requires vm.nr_hugepages > 0 or
+//     `vm.nr_overcommit_hugepages` > 0.  On failure we fall back to a
+//     plain mmap + `madvise(MADV_HUGEPAGE)` (transparent huge pages).
+//   * macOS / other: falls back to `bolt_aligned_alloc` (macOS has no
+//     general-purpose huge-page knob for userspace).
+//   * When `BOLT_ENABLE_HUGE_PAGES` is 0: always falls back to
+//     `bolt_aligned_alloc` so the symbol is still callable.
+//
+// `size_out` receives the actual rounded-up allocation size (huge-page
+// paths round up to 2 MB).  Callers pair with `bolt_huge_free(p, size)`
+// — Windows `VirtualFree` ignores size but Linux `munmap` needs it.
+//
+// Returns nullptr on OOM (same contract as `bolt_aligned_alloc`).
+// ---------------------------------------------------------------------------
+
+inline constexpr size_t kBoltHugePageBytes = 2ull * 1024ull * 1024ull;  // 2 MB
+
+BOLT_FORCE_INLINE void* bolt_aligned_alloc_huge(size_t size,
+                                                size_t* size_out) noexcept {
+    assert(size > 0);
+    assert(size_out != nullptr);
+    size_t rounded = (size + kBoltHugePageBytes - 1) &
+                     ~(kBoltHugePageBytes - 1);
+
+#if !defined(BOLT_ENABLE_HUGE_PAGES) || BOLT_ENABLE_HUGE_PAGES == 0
+    // Compile-time off: fall back immediately, report the caller-requested
+    // size cache-line rounded (64-byte aligned via bolt_aligned_alloc).
+    (void)rounded;
+    *size_out = size;
+    return bolt_aligned_alloc(64, size);
+#elif defined(_WIN32)
+    void* p = VirtualAlloc(nullptr, rounded,
+                           MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE);
+    if (p != nullptr) { *size_out = rounded; return p; }
+    // Fallback: plain aligned alloc at the caller-requested size.
+    *size_out = size;
+    return bolt_aligned_alloc(64, size);
+#elif defined(__linux__)
+    // MAP_HUGETLB first; fall back to regular mmap + MADV_HUGEPAGE on fail.
+    #if defined(MAP_HUGETLB)
+    void* p = ::mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (p != MAP_FAILED) { *size_out = rounded; return p; }
+    #endif
+    void* q = ::mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (q == MAP_FAILED) { *size_out = size; return bolt_aligned_alloc(64, size); }
+    #if defined(MADV_HUGEPAGE)
+    (void)::madvise(q, rounded, MADV_HUGEPAGE);
+    #endif
+    *size_out = rounded;
+    return q;
+#else
+    *size_out = size;
+    return bolt_aligned_alloc(64, size);
+#endif
+}
+
+// Paired free.  Needs the size returned from bolt_aligned_alloc_huge for
+// the Linux munmap path; Windows and the fallback ignore it.
+BOLT_FORCE_INLINE void bolt_aligned_free_huge(void* p, size_t size) noexcept {
+    if (p == nullptr) return;
+#if !defined(BOLT_ENABLE_HUGE_PAGES) || BOLT_ENABLE_HUGE_PAGES == 0
+    (void)size;
+    bolt_aligned_free(p);
+#elif defined(_WIN32)
+    (void)size;
+    // If the allocation came from VirtualAlloc we must VirtualFree; if it
+    // fell back to _aligned_malloc we must _aligned_free. Distinguish via
+    // VirtualQuery: pages from VirtualAlloc have a nonzero AllocationBase.
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(p, &info, sizeof(info)) != 0 &&
+        info.AllocationBase == p &&
+        (info.Type & MEM_PRIVATE) != 0 &&
+        (info.State & MEM_COMMIT) != 0) {
+        VirtualFree(p, 0, MEM_RELEASE);
+    } else {
+        bolt_aligned_free(p);
+    }
+#elif defined(__linux__)
+    if (size > 0) ::munmap(p, size);
+    else bolt_aligned_free(p);
+#else
+    (void)size;
+    bolt_aligned_free(p);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Platform headers needed by the thread-affinity / NUMA shims below.
 // Kept inside their own #ifdef branches so non-host platforms stay clean.
 // ---------------------------------------------------------------------------
@@ -169,6 +272,7 @@ BOLT_FORCE_INLINE void bolt_aligned_free(void* p) noexcept {
 #elif defined(__linux__)
     #include <pthread.h>
     #include <sched.h>
+    #include <sys/mman.h>
     #include <sys/syscall.h>
     #include <unistd.h>
 #elif defined(__APPLE__)
@@ -185,10 +289,10 @@ BOLT_FORCE_INLINE void bolt_aligned_free(void* p) noexcept {
 // #ifdef branches to keep the common public surface clean.
 //
 // Per-platform semantics:
-//   * Windows: thread affinity via SetThreadAffinityMask, logical CPUs
-//     0..63 only for this wave.
-//     TODO(bolt): wider-than-64 cores via processor groups
-//     (SetThreadGroupAffinity).
+//   * Windows: thread affinity — processor-group aware. CPUs 0..63 pin
+//     via `SetThreadAffinityMask` (single-group fast path); CPUs 64+
+//     use `SetThreadGroupAffinity` (group_idx = cpu >> 6, mask within
+//     group = 1 << (cpu & 63)). Supports the full 4096-CPU space.
 //   * Linux:   pthread_setaffinity_np; NUMA via raw set_mempolicy syscall
 //     to stay libnuma-free.
 //   * macOS:   thread_policy_set(THREAD_AFFINITY_POLICY) — Darwin treats
@@ -203,20 +307,31 @@ BOLT_FORCE_INLINE uint32_t bolt_get_hardware_concurrency() noexcept {
 }
 
 // Pin the calling thread to `logical_cpu`. Returns true on success.
-// On macOS this is only a scheduler hint. On Windows we currently support
-// CPUs 0..63 (single processor group).
+// On macOS this is only a scheduler hint. On Windows this routes to
+// `SetThreadAffinityMask` (group 0) or `SetThreadGroupAffinity` (group > 0)
+// based on `logical_cpu >> 6`, covering the full 4096-CPU space.
 BOLT_FORCE_INLINE bool bolt_pin_current_thread(uint32_t logical_cpu) noexcept {
     assert(logical_cpu < 4096u && "suspiciously large logical CPU index");
 #if defined(_WIN32)
-    // TODO(bolt): wider-than-64 cores via processor groups.
-    assert(logical_cpu < 64u && "Windows shim supports CPUs 0..63 only");
-    if (logical_cpu >= 64u) {
-        return false;
+    HANDLE         h            = GetCurrentThread();
+    const uint32_t group_idx    = logical_cpu >> 6;
+    const uint32_t cpu_in_group = logical_cpu & 63u;
+    if (group_idx == 0u) {
+        // Single-group fast path — preserves the classic affinity mask.
+        DWORD_PTR mask = static_cast<DWORD_PTR>(1ull << cpu_in_group);
+        DWORD_PTR prev = SetThreadAffinityMask(h, mask);
+        return prev != 0;
     }
-    HANDLE     h    = GetCurrentThread();
-    DWORD_PTR  mask = static_cast<DWORD_PTR>(1ull << (logical_cpu & 63u));
-    DWORD_PTR  prev = SetThreadAffinityMask(h, mask);
-    return prev != 0;
+    // Multi-group: groups 0..n-1 each hold up to 64 logical CPUs.
+    // SetThreadGroupAffinity is the Win7+ API that crosses the group boundary.
+    GROUP_AFFINITY ga;
+    ga.Mask        = static_cast<KAFFINITY>(1ull << cpu_in_group);
+    ga.Group       = static_cast<WORD>(group_idx);
+    ga.Reserved[0] = 0;
+    ga.Reserved[1] = 0;
+    ga.Reserved[2] = 0;
+    const BOOL ok = SetThreadGroupAffinity(h, &ga, nullptr);
+    return ok != 0;
 #elif defined(__linux__)
     assert(logical_cpu < static_cast<uint32_t>(CPU_SETSIZE) && "cpu index exceeds CPU_SETSIZE");
     if (logical_cpu >= static_cast<uint32_t>(CPU_SETSIZE)) {
@@ -721,6 +836,19 @@ BOLT_FORCE_INLINE bmm_vec_f32 bmm_cmpgt_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexce
 BOLT_FORCE_INLINE bmm_vec_f32 bmm_cmpeq_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return _mm256_cmp_ps(a, b, _CMP_EQ_OQ); }
 BOLT_FORCE_INLINE int bmm_movemask_f32(bmm_vec_f32 v) noexcept { return _mm256_movemask_ps(v); }
 
+// f32 accumulator primitives (A5 — sum kernel support)
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_setzero_f32() noexcept { return _mm256_setzero_ps(); }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_add_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return _mm256_add_ps(a, b); }
+BOLT_FORCE_INLINE float bmm_hadd_f32(bmm_vec_f32 v) noexcept {
+    // 8-lane → 4-lane reduce via hi+lo halves, then scalar-pair reduce.
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x1));
+    return _mm_cvtss_f32(s1);
+}
+
 // i8 vector (32 lanes on AVX2)
 using bmm_vec_i8 = __m256i;
 inline constexpr int bmm_lanes_i8 = 32;
@@ -913,6 +1041,13 @@ BOLT_FORCE_INLINE bmm_vec_f32 bmm_set1_f32(float x) noexcept { return _mm_set1_p
 BOLT_FORCE_INLINE bmm_vec_f32 bmm_cmpgt_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return _mm_cmpgt_ps(a, b); }
 BOLT_FORCE_INLINE bmm_vec_f32 bmm_cmpeq_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return _mm_cmpeq_ps(a, b); }
 BOLT_FORCE_INLINE int bmm_movemask_f32(bmm_vec_f32 v) noexcept { return _mm_movemask_ps(v); }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_setzero_f32() noexcept { return _mm_setzero_ps(); }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_add_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return _mm_add_ps(a, b); }
+BOLT_FORCE_INLINE float bmm_hadd_f32(bmm_vec_f32 v) noexcept {
+    __m128 s2 = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x1));
+    return _mm_cvtss_f32(s1);
+}
 
 using bmm_vec_i8 = __m128i;
 inline constexpr int bmm_lanes_i8 = 16;
@@ -1007,6 +1142,9 @@ BOLT_FORCE_INLINE int bmm_movemask_f32(bmm_vec_f32 v) noexcept {
     uint32x4_t bits = vshlq_u32(vshrq_n_u32(u, 31), shift);
     return static_cast<int>(vaddvq_u32(bits));
 }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_setzero_f32() noexcept { return vdupq_n_f32(0.0f); }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_add_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept { return vaddq_f32(a, b); }
+BOLT_FORCE_INLINE float bmm_hadd_f32(bmm_vec_f32 v) noexcept { return vaddvq_f32(v); }
 
 using bmm_vec_i8 = int8x16_t;
 inline constexpr int bmm_lanes_i8 = 16;
@@ -1132,6 +1270,11 @@ BOLT_FORCE_INLINE int bmm_movemask_f32(bmm_vec_f32 v) noexcept {
     }
     return m;
 }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_setzero_f32() noexcept { return bmm_vec_f32{{0.0f,0.0f,0.0f,0.0f}}; }
+BOLT_FORCE_INLINE bmm_vec_f32 bmm_add_f32(bmm_vec_f32 a, bmm_vec_f32 b) noexcept {
+    bmm_vec_f32 r; for (int i=0;i<4;++i) r.v[i] = a.v[i] + b.v[i]; return r;
+}
+BOLT_FORCE_INLINE float bmm_hadd_f32(bmm_vec_f32 v) noexcept { return v.v[0]+v.v[1]+v.v[2]+v.v[3]; }
 
 struct bmm_vec_i8 { std::array<int8_t, 16> v; };
 inline constexpr int bmm_lanes_i8 = 16;
@@ -1212,6 +1355,62 @@ BOLT_FORCE_INLINE uint32_t bmm_popcount_mask(uint32_t m) noexcept {
 }
 
 } // namespace simd
+
+// ---------------------------------------------------------------------------
+// bolt_memcpy_nt — non-temporal streaming copy for buffers larger than L3.
+//
+// Standalone primitive kept alongside plain `memcpy`.  The default COW /
+// clone_into paths still use `memcpy` (cache-friendly for buffers that
+// the caller plans to read back).  `bolt_memcpy_nt` is for one-shot
+// large transfers (persisted materialisations, spill buffers, arena
+// evictions) where the destination will NOT be re-read soon — streaming
+// stores bypass the cache and save L2/L3 eviction cost.
+//
+// Default threshold: 8 MB (~half of a modern-laptop L3).  Below that,
+// caller should prefer `memcpy` — NT stores beat memcpy only when the
+// destination isn't about to be reloaded.  Callers override by measuring.
+//
+// AVX2: `_mm256_stream_si256` on 64-byte-aligned chunks, scalar tail.
+// Non-AVX2 / non-x86: falls back to plain `memcpy` (memcpy is already
+// well-optimised on those paths).
+// ---------------------------------------------------------------------------
+
+inline constexpr size_t kBoltMemcpyNtThreshold = 8u * 1024u * 1024u;
+
+BOLT_FORCE_INLINE void bolt_memcpy_nt(void* BOLT_RESTRICT dst,
+                                      const void* BOLT_RESTRICT src,
+                                      size_t bytes) noexcept {
+    assert(dst != nullptr || bytes == 0);
+    assert(src != nullptr || bytes == 0);
+#if BOLT_SIMD_AVX2 || BOLT_SIMD_AVX512
+    // Require 32-byte alignment for NT stores; if callers can't meet it
+    // fall back to memcpy (hot-path asserts would be wrong here — the
+    // fallback is a correctness, not a perf, requirement).
+    const uintptr_t a = reinterpret_cast<uintptr_t>(dst);
+    if ((a & 31u) != 0u) { memcpy(dst, src, bytes); return; }
+
+    uint8_t*       d = static_cast<uint8_t*>(dst);
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    size_t i = 0;
+    // 128-byte chunks → 4 × _mm256_stream_si256 per iter (one cache line each).
+    for (; i + 128u <= bytes; i += 128u) {
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i +  0));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i +  0), v0);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), v1);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), v2);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), v3);
+    }
+    // Scalar tail for sub-128-byte remainder.
+    if (i < bytes) memcpy(d + i, s + i, bytes - i);
+    _mm_sfence();   // order NT stores before any subsequent loads
+#else
+    memcpy(dst, src, bytes);
+#endif
+}
+
 } // namespace bolt
 
 // ---------------------------------------------------------------------------

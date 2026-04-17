@@ -49,3 +49,7 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+      - name: Perf gate (Linux gcc only)
+        if: matrix.label == 'linux-gcc'
+        run: python3 ci/perf_check.py --build-dir build/${{ matrix.preset }}

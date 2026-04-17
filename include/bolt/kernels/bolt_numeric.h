@@ -292,6 +292,63 @@ inline accum_t<T> filter_sum_gt(const T* BOLT_RESTRICT data, int64_t n,
     return acc;
 }
 
+// filter_count_gt<T> — fully fused filter-then-count, branchless.
+// One compare + one 0/1 add per element. Auto-vectorises cleanly on all
+// ISAs; no selection vector, no data widening beyond bool-to-int.
+template <typename T>
+inline int64_t filter_count_gt(const T* BOLT_RESTRICT data, int64_t n,
+                               T scalar) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(n >= 0);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        count += static_cast<int64_t>(data[i] > scalar);
+    }
+    return count;
+}
+
+// filter_minmax_gt<T> — fully fused filter-then-{min,max}, branchless.
+// Walks rows that pass `> scalar` and tracks the min+max of those.
+// Uses a sentinel seeded to (numeric_limits::max, numeric_limits::lowest)
+// so an empty match reports "no result" via the returned count=0; when
+// count>0, min/max are the aggregate over matching rows.
+//
+// Returns the number of matching rows; writes results through `out_min`
+// and `out_max` (non-null, caller-owned).
+template <typename T>
+inline int64_t filter_minmax_gt(const T* BOLT_RESTRICT data, int64_t n,
+                                T scalar,
+                                T* BOLT_RESTRICT out_min,
+                                T* BOLT_RESTRICT out_max) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out_min != nullptr);
+    assert(out_max != nullptr);
+    assert(n >= 0);
+
+    // Seed sentinels so the first accepted row wins both comparisons
+    // without a leading branch. If no row passes, count=0 tells the
+    // caller not to read the sentinels.
+    T mn = std::numeric_limits<T>::max();
+    T mx = std::numeric_limits<T>::lowest();
+    int64_t count = 0;
+
+    for (int64_t i = 0; i < n; ++i) {
+        const T v  = data[i];
+        const bool pass = (v > scalar);
+        // Branchless update: if !pass, keep current min/max; if pass,
+        // take v when it extends the range. `pass ? v : mn` is a cmov
+        // on x86 / csel on ARM.
+        const T v_for_min = pass ? v : mn;
+        const T v_for_max = pass ? v : mx;
+        mn = (v_for_min < mn) ? v_for_min : mn;
+        mx = (v_for_max > mx) ? v_for_max : mx;
+        count += static_cast<int64_t>(pass);
+    }
+    *out_min = mn;
+    *out_max = mx;
+    return count;
+}
+
 // ============================================================================
 // Arithmetic kernels — two-input, one-output, write-into-buffer
 // ============================================================================

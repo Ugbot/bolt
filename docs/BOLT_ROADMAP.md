@@ -97,6 +97,13 @@ bolt::bolt     umbrella — core + all siblings
 
 ## Phases
 
+### Active wave — Base-layer perf lockdown
+
+Before any new feature surface (ingest/watermarks, marbledb, chukonu), we
+are closing out every half-landed or TODO'd perf item in a single tracked
+wave. See [`BOLT_PERF_PUNCHLIST.md`](BOLT_PERF_PUNCHLIST.md) for the live
+checklist, parallel-track layout, and per-item verification contract.
+
 ### Phase 0 — Hygiene + Windows portability pass  ✅ DONE
 
 Delivered:

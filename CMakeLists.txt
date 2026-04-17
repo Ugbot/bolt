@@ -32,6 +32,48 @@ set(BOLT_SIMD_TIER "NATIVE" CACHE STRING
     "SIMD ISA tier for bolt::core: NATIVE|AVX512|AVX2|SSE42|PORTABLE")
 set_property(CACHE BOLT_SIMD_TIER PROPERTY STRINGS NATIVE AVX512 AVX2 SSE42 PORTABLE)
 
+# ---------------------------------------------------------------------------
+# Perf-punchlist feature toggles (docs/BOLT_PERF_PUNCHLIST.md).
+# Each is a compile-time switch per the multiple-impls-one-default rule:
+# one default implementation ships active, alternatives live behind these
+# toggles with zero runtime branch cost.
+# ---------------------------------------------------------------------------
+
+# Huge pages (2 MB) for arenas ≥16 MB.  See D1.
+#   Linux: default ON — `mmap(MAP_HUGETLB)` + `madvise(MADV_HUGEPAGE)`.
+#   Windows: default OFF — `VirtualAlloc(MEM_LARGE_PAGES)` needs
+#            `SeLockMemoryPrivilege` which isn't granted by default.
+if(WIN32)
+    option(BOLT_ENABLE_HUGE_PAGES "Opt-in 2MB huge pages for large arenas" OFF)
+else()
+    option(BOLT_ENABLE_HUGE_PAGES "Opt-in 2MB huge pages for large arenas" ON)
+endif()
+
+# NUMA-aware per-socket channels + worker affinity.  See E1.
+option(BOLT_ENABLE_NUMA
+    "Enable NUMA-aware per-socket channel pools and worker affinity" OFF)
+
+# SwissTable layout alternative.  See C3.
+#   FLAT         — single flat 16-slot SIMD groups (default; current code)
+#   INTERLEAVED  — row-major groups+keys; wins on >L3 tables (TLB-friendly)
+set(BOLT_SWISS_LAYOUT "FLAT" CACHE STRING
+    "SwissTable physical layout: FLAT|INTERLEAVED")
+set_property(CACHE BOLT_SWISS_LAYOUT PROPERTY STRINGS FLAT INTERLEAVED)
+
+# Hash mixer tier.  See A3 + docs/research/hash-functions.md.
+# All three variants are always compiled into the binary as named
+# functions in bolt_hash.h (keep-code-paths-for-JIT-later policy); this
+# switch only selects which one the default `swiss_mix` symbol resolves
+# to.
+#   WYHASH3 — wyhash-family 3-op mix (xor-shift / multiply / xor-shift).
+#             Current ship-default; wins on 1BRC-class workloads.
+#   MURMUR3 — Murmur3 finalizer (6 ops). Slower but stronger avalanche.
+#   XXH3    — xxh3-64 finalizer shape. Stronger distribution than
+#             WYHASH3 at similar op count.
+set(BOLT_HASH_TIER "WYHASH3" CACHE STRING
+    "Hash mixer for SwissTable/hashjoin: WYHASH3|XXH3|MURMUR3")
+set_property(CACHE BOLT_HASH_TIER PROPERTY STRINGS WYHASH3 XXH3 MURMUR3)
+
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(BoltCompileOptions)
 
@@ -52,6 +94,7 @@ target_include_directories(bolt_core INTERFACE
 target_compile_features(bolt_core INTERFACE cxx_std_20)
 bolt_apply_hardening(bolt_core)
 bolt_apply_simd(bolt_core ${BOLT_SIMD_TIER})
+bolt_apply_feature_toggles(bolt_core)
 
 # Placeholder sibling modules. Populated as phases land.
 foreach(mod IN ITEMS kernels join wire arrow)

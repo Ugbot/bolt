@@ -37,6 +37,20 @@
       }
     },
     {
+      "name": "all-features",
+      "inherits": "base",
+      "displayName": "Release with every perf-punchlist toggle ON",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":        "Release",
+        "BOLT_SIMD_TIER":          "NATIVE",
+        "BOLT_ENABLE_NATIVE":      "ON",
+        "BOLT_ENABLE_HUGE_PAGES":  "ON",
+        "BOLT_ENABLE_NUMA":        "ON",
+        "BOLT_SWISS_LAYOUT":       "INTERLEAVED",
+        "BOLT_HASH_TIER":          "MURMUR3"
+      }
+    },
+    {
       "name": "msvc",
       "inherits": "base",
       "displayName": "MSVC (Visual Studio 2022)",
@@ -73,6 +87,7 @@
     {"name": "debug",            "configurePreset": "debug"},
     {"name": "release",          "configurePreset": "release"},
     {"name": "release-portable", "configurePreset": "release-portable"},
+    {"name": "all-features",     "configurePreset": "all-features"},
     {"name": "msvc",             "configurePreset": "msvc",       "configuration": "Release"},
     {"name": "ninja-msvc",       "configurePreset": "ninja-msvc"},
     {"name": "clang-cl",         "configurePreset": "clang-cl"}
@@ -81,6 +96,7 @@
     {"name": "debug",            "configurePreset": "debug",            "output": {"outputOnFailure": true}},
     {"name": "release",          "configurePreset": "release",          "output": {"outputOnFailure": true}},
     {"name": "release-portable", "configurePreset": "release-portable", "output": {"outputOnFailure": true}},
+    {"name": "all-features",     "configurePreset": "all-features",     "output": {"outputOnFailure": true}},
     {"name": "msvc",             "configurePreset": "msvc",             "configuration": "Release", "output": {"outputOnFailure": true}},
     {"name": "ninja-msvc",       "configurePreset": "ninja-msvc",       "output": {"outputOnFailure": true}},
     {"name": "clang-cl",         "configurePreset": "clang-cl",         "output": {"outputOnFailure": true}}

@@ -318,6 +318,63 @@ TEST(BoltKernels, GatherToColumnInt32Sparse) {
     EXPECT_EQ(got[3], 123 * 3);
 }
 
+// ---------------------------------------------------------------------------
+// gather_to_column<int32_t> — validity propagation (B1)
+// Source has a validity bitmap with some nulls; the output must receive a
+// freshly-packed bitmap where bit i reflects src's validity at sel[i].
+// ---------------------------------------------------------------------------
+TEST(BoltKernels, GatherToColumnInt32ValidityPropagated) {
+    Arena arena;
+    int32_t src_data[8] = {100, 101, 102, 103, 104, 105, 106, 107};
+    // Arrow-format validity bitmap: 1 = valid.  Mark indices 1, 4, 6 as null.
+    // Bits (LSB-first): idx 0=1, 1=0, 2=1, 3=1, 4=0, 5=1, 6=0, 7=1
+    //                 = 0b1010_1101 = 0xAD
+    uint8_t validity[1] = {0xAD};
+    BoltColumn src = BoltColumn::make_flat(src_data, validity, 8, BoltType::Int32);
+    src.stats.all_valid = false;
+    src.stats.null_count = 3;
+
+    // Gather: include a mix of null (1,4,6) and valid (0,2,3,5,7) rows.
+    const int32_t sel[7] = {0, 1, 4, 2, 6, 7, 3};
+    BoltColumn out = gather_to_column<int32_t>(src, sel, 7, &arena);
+
+    ASSERT_EQ(out.length, 7);
+    ASSERT_NE(out.validity, nullptr)
+        << "validity bitmap must be propagated when src has nulls";
+    EXPECT_FALSE(out.stats.all_valid);
+    EXPECT_EQ(out.stats.null_count, 3);
+    EXPECT_EQ(out.validity_offset, 0);
+
+    // Expected: sel[i] points to src row r; bit i in out.validity should
+    // mirror bit r in src.validity.
+    //   sel = {0, 1, 4, 2, 6, 7, 3}
+    //   src valid[r]: {1, 0, 0, 1, 0, 1, 1}
+    const uint8_t expect = 0b0101'1001;  // LSB-first = [1,0,0,1,1,0,1,...]
+    // Note: bit order in uint8_t: bit 0 = 2^0, so reading the literal as LSB-
+    // first gives the sequence {1,0,0,1,1,0,1,0}. sel produces {1,0,0,1,0,1,1}
+    // = {1,0,0,1,0,1,1, 0} in bit order → 0b0110'1001 = 0x69.
+    EXPECT_EQ(out.validity[0] & 0x7F, 0x69)
+        << "validity bits=" << int(out.validity[0]);
+    (void)expect;
+}
+
+TEST(BoltKernels, GatherToColumnInt32AllValidSrcNoBitmap) {
+    // Source declares all_valid and has no bitmap — the output must not
+    // allocate a validity bitmap either (fast path preserved).
+    Arena arena;
+    int32_t src_data[4] = {1, 2, 3, 4};
+    BoltColumn src = BoltColumn::make_flat(src_data, nullptr, 4, BoltType::Int32);
+    ASSERT_TRUE(src.stats.all_valid);
+
+    const int32_t sel[3] = {3, 0, 2};
+    BoltColumn out = gather_to_column<int32_t>(src, sel, 3, &arena);
+
+    EXPECT_EQ(out.length, 3);
+    EXPECT_EQ(out.validity, nullptr);
+    EXPECT_TRUE(out.stats.all_valid);
+    EXPECT_EQ(out.stats.null_count, 0);
+}
+
 // ===========================================================================
 // Wave F1 — sum_masked / filter_sum_gt (fused filter+sum)
 // ===========================================================================
@@ -418,6 +475,59 @@ TEST(BoltKernels, FilterSumGtBoundary) {
     // threshold MAX → nothing qualifies.
     int64_t s3 = filter_sum_gt<int32_t>(data, 5, MAX);
     EXPECT_EQ(s3, 0);
+}
+
+TEST(BoltKernels, FilterCountGtMatchesTwoPass) {
+    constexpr int64_t N = 4096;
+    std::vector<int32_t> data(N);
+    std::vector<int32_t> sel(N);
+    std::mt19937 rng(0xF11E);
+    std::uniform_int_distribution<int32_t> dv(-500, 500);
+    for (int64_t i = 0; i < N; ++i) data[i] = dv(rng);
+    const int32_t scalar = 42;
+
+    int64_t two_pass = filter_gt<int32_t>(data.data(), N, scalar, sel.data());
+    int64_t fused    = filter_count_gt<int32_t>(data.data(), N, scalar);
+    EXPECT_EQ(fused, two_pass);
+    EXPECT_EQ(filter_count_gt<int32_t>(nullptr, 0, 0), 0);
+}
+
+TEST(BoltKernels, FilterMinMaxGtMatchesManual) {
+    constexpr int64_t N = 4096;
+    std::vector<int64_t> data(N);
+    std::mt19937_64 rng(0xBABA);
+    std::uniform_int_distribution<int64_t> dv(-1'000'000, 1'000'000);
+    for (int64_t i = 0; i < N; ++i) data[i] = dv(rng);
+    const int64_t scalar = 123;
+
+    int64_t ref_min = std::numeric_limits<int64_t>::max();
+    int64_t ref_max = std::numeric_limits<int64_t>::lowest();
+    int64_t ref_count = 0;
+    for (int64_t v : data) {
+        if (v > scalar) {
+            ref_count++;
+            if (v < ref_min) ref_min = v;
+            if (v > ref_max) ref_max = v;
+        }
+    }
+
+    int64_t got_min = 0, got_max = 0;
+    int64_t got_count = filter_minmax_gt<int64_t>(
+        data.data(), N, scalar, &got_min, &got_max);
+    EXPECT_EQ(got_count, ref_count);
+    ASSERT_GT(ref_count, 0);
+    EXPECT_EQ(got_min, ref_min);
+    EXPECT_EQ(got_max, ref_max);
+}
+
+TEST(BoltKernels, FilterMinMaxGtNonePass) {
+    const int32_t data[] = {1, 2, 3};
+    int32_t mn = 0, mx = 0;
+    int64_t n = filter_minmax_gt<int32_t>(data, 3, 1000, &mn, &mx);
+    EXPECT_EQ(n, 0);
+    // Sentinels are held; callers must gate on count.
+    EXPECT_EQ(mn, std::numeric_limits<int32_t>::max());
+    EXPECT_EQ(mx, std::numeric_limits<int32_t>::lowest());
 }
 
 TEST(BoltKernels, FilterSumGtAllPass) {

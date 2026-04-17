@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <vector>
 
 using namespace bolt;
@@ -423,4 +424,119 @@ TEST(BoltHashJoin, BranchlessProbeLargeInput) {
         EXPECT_EQ(got_pairs[i].b, ref_pairs[i].b) << "i=" << i;
         EXPECT_EQ(got_pairs[i].p, ref_pairs[i].p) << "i=" << i;
     }
+}
+
+// ---------- Bloom-gated probe (C2) ---------------------------------------
+// `probe_with_bloom` must return the same pairs as the default `probe`,
+// build-side constructed with `build_bloom = true`. Exercises both the
+// SIMD block and the scalar tail path via a large mixed-match input.
+TEST(BoltHashJoin, BloomGatedProbeMatchesDefault) {
+    Arena arena;
+    constexpr int64_t BN = 1024;
+    constexpr int64_t PN = 100000;
+    std::vector<int64_t> bk(BN), pk(PN);
+    for (int64_t i = 0; i < BN; ++i) bk[i] = 20000 + i;
+
+    // ~10% match rate — the regime where Bloom should be net-positive.
+    uint64_t s = 0x9E3779B97F4A7C15ULL;
+    int64_t expected_hits = 0;
+    for (int64_t i = 0; i < PN; ++i) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        bool hit = ((s % 10u) == 0);
+        if (hit) {
+            pk[i] = 20000 + static_cast<int64_t>((s >> 3) % BN);
+            ++expected_hits;
+        } else {
+            pk[i] = -1000000 - static_cast<int64_t>(i);
+        }
+    }
+
+    BoltColumn bc = BoltColumn::make_flat(bk.data(), nullptr, BN, BoltType::Int64);
+    BoltColumn pc = BoltColumn::make_flat(pk.data(), nullptr, PN, BoltType::Int64);
+
+    HashJoinBuild b{};
+    ASSERT_TRUE(b.build(bc, &arena, /*build_bloom=*/true));
+    ASSERT_TRUE(b.has_bloom);
+
+    std::vector<int32_t> out_b(PN), out_p(PN);
+    int64_t got = HashJoinProbe::probe_with_bloom(
+        b, pc, out_b.data(), out_p.data());
+    ASSERT_EQ(got, expected_hits);
+
+    // Cross-check against the non-Bloom path on the same build side.
+    std::vector<int32_t> ref_b(PN), ref_p(PN);
+    int64_t ref_got = HashJoinProbe::probe(b, pc, ref_b.data(), ref_p.data());
+    ASSERT_EQ(got, ref_got);
+
+    std::vector<Pair> got_pairs(got), ref_pairs(ref_got);
+    for (int64_t i = 0; i < got; ++i) got_pairs[i] = {out_b[i], out_p[i]};
+    for (int64_t i = 0; i < ref_got; ++i) ref_pairs[i] = {ref_b[i], ref_p[i]};
+    std::sort(got_pairs.begin(), got_pairs.end(), pair_lt);
+    std::sort(ref_pairs.begin(), ref_pairs.end(), pair_lt);
+    for (int64_t i = 0; i < got; ++i) {
+        EXPECT_EQ(got_pairs[i].b, ref_pairs[i].b) << "i=" << i;
+        EXPECT_EQ(got_pairs[i].p, ref_pairs[i].p) << "i=" << i;
+    }
+}
+
+TEST(BoltHashJoin, BloomNotBuiltByDefault) {
+    Arena arena;
+    int64_t bk[4] = {1, 2, 3, 4};
+    BoltColumn bc = BoltColumn::make_flat(bk, nullptr, 4, BoltType::Int64);
+
+    HashJoinBuild b{};
+    ASSERT_TRUE(b.build(bc, &arena));
+    EXPECT_FALSE(b.has_bloom);  // default is bloom-off
+}
+
+// ---------- SwissTableInterleaved (C3) -----------------------------------
+// Build-from-flat + find must return the same value as the source
+// SwissTable for every key that was inserted (and -1 for every miss).
+TEST(BoltSwiss, InterleavedMatchesFlatFind) {
+    Arena arena;
+    SwissTable flat;
+    ASSERT_TRUE(SwissTable::create(&flat, /*capacity_hint=*/256, &arena));
+
+    // Insert 200 unique keys mapped to sequential values.
+    std::mt19937_64 rng(0xC0FFEE);
+    std::vector<uint64_t> keys;
+    keys.reserve(200);
+    for (int i = 0; i < 200; ++i) {
+        uint64_t k = rng();
+        // Avoid accidental collisions in the test fixture.
+        while (flat.find(k) >= 0) k = rng();
+        ASSERT_TRUE(flat.insert(k, static_cast<uint32_t>(i)));
+        keys.push_back(k);
+    }
+
+    SwissTableInterleaved iv{};
+    ASSERT_TRUE(SwissTableInterleaved::build_from(&iv, flat, &arena));
+    EXPECT_EQ(iv.capacity, flat.capacity);
+    EXPECT_EQ(iv.size, flat.size);
+
+    // Hits: every inserted key must find at the same value in both.
+    for (int i = 0; i < 200; ++i) {
+        int32_t f = flat.find(keys[i]);
+        int32_t g = iv.find(keys[i]);
+        ASSERT_EQ(f, static_cast<int32_t>(i)) << "flat miss at i=" << i;
+        EXPECT_EQ(g, f) << "interleaved mismatch at i=" << i;
+    }
+    // Misses: random never-inserted keys.
+    for (int i = 0; i < 200; ++i) {
+        uint64_t miss = rng() | 1ULL;  // perturb; extremely unlikely to collide
+        int32_t f = flat.find(miss);
+        int32_t g = iv.find(miss);
+        EXPECT_EQ(g, f) << "miss disagreement at i=" << i;
+    }
+}
+
+TEST(BoltSwiss, InterleavedEmptyTable) {
+    Arena arena;
+    SwissTable flat;
+    ASSERT_TRUE(SwissTable::create(&flat, /*capacity_hint=*/16, &arena));
+    SwissTableInterleaved iv{};
+    ASSERT_TRUE(SwissTableInterleaved::build_from(&iv, flat, &arena));
+    EXPECT_EQ(iv.find(42), -1);
+    EXPECT_EQ(iv.find(0), -1);
+    EXPECT_EQ(iv.size, 0u);
 }

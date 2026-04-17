@@ -145,6 +145,56 @@ function(bolt_apply_simd tgt mode)
     endif()
 endfunction()
 
+# bolt_apply_feature_toggles(tgt)
+#   Propagate the perf-punchlist compile-time toggles as preprocessor
+#   defines on `tgt` (INTERFACE scope for INTERFACE libs, PRIVATE otherwise).
+#   Toggles: BOLT_ENABLE_HUGE_PAGES, BOLT_ENABLE_NUMA, BOLT_SWISS_LAYOUT,
+#   BOLT_HASH_TIER.  See docs/BOLT_PERF_PUNCHLIST.md.
+function(bolt_apply_feature_toggles tgt)
+    get_target_property(type ${tgt} TYPE)
+    if(type STREQUAL "INTERFACE_LIBRARY")
+        set(scope INTERFACE)
+    else()
+        set(scope PRIVATE)
+    endif()
+
+    if(BOLT_ENABLE_HUGE_PAGES)
+        target_compile_definitions(${tgt} ${scope} BOLT_ENABLE_HUGE_PAGES=1)
+    else()
+        target_compile_definitions(${tgt} ${scope} BOLT_ENABLE_HUGE_PAGES=0)
+    endif()
+
+    if(BOLT_ENABLE_NUMA)
+        target_compile_definitions(${tgt} ${scope} BOLT_ENABLE_NUMA=1)
+    else()
+        target_compile_definitions(${tgt} ${scope} BOLT_ENABLE_NUMA=0)
+    endif()
+
+    string(TOUPPER "${BOLT_SWISS_LAYOUT}" _swiss_up)
+    if(_swiss_up STREQUAL "FLAT")
+        target_compile_definitions(${tgt} ${scope} BOLT_SWISS_LAYOUT_FLAT=1)
+    elseif(_swiss_up STREQUAL "INTERLEAVED")
+        target_compile_definitions(${tgt} ${scope} BOLT_SWISS_LAYOUT_INTERLEAVED=1)
+    else()
+        message(FATAL_ERROR
+            "bolt_apply_feature_toggles: BOLT_SWISS_LAYOUT='${BOLT_SWISS_LAYOUT}' "
+            "(expected FLAT|INTERLEAVED)")
+    endif()
+
+    string(TOUPPER "${BOLT_HASH_TIER}" _hash_up)
+    if(_hash_up STREQUAL "WYHASH3")
+        target_compile_definitions(${tgt} ${scope} BOLT_HASH_TIER_WYHASH3=1)
+    elseif(_hash_up STREQUAL "XXH3")
+        target_compile_definitions(${tgt} ${scope} BOLT_HASH_TIER_XXH3=1)
+    elseif(_hash_up STREQUAL "MURMUR3")
+        target_compile_definitions(${tgt} ${scope} BOLT_HASH_TIER_MURMUR3=1)
+    else()
+        message(FATAL_ERROR
+            "bolt_apply_feature_toggles: BOLT_HASH_TIER='${BOLT_HASH_TIER}' "
+            "(expected WYHASH3|XXH3|MURMUR3)")
+    endif()
+endfunction()
+
 function(bolt_apply_bench_tuning tgt)
     if(MSVC)
         target_compile_options(${tgt} PRIVATE /O2)

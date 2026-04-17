@@ -23,6 +23,9 @@ or plan prose. New topic → new file + add an entry below.
   with measured outcomes: what we tried, what we kept, what we backed
   out and why. Append-only; future tuning starts here so we don't
   re-litigate `MergeTriple` 40-vs-64-byte etc.
+- [`../BOLT_PERF_PUNCHLIST.md`](../BOLT_PERF_PUNCHLIST.md) — the live
+  checklist of base-layer perf items being closed out before any new
+  feature surface opens. Each ticked box links to a design-log entry.
 
 ### Hashing
 
@@ -71,6 +74,8 @@ or plan prose. New topic → new file + add an entry below.
 
 ### Dataflow runtime (Wave 1)
 
+Design-blocking research:
+
 - [dataflow-operators.md](dataflow-operators.md) — operator algebra
   (POD struct + fn ptr, push-stream, no vtable), fusion classes
   (trivial / compute / pipeline-breaking), three-category pipeline
@@ -87,6 +92,26 @@ or plan prose. New topic → new file + add an entry below.
   shape for the 74 fintech kernels: Tier 1 mechanical, Tier 2
   stateful (arena-pinned POD state), Tier 3 deferred until
   event-time + keyed state primitives land. Worked EMA diff.
+
+Comparative analysis (validates the choices above):
+
+- [polars-streaming-engine.md](polars-streaming-engine.md) — lazy
+  expression DAG, predicate / projection / slice pushdown, streaming
+  morsels (~50K rows), pipeline-breaker phases, Rayon work-stealing.
+- [duckdb-vectorized-push.md](duckdb-vectorized-push.md) — Vector
+  multi-format (Flat / Constant / Dictionary / Sequence / FSST),
+  push-based execution, pipeline-breaker categorization,
+  partition-on-overflow, morsel-driven parallelism. Many of Bolt's
+  existing primitives trace here.
+- [tremor-rs-lessons.md](tremor-rs-lessons.md) — TQL-defined
+  pipelines, contraflow back-pressure channel, connector / operator
+  separation, circuit breakers. We adopt the connector model
+  conceptually; skip the DSL.
+- [kdb-questdb-tick-models.md](kdb-questdb-tick-models.md) — the
+  user's explicit perf anchors. kdb+ tickerplant + RDB + HDB chain;
+  QuestDB time-partitioned column files, symbol type, O3 ingest,
+  JIT filters. The continuous-query shape these model is the same
+  shape bolt::dataflow's push dispatch produces.
 
 Synthesized into the design doc [`../BOLT_DATAFLOW.md`](../BOLT_DATAFLOW.md).
 

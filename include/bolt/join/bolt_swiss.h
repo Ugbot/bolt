@@ -14,6 +14,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_config.h"
+#include "bolt/bolt_hash.h"
 #include "bolt/bolt_port.h"
 
 #include <cassert>
@@ -39,26 +40,14 @@ struct SwissSlot {
 static_assert(sizeof(SwissSlot) == 16, "SwissSlot must be 16 bytes");
 
 // ---------------------------------------------------------------------------
-// Hash mixer — wyhash-style 3-op mix.
+// Hash mixer — see `bolt_hash.h`.
 //
-// Was Murmur3 finalizer (6 ops, ~5-7 cycle dep chain). The 3-op form
-// keeps independent high/low halves (so SwissTable's tag/idx split keeps
-// its selectivity) at roughly half the cost. Avalanche margin is lower
-// than Murmur3 but adequate for open-addressing on adversarial-but-not-
-// pathological inputs.
-//
-// Trade-off rationale and rejected alternatives (plain Fibonacci hash,
-// PtrHash, pre-hashed contracts) are documented in
-// docs/research/hash-functions.md. Constant from the wyhash / foldhash
-// family (Wang Yi, https://github.com/wangyi-fudan/wyhash).
+// `swiss_mix` resolves to the variant selected by `BOLT_HASH_TIER_*`
+// (WYHASH3 default, XXH3 and MURMUR3 also compiled in). Rationale,
+// alternatives, and measured trade-offs live in
+// docs/research/hash-functions.md and
+// docs/research/design-log.md ("Hash mixer — …"). No runtime branch.
 // ---------------------------------------------------------------------------
-BOLT_FORCE_INLINE uint64_t swiss_mix(uint64_t k) noexcept {
-    k ^= k >> 32;
-    k *= 0xE7037ED1A0B428DBULL;
-    k ^= k >> 32;
-    return k;
-}
-
 BOLT_FORCE_INLINE uint8_t swiss_tag(uint64_t h) noexcept {
     // Low 7 bits of the upper word; high bit 0 so we never collide with Empty.
     return static_cast<uint8_t>((h >> 57) & 0x7Fu);
@@ -256,6 +245,177 @@ struct SwissTable {
                 out[i] = find(keys[i]);
             }
         }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SwissTableInterleaved (C3) — read-only interleaved layout alternative.
+//
+// FLAT layout (`SwissTable`): ctrl[capacity] and slots[capacity] live in
+// separate arrays.  A probe loads one ctrl cache line and, on a tag
+// match, loads one SwissSlot cache line (may be 4 lines away in memory).
+// On >L3 tables the ctrl↔slot pair traverse different TLB entries.
+//
+// INTERLEAVED layout (`SwissTableInterleaved`): each group of 16 control
+// bytes + 16 SwissSlot entries sits in one contiguous 272-byte block.
+// The ctrl cache line and the first few slot cache lines fall under the
+// same TLB mapping — probes that match in the first few lanes save a
+// TLB walk on large tables.
+//
+// Build-once, probe-many: `build_from` copies a populated `SwissTable`
+// into the interleaved layout. No insert/update/delete in this wave —
+// hash-join build is insert-once, so this covers the main use-case.
+// Kept-code-paths policy: FLAT remains the default
+// (`BOLT_SWISS_LAYOUT_FLAT=1` from `bolt_apply_feature_toggles`). This
+// alternative ships alongside and is reachable by name (or by CMake
+// switch once a caller auto-selects per table size).
+// ---------------------------------------------------------------------------
+
+// Local cache-line constant (bolt_channel.h defines the canonical one but
+// we avoid the include-cycle by duplicating it here).
+inline constexpr uint32_t kSwissCacheLine = 64;
+
+// One packed group: 16 ctrl bytes + 16 slots. Cache-line-aligned so the
+// group lands on a line boundary regardless of the previous group's end.
+struct alignas(kSwissCacheLine) SwissInterleavedGroup {
+    uint8_t   ctrl[kSwissGroupWidth];   // 16 bytes
+    uint8_t   pad[kSwissCacheLine - kSwissGroupWidth]; // pad before slots
+    SwissSlot slots[kSwissGroupWidth];  // 16 × 16 = 256 bytes = 4 lines
+};
+static_assert(sizeof(SwissInterleavedGroup) ==
+              kSwissCacheLine + sizeof(SwissSlot) * kSwissGroupWidth,
+              "SwissInterleavedGroup layout");
+
+struct SwissTableInterleaved {
+    SwissInterleavedGroup* groups;  // capacity / kGroupWidth entries
+    uint32_t               num_groups;  // capacity / kSwissGroupWidth
+    uint32_t               group_mask;  // num_groups - 1
+    uint32_t               capacity;
+    uint32_t               size;
+
+    // Create an empty interleaved table sized for `capacity_hint` entries.
+    // Internal probing is group-aligned (probe-by-group, not probe-by-slot),
+    // so the layout is self-contained — key placement will differ from FLAT
+    // but every key that was inserted here is findable here.
+    static bool create(SwissTableInterleaved* out, uint64_t capacity_hint,
+                       Arena* arena) noexcept {
+        assert(out != nullptr);
+        assert(arena != nullptr);
+
+        uint64_t target = capacity_hint * 2;
+        if (target < kSwissMinCapacity) target = kSwissMinCapacity;
+        uint32_t cap = swiss_round_up_pow2(target);
+        const uint32_t ng = cap / kSwissGroupWidth;
+
+        SwissInterleavedGroup* g = arena->allocate_array<SwissInterleavedGroup>(ng);
+        if (!g) return false;
+
+        // Initialize every ctrl byte to Empty; slots zero-init.
+        for (uint32_t i = 0; i < ng; ++i) {
+            memset(g[i].ctrl, kSwissCtrlEmpty, kSwissGroupWidth);
+            memset(g[i].slots, 0, sizeof(SwissSlot) * kSwissGroupWidth);
+        }
+
+        out->groups      = g;
+        out->num_groups  = ng;
+        out->group_mask  = ng - 1u;
+        out->capacity    = cap;
+        out->size        = 0;
+        return true;
+    }
+
+    // Insert. Linear-probe across groups (group-aligned).  Within a group,
+    // fill the first Empty lane.  Returns false if the table is full.
+    bool insert(uint64_t key, uint32_t value) noexcept {
+        assert(groups != nullptr);
+        if (size >= capacity) return false;
+
+        const uint64_t h = swiss_mix(key);
+        const uint8_t tag = swiss_tag(h);
+        uint32_t gi = (static_cast<uint32_t>(h) & (capacity - 1u)) / kSwissGroupWidth;
+
+        for (uint32_t p = 0; p < num_groups; ++p) {
+            SwissInterleavedGroup& grp = groups[gi];
+            // Scan for matching tag first — update-on-existing-key.
+            for (uint32_t lane = 0; lane < kSwissGroupWidth; ++lane) {
+                const uint8_t c = grp.ctrl[lane];
+                if (c == tag && grp.slots[lane].key == key) {
+                    grp.slots[lane].value = value;
+                    return true;
+                }
+            }
+            // No existing match — look for an Empty.
+            for (uint32_t lane = 0; lane < kSwissGroupWidth; ++lane) {
+                if (grp.ctrl[lane] == kSwissCtrlEmpty) {
+                    grp.ctrl[lane] = tag;
+                    grp.slots[lane].key   = key;
+                    grp.slots[lane].value = value;
+                    ++size;
+                    return true;
+                }
+            }
+            gi = (gi + 1u) & group_mask;
+        }
+        return false;
+    }
+
+    // Build from a populated FLAT SwissTable by reinserting every occupied
+    // slot. Capacity matches the source so collisions don't force growth.
+    static bool build_from(SwissTableInterleaved* out, const SwissTable& src,
+                           Arena* arena) noexcept {
+        assert(out != nullptr);
+        assert(arena != nullptr);
+        assert(src.capacity > 0);
+
+        // Size for >=src.size entries; interleaved's own 2x oversize runs
+        // inside create().
+        if (!create(out, src.size, arena)) return false;
+
+        for (uint32_t i = 0; i < src.capacity; ++i) {
+            if (src.ctrl[i] != kSwissCtrlEmpty) {
+                if (!out->insert(src.slots[i].key, src.slots[i].value)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Find. Returns value index, or -1.
+    int32_t find(uint64_t key) const noexcept {
+        assert(groups != nullptr);
+
+        using namespace bolt::simd;
+        const uint64_t h   = swiss_mix(key);
+        const uint8_t  tag = swiss_tag(h);
+
+        const bmm_vec_i8 vtag   = bmm_set1_i8(static_cast<int8_t>(tag));
+        const bmm_vec_i8 vempty = bmm_set1_i8(static_cast<int8_t>(kSwissCtrlEmpty));
+
+        uint32_t gi = (static_cast<uint32_t>(h) & (capacity - 1u)) / kSwissGroupWidth;
+
+        for (uint32_t p = 0; p < num_groups; ++p) {
+            const SwissInterleavedGroup& grp = groups[gi];
+            const bmm_vec_i8 cgrp = bmm_loadu_i8(
+                reinterpret_cast<const int8_t*>(grp.ctrl));
+
+            uint32_t tag_mask = static_cast<uint32_t>(bmm_movemask_i8(
+                                    bmm_cmpeq_i8(cgrp, vtag))) & 0xFFFFu;
+            const uint32_t empty_mask = static_cast<uint32_t>(bmm_movemask_i8(
+                                    bmm_cmpeq_i8(cgrp, vempty))) & 0xFFFFu;
+
+            while (tag_mask) {
+                const uint32_t lane = static_cast<uint32_t>(bolt_ctz32(tag_mask));
+                if (grp.slots[lane].key == key) {
+                    return static_cast<int32_t>(grp.slots[lane].value);
+                }
+                tag_mask &= tag_mask - 1;
+            }
+            if (empty_mask != 0) return -1;
+
+            gi = (gi + 1u) & group_mask;
+        }
+        return -1;
     }
 };
 

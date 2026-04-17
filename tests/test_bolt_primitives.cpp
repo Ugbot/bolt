@@ -11,7 +11,9 @@
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_column.h"
 
+#include <algorithm>
 #include <thread>
+#include <vector>
 #include <cstring>
 #include <atomic>
 
@@ -194,6 +196,25 @@ TEST(BoltArena, ReturnsNullOnBlockTableFull) {
     // or the allocation should succeed if blocks are reused
 }
 
+// D1 — huge-page allocator primitive. Verifies the allocator always
+// returns usable memory (either real huge pages on privileged systems,
+// or the fallback 4 KB path). Cannot assume huge pages land on every
+// CI box (Windows needs SeLockMemoryPrivilege; Linux needs
+// vm.nr_hugepages > 0) — tests the contract, not the page size.
+TEST(BoltPort, HugePageAllocBasic) {
+    // 8 MB — above the "huge-page worth considering" threshold.
+    constexpr size_t kSize = 8ull * 1024ull * 1024ull;
+    size_t got = 0;
+    void* p = ::bolt_aligned_alloc_huge(kSize, &got);
+    ASSERT_NE(p, nullptr);
+    EXPECT_GE(got, kSize);
+    // Write every 4 KB page to make sure the memory is actually backed.
+    uint8_t* bytes = static_cast<uint8_t*>(p);
+    for (size_t off = 0; off < kSize; off += 4096) bytes[off] = 0x42;
+    for (size_t off = 0; off < kSize; off += 4096) EXPECT_EQ(bytes[off], 0x42);
+    ::bolt_aligned_free_huge(p, got);
+}
+
 TEST(BoltArena, PoisonOnReset) {
     ArenaConfig cfg;
     cfg.poison_on_reset = true;
@@ -344,6 +365,77 @@ TEST(BoltMPSC, MultipleProducers) {
     }
     for (auto& t : producers) t.join();
     EXPECT_EQ(sum, TOTAL * (TOTAL + 1) / 2);
+}
+
+// ============================================================================
+// NUMA Channel Pool Tests (E1)
+// ============================================================================
+
+TEST(BoltNumaPool, PushThenRoundRobinPop) {
+    // 4-node pool; each node gets 2 items; verify round-robin pop sees all.
+    NumaChannelPool<uint64_t, 64, 4> pool;
+    for (size_t node = 0; node < 4; ++node) {
+        ASSERT_TRUE(pool.try_push(node, /*item=*/ (node * 10ULL + 1)));
+        ASSERT_TRUE(pool.try_push(node, /*item=*/ (node * 10ULL + 2)));
+    }
+
+    // We pushed 8 items across 4 nodes; pop them all; order depends on
+    // round-robin starting at node 0.
+    std::vector<uint64_t> seen;
+    seen.reserve(8);
+    for (int k = 0; k < 8; ++k) {
+        uint64_t v = 0;
+        ASSERT_TRUE(pool.try_pop(&v));
+        seen.push_back(v);
+    }
+    // Empty: next pop returns false.
+    uint64_t dummy = 0;
+    EXPECT_FALSE(pool.try_pop(&dummy));
+
+    // Every value we pushed must appear exactly once.
+    std::sort(seen.begin(), seen.end());
+    std::vector<uint64_t> expected{1,2, 11,12, 21,22, 31,32};
+    EXPECT_EQ(seen, expected);
+}
+
+TEST(BoltNumaPool, MultiProducerConcurrent) {
+    constexpr size_t NumNodes = 4;
+    constexpr size_t PerNode  = 500;
+    NumaChannelPool<uint64_t, 1024, NumNodes> pool;
+
+    std::atomic<bool> go{false};
+    std::vector<std::thread> producers;
+    for (size_t n = 0; n < NumNodes; ++n) {
+        producers.emplace_back([&, n]() {
+            while (!go.load(std::memory_order_acquire)) cpu_pause();
+            for (uint64_t i = 0; i < PerNode; ++i) {
+                uint64_t v = n * PerNode + i + 1;  // positive, unique
+                while (!pool.try_push(n, static_cast<uint64_t&&>(v))) cpu_pause();
+            }
+        });
+    }
+    go.store(true, std::memory_order_release);
+
+    constexpr size_t Total = NumNodes * PerNode;
+    uint64_t sum = 0;
+    size_t got = 0;
+    while (got < Total) {
+        uint64_t v = 0;
+        if (pool.try_pop(&v)) { sum += v; ++got; }
+        else cpu_pause();
+    }
+    for (auto& t : producers) t.join();
+    // Expected sum = sum of 1..Total.
+    EXPECT_EQ(sum, Total * (Total + 1) / 2);
+}
+
+TEST(BoltNumaPool, SingleNodeDegenerate) {
+    // NumNodes=1 is the degenerate case — behaves like plain MPSC.
+    NumaChannelPool<int, 16, 1> pool;
+    ASSERT_TRUE(pool.try_push(0, 42));
+    int v = 0;
+    ASSERT_TRUE(pool.try_pop(&v));
+    EXPECT_EQ(v, 42);
 }
 
 // ============================================================================
@@ -587,6 +679,156 @@ TEST(BitmapIndex, BuildAndCount) {
     uint32_t kq[] = {0, 2};
     int64_t n2 = idx->filter_in(kq, 2, out);
     EXPECT_EQ(n2, 7);  // 4 + 3
+}
+
+// C5 — ensure_bitmap_index: lazy build + cache on the sidecar slot.
+TEST(BitmapIndex, EnsureIndexCaches) {
+    Arena a;
+    // Same dictionary column shape as BuildAndCount.
+    auto dict = BoltColumn::make_flat_alloc(3, BoltType::Int32, &a);
+    auto* dv = dict.typed_mutable<int32_t>();
+    dv[0] = 100; dv[1] = 200; dv[2] = 300;
+
+    BoltColumn col = BoltColumn::make_empty();
+    col.format = ColumnFormat::Dictionary;
+    col.type = BoltType::Int32;
+    col.type_size_bytes = 1;
+    col.length = 10;
+    uint8_t* keys = a.allocate_array<uint8_t>(10);
+    uint8_t seq[] = {0,1,2,0,1,2,0,1,2,0};
+    memcpy(keys, seq, 10);
+    col.data = keys;
+    BoltColumn* child = a.allocate_array<BoltColumn>(1);
+    *child = dict;
+    col.dict_child = child;
+    col.arena = &a;
+
+    ASSERT_EQ(col.sidecars.bitmap_index, nullptr);
+    BitmapIndex* first  = col.ensure_bitmap_index(&a);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->num_keys, 3u);
+
+    // Second call returns the cached pointer (same address), no rebuild.
+    BitmapIndex* second = col.ensure_bitmap_index(&a);
+    EXPECT_EQ(first, second);
+
+    // Non-Dictionary columns return nullptr without allocating.
+    int32_t flat_data[4] = {1,2,3,4};
+    BoltColumn flat = BoltColumn::make_flat(flat_data, nullptr, 4, BoltType::Int32);
+    EXPECT_EQ(flat.ensure_bitmap_index(&a), nullptr);
+    EXPECT_EQ(flat.sidecars.bitmap_index, nullptr);
+}
+
+// B2 — RLE column format: runs of equal values expanded via materialize.
+TEST(BoltColumn, RLEMaterializeRoundTrip) {
+    Arena a;
+    // Logical rows: 5×A, 3×B, 2×A, 4×C = 14 rows across 4 runs.
+    int32_t values[4]   = {100, 200, 100, 300};
+    int32_t run_ends[4] = {5, 8, 10, 14};
+
+    BoltColumn rle = BoltColumn::make_rle(
+        values, /*num_runs=*/4, run_ends, /*total_rows=*/14,
+        BoltType::Int32, &a);
+    ASSERT_EQ(rle.format, ColumnFormat::RLE);
+    ASSERT_EQ(rle.length, 14);
+    ASSERT_NE(rle.dict_child, nullptr);
+    EXPECT_EQ(rle.dict_child->length, 4);
+
+    BoltColumn flat = rle.materialize(&a);
+    ASSERT_EQ(flat.format, ColumnFormat::Flat);
+    ASSERT_EQ(flat.length, 14);
+    ASSERT_NE(flat.data, nullptr);
+
+    const int32_t* out = static_cast<const int32_t*>(flat.data);
+    const int32_t expected[14] = {100,100,100,100,100, 200,200,200,
+                                  100,100, 300,300,300,300};
+    for (int i = 0; i < 14; ++i) EXPECT_EQ(out[i], expected[i]) << "row " << i;
+}
+
+TEST(BoltColumn, RLEEmpty) {
+    Arena a;
+    BoltColumn rle = BoltColumn::make_rle(nullptr, 0, nullptr, 0,
+                                           BoltType::Int64, &a);
+    EXPECT_EQ(rle.format, ColumnFormat::RLE);
+    EXPECT_EQ(rle.length, 0);
+
+    BoltColumn flat = rle.materialize(&a);
+    EXPECT_EQ(flat.length, 0);
+}
+
+TEST(BoltColumn, RLESingleRun) {
+    Arena a;
+    int64_t values[1]   = {42};
+    int32_t run_ends[1] = {7};
+    BoltColumn rle = BoltColumn::make_rle(values, 1, run_ends, 7,
+                                           BoltType::Int64, &a);
+    ASSERT_EQ(rle.length, 7);
+    BoltColumn flat = rle.materialize(&a);
+    ASSERT_EQ(flat.length, 7);
+    const int64_t* out = static_cast<const int64_t*>(flat.data);
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(out[i], 42);
+}
+
+// B3 — BitPacked round-trip. 12 values, 3 bits each (range 0-7).
+TEST(BoltColumn, BitPackedRoundTrip3Bit) {
+    Arena a;
+    // Packing 12 × 3-bit values = 36 bits, fits in one uint64.
+    // Values: 0,1,2,3,4,5,6,7,0,1,2,3
+    const uint32_t vals[12] = {0,1,2,3,4,5,6,7,0,1,2,3};
+    uint64_t word = 0;
+    for (int i = 0; i < 12; ++i) word |= uint64_t(vals[i]) << (i * 3);
+    uint64_t packed[2] = {word, 0};  // second word just safe read-ahead pad
+
+    BoltColumn bp = BoltColumn::make_bitpacked(
+        packed, /*bit_width=*/3, /*total_rows=*/12,
+        BoltType::Int32, &a);
+    ASSERT_EQ(bp.length, 12);
+    BoltColumn flat = bp.materialize(&a);
+    ASSERT_EQ(flat.length, 12);
+    const int32_t* out = static_cast<const int32_t*>(flat.data);
+    for (int i = 0; i < 12; ++i) EXPECT_EQ(out[i], static_cast<int32_t>(vals[i])) << "i=" << i;
+}
+
+TEST(BoltColumn, BitPacked17BitCrossesWordBoundary) {
+    Arena a;
+    // 5 × 17-bit values = 85 bits; crosses a uint64 boundary after the 3rd.
+    const uint32_t vals[5] = {0x0AAAA, 0x15555, 0x1FFFF, 0x00001, 0x10000};
+    uint64_t words[3] = {0, 0, 0};
+    for (int i = 0; i < 5; ++i) {
+        uint64_t bit_off = uint64_t(i) * 17;
+        uint64_t bit_in  = bit_off & 63u;
+        words[bit_off >> 6] |= uint64_t(vals[i]) << bit_in;
+        if (bit_in + 17 > 64) {
+            words[(bit_off >> 6) + 1] |= uint64_t(vals[i]) >> (64 - bit_in);
+        }
+    }
+    BoltColumn bp = BoltColumn::make_bitpacked(
+        words, 17, 5, BoltType::Int32, &a);
+    BoltColumn flat = bp.materialize(&a);
+    const int32_t* out = static_cast<const int32_t*>(flat.data);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(out[i], static_cast<int32_t>(vals[i])) << "i=" << i;
+}
+
+// B4 — FrameOfReference round-trip.  base + bit-packed deltas.
+TEST(BoltColumn, FrameOfReferenceRoundTrip) {
+    Arena a;
+    // Simulate monotonic timestamps: 1_000_000 + {0, 5, 12, 20, 31, 48, 63}.
+    const int64_t base = 1'000'000;
+    const uint32_t deltas[7] = {0, 5, 12, 20, 31, 48, 63};
+    uint64_t word = 0;
+    for (int i = 0; i < 7; ++i) word |= uint64_t(deltas[i]) << (i * 6);
+    uint64_t packed[2] = {word, 0};
+
+    BoltColumn fr = BoltColumn::make_frame_of_ref(
+        packed, /*bit_width=*/6, base, /*total_rows=*/7,
+        BoltType::Int64, &a);
+    ASSERT_EQ(fr.length, 7);
+    BoltColumn flat = fr.materialize(&a);
+    ASSERT_EQ(flat.length, 7);
+    const int64_t* out = static_cast<const int64_t*>(flat.data);
+    for (int i = 0; i < 7; ++i) {
+        EXPECT_EQ(out[i], base + deltas[i]) << "i=" << i;
+    }
 }
 
 TEST(BoltBatchArrow, FillSchemaStruct) {

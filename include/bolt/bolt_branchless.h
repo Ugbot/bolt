@@ -303,6 +303,10 @@ inline void hash_combine_branchless(const uint32_t* BOLT_RESTRICT h1,
 /// Branchless gather: copy selected elements to contiguous output.
 /// Software prefetch hides memory latency for random access patterns.
 /// No branches in the loop.
+///
+/// The generic template uses scalar loads with a software-prefetch pipeline;
+/// `int32_t` and `int64_t` are specialised below on AVX2/AVX-512 to use
+/// hardware gather (`_mm256_i32gather_*`) + vectorised prefetch lookahead.
 template <typename T>
 void gather_branchless(const T* BOLT_RESTRICT data,
                         const int32_t* BOLT_RESTRICT indices,
@@ -324,6 +328,109 @@ void gather_branchless(const T* BOLT_RESTRICT data,
     }
 }
 
+#if BOLT_SIMD_AVX2 || BOLT_SIMD_AVX512
+
+// ----------------------------------------------------------------------
+// Named SIMD variants — kept in source so a future JIT / runtime dispatch
+// can reach for them per-CPU or per-shape without digging through git.
+// Currently: `gather_simd_i32` is the default for int32_t (wins ~17%
+// median on client Intel); `gather_simd_i64` is slower on client Intel
+// (AVX2 hardware `_mm256_i32gather_epi64` serialises internally and
+// loses ~3× to prefetched scalar loads), so the generic template stays
+// the default for int64_t. See design-log "gather_branchless — SIMD
+// gather vs scalar + prefetch (A2)" for workloads that would flip this.
+// ----------------------------------------------------------------------
+
+/// Hardware-gather path for int32: `_mm256_i32gather_epi32` on 8 lanes,
+/// with the prefetch pipeline seeded two SIMD batches ahead. Always
+/// available on AVX2+; callers who want this explicitly can invoke it.
+inline void gather_simd_i32(
+        const int32_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT indices,
+        int64_t count,
+        int32_t* BOLT_RESTRICT output) noexcept {
+    assert(data != nullptr || count == 0);
+    assert(indices != nullptr || count == 0);
+    assert(output != nullptr || count == 0);
+
+    using namespace bolt::simd;
+    constexpr int L = bmm_lanes_i32;          // 8 on AVX2
+    constexpr int64_t kAhead = L * 2;         // two SIMD batches ahead
+
+    for (int64_t p = 0; p < bmin(count, kAhead); ++p) {
+        BOLT_PREFETCH_READ(&data[indices[p]]);
+    }
+    int64_t i = 0;
+    for (; i + L <= count; i += L) {
+        const int64_t pi = i + kAhead;
+        if (pi + L <= count) {
+            for (int k = 0; k < L; ++k) {
+                BOLT_PREFETCH_READ(&data[indices[pi + k]]);
+            }
+        }
+        const bmm_vec_i32 vidx = bmm_loadu_i32(indices + i);
+        const bmm_vec_i32 vout = bmm_gather_i32(data, vidx);
+        bmm_storeu_i32(output + i, vout);
+    }
+    for (; i < count; ++i) output[i] = data[indices[i]];
+}
+
+/// Hardware-gather path for int64: `_mm256_i32gather_epi64` on 4 lanes.
+/// Kept for future use (Zen3+, Sapphire Rapids, or JIT dispatch) — on
+/// client Intel this is measurably slower than the scalar-prefetch
+/// template so it is NOT the default for `gather_branchless<int64_t>`.
+inline void gather_simd_i64(
+        const int64_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT indices,
+        int64_t count,
+        int64_t* BOLT_RESTRICT output) noexcept {
+    assert(data != nullptr || count == 0);
+    assert(indices != nullptr || count == 0);
+    assert(output != nullptr || count == 0);
+
+    using namespace bolt::simd;
+    constexpr int L = bmm_lanes_i64;          // 4 on AVX2
+    constexpr int64_t kAhead = L * 4;         // 16 items ahead
+
+    for (int64_t p = 0; p < bmin(count, kAhead); ++p) {
+        BOLT_PREFETCH_READ(&data[indices[p]]);
+    }
+    int64_t i = 0;
+    for (; i + L <= count; i += L) {
+        const int64_t pi = i + kAhead;
+        if (pi + L <= count) {
+            for (int k = 0; k < L; ++k) {
+                BOLT_PREFETCH_READ(&data[indices[pi + k]]);
+            }
+        }
+        // Build an 8-lane i32 vector from L=4 indices; upper lanes are
+        // unused by bmm_gather_i64 (consumes only the low 128 bits).
+        alignas(32) int32_t idx_buf[8] = {0};
+        for (int k = 0; k < L; ++k) idx_buf[k] = indices[i + k];
+        const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
+        const bmm_vec_i64 vout = bmm_gather_i64(data, vidx);
+        bmm_storeu_i64(output + i, vout);
+    }
+    for (; i < count; ++i) output[i] = data[indices[i]];
+}
+
+/// Default for int32_t: route to the SIMD gather path (wins on AVX2).
+template <>
+inline void gather_branchless<int32_t>(
+        const int32_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT indices,
+        int64_t count,
+        int32_t* BOLT_RESTRICT output) noexcept {
+    gather_simd_i32(data, indices, count, output);
+}
+
+// int64_t intentionally NOT specialised — the generic scalar-prefetch
+// template is faster on measured client-Intel hardware. Callers who
+// know the target CPU favours hardware gather can call
+// `gather_simd_i64` by name.
+
+#endif  // BOLT_SIMD_AVX2 || BOLT_SIMD_AVX512
+
 // ============================================================================
 // Branchless Selection Vector Intersection (AND of two filters)
 // ============================================================================
@@ -344,31 +451,47 @@ void gather_branchless(const T* BOLT_RESTRICT data,
 ///   j += advance_b;
 ///
 /// No branch predictor involved. Pure arithmetic.
-inline int64_t selection_intersect_branchless(
-        const int32_t* BOLT_RESTRICT a, int64_t na,
-        const int32_t* BOLT_RESTRICT b, int64_t nb,
-        int32_t* BOLT_RESTRICT out) noexcept {
+///
+/// Generic on index type (`int32_t`, `int64_t`, `uint32_t`, …) so selection
+/// vectors from kernels that use wider row indices can chain without
+/// materialising to i32 first.  The original `selection_intersect_branchless`
+/// signature (i32-only) is preserved as an inline wrapper for callers who
+/// don't want to name the type.
+template <typename Idx>
+inline int64_t selection_intersect_t(
+        const Idx* BOLT_RESTRICT a, int64_t na,
+        const Idx* BOLT_RESTRICT b, int64_t nb,
+        Idx* BOLT_RESTRICT out) noexcept {
+    static_assert(sizeof(Idx) <= sizeof(int64_t),
+                  "selection_intersect_t: index type too wide");
+    assert(a != nullptr || na == 0);
+    assert(b != nullptr || nb == 0);
+    assert(out != nullptr || (na == 0 || nb == 0));
     int64_t i = 0, j = 0, count = 0;
     while (i < na && j < nb) {
-        int32_t va = a[i], vb = b[j];
+        Idx va = a[i], vb = b[j];
         bool match = (va == vb);
         out[count] = va;
         count += match;
-        i += (va <= vb);  // Advance a if a <= b (branchless)
-        j += (va >= vb);  // Advance b if a >= b (branchless)
+        i += (va <= vb);
+        j += (va >= vb);
     }
     return count;
 }
 
-/// Branchless union of two sorted selection vectors.
-inline int64_t selection_union_branchless(
-        const int32_t* BOLT_RESTRICT a, int64_t na,
-        const int32_t* BOLT_RESTRICT b, int64_t nb,
-        int32_t* BOLT_RESTRICT out) noexcept {
+template <typename Idx>
+inline int64_t selection_union_t(
+        const Idx* BOLT_RESTRICT a, int64_t na,
+        const Idx* BOLT_RESTRICT b, int64_t nb,
+        Idx* BOLT_RESTRICT out) noexcept {
+    static_assert(sizeof(Idx) <= sizeof(int64_t),
+                  "selection_union_t: index type too wide");
+    assert(a != nullptr || na == 0);
+    assert(b != nullptr || nb == 0);
     int64_t i = 0, j = 0, count = 0;
     while (i < na && j < nb) {
-        int32_t va = a[i], vb = b[j];
-        int32_t val = bmin(va, vb);
+        Idx va = a[i], vb = b[j];
+        Idx val = bmin<Idx>(va, vb);
         out[count] = val;
         count++;
         i += (va <= vb);
@@ -376,6 +499,58 @@ inline int64_t selection_union_branchless(
     }
     while (i < na) out[count++] = a[i++];
     while (j < nb) out[count++] = b[j++];
+    return count;
+}
+
+// Back-compat: i32 inline shims so existing call sites keep working.
+inline int64_t selection_intersect_branchless(
+        const int32_t* BOLT_RESTRICT a, int64_t na,
+        const int32_t* BOLT_RESTRICT b, int64_t nb,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    return selection_intersect_t<int32_t>(a, na, b, nb, out);
+}
+
+inline int64_t selection_union_branchless(
+        const int32_t* BOLT_RESTRICT a, int64_t na,
+        const int32_t* BOLT_RESTRICT b, int64_t nb,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    return selection_union_t<int32_t>(a, na, b, nb, out);
+}
+
+/// Convert a 64-bit-word bitmap (Arrow format: LSB-first, bit i = row i)
+/// into a dense selection vector of indices. `num_rows` bounds the valid
+/// range so trailing bits past `num_rows` in the last word are ignored.
+/// Writes ctz(word) derived indices — fully branchless per bit.
+template <typename Idx>
+inline int64_t bitmap_to_indices(const uint64_t* BOLT_RESTRICT bitmap,
+                                  int64_t num_rows,
+                                  Idx* BOLT_RESTRICT out) noexcept {
+    static_assert(sizeof(Idx) <= sizeof(int64_t),
+                  "bitmap_to_indices: index type too wide");
+    assert(bitmap != nullptr || num_rows == 0);
+    assert(out != nullptr || num_rows == 0);
+
+    int64_t count = 0;
+    const int64_t full_words = num_rows >> 6;
+    const int     tail_bits  = static_cast<int>(num_rows & 63);
+
+    int64_t base = 0;
+    for (int64_t w = 0; w < full_words; ++w, base += 64) {
+        uint64_t word = bitmap[w];
+        while (word) {
+            const int b = bolt_ctz64(word);
+            out[count++] = static_cast<Idx>(base + b);
+            word &= word - 1;
+        }
+    }
+    if (tail_bits > 0) {
+        uint64_t word = bitmap[full_words] & ((uint64_t{1} << tail_bits) - 1);
+        while (word) {
+            const int b = bolt_ctz64(word);
+            out[count++] = static_cast<Idx>(base + b);
+            word &= word - 1;
+        }
+    }
     return count;
 }
 
@@ -417,6 +592,62 @@ inline void bitmap_or(const uint64_t* BOLT_RESTRICT a,
     for (uint32_t i = 0; i < num_words; ++i) {
         out[i] = a[i] | b[i];
     }
+}
+
+// ============================================================================
+// Run-native kernels (B2b) — operate on RLE-encoded columns directly, so each
+// run is evaluated once regardless of run length. Complements the materialise-
+// then-scan path; callers pick based on expected run length (run-native wins
+// past ~4 rows/run on modern CPUs).
+// ============================================================================
+
+/// Run-native `filter_eq`: walks `num_runs` (value, run_end) pairs and emits
+/// every row index where `values[i] == scalar`. O(num_runs) compares and
+/// O(matching_rows) stores — no per-row compare. The per-run inner loop
+/// is a tight `for` that compiles to `rep stosd`-equivalent on x86.
+template <typename T>
+inline int64_t filter_eq_rle(const T* BOLT_RESTRICT values,
+                              const int32_t* BOLT_RESTRICT run_ends,
+                              int64_t num_runs,
+                              T scalar,
+                              int32_t* BOLT_RESTRICT out) noexcept {
+    assert(values   != nullptr || num_runs == 0);
+    assert(run_ends != nullptr || num_runs == 0);
+    assert(out      != nullptr || num_runs == 0);
+    assert(num_runs >= 0);
+
+    int64_t count = 0;
+    int32_t prev = 0;
+    for (int64_t i = 0; i < num_runs; ++i) {
+        const int32_t end = run_ends[i];
+        assert(end >= prev);
+        if (values[i] == scalar) {
+            for (int32_t r = prev; r < end; ++r) out[count++] = r;
+        }
+        prev = end;
+    }
+    return count;
+}
+
+/// Run-native `sum` over an RLE column: Σ values[i] * run_length[i].
+/// Width-widened accumulator so 8-bit runs don't overflow on long runs.
+template <typename T>
+inline int64_t sum_rle_i64(const T* BOLT_RESTRICT values,
+                            const int32_t* BOLT_RESTRICT run_ends,
+                            int64_t num_runs) noexcept {
+    assert(values   != nullptr || num_runs == 0);
+    assert(run_ends != nullptr || num_runs == 0);
+    assert(num_runs >= 0);
+
+    int64_t acc = 0;
+    int32_t prev = 0;
+    for (int64_t i = 0; i < num_runs; ++i) {
+        const int32_t end = run_ends[i];
+        assert(end >= prev);
+        acc += static_cast<int64_t>(values[i]) * (end - prev);
+        prev = end;
+    }
+    return acc;
 }
 
 /// Extract set bit positions to selection vector (branchless per word).
@@ -488,10 +719,9 @@ inline int64_t filter_gt_avx2_i32(const int32_t* BOLT_RESTRICT data, int64_t n,
 }
 
 /// SIMD branchless filter: int64 column > scalar.
-/// Processes `bmm_lanes_i64` elements per iteration via compare + movemask.
-/// Emits int32 row indices. Uses a tight 4-lane (or 2-lane on SSE/NEON) mask
-/// loop to emit indices — smaller than a dedicated i32 compressstore from a
-/// narrow mask, and measurably faster than the scalar template for filter-gt.
+/// Processes two `bmm_lanes_i64` groups per iteration so the combined mask
+/// width exactly matches `bmm_compressstore_i32` (8 lanes on AVX2, 4 on
+/// SSE/NEON). One SIMD compressstore per step — no per-mask-bit scalar loop.
 inline int64_t filter_gt_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n,
                                    int64_t scalar,
                                    int32_t* BOLT_RESTRICT out) noexcept {
@@ -501,23 +731,31 @@ inline int64_t filter_gt_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n,
 
     using namespace bolt::simd;
     const bmm_vec_i64 vscalar = bmm_set1_i64(scalar);
-    constexpr int L = bmm_lanes_i64;
+    constexpr int Li = bmm_lanes_i64;      // 4 on AVX2, 2 on SSE/NEON
+    constexpr int Lo = bmm_lanes_i32;      // 8 on AVX2, 4 on SSE/NEON
+    static_assert(Lo == 2 * Li,
+                  "filter_gt_avx2_i64: i32 lanes must be 2 * i64 lanes");
     int64_t count = 0;
     int64_t i = 0;
 
-    for (; i + L <= n; i += L) {
-        const bmm_vec_i64 vdata = bmm_loadu_i64(data + i);
-        const bmm_vec_i64 vcmp  = bmm_cmpgt_i64(vdata, vscalar);
-        const uint32_t    mask  = static_cast<uint32_t>(bmm_movemask_i64(vcmp));
+    // Main SIMD loop: two i64 loads per step; combined mask feeds a single
+    // compressstore that emits popcount(mask) contiguous i32 indices.
+    for (; i + Lo <= n; i += Lo) {
+        const bmm_vec_i64 vdata0 = bmm_loadu_i64(data + i);
+        const bmm_vec_i64 vdata1 = bmm_loadu_i64(data + i + Li);
+        const bmm_vec_i64 vcmp0  = bmm_cmpgt_i64(vdata0, vscalar);
+        const bmm_vec_i64 vcmp1  = bmm_cmpgt_i64(vdata1, vscalar);
+        const uint32_t    m0     = static_cast<uint32_t>(bmm_movemask_i64(vcmp0));
+        const uint32_t    m1     = static_cast<uint32_t>(bmm_movemask_i64(vcmp1));
+        const uint32_t    mask   = m0 | (m1 << Li);
 
-        // Branchless emit: always write base+k, bump on mask bit. Unrolled.
-        for (int k = 0; k < L; ++k) {
-            out[count] = static_cast<int32_t>(i) + k;
-            count += ((mask >> k) & 1u);
-        }
+        alignas(32) int32_t idx_buf[16];   // 16 >= Lo for every ISA
+        for (int k = 0; k < Lo; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
+        const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
+        count += bmm_compressstore_i32(out + count, vidx, mask);
     }
 
-    // Scalar tail.
+    // Scalar tail (shared shape with the i32 kernel's tail).
     for (; i < n; ++i) {
         out[count] = static_cast<int32_t>(i);
         count += (data[i] > scalar);
@@ -527,6 +765,8 @@ inline int64_t filter_gt_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n,
 
 /// SIMD branchless filter: float64 column > scalar.
 /// Mirrors filter_gt_avx2_i64; uses ordered greater-than (NaN → no match).
+/// Processes two `bmm_lanes_f64` groups per iteration and funnels the
+/// combined mask into `bmm_compressstore_i32`.
 inline int64_t filter_gt_avx2_f64(const double* BOLT_RESTRICT data, int64_t n,
                                    double scalar,
                                    int32_t* BOLT_RESTRICT out) noexcept {
@@ -536,19 +776,26 @@ inline int64_t filter_gt_avx2_f64(const double* BOLT_RESTRICT data, int64_t n,
 
     using namespace bolt::simd;
     const bmm_vec_f64 vscalar = bmm_set1_f64(scalar);
-    constexpr int L = bmm_lanes_f64;
+    constexpr int Li = bmm_lanes_f64;      // 4 on AVX2, 2 on SSE/NEON
+    constexpr int Lo = bmm_lanes_i32;      // 8 on AVX2, 4 on SSE/NEON
+    static_assert(Lo == 2 * Li,
+                  "filter_gt_avx2_f64: i32 lanes must be 2 * f64 lanes");
     int64_t count = 0;
     int64_t i = 0;
 
-    for (; i + L <= n; i += L) {
-        const bmm_vec_f64 vdata = bmm_loadu_f64(data + i);
-        const bmm_vec_f64 vcmp  = bmm_cmpgt_f64(vdata, vscalar);
-        const uint32_t    mask  = static_cast<uint32_t>(bmm_movemask_f64(vcmp));
+    for (; i + Lo <= n; i += Lo) {
+        const bmm_vec_f64 vdata0 = bmm_loadu_f64(data + i);
+        const bmm_vec_f64 vdata1 = bmm_loadu_f64(data + i + Li);
+        const bmm_vec_f64 vcmp0  = bmm_cmpgt_f64(vdata0, vscalar);
+        const bmm_vec_f64 vcmp1  = bmm_cmpgt_f64(vdata1, vscalar);
+        const uint32_t    m0     = static_cast<uint32_t>(bmm_movemask_f64(vcmp0));
+        const uint32_t    m1     = static_cast<uint32_t>(bmm_movemask_f64(vcmp1));
+        const uint32_t    mask   = m0 | (m1 << Li);
 
-        for (int k = 0; k < L; ++k) {
-            out[count] = static_cast<int32_t>(i) + k;
-            count += ((mask >> k) & 1u);
-        }
+        alignas(32) int32_t idx_buf[16];
+        for (int k = 0; k < Lo; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
+        const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
+        count += bmm_compressstore_i32(out + count, vidx, mask);
     }
 
     for (; i < n; ++i) {
@@ -573,6 +820,86 @@ inline int64_t sum_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n) noexce
     }
     int64_t result = bmm_hadd_i64(acc);
     for (; i < n; ++i) result += data[i];
+    return result;
+}
+
+/// SIMD branchless filter: float32 column > scalar. (A5)
+/// Mirrors filter_gt_avx2_f64 — two loads per step, combined mask into
+/// bmm_compressstore_i32. 8 f32 lanes per load on AVX2 fill the 8-lane
+/// i32 compressstore exactly; on SSE/NEON (4+4=8) the step naturally
+/// doubles relative to a single load.  Uses ordered GT: NaN → no match.
+inline int64_t filter_gt_avx2_f32(const float* BOLT_RESTRICT data, int64_t n,
+                                   float scalar,
+                                   int32_t* BOLT_RESTRICT out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out  != nullptr || n == 0);
+    assert(n >= 0);
+
+    using namespace bolt::simd;
+    const bmm_vec_f32 vscalar = bmm_set1_f32(scalar);
+    constexpr int Li = bmm_lanes_f32;          // 8 on AVX2, 4 on SSE/NEON
+    constexpr int Lo = Li + Li;                // two loads per iter
+    int64_t count = 0;
+    int64_t i = 0;
+
+    for (; i + Lo <= n; i += Lo) {
+        const bmm_vec_f32 v0 = bmm_loadu_f32(data + i);
+        const bmm_vec_f32 v1 = bmm_loadu_f32(data + i + Li);
+        const uint32_t m0 = static_cast<uint32_t>(bmm_movemask_f32(bmm_cmpgt_f32(v0, vscalar)));
+        const uint32_t m1 = static_cast<uint32_t>(bmm_movemask_f32(bmm_cmpgt_f32(v1, vscalar)));
+        const uint32_t mask = (m0 | (m1 << Li)) & ((1u << Lo) - 1u);
+
+        // compressstore_i32 takes an 8-lane i32 vec; fill one-to-one on
+        // AVX2 (Lo=16 > 8 there → skip the wide path) or two-to-one on
+        // SSE/NEON (Lo=8 exactly matches the 4-lane i32 buf upper half).
+        // The simpler portable path: emit per mask bit when Lo > 8; the
+        // AVX2 path gets the SIMD win when Lo == 8.
+        if constexpr (Lo <= 8) {
+            alignas(32) int32_t idx_buf[16];
+            for (int k = 0; k < Lo; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
+            const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
+            count += bmm_compressstore_i32(out + count, vidx, mask);
+        } else {
+            // AVX2 (Lo=16): split into two 8-lane compressstores.
+            alignas(32) int32_t idx_buf0[16];
+            alignas(32) int32_t idx_buf1[16];
+            for (int k = 0; k < 8; ++k) {
+                idx_buf0[k] = static_cast<int32_t>(i) + k;
+                idx_buf1[k] = static_cast<int32_t>(i) + k + 8;
+            }
+            const uint32_t mask_lo = mask & 0xFFu;
+            const uint32_t mask_hi = (mask >> 8) & 0xFFu;
+            count += bmm_compressstore_i32(out + count,
+                                           bmm_loadu_i32(idx_buf0), mask_lo);
+            count += bmm_compressstore_i32(out + count,
+                                           bmm_loadu_i32(idx_buf1), mask_hi);
+        }
+    }
+    // Scalar tail.
+    for (; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (data[i] > scalar);
+    }
+    return count;
+}
+
+/// SIMD branchless sum: float32 column.
+/// Accumulates `bmm_lanes_f32` lanes in parallel, then horizontal-reduces.
+inline double sum_avx2_f32(const float* BOLT_RESTRICT data, int64_t n) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(n >= 0);
+
+    using namespace bolt::simd;
+    constexpr int L = bmm_lanes_f32;
+    bmm_vec_f32 acc = bmm_setzero_f32();
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        acc = bmm_add_f32(acc, bmm_loadu_f32(data + i));
+    }
+    // Widen to double for the reduction — matches the scalar semantics
+    // of f64 accumulators everywhere else in the codebase.
+    double result = static_cast<double>(bmm_hadd_f32(acc));
+    for (; i < n; ++i) result += static_cast<double>(data[i]);
     return result;
 }
 

@@ -87,6 +87,13 @@ enum class ColumnFormat : uint8_t {
     Dictionary = 2,   // Keys array + values column
     Sequence   = 3,   // value[i] = offset + i * step
     View       = 4,   // Zero-copy slice of parent
+    RLE        = 5,   // Run-length: `data` = values[num_runs];
+                      // `dict_child` = int32 run_ends[num_runs]
+                      // where run i covers [run_ends[i-1], run_ends[i]).
+    BitPacked  = 6,   // Bit-packed: `data` = uint64 words, each value uses
+                      // `seq_step` bits (reused from union). Width ∈ [1,32].
+    FrameOfRef = 7,   // FOR = base + bit-packed deltas: `data` = delta words,
+                      // `seq_offset` = base value, `seq_step` = bit width.
 };
 
 // ============================================================================
@@ -95,6 +102,9 @@ enum class ColumnFormat : uint8_t {
 
 /// Forward declaration for dictionary child
 struct BoltColumn;
+
+/// Forward declaration — full definition further below (post-BoltColumn).
+struct BitmapIndex;
 
 /// A single column. Fixed-size struct. Arena-owned data. No heap.
 ///
@@ -223,6 +233,106 @@ struct BoltColumn {
     }
 
     /// View (zero-copy slice)
+    /// Run-length encoded column (B2). `values[]` and `run_ends[]` must each
+    /// have `num_runs` elements and live in or outlive `arena`. Run i covers
+    /// rows `[run_ends[i-1], run_ends[i])` (run_ends[-1] is treated as 0);
+    /// `run_ends[num_runs-1]` must equal `total_rows`. Returns make_empty()
+    /// on shape violation or OOM.
+    ///
+    /// Storage: `data = values`, `dict_child = &flat int32 column over run_ends`,
+    /// `length = total_rows`. The `dict_child` is an int32 Flat column (created
+    /// from the caller-supplied pointer; zero-copy).
+    static BoltColumn make_rle(const void* values, int64_t num_runs,
+                               const int32_t* run_ends, int64_t total_rows,
+                               BoltType type, Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(num_runs >= 0);
+        assert(total_rows >= 0);
+        if (num_runs == 0 && total_rows == 0) {
+            BoltColumn c = make_empty();
+            c.type = type;
+            c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
+            c.length = 0;
+            c.format = ColumnFormat::RLE;
+            c.arena = arena;
+            return c;
+        }
+        if (values == nullptr || run_ends == nullptr) return make_empty();
+        if (num_runs <= 0) return make_empty();
+        // Last run end must match total_rows — trust but assert in debug.
+        assert(run_ends[num_runs - 1] == static_cast<int32_t>(total_rows));
+
+        BoltColumn c = make_empty();
+        c.type = type;
+        c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
+        c.length = total_rows;
+        c.format = ColumnFormat::RLE;
+        c.arena = arena;
+        // Borrow the values pointer; caller owns lifetime.
+        c.data = const_cast<void*>(values);
+
+        // Wrap run_ends in a child column.  Arena-allocate a BoltColumn
+        // descriptor so the RLE column is self-contained.
+        BoltColumn* rc = arena->allocate_array<BoltColumn>(1);
+        if (!rc) return make_empty();
+        *rc = BoltColumn::make_flat(
+            const_cast<int32_t*>(run_ends), nullptr, num_runs,
+            BoltType::Int32);
+        c.dict_child = rc;
+
+        c.stats.all_valid = true;
+        return c;
+    }
+
+    /// Bit-packed column (B3). `packed_words` holds `total_rows * bit_width`
+    /// bits LSB-first, each value using `bit_width` ∈ [1,32] bits. Caller
+    /// owns the buffer lifetime. `type` determines the output integer type
+    /// at materialise time (must be a ≤32-bit signed or unsigned int).
+    static BoltColumn make_bitpacked(const uint64_t* packed_words,
+                                      uint8_t bit_width, int64_t total_rows,
+                                      BoltType type, Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(bit_width >= 1 && bit_width <= 32);
+        assert(total_rows >= 0);
+        if (total_rows > 0 && packed_words == nullptr) return make_empty();
+
+        BoltColumn c = make_empty();
+        c.type = type;
+        c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
+        c.length = total_rows;
+        c.format = ColumnFormat::BitPacked;
+        c.arena = arena;
+        c.data = const_cast<uint64_t*>(packed_words);
+        c.seq_offset = 0;  // unused for BitPacked
+        c.seq_step   = static_cast<int64_t>(bit_width);
+        c.stats.all_valid = true;
+        return c;
+    }
+
+    /// Frame-of-reference column (B4). Logical value[i] = base + delta[i],
+    /// where delta[] is bit-packed at `bit_width` bits per delta.
+    static BoltColumn make_frame_of_ref(const uint64_t* packed_deltas,
+                                         uint8_t bit_width, int64_t base,
+                                         int64_t total_rows,
+                                         BoltType type, Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(bit_width >= 1 && bit_width <= 32);
+        assert(total_rows >= 0);
+        if (total_rows > 0 && packed_deltas == nullptr) return make_empty();
+
+        BoltColumn c = make_empty();
+        c.type = type;
+        c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
+        c.length = total_rows;
+        c.format = ColumnFormat::FrameOfRef;
+        c.arena = arena;
+        c.data = const_cast<uint64_t*>(packed_deltas);
+        c.seq_offset = base;
+        c.seq_step   = static_cast<int64_t>(bit_width);
+        c.stats.all_valid = true;
+        return c;
+    }
+
     static BoltColumn make_view(const BoltColumn& parent, int64_t offset,
                                 int64_t length) noexcept {
         assert(offset >= 0 && offset + length <= parent.length);
@@ -361,6 +471,13 @@ struct BoltColumn {
 
     /// Materialize non-Flat formats to Flat (arena-allocated)
     BoltColumn materialize(Arena* arena) const noexcept;
+
+    /// Ensure a `BitmapIndex` is attached to this column, building it lazily
+    /// on first call from `arena`. The index lives on the `bitmap_index`
+    /// slot; subsequent calls return the cached pointer with no work.
+    /// Returns nullptr if the column is not a Dictionary (only shape the
+    /// current `BitmapIndex::build` supports) or on OOM. C5.
+    BitmapIndex* ensure_bitmap_index(Arena* arena) noexcept;
 
     static void noop_release_schema(ArrowSchema*) noexcept {}
     static void noop_release_array(ArrowArray*) noexcept {}
@@ -781,6 +898,58 @@ inline BoltColumn BoltColumn::materialize(Arena* arena_in) const noexcept {
             }
             out.validity = nval;
         }
+    } else if (format == ColumnFormat::BitPacked ||
+               format == ColumnFormat::FrameOfRef) {
+        // B3/B4 unpack — read `bit_width` bits at a time from `data` and
+        // store each decoded value (plus base for FOR) into the Flat buffer.
+        if (!data) return make_empty();
+        const uint64_t* words = static_cast<const uint64_t*>(data);
+        const int64_t  bw = seq_step;      // bit_width
+        if (bw < 1 || bw > 32) return make_empty();
+        const int64_t base = (format == ColumnFormat::FrameOfRef) ? seq_offset : 0;
+        const uint64_t mask = (bw == 64) ? ~uint64_t{0}
+                                         : ((uint64_t{1} << bw) - 1u);
+        for (int64_t i = 0; i < length; ++i) {
+            const uint64_t bit_off     = static_cast<uint64_t>(i) * static_cast<uint64_t>(bw);
+            const uint64_t word_off    = bit_off >> 6;
+            const uint64_t bit_in_word = bit_off & 63u;
+            uint64_t v = words[word_off] >> bit_in_word;
+            if (bit_in_word + static_cast<uint64_t>(bw) > 64u) {
+                v |= words[word_off + 1] << (64u - bit_in_word);
+            }
+            v &= mask;
+            const int64_t  full = base + static_cast<int64_t>(v);
+            uint8_t*       dst  = static_cast<uint8_t*>(buf) + (size_t)i * tsz;
+            // Narrow to the target type's width (all supported widths are ≤8).
+            if      (tsz == 1) { uint8_t  t = static_cast<uint8_t>(full);  memcpy(dst, &t, 1); }
+            else if (tsz == 2) { uint16_t t = static_cast<uint16_t>(full); memcpy(dst, &t, 2); }
+            else if (tsz == 4) { uint32_t t = static_cast<uint32_t>(full); memcpy(dst, &t, 4); }
+            else if (tsz == 8) { int64_t  t = full;                        memcpy(dst, &t, 8); }
+            else return make_empty();
+        }
+    } else if (format == ColumnFormat::RLE) {
+        // Expand runs: for each run i, memset/memcpy `values[i]` into
+        // `out[run_ends[i-1] .. run_ends[i])`.  Values buffer sits at
+        // `data`, run_ends at `dict_child->data` (int32, length=num_runs).
+        if (!dict_child || !data) return make_empty();
+        if (dict_child->format != ColumnFormat::Flat) return make_empty();
+        if (dict_child->type != BoltType::Int32) return make_empty();
+        const int64_t num_runs = dict_child->length;
+        if (num_runs <= 0) { return out; }  // empty + early-exit keeps out.data
+        const uint8_t*  vals = static_cast<const uint8_t*>(data);
+        const int32_t* rends = static_cast<const int32_t*>(dict_child->data);
+        uint8_t* dst = static_cast<uint8_t*>(buf);
+        int32_t prev = 0;
+        for (int64_t i = 0; i < num_runs; ++i) {
+            const int32_t end = rends[i];
+            assert(end >= prev);
+            const int64_t run_len = static_cast<int64_t>(end) - prev;
+            const uint8_t* src = vals + (size_t)i * tsz;
+            for (int64_t r = 0; r < run_len; ++r) {
+                memcpy(dst + (size_t)(prev + r) * tsz, src, tsz);
+            }
+            prev = end;
+        }
     } else if (format == ColumnFormat::Dictionary) {
         // Expand keys → values via dict_child.
         if (!dict_child || !data) return make_empty();
@@ -1059,6 +1228,33 @@ inline int64_t BitmapIndex::filter_in(const uint32_t* keys, uint32_t nkeys,
 }
 
 // ============================================================================
+// BoltColumn::ensure_bitmap_index (C5)
+// ============================================================================
+// Lazily attach a BitmapIndex to a Dictionary column; cached in the
+// `bitmap_index` slot. Callers typically hit this once per column at
+// plan time and re-use across filter / semi-join probes.
+//
+// NOTE: default filter dispatch does NOT consult the index — callers
+// opt in by calling `col.ensure_bitmap_index(arena)->filter(key, out)`
+// directly. This matches the keep-code-paths-for-JIT-later policy:
+// the primitive is in the binary, an explicit name reaches it; a
+// future planner can choose bitmap-vs-scan per column based on
+// cardinality and selectivity stats.
+// ============================================================================
+
+inline BitmapIndex* BoltColumn::ensure_bitmap_index(Arena* arena_in) noexcept {
+    assert(arena_in != nullptr);
+    if (sidecars.bitmap_index != nullptr) {
+        return static_cast<BitmapIndex*>(sidecars.bitmap_index);
+    }
+    if (format != ColumnFormat::Dictionary) return nullptr;
+    BitmapIndex* idx = BitmapIndex::build(*this, arena_in);
+    if (idx == nullptr) return nullptr;
+    sidecars.bitmap_index = idx;
+    return idx;
+}
+
+// ============================================================================
 // gather_to_column<T> — materialize a selection of a Flat column into a new
 // arena-backed Flat column. Used by join probe paths that have (column +
 // selection vector) and need a compacted column for a downstream operator.
@@ -1068,7 +1264,9 @@ inline int64_t BitmapIndex::filter_in(const uint32_t* keys, uint32_t nkeys,
 //     trip BOLT_NYI in debug builds.
 //   - sel must have `sel_n` valid int32 indices in [0, src.length).
 //   - arena must be non-null; result is arena-owned.
-//   - Validity is not propagated in this wave (TODO when needed).
+//   - Validity IS propagated: if src has a validity bitmap and is not
+//     all_valid, the output gets a freshly-packed bitmap with bit i set iff
+//     src is valid at position sel[i]. src.validity_offset is honoured.
 // ============================================================================
 template <typename T>
 inline BoltColumn gather_to_column(const BoltColumn& src,
@@ -1097,6 +1295,37 @@ inline BoltColumn gather_to_column(const BoltColumn& src,
         dst[i] = in[idx];
     }
     (void)src_n;
+
+    // Propagate validity if the source actually carries nulls. If src is
+    // all_valid (no nulls) or has no bitmap, skip — leaves out.validity
+    // null and out.stats.all_valid = true (set by make_flat_alloc).
+    if (src.validity != nullptr && !src.stats.all_valid && sel_n > 0) {
+        const size_t vbytes = (static_cast<size_t>(sel_n) + 7u) / 8u;
+        uint8_t* nval = static_cast<uint8_t*>(arena->allocate_zeroed(vbytes));
+        if (nval != nullptr) {
+            assert(src.validity_offset >= 0);
+            int64_t null_count = 0;
+            for (int64_t i = 0; i < sel_n; ++i) {
+                const int64_t srcbit = src.validity_offset +
+                                       static_cast<int64_t>(sel[i]);
+                const uint8_t bit =
+                    (src.validity[srcbit >> 3] >> (srcbit & 7)) & 1u;
+                nval[i >> 3] |= static_cast<uint8_t>(bit << (i & 7));
+                null_count += (1 - static_cast<int64_t>(bit));
+            }
+            out.validity = nval;
+            out.validity_offset = 0;
+            // null_count is uint32_t; sel_n is capped at int64 but in
+            // practice arrays this big would OOM long before overflow.
+            assert(null_count >= 0 && null_count <= 0xFFFFFFFFLL);
+            out.stats.null_count = static_cast<uint32_t>(null_count);
+            out.stats.all_valid = (null_count == 0);
+        }
+        // If arena OOM'd the validity bitmap: leave out.validity = null and
+        // stats.all_valid = true. Callers already have to handle OOM on
+        // the main data buffer; a missing validity buffer is degraded but
+        // not corrupt (rows appear valid; equivalent to all_valid claim).
+    }
     return out;
 }
 

@@ -128,4 +128,56 @@ TEST(BoltScheduler, GrainRowsHelper) {
     EXPECT_EQ(bolt::bolt_grain_rows(256u * 1024u, 128), 2048u);
 }
 
+// E2 — adaptive morsel sizing (opt-in feedback). Default path is
+// unaffected; `recommended_grain_bytes` returns the static grain with
+// zero samples, and grows / shrinks toward the 1-10 ms target band as
+// observations accumulate.
+TEST(BoltScheduler, AdaptiveGrainStartsAtStatic) {
+    bolt::Scheduler s{};
+    bolt::SchedulerConfig cfg{};
+    cfg.num_workers = 1;
+    ASSERT_TRUE(s.init(cfg));
+    EXPECT_EQ(s.recommended_grain_bytes(8), s.grain_bytes());
+    s.shutdown();
+}
+
+TEST(BoltScheduler, AdaptiveGrainShrinksWhenSlow) {
+    bolt::Scheduler s{};
+    bolt::SchedulerConfig cfg{};
+    cfg.num_workers = 1;
+    ASSERT_TRUE(s.init(cfg));
+    // 256 KB / 8-byte rows = 32 768 rows per morsel. At 100 ns/row that's
+    // 3.2 ms — inside the 1-10 ms target band (no adjustment).
+    // At 1000 ns/row that's 32 ms — above 10 ms, so recommend halving.
+    s.record_morsel_ns_per_row(1000.0);
+    uint32_t rec = s.recommended_grain_bytes(8);
+    EXPECT_LT(rec, s.grain_bytes());
+    EXPECT_GE(rec, s.grain_bytes() / 4u);
+    s.shutdown();
+}
+
+TEST(BoltScheduler, AdaptiveGrainGrowsWhenFast) {
+    bolt::Scheduler s{};
+    bolt::SchedulerConfig cfg{};
+    cfg.num_workers = 1;
+    ASSERT_TRUE(s.init(cfg));
+    // 0.1 ns/row → 32 768 rows × 0.1 ns = 3.3 µs per morsel; below 1 ms,
+    // so recommend doubling.
+    s.record_morsel_ns_per_row(0.1);
+    uint32_t rec = s.recommended_grain_bytes(8);
+    EXPECT_GT(rec, s.grain_bytes());
+    EXPECT_LE(rec, s.grain_bytes() * 4u);
+    s.shutdown();
+}
+
+TEST(BoltScheduler, AdaptiveGrainIgnoresZeroObservation) {
+    bolt::Scheduler s{};
+    bolt::SchedulerConfig cfg{};
+    cfg.num_workers = 1;
+    ASSERT_TRUE(s.init(cfg));
+    s.record_morsel_ns_per_row(0.0);           // ignored — guard against NaN / zero
+    EXPECT_EQ(s.recommended_grain_bytes(8), s.grain_bytes());
+    s.shutdown();
+}
+
 }  // namespace

@@ -342,6 +342,73 @@ struct Scheduler {
         std::atomic<uint64_t> tasks_completed;
     } stats;
 
+    // E2 — adaptive morsel sizing (opt-in feedback).
+    //
+    // Callers may record the observed ns-per-row of their most recent
+    // morsel; `recommended_grain_bytes()` uses an exponentially-weighted
+    // average of those observations to suggest a grain within the
+    // profile's bounded range [grain_bytes/4, grain_bytes*4]. The
+    // default `submit_range` DOES NOT read the recommendation — callers
+    // opt in by passing `recommended_grain_bytes(elem_size)` instead of
+    // the static `grain_bytes()`. Keeps the hot path unchanged.
+    //
+    // Reset by `init()`; thread-safe via atomic<double> on platforms
+    // that provide it (all supported compilers do for IEEE 64-bit).
+    struct {
+        std::atomic<double>  ns_per_row_ewma;  // 0.0 until first observation
+        std::atomic<uint64_t> samples;         // monotonic observation count
+    } adaptive;
+
+    // Record one observation. Typical call site: wrap a kernel invocation
+    // in a Clock::now() pair, compute `(t1-t0).count() / rows`, call this
+    // once per morsel. alpha = 0.25 → fast enough to track shape changes
+    // across 4-8 morsels, slow enough not to chase single-morsel noise.
+    void record_morsel_ns_per_row(double observed) noexcept {
+        assert(observed >= 0.0);
+        if (!(observed > 0.0)) return;  // guard NaN / zero
+        double cur = adaptive.ns_per_row_ewma.load(std::memory_order_relaxed);
+        double next = (cur > 0.0) ? (0.75 * cur + 0.25 * observed) : observed;
+        adaptive.ns_per_row_ewma.store(next, std::memory_order_relaxed);
+        adaptive.samples.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // Suggest a morsel grain size (bytes) for the next submit_range. Uses
+    // the EWMA observed ns/row to keep each morsel in the 1-10 ms band:
+    //   target_rows = clamp(10 ms / ns_per_row, 1024, grain_bytes * 64 / elem_size)
+    // and returns target_rows * elem_size clamped to
+    // [grain_bytes/4, grain_bytes*4]. Returns the profile static if no
+    // observations exist yet.
+    uint32_t recommended_grain_bytes(size_t elem_size) const noexcept {
+        assert(elem_size > 0);
+        const uint32_t base = cfg.grain_bytes;
+        const uint64_t samples = adaptive.samples.load(std::memory_order_relaxed);
+        if (samples == 0u) return base;
+        const double ns_per_row = adaptive.ns_per_row_ewma.load(std::memory_order_relaxed);
+        if (!(ns_per_row > 0.0)) return base;
+
+        // Target band: 1 ms lower bound (avoid per-morsel overhead
+        // dominating), 10 ms upper bound (keep scheduler responsive).
+        constexpr double kLowerNs = 1'000'000.0;
+        constexpr double kUpperNs = 10'000'000.0;
+        const double current_rows = static_cast<double>(base) / static_cast<double>(elem_size);
+        const double current_ns   = current_rows * ns_per_row;
+
+        double target_rows = current_rows;
+        if (current_ns < kLowerNs) target_rows *= 2.0;
+        else if (current_ns > kUpperNs) target_rows *= 0.5;
+
+        const double min_rows = static_cast<double>(base / 4u) / static_cast<double>(elem_size);
+        const double max_rows = static_cast<double>(base * 4u) / static_cast<double>(elem_size);
+        if (target_rows < min_rows) target_rows = min_rows;
+        if (target_rows > max_rows) target_rows = max_rows;
+
+        const uint64_t grain = static_cast<uint64_t>(target_rows) * elem_size;
+        // Keep within the caller's 32-bit grain contract.
+        if (grain > 0xFFFFFFFFu) return 0xFFFFFFFFu;
+        if (grain < 64u) return 64u;
+        return static_cast<uint32_t>(grain);
+    }
+
     // =====================================================================
     // Init / Shutdown
     // =====================================================================
@@ -579,6 +646,8 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     shutdown_flag.store(false, std::memory_order_relaxed);
     stats.tasks_submitted.store(0, std::memory_order_relaxed);
     stats.tasks_completed.store(0, std::memory_order_relaxed);
+    adaptive.ns_per_row_ewma.store(0.0, std::memory_order_relaxed);
+    adaptive.samples.store(0, std::memory_order_relaxed);
     num_workers = 0;
 
     // Detect topology on the stack (~2KB): not persisted after init.

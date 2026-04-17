@@ -120,4 +120,70 @@ private:
     alignas(kCacheLine) size_t rpos_ = 0;
 };
 
+// ---------------------------------------------------------------------------
+// E1 — NUMA-aware channel pool (opt-in).
+//
+// Cross-socket traffic on a single shared MPSC serialises on the atomic
+// `wseq_` counter — at 4-plus sockets that cache-line bounces every
+// claim.  A pool of N MPSC channels (one per NUMA node) keeps each
+// producer writing to a socket-local atomic; the single consumer polls
+// all N round-robin.
+//
+// Kept-code-paths policy: the default `Scheduler` submit path still
+// uses a single `TaskRing`. Callers who own the producer↔socket
+// mapping (parallel groupby, parallel join) can opt into the pool
+// at dispatch time.  No runtime branch in the hot path — templated
+// `NumNodes` + compile-time dispatch.
+//
+// Typical use:
+//   NumaChannelPool<Task, 4096, 4> pool;  // 4-node box
+//   producer: pool.push(my_numa_node, std::move(task));
+//   consumer: pool.try_pop(&task);         // round-robin across nodes
+// ---------------------------------------------------------------------------
+template <typename T, size_t Capacity = 4096, size_t NumNodes = 4>
+class NumaChannelPool {
+    static_assert(NumNodes >= 1, "NumaChannelPool: NumNodes must be >= 1");
+    static_assert(NumNodes <= 16, "NumaChannelPool: sanity bound exceeded");
+
+public:
+    NumaChannelPool() noexcept = default;
+
+    // Push onto the `node`-th channel. `node` must be in [0, NumNodes).
+    bool try_push(size_t node, T&& item) noexcept {
+        assert(node < NumNodes);
+        return channels_[node].try_push(static_cast<T&&>(item));
+    }
+
+    // Pop round-robin: start from the next node after the last successful
+    // pop's source so no single node starves the rest.
+    bool try_pop(T* out) noexcept {
+        assert(out != nullptr);
+        const size_t start = rr_start_;
+        for (size_t i = 0; i < NumNodes; ++i) {
+            const size_t n = (start + i) % NumNodes;
+            if (channels_[n].try_pop(out)) {
+                rr_start_ = (n + 1) % NumNodes;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Summed approx_size across nodes (consumer-side diagnostic).
+    size_t approx_size() const noexcept {
+        size_t s = 0;
+        for (size_t n = 0; n < NumNodes; ++n) s += channels_[n].approx_size();
+        return s;
+    }
+
+    static constexpr size_t num_nodes() noexcept { return NumNodes; }
+
+private:
+    // One MPSCChannel per NUMA node; each brings its own cache-line-padded
+    // `wseq_` so producers don't contend cross-socket.
+    MPSCChannel<T, Capacity> channels_[NumNodes];
+    // Round-robin start pointer for try_pop; single-consumer so no atomic.
+    size_t rr_start_ = 0;
+};
+
 }  // namespace bolt

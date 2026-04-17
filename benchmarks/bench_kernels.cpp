@@ -118,7 +118,7 @@ static void bench_filter_i64(int64_t N, int iters) {
     });
 
 #if BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42 || BOLT_SIMD_NEON
-    bench("  bmm_* SIMD kernel (i64 compare+emit)", N, iters, [&] {
+    bench("  bmm_* SIMD kernel (compressstore)", N, iters, [&] {
         int64_t c = bolt::branchless::filter_gt_avx2_i64(
             data.data(), N, scalar, out.data());
         DoNotOptimize(c);
@@ -143,7 +143,7 @@ static void bench_filter_f64(int64_t N, int iters) {
     });
 
 #if BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42 || BOLT_SIMD_NEON
-    bench("  bmm_* SIMD kernel (f64 compare+emit)", N, iters, [&] {
+    bench("  bmm_* SIMD kernel (compressstore)", N, iters, [&] {
         int64_t c = bolt::branchless::filter_gt_avx2_f64(
             data.data(), N, scalar, out.data());
         DoNotOptimize(c);
@@ -228,6 +228,56 @@ static void bench_groupby_i64(int64_t N, int iters, bolt::Scheduler* sched, bolt
     }
 #else
     (void)sched;
+#endif
+}
+
+static void bench_gather_i32(int64_t N_data, int64_t N_probes, int iters) {
+    std::vector<int32_t> data(N_data);
+    std::mt19937 rng(42);
+    for (auto& v : data) v = static_cast<int32_t>(rng());
+
+    // Random indices — the cache-unfriendly worst case that motivates the
+    // gather + prefetch machinery.
+    std::vector<int32_t> indices(N_probes);
+    std::uniform_int_distribution<int32_t> dist(0, static_cast<int32_t>(N_data - 1));
+    for (auto& v : indices) v = dist(rng);
+
+    std::vector<int32_t> out(N_probes);
+    printf("gather<int32_t>  (data=%lld, probes=%lld, random indices):\n",
+           static_cast<long long>(N_data), static_cast<long long>(N_probes));
+    bench("  gather_branchless (SIMD + prefetch)", N_probes, iters, [&] {
+        bolt::branchless::gather_branchless<int32_t>(
+            data.data(), indices.data(), N_probes, out.data());
+        DoNotOptimize(out[0]);
+    });
+}
+
+static void bench_gather_i64(int64_t N_data, int64_t N_probes, int iters) {
+    std::vector<int64_t> data(N_data);
+    std::mt19937_64 rng(42);
+    for (auto& v : data) v = static_cast<int64_t>(rng());
+
+    std::vector<int32_t> indices(N_probes);
+    std::uniform_int_distribution<int32_t> dist(0, static_cast<int32_t>(N_data - 1));
+    std::mt19937 irng(7);
+    for (auto& v : indices) v = dist(irng);
+
+    std::vector<int64_t> out(N_probes);
+    printf("gather<int64_t>  (data=%lld, probes=%lld, random indices):\n",
+           static_cast<long long>(N_data), static_cast<long long>(N_probes));
+    bench("  gather_branchless (scalar + prefetch) [default]", N_probes, iters, [&] {
+        bolt::branchless::gather_branchless<int64_t>(
+            data.data(), indices.data(), N_probes, out.data());
+        DoNotOptimize(out[0]);
+    });
+#if BOLT_SIMD_AVX2 || BOLT_SIMD_AVX512
+    // Kept-in-source alternative: hardware gather. Slower on client Intel;
+    // reachable by name for future JIT dispatch or other hardware.
+    bench("  gather_simd_i64 (alternative, slower on client Intel)", N_probes, iters, [&] {
+        bolt::branchless::gather_simd_i64(
+            data.data(), indices.data(), N_probes, out.data());
+        DoNotOptimize(out[0]);
+    });
 #endif
 }
 
@@ -319,6 +369,10 @@ int main() {
     bench_groupby_i64(1'000'000, kIters, parallel_sched_ptr, &parallel_arena);
     printf("\n");
     bench_swiss_find(  500'000, kIters);
+    printf("\n");
+    bench_gather_i32(1'000'000, 1'000'000, kIters);
+    printf("\n");
+    bench_gather_i64(1'000'000, 1'000'000, kIters);
     printf("\n");
 
     if (sched_live) parallel_sched.shutdown();

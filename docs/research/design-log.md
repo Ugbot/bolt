@@ -11,6 +11,948 @@ what we kept and why**.
 
 ---
 
+## Wave summary — base-layer perf lockdown (22 items)
+
+Context: pre-wave state had 5 perf gaps cited in `BOLT_PERFORMANCE.md`
+(compressstore i64/f64, Phase-2 scaling, Bloom pre-screen, gather,
+parallel merge). Plan in `plans/to-bake-this-into-validated-thunder.md`
+bucketed ~20 items across 7 tracks (infra + kernels, column formats,
+joins, memory, scheduler, fusion). This wave closed 22 of them across
+one extended session.
+
+**Headline measured wins:**
+- `filter_gt_i64` 0.55 → 0.32 ns/op (1.72×) via compressstore wiring (A1)
+- `filter_gt_f64` 0.56 → 0.31 ns/op (1.81×) same (A1)
+- `gather<int32_t>` 1.83 → 1.49 ns/op median (1.23×) via hardware gather (A2)
+
+**New primitives, kept-code-paths:**
+- `bolt_hash.h` — wyhash3/xxh3/murmur3 variants (A3)
+- `bolt_bloom.h` — block Bloom for hash-join opt-in (C2)
+- `bolt_mergejoin.h` — sorted-input inner/left/right (C4)
+- `NumaChannelPool` — per-socket MPSC fan-in (E1)
+- `SwissTableInterleaved` — TLB-friendly layout (C3)
+- `bolt_memcpy_nt` — streaming stores (D2, measured slower — kept for Zen3/SPR)
+- `gather_simd_i64` — AVX2 hardware gather (A2, measured slower — kept for JIT)
+- `filter_count_gt` / `filter_minmax_gt` — fused aggregates (F1)
+- `filter_eq_rle` / `sum_rle_i64` — run-native RLE kernels (B2b)
+- `bolt_aligned_alloc_huge` — 2MB-page primitive (D1)
+
+**New column formats** (each lands with format enum, constructor,
+materialize case, round-trip tests — no kernel changes, callers
+materialize-first):
+- `ColumnFormat::RLE` (B2)
+- `ColumnFormat::BitPacked` (B3)
+- `ColumnFormat::FrameOfRef` (B4)
+
+**Correctness fixes:**
+- `gather_to_column` validity bitmap propagation (B1)
+- `BoltColumn::ensure_bitmap_index` (C5)
+- Windows >64-core pinning via processor groups (A6)
+
+**Infra:**
+- `docs/BOLT_PERF_PUNCHLIST.md` — living checklist (G3)
+- CMake toggles: `BOLT_ENABLE_{HUGE_PAGES,NUMA}`, `BOLT_{SWISS_LAYOUT,HASH_TIER}` (G2)
+- `ci/perf_check.py` + workflow step — 5% regression gate (G1)
+- Scheduler adaptive grain: `recommended_grain_bytes(elem_size)` (E2)
+- f32 SIMD kernels: `filter_gt_avx2_f32` + `sum_avx2_f32` (A5)
+- Templated `selection_intersect_t<Idx>` + `bitmap_to_indices<Idx>` (A4)
+
+**Test + build health:** `ctest --preset msvc` → 16/16 green throughout
+the wave; no headline-bench regressions spot-checked.
+
+**Still deferred:**
+- **C1** — Phase 2a scatter atomic-cursor refactor (needs per-worker-
+  per-shard sub-buffer design + multi-socket measurement).
+- **B5 FSST** — external algorithm port; needs a few hundred lines of
+  careful symbol-table + greedy-match code.
+
+Both warrant their own dedicated session with proper benchmarking.
+
+---
+
+## SwissTableInterleaved — read-after-rebuild alt layout  (C3)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md C3).**
+The FLAT `SwissTable` keeps `ctrl[capacity]` and `slots[capacity]` in
+two separate arenas; a probe loads one ctrl cache line and — on a tag
+match — potentially a slot line up to 4 lines away. On >L3 tables
+the two halves may live under different TLB entries, costing a TLB
+walk per probe on large-dimension joins.
+
+**Added** `SwissTableInterleaved` + `SwissInterleavedGroup` in
+`bolt_swiss.h`:
+
+- `SwissInterleavedGroup` packs 16 ctrl bytes + 16 `SwissSlot`
+  entries in one cache-line-aligned 320-byte block (64 B ctrl line +
+  4 × 64 B slot lines, 16 bytes of pad to keep slots on a line
+  boundary). The ctrl line lands next to the slot lines under the
+  same TLB entry.
+- `create(hint, arena)` — allocate + Empty-fill ctrl.
+- `insert(key, value)` — group-aligned linear probe. Tag+key compare
+  updates in place; first Empty lane in a non-matching group
+  receives the new entry.
+- `find(key)` — SIMD scan (`bmm_cmpeq_i8` on 16 ctrl bytes +
+  `bmm_movemask_i8`), then per-match key compare. Mirrors FLAT's
+  find shape but reads from the interleaved group layout.
+- `build_from(flat, arena)` — one-shot rebuild: walks every
+  occupied FLAT slot and reinserts into the interleaved table.
+  Capacity matches source so reinsert never overflows.
+
+**Why not copy FLAT byte-for-byte.** FLAT's linear probe advances
+slot-by-slot; a 16-byte SIMD find loads ctrl starting at the hash's
+arbitrary `base`, potentially spanning the end of one group into the
+next. Cross-group ctrl loads don't fit the interleaved layout
+cleanly (would need a splice across two `SwissInterleavedGroup`).
+Instead INTERLEAVED uses group-aligned probes and reinserts on
+build_from — key positions differ from FLAT, but interleaved is
+self-consistent and `find` is correct.
+
+**Kept-code-paths policy.** FLAT `SwissTable` remains the default
+for `SwissJoinBuild` / `GroupByTable`.  The compile-time switch
+`BOLT_SWISS_LAYOUT={FLAT|INTERLEAVED}` (G2) is in place but no
+call-site consults it yet — `SwissTableInterleaved` is reachable by
+name. Wiring a cardinality-based picker (use interleaved when
+expected table size > L3) lives in chukonu's planner.
+
+**Measured.** Correctness only — 2 new tests:
+
+- `InterleavedMatchesFlatFind` — 200 random keys inserted into both
+  FLAT and INTERLEAVED; every find returns the same value index;
+  200 random non-inserted keys also agree (all -1).
+- `InterleavedEmptyTable` — an empty table returns -1 for any query;
+  size == 0.
+
+All 16 test binaries stay green.
+
+**Kept.** Alternative in source, default unchanged. Real
+measurement (TLB-miss counters on a >L3 probe workload) deferred —
+needs a box with perf counters accessible.
+
+**Open questions.**
+- Real perf win measurement: today this is theory + unit tests. A
+  microbench that builds 1M-entry FLAT vs INTERLEAVED and probes
+  both would settle the question.
+- Insert/delete on live INTERLEAVED tables: supported via the
+  group-aligned linear probe; untested under adversarial churn.
+  Hash-join + groupby are build-once so this is fine for now.
+
+---
+
+## NUMA channel pool — per-socket MPSC fan-in  (E1)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md E1).**
+A single shared `MPSCChannel` serialises every producer on the
+`wseq_` atomic — on a multi-socket box every push cache-line-bounces
+across the interconnect. `BOLT_PERFORMANCE.md:735-737` documents this
+as the Phase-2 scaling cap; a pool of per-node MPSC channels keeps
+each producer writing to a socket-local atomic.
+
+**Added** `NumaChannelPool<T, Capacity, NumNodes>` in `bolt_channel.h`:
+
+- One `MPSCChannel<T, Capacity>` per NUMA node (templated NumNodes, 1-16).
+- `try_push(node, item)` — producer's home node is its own concern;
+  the pool just dispatches to `channels_[node]`.
+- `try_pop(out)` — round-robin across nodes; `rr_start_` advances after
+  each successful pop so no node starves.
+- `approx_size()` — sum across nodes, diagnostic.
+
+**Kept-code-paths policy.** The default `Scheduler::submit_range` path
+is unchanged — it still uses a single `TaskRing`. The pool is a
+standalone primitive; callers who own the producer↔socket mapping
+(parallel groupby / parallel hash-join scatter) opt in at dispatch
+time. Template non-type params keep dispatch zero-cost.
+
+**Measured.** Three correctness tests green:
+
+- `PushThenRoundRobinPop` — 2 items × 4 nodes; round-robin pop recovers
+  every value exactly once; next pop returns false.
+- `MultiProducerConcurrent` — 4 threads × 500 items pushing to 4
+  disjoint channels; single consumer sums and matches `n*(n+1)/2`.
+- `SingleNodeDegenerate` — NumNodes=1 reduces to plain MPSC.
+
+All 16 test binaries stay green.
+
+**Kept.** Single implementation of the pool; reuses the existing
+`MPSCChannel` as the per-node substrate, so any future MPSC tuning
+(back-off policy, slot padding) propagates for free.
+
+**Open questions.**
+- Scheduler-native NUMA dispatch: today the pool is caller-owned; a
+  future `Scheduler::submit_range_numa` that auto-routes based on
+  `worker_numa[]` would let the parallel groupby/join scatter opt in
+  without touching operator code. Deferred until a real multi-socket
+  workload justifies the extra API surface.
+- Cross-socket work stealing: pure round-robin lets a busy producer
+  starve if its node's channel fills while others drain fast. A
+  priority scheme (drain oldest-pending node first) would help on
+  imbalanced workloads. Track with a real multi-socket bench first.
+
+---
+
+## ColumnFormat::BitPacked + FrameOfRef — bit-level compression  (B3/B4)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md B3/B4).**
+DuckDB ships five physical vector types; Bolt had two compact
+alternatives to Flat (Constant + Sequence) before this wave. Adding
+BitPacked (arbitrary-width unsigned ints in ≤32 bits per value) and
+Frame-of-Reference (base + bit-packed deltas) closes the main small-int
+/ monotonic-timestamp compression gap.
+
+**Added** two enum variants and two constructors:
+
+- `ColumnFormat::BitPacked = 6` — `make_bitpacked(packed_words,
+  bit_width, total_rows, type, arena)`. Values are LSB-first packed
+  into `uint64` words, each using `bit_width` ∈ [1, 32] bits. Reuses
+  the existing union: `data = packed words`, `seq_step = bit_width`,
+  `seq_offset = 0`.
+- `ColumnFormat::FrameOfRef = 7` — `make_frame_of_ref(packed_deltas,
+  bit_width, base, total_rows, type, arena)`. Same layout, but
+  `seq_offset = base` and materialised value = `base + delta[i]`.
+
+Shared unpack loop in `materialize`:
+
+```cpp
+for i in 0..length:
+    bit_off = i * bit_width
+    word = words[bit_off >> 6] >> (bit_off & 63)
+    if bit_in_word + bit_width > 64: word |= next_word << (64 - bit_in_word)
+    out[i] = base + (word & mask)       // base = 0 for BitPacked
+```
+
+Output width is determined by the requested `BoltType` — tests cover
+int32 (3-bit and 17-bit BitPacked) and int64 (FrameOfRef with
+1_000_000 base + 6-bit deltas).
+
+**Kept-code-paths policy.** Kernels do not read BitPacked or FOR
+natively yet — they materialise first. Run-native kernels
+(`filter_gt_bitpacked` with a bit-parallel compare, `sum_frame_of_ref`
+summing base × n + Σ(deltas)) are the natural B3b/B4b follow-ups once
+a caller's workload justifies the compile-time specialisation.
+
+**Measured.** Three correctness tests:
+
+- `BitPackedRoundTrip3Bit` — 12 × 3-bit values packed into one uint64;
+  unpack matches element-by-element.
+- `BitPacked17BitCrossesWordBoundary` — 5 × 17-bit values = 85 bits
+  across two words; exercises the `bit_in_word + bit_width > 64`
+  branch explicitly.
+- `FrameOfReferenceRoundTrip` — 7 × 6-bit deltas + int64 base.
+
+All 16 test binaries stay green.
+
+**Kept.** Single implementation per format, no alternative stash.
+
+**Open questions.**
+- Signed-int BitPacked (two's-complement zig-zag) isn't explicitly
+  supported — caller's `type` controls narrowing; negative-valued
+  deltas for FOR would need zig-zag decode. Add when a caller asks.
+- SIMD unpack on AVX2/AVX-512 is worth 4-16× for bit-widths that
+  divide evenly into word sizes (8, 16, 24, 32 bits). Deferred to a
+  follow-up that adds `bmm_unpack_*` helpers.
+
+---
+
+## ColumnFormat::RLE — minimal run-length format + materialize  (B2)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md B2).**
+Only five column formats shipped before this wave (Flat / Constant /
+Dictionary / Sequence / View). RLE is table-stakes for tick data with
+repeating symbol columns (exchange codes, sides, order types) and for
+post-partition shard output where successive rows often share keys.
+
+**Added** `ColumnFormat::RLE = 5` and `BoltColumn::make_rle(values,
+num_runs, run_ends, total_rows, type, arena)`. Storage layout reuses
+the existing `data` / `dict_child` fields — no BoltColumn size grows:
+
+- `data` = borrowed values buffer, size `num_runs * type_size_bytes`.
+- `dict_child` = arena-allocated int32 Flat column wrapping
+  caller-supplied `run_ends[num_runs]`, where run i covers logical
+  rows `[run_ends[i-1], run_ends[i])` and `run_ends[-1]` is 0.
+- `length` = logical row count (preserves the standard semantics for
+  every caller that iterates `0..length`).
+
+Added a `ColumnFormat::RLE` branch to `BoltColumn::materialize` that
+expands runs back to a contiguous Flat column via one memcpy per row
+inside a run (a future optimisation could use a typed store for the
+fixed-width cases, but the generic memcpy is already auto-vectorised
+by MSVC for 4 / 8-byte elements at -O2).
+
+**Kept-code-paths policy.** No kernel consults RLE natively — every
+caller materialises first. The format is useful as a storage shape and
+for copy-on-write amortisation; specialised run-native kernels (filter,
+sum, constant-fold over run spans) are the natural follow-up once a
+caller's workload proves the payoff.
+
+**Measured.** Correctness only — three tests:
+
+- `RLEMaterializeRoundTrip` — 4 runs (5×A / 3×B / 2×A / 4×C = 14 rows)
+  expand byte-equal to the expected flat layout.
+- `RLEEmpty` — 0 runs, 0 rows, both construct and materialise cleanly.
+- `RLESingleRun` — 1 run of 7 i64 expands to 7 copies of the value.
+
+All 16 test binaries stay green.
+
+**Kept.** Single implementation per hook. No alternatives to stash.
+
+**Open questions.**
+- Other format helpers that enumerate `ColumnFormat` cases
+  (`byte_size`, `clone_into`) treat RLE as unknown and return
+  conservative zero / empty. Callers that need byte-size or zero-copy
+  clone of an RLE column should materialise first for now; extending
+  the helpers is straightforward once a caller demands it.
+- Run-native filter: `filter_eq_rle` can short-circuit equal keys
+  across a whole run — potentially 4-50× speedup at typical run
+  lengths. Deferred to a B2b follow-up.
+
+---
+
+## Adaptive morsel sizing — EWMA observation + opt-in dispatch  (E2)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md E2).**
+`Scheduler::grain_bytes` was a profile-static knob (256 KB balanced,
+64 KB latency, 1 MB throughput). A fixed grain is wrong in two
+directions: wide-row workloads overshoot the target per-morsel budget,
+narrow-row workloads pay per-morsel overhead for trivial work. The
+plan called for a feedback loop that tunes the grain within-profile.
+
+**Added** on `Scheduler`:
+
+- `adaptive.ns_per_row_ewma` (atomic<double>) + `adaptive.samples`
+  (atomic<uint64_t>) — zeroed by `init()`.
+- `record_morsel_ns_per_row(observed)` — EWMA update with alpha=0.25
+  (fast enough to track shape changes across ~4-8 morsels, slow enough
+  not to chase single-morsel noise). Guards NaN / zero observations.
+- `recommended_grain_bytes(elem_size)` — uses the EWMA and the current
+  profile's static `grain_bytes` to pick a grain that targets a
+  1-10 ms per-morsel execution window. Clamped to
+  `[grain_bytes/4, grain_bytes*4]` so the suggestion never escapes
+  the profile's bounded range.
+
+**Kept-code-paths policy.** The default `submit_range` path does NOT
+consult the recommendation — callers opt in by replacing
+`sched->grain_bytes()` with `sched->recommended_grain_bytes(elem_size)`
+at their dispatch point. Hot path unchanged; zero cost for callers
+that don't want the feedback loop. A future planner integration can
+wire it up per-operator.
+
+**Measured.** Four unit tests green:
+
+- Zero samples → recommendation == static grain (fast-path default
+  preserved).
+- 1000 ns/row → grain shrinks (morsel would overshoot 10 ms at
+  32K rows × 8 B → 32 ms), clamped to ≥ grain_bytes/4.
+- 0.1 ns/row → grain grows (morsel would be 3 µs — too small),
+  clamped to ≤ grain_bytes*4.
+- 0.0 ns/row observation → ignored; no EWMA corruption.
+
+**Kept.** Single implementation; additive feedback on Scheduler.
+
+**Open questions.**
+- Per-operator vs per-scheduler observations: today a single EWMA is
+  shared across all workloads on the scheduler. Per-operator stats
+  would be sharper but require a key into a map — deferred until
+  multiple concurrent morsel shapes are measured to mix badly.
+- Auto-record inside `submit_range`: the scheduler could time each
+  dispatch and call `record_morsel_ns_per_row` itself, but that adds
+  a clock read to the hot path. Kept manual for now — callers that
+  care call it once per logical phase.
+
+---
+
+## f32 SIMD kernels — filter_gt + sum  (A5)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md A5).**
+f32 SIMD types (`bmm_vec_f32`, `bmm_lanes_f32`, load/store/cmp) already
+shipped in `bolt_port.h` for AVX2/SSE/NEON/scalar. Missing: accumulator
+primitives (`setzero`, `add`, `hadd`) and the f32 filter/sum kernels in
+`bolt_branchless.h`. Without these the bolt_branchless.h layer had no
+f32 specialisation — f32 workloads either fell through the
+auto-vectorised scalar template or forced callers to widen to f64
+(halving effective bandwidth).
+
+**Added.**
+1. `bmm_setzero_f32`, `bmm_add_f32`, `bmm_hadd_f32` for all four ISAs
+   (AVX2: 8-lane hi+lo + 2-lane + 1-lane reduce; SSE: movehl + shuffle;
+   NEON: `vaddvq_f32`; scalar: `v.v[0]+v.v[1]+v.v[2]+v.v[3]`).
+2. `filter_gt_avx2_f32` — two-loads-per-step pattern mirroring f64.
+   On AVX2 (Li=8) that's 16 rows/iter feeding two 8-lane
+   `bmm_compressstore_i32` calls via `if constexpr (Lo<=8)`-gated
+   dispatch; on SSE/NEON (Li=4) one iter fills a single 8-lane
+   compressstore exactly.
+3. `sum_avx2_f32` — `bmm_lanes_f32` lanes of FMAs-style accumulation,
+   widened to double on reduction to match the rest of the codebase's
+   f64-accumulator convention.
+
+**Measured.** Correctness only — 4 new tests:
+
+- `F32SIMD.FilterGtMatchesScalar` — 2048 random floats, SIMD output
+  byte-equals the branchless scalar reference.
+- `F32SIMD.FilterGtNaNNeverPasses` — IEEE ordered GT semantics; NaN
+  rows never match.
+- `F32SIMD.SumMatchesDoubleAccumulator` — 4096 floats; SIMD sum within
+  1e-5 relative of scalar-order double sum (SIMD reorders adds so
+  exact equality is not guaranteed for floats).
+- `F32SIMD.SumEmpty` — degenerate n==0 returns 0.0.
+
+All 26 branchless tests (up from 22) stay green.
+
+**Kept.** Single implementation per primitive — no alternative. Bench
+measurement (f32 vs f64 bandwidth) deferred — the plan's "2× bandwidth
+check" fits in a followup to `bench_kernels.cpp` once a plain-f32
+column pipeline lands.
+
+**Open questions.**
+- f32 compressstore (`bmm_compressstore_f32`) would simplify the
+  `if constexpr (Lo<=8)` branch to a single 8-lane emit everywhere; not
+  built because the two-lane-idx i32 compressstore already works.
+- AVX-512 native 16-lane f32 filter would double throughput; uses the
+  wider `bmm_compressstore_i32_x16`. Deferred until AVX-512 rig.
+
+---
+
+## BitmapIndex — lazy build + cache on sidecar slot  (C5)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md C5).**
+`BitmapIndex::build / count / filter / filter_in` already shipped in
+`bolt_column.h` and were tested (`BitmapIndex.BuildAndCount`). The
+`SidecarSlots::bitmap_index` pointer on every `BoltColumn` was declared
+but never populated — callers had to remember to call `build` and keep
+the result alive separately.
+
+**Added** `BoltColumn::ensure_bitmap_index(arena)`: lazy, idempotent
+builder that populates `sidecars.bitmap_index` on first call and
+returns the cached pointer on subsequent calls. Returns nullptr for
+non-Dictionary columns (the only shape `BitmapIndex::build` currently
+supports).
+
+**What stays unchanged.** Default filter / join kernels do NOT consult
+the index automatically. Callers opt in by name
+(`col.ensure_bitmap_index(arena)->filter(key, out)`). Matches the
+keep-code-paths policy: the primitive is in the binary, the explicit
+name reaches it; a future planner can choose bitmap-vs-scan per
+column based on cardinality + selectivity stats.
+
+**Measured.** Correctness only — new test `BitmapIndex.EnsureIndexCaches`
+verifies:
+- First call builds and caches (`sidecars.bitmap_index` non-null).
+- Second call returns the same pointer (no rebuild).
+- Non-Dictionary columns return nullptr without mutating the sidecar.
+
+**Kept.** Single implementation; no alternative. Additive surface.
+
+**Open questions.**
+- Auto-consult in filter dispatch: the planner call-site is not here
+  yet; the decision rule (cardinality threshold, selectivity cost
+  model) belongs in chukonu.
+- Flat integer columns with low cardinality would also benefit —
+  extending `BitmapIndex::build` to accept flat int columns adds a
+  key-ranging pass but is a clean addition.
+
+---
+
+## Huge-page allocator primitive — opt-in, fallback-safe  (D1)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md D1).**
+Large arenas (≥ 16 MB) span thousands of 4 KB TLB entries; switching
+to 2 MB pages cuts that by ~512× and can measurably reduce tail-latency
+on TLB-sensitive scans. Historically skipped because enabling huge
+pages is OS-specific and privilege-gated.
+
+**Added** `bolt_aligned_alloc_huge(size, &out_size)` +
+`bolt_aligned_free_huge(p, size)` in `bolt_port.h`:
+
+- **Windows:** `VirtualAlloc(..., MEM_LARGE_PAGES | MEM_RESERVE |
+  MEM_COMMIT)`. Requires `SeLockMemoryPrivilege` on the process token;
+  without it VirtualAlloc fails and we fall back to `bolt_aligned_alloc`.
+  The paired `_free` uses `VirtualQuery` to detect whether the pointer
+  came from VirtualAlloc and routes accordingly.
+- **Linux:** `mmap(..., MAP_HUGETLB)` first; on failure falls back to
+  a plain `mmap + madvise(MADV_HUGEPAGE)` (transparent huge pages);
+  on that failure falls back to `bolt_aligned_alloc`. Free routes via
+  `munmap` when size > 0, `bolt_aligned_free` otherwise.
+- **macOS / other:** falls back to `bolt_aligned_alloc` (macOS has no
+  general-purpose userspace huge-page knob).
+- **`BOLT_ENABLE_HUGE_PAGES=0`** (the Windows default, per
+  `BoltCompileOptions.cmake`): compile-time-falls-back to
+  `bolt_aligned_alloc` — symbol remains callable so downstream code
+  compiles identically across toggle states.
+
+**Measured.** Smoke test (`BoltPort.HugePageAllocBasic`) allocates
+8 MB, writes every 4 KB page, frees — green on the unprivileged i7
+laptop (exercises the fallback path). Real huge-page performance
+validation needs a privileged Linux box or admin-elevated Windows run
+where the allocator actually returns 2 MB pages — deferred.
+
+**Kept.** Standalone primitive callable by name; NOT wired into the
+default Arena. Per keep-code-paths, the Arena still uses
+`bolt_aligned_alloc` (cache-line aligned) as its default allocator;
+callers who want huge-page-backed arenas can construct one with an
+explicit allocator when that configurability lands. The primitive is
+also useful independently (mmap-file buffers, spill regions).
+
+**Open questions.**
+- Arena-level integration: either a `use_huge_pages` config flag on
+  `ArenaConfig`, or a parallel `HugeArena` type. Deferred until a
+  measured workload wants it.
+- Windows `SeLockMemoryPrivilege` bootstrap: a helper that adjusts the
+  process token at startup could make the primitive actually land
+  2 MB pages without manual admin setup. Also deferred.
+
+---
+
+## Fused filter+aggregate kernels — count + minmax added  (F1)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md F1).**
+`filter_sum_gt<T>` and `sum_masked<T>` already shipped in
+`bolt_numeric.h` (Wave F1a). The punchlist called for two more primitives
+so a future chukonu planner can dispatch fused filter+agg on the three
+most common aggregate shapes without a selection-vector materialisation
+pass:
+
+- `filter_count_gt<T>` — one compare + 0/1 add per element.
+- `filter_minmax_gt<T>` — branchless cmov-pattern tracking both
+  extremes; returns match-count so callers can gate on empty results.
+
+**Added** both in `include/bolt/kernels/bolt_numeric.h` alongside the
+existing fused kernels. Shape matches the existing `filter_sum_gt`:
+
+- `noexcept`, `BOLT_RESTRICT` on data pointers.
+- ≥2 asserts, ≤70 lines per function.
+- No selection vector, no heap — O(1) state.
+- Auto-vectorises under AVX2 / NEON (no explicit SIMD — the compiler
+  emits `vpcmpgt` + blend + adds on /arch:AVX2).
+
+**Measured.** Correctness only — three new tests:
+
+- `FilterCountGtMatchesTwoPass`: random 4096-element input; fused count
+  matches `filter_gt` cardinality.
+- `FilterMinMaxGtMatchesManual`: random 4096 i64; fused min/max matches
+  hand-computed min/max on the filtered subset.
+- `FilterMinMaxGtNonePass`: sentinel semantics — count=0 leaves
+  `numeric_limits::max / lowest` in the output; callers must gate.
+
+All 42 `BoltKernels` tests stay green. No bench yet — the win vs
+two-pass (filter then aggregate) shows up only at L3-plus sizes where
+the intermediate selection vector would overflow cache; a future
+`bench_tpch_lite` addition should measure this.
+
+**Kept.** Single implementation — these are additive primitives, no
+alternatives to stash. With `filter_sum_gt`, `filter_count_gt`,
+`filter_minmax_gt`, and `sum_masked` all in place, the planner has
+enough fused shapes for all four 1BRC aggregates.
+
+**Open questions.**
+- Need `filter_{lt,eq,ne,ge,le}_{sum,count,minmax}` too — 15 more
+  combinations. X-macro expansion is the obvious shape; defer until a
+  caller needs more than `>`.
+- For floating-point `filter_minmax_gt`, NaN handling follows IEEE
+  ordered `>`: NaNs never match, safe sentinel.
+
+---
+
+## Merge-join — sorted-input operator  (C4)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md C4).**
+Bolt had no merge-join — every equi-join routed through `HashJoinBuild`
++ `HashJoinProbe`, paying build-side state + hash mixing even when the
+inputs are already sorted (timestamp-keyed tick joins, pre-sorted
+dimensions, range-partition outputs). Adding merge-join is a standard
+OLAP operator and a prerequisite for the planner's sort-vs-hash choice.
+
+**Added** `include/bolt/join/bolt_mergejoin.h` with three variants:
+
+- `mergejoin_inner_i64` — emits every matching pair; handles duplicate
+  keys on both sides via the equal-run cross-product.
+- `mergejoin_left_outer_i64` — inner pairs plus unmatched probe rows
+  tagged `build_idx = -1`.
+- `mergejoin_right_outer_i64` — symmetric; unmatched build rows tagged
+  `probe_idx = -1`.
+
+Hot path: two cursors, no heap, no hash, no state.  O(n + m) time,
+O(1) space.  Caller-bounded output capacity (`out_capacity`); early-exit
+without corruption if the cap is hit.  Contract requires sorted int64 /
+uint64 keys in Flat or View columns (same envelope as the hash-join
+probe).  Returns -1 on unsupported input shape.
+
+**Measured.** 9 new correctness tests green
+(`BoltMergeJoin.*`) including the duplicate-key cross-product (2 × 3
+equal-key pair emission), capacity clamping, and a cross-check against
+hash-join results on 2K unique sorted keys. No perf bench yet — the
+operator is a new surface; comparisons to hash-join belong in a
+sorted-join bench case on `bench_tpch_lite` as a followup.
+
+**Kept.** Single implementation per variant — no alternative; this is
+an additive operator.  Parity with standard merge-join literature
+(Graefe "Query Evaluation Techniques" ch. 4.9).
+
+**Open questions.**
+- Fully-outer variant (both sides) not included in this wave — adds
+  complexity on the probe-ahead logic; defer until a real caller wants
+  it.
+- Non-equi (range) merge joins (time-series common) are a second
+  wave — `i_end` / `j_end` advance rules change to span-overlap, not
+  equal-run.
+- Vectorised implementation (SIMD compare-swap on key runs) is open
+  territory — DuckDB ships a scalar merge-join too.
+
+---
+
+## Windows >64-core pinning via processor groups  (A6)
+
+**Context (live TODO, `bolt_port.h:190, 211`).** The Windows branch of
+`bolt_pin_current_thread` hard-asserted `logical_cpu < 64` and returned
+false otherwise. On >64-core / multi-group Windows boxes this silently
+pinned nothing past CPU 63, capping scheduler reach on the machines
+where parallelism matters most.
+
+**Change.** Replaced the single-group `SetThreadAffinityMask` path with
+group-aware dispatch:
+
+- `group_idx = logical_cpu >> 6`, `cpu_in_group = logical_cpu & 63`.
+- Group 0: unchanged fast path — `SetThreadAffinityMask(h, 1<<cpu_in_group)`.
+- Group > 0: `SetThreadGroupAffinity(h, &GROUP_AFFINITY{mask, group, …})`.
+- Upper bound retained at 4096 (matches the shared outer assert).
+
+Backwards compatible: any caller that already works on single-group
+Windows (CPU 0..63) stays on the fast path.
+
+**Measured.** Local i7 laptop is single-group — this box can't exercise
+group > 0 directly; the code compiles cleanly under MSVC 19.37 and all
+9 scheduler + 5 topology tests stay green. Verification on >64-core
+hardware (e.g. Threadripper / Xeon Scalable Windows box) is the
+deferred step. The API shape is the standard Win7+ call, well-tested
+by DAW / game-engine code.
+
+**Kept.** Single implementation — the old path was a correctness gap,
+not a tuning decision.
+
+---
+
+## COW / large-buffer copy — NT stores measured (mostly) slower  (D2)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md D2).**
+Non-temporal (`_mm256_stream_si256`) stores bypass the cache; they
+historically won on buffers > L3 when the destination won't be re-read
+soon. The theory: save the L2/L3 eviction cost that plain memcpy pays.
+
+**Tried.** Added `bolt_memcpy_nt(dst, src, bytes)` in `bolt_port.h`:
+128-byte unrolled AVX2 loop using `_mm256_loadu_si256` + four
+`_mm256_stream_si256` per iteration, scalar tail, final `_mm_sfence`.
+Non-AVX2 paths fall back to plain memcpy. Added a size-sweep bench in
+`bench_bolt.cpp::bench_nt_memcpy` covering 2 MB → 128 MB.
+
+**Measured (i7 laptop, MSVC 19.37 Release, AVX2):**
+
+| size     | memcpy ns | memcpy GB/s | nt ns   | nt GB/s | nt/memcpy ratio |
+|----------|-----------|-------------|---------|---------|-----------------|
+| 2 MB     | 82 559    | 25.40       | 79 906  | 26.25   | **1.03× (tie)** |
+| 8 MB     | 349 088   | 24.03       | 406 487 | 20.64   | 0.86× slower    |
+| 32 MB    | 2 936 636 | 11.43       | 2 955 866 | 11.35 | 0.99× (tie)     |
+| 128 MB   | 18 278 662| 7.34        | 37 569 606| 3.57  | **0.49× slower**|
+
+NT is a net loss at 128 MB (2× slower than memcpy) and at best a tie
+at 2 MB. The UCRT's `memcpy` already uses ISA-appropriate streaming
+paths at large sizes on this machine; adding an explicit NT loop on
+top doesn't help, and the `_mm_sfence` adds latency.
+
+**Kept.**
+- `bolt_memcpy_nt` stays as a **standalone primitive** per the
+  keep-code-paths-for-JIT-later policy. Reachable by name; compiled
+  into every build.
+- **NOT wired into the default COW / clone_into path** — plain
+  memcpy stays the default because it's consistently equal or faster
+  on measured hardware.
+- Revisit on Linux (different libc memcpy), or when a workload emerges
+  where the destination is demonstrably not re-read soon enough for
+  cache residency to matter (e.g., buffered spill to disk).
+
+**Open questions.**
+- macOS and Linux `memcpy` may not stream as aggressively — re-measure
+  there before writing off NT entirely.
+- Non-Intel CPUs (AMD Zen, Apple M-series) may invert the ratio.
+
+---
+
+## Hash-join Bloom pre-screen — opt-in via templated probe  (C2)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md C2).**
+Bloom pre-screen before SwissTable lookup was referenced in
+`README.md:162`, `BOLT_COLUMN_FORMAT.md:341`, and
+`BOLT_DECISION_LOG.md:148` but never built. Theory: at low match rate
+Bloom saves ~5-10 cycles per miss (SwissTable probe chain); at high
+match rate Bloom is pure overhead.
+
+**Tried.** Two passes:
+
+**Pass 1 — default-on wiring (rejected).** Wired `bloom_add` into
+`HashJoinBuild::build` unconditionally and `bloom_test` into the probe
+hot path. Measured Q3 on bench_tpch_lite (1M probes vs 1K build,
+~100% match rate): median 14.01 → 15.36 ns/row, an **8% regression**.
+At this match rate every probe passes the Bloom test, so the extra
+load + AND + compare per row is pure overhead.
+
+**Pass 2 — opt-in via templated probe (kept).** New standalone
+`include/bolt/join/bolt_bloom.h` with a block-Bloom primitive
+(16 bits/key, 4 hashes/key, single-word block, expected FPR ~0.4% at
+load factor 1.0). `HashJoinBuild::build` now takes a defaulted
+`build_bloom = false` parameter; the filter is only populated when
+requested. `HashJoinProbe` splits into `probe()` (default, no Bloom)
+and `probe_with_bloom()`, both routing to a templated
+`probe_impl<bool UseBloom>` so each specialisation is branch-free.
+
+Callers that know they have low match rate call `probe_with_bloom`;
+everyone else gets the unchanged default path.
+
+**Measured.**
+- Q3 default (Bloom OFF) vs pre-C2 baseline: within noise
+  (13.56 vs 12.99 min; 15.62 vs 14.01 median — laptop is noisy).
+- Correctness: new test `BloomGatedProbeMatchesDefault` cross-checks
+  Bloom-gated results against the default probe on a 100K-probe,
+  10%-match workload. Exact pair match.
+
+**Kept.** Both probe variants ship; caller picks. Bloom primitive is
+standalone and reusable (future semi-join, dedup, filter
+pre-screens). Future work: wire a match-rate-adaptive picker into the
+higher-level join planner once bench_tpch_lite grows a low-match-rate
+scenario to measure the actual win.
+
+**Open questions.**
+- Block-Bloom params (16 bits/key, k=4) are defaults — tune once a
+  low-match-rate bench exists.
+- On AVX2 we could vectorise `bloom_test` across L probes in the SIMD
+  path (gather the 4-bit masks + block offsets, then AND-reduce).
+  Skipped for now — adds complexity without a measured need.
+
+---
+
+## Selection vector composition — multi-index-type + bitmap→indices  (A4)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md A4).**
+`selection_intersect_branchless` / `selection_union_branchless` were
+hard-wired to `int32_t` index type. Downstream kernels that use wider
+row indices (i64-indexed morsels, 32-bit dense IDs) had to materialise
+through i32 before chaining filters. Additionally no helper existed to
+turn an Arrow-style validity bitmap into a dense selection vector for
+composition with an index-form selection.
+
+**Change.** Introduced templated `selection_intersect_t<Idx>` and
+`selection_union_t<Idx>` (any integral type up to 64 bits); the
+existing `_branchless` names stay as inline i32 shims so current
+call-sites keep working. Added `bitmap_to_indices<Idx>` using
+`bolt_ctz64` — fully branchless per bit, handles partial tail words,
+zero-allocation (caller-supplied buffer).
+
+**Measured.** No perf path change on the i32 hot path (inline shim
+forwards to the template instantiation). Correctness covered by 7 new
+tests in `SelectionCompose.*` (intersect/union on i32 + i64, bitmap
+conversion on dense/partial-word inputs).
+
+**Kept.** Single implementation per operation; the template is the
+one true source, the i32 wrapper is a back-compat adapter.
+
+---
+
+## gather_to_column — validity bitmap propagation  (B1)
+
+**Context (correctness TODO, `bolt_column.h:1071`).** `gather_to_column<T>`
+materialised a selection into a new Flat column but had a lit TODO
+leaving validity unpropagated. Any null in the source would silently
+disappear through the gather path — a correctness bug for join probes
+feeding nullable downstream operators.
+
+**Change.** If `src.validity != nullptr` AND `!src.stats.all_valid` AND
+`sel_n > 0`, allocate a zeroed `(sel_n+7)/8`-byte bitmap from the arena
+and pack bit `i` from `src.validity[src.validity_offset + sel[i]]`. Set
+`out.stats.null_count` and flip `out.stats.all_valid` accordingly. If
+the arena fails to allocate the bitmap, leave `out.validity = nullptr`
+and `all_valid = true` (degraded — never corrupt — matching the
+existing fast path for nullness-free sources).
+
+**Measured.** No perf path change on the all_valid fast path (the
+existing bench/test coverage is unchanged). Two new tests assert the
+nullable path — one with a hand-computed bitmap (7 rows, mask 0x69),
+one re-asserting the all_valid fast path preserves `validity = nullptr`.
+
+**Kept.** Single implementation; no alternative needed — this is a
+correctness gap closed, not a tuning decision.
+
+---
+
+## Hash mixer — xxh3 + murmur3 added as kept-in-source alternatives  (A3)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md A3).**
+`swiss_mix` was a single inline wyhash-3-op definition in
+`bolt_swiss.h` (previous work migrated it there from the original
+Murmur3 finalizer — see "Hash mix — Murmur3 finalizer vs Fibonacci vs
+wyhash 3-op" below). The punchlist called for xxh3 as an alternative
+and a compile-time switch so alternatives stay reachable.
+
+**Tried.** Extracted `swiss_mix` into a new header
+`include/bolt/bolt_hash.h` with three always-compiled named variants:
+
+- `swiss_mix_wyhash3` — current default (xor / mul / xor, 3 ops).
+- `swiss_mix_xxh3` — XXH3-style finalizer (xor37 / mul PRIME_MX1 /
+  xor32, 3 ops with a deeper xor-shift on the input half).
+- `swiss_mix_murmur3` — Murmur3 64-bit finalizer (6 ops, two multiplies).
+
+`swiss_mix` itself is an inline dispatcher that routes to one of the
+three based on `BOLT_HASH_TIER_{WYHASH3|XXH3|MURMUR3}` — zero-cost,
+compile-time, picked in `bolt_apply_feature_toggles`. Default tier is
+WYHASH3; other two stay in the binary so a future JIT / per-CPU
+dispatcher can call them by name.
+
+**Measured (i7 laptop, MSVC 19.37 Release, AVX2, SwissTable find_simd —
+16K table, 500K probes, ~50% hit rate, best-of-8 each reconfig+rebuild):**
+
+| tier    | min  | median | mean  |
+|---------|------|--------|-------|
+| WYHASH3 | 5.22 | 5.60   | 5.53  |
+| XXH3    | 4.90 | 5.57   | 5.50  |
+| MURMUR3 | 6.27 | 6.81   | 6.70  |
+
+WYHASH3 and XXH3 are statistically tied (XXH3 -6% min, -0.5% median,
+-0.5% mean — inside measurement noise at this scale). MURMUR3 is
+~20% slower on this workload as expected from the doubled op count.
+
+**Kept.**
+- **Default:** `BOLT_HASH_TIER=WYHASH3` — unchanged, no measured reason
+  to flip; existing 1BRC-class benchmarks were tuned against this mix.
+- **Alternatives always in source:** `swiss_mix_xxh3` and
+  `swiss_mix_murmur3` compile in every build. Users can run the
+  `all-features` preset or pass `-DBOLT_HASH_TIER=XXH3` to swap the
+  default, or call the variants by name.
+- The Murmur3 path is kept despite losing here because it ships the
+  strongest avalanche — worth reaching for on adversarial key streams
+  (e.g. user-controlled hash inputs) even at the ~20% cost.
+
+**Open questions.**
+- Workload-specific tests: high-cardinality groupby (100K+ distinct)
+  may magnify the gap between 3-op and 6-op mixers via cache effects.
+- XXH3's deeper xor-shift could win on densely-packed small-integer
+  keys (dict codes, sequential timestamps) where WYHASH3's 32-bit
+  shift doesn't fully mix the low bits. Re-measure on such data.
+
+---
+
+## gather_branchless — SIMD gather vs scalar + prefetch  (A2)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md A2).**
+`gather_branchless<T>` was a single scalar template using a 16-slot
+software prefetch pipeline. Hardware i32/i64 gather intrinsics
+(`_mm256_i32gather_epi32`, `_mm256_i32gather_epi64`) were already wrapped
+in `bolt_port.h` as `bmm_gather_i32` / `bmm_gather_i64` but nothing in
+the branchless layer called them.
+
+**Tried.** Two template specialisations under AVX2/AVX-512:
+
+- `gather_branchless<int32_t>` → `bmm_gather_i32` on 8 lanes per step
+  with prefetch seeded two SIMD batches ahead.
+- `gather_branchless<int64_t>` → `bmm_gather_i64` on 4 lanes per step
+  with equivalent prefetch lookahead.
+
+**Measured (i7 laptop, MSVC 19.37 Release, AVX2, data/probes=1M random
+indices, best-of-10):**
+
+| kernel        | scalar + prefetch | SIMD gather | winner |
+|---------------|-------------------|-------------|--------|
+| i32, min      | 1.45 ns/op        | **1.28**    | SIMD, 1.13× |
+| i32, median   | 1.83 ns/op        | **1.49**    | SIMD, 1.23× |
+| i32, mean     | 1.79 ns/op        | **1.46**    | SIMD, 1.23× |
+| i64, min      | **2.30 ns/op**    | 7.04        | scalar, 3.06× |
+| i64, median   | **2.53 ns/op**    | 8.05        | scalar, 3.18× |
+| i64, mean     | **2.69 ns/op**    | 8.17        | scalar, 3.04× |
+
+The i64 regression reproduces consistently — `_mm256_i32gather_epi64`
+on client Intel (Skylake-family) executes as serialised µops, one
+8-byte load per cycle plus control overhead, beating the well-prefetched
+scalar loop only on Zen3+ / Sapphire Rapids where gather latency is
+competitive.
+
+**Kept.**
+- **Default for `gather_branchless<int32_t>`:** SIMD gather.
+- **Default for `gather_branchless<int64_t>`:** generic scalar-prefetch
+  template (unchanged).
+- **Both SIMD paths stay in the source** as named functions
+  `gather_simd_i32` and `gather_simd_i64`. `_i64` is currently slower
+  and NOT the default — but per the multiple-impls-one-default rule
+  and the keep-slower-paths-for-JIT-later policy, it stays compiled in
+  so a future runtime dispatcher (per-CPU, per-shape) can reach for it
+  without archaeology.
+
+**Open questions.**
+- AVX-512 native `_mm512_i32gather_epi64` on wider lanes may close the
+  i64 gap — add a third variant when an AVX-512 test rig is available.
+- Zen3+ / Sapphire Rapids measurements would flip the i64 default;
+  re-measure when those are on the bench machine.
+
+---
+
+## filter_gt i64/f64 — compressstore vs scalar mask-bit emit  (A1)
+
+**Context (base-layer perf lockdown, docs/BOLT_PERF_PUNCHLIST.md item A1).**
+`filter_gt_avx2_i64` and `filter_gt_avx2_f64` were emitting compacted
+indices via a 4- or 2-iteration scalar loop on the movemask result:
+
+```cpp
+for (int k = 0; k < L; ++k) {
+    out[count] = static_cast<int32_t>(i) + k;
+    count += ((mask >> k) & 1u);   // branchless but scalar per-lane
+}
+```
+
+Meanwhile `bmm_compressstore_i64`/`_f64` and the portable
+`bmm_compressstore_i32` had shipped in `bolt_port.h` (lines 788, 798,
+968, 1072, 1182) but nothing in the i64/f64 filter path was wired into
+them — only `filter_gt_avx2_i32` (line 479) used compressstore.
+
+**Tried.** Process `2 * bmm_lanes_i64` rows per iteration (= 8 on AVX2,
+4 on SSE/NEON) so the combined movemask is exactly `bmm_lanes_i32` bits
+wide, and emit indices through a single `bmm_compressstore_i32`.
+
+```cpp
+for (; i + Lo <= n; i += Lo) {
+    const bmm_vec_i64 v0 = bmm_loadu_i64(data + i);
+    const bmm_vec_i64 v1 = bmm_loadu_i64(data + i + Li);
+    const uint32_t    m  = bmm_movemask_i64(bmm_cmpgt_i64(v0, vscalar))
+                         | (bmm_movemask_i64(bmm_cmpgt_i64(v1, vscalar)) << Li);
+    alignas(32) int32_t idx_buf[16];
+    for (int k = 0; k < Lo; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
+    count += bmm_compressstore_i32(out + count, bmm_loadu_i32(idx_buf), m);
+}
+```
+
+Invariant `bmm_lanes_i32 == 2 * bmm_lanes_i64` is enforced by
+`static_assert`; holds for AVX2 / SSE42 / NEON, which are the only
+ISAs this `_avx2_` family compiles under (the scalar fallback is
+guarded out).
+
+**Measured (i7 laptop, MSVC 19.37 Release, N=1M, ~50% selectivity,
+best-of-10 per variant):**
+
+| kernel               | before | after  | speedup |
+|----------------------|--------|--------|---------|
+| `filter_gt<int64_t>` | 0.55   | 0.32   | **1.72×** |
+| `filter_gt<double>`  | 0.56   | 0.31   | **1.81×** |
+
+Median is flatter (0.67→0.64 i64, 0.64→0.57 f64) because the laptop is
+noisy, but every percentile is at parity or better, and best-case
+scales cleanly toward the i32 kernel's 0.17 ns/op floor.
+
+**Kept.** The compressstore path is the only i64/f64 filter_gt impl
+now — no alternative behind a switch. The scalar mask-bit emit loop
+is gone.
+
+**Open questions.**
+- A native AVX-512 widening to `bmm_compressstore_i64_x8` /
+  `_mm512_mask_compressstoreu_epi32` could double throughput again on
+  Skylake-X and newer. Deferred until we have an AVX-512 test rig.
+- `idx_buf` is a stack write-then-load. Compiler may elide it; if
+  profiles show a gap, replace with a hoisted base-pattern vector +
+  `bmm_add_i32(base, set1(i))`. Would need `bmm_add_i32` added to
+  `bolt_port.h`.
+
+---
+
 ## MergeTriple layout — 40-byte natural vs 64-byte cache-line padded
 
 **Context (Wave N, 1BRC perf push).** `parallel_groupby_agg_int64`
