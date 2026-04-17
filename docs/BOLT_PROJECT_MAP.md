@@ -35,7 +35,44 @@ chukonu/
 │   │       ├── funding_cost.h        Phase 4a: position · price · rate
 │   │       ├── cip_basis.h           Phase 4a: CIP basis (log-form)
 │   │       ├── funding_apr.h         Phase 4a: rate · periods · 100
-│   │       └── perp_fair_price.h     Phase 4a: spot · (1 + fr·h/8)
+│   │       ├── perp_fair_price.h     Phase 4a: spot · (1 + fr·h/8)
+│   │       ├── log_returns.h        Phase 4b: log(p[i]/p[i-1]), 0 at i=0
+│   │       ├── ofi.h                Phase 4b: buy_vol - sell_vol
+│   │       ├── implementation_shortfall.h Phase 4b: 10000·(exec-bench)/bench bps
+│   │       ├── open_interest_delta.h Phase 4b: oi[i]-oi[i-1], 0 at i=0
+│   │       ├── corwin_schultz.h     Phase 4b: high-low pair spread estimator
+│   │       ├── garman_klass.h       Phase 4b: OHLC volatility
+│   │       ├── parkinson.h          Phase 4b: high-low volatility
+│   │       ├── rogers_satchell.h    Phase 4b: drift-independent OHLC vol
+│   │       ├── realized_var.h       Phase 4b: Σr² broadcast
+│   │       ├── bipower_var.h        Phase 4b: jump-robust (π/2)·Σ|r_i||r_{i-1}|
+│   │       ├── stale_quote_detector.h Phase 4b: ts-lastUpdate>max_age flag
+│   │       ├── price_band_guard.h   Phase 4b: |order/ref-1|≥band flag
+│   │       ├── fat_finger_guard.h   Phase 4b: band OR notional flag
+│   │       ├── circuit_breaker.h    Phase 4b: |p/ref-1|>thr flag (batch-local)
+│   │       ├── monotonic_deque.h    Phase 5.R: IndexRing<kCap> sliding-window extrema
+│   │       ├── sma.h                Phase 5.R: rolling mean (SMA)
+│   │       ├── bollinger_bands.h    Phase 5.R: SMA ± k·stddev (3 cols)
+│   │       ├── donchian_channel.h   Phase 5.R: rolling high/low channel (2 cols)
+│   │       ├── atr.h                Phase 5.R: rolling mean of True Range
+│   │       ├── vwap_twap.h          Phase 5.R: rolling VWAP + rolling TWAP
+│   │       ├── rolling_min_max.h    Phase 5.R: O(1) amortised rolling min/max
+│   │       ├── stochastic_osc.h     Phase 5.R: Stochastic %K oscillator
+│   │       ├── ema.h                Phase 3 / P5.E.1: worked Tier 2 template; arena-pinned EMAState
+│   │       ├── ewma.h               Phase 5.E.2: caller-supplied alpha EWMA
+│   │       ├── ewcov.h              Phase 5.E.3: two-variable EW covariance (RiskMetrics lambda)
+│   │       ├── macd.h               Phase 5.E.4: MACD line/signal/histogram (3 chained EmaState)
+│   │       ├── rsi.h                Phase 5.E.5: Wilder RSI (alpha = 1/period)
+│   │       ├── welford_mean_var.h   Phase 5.W.1: streaming (mean, pop_var) per row
+│   │       ├── rolling_std.h        Phase 5.W.2: rolling pop_stddev (rescan-Welford)
+│   │       ├── rolling_zscore.h     Phase 5.W.3: (x - rolling_mean)/rolling_stddev
+│   │       ├── sharpe_ratio.h       Phase 5.W.4: scalar Sharpe, sample-var, annualized
+│   │       ├── sortino_ratio.h     Phase 5.W.5: scalar Sortino, downside-dev
+│   │       ├── rolling_correlation.h Phase 5.W.6: rolling Pearson corr (two rings, rescan)
+│   │       ├── rolling_skew.h       Phase 5.W.7: rolling raw skewness (pop moments)
+│   │       ├── rolling_kurt.h       Phase 5.W.8: rolling EXCESS kurtosis
+│   │       ├── autocorr.h           Phase 5.W.9: rolling Pearson autocorr at lag k
+│   │       └── risk_metrics_vol.h   Phase 5.W.10: EWMA of r² (RiskMetrics'94), emits stddev
 │   └── README.md                      Full project documentation
 │
 ├── src/bolt/                        ← Implementation notes

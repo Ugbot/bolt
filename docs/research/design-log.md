@@ -1587,6 +1587,142 @@ needs the Welford-decrement formula. We haven't picked between the
 symmetric "West/Chan two-pass" approach and a separate streaming
 variant — that decision lands with RollingStd (P5.W.2).
 
+## RSI Wilder vs classical EMA alpha — which convention wins inside rsi.h  (P5.E.5)
+
+**Context:** Phase 5.E.5 ports `CreateRSIProcessor` from chukonu. RSI
+requires an exponentially-weighted average of the per-sample gains and
+losses, but the EMA-alpha convention is *not* the same as classical EMA.
+
+Two candidates:
+
+1. **Classical EMA** `alpha = 2 / (period + 1)`. This is what
+   `EmaState::init(period)` computes. For period=14 → alpha ≈ 0.1333.
+   Matches what we already use for EMA (P3.1) and MACD (P5.E.4).
+2. **Wilder's smoothing** `alpha = 1 / period`. For period=14 → alpha ≈
+   0.0714. Defined by Welles Wilder in *New Concepts in Technical
+   Trading Systems* (1978) specifically for RSI, ADX, ATR. Roughly half
+   the responsiveness of classical EMA at the same period number.
+
+**Kept:** Wilder `alpha = 1/period`, exclusively inside `rsi.h`. Two
+reasons:
+
+- **Chukonu source-of-truth.** `CreateRSIProcessor` at kernels.h:536
+  computes `alpha = 1.0 / period` directly. Porting RSI without matching
+  this would produce numerically different output for the same period
+  argument — the port's round-trip test against the Arrow version would
+  diverge.
+- **Convention is domain-stable.** Every charting package (TradingView,
+  MetaTrader, TA-Lib, pandas-ta) uses Wilder for RSI. A user asking for
+  "RSI(14)" expects the Wilder result.
+
+**Implementation shape:** `EmaState::init(period)` hard-codes the
+`2/(p+1)` formula. Rather than add a second `init_wilder(period)` method
+to `state.h` (which is read-only substrate shared by EMA + MACD), we
+bypass `init()` inside `make_rsi_state()` and set `ema.alpha = 1.0 /
+period` manually. This keeps `state.h` untouched and localises the
+convention difference to `rsi.h`, where the comment makes it auditable.
+EWMA (P5.E.2) uses the same "bypass init, set alpha directly" pattern
+for a different reason: the caller supplies alpha verbatim (e.g. the
+RiskMetrics 0.06 or user-specified decay), not a period.
+
+**Rejected alternative:** adding `EmaState::init_wilder(period)` as a
+second constructor. Would be one extra call and one extra source of
+truth for "which alpha convention applies here?" — better to keep
+`state.h` minimal and let each kernel header declare its convention in
+its own `make_*_state()` constructor.
+
+**Open question:** ATR (P5.R.4) currently uses a rolling arithmetic
+mean. The canonical Wilder ATR uses the same `alpha = 1/period`
+smoothing as RSI. When ATR gets its Wilder-form alternative kernel
+(`atr_wilder.h`?), it should copy the bypass-init pattern from
+`rsi.h::make_rsi_state`. Document that port choice in a new design-log
+entry at that time.
+
+## Rolling-window Welford — rescan vs decrement  (P5.W landing, closes P2.2 open question)
+
+**Context:** Phase 5.W landed ten Welford-based fintech kernels
+(WelfordMeanVar, RollingStd, RollingZScore, SharpeRatio, SortinoRatio,
+RollingCorrelation, RollingSkew, RollingKurt, Autocorr, RiskMetricsVol).
+Five of these are true sliding-window moment kernels (RollingStd,
+RollingZScore, RollingCorrelation, RollingSkew, RollingKurt); the rest
+are either streaming (no window) or scalar-broadcast (whole-batch).
+
+The P2.2 entry flagged an open question for sliding-window Welford:
+Welford's online formula is only stable for *append-only* streams. A
+rolling window needs both an add and a drop — the "symmetric Welford"
+variant (West 1979 / Chan et al. 1983) exists but reintroduces a
+subtraction that can cancel when the dropped value is close to the
+current mean.
+
+**Candidates for the rolling variants:**
+
+1. **Welford-decrement.** Maintain `(count, mean, m2)` online; apply
+   the inverse Welford update on eviction. `O(1)` per row, but
+   accumulates cancellation error over long streams — especially for
+   higher moments (skew m3, kurt m4).
+2. **Rescan from ring.** Recompute mean and central moments from the
+   whole `RollingRing` each row. `O(w)` per row; every row produces a
+   fresh accumulator with no history-dependent cancellation.
+
+**Kept: rescan from ring.** Reasoning:
+
+- **Chukonu-parity.** `CreateRollingStdProcessor`,
+  `CreateRollingZScoreProcessor`, `CreateRollingCorrelationProcessor`,
+  `CreateRollingSkewProcessor`, `CreateRollingKurtProcessor` in
+  `chukonu/fintech/kernels.h` all rescan. Matching the numerical
+  behaviour keeps the regression-parity plan in `BOLT_FINTECH_PORT.md`
+  intact — Arrow-output vs Bolt-output must match bit-for-bit (or
+  within 1e-12) for the port to be considered landed.
+- **Windows are small.** Typical fintech rolling windows are ≤256
+  (intraday SMA, vol lookbacks). A 256-double rescan is ~2 KiB of
+  sequential L1 traffic per row — the ring is already cache-hot from
+  the push, so the `O(w)` cost is dwarfed by the per-row output store
+  and surrounding morsel plumbing.
+- **Higher moments are where decrement hurts most.** Pébay/Bennett
+  (Sandia National Laboratories, 2008) analyses of sliding higher-moment
+  statistics show decrement errors on m3/m4 growing as O(sqrt(stream
+  length / window)) in typical financial signals — enough to silently
+  bias CornishFisherVaR (P5.S.9) or MAD outlier flags (P5.S.14).
+- **Streaming kernels are unaffected.** WelfordMeanVar, SharpeRatio,
+  SortinoRatio are append-only or whole-batch — they use the streaming
+  `WelfordAccumulator` directly. Rescan only applies to the five
+  rolling-moment kernels.
+
+**Shared helper:** `welford_rescan_pop<kCap>(ring, &mean, &var)` in
+`rolling_std.h` is reused by `RollingStd` and `RollingZScore`. The
+correlation / skew / kurt / autocorr kernels inline their own rescan
+because they need additional accumulators in the same pass (cov, m3,
+m4, lagged means).
+
+**Also matched from chukonu (numerical-convention notes, per-kernel):**
+
+- `WelfordMeanVar` emits **population** variance (`m2/count`), not
+  sample — streaming case, chukonu-parity.
+- `SharpeRatio` uses **sample** variance (`m2/(n-1)`), annualised by
+  `sqrt(annualization_periods)`, default `periods = 252`. Scalar
+  broadcast across the batch. Chukonu divides by `n-1` here, unlike
+  its rolling-moment kernels.
+- `SortinoRatio` divides the downside sum-of-squares by `n`
+  (total sample count), **not** by the number of downside
+  observations — a chukonu idiosyncrasy we match for parity.
+- `RollingKurt` emits **excess** kurtosis (`m4/m2² - 3`), the
+  finance-industry default.
+- `RollingSkew` emits **raw / biased** skewness (`m3 / stddev³`,
+  population moments), not Fisher-Pearson g1.
+- `RiskMetricsVol` emits **stddev** per row (not variance), seeded at
+  `|r0|` on the first sample.
+- Warmup convention across the rolling kernels: chukonu emits **0.0**
+  (not NaN) for `w < min_required` — `w < 3` for skew, `w < 4` for
+  kurt, `w < 2` for correlation, `w < w+lag` for autocorr. Matched
+  verbatim.
+
+**Open question:** for windows >1024 the rescan cost starts to eat
+into the morsel budget. If a future workload demands that scale,
+revisit the symmetric-Welford-decrement path with Kahan / Neumaier
+compensation on the subtraction, gated behind a compile-time
+`BOLT_WELFORD_DECREMENT` flag in `bolt_config.h` (default off).
+Chukonu-parity tests would need a looser tolerance in that mode.
+
 ## How to add an entry
 
 1. Run the change. Capture before/after numbers (≥3 runs each).

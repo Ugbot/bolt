@@ -102,6 +102,71 @@ bolt_apply_hardening(test_bolt_fintech_phase4a)
 
 add_test(NAME test_bolt_fintech_phase4a COMMAND test_bolt_fintech_phase4a)
 
+add_executable(test_bolt_fintech_phase4b test_bolt_fintech_phase4b.cpp)
+
+target_link_libraries(test_bolt_fintech_phase4b
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase4b)
+
+add_test(NAME test_bolt_fintech_phase4b COMMAND test_bolt_fintech_phase4b)
+
+add_executable(test_bolt_fintech_phase5r test_bolt_fintech_phase5r.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5r
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5r)
+
+add_test(NAME test_bolt_fintech_phase5r COMMAND test_bolt_fintech_phase5r)
+
+add_executable(test_bolt_fintech_phase3 test_bolt_fintech_phase3.cpp)
+
+target_link_libraries(test_bolt_fintech_phase3
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase3)
+
+add_test(NAME test_bolt_fintech_phase3 COMMAND test_bolt_fintech_phase3)
+
+add_executable(test_bolt_fintech_phase5e test_bolt_fintech_phase5e.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5e
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5e)
+
+add_test(NAME test_bolt_fintech_phase5e COMMAND test_bolt_fintech_phase5e)
+
+add_executable(test_bolt_fintech_phase5w test_bolt_fintech_phase5w.cpp)
+
+target_link_libraries(test_bolt_fintech_phase5w
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_phase5w)
+
+add_test(NAME test_bolt_fintech_phase5w COMMAND test_bolt_fintech_phase5w)
+
 add_executable(test_bolt_wave2 test_bolt_wave2.cpp)
 
 target_link_libraries(test_bolt_wave2

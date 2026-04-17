@@ -122,6 +122,15 @@ if relevant.
 | P5.R.6 | **RollingMin / RollingMax** | monotonic deque | P2.1 |
 | P5.R.7 | **StochasticOsc** | `(x - low) / (high - low)` rolling | P5.R.3 |
 
+Phase 5.R status (landed):
+- [x] P5.R.1 SMA
+- [x] P5.R.2 BollingerBands
+- [x] P5.R.3 DonchianChannel
+- [x] P5.R.4 ATR  (rolling-mean form — Wilder's EMA shape deferred to 5.E)
+- [x] P5.R.5 VWAP / TWAP  (rolling; chukonu's batch-aggregate shape dropped)
+- [x] P5.R.6 RollingMin / RollingMax
+- [x] P5.R.7 StochasticOsc (%K only; %D is SMA(K,3) downstream)
+
 ### P5.W — Welford-based (moments)
 
 | # | Kernel | Why | Deps |
@@ -136,6 +145,24 @@ if relevant.
 | P5.W.8 | **RollingKurt** | 4th central moment online | P2.2 extension |
 | P5.W.9 | **Autocorr** | `cov(x, lag(x, k)) / var(x)` | P1.2, P2.2 |
 | P5.W.10 | **RiskMetricsVol** | EWMA of r² (variance) | P2.3 + P1.4 |
+
+Phase 5.W status (landed):
+- [x] P5.W.1 WelfordMeanVar (streaming; chukonu uses POP variance, not sample)
+- [x] P5.W.2 RollingStd (pop-var rescan; no warmup NaN — chukonu parity)
+- [x] P5.W.3 RollingZScore (stddev==0 → 0.0, chukonu parity, not NaN)
+- [x] P5.W.4 SharpeRatio (scalar broadcast; SAMPLE variance; annualized sqrt(periods))
+- [x] P5.W.5 SortinoRatio (scalar broadcast; downside_dev divides by n not n_downside)
+- [x] P5.W.6 RollingCorrelation (rescan; w<2 → 0.0)
+- [x] P5.W.7 RollingSkew (raw/biased; w<3 → 0.0)
+- [x] P5.W.8 RollingKurt (EXCESS kurtosis, kurt - 3; w<4 → 0.0)
+- [x] P5.W.9 Autocorr (single ring size w+lag; first w+lag-1 rows → 0.0)
+- [x] P5.W.10 RiskMetricsVol (seed var₀=r₀²; emits stddev not variance)
+
+Rolling-window Welford stability: for the rolling variants (P5.W.2/3/6/7/8)
+we rescan the `RollingRing` on each row rather than doing a Welford
+decrement. O(w) per row, numerically safe, cache-hot for small windows.
+See `docs/research/design-log.md` entry "Rolling-window Welford — rescan
+vs decrement".
 
 ### P5.E — EMA-based
 
@@ -214,21 +241,49 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done
 - [x] P2.3 EmaState
 
 ### Phase 3 (worked EMA)
-- [ ] P3.1 execute_ema
+- [x] P3.1 execute_ema  (include/bolt/kernels/fintech/ema.h; Tier 2 template
+  validated — POD state, arena-pinned via `make_ema_state`, persists across
+  `execute_ema` calls, zero hot-path allocation. Also satisfies P5.E.1.)
 
 ### Phase 4 (Tier 1 mechanical — 26 kernels)
 - [x] P4.1 Midprice  · [x] P4.2 Microprice · [x] P4.3 L1Imbalance
-- [x] P4.4 QuotedSpread · [x] P4.5 EffectiveSpread · [ ] P4.6 LogReturns
-- [x] P4.7 SignedVolume · [ ] P4.8 OFI · [x] P4.9 ArrivalPriceImpact
-- [ ] P4.10 ImplementationShortfall · [x] P4.11 ForwardPoints · [x] P4.12 FundingCost
+- [x] P4.4 QuotedSpread · [x] P4.5 EffectiveSpread · [x] P4.6 LogReturns
+- [x] P4.7 SignedVolume · [x] P4.8 OFI · [x] P4.9 ArrivalPriceImpact
+- [x] P4.10 ImplementationShortfall · [x] P4.11 ForwardPoints · [x] P4.12 FundingCost
 - [x] P4.13 CIPBasis · [x] P4.14 FundingAPR · [x] P4.15 PerpFairPrice
-- [ ] P4.16 OpenInterestDelta · [ ] P4.17 CorwinSchultz · [ ] P4.18 GarmanKlass
-- [ ] P4.19 Parkinson · [ ] P4.20 RogersSatchell · [ ] P4.21 RealizedVar
-- [ ] P4.22 BipowerVar · [ ] P4.23 StaleQuoteDetector · [ ] P4.24 PriceBandGuard
-- [ ] P4.25 FatFingerGuard · [ ] P4.26 CircuitBreaker
+- [x] P4.16 OpenInterestDelta · [x] P4.17 CorwinSchultz · [x] P4.18 GarmanKlass
+- [x] P4.19 Parkinson · [x] P4.20 RogersSatchell · [x] P4.21 RealizedVar
+- [x] P4.22 BipowerVar · [x] P4.23 StaleQuoteDetector · [x] P4.24 PriceBandGuard
+- [x] P4.25 FatFingerGuard · [x] P4.26 CircuitBreaker
 
 ### Phase 5 (Tier 2 stateful — 32 kernels)
 RollingRing, Welford, EMA, and specialised groups — see tables above.
+
+#### P5.R (RollingRing-based)
+- [x] P5.R.1 SMA  (`include/bolt/kernels/fintech/sma.h`)
+- [x] P5.R.2 BollingerBands  (`include/bolt/kernels/fintech/bollinger_bands.h`;
+  two RollingRings over x and x², population stddev — deviates from Welford
+  to stay O(1) amortised under eviction; cancellation guard clamps var≥0)
+- [x] P5.R.3 DonchianChannel  (`include/bolt/kernels/fintech/donchian_channel.h`;
+  two IndexRing<kCap> monotonic deques; emits upper/lower, mid dropped)
+- [x] P5.R.4 ATR  (`include/bolt/kernels/fintech/atr.h`;
+  rolling mean of True Range — *not* Wilder's EMA like chukonu; Wilder
+  shape deferred to Phase 5.E if needed)
+- [x] P5.R.5 VWAP / TWAP  (`include/bolt/kernels/fintech/vwap_twap.h`;
+  per-row rolling, not chukonu's batch-aggregate fill shape)
+- [x] P5.R.6 RollingMin / RollingMax  (`include/bolt/kernels/fintech/rolling_min_max.h`;
+  O(1) amortised via shared `monotonic_deque.h`)
+- [x] P5.R.7 StochasticOsc  (`include/bolt/kernels/fintech/stochastic_osc.h`;
+  %K only — %D is SMA(K,3) downstream; composes DonchianChannelState)
+
+#### P5.E (EMA-based)
+- [x] P5.E.1 EMA  (covered by P3.1 — lives in `include/bolt/kernels/fintech/ema.h`)
+- [x] P5.E.2 EWMA  (`include/bolt/kernels/fintech/ewma.h`; caller-supplied alpha)
+- [x] P5.E.3 EWCOV  (`include/bolt/kernels/fintech/ewcov.h`; RiskMetrics lambda-form)
+- [x] P5.E.4 MACD  (`include/bolt/kernels/fintech/macd.h`; three chained EmaState;
+  emits line/signal/histogram)
+- [x] P5.E.5 RSI  (`include/bolt/kernels/fintech/rsi.h`; Wilder smoothing
+  α = 1/period — see design-log entry "RSI Wilder vs classical EMA alpha")
 
 ### Phase 6 (Tier 3 — DEFERRED)
 Waits for event-time + keyed state; not in this plan.
