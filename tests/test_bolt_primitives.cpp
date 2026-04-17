@@ -12,6 +12,7 @@
 #include "bolt/bolt_column.h"
 
 #include <algorithm>
+#include <random>
 #include <thread>
 #include <vector>
 #include <cstring>
@@ -438,6 +439,61 @@ TEST(BoltNumaPool, SingleNodeDegenerate) {
     EXPECT_EQ(v, 42);
 }
 
+// Imbalanced producer rates — one node pushes 4× as much as the others.
+// Round-robin pop must still drain every item; no node starves the
+// rest, no item is lost or duplicated.
+TEST(BoltNumaPool, ImbalancedProducers) {
+    constexpr size_t NumNodes = 4;
+    NumaChannelPool<uint64_t, 2048, NumNodes> pool;
+
+    std::atomic<bool> go{false};
+    std::vector<std::thread> producers;
+    const size_t counts[NumNodes] = {1000, 250, 250, 250};
+    size_t total = 0;
+    for (size_t n = 0; n < NumNodes; ++n) total += counts[n];
+
+    uint64_t base = 1;
+    for (size_t n = 0; n < NumNodes; ++n) {
+        const uint64_t lo = base;
+        const uint64_t hi = base + counts[n];
+        producers.emplace_back([&, n, lo, hi]() {
+            while (!go.load(std::memory_order_acquire)) cpu_pause();
+            for (uint64_t v = lo; v < hi; ++v) {
+                while (!pool.try_push(n, static_cast<uint64_t&&>(v))) cpu_pause();
+            }
+        });
+        base = hi;
+    }
+    go.store(true, std::memory_order_release);
+
+    std::vector<uint64_t> seen;
+    seen.reserve(total);
+    while (seen.size() < total) {
+        uint64_t v = 0;
+        if (pool.try_pop(&v)) seen.push_back(v);
+        else cpu_pause();
+    }
+    for (auto& t : producers) t.join();
+
+    std::sort(seen.begin(), seen.end());
+    for (size_t i = 0; i < total; ++i) EXPECT_EQ(seen[i], static_cast<uint64_t>(i + 1));
+}
+
+// 16-node pool — exercises the upper-bound template parameter.
+TEST(BoltNumaPool, SixteenNodeRoundRobin) {
+    constexpr size_t NumNodes = 16;
+    NumaChannelPool<int, 64, NumNodes> pool;
+    for (size_t n = 0; n < NumNodes; ++n) {
+        ASSERT_TRUE(pool.try_push(n, static_cast<int>(n) * 100));
+    }
+    std::vector<int> seen;
+    int v = 0;
+    while (pool.try_pop(&v)) seen.push_back(v);
+    EXPECT_EQ(seen.size(), NumNodes);
+    std::sort(seen.begin(), seen.end());
+    for (size_t n = 0; n < NumNodes; ++n) EXPECT_EQ(seen[n], static_cast<int>(n) * 100);
+}
+
 // ============================================================================
 // Column Tests
 // ============================================================================
@@ -807,6 +863,66 @@ TEST(BoltColumn, BitPacked17BitCrossesWordBoundary) {
     BoltColumn flat = bp.materialize(&a);
     const int32_t* out = static_cast<const int32_t*>(flat.data);
     for (int i = 0; i < 5; ++i) EXPECT_EQ(out[i], static_cast<int32_t>(vals[i])) << "i=" << i;
+}
+
+// B3 edge widths: 1-bit (smallest) and 32-bit (largest supported).
+TEST(BoltColumn, BitPacked1BitEdge) {
+    Arena a;
+    // 70 bits → 2 words. Pattern: alternating 1,0,1,0,...
+    uint64_t packed[2] = {0xAAAAAAAAAAAAAAAAULL, 0x2AULL /*70th..64th bits*/};
+    BoltColumn bp = BoltColumn::make_bitpacked(packed, 1, 70, BoltType::Int32, &a);
+    BoltColumn flat = bp.materialize(&a);
+    ASSERT_EQ(flat.length, 70);
+    const int32_t* out = static_cast<const int32_t*>(flat.data);
+    for (int i = 0; i < 64; ++i) EXPECT_EQ(out[i], (i & 1) ? 1 : 0) << "i=" << i;
+    // Bits 64..69 are the low 6 bits of 0x2A = 0b101010 → 0,1,0,1,0,1.
+    const int32_t tail[6] = {0,1,0,1,0,1};
+    for (int i = 0; i < 6; ++i) EXPECT_EQ(out[64 + i], tail[i]) << "i=" << 64+i;
+}
+
+TEST(BoltColumn, BitPacked32BitEdge) {
+    Arena a;
+    // 4 × 32-bit values pack into 2 uint64 words (exactly).
+    const uint32_t vals[4] = {0x00000000u, 0xFFFFFFFFu, 0xCAFEBABEu, 0x12345678u};
+    uint64_t words[3] = {0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        words[i / 2] |= uint64_t(vals[i]) << ((i & 1) * 32);
+    }
+    BoltColumn bp = BoltColumn::make_bitpacked(words, 32, 4, BoltType::Int32, &a);
+    BoltColumn flat = bp.materialize(&a);
+    ASSERT_EQ(flat.length, 4);
+    const int32_t* out = static_cast<const int32_t*>(flat.data);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(static_cast<uint32_t>(out[i]), vals[i]) << "i=" << i;
+}
+
+// RLE stress: 1000 runs with varying lengths — exercises the materialize
+// loop's tail branch more than the 4-run smoke test.
+TEST(BoltColumn, RLELongRunList) {
+    Arena a;
+    constexpr int NRUNS = 1000;
+    std::vector<int64_t> values(NRUNS);
+    std::vector<int32_t> run_ends(NRUNS);
+    int32_t pos = 0;
+    std::mt19937 rng{0xDEAFu};
+    std::uniform_int_distribution<int> run_len{1, 10};
+    for (int i = 0; i < NRUNS; ++i) {
+        values[i]    = (i & 1) ? 0xAAAAAAAAAAAAAAAALL : 0x5555555555555555LL;
+        pos         += run_len(rng);
+        run_ends[i]  = pos;
+    }
+    BoltColumn rle = BoltColumn::make_rle(
+        values.data(), NRUNS, run_ends.data(), pos, BoltType::Int64, &a);
+    BoltColumn flat = rle.materialize(&a);
+    ASSERT_EQ(flat.length, pos);
+
+    const int64_t* out = static_cast<const int64_t*>(flat.data);
+    int32_t prev = 0;
+    for (int i = 0; i < NRUNS; ++i) {
+        for (int32_t r = prev; r < run_ends[i]; ++r) {
+            ASSERT_EQ(out[r], values[i]) << "row " << r;
+        }
+        prev = run_ends[i];
+    }
 }
 
 // B4 — FrameOfReference round-trip.  base + bit-packed deltas.

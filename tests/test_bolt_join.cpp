@@ -479,6 +479,42 @@ TEST(BoltHashJoin, BloomGatedProbeMatchesDefault) {
     }
 }
 
+// Bloom FPR sanity: build with 1000 keys, probe 10 000 never-inserted keys.
+// Block-Bloom at 16 bits/key should give FPR well under 5%.
+TEST(BoltHashJoin, BloomFprUnderFivePercent) {
+    Arena arena;
+    constexpr int64_t BN = 1000;
+    std::vector<int64_t> bk(BN);
+    std::mt19937_64 rng(0xB10F);
+    for (int64_t i = 0; i < BN; ++i) bk[i] = static_cast<int64_t>(rng() | 1ULL);
+
+    BoltColumn bc = BoltColumn::make_flat(bk.data(), nullptr, BN, BoltType::Int64);
+    HashJoinBuild b{};
+    ASSERT_TRUE(b.build(bc, &arena, /*build_bloom=*/true));
+    ASSERT_TRUE(b.has_bloom);
+
+    // Probe 10 000 keys that are definitely not in the build side
+    // (top bit is 0 here, build had | 1 forcing low bit set only; so use
+    // keys with the high bit set AND disjoint from the build distribution).
+    constexpr int64_t PN = 10000;
+    int64_t false_positives = 0;
+    for (int64_t i = 0; i < PN; ++i) {
+        uint64_t probe = (static_cast<uint64_t>(rng()) | (1ULL << 63));
+        // Must not actually be in the build side; if it is, skip.
+        bool in_build = false;
+        for (int64_t j = 0; j < BN; ++j) {
+            if (static_cast<uint64_t>(bk[j]) == probe) { in_build = true; break; }
+        }
+        if (in_build) { --i; continue; }
+        const uint64_t h = swiss_mix(probe);
+        if (bloom_test(b.bloom, h)) ++false_positives;
+    }
+    // 16 bits/key + 4 hashes per key → expected FPR ≈ 0.4%.
+    // Be generous on the assert: under 5% is the contract.
+    EXPECT_LT(false_positives * 100 / PN, 5)
+        << "FPR too high: " << false_positives << "/" << PN;
+}
+
 TEST(BoltHashJoin, BloomNotBuiltByDefault) {
     Arena arena;
     int64_t bk[4] = {1, 2, 3, 4};
@@ -539,4 +575,73 @@ TEST(BoltSwiss, InterleavedEmptyTable) {
     EXPECT_EQ(iv.find(42), -1);
     EXPECT_EQ(iv.find(0), -1);
     EXPECT_EQ(iv.size, 0u);
+}
+
+// High-cardinality stress — 10 000 unique keys exercise multi-group
+// linear-probe chains on both FLAT and INTERLEAVED.  Also ensures the
+// rebuild path copes when the interleaved table has capacity equal
+// to the flat source (no growth; just reinsert).
+TEST(BoltSwiss, InterleavedHighCardinalityMatchesFlat) {
+    Arena arena;
+    SwissTable flat;
+    ASSERT_TRUE(SwissTable::create(&flat, /*capacity_hint=*/10000, &arena));
+
+    std::mt19937_64 rng(0xCAFEB0BA);
+    std::vector<uint64_t> keys;
+    keys.reserve(10000);
+    for (int i = 0; i < 10000; ++i) {
+        uint64_t k = rng();
+        while (flat.find(k) >= 0) k = rng();
+        ASSERT_TRUE(flat.insert(k, static_cast<uint32_t>(i)));
+        keys.push_back(k);
+    }
+
+    SwissTableInterleaved iv{};
+    ASSERT_TRUE(SwissTableInterleaved::build_from(&iv, flat, &arena));
+    EXPECT_EQ(iv.size, flat.size);
+
+    // Shuffle lookup order so prefetch + locality aren't accidentally aligned.
+    std::shuffle(keys.begin(), keys.end(), rng);
+    for (auto k : keys) {
+        int32_t g = iv.find(k);
+        ASSERT_GE(g, 0) << "missing key " << k;
+        EXPECT_EQ(flat.find(k), g);
+    }
+}
+
+// Collision-heavy stress — hash_mix is deterministic, but we can force
+// a crowded group by hand-picking keys whose `swiss_mix` falls in the
+// same 16-wide group. Drives the linear-probe chain past the initial
+// group into neighbours. Verifies INTERLEAVED's group-aligned probe
+// handles overflow into subsequent groups.
+TEST(BoltSwiss, InterleavedLinearProbeSpillover) {
+    Arena arena;
+    SwissTableInterleaved iv{};
+    // Small table so collisions are dense. 16 groups × 16 lanes = 256 slots.
+    ASSERT_TRUE(SwissTableInterleaved::create(&iv, /*hint=*/120, &arena));
+
+    // Insert 100 distinct keys; at 50% load factor collisions are frequent.
+    std::mt19937_64 rng(0x1234);
+    std::vector<uint64_t> keys;
+    keys.reserve(100);
+    for (int i = 0; i < 100; ++i) {
+        uint64_t k = rng();
+        while (iv.find(k) >= 0) k = rng();
+        ASSERT_TRUE(iv.insert(k, static_cast<uint32_t>(i)));
+        keys.push_back(k);
+    }
+    EXPECT_EQ(iv.size, 100u);
+
+    // All inserted keys must still be findable.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(iv.find(keys[i]), static_cast<int32_t>(i))
+            << "lost key at i=" << i;
+    }
+
+    // Update-on-existing-key semantics: reinserting flips value without
+    // growing size.
+    const uint32_t old_size = iv.size;
+    ASSERT_TRUE(iv.insert(keys[42], /*new value=*/9999));
+    EXPECT_EQ(iv.size, old_size);
+    EXPECT_EQ(iv.find(keys[42]), 9999);
 }

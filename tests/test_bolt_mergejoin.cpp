@@ -175,6 +175,65 @@ TEST(BoltMergeJoin, RightOuterEmitsUnmatchedBuilds) {
     }
 }
 
+// Adversarial: all rows on both sides share the same key. Equal-run
+// cross-product is n × m. Exercises the inner-run emit loop past any
+// small-constant inline buffers.
+TEST(BoltMergeJoin, InnerAllDuplicates) {
+    std::vector<int64_t> bk(20, 77);   // 20 rows, all key=77
+    std::vector<int64_t> pk(15, 77);   // 15 rows, all key=77
+    auto bc = make_i64(bk);
+    auto pc = make_i64(pk);
+
+    std::vector<int32_t> ob(500), op(500);
+    int64_t n = bolt::mergejoin_inner_i64(bc, pc, ob.data(), op.data(), 500);
+    EXPECT_EQ(n, 20 * 15);
+
+    // Every (build_idx, probe_idx) in [0,20) × [0,15) must appear exactly once.
+    std::vector<Pair> got(n);
+    for (int64_t i = 0; i < n; ++i) got[i] = {ob[i], op[i]};
+    std::sort(got.begin(), got.end(), pair_lt);
+    // Check monotone by build_idx, then by probe_idx within each build.
+    int64_t k = 0;
+    for (int32_t b = 0; b < 20; ++b) {
+        for (int32_t p = 0; p < 15; ++p) {
+            EXPECT_EQ(got[k].b, b);
+            EXPECT_EQ(got[k].p, p);
+            ++k;
+        }
+    }
+}
+
+TEST(BoltMergeJoin, LeftOuterAllBuildAfterProbes) {
+    // Build keys all higher than probe keys → every probe unmatched.
+    std::vector<int64_t> bk = {100, 200, 300};
+    std::vector<int64_t> pk = {1, 2, 3, 4, 5};
+    auto bc = make_i64(bk);
+    auto pc = make_i64(pk);
+
+    std::vector<int32_t> ob(16), op(16);
+    int64_t n = bolt::mergejoin_left_outer_i64(bc, pc, ob.data(), op.data(), 16);
+    ASSERT_EQ(n, 5);
+    for (int64_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(ob[i], -1);
+        EXPECT_EQ(op[i], static_cast<int32_t>(i));
+    }
+}
+
+TEST(BoltMergeJoin, RightOuterAllProbesAfterBuild) {
+    std::vector<int64_t> bk = {1, 2, 3, 4, 5};
+    std::vector<int64_t> pk = {100, 200};
+    auto bc = make_i64(bk);
+    auto pc = make_i64(pk);
+
+    std::vector<int32_t> ob(16), op(16);
+    int64_t n = bolt::mergejoin_right_outer_i64(bc, pc, ob.data(), op.data(), 16);
+    ASSERT_EQ(n, 5);
+    for (int64_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(ob[i], static_cast<int32_t>(i));
+        EXPECT_EQ(op[i], -1);
+    }
+}
+
 // ---- Cross-check vs hash-join --------------------------------------------
 // Inner merge-join must produce the same set of pairs as an inner hash-join
 // on the same (sorted, unique-key) inputs.
