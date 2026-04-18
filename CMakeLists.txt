@@ -111,6 +111,26 @@ target_link_libraries(bolt INTERFACE
 )
 
 # ---------------------------------------------------------------------------
+# bolt::io — compiled static library (I/O-adjacent pure-compute primitives:
+# CRC32C software fallback, varints). No actual I/O — keeps Bolt's no-IO
+# invariant intact. The .cpp hosts the 8 KB slicing-by-8 CRC32C tables so
+# they link once per binary.
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_IO "Build bolt::io compiled library" ${BOLT_IS_TOPLEVEL})
+
+if(BOLT_BUILD_IO)
+    add_library(bolt_io STATIC src/io/bolt_crc32c.cpp)
+    add_library(bolt::io ALIAS bolt_io)
+    target_link_libraries(bolt_io PUBLIC bolt::core)
+    target_include_directories(bolt_io PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_io)
+    bolt_apply_simd(bolt_io ${BOLT_SIMD_TIER})
+    target_link_libraries(bolt INTERFACE bolt::io)
+endif()
+
+# ---------------------------------------------------------------------------
 # bolt::parse — compiled static library (ASCII numeric parsers).
 # Header-only rules don't apply here: we want the magic-multiplier code
 # in a single TU so it links once, not per consumer.
@@ -179,6 +199,9 @@ install(DIRECTORY include/bolt
 )
 
 set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt)
+if(BOLT_BUILD_IO)
+    list(APPEND _bolt_install_targets bolt_io)
+endif()
 if(BOLT_BUILD_PARSE)
     list(APPEND _bolt_install_targets bolt_parse)
 endif()

@@ -19,7 +19,12 @@ chukonu/
 │   ├── bolt_column.h                  Adaptive column + BoltBatch + BitmapIndex
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
 │   ├── bolt_scheduler.h               Task ring, worker pool, phase barriers
+│   ├── io/
+│   │   └── bolt_crc32c.h              I/O-adjacent pure-compute: CRC32C (Castagnoli),
+│   │                                   SSE4.2 / ARM CRC / slicing-by-8 software fallback
 │   ├── kernels/
+│   │   ├── bolt_binsearch.h           Branchless binary search (i64/u64/f64) —
+│   │   │                               exact + lower_bound + upper_bound, cmov loop
 │   │   ├── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
 │   │   └── fintech/
 │   │       ├── column_primitives.h   Phase 1: diff/lag/log/sum_of_squares/running_max_drawdown

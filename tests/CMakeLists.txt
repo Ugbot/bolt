@@ -232,6 +232,32 @@ bolt_apply_hardening(test_bolt_wire)
 
 add_test(NAME test_bolt_wire COMMAND test_bolt_wire)
 
+add_executable(test_bolt_wire_stream test_bolt_wire_stream.cpp)
+
+target_link_libraries(test_bolt_wire_stream
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_wire_stream)
+
+add_test(NAME test_bolt_wire_stream COMMAND test_bolt_wire_stream)
+
+add_executable(test_bolt_kmerge test_bolt_kmerge.cpp)
+
+target_link_libraries(test_bolt_kmerge
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_kmerge)
+
+add_test(NAME test_bolt_kmerge COMMAND test_bolt_kmerge)
+
 add_executable(test_bolt_kernels test_bolt_kernels.cpp)
 
 target_link_libraries(test_bolt_kernels
@@ -336,6 +362,19 @@ bolt_apply_hardening(test_bolt_branchless)
 
 add_test(NAME test_bolt_branchless COMMAND test_bolt_branchless)
 
+add_executable(test_bolt_ebr test_bolt_ebr.cpp)
+
+target_link_libraries(test_bolt_ebr
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_ebr)
+
+add_test(NAME test_bolt_ebr COMMAND test_bolt_ebr)
+
 if(BOLT_BUILD_PARSE)
     add_executable(test_bolt_ascii test_bolt_ascii.cpp)
     target_link_libraries(test_bolt_ascii
@@ -350,4 +389,12 @@ if(BOLT_BUILD_INGEST)
         PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_csv)
     add_test(NAME test_bolt_csv COMMAND test_bolt_csv)
+endif()
+
+if(BOLT_BUILD_IO)
+    add_executable(test_bolt_binsearch_crc32c test_bolt_binsearch_crc32c.cpp)
+    target_link_libraries(test_bolt_binsearch_crc32c
+        PRIVATE bolt::bolt bolt::io GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_binsearch_crc32c)
+    add_test(NAME test_bolt_binsearch_crc32c COMMAND test_bolt_binsearch_crc32c)
 endif()
