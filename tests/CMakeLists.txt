@@ -11,6 +11,17 @@ bolt_apply_hardening(test_bolt_primitives)
 
 add_test(NAME test_bolt_primitives COMMAND test_bolt_primitives)
 
+# ZoneMap primitive — MarbleDB Wave 10.1 consolidation.
+add_executable(test_bolt_zonemap test_bolt_zonemap.cpp)
+target_link_libraries(test_bolt_zonemap
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_zonemap)
+add_test(NAME test_bolt_zonemap COMMAND test_bolt_zonemap)
+
 add_executable(test_bolt_scheduler test_bolt_scheduler.cpp)
 
 target_link_libraries(test_bolt_scheduler
