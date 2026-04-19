@@ -617,6 +617,59 @@ TEST(BoltColumnStats, SketchOverflow) {
     EXPECT_EQ(col.stats.max_value, 99);
 }
 
+// ----------------------------------------------------------------------------
+// ColumnStats.mean / .variance — Welford one-pass, verified against the
+// analytical answer for a seeded random array.
+// ----------------------------------------------------------------------------
+TEST(BoltColumnStats, WelfordMeanVariance) {
+    // Offsets are a property of the ABI — assert we haven't drifted the
+    // pad layout away from what MarbleDB PDX-BOND σ-bound assumes.
+    EXPECT_EQ(sizeof(ColumnStats), 64u);
+    EXPECT_EQ(offsetof(ColumnStats, mean), 40u);
+    EXPECT_EQ(offsetof(ColumnStats, variance), 44u);
+
+    Arena arena;
+    constexpr int64_t N = 4096;
+    auto col = BoltColumn::make_flat_alloc(N, BoltType::Float32, &arena);
+    auto* d = col.typed_mutable<float>();
+
+    std::mt19937 rng(0xC0FFEEu);
+    std::uniform_real_distribution<float> dist(-3.0f, 5.0f);
+    double sum = 0.0, sum_sq = 0.0;
+    for (int64_t i = 0; i < N; ++i) {
+        const float v = dist(rng);
+        d[i] = v;
+        sum += static_cast<double>(v);
+        sum_sq += static_cast<double>(v) * static_cast<double>(v);
+    }
+    const double expect_mean = sum / static_cast<double>(N);
+    // Population variance (matches the Welford output choice).
+    const double expect_var = sum_sq / static_cast<double>(N) -
+                              expect_mean * expect_mean;
+
+    col.compute_stats_numeric();
+
+    EXPECT_NEAR(static_cast<double>(col.stats.mean), expect_mean, 1e-3);
+    EXPECT_NEAR(static_cast<double>(col.stats.variance), expect_var, 1e-3);
+
+    // Default-initialised ColumnStats has NaN sentinels (for the
+    // "caller didn't run stats_scan_typed" detection path).
+    auto fresh = ColumnStats::make_default();
+    EXPECT_TRUE(std::isnan(fresh.mean));
+    EXPECT_TRUE(std::isnan(fresh.variance));
+}
+
+// Constant array — variance must be exactly zero, mean equal to value.
+TEST(BoltColumnStats, WelfordConstantArrayZeroVariance) {
+    Arena arena;
+    auto col = BoltColumn::make_flat_alloc(1024, BoltType::Float32, &arena);
+    auto* d = col.typed_mutable<float>();
+    for (int64_t i = 0; i < 1024; ++i) d[i] = 7.5f;
+    col.compute_stats_numeric();
+    EXPECT_FLOAT_EQ(col.stats.mean, 7.5f);
+    EXPECT_NEAR(static_cast<double>(col.stats.variance), 0.0, 1e-6);
+}
+
 TEST(BoltColumn, CloneIntoFlat) {
     Arena a1, a2;
     auto col = BoltColumn::make_flat_alloc(16, BoltType::Int64, &a1);

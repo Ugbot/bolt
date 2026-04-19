@@ -33,19 +33,27 @@ enum class SortOrder : uint8_t {
 };
 
 struct alignas(64) ColumnStats {
-    int64_t  min_value;        // Type-punned for fixed-width types
-    int64_t  max_value;
-    uint32_t null_count;
-    uint32_t distinct_count;   // Exact if < 1024, HLL approx otherwise
-    CardinalityClass cardinality;
-    SortOrder sort_order;
-    bool     all_valid;        // No nulls → skip validity bitmap
-    bool     is_monotonic;
-    uint32_t max_string_len;
-    uint32_t total_string_bytes;
-    uint16_t avg_string_len;
-    bool     all_inline;       // All strings ≤ 12 bytes
-    uint8_t  _pad[13];
+    int64_t  min_value;        // Type-punned for fixed-width types    (0..7)
+    int64_t  max_value;        //                                       (8..15)
+    uint32_t null_count;       //                                       (16..19)
+    uint32_t distinct_count;   // Exact if < 1024, HLL approx otherwise (20..23)
+    CardinalityClass cardinality;   //                                   24
+    SortOrder sort_order;           //                                   25
+    bool     all_valid;             //                                   26
+    bool     is_monotonic;          //                                   27
+    uint32_t max_string_len;        //                                   28..31
+    uint32_t total_string_bytes;    //                                   32..35
+    uint16_t avg_string_len;        //                                   36..37
+    bool     all_inline;            //                                   38
+    uint8_t  _pad_align;            // 39: align `mean` to 4-byte offset 40
+    // Numeric Welford sketch — populated by `stats_scan_typed`. When
+    // `stats_scan_typed` has not run yet these are NaN sentinels so
+    // downstream consumers (MarbleDB PDX-BOND σ-bound) can detect the
+    // "stats unavailable" case without an extra flag. 8 bytes used of
+    // the original 13-byte pad region; 4 bytes remain via `_pad`.
+    float    mean;                  //                                   40..43
+    float    variance;              //                                   44..47
+    uint8_t  _pad[4];               //                                   48..51
 
     bool can_skip_eq(int64_t v) const noexcept { return v < min_value || v > max_value; }
     bool can_skip_gt(int64_t v) const noexcept { return max_value <= v; }
@@ -60,11 +68,21 @@ struct alignas(64) ColumnStats {
         ColumnStats s;
         memset(&s, 0, sizeof(s));
         s.all_valid = true;
+        // Mean / variance default to NaN so callers that do not populate
+        // them via `compute_stats_numeric` can detect the gap (used by
+        // MarbleDB PDX-BOND σ-bound to fall back to the min/max bound).
+        const uint32_t nan_bits = 0x7FC00000u;
+        memcpy(&s.mean, &nan_bits, sizeof(float));
+        memcpy(&s.variance, &nan_bits, sizeof(float));
         return s;
     }
 };
 
 static_assert(sizeof(ColumnStats) == 64, "ColumnStats must be one cache line");
+static_assert(offsetof(ColumnStats, mean) == 40,
+              "ColumnStats::mean must sit at offset 40 (4-byte-aligned pad slot)");
+static_assert(offsetof(ColumnStats, variance) == 44,
+              "ColumnStats::variance must sit at offset 44");
 
 // ============================================================================
 // Sidecar Index Slots — arena-allocated, ephemeral per morsel
@@ -675,6 +693,17 @@ inline void stats_scan_typed(const T* BOLT_RESTRICT data,
     bool monotonic_desc = true;
     T prev = T{};
 
+    // Welford's online mean + variance. Numerically stable single-pass.
+    // `welford_n` counts valid samples; `welford_mean` is the running
+    // mean; `welford_m2` is Σ(x − μ)² accumulated via
+    //   δ₁ = x − μ_old;  μ_new = μ_old + δ₁ / n;  δ₂ = x − μ_new;
+    //   M2 ← M2 + δ₁ · δ₂.
+    // Double precision so that large-count runs don't lose low bits of
+    // the variance.
+    uint64_t welford_n = 0;
+    double   welford_mean = 0.0;
+    double   welford_m2   = 0.0;
+
     for (int64_t i = 0; i < n; ++i) {
         bool valid = true;
         if (validity) {
@@ -690,6 +719,14 @@ inline void stats_scan_typed(const T* BOLT_RESTRICT data,
             if (v > prev) monotonic_desc = false;
             prev = v;
         }
+        // Welford step.
+        welford_n += 1u;
+        const double xd = static_cast<double>(v);
+        const double delta1 = xd - welford_mean;
+        welford_mean += delta1 / static_cast<double>(welford_n);
+        const double delta2 = xd - welford_mean;
+        welford_m2 += delta1 * delta2;
+
         if (!overflow) {
             bool seen = false;
             for (int k = 0; k < sketch_n; ++k) {
@@ -707,7 +744,18 @@ inline void stats_scan_typed(const T* BOLT_RESTRICT data,
     if (first) {
         out->distinct_count = 0;
         out->cardinality = CardinalityClass::Unknown;
+        // No valid samples → leave `mean` / `variance` at their NaN
+        // sentinels from `make_default()`.
         return;
+    }
+
+    // Finalise Welford — σ² = M2 / N (population variance — chosen over
+    // sample variance because the σ-bound consumer wants a closed-form
+    // upper envelope of the observed data, not an unbiased estimator).
+    if (welford_n > 0u) {
+        out->mean = static_cast<float>(welford_mean);
+        out->variance = static_cast<float>(
+            welford_m2 / static_cast<double>(welford_n));
     }
 
     // Type-pun min/max into the 64-bit slots (floating types overlay).
