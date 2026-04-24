@@ -317,4 +317,37 @@ inline uint32_t ebr_try_advance_and_collect(Ebr* e) noexcept {
     return freed;
 }
 
+// ---------------------------------------------------------------------------
+// EbrGuard — scoped ebr_enter / ebr_exit pair. The one RAII idiom we allow
+// in Tiger Style for EBR readers, same justification as ArenaGuard in
+// bolt_arena.h: zero allocation, two atomic stores in constructor and
+// destructor, no exceptions. Use this anywhere a function-scoped reader
+// pin is needed.
+//
+// Usage:
+//   bolt::EbrGuard g(&db_ebr, shard_id);
+//   // ... read protected state freely here; no tables_mu required ...
+//   // destructor calls ebr_exit on scope end.
+// ---------------------------------------------------------------------------
+class EbrGuard {
+public:
+    BOLT_FORCE_INLINE EbrGuard(Ebr* e, uint32_t shard_id) noexcept
+        : e_(e), shard_id_(shard_id) {
+        assert(e_ != nullptr);
+        assert(shard_id_ < e_->num_shards);
+        ebr_enter(e_, shard_id_);
+    }
+    BOLT_FORCE_INLINE ~EbrGuard() noexcept {
+        ebr_exit(e_, shard_id_);
+    }
+    EbrGuard(const EbrGuard&)            = delete;
+    EbrGuard& operator=(const EbrGuard&) = delete;
+    EbrGuard(EbrGuard&&)                 = delete;
+    EbrGuard& operator=(EbrGuard&&)      = delete;
+
+private:
+    Ebr*     e_;
+    uint32_t shard_id_;
+};
+
 }  // namespace bolt

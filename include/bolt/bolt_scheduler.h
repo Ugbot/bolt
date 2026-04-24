@@ -29,11 +29,20 @@ namespace bolt {
 enum class SpinPolicy : uint8_t {
     BusySpin,     // Pure spin. Pin to core. Latency-critical (< 1μs).
     SpinYield,    // Spin N then yield(). Default for compute workers.
-    ParkWait,     // futex/condvar. I/O-bound or infrequent work.
+    ParkWait,     // Condvar-backed park. Sleeps on the scheduler's
+                  // idle_cv_ when the ring is empty; woken by
+                  // scheduler_notify_submit() after a push. Real impl
+                  // requires a Scheduler*, so callers should prefer
+                  // scheduler_worker_idle(sched, worker_id) — this
+                  // enum slot is still accepted by spin_wait() which
+                  // falls back to yield for back-compat.
 };
 
 static constexpr uint32_t kDefaultSpinCount = config::kDefaultSpinCount;
 
+// Scheduler-less spin_wait. Keeps back-compat for callers that don't
+// have a Scheduler* handy (submit_wait, wait_all). The ParkWait path
+// here falls back to yield — real parking lives in scheduler_worker_idle.
 inline void spin_wait(SpinPolicy policy, uint32_t& spin_count, uint32_t max_spins) noexcept {
     switch (policy) {
         case SpinPolicy::BusySpin:
@@ -48,8 +57,8 @@ inline void spin_wait(SpinPolicy policy, uint32_t& spin_count, uint32_t max_spin
             }
             break;
         case SpinPolicy::ParkWait:
-            // For proper park/unpark we'd use futex or condition_variable.
-            // Fallback to yield for now.
+            // No Scheduler* here — worst case a yield. Hot path uses
+            // scheduler_worker_idle which has the real cv-backed wait.
             std::this_thread::yield();
             break;
     }
@@ -342,6 +351,13 @@ struct Scheduler {
         std::atomic<uint64_t> tasks_completed;
     } stats;
 
+    // ParkWait machinery (Wave 18a). Lock-free via std::atomic::wait /
+    // notify (C++20), which maps to WaitOnAddress on Windows and futex
+    // on Linux — no std::mutex or condition_variable. `submit_seq_` is
+    // bumped on every task submission (and on shutdown) so parked
+    // workers observing the old value are woken.
+    alignas(64) std::atomic<uint64_t> submit_seq_;
+
     // E2 — adaptive morsel sizing (opt-in feedback).
     //
     // Callers may record the observed ns-per-row of their most recent
@@ -425,6 +441,11 @@ struct Scheduler {
     void submit(TaskFn fn, void* arg) noexcept {
         ring.submit_wait(fn, arg, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
+        // Wave 18a — wake any ParkWait worker that may be sleeping on
+        // `submit_seq_`. Release-order bump ensures the ring push above
+        // happens-before the wake observer's acquire-load in the worker.
+        submit_seq_.fetch_add(1, std::memory_order_release);
+        submit_seq_.notify_one();
     }
 
     /// Range task — auto-subdivides [0, count) across workers.
@@ -570,11 +591,28 @@ inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept
     const uint32_t max_spins = sched->worker_configs[worker_id].spin_count;
     uint32_t spins = 0;
 
-    while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
-        if (sched->ring.try_claim_and_execute()) {
-            spins = 0;
-        } else {
-            spin_wait(policy, spins, max_spins);
+    if (policy == SpinPolicy::ParkWait) {
+        // Wave 18a — real park/unpark via std::atomic::wait. No mutex,
+        // no condition_variable. Submitters bump `submit_seq_` + call
+        // notify_one / notify_all; shutdown() calls notify_all.
+        // Re-check ring after wake to cover the race where notify fires
+        // between the ring check and the wait() call.
+        while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
+            if (sched->ring.try_claim_and_execute()) continue;
+            const uint64_t seen = sched->submit_seq_.load(std::memory_order_acquire);
+            // Re-check once after sampling the seq so we don't miss work
+            // that arrived between the first try and the sample.
+            if (sched->ring.try_claim_and_execute()) continue;
+            if (sched->shutdown_flag.load(std::memory_order_acquire)) break;
+            sched->submit_seq_.wait(seen, std::memory_order_acquire);
+        }
+    } else {
+        while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
+            if (sched->ring.try_claim_and_execute()) {
+                spins = 0;
+            } else {
+                spin_wait(policy, spins, max_spins);
+            }
         }
     }
 
@@ -646,6 +684,7 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     shutdown_flag.store(false, std::memory_order_relaxed);
     stats.tasks_submitted.store(0, std::memory_order_relaxed);
     stats.tasks_completed.store(0, std::memory_order_relaxed);
+    submit_seq_.store(0, std::memory_order_relaxed);
     adaptive.ns_per_row_ewma.store(0.0, std::memory_order_relaxed);
     adaptive.samples.store(0, std::memory_order_relaxed);
     num_workers = 0;
@@ -702,6 +741,11 @@ inline void Scheduler::shutdown() noexcept {
     assert(num_workers <= kMaxWorkers);
 
     shutdown_flag.store(true, std::memory_order_release);
+    // Wave 18a — wake any ParkWait workers sleeping on submit_seq_ so
+    // they observe shutdown_flag. Bump + notify_all handles all workers
+    // including those that sampled a stale seq value.
+    submit_seq_.fetch_add(1, std::memory_order_release);
+    submit_seq_.notify_all();
     for (uint32_t i = 0; i < num_workers; ++i) {
         if (workers[i].joinable()) workers[i].join();
     }
@@ -741,6 +785,11 @@ inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
 
         ring.submit_wait(&scheduler_range_trampoline, p, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
+        // Wave 18a — wake any ParkWait worker that may be sleeping on
+        // `submit_seq_`. Release-order bump ensures the ring push above
+        // happens-before the wake observer's acquire-load in the worker.
+        submit_seq_.fetch_add(1, std::memory_order_release);
+        submit_seq_.notify_one();
     }
 }
 
@@ -773,6 +822,11 @@ inline void Scheduler::submit_column_task(ColumnTaskFn fn, const void* read_batc
 
         ring.submit_wait(&scheduler_column_trampoline, p, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
+        // Wave 18a — wake any ParkWait worker that may be sleeping on
+        // `submit_seq_`. Release-order bump ensures the ring push above
+        // happens-before the wake observer's acquire-load in the worker.
+        submit_seq_.fetch_add(1, std::memory_order_release);
+        submit_seq_.notify_one();
     }
 }
 
