@@ -22,6 +22,86 @@ target_link_libraries(test_bolt_zonemap
 bolt_apply_hardening(test_bolt_zonemap)
 add_test(NAME test_bolt_zonemap COMMAND test_bolt_zonemap)
 
+# Vector distance kernels — L2/IP/cosine pair + vertical accumulators.
+# Math leaf lifted from src/ext/pdx_kernels.cpp during the
+# inherited-noodle-agent consolidation.
+add_executable(test_bolt_vector_distance test_bolt_vector_distance.cpp)
+target_link_libraries(test_bolt_vector_distance
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_distance)
+add_test(NAME test_bolt_vector_distance COMMAND test_bolt_vector_distance)
+
+# Rotation kernels — Householder QR + DCT-II.
+add_executable(test_bolt_rotation test_bolt_rotation.cpp)
+target_link_libraries(test_bolt_rotation
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_rotation)
+add_test(NAME test_bolt_rotation COMMAND test_bolt_rotation)
+
+# Column stats f32 kernel — Welford mean/var/min/max.
+add_executable(test_bolt_column_stats test_bolt_column_stats.cpp)
+target_link_libraries(test_bolt_column_stats
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_column_stats)
+add_test(NAME test_bolt_column_stats COMMAND test_bolt_column_stats)
+
+# Bitmap primitive — MarbleDB inherited-noodle agent consolidation.
+add_executable(test_bolt_bitmap test_bolt_bitmap.cpp)
+target_link_libraries(test_bolt_bitmap
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_bitmap)
+add_test(NAME test_bolt_bitmap COMMAND test_bolt_bitmap)
+
+# TopK kernel — argmin + max-heap top-k.
+add_executable(test_bolt_topk test_bolt_topk.cpp)
+target_link_libraries(test_bolt_topk
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_topk)
+add_test(NAME test_bolt_topk COMMAND test_bolt_topk)
+
+# K-means kernel — assign / update / convergence delta. Wave 19 Plan D.
+add_executable(test_bolt_kmeans test_bolt_kmeans.cpp)
+target_link_libraries(test_bolt_kmeans
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_kmeans)
+add_test(NAME test_bolt_kmeans COMMAND test_bolt_kmeans)
+
+# Quantized distance kernels — SQ8 / RaBitQ / F16, scalar-first
+# (Wave 19 plan B; AVX2 specialisations deferred).
+add_executable(test_bolt_quantized_distance test_bolt_quantized_distance.cpp)
+target_link_libraries(test_bolt_quantized_distance
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_quantized_distance)
+add_test(NAME test_bolt_quantized_distance COMMAND test_bolt_quantized_distance)
+
 add_executable(test_bolt_scheduler test_bolt_scheduler.cpp)
 
 target_link_libraries(test_bolt_scheduler
