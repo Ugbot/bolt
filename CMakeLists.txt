@@ -131,6 +131,23 @@ if(BOLT_BUILD_IO)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::ribbon — Wave 20D.4 banded GF(2) Ribbon filter (Dillinger 2021).
+# Pure-compute (no I/O); we promote the body to a single TU so callers
+# don't have to redefine the construction kernel inline at every consumer.
+# Header `bolt/bolt_ribbon.h` declares the API; this static lib carries
+# `build` + `might_contain`.
+# ---------------------------------------------------------------------------
+add_library(bolt_ribbon STATIC src/bolt_ribbon.cpp)
+add_library(bolt::ribbon ALIAS bolt_ribbon)
+target_link_libraries(bolt_ribbon PUBLIC bolt::core)
+target_include_directories(bolt_ribbon PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_ribbon)
+bolt_apply_simd(bolt_ribbon ${BOLT_SIMD_TIER})
+target_link_libraries(bolt INTERFACE bolt::ribbon)
+
+# ---------------------------------------------------------------------------
 # bolt::parse — compiled static library (ASCII numeric parsers).
 # Header-only rules don't apply here: we want the magic-multiplier code
 # in a single TU so it links once, not per consumer.
@@ -198,7 +215,7 @@ install(DIRECTORY include/bolt
     FILES_MATCHING PATTERN "*.h"
 )
 
-set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt)
+set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon)
 if(BOLT_BUILD_IO)
     list(APPEND _bolt_install_targets bolt_io)
 endif()

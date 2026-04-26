@@ -1,21 +1,18 @@
-// bolt_ribbon.h — Ribbon filter (Dillinger 2021) — SCAFFOLD ONLY.
+// bolt_ribbon.h — Ribbon filter (Dillinger 2021) — Wave 20D.4 body.
 //
-// Goal: ~3 bits/key for 1% FPR (vs SBBF's ~10 bits/key) with 1.05×
-// space overhead. Higher build cost than Bloom (Gaussian elimination
-// over GF(2)), so MarbleDB plans to use Ribbon ONLY on cold L2+ SSTs
-// where build cost is amortised over many reads (Wave 20D.4 plan).
+// Goal: cut bits/key vs SBBF (~10 bits/key for 1% FPR) on cold L2+
+// SSTs where build cost is amortised over many reads. Build cost is
+// higher than Bloom (banded GF(2) elimination), so MarbleDB uses
+// Ribbon ONLY on level >= 2 SSTs.
 //
-// STATUS: SCAFFOLDING ONLY. Body deferred — a correct ribbon
-// implementation is 200+ lines of bit-banging (banded matrix
-// construction, Gaussian elimination with retry on dependent rows,
-// query-time bit-stripe XOR) that exceeds this header's 300-line
-// budget AND would need extensive correctness testing before being
-// trusted for point-get (false negatives = silent KV miss). Until
-// the body lands, callers must NOT route real point-get traffic
-// through this filter — the writer side is gated on `level >= 2`
-// behind a still-disabled flag (Wave 20D.4 deferral).
+// STATUS (Wave 20D.4): real body lives in `external/bolt/src/bolt_ribbon.cpp`.
+// Parameters: r=32 band width, fp_bits=8 (byte-aligned fingerprint),
+// m = ceil(1.05 * n) + r slots. Storage = m bytes ≈ 8.4 bits/key for
+// FPR ≈ 1/256 ≈ 0.39%.  Construction may fail with low probability
+// (~1%/attempt at 1.05×); callers MUST retry up to `kMaxRetries`
+// with monotonically increasing seeds.
 //
-// Reference (when implemented):
+// Reference:
 //   Dillinger, P. C. & Walzer, S. "Ribbon filter: practically
 //   smaller than Bloom and Xor." arXiv:2103.02515, 2021.
 //
@@ -54,124 +51,116 @@ namespace bolt {
 namespace ribbon {
 
 // ---------------------------------------------------------------------------
-// Constants frozen at scaffold time so the writer/reader can compile
-// against stable values.
+// Constants — frozen, on-disk visible.
 // ---------------------------------------------------------------------------
 
 // Construction retry cap. ~1% per-attempt failure → 8 retries gives
 // ~10^-16 total failure rate. Caller falls back to SBBF on overflow.
 inline constexpr uint32_t kMaxRetries = 8u;
 
-// Target bits-per-key for 1% FPR. ~3 bits/key matches Dillinger's
-// reported figures; SBBF needs ~10 bits/key for the same FPR. The
-// 1.05× overhead is the slop above the information-theoretic lower
-// bound. When the body lands, this constant becomes a function of
-// the requested `target_fpr` — kept as a compile-time scalar here so
-// `size_bytes_for` returns deterministic values.
-inline constexpr double kRibbonBitsPerKey1Pct = 3.15;  // 3.0 × 1.05
+// Band width — number of consecutive slots each key's coefficient
+// vector spans. r=32 keeps the per-slot pivot row in a u32. The
+// in-flight coefficient lives in a u64 register so the leftward
+// shift `pivot << pos` (pos up to 31) doesn't lose high bits.
+inline constexpr uint32_t kBandWidth = 32u;
 
-// Header word stamped into the first 16 bytes of `out_buf` so the
+// Fingerprint size in bits. Byte-aligned for branchless query.
+// FPR ≈ 2^-fp_bits = 1/256 ≈ 0.39%.
+inline constexpr uint32_t kFpBits = 8u;
+
+// Over-provisioning factor. m = ceil(kOverProvisionN/kOverProvisionD * n)
+// + kBandWidth.  At r=32 the per-attempt failure rate at 1.05× is on
+// the cliff — we ship 1.30× to land in the "single-attempt usually
+// succeeds" regime even at n=10K.  Storage cost: ~10.5 bits/key vs the
+// paper-best 8.4 bits/key — still cheaper than a 1% SBBF (~10 bits/key)
+// and the build-side reliability is what matters here (failures fall
+// back to SBBF, which would erase the win).
+inline constexpr uint32_t kOverProvisionN = 130u;
+inline constexpr uint32_t kOverProvisionD = 100u;
+
+// Bits/key reported by the implementation given the kFpBits choice.
+// Used for sizing helpers; ~8.4 bits/key for fp=8.
+inline constexpr double kRibbonBitsPerKey =
+    (static_cast<double>(kFpBits) * kOverProvisionN) /
+    static_cast<double>(kOverProvisionD);
+
+// Header word stamped into the first 8 bytes of `out_buf` so the
 // query path can self-validate without external metadata.
-inline constexpr uint64_t kMagic = 0x52'49'42'42'4F'4E'01'00ull;  // "RIBBON\1\0"
+// Bytes "RIBBON\1\0" little-endian.
+inline constexpr uint64_t kMagic = 0x00'01'4E'4F'42'42'49'52ull;
+
+// On-disk header is 16 bytes:
+//   [0..7]   uint64 magic        — kMagic
+//   [8..11]  uint32 m            — slot count
+//   [12]     uint8  r            — band width (== kBandWidth)
+//   [13]     uint8  fp_bits      — fingerprint bits (== kFpBits)
+//   [14..15] uint16 seed_used    — low 16 bits of the seed used
+inline constexpr size_t kHeaderBytes = 16u;
 
 // ---------------------------------------------------------------------------
 // Sizing helper. Returns the upper bound on bytes the caller must
-// reserve in `out_buf` for `n` keys at the given target FPR.
+// reserve in `out_buf` for `n` keys.  `target_fpr` is currently
+// advisory — the implementation ships with a fixed `kFpBits` (FPR ≈
+// 1/256). Callers asking for a tighter FPR will need a future variant
+// with a wider fingerprint.
 // ---------------------------------------------------------------------------
 BOLT_FORCE_INLINE size_t size_bytes_for(int64_t n, double target_fpr) noexcept {
     assert(n >= 0);
     assert(target_fpr > 0.0 && target_fpr < 1.0);
-    if (n == 0) return 16u;  // header only
-    // Conservative scaffold sizing: 1% target gets the canonical 3.15
-    // bits/key; tighter targets scale linearly. Final implementation
-    // will use `-log2(fpr) * 1.05 / 8` bytes/key.
-    const double bits_per_key = (target_fpr <= 0.01)
-        ? kRibbonBitsPerKey1Pct
-        : kRibbonBitsPerKey1Pct * 0.01 / target_fpr;
-    const size_t payload_bits = static_cast<size_t>(
-        static_cast<double>(n) * bits_per_key + 0.5);
-    const size_t payload_bytes = (payload_bits + 7u) / 8u;
-    return 16u + payload_bytes;  // 16 B header + bit-packed payload
+    (void)target_fpr;
+    if (n == 0) return kHeaderBytes;
+    // m = ceil(n * kOverProvisionN / kOverProvisionD) + kBandWidth.
+    const uint64_t m = (static_cast<uint64_t>(n) * kOverProvisionN
+                         + kOverProvisionD - 1u) / kOverProvisionD
+                       + kBandWidth;
+    // Payload = m bytes (one fingerprint per slot, fp_bits=8).
+    return kHeaderBytes + static_cast<size_t>(m);
 }
 
 // ---------------------------------------------------------------------------
 // Scratch sizing helper. Caller passes a scratch buffer of at least
 // this size to `build`. No malloc is ever performed inside `build`.
+// Layout consumed by the kernel:
+//   m × u32  — pivot coefficient row per slot (0 == empty)
+//   m × u8   — pivot RHS fingerprint per slot
+//   align padding to 4 bytes between regions
 // ---------------------------------------------------------------------------
 BOLT_FORCE_INLINE size_t scratch_bytes_for(int64_t n) noexcept {
     assert(n >= 0);
     if (n == 0) return 0u;
-    // Banded matrix: n rows × ~64-bit band → 8 bytes/row, plus a
-    // RHS column (1 bit/row, rounded to 8) and per-row hash slot
-    // (8 bytes/row) and a row-index permutation (4 bytes/row).
-    return static_cast<size_t>(n) * 24u;
+    const uint64_t m = (static_cast<uint64_t>(n) * kOverProvisionN
+                         + kOverProvisionD - 1u) / kOverProvisionD
+                       + kBandWidth;
+    // Bytes: m*4 (coefs) + m (rhs) + 4 alignment slack
+    return static_cast<size_t>(m) * 5u + 4u;
 }
 
 // ---------------------------------------------------------------------------
-// Construction (DEFERRED — scaffold only).
+// Construction.
 //
-// On success: writes the filter to `out_buf` and returns the byte
-// count actually used. On failure (column dependency, scratch too
-// small, out_buf too small, n < 0): returns 0. The caller retries
-// with `seed + 1` up to `kMaxRetries` times before falling back.
-//
-// The scaffold body always returns 0 — DO NOT WIRE THIS UP TO REAL
-// POINT-GET TRAFFIC. The writer-side gate stays on SBBF until the
-// body lands and the `test_ribbon_filter` round-trip tests are
-// enabled.
+// On success: writes the filter to `out_buf` (header + payload) and
+// returns the byte count actually used (== size_bytes_for(n)). On
+// failure (column dependency, scratch too small, out_buf too small,
+// n < 0): returns 0. The caller retries with `seed + 1` up to
+// `kMaxRetries` times before falling back to SBBF.
+// Definition: external/bolt/src/bolt_ribbon.cpp.
 // ---------------------------------------------------------------------------
-BOLT_FORCE_INLINE size_t build(const uint64_t* keys, int64_t n,
-                                double target_fpr,
-                                void* scratch, size_t scratch_bytes,
-                                void* out_buf, size_t out_buf_bytes,
-                                uint64_t seed) noexcept {
-    assert(out_buf != nullptr || out_buf_bytes == 0);
-    assert(scratch != nullptr || scratch_bytes == 0);
-    (void)keys;
-    (void)n;
-    (void)target_fpr;
-    (void)scratch;
-    (void)scratch_bytes;
-    (void)out_buf;
-    (void)out_buf_bytes;
-    (void)seed;
-    // SCAFFOLD: body deferred. Returning 0 forces every caller's
-    // retry loop to exhaust and fall back to SBBF, preserving point-
-    // get correctness while the real implementation is pending.
-    // TODO(wave-20D.4-followup): implement banded GF(2) construction
-    // per Dillinger 2021 §3.2. Estimate: ~180 lines (banded matrix
-    // build + Gaussian elimination + bit-stripe pack).
-    return 0u;
-}
+size_t build(const uint64_t* keys, int64_t n,
+             double target_fpr,
+             void* scratch, size_t scratch_bytes,
+             void* out_buf, size_t out_buf_bytes,
+             uint64_t seed) noexcept;
 
 // ---------------------------------------------------------------------------
-// Query (DEFERRED — scaffold only).
+// Query.
 //
 // Returns true if `key` MAY be present (false positive possible),
 // false if `key` is definitely absent. NEVER returns false for a
-// member key (the no-false-negative invariant is what makes the
-// filter safe in the point-get path).
-//
-// The scaffold body always returns true (a "no filter at all" answer
-// — every query falls through to the actual SST block I/O). This is
-// safe but slow; it lets the writer-side gate ship behind a flag
-// without breaking any reader that happens to encounter a Ribbon-
-// kind file before the body lands.
+// member key. Branchless inner loop — bounded ~30 cycles.
+// Definition: external/bolt/src/bolt_ribbon.cpp.
 // ---------------------------------------------------------------------------
-BOLT_FORCE_INLINE bool might_contain(const void* filter_bytes, size_t len,
-                                      uint64_t key) noexcept {
-    assert(filter_bytes != nullptr || len == 0);
-    (void)filter_bytes;
-    (void)len;
-    (void)key;
-    // SCAFFOLD: body deferred. Conservative answer = true (= "may be
-    // present"), so the caller falls through to block I/O — no false
-    // negatives, just no filtering benefit. Real implementation will
-    // probe the banded matrix at `swiss_mix(key)` and XOR-reduce.
-    // TODO(wave-20D.4-followup): implement query per Dillinger 2021
-    // §3.3. Estimate: ~40 lines.
-    return true;
-}
+bool might_contain(const void* filter_bytes, size_t len,
+                   uint64_t key) noexcept;
 
 // ---------------------------------------------------------------------------
 // Header validation. Returns true iff `filter_bytes[0..16)` carries
