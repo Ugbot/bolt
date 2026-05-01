@@ -44,6 +44,12 @@
 #include <cstdint>
 #include <cstring>
 
+// SIMD overlay (Layer 2.1b). The header expands to nothing useful when
+// BOLT_SIMD_AVX2 / BOLT_SIMD_SSE42 are both 0, leaving the scalar path
+// in sole control. Bit-exact equivalence with scalar is asserted by
+// `tests/test_bolt_pfor_simd.cpp`.
+#include "bolt/kernels/bolt_pfor_simd.h"
+
 namespace bolt {
 namespace kernels {
 namespace pfor {
@@ -81,13 +87,20 @@ BOLT_FORCE_INLINE int32_t pfor_payload_bytes(int32_t n, uint8_t bpv) noexcept {
 
 // --- pack_bits / unpack_bits -----------------------------------------------
 //
-// Pure bit-packer. `bpv` is loaded once and the inner loop has no branches.
-// `out` MUST be pre-zeroed for the bytes we will OR into (caller's job).
-// `out` MUST have at least pfor_payload_bytes(n_values, bpv) + kBitpackTailSlack
-// bytes addressable to allow the 8-byte read/modify/write window.
-BOLT_FORCE_INLINE void pack_bits(const uint32_t* BOLT_RESTRICT in,
-                                  int32_t n_values, uint8_t bpv,
-                                  uint8_t* BOLT_RESTRICT out) noexcept {
+// `internal::pack_bits_scalar` / `internal::unpack_bits_scalar` are the
+// branchless scalar bodies. They are exposed in this header (instead of
+// hidden in an anonymous namespace) so the SIMD overlay test
+// (`tests/test_bolt_pfor_simd.cpp`) can call the scalar path explicitly
+// and assert byte-for-byte equality with the SIMD path. The load-bearing
+// correctness gate is "SIMD packed bytes == scalar packed bytes" — any
+// drift breaks every downstream consumer of the wire format.
+namespace internal {
+
+// Pure scalar bit-packer. `bpv` is loaded once and the inner loop has no
+// branches. `out` MUST be pre-zeroed for the bytes we will OR into.
+BOLT_FORCE_INLINE void pack_bits_scalar(const uint32_t* BOLT_RESTRICT in,
+                                         int32_t n_values, uint8_t bpv,
+                                         uint8_t* BOLT_RESTRICT out) noexcept {
     assert(in != nullptr);
     assert(out != nullptr);
     assert(n_values >= 0);
@@ -110,11 +123,10 @@ BOLT_FORCE_INLINE void pack_bits(const uint32_t* BOLT_RESTRICT in,
     }
 }
 
-// Pure bit-unpacker. Branchless inner loop. `in` MUST have at least
-// pfor_payload_bytes(n_values, bpv) + kBitpackTailSlack bytes addressable.
-BOLT_FORCE_INLINE void unpack_bits(const uint8_t* BOLT_RESTRICT in,
-                                    int32_t n_values, uint8_t bpv,
-                                    uint32_t* BOLT_RESTRICT out) noexcept {
+// Pure scalar bit-unpacker. Branchless inner loop.
+BOLT_FORCE_INLINE void unpack_bits_scalar(const uint8_t* BOLT_RESTRICT in,
+                                           int32_t n_values, uint8_t bpv,
+                                           uint32_t* BOLT_RESTRICT out) noexcept {
     assert(in != nullptr);
     assert(out != nullptr);
     assert(n_values >= 0);
@@ -136,6 +148,43 @@ BOLT_FORCE_INLINE void unpack_bits(const uint8_t* BOLT_RESTRICT in,
         std::memcpy(&w, in + byte_off, 8);
         out[i] = static_cast<uint32_t>((w >> shift) & mask);
     }
+}
+
+}  // namespace internal
+
+// Public bit-packer. Tries the SIMD overlay first (compile-time gated, no
+// runtime branch in the inner loop) and falls through to the scalar path on
+// `false` return (unsupported bpv / shape). `out` MUST be pre-zeroed for the
+// bytes we will OR into. `out` MUST have at least pfor_payload_bytes(n_values,
+// bpv) + kBitpackTailSlack bytes addressable for the scalar 8-byte
+// read/modify/write window.
+BOLT_FORCE_INLINE void pack_bits(const uint32_t* BOLT_RESTRICT in,
+                                  int32_t n_values, uint8_t bpv,
+                                  uint8_t* BOLT_RESTRICT out) noexcept {
+    assert(in != nullptr);
+    assert(out != nullptr);
+#if BOLT_SIMD_AVX2
+    if (bolt::kernels::pfor::simd::pack_avx2(in, n_values, bpv, out)) { return; }
+#elif BOLT_SIMD_SSE42
+    if (bolt::kernels::pfor::simd::pack_sse42(in, n_values, bpv, out)) { return; }
+#endif
+    internal::pack_bits_scalar(in, n_values, bpv, out);
+}
+
+// Public bit-unpacker. SIMD-first dispatch with scalar fallback. `in` MUST
+// have at least pfor_payload_bytes(n_values, bpv) + kBitpackTailSlack bytes
+// addressable for the scalar 8-byte read window.
+BOLT_FORCE_INLINE void unpack_bits(const uint8_t* BOLT_RESTRICT in,
+                                    int32_t n_values, uint8_t bpv,
+                                    uint32_t* BOLT_RESTRICT out) noexcept {
+    assert(in != nullptr);
+    assert(out != nullptr);
+#if BOLT_SIMD_AVX2
+    if (bolt::kernels::pfor::simd::unpack_avx2(in, n_values, bpv, out)) { return; }
+#elif BOLT_SIMD_SSE42
+    if (bolt::kernels::pfor::simd::unpack_sse42(in, n_values, bpv, out)) { return; }
+#endif
+    internal::unpack_bits_scalar(in, n_values, bpv, out);
 }
 
 // --- Block pack ------------------------------------------------------------

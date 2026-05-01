@@ -554,3 +554,11 @@ target_link_libraries(test_bolt_pfor
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_pfor)
 add_test(NAME test_bolt_pfor COMMAND test_bolt_pfor)
+
+# PFOR-Delta SIMD overlay — Layer 2.1b (AVX2 + SSE4.2). Bit-exact equivalence
+# with the scalar path is the load-bearing correctness gate.
+add_executable(test_bolt_pfor_simd test_bolt_pfor_simd.cpp)
+target_link_libraries(test_bolt_pfor_simd
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_pfor_simd)
+add_test(NAME test_bolt_pfor_simd COMMAND test_bolt_pfor_simd)
