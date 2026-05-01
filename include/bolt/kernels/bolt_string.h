@@ -236,5 +236,125 @@ BOLT_FORCE_INLINE void utf8_upper_ascii(
     }
 }
 
+// ===========================================================================
+// VarBinary kernels — operate directly on the offsets+data shape of
+// `BoltColumn::Format::VarBinary`. They do NOT require a parallel
+// StringView header array; the column itself is the canonical layout.
+// Inputs:
+//   data    — flat payload bytes (concatenated rows)
+//   offsets — Int32 array of length n+1; row i spans [offsets[i],offsets[i+1])
+//   n       — row count
+// Outputs:
+//   out     — selection vector (caller-sized for at least n int32_t)
+// All kernels: noexcept, branchless write into `out`, ≥2 asserts.
+// ===========================================================================
+
+BOLT_FORCE_INLINE int64_t varbinary_equals(
+        const uint8_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT offsets, int64_t n,
+        const uint8_t* BOLT_RESTRICT needle, int32_t nlen,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    assert(offsets != nullptr || n == 0);
+    assert(out     != nullptr || n == 0);
+    assert(nlen >= 0);
+    assert(n >= 0);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t start = offsets[i];
+        const int32_t len   = offsets[i + 1] - start;
+        bool match = (len == nlen);
+        if (match && nlen > 0) {
+            match = (memcmp(data + start, needle, static_cast<size_t>(nlen)) == 0);
+        }
+        out[count] = static_cast<int32_t>(i);
+        count += match ? 1 : 0;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE int64_t varbinary_starts_with(
+        const uint8_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT offsets, int64_t n,
+        const uint8_t* BOLT_RESTRICT prefix, int32_t plen,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    assert(offsets != nullptr || n == 0);
+    assert(out     != nullptr || n == 0);
+    assert(plen >= 0);
+    assert(n >= 0);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t start = offsets[i];
+        const int32_t len   = offsets[i + 1] - start;
+        bool match = (len >= plen);
+        if (match && plen > 0) {
+            match = (memcmp(data + start, prefix, static_cast<size_t>(plen)) == 0);
+        }
+        out[count] = static_cast<int32_t>(i);
+        count += match ? 1 : 0;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE int64_t varbinary_contains(
+        const uint8_t* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT offsets, int64_t n,
+        const uint8_t* BOLT_RESTRICT needle, int32_t nlen,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    assert(offsets != nullptr || n == 0);
+    assert(out     != nullptr || n == 0);
+    assert(nlen >= 0);
+    assert(n >= 0);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t start = offsets[i];
+        const int32_t len   = offsets[i + 1] - start;
+        bool match = false;
+        if (nlen == 0) {
+            match = true;
+        } else if (len >= nlen) {
+            const uint8_t* hay = data + start;
+            const int32_t  last = len - nlen;
+            for (int32_t k = 0; k <= last; ++k) {
+                if (memcmp(hay + k, needle, static_cast<size_t>(nlen)) == 0) {
+                    match = true;
+                    break;
+                }
+            }
+        }
+        out[count] = static_cast<int32_t>(i);
+        count += match ? 1 : 0;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE int64_t varbinary_length_in_range(
+        const int32_t* BOLT_RESTRICT offsets, int64_t n,
+        int32_t lo_incl, int32_t hi_incl,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    assert(offsets != nullptr || n == 0);
+    assert(out     != nullptr || n == 0);
+    assert(n >= 0);
+    assert(lo_incl <= hi_incl);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t len = offsets[i + 1] - offsets[i];
+        const bool match = (len >= lo_incl) & (len <= hi_incl);
+        out[count] = static_cast<int32_t>(i);
+        count += match ? 1 : 0;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE void varbinary_lengths(
+        const int32_t* BOLT_RESTRICT offsets, int64_t n,
+        int32_t* BOLT_RESTRICT out_lens) noexcept {
+    assert(offsets  != nullptr || n == 0);
+    assert(out_lens != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) {
+        out_lens[i] = offsets[i + 1] - offsets[i];
+    }
+}
+
 } // namespace kernels
 } // namespace bolt

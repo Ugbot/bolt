@@ -301,4 +301,96 @@ BOLT_FORCE_INLINE void zone_merge_f32(ZoneMap* dst,
     std::memcpy(&dst->variance, &nb, sizeof(nb));
 }
 
+// ---------------------------------------------------------------------------
+// String / VarBinary 8-byte prefix zone-map helpers.
+//
+// `min_value` / `max_value` are reused as raw 8-byte buffers holding the
+// lexicographically-smallest and -largest 8-byte prefix of any payload in
+// the zone. Shorter payloads are zero-padded on the right; this is correct
+// for byte-wise lexicographic compare provided the query prefix is also
+// zero-padded the same way (it is, in `zone_can_have_eq_str8`). Any payload
+// longer than 8 bytes whose first 8 bytes lie strictly between min and max
+// can still be present, so shifting comparisons to the 8-byte prefix
+// remains a valid (conservative) skip predicate.
+//
+// `flags` and `cardinality_class` are unaffected; this overlay only uses
+// the 16 bytes of min/max.
+// ---------------------------------------------------------------------------
+
+BOLT_FORCE_INLINE ZoneMap zone_make_empty_str8() noexcept {
+    ZoneMap z;
+    std::memset(&z, 0, sizeof(z));
+    // min = 0xFF... so first sample wins; max = 0x00... so first sample wins.
+    std::memset(&z.min_value, 0xFF, sizeof(z.min_value));
+    std::memset(&z.max_value, 0x00, sizeof(z.max_value));
+    uint32_t nb = kZoneNanBits;
+    std::memcpy(&z.mean, &nb, sizeof(nb));
+    std::memcpy(&z.variance, &nb, sizeof(nb));
+    return z;
+}
+
+BOLT_FORCE_INLINE void zone_str8_to_buf(const uint8_t* bytes, int32_t len,
+                                          uint8_t out[8]) noexcept {
+    assert(bytes != nullptr || len == 0);
+    assert(len >= 0);
+    const int32_t n = (len < 8) ? len : 8;
+    if (n > 0) std::memcpy(out, bytes, static_cast<size_t>(n));
+    for (int32_t i = n; i < 8; ++i) out[i] = 0;
+}
+
+BOLT_FORCE_INLINE void zone_str8_observe(ZoneMap* z,
+                                          const uint8_t* bytes,
+                                          int32_t len) noexcept {
+    assert(z != nullptr);
+    uint8_t buf[8];
+    zone_str8_to_buf(bytes, len, buf);
+    uint8_t mn[8], mx[8];
+    std::memcpy(mn, &z->min_value, 8);
+    std::memcpy(mx, &z->max_value, 8);
+    if (std::memcmp(buf, mn, 8) < 0) std::memcpy(&z->min_value, buf, 8);
+    if (std::memcmp(buf, mx, 8) > 0) std::memcpy(&z->max_value, buf, 8);
+}
+
+// Equality skip predicate: can this zone contain a row equal to `q`?
+// `q_len` may exceed 8 — the comparison uses only the first 8 bytes.
+// Returns false only when the q-prefix is strictly outside [min, max].
+BOLT_FORCE_INLINE bool zone_can_have_eq_str8(const ZoneMap* z,
+                                              const uint8_t* q,
+                                              int32_t q_len) noexcept {
+    assert(z != nullptr);
+    assert(q != nullptr || q_len == 0);
+    uint8_t qbuf[8];
+    zone_str8_to_buf(q, q_len, qbuf);
+    uint8_t mn[8], mx[8];
+    std::memcpy(mn, &z->min_value, 8);
+    std::memcpy(mx, &z->max_value, 8);
+    return !(std::memcmp(qbuf, mx, 8) > 0 ||
+             std::memcmp(qbuf, mn, 8) < 0);
+}
+
+// Prefix skip predicate: can this zone contain a row whose first
+// `q_len` bytes equal `q`? Pads `q` with 0x00 on the low side and
+// 0xFF on the high side to form the candidate range, then asks
+// whether [low, high] intersects [min, max]. Conservative — false
+// is a hard skip; true means the scanner must visit the block.
+BOLT_FORCE_INLINE bool zone_can_have_prefix_str8(const ZoneMap* z,
+                                                  const uint8_t* q,
+                                                  int32_t q_len) noexcept {
+    assert(z != nullptr);
+    assert(q != nullptr || q_len == 0);
+    uint8_t lo[8];
+    uint8_t hi[8];
+    const int32_t n = (q_len < 8) ? q_len : 8;
+    if (n > 0) {
+        std::memcpy(lo, q, static_cast<size_t>(n));
+        std::memcpy(hi, q, static_cast<size_t>(n));
+    }
+    for (int32_t i = n; i < 8; ++i) { lo[i] = 0x00; hi[i] = 0xFF; }
+    uint8_t mn[8], mx[8];
+    std::memcpy(mn, &z->min_value, 8);
+    std::memcpy(mx, &z->max_value, 8);
+    return !(std::memcmp(lo, mx, 8) > 0 ||
+             std::memcmp(hi, mn, 8) < 0);
+}
+
 }  // namespace bolt

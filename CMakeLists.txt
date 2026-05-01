@@ -155,7 +155,7 @@ target_link_libraries(bolt INTERFACE bolt::ribbon)
 option(BOLT_BUILD_PARSE "Build bolt::parse compiled library" ${BOLT_IS_TOPLEVEL})
 
 if(BOLT_BUILD_PARSE)
-    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp)
+    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp)
     add_library(bolt::parse ALIAS bolt_parse)
     target_link_libraries(bolt_parse PUBLIC bolt::core)
     target_include_directories(bolt_parse PUBLIC

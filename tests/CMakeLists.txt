@@ -489,3 +489,61 @@ if(BOLT_BUILD_IO)
     bolt_apply_hardening(test_bolt_binsearch_crc32c)
     add_test(NAME test_bolt_binsearch_crc32c COMMAND test_bolt_binsearch_crc32c)
 endif()
+
+# Variable-width payload column — Layer 1.1 of the parse / JSON / doc work.
+add_executable(test_bolt_var_column test_bolt_var_column.cpp)
+target_link_libraries(test_bolt_var_column
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_var_column)
+add_test(NAME test_bolt_var_column COMMAND test_bolt_var_column)
+
+# VarBinary string kernels + str8 zone-map — Layer 1.2.
+add_executable(test_bolt_var_kernels test_bolt_var_kernels.cpp)
+target_link_libraries(test_bolt_var_kernels
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_var_kernels)
+add_test(NAME test_bolt_var_kernels COMMAND test_bolt_var_kernels)
+
+# Variant (sum-type) column primitive — Layer 1.2b.
+add_executable(test_bolt_variant_column test_bolt_variant_column.cpp)
+target_link_libraries(test_bolt_variant_column
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_variant_column)
+add_test(NAME test_bolt_variant_column COMMAND test_bolt_variant_column)
+
+# Skip-aware JSON parser — Layer 1.3.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_json test_bolt_parse_json.cpp)
+    target_link_libraries(test_bolt_parse_json
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_json)
+    add_test(NAME test_bolt_parse_json COMMAND test_bolt_parse_json)
+endif()
+
+# Atomic-bitmap primitives — soft-delete / live-mask substrate.
+add_executable(test_bolt_atomic_bitmap test_bolt_atomic_bitmap.cpp)
+target_link_libraries(test_bolt_atomic_bitmap
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_atomic_bitmap)
+add_test(NAME test_bolt_atomic_bitmap COMMAND test_bolt_atomic_bitmap)
+
+# JSONB sorted-keys binary container — Layer 1.4.
+add_executable(test_bolt_jsonb test_bolt_jsonb.cpp)
+target_link_libraries(test_bolt_jsonb
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_jsonb)
+add_test(NAME test_bolt_jsonb COMMAND test_bolt_jsonb)
+
+# Small-array sort kernels — fixed-cap insertion sorts for hot top-k drains.
+add_executable(test_bolt_smallsort test_bolt_smallsort.cpp)
+target_link_libraries(test_bolt_smallsort
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_smallsort)
+add_test(NAME test_bolt_smallsort COMMAND test_bolt_smallsort)
+
+# FST term dictionary — Layer 1.5 (Lucene-style minimal acyclic FST).
+add_executable(test_bolt_fst test_bolt_fst.cpp)
+target_link_libraries(test_bolt_fst
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_fst)
+add_test(NAME test_bolt_fst COMMAND test_bolt_fst)

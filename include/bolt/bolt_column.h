@@ -112,6 +112,12 @@ enum class ColumnFormat : uint8_t {
                       // `seq_step` bits (reused from union). Width ∈ [1,32].
     FrameOfRef = 7,   // FOR = base + bit-packed deltas: `data` = delta words,
                       // `seq_offset` = base value, `seq_step` = bit width.
+    VarBinary  = 8,   // Variable-width payload (Utf8 / Binary / JSONB / etc.).
+                      // `data`  = flat byte buffer (concatenated payloads).
+                      // `dict_child` = Flat Int32 column of length+1 offsets.
+                      //                row i spans bytes [offsets[i], offsets[i+1]).
+                      // `validity` = optional null bitmap (Arrow shape).
+                      // `type_size_bytes` = 0 (variable width).
 };
 
 // ============================================================================
@@ -302,6 +308,69 @@ struct BoltColumn {
         return c;
     }
 
+    /// Variable-width payload column (Layer 1.1).
+    ///
+    /// Borrows caller-owned buffers — does NOT copy or take ownership.
+    /// `offsets` must be of length `total_rows + 1` and monotonically
+    /// non-decreasing; `data` must hold at least `offsets[total_rows]` bytes.
+    /// Row i spans bytes `[offsets[i], offsets[i+1])`. Empty rows have
+    /// `offsets[i] == offsets[i+1]`. Null rows are indicated via the optional
+    /// `validity` bitmap (Arrow convention: bit set = valid).
+    ///
+    /// Used by Bolt's parse/JSONB consumers and by ClickHouse-style
+    /// per-path JSON subcolumns. Tiger Style: noexcept, ≥2 assertions,
+    /// caller-supplied buffers, no allocation here beyond the descriptor for
+    /// the offsets sub-column.
+    static BoltColumn make_var_binary(void* data, uint8_t* validity,
+                                       const int32_t* offsets,
+                                       int64_t total_rows, BoltType type,
+                                       Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(total_rows >= 0);
+        if (total_rows < 0) return make_empty();
+        if (total_rows > 0) {
+            // Inputs must be present for non-empty columns.
+            if (offsets == nullptr) return make_empty();
+            if (offsets[total_rows] > 0 && data == nullptr) return make_empty();
+        }
+        BoltColumn c = make_empty();
+        c.data            = data;
+        c.validity        = validity;
+        c.length          = total_rows;
+        c.format          = ColumnFormat::VarBinary;
+        c.type            = type;
+        c.type_size_bytes = 0;          // variable-width
+        c.arena           = arena;
+
+        // Wrap offsets in a child Flat Int32 column so the descriptor is
+        // self-contained. Offsets array has length+1 entries by Arrow convention.
+        BoltColumn* oc = arena->allocate_array<BoltColumn>(1);
+        if (oc == nullptr) return make_empty();
+        *oc = BoltColumn::make_flat(
+            const_cast<int32_t*>(offsets), nullptr, total_rows + 1,
+            BoltType::Int32);
+        c.dict_child = oc;
+
+        c.stats.all_valid = (validity == nullptr);
+        return c;
+    }
+
+    /// Variable-width payload accessor. Returns `(ptr, len)` for row `i`.
+    /// Caller must verify the column is `Format::VarBinary`. Branchless: a
+    /// pair of int32 loads + a pointer add. Validity is NOT checked here —
+    /// caller probes the validity bitmap separately if needed.
+    BOLT_FORCE_INLINE void var_binary_at(int64_t row,
+                                          const uint8_t** out_data,
+                                          int32_t* out_len) const noexcept {
+        assert(format == ColumnFormat::VarBinary);
+        assert(out_data != nullptr && out_len != nullptr);
+        const int32_t* offs = static_cast<const int32_t*>(dict_child->data);
+        const int32_t  start = offs[row];
+        const int32_t  end   = offs[row + 1];
+        *out_data = static_cast<const uint8_t*>(data) + start;
+        *out_len  = end - start;
+    }
+
     /// Bit-packed column (B3). `packed_words` holds `total_rows * bit_width`
     /// bits LSB-first, each value using `bit_width` ∈ [1,32] bits. Caller
     /// owns the buffer lifetime. `type` determines the output integer type
@@ -422,6 +491,18 @@ struct BoltColumn {
             case ColumnFormat::Constant:   return type_size_bytes;
             case ColumnFormat::Dictionary: return static_cast<size_t>(length) * type_size_bytes;
             case ColumnFormat::Sequence:   return 0;
+            case ColumnFormat::VarBinary: {
+                if (length <= 0 || dict_child == nullptr) return 0;
+                const int32_t* offs = static_cast<const int32_t*>(dict_child->data);
+                const size_t payload = static_cast<size_t>(offs[length]);
+                const size_t offsets_bytes = static_cast<size_t>(length + 1) * sizeof(int32_t);
+                const size_t valid_bytes = validity ? (static_cast<size_t>(length) + 7) / 8 : 0;
+                return payload + offsets_bytes + valid_bytes;
+            }
+            case ColumnFormat::RLE:
+            case ColumnFormat::BitPacked:
+            case ColumnFormat::FrameOfRef:
+                return 0;  // existing TODO; sized by their own buffers
         }
         return 0;
     }

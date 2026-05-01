@@ -1792,3 +1792,53 @@ If a user ships VaR with a 10-year rolling window of minute bars
 4. If the rejected alternative might come back later (different
    workload, new hardware), say so explicitly in an "open question"
    line — that's how `MergeTriple` got its high-cardinality followup.
+
+---
+
+## 2026-05-01 / soft-delete substrate — atomic-bitmap primitives lifted from MarbleDB BM25
+
+Context: MarbleDB BM25's Wave-9.2 rebuild (llm-station plan
+`this-was-a-freach-hashed-crab.md`) needed a lock-free tombstone bitmap
+for `bm25_remove_doc`. The first cut inlined `std::atomic<uint64_t>*` +
+`fetch_or` + bit-tests directly inside `src/ext/bm25.cpp`. That pattern
+will repeat for every future "soft delete" surface (PDX cluster
+live-mask, HNSW evicted-entry mask, episodic retire bitmap), so the
+primitive moved to Bolt.
+
+What landed: `include/bolt/kernels/bolt_atomic_bitmap.h` —
+- `atomic_bitmap_words_for(n_bits)` constexpr sizing.
+- `atomic_bitmap_set(words, bit) → bool` — `fetch_or(acq_rel)`; returns
+  true iff this call performed the 0→1 transition.
+- `atomic_bitmap_clear(words, bit) → bool` — `fetch_and(~m, acq_rel)`.
+- `atomic_bitmap_test(words, bit) → bool` — relaxed load + bit test.
+- `atomic_bitmap_popcount(words, n_words)` — relaxed loads + Bolt's
+  existing `bolt_popcount64`.
+- `atomic_bitmap_clear_all(words, n_words)` — release stores.
+
+Also extended in this pass:
+- `bolt_binsearch.h` gained `contains_{i64,u64,f64,f32}` — `lower_bound`
+  + branchless tail compare. Removes the per-consumer
+  `sorted_contains` inlining MarbleDB and future filter-pushdown
+  consumers were going to redo.
+- New header `include/bolt/kernels/bolt_smallsort.h` —
+  `sort_small_{u64,i64,u32}_asc` insertion sort with `kSmallSortCap=1024`.
+  Used by MarbleDB's BM25 boolean-query drain (`bm25_query_and` /
+  `bm25_query_or`).
+
+Tests landed: `tests/test_bolt_atomic_bitmap.cpp` (6 assertions
+including 8-thread concurrent-set race), `tests/test_bolt_smallsort.cpp`
+(7 assertions, randomised cross-checks against `std::sort`). Both green
+under MSVC RelWithDebInfo.
+
+What we kept: scalar insertion sort for `sort_small_*`. Open question:
+SIMD bitonic merge for `n ≥ 32` would beat insertion sort for the
+high end of the cap range; left as a future dispatch path because
+MarbleDB BM25's actual `n` is ≤ ~50 in profile. When a consumer profile
+shows the n ∈ [32, 1024] range is hot, write a topic file under
+`docs/research/smallsort-simd.md` and add an opt-in
+`#ifdef BOLT_SORT_SMALL_SIMD` switch.
+
+Open question: `atomic_bitmap_clear_all` uses release stores
+non-atomically with respect to concurrent writers. A correct
+"reset-while-others-write" path needs a per-word CAS loop — defer
+until a consumer actually needs concurrent-reset semantics (none today).

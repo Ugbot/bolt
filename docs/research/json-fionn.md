@@ -129,3 +129,22 @@ caller must consume events immediately (no random access to re-visit).
 - Fionn-simd module: https://github.com/darach/fionn/tree/main/crates/fionn-simd/src
 - SimdJSON HACKING.md: https://github.com/simdjson/simdjson/blob/master/HACKING.md
 - SimdJSON documentation: https://github.com/simdjson/simdjson/tree/master/doc
+
+## Bolt port — implementation notes
+
+Layer 1.3 of the `this-was-a-freach-hashed-crab.md` plan landed
+`bolt::parse::json`. It rebuilds Fionn's architecture in C++20 (no Rust
+imported), Tiger-Style throughout: `noexcept` everywhere, no STL in
+production code, all allocation through `bolt::Arena`, depth cap at 64,
+PathFilter cap at 1024 paths.
+
+The four-stage walk-through, the path-filter design, the
+`iter_skip_to_close` cost model, the deferred-SIMD TODO, and the measured
+token-count delta on the synthetic filter test (full=796 vs filtered=11
+on `interest = {/wanted, /also/0}`, **~98.6% reduction**) live in the
+sibling note `json-skip-architecture.md`. This note stays as the
+upstream-research log; that note is the implementation log.
+
+Files: `include/bolt/parse/bolt_json.h`,
+`src/parse/bolt_json.cpp`, `tests/test_bolt_parse_json.cpp`. Wired into
+the existing `bolt::parse` static library (one-line CMake addition).

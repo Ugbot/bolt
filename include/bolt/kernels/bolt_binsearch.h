@@ -207,5 +207,48 @@ BOLT_FORCE_INLINE int64_t upper_bound_f32(
     return bolt_upper_bound_tmpl<float>(data, n, key);
 }
 
+// ============================================================================
+// Membership tests (sorted-array `contains`)
+// ============================================================================
+//
+// `contains_*` returns true iff `key` is present in the monotonically
+// non-decreasing range `data[0..n)`. Implemented as `lower_bound` + a
+// branchless tail compare so the cmov shape is preserved end-to-end. Use
+// these in any hot path that wants "is this id in this allow-set?" rather
+// than re-rolling a binary search at the call site.
+template <typename T>
+BOLT_FORCE_INLINE bool bolt_contains_tmpl(
+        const T* BOLT_RESTRICT data, int64_t n, T key) noexcept {
+    assert(n >= 0);
+    assert(n == 0 || data != nullptr);
+    const int64_t i = bolt_lower_bound_tmpl<T>(data, n, key);
+    // Branchless: the AND folds the bounds check and the equality check
+    // into one cmov on x86 / csel on ARM64. `i == n` is the only way the
+    // first half can be false; in that case we must not deref data[i].
+    const bool in_bounds = (i < n);
+    const T    probe     = bolt::branchless::bselect<T>(in_bounds, data[bolt::branchless::bselect<int64_t>(in_bounds, i, 0)], key);
+    return in_bounds && (probe == key);
+}
+
+BOLT_FORCE_INLINE bool contains_i64(
+        const int64_t* BOLT_RESTRICT data, int64_t n, int64_t key) noexcept {
+    return bolt_contains_tmpl<int64_t>(data, n, key);
+}
+
+BOLT_FORCE_INLINE bool contains_u64(
+        const uint64_t* BOLT_RESTRICT data, int64_t n, uint64_t key) noexcept {
+    return bolt_contains_tmpl<uint64_t>(data, n, key);
+}
+
+BOLT_FORCE_INLINE bool contains_f64(
+        const double* BOLT_RESTRICT data, int64_t n, double key) noexcept {
+    return bolt_contains_tmpl<double>(data, n, key);
+}
+
+BOLT_FORCE_INLINE bool contains_f32(
+        const float* BOLT_RESTRICT data, int64_t n, float key) noexcept {
+    return bolt_contains_tmpl<float>(data, n, key);
+}
+
 }  // namespace kernels
 }  // namespace bolt
