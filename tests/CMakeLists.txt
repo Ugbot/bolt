@@ -547,3 +547,10 @@ target_link_libraries(test_bolt_fst
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_fst)
 add_test(NAME test_bolt_fst COMMAND test_bolt_fst)
+
+# PFOR-Delta scalar block kernels — Layer 2 substrate (Lemire 2015 / Lucene104).
+add_executable(test_bolt_pfor test_bolt_pfor.cpp)
+target_link_libraries(test_bolt_pfor
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_pfor)
+add_test(NAME test_bolt_pfor COMMAND test_bolt_pfor)
