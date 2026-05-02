@@ -915,6 +915,17 @@ inline bool encode_frame(JsonbBuilder* b, bool is_object,
     b->scratch_size += total;
     *out_off = base;
     *out_len = total;
+    // Sub-wave 3.B.1 fix: release the just-consumed child slots so the
+    // parent frame's children remain contiguous in `b->children`. Without
+    // this, two siblings of an outer frame straddling a nested container
+    // produce a non-contiguous run that encode_frame walks incorrectly.
+    // Invariants: first ∈ [0, children_size]; the slots being dropped
+    // (children[first..children_size)) are now fully encoded into the
+    // self-contained slab at [base, base+total) in scratch and are no
+    // longer referenced.
+    assert(first >= 0 && first <= b->children_size);
+    assert(count <= b->children_size - first);
+    b->children_size = first;
     return true;
 }
 

@@ -331,3 +331,273 @@ TEST(BoltJsonb, BinarySearchCorrectnessOnObjectsOf1_2_32_1024Keys) {
         EXPECT_EQ(out.tag, JsonbTag::Null);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sub-wave 3.B.1 — nested-sibling regression coverage.
+//
+// Pre-fix, JsonbBuilder shared one global `children[]` array across all open
+// frames. When two siblings of an outer frame straddled a nested container —
+// e.g. {"items":[...], "meta":{...}} — the inner frame's children polluted
+// the global array, so the outer frame's child run was no longer contiguous
+// in `children[first..first+count)`. encode_frame walked the wrong slots and
+// only one of the two top-level keys round-tripped.
+//
+// The fix truncates `children_size` back to `first` after encode_frame
+// consumes a frame's children, restoring the contiguous-walk invariant for
+// the outer frame.
+// ---------------------------------------------------------------------------
+
+TEST(BoltJsonb, NestedSiblingsRoundTrip) {
+    // Pattern: {"items":[{"id":7}], "meta":{"v":1}}
+    // Two top-level keys with a nested container between them.
+    bolt::Arena arena = make_arena();
+    JsonbBuilder b{};
+    ASSERT_TRUE(jsonb_builder_init(&b, &arena, 4096));
+
+    ASSERT_TRUE(jsonb_begin_object(&b));
+        ASSERT_TRUE(jsonb_emit_key(&b, "items", 5));
+        ASSERT_TRUE(jsonb_begin_array(&b));
+            ASSERT_TRUE(jsonb_begin_object(&b));
+                ASSERT_TRUE(jsonb_emit_key(&b, "id", 2));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 7));
+            ASSERT_TRUE(jsonb_end_object(&b));
+        ASSERT_TRUE(jsonb_end_array(&b));
+        ASSERT_TRUE(jsonb_emit_key(&b, "meta", 4));
+        ASSERT_TRUE(jsonb_begin_object(&b));
+            ASSERT_TRUE(jsonb_emit_key(&b, "v", 1));
+            ASSERT_TRUE(jsonb_emit_int64(&b, 1));
+        ASSERT_TRUE(jsonb_end_object(&b));
+    ASSERT_TRUE(jsonb_end_object(&b));
+
+    JsonbView view{};
+    ASSERT_TRUE(jsonb_finish(&b, &view));
+
+    // Both top-level keys must resolve.
+    {
+        JsonbValue v{};
+        ASSERT_TRUE(lookup_key(view, "items", &v));
+        EXPECT_EQ(v.tag, JsonbTag::Array);
+    }
+    {
+        JsonbValue v{};
+        ASSERT_TRUE(lookup_key(view, "meta", &v));
+        EXPECT_EQ(v.tag, JsonbTag::Object);  // pre-fix: this fails
+    }
+
+    // Deep path through the array element should also resolve.
+    {
+        const uint8_t kinds[3] = { 0, 1 /* array idx */, 0 };
+        const char*   strs[3]  = { "items", nullptr, "id" };
+        const int32_t lens[3]  = { 5, 0, 2 };
+        const int32_t idxs[3]  = { 0, 0, 0 };
+        JsonbValue v{};
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 3, &v));
+        EXPECT_EQ(v.tag, JsonbTag::Int64);
+        EXPECT_EQ(v.i64, 7);
+    }
+
+    // Deep path through the meta object should also resolve.
+    {
+        const uint8_t kinds[2] = { 0, 0 };
+        const char*   strs[2]  = { "meta", "v" };
+        const int32_t lens[2]  = { 4, 1 };
+        const int32_t idxs[2]  = { 0, 0 };
+        JsonbValue v{};
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 2, &v));
+        EXPECT_EQ(v.tag, JsonbTag::Int64);
+        EXPECT_EQ(v.i64, 1);
+    }
+}
+
+TEST(BoltJsonb, MultipleSiblingsAcrossSiblingNests) {
+    // Three top-level keys of different shapes interleaved with nested
+    // containers. Stresses the children-array contiguity invariant from
+    // multiple angles: scalar between two nested siblings, then array of
+    // objects, then a deep object.
+    bolt::Arena arena = make_arena();
+    JsonbBuilder b{};
+    ASSERT_TRUE(jsonb_builder_init(&b, &arena, 4096));
+
+    ASSERT_TRUE(jsonb_begin_object(&b));
+        // Key 1: scalar
+        ASSERT_TRUE(jsonb_emit_key(&b, "alpha", 5));
+        ASSERT_TRUE(jsonb_emit_int64(&b, 42));
+
+        // Key 2: array of objects (nested 2 deep)
+        ASSERT_TRUE(jsonb_emit_key(&b, "beta", 4));
+        ASSERT_TRUE(jsonb_begin_array(&b));
+            ASSERT_TRUE(jsonb_begin_object(&b));
+                ASSERT_TRUE(jsonb_emit_key(&b, "x", 1));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 1));
+            ASSERT_TRUE(jsonb_end_object(&b));
+            ASSERT_TRUE(jsonb_begin_object(&b));
+                ASSERT_TRUE(jsonb_emit_key(&b, "x", 1));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 2));
+            ASSERT_TRUE(jsonb_end_object(&b));
+        ASSERT_TRUE(jsonb_end_array(&b));
+
+        // Key 3: another scalar — sandwiched by nested siblings.
+        ASSERT_TRUE(jsonb_emit_key(&b, "gamma", 5));
+        ASSERT_TRUE(jsonb_emit_string(&b, "hello", 5));
+
+        // Key 4: object with nested array
+        ASSERT_TRUE(jsonb_emit_key(&b, "delta", 5));
+        ASSERT_TRUE(jsonb_begin_object(&b));
+            ASSERT_TRUE(jsonb_emit_key(&b, "list", 4));
+            ASSERT_TRUE(jsonb_begin_array(&b));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 100));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 200));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 300));
+            ASSERT_TRUE(jsonb_end_array(&b));
+        ASSERT_TRUE(jsonb_end_object(&b));
+
+        // Key 5: trailing scalar after the last nested sibling.
+        ASSERT_TRUE(jsonb_emit_key(&b, "epsilon", 7));
+        ASSERT_TRUE(jsonb_emit_bool(&b, true));
+    ASSERT_TRUE(jsonb_end_object(&b));
+
+    JsonbView view{};
+    ASSERT_TRUE(jsonb_finish(&b, &view));
+
+    JsonbValue v{};
+
+    ASSERT_TRUE(lookup_key(view, "alpha", &v));
+    EXPECT_EQ(v.tag, JsonbTag::Int64);
+    EXPECT_EQ(v.i64, 42);
+
+    ASSERT_TRUE(lookup_key(view, "beta", &v));
+    EXPECT_EQ(v.tag, JsonbTag::Array);
+
+    ASSERT_TRUE(lookup_key(view, "gamma", &v));
+    EXPECT_EQ(v.tag, JsonbTag::String);
+    EXPECT_EQ(v.len, 5);
+    EXPECT_EQ(0, std::memcmp(v.bytes, "hello", 5));
+
+    ASSERT_TRUE(lookup_key(view, "delta", &v));
+    EXPECT_EQ(v.tag, JsonbTag::Object);
+
+    ASSERT_TRUE(lookup_key(view, "epsilon", &v));
+    EXPECT_EQ(v.tag, JsonbTag::BoolTrue);
+
+    // Drill into beta[1].x — must be 2.
+    {
+        const uint8_t kinds[3] = { 0, 1, 0 };
+        const char*   strs[3]  = { "beta", nullptr, "x" };
+        const int32_t lens[3]  = { 4, 0, 1 };
+        const int32_t idxs[3]  = { 0, 1, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 3, &v));
+        EXPECT_EQ(v.tag, JsonbTag::Int64);
+        EXPECT_EQ(v.i64, 2);
+    }
+
+    // Drill into delta.list[2] — must be 300.
+    {
+        const uint8_t kinds[3] = { 0, 0, 1 };
+        const char*   strs[3]  = { "delta", "list", nullptr };
+        const int32_t lens[3]  = { 5, 4, 0 };
+        const int32_t idxs[3]  = { 0, 0, 2 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 3, &v));
+        EXPECT_EQ(v.tag, JsonbTag::Int64);
+        EXPECT_EQ(v.i64, 300);
+    }
+}
+
+TEST(BoltJsonb, DeeplyNestedSiblings) {
+    // Five-level nesting, with siblings at every level. Each level is an
+    // object with two keys: a scalar "n" carrying the depth, and a
+    // "child" that opens the next level. The final level closes with a
+    // pair of scalar siblings to confirm contiguity at the leaf depth too.
+    bolt::Arena arena = make_arena();
+    JsonbBuilder b{};
+    ASSERT_TRUE(jsonb_builder_init(&b, &arena, 4096));
+
+    ASSERT_TRUE(jsonb_begin_object(&b));
+        ASSERT_TRUE(jsonb_emit_key(&b, "n", 1));
+        ASSERT_TRUE(jsonb_emit_int64(&b, 0));
+        ASSERT_TRUE(jsonb_emit_key(&b, "child", 5));
+        ASSERT_TRUE(jsonb_begin_object(&b));
+            ASSERT_TRUE(jsonb_emit_key(&b, "n", 1));
+            ASSERT_TRUE(jsonb_emit_int64(&b, 1));
+            ASSERT_TRUE(jsonb_emit_key(&b, "child", 5));
+            ASSERT_TRUE(jsonb_begin_object(&b));
+                ASSERT_TRUE(jsonb_emit_key(&b, "n", 1));
+                ASSERT_TRUE(jsonb_emit_int64(&b, 2));
+                ASSERT_TRUE(jsonb_emit_key(&b, "child", 5));
+                ASSERT_TRUE(jsonb_begin_object(&b));
+                    ASSERT_TRUE(jsonb_emit_key(&b, "n", 1));
+                    ASSERT_TRUE(jsonb_emit_int64(&b, 3));
+                    ASSERT_TRUE(jsonb_emit_key(&b, "child", 5));
+                    ASSERT_TRUE(jsonb_begin_object(&b));
+                        ASSERT_TRUE(jsonb_emit_key(&b, "n", 1));
+                        ASSERT_TRUE(jsonb_emit_int64(&b, 4));
+                        ASSERT_TRUE(jsonb_emit_key(&b, "leaf_a", 6));
+                        ASSERT_TRUE(jsonb_emit_int64(&b, 1000));
+                        ASSERT_TRUE(jsonb_emit_key(&b, "leaf_b", 6));
+                        ASSERT_TRUE(jsonb_emit_int64(&b, 2000));
+                    ASSERT_TRUE(jsonb_end_object(&b));
+                ASSERT_TRUE(jsonb_end_object(&b));
+            ASSERT_TRUE(jsonb_end_object(&b));
+        ASSERT_TRUE(jsonb_end_object(&b));
+    ASSERT_TRUE(jsonb_end_object(&b));
+
+    JsonbView view{};
+    ASSERT_TRUE(jsonb_finish(&b, &view));
+
+    JsonbValue v{};
+
+    // n at root.
+    ASSERT_TRUE(lookup_key(view, "n", &v));
+    EXPECT_EQ(v.tag, JsonbTag::Int64);
+    EXPECT_EQ(v.i64, 0);
+
+    // Walk down the chain and verify every "n" along the way.
+    {
+        const uint8_t kinds[2] = { 0, 0 };
+        const char*   strs[2]  = { "child", "n" };
+        const int32_t lens[2]  = { 5, 1 };
+        const int32_t idxs[2]  = { 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 2, &v));
+        EXPECT_EQ(v.i64, 1);
+    }
+    {
+        const uint8_t kinds[3] = { 0, 0, 0 };
+        const char*   strs[3]  = { "child", "child", "n" };
+        const int32_t lens[3]  = { 5, 5, 1 };
+        const int32_t idxs[3]  = { 0, 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 3, &v));
+        EXPECT_EQ(v.i64, 2);
+    }
+    {
+        const uint8_t kinds[4] = { 0, 0, 0, 0 };
+        const char*   strs[4]  = { "child", "child", "child", "n" };
+        const int32_t lens[4]  = { 5, 5, 5, 1 };
+        const int32_t idxs[4]  = { 0, 0, 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 4, &v));
+        EXPECT_EQ(v.i64, 3);
+    }
+    {
+        const uint8_t kinds[5] = { 0, 0, 0, 0, 0 };
+        const char*   strs[5]  = { "child", "child", "child", "child", "n" };
+        const int32_t lens[5]  = { 5, 5, 5, 5, 1 };
+        const int32_t idxs[5]  = { 0, 0, 0, 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 5, &v));
+        EXPECT_EQ(v.i64, 4);
+    }
+    // Both leaf siblings at the deepest level.
+    {
+        const uint8_t kinds[5] = { 0, 0, 0, 0, 0 };
+        const char*   strs[5]  = { "child", "child", "child", "child", "leaf_a" };
+        const int32_t lens[5]  = { 5, 5, 5, 5, 6 };
+        const int32_t idxs[5]  = { 0, 0, 0, 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 5, &v));
+        EXPECT_EQ(v.i64, 1000);
+    }
+    {
+        const uint8_t kinds[5] = { 0, 0, 0, 0, 0 };
+        const char*   strs[5]  = { "child", "child", "child", "child", "leaf_b" };
+        const int32_t lens[5]  = { 5, 5, 5, 5, 6 };
+        const int32_t idxs[5]  = { 0, 0, 0, 0, 0 };
+        ASSERT_TRUE(path_lookup(view, kinds, strs, lens, idxs, 5, &v));
+        EXPECT_EQ(v.i64, 2000);
+    }
+}
