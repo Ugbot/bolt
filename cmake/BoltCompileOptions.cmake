@@ -29,20 +29,29 @@ function(bolt_apply_hardening tgt)
         # Note: MSVC stdlib headers (<chrono>, <mutex>, ...) require /EHsc, so
         # we keep exceptions *enabled at the ABI level*. Our own code is still
         # exception-free — enforced by `noexcept` on every function, not by
-        # the compiler flag. /GR- disables RTTI for user code.
+        # the compiler flag.
+        #
+        # `/GR-` (no-RTTI) is applied PRIVATE only — Bolt's own code never
+        # uses dynamic_cast. Consumers may legitimately need RTTI (e.g.
+        # llm-station's tool-registry dynamic_cast); propagating `/GR-` via
+        # INTERFACE caused silent crashes in consumer code on Windows where
+        # consumer dynamic_cast sites compiled to UB.
         target_compile_options(${tgt} ${scope}
             /W4
             /permissive-
             /Zc:__cplusplus
             /Zc:preprocessor
             /EHsc
-            /GR-
             /utf-8
             /wd4324   # structure padded due to alignas — deliberate
             /wd4201   # nameless struct/union — used in BoltColumn
             /DNOMINMAX
             /D_CRT_SECURE_NO_WARNINGS
         )
+        if(NOT scope STREQUAL "INTERFACE")
+            # PRIVATE for compiled libraries — keeps Bolt's own TUs RTTI-free.
+            target_compile_options(${tgt} PRIVATE /GR-)
+        endif()
         if(BOLT_WARNINGS_AS_ERRORS)
             target_compile_options(${tgt} ${scope} /WX)
         endif()
