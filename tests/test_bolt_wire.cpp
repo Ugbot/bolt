@@ -136,3 +136,99 @@ TEST(BoltWire, DataOffsetAligned) {
     std::memcpy(&data_off, buf.data() + 28, sizeof(data_off));
     EXPECT_EQ(data_off % 64u, 0u);
 }
+
+// ---------------------------------------------------------------------------
+// VarBinary round-trip (wire v2). Mixed-shape batch: Int64 PK + Utf8
+// VarBinary body. Includes an empty-string row so the offsets[i] ==
+// offsets[i+1] sentinel path is exercised.
+// ---------------------------------------------------------------------------
+TEST(BoltWire, VarBinaryRoundTrip) {
+    Arena arena_src, arena_dst;
+
+    BoltBatch src;
+    BoltBatch::init_empty(&src);
+    src.arena    = &arena_src;
+    src.num_cols = 2;
+    src.num_rows = 4;
+    src.schema.num_fields = 2;
+    {
+        BoltField& f0 = src.schema.fields[0];
+        std::memset(&f0, 0, sizeof(f0));
+        std::memcpy(f0.name, "id", 2);
+        f0.type = BoltType::Int64;
+        BoltField& f1 = src.schema.fields[1];
+        std::memset(&f1, 0, sizeof(f1));
+        std::memcpy(f1.name, "body", 4);
+        f1.type = BoltType::Utf8;
+    }
+
+    int64_t* ids = static_cast<int64_t*>(arena_src.allocate(4 * 8, 64));
+    ids[0] = 100; ids[1] = 200; ids[2] = 300; ids[3] = 400;
+    BoltColumn c0 = BoltColumn::make_flat(ids, nullptr, 4, BoltType::Int64);
+    src.columns[0][0] = c0;
+    src.columns[1][0] = c0;
+
+    const char* bodies[4] = { "alpha", "", "carrot_juice", "z" };
+    int32_t lens[4]       = { 5, 0, 12, 1 };
+    int32_t* offs = static_cast<int32_t*>(arena_src.allocate(5 * 4, 64));
+    offs[0] = 0;
+    for (int i = 0; i < 4; ++i) offs[i + 1] = offs[i] + lens[i];
+    uint8_t* pool = static_cast<uint8_t*>(
+        arena_src.allocate(static_cast<size_t>(offs[4] > 0 ? offs[4] : 1), 64));
+    {
+        int32_t cur = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (lens[i] > 0) {
+                std::memcpy(pool + cur, bodies[i], lens[i]);
+                cur += lens[i];
+            }
+        }
+    }
+    BoltColumn c1 = BoltColumn::make_var_binary(
+        pool, nullptr, offs, 4, BoltType::Utf8, &arena_src);
+    ASSERT_EQ(c1.format, ColumnFormat::VarBinary);
+    src.columns[0][1] = c1;
+    src.columns[1][1] = c1;
+
+    const size_t need = wire::bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    std::vector<uint8_t> buf(need, 0);
+    ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
+
+    BoltBatch dst;
+    BoltBatch::init_empty(&dst);
+    ASSERT_TRUE(
+        wire::bolt_wire_deserialize(buf.data(), buf.size(), &dst, &arena_dst));
+    EXPECT_EQ(dst.num_cols, 2u);
+    EXPECT_EQ(dst.num_rows, 4);
+
+    const BoltColumn& d0 = dst.columns[dst.read_epoch][0];
+    EXPECT_EQ(d0.format, ColumnFormat::Flat);
+    const int64_t* dids = static_cast<const int64_t*>(d0.data);
+    EXPECT_EQ(dids[0], 100); EXPECT_EQ(dids[3], 400);
+
+    const BoltColumn& d1 = dst.columns[dst.read_epoch][1];
+    EXPECT_EQ(d1.format, ColumnFormat::VarBinary);
+    EXPECT_EQ(d1.length, 4);
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t* bp = nullptr;
+        int32_t        bl = 0;
+        d1.var_binary_at(i, &bp, &bl);
+        EXPECT_EQ(bl, lens[i]);
+        if (lens[i] > 0) {
+            EXPECT_EQ(0, std::memcmp(bp, bodies[i], lens[i]));
+        }
+    }
+}
+
+TEST(BoltWire, VersionStampIsTwo) {
+    Arena arena;
+    BoltBatch src;
+    build_int32_batch(&src, &arena, 1, 1);
+    const size_t need = wire::bolt_wire_size(&src);
+    std::vector<uint8_t> buf(need, 0);
+    ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
+    uint32_t version = 0;
+    std::memcpy(&version, buf.data() + 4, sizeof(version));
+    EXPECT_EQ(version, 2u);
+}

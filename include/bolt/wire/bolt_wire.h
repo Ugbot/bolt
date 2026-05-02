@@ -3,12 +3,16 @@
 // RULES: No exceptions. No RTTI. No smart pointers. No std::string. No std::vector.
 // All functions noexcept. Fixed caps, >=2 asserts per function, functions <=70 lines.
 //
-// Scope (Phase 1):
-//   - Only Flat-format columns are supported. Constant/Sequence/Dictionary/View
-//     columns must be materialized by the caller before serialize — otherwise
-//     serialize returns 0.
-//   - Only the numeric types in BOLT_NUMERIC_TYPES plus Bool and Utf8 are
-//     supported. Other types cause serialize to return 0.
+// Scope:
+//   - Format::Flat columns: numeric types in BOLT_NUMERIC_TYPES plus Bool.
+//   - Format::VarBinary columns: BoltType::Utf8 / Binary / Symbol — payload
+//     is `(offsets[len+1], raw bytes)`. Per-row slice = pool[off[i]..off[i+1]).
+//     Added at version 2 (Pass-Wiring 2026-05-01) to carry the unified-
+//     memtable Field::* paths (kText / kKeyword / kJson / kStored) through
+//     the WAL kBatch path.
+//   - Other formats (Constant / Dictionary / Sequence / View / RLE /
+//     BitPacked / FrameOfRef) must be materialized by the caller before
+//     serialize — otherwise serialize returns 0.
 //   - Little-endian target only (x86 / ARM64). Flag bit 0 records this.
 //   - Deserialize copies each column buffer into the caller-provided Arena.
 //     Zero-copy-over-mmap is a future goal; the 64-byte alignment in the blob
@@ -17,7 +21,7 @@
 // Binary layout:
 //   +------------------------------------------------+ offset 0
 //   |  magic[4]       = "BOLT"                       |
-//   |  version        = u32 (1)                      |
+//   |  version        = u32 (2 — VarBinary support)  |
 //   |  flags          = u32 (bit0=LE, bit1=aligned64)|
 //   |  num_rows       = i64                          |
 //   |  num_cols       = u32                          |
@@ -37,8 +41,12 @@
 //   +------------------------------------------------+
 //   | Data region (64-byte aligned per buffer)       |
 //   |   b0 = validity bitmap (may be empty)          |
-//   |   b1 = primitive data / utf8 offsets           |
-//   |   b2 = utf8 data (string columns only)         |
+//   |   Flat:                                        |
+//   |     b1 = primitive data array                  |
+//   |     b2 = (unused; len 0)                       |
+//   |   VarBinary:                                   |
+//   |     b1 = offsets array (int32 × (rows + 1))    |
+//   |     b2 = payload bytes (offsets[rows] long)    |
 //   +------------------------------------------------+
 
 #pragma once
@@ -61,7 +69,7 @@ namespace wire {
 // ===========================================================================
 
 inline constexpr uint32_t kWireMagic    = 0x544C4F42u;  // 'BOLT' LE
-inline constexpr uint32_t kWireVersion  = 1u;
+inline constexpr uint32_t kWireVersion  = 2u;            // bumped: VarBinary support
 inline constexpr uint32_t kWireFlagLE   = 1u << 0;
 inline constexpr uint32_t kWireFlagAln  = 1u << 1;
 
@@ -86,11 +94,30 @@ BOLT_FORCE_INLINE size_t align_up(size_t x, size_t a) noexcept {
 }
 
 BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
-    if (t == BoltType::Bool) return true;
-    if (t == BoltType::Utf8) return true;
+    if (t == BoltType::Bool)   return true;
+    if (t == BoltType::Utf8)   return true;
+    if (t == BoltType::Binary) return true;
+    if (t == BoltType::Symbol) return true;
     auto v = static_cast<uint8_t>(t);
     return v >= static_cast<uint8_t>(BoltType::Int8)
         && v <= static_cast<uint8_t>(BoltType::Float64);
+}
+
+// True if (`type`, `format`) is a legal pair for the wire format. v2:
+//   Format::Flat       + numeric / Bool
+//   Format::VarBinary  + Utf8 / Binary / Symbol
+BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
+                                                 ColumnFormat f) noexcept {
+    if (f == ColumnFormat::Flat) {
+        return is_supported_type(t)
+            && t != BoltType::Utf8 && t != BoltType::Binary
+            && t != BoltType::Symbol;
+    }
+    if (f == ColumnFormat::VarBinary) {
+        return t == BoltType::Utf8 || t == BoltType::Binary
+            || t == BoltType::Symbol;
+    }
+    return false;
 }
 
 // Byte length of the data buffer (buffer1) for a Flat column of the given
@@ -147,18 +174,29 @@ inline size_t collect_column_sizes(const BoltBatch* b,
     const uint32_t n = b->num_cols;
     for (uint32_t i = 0; i < n && i < kWireMaxCols; ++i) {
         const BoltColumn& c = b->col(i);
-        if (c.format != ColumnFormat::Flat) return 0;
-        if (!is_supported_type(c.type))     return 0;
+        if (!is_supported_format_pair(c.type, c.format)) return 0;
 
         const size_t v_len = c.validity ? validity_bytes(c.length) : 0;
         size_t d_len = 0;
         size_t s_len = 0;
-        if (c.type == BoltType::Utf8) {
-            // Utf8 unsupported end-to-end in Phase 1: we don't have enough
-            // metadata on a Flat BoltColumn to reconstruct offsets + data.
-            // Caller should materialize into a primitive form first.
-            return 0;
+
+        if (c.format == ColumnFormat::VarBinary) {
+            // b1 = (length+1) Int32 offsets; b2 = `offsets[length]` payload bytes.
+            d_len = static_cast<size_t>(c.length + 1) * sizeof(int32_t);
+            if (c.length > 0 && c.dict_child != nullptr &&
+                c.dict_child->data != nullptr) {
+                const int32_t* offs =
+                    static_cast<const int32_t*>(c.dict_child->data);
+                const int32_t total_payload = offs[c.length];
+                if (total_payload < 0) return 0;
+                s_len = static_cast<size_t>(total_payload);
+            } else if (c.length == 0) {
+                s_len = 0;
+            } else {
+                return 0;            // length > 0 but no offsets
+            }
         } else {
+            // Flat numeric / Bool.
             d_len = data_buffer_size(c.type, c.length);
         }
 
@@ -232,12 +270,26 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     // Collect sizes + validate supported formats.
     for (uint32_t i = 0; i < b->num_cols; ++i) {
         const BoltColumn& c = b->col(i);
-        if (c.format != ColumnFormat::Flat)        return 0;
-        if (!detail::is_supported_type(c.type))    return 0;
-        if (c.type == BoltType::Utf8)              return 0;
+        if (!detail::is_supported_format_pair(c.type, c.format)) return 0;
         b0[i] = c.validity ? detail::validity_bytes(c.length) : 0;
-        b1[i] = detail::data_buffer_size(c.type, c.length);
-        b2[i] = 0;
+        if (c.format == ColumnFormat::VarBinary) {
+            b1[i] = static_cast<size_t>(c.length + 1) * sizeof(int32_t);
+            if (c.length > 0 && c.dict_child != nullptr &&
+                c.dict_child->data != nullptr) {
+                const int32_t* offs =
+                    static_cast<const int32_t*>(c.dict_child->data);
+                const int32_t payload = offs[c.length];
+                if (payload < 0) return 0;
+                b2[i] = static_cast<size_t>(payload);
+            } else if (c.length == 0) {
+                b2[i] = 0;
+            } else {
+                return 0;
+            }
+        } else {
+            b1[i] = detail::data_buffer_size(c.type, c.length);
+            b2[i] = 0;
+        }
     }
 
     const size_t total = bolt_wire_size(b);
@@ -288,7 +340,18 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         d[48] = static_cast<uint8_t>(c.format);
 
         if (b0[i] && c.validity) memcpy(buf + off0, c.validity, b0[i]);
-        if (b1[i] && c.data)     memcpy(buf + off1, c.data,     b1[i]);
+        if (c.format == ColumnFormat::VarBinary) {
+            // b1 = offsets array; b2 = payload bytes.
+            if (b1[i] > 0 && c.dict_child != nullptr &&
+                c.dict_child->data != nullptr) {
+                memcpy(buf + off1, c.dict_child->data, b1[i]);
+            }
+            if (b2[i] > 0 && c.data != nullptr) {
+                memcpy(buf + off2, c.data, b2[i]);
+            }
+        } else {
+            if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
+        }
     }
 
     return total;
@@ -306,7 +369,12 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
     // --- Header validation ---
     if (memcmp(p, "BOLT", 4) != 0) return false;
     const uint32_t version = detail::read_u32_le(p + 4);
-    if (version != kWireVersion) return false;
+    // v1 and v2 are wire-compatible at the header / descriptor level;
+    // v2 adds VarBinary support without changing the on-disk shape of
+    // existing v1 columns. Readers accept both. (Old readers compiled
+    // against kWireVersion=1 will reject v2 payloads — that is the
+    // intentional break for VarBinary writers.)
+    if (version != 1u && version != 2u) return false;
     const uint32_t flags = detail::read_u32_le(p + 8);
     if (!(flags & kWireFlagLE)) return false;
     const int64_t  num_rows     = detail::read_i64_le(p + 12);
@@ -338,44 +406,75 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
         f.name[kMaxFieldName] = '\0';
         f.type     = static_cast<BoltType>(e[64]);
         f.nullable = (e[66] != 0);
-        if (!detail::is_supported_type(f.type)) return false;
-        if (f.type == BoltType::Utf8)           return false;
+        const ColumnFormat schema_fmt =
+            static_cast<ColumnFormat>(e[65]);
+        if (!detail::is_supported_format_pair(f.type, schema_fmt)) return false;
 
         const uint8_t* d = p + desc_off + i * kWireDescSize;
         const uint64_t o0 = detail::read_u64_le(d +  0);
         const uint64_t l0 = detail::read_u64_le(d +  8);
         const uint64_t o1 = detail::read_u64_le(d + 16);
         const uint64_t l1 = detail::read_u64_le(d + 24);
-        const uint8_t  fm = d[48];
-        if (fm != static_cast<uint8_t>(ColumnFormat::Flat)) return false;
-        if (o0 + l0 > buf_len || o1 + l1 > buf_len)         return false;
+        const uint64_t o2 = detail::read_u64_le(d + 32);
+        const uint64_t l2 = detail::read_u64_le(d + 40);
+        const ColumnFormat fm = static_cast<ColumnFormat>(d[48]);
+        if (fm != schema_fmt) return false;
+        if (!detail::is_supported_format_pair(f.type, fm)) return false;
+        if (o0 + l0 > buf_len || o1 + l1 > buf_len ||
+            o2 + l2 > buf_len) return false;
 
-        BoltColumn c = BoltColumn::make_empty();
-        c.length  = num_rows;
-        c.format  = ColumnFormat::Flat;
-        c.type    = f.type;
-        c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
-        c.arena   = arena;
-
+        // Validity is shared across both formats.
+        uint8_t* validity = nullptr;
+        bool all_valid = true;
         if (l0) {
             void* v = arena->copy_into(p + o0, l0, kWireAlign);
             if (!v) return false;
-            c.validity = static_cast<uint8_t*>(v);
-            c.stats.all_valid = false;
-        } else {
-            c.validity = nullptr;
-            c.stats.all_valid = true;
-        }
-        if (l1) {
-            c.data = arena->copy_into(p + o1, l1, kWireAlign);
-            if (!c.data) return false;
-        } else {
-            c.data = nullptr;
+            validity = static_cast<uint8_t*>(v);
+            all_valid = false;
         }
 
-        // Install in both epochs so reads work regardless of read_epoch.
-        out->columns[0][i] = c;
-        out->columns[1][i] = c;
+        if (fm == ColumnFormat::Flat) {
+            BoltColumn c = BoltColumn::make_empty();
+            c.length  = num_rows;
+            c.format  = ColumnFormat::Flat;
+            c.type    = f.type;
+            c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
+            c.arena   = arena;
+            c.validity = validity;
+            c.stats.all_valid = all_valid;
+            if (l1) {
+                c.data = arena->copy_into(p + o1, l1, kWireAlign);
+                if (!c.data) return false;
+            }
+            out->columns[0][i] = c;
+            out->columns[1][i] = c;
+        } else {
+            // VarBinary: rebuild via make_var_binary with arena-resident
+            // copies of the offsets + data buffers.
+            int32_t* offs = nullptr;
+            uint8_t* data = nullptr;
+            if (l1) {
+                offs = static_cast<int32_t*>(
+                    arena->copy_into(p + o1, l1, kWireAlign));
+                if (!offs) return false;
+            }
+            if (l2) {
+                data = static_cast<uint8_t*>(
+                    arena->copy_into(p + o2, l2, kWireAlign));
+                if (!data) return false;
+            }
+            // num_rows == 0 → make_var_binary with a nullptr offsets is OK
+            // because the inner check skips offsets/data when total_rows == 0.
+            BoltColumn c = BoltColumn::make_var_binary(
+                data, validity, offs, num_rows, f.type, arena);
+            if (c.format != ColumnFormat::VarBinary) {
+                // make_var_binary rejected the input — that's a corrupt
+                // wire payload (e.g. offsets[len] > 0 but data == nullptr).
+                return false;
+            }
+            out->columns[0][i] = c;
+            out->columns[1][i] = c;
+        }
     }
     return true;
 }
