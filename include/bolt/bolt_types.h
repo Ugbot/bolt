@@ -62,6 +62,19 @@ inline constexpr bool is_fixed_width(BoltType t) noexcept { return type_size(t) 
 inline constexpr bool is_numeric(BoltType t) noexcept {
     auto v = static_cast<uint8_t>(t); return v >= 2 && v <= 12;
 }
+inline constexpr bool is_vector(BoltType t) noexcept {
+    return t == BoltType::Embedding;
+}
+
+// Vector / Embedding columns carry a runtime-dynamic stride: their
+// physical row size is `dim * sizeof(float)`. `kTypeSize[Embedding]`
+// stays 0 (the "dynamic" sentinel that `is_fixed_width` already
+// recognises); callers that need the byte stride must consult the
+// dimension explicitly via this helper.
+BOLT_FORCE_INLINE size_t
+embedding_stride(uint32_t dim) noexcept {
+    return static_cast<size_t>(dim) * sizeof(float);
+}
 inline constexpr bool is_integer(BoltType t) noexcept {
     auto v = static_cast<uint8_t>(t); return v >= 2 && v <= 9;
 }
