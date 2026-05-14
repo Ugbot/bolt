@@ -72,14 +72,60 @@ BOLT_FORCE_INLINE uint32_t bond_zone_rank_scores_f32(
 }
 
 // ===========================================================================
-// sigma_bound_remaining_minmax_f32 — exact Weber 1998 VA-File bound
+// box_lower_bound_l2_f32 — exact lower bound for block-skip
+// ===========================================================================
+//
+// Returns the minimum possible squared L2 distance from `q` to any
+// point inside the axis-aligned box [min_d, max_d] in every
+// dimension. Per-dim contribution:
+//   if q_d < min_d : (min_d − q_d)²
+//   if q_d > max_d : (q_d − max_d)²
+//   else           : 0
+//
+// If this lower bound exceeds the current kth-best τ, every vector
+// in the block is provably farther than τ — the block can be
+// skipped entirely. Recall-1.0 preserved.
+//
+// `visited_mask` lets the orchestrator carry incremental row-level
+// state (don't double-count dims already accumulated into the
+// partial distance). nullptr ⇒ all dims contribute.
+
+BOLT_FORCE_INLINE float box_lower_bound_l2_f32(
+    const float* BOLT_RESTRICT q,
+    const float* BOLT_RESTRICT min_d,
+    const float* BOLT_RESTRICT max_d,
+    const uint8_t* visited_mask,
+    uint32_t dim) noexcept {
+    assert(q != nullptr); assert(min_d != nullptr); assert(max_d != nullptr);
+    assert(dim <= kBondMaxDim);
+    float acc = 0.0f;
+    for (uint32_t d = 0; d < dim; ++d) {
+        if (visited_mask != nullptr &&
+            ((visited_mask[d >> 3] >> (d & 7u)) & 1u) != 0u) {
+            continue;
+        }
+        const float qd = q[d];
+        float gap = 0.0f;
+        if (qd < min_d[d]) gap = min_d[d] - qd;
+        else if (qd > max_d[d]) gap = qd - max_d[d];
+        acc += gap * gap;
+    }
+    return acc;
+}
+
+// ===========================================================================
+// sigma_bound_remaining_minmax_f32 — exact upper bound (row-level prune)
 // ===========================================================================
 //
 // Returns Σ_{d ∉ visited} max((q_d − min_d)², (q_d − max_d)²). Adding
-// this to `partial_distance` gives an exact upper bound on the L2²
-// distance from `q` to any vector inside this cluster. If that bound
-// is below the current kth-best, the cluster is the new top-k
-// candidate; if it exceeds τ, the cluster contributes nothing.
+// this to a row's `partial_distance` (computed over the visited dim
+// subset) gives an exact UPPER bound on the row's full L2². If
+// `partial + bound ≤ τ`, the row is a guaranteed top-k candidate;
+// if `partial > τ` already, drop.
+//
+// Use `box_lower_bound_l2_f32` for whole-block skip — that's the
+// lower bound. This kernel is the upper bound, used by Phase 4's
+// row-level ADSampling / σ-walk inside a probed block.
 //
 // Recall=1.0 preserved (no probabilistic argument). `visited_mask`
 // is one bit per dim (LSB first). nullptr ⇒ no dims visited yet.
