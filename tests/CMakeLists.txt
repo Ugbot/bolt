@@ -90,6 +90,19 @@ target_link_libraries(test_bolt_kmeans
 bolt_apply_hardening(test_bolt_kmeans)
 add_test(NAME test_bolt_kmeans COMMAND test_bolt_kmeans)
 
+# Wave 9.4 — vector column primitive + centroid kernels (row-major).
+# Covers BoltType::Embedding factories, VectorStats sidecar, wire
+# round-trip with fixed_size, k-means train, BOND zone ranking, σ-bound.
+add_executable(test_bolt_vector_column test_bolt_vector_column.cpp)
+target_link_libraries(test_bolt_vector_column
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_column)
+add_test(NAME test_bolt_vector_column COMMAND test_bolt_vector_column)
+
 # Quantized distance kernels — SQ8 / RaBitQ / F16, scalar-first
 # (Wave 19 plan B; AVX2 specialisations deferred).
 add_executable(test_bolt_quantized_distance test_bolt_quantized_distance.cpp)

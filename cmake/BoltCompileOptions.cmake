@@ -63,9 +63,15 @@ function(bolt_apply_hardening tgt)
             -Wshadow
             -Wconversion
             -Wno-unused-parameter
-            -fno-exceptions
-            -fno-rtti
         )
+        # -fno-exceptions / -fno-rtti: Bolt's own code is exception- and
+        # RTTI-free, but propagating these via INTERFACE breaks consumers
+        # that legitimately use them (cppzmq throws on socket errors;
+        # llm-station's ToolExecutorRegistry uses dynamic_cast). Apply
+        # PRIVATE only — same precedent the MSVC branch uses for /GR-.
+        if(NOT scope STREQUAL "INTERFACE")
+            target_compile_options(${tgt} PRIVATE -fno-exceptions -fno-rtti)
+        endif()
         if(BOLT_WARNINGS_AS_ERRORS)
             target_compile_options(${tgt} ${scope} -Werror)
         endif()

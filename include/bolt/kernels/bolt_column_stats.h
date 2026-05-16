@@ -6,7 +6,9 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
-#if defined(BOLT_SIMD_AVX2)
+// bolt_port.h defines BOLT_SIMD_AVX2 to 0 on non-AVX2 hosts, so test the
+// value, not the definition, to keep arm64 / NEON builds clean.
+#if BOLT_SIMD_AVX2
 #include <immintrin.h>
 #endif
 

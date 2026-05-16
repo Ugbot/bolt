@@ -94,10 +94,11 @@ BOLT_FORCE_INLINE size_t align_up(size_t x, size_t a) noexcept {
 }
 
 BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
-    if (t == BoltType::Bool)   return true;
-    if (t == BoltType::Utf8)   return true;
-    if (t == BoltType::Binary) return true;
-    if (t == BoltType::Symbol) return true;
+    if (t == BoltType::Bool)      return true;
+    if (t == BoltType::Utf8)      return true;
+    if (t == BoltType::Binary)    return true;
+    if (t == BoltType::Symbol)    return true;
+    if (t == BoltType::Embedding) return true;
     auto v = static_cast<uint8_t>(t);
     return v >= static_cast<uint8_t>(BoltType::Int8)
         && v <= static_cast<uint8_t>(BoltType::Float64);
@@ -122,12 +123,27 @@ BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
 
 // Byte length of the data buffer (buffer1) for a Flat column of the given
 // type and row count. Utf8 is handled separately (returns 0 here).
+// Embedding columns must use the 3-arg overload (their stride is
+// runtime-dynamic = dim * 4); the 2-arg form returns 0 for Embedding.
 BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
     assert(n >= 0);
     if (t == BoltType::Utf8) return 0;
     if (t == BoltType::Bool) return static_cast<size_t>((n + 7) / 8);
     size_t tsz = type_size(t);
     return tsz * static_cast<size_t>(n);
+}
+
+// 3-arg overload — supplies the per-row stride directly so vector
+// Embedding columns (whose `type_size_bytes` is `dim * 4`) reuse the
+// same caller shape as scalar Flat columns. Falls through to the
+// 2-arg form for non-Embedding types.
+BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n,
+                                           uint16_t type_size_bytes) noexcept {
+    assert(n >= 0);
+    if (t == BoltType::Embedding) {
+        return static_cast<size_t>(type_size_bytes) * static_cast<size_t>(n);
+    }
+    return data_buffer_size(t, n);
 }
 
 BOLT_FORCE_INLINE size_t validity_bytes(int64_t n) noexcept {
@@ -196,8 +212,11 @@ inline size_t collect_column_sizes(const BoltBatch* b,
                 return 0;            // length > 0 but no offsets
             }
         } else {
-            // Flat numeric / Bool.
-            d_len = data_buffer_size(c.type, c.length);
+            // Flat numeric / Bool / Embedding. Embedding uses the 3-arg
+            // overload so the runtime-dynamic stride (dim * 4) is taken
+            // from `c.type_size_bytes` rather than the 0 sentinel in
+            // `kTypeSize[]`.
+            d_len = data_buffer_size(c.type, c.length, c.type_size_bytes);
         }
 
         out_b0_len[i] = v_len;
@@ -287,7 +306,8 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
                 return 0;
             }
         } else {
-            b1[i] = detail::data_buffer_size(c.type, c.length);
+            b1[i] = detail::data_buffer_size(c.type, c.length,
+                                              c.type_size_bytes);
             b2[i] = 0;
         }
     }
@@ -320,7 +340,12 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         e[64] = static_cast<uint8_t>(f.type);
         e[65] = static_cast<uint8_t>(b->col(i).format);
         e[66] = f.nullable ? 1u : 0u;
-        // bytes 67..71 remain zero padding.
+        e[67] = 0u;                                // reserved
+        // bytes 68..71: fixed_size (Embedding dim or FixedSizeBinary
+        // width). Zero for all other types — old readers see zeroes
+        // and ignore the field; new readers consult it for vector
+        // round-trip.
+        detail::write_u32_le(e + 68, f.fixed_size);
     }
 
     // --- Column descriptors + data copy ---
@@ -406,9 +431,18 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
         f.name[kMaxFieldName] = '\0';
         f.type     = static_cast<BoltType>(e[64]);
         f.nullable = (e[66] != 0);
+        // bytes 68..71 carry fixed_size (Embedding dim / FixedSizeBinary
+        // width). Old writers wrote zero into the trailing pad, so
+        // pre-vector schemas decode as fixed_size = 0 — matches the
+        // default-initialised BoltField.
+        f.fixed_size = detail::read_u32_le(e + 68);
         const ColumnFormat schema_fmt =
             static_cast<ColumnFormat>(e[65]);
         if (!detail::is_supported_format_pair(f.type, schema_fmt)) return false;
+        // Embedding columns require a non-zero dim; reject corrupt /
+        // pre-vector payloads that label a column Embedding without
+        // carrying the stride.
+        if (f.type == BoltType::Embedding && f.fixed_size == 0u) return false;
 
         const uint8_t* d = p + desc_off + i * kWireDescSize;
         const uint64_t o0 = detail::read_u64_le(d +  0);
@@ -438,7 +472,15 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
             c.length  = num_rows;
             c.format  = ColumnFormat::Flat;
             c.type    = f.type;
-            c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
+            // Embedding columns store stride = dim * 4; everything
+            // else falls back to the static `kTypeSize[]` lookup.
+            if (f.type == BoltType::Embedding) {
+                const size_t stride = embedding_stride(f.fixed_size);
+                if (stride > UINT16_MAX) return false;
+                c.type_size_bytes = static_cast<uint16_t>(stride);
+            } else {
+                c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
+            }
             c.arena   = arena;
             c.validity = validity;
             c.stats.all_valid = all_valid;

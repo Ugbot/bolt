@@ -3,7 +3,11 @@
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
-#if defined(__AVX2__) || defined(BOLT_SIMD_AVX2)
+// bolt_port.h #defines BOLT_SIMD_AVX2 to 0 on non-AVX2 hosts, so the
+// previous guard `defined(BOLT_SIMD_AVX2)` was always true and pulled
+// <immintrin.h> in on arm64 / NEON-only builds. Use the value, not the
+// definition, to match every other consumer.
+#if defined(__AVX2__) || BOLT_SIMD_AVX2
 #include <immintrin.h>
 #endif
 

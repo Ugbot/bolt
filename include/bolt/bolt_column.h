@@ -88,11 +88,33 @@ static_assert(offsetof(ColumnStats, variance) == 44,
 // Sidecar Index Slots — arena-allocated, ephemeral per morsel
 // ============================================================================
 
+// Per-dimension statistics for a vector / Embedding column. Sized by
+// the column's `fixed_size` (== dim). Arena-allocated; the four
+// parallel float arrays back PDX-BOND zone-rank scoring
+// (`bond_zone_rank_scores_f32`) and the σ-bound column-level
+// early-termination kernels (`sigma_bound_remaining_*_f32`).
+//
+// Tiger Style: POD, no constructors, fixed-size pointers, no smart
+// pointers. The dim slot is replicated here so kernels can validate
+// against the BoltColumn's `fixed_size` in one read.
+struct VectorStats {
+    float*   min;         // [dim]   per-dim minimum
+    float*   max;         // [dim]   per-dim maximum
+    float*   mean;        // [dim]   per-dim mean (Welford)
+    float*   variance;    // [dim]   per-dim variance (Welford M2 / (n-1))
+    uint32_t dim;         //         redundant copy of column.fixed_size
+    uint32_t row_count;   //         row count used to compute the stats
+};
+
+static_assert(sizeof(VectorStats) == 40,
+              "VectorStats POD layout drift — kernels assume 40 bytes");
+
 struct SidecarSlots {
     void* bitmap_index;    // BitmapIndex*
     void* hash_index;      // HashIndex*
     void* sort_index;      // int32_t* permutation
     void* bloom_filter;    // BloomFilter*
+    void* vector_stats;    // VectorStats* — Embedding columns only
 };
 
 // ============================================================================
@@ -206,6 +228,71 @@ struct BoltColumn {
         c.arena = arena;
         c.stats.all_valid = true;
         return c;
+    }
+
+    /// Flat column carrying fixed-stride f32 vectors (Embedding columns).
+    /// `data` layout = N row-major float32 vectors, each of `dim` lanes
+    /// (per-row stride = `dim * 4` bytes). The dimension is encoded
+    /// into `type_size_bytes` so existing flat-array kernels see the
+    /// correct per-row stride without a special case; the dimension
+    /// can be recovered via `vector_dim()`.
+    ///
+    /// Returns `make_empty()` if `dim` is zero or the per-row stride
+    /// would overflow `type_size_bytes` (uint16; cap ≈ 16 384 dims).
+    /// Borrows `data` (does not allocate).
+    static BoltColumn make_flat_vector(void* data, uint8_t* validity,
+                                        int64_t length, uint32_t dim) noexcept {
+        if (dim == 0u) return make_empty();
+        const size_t stride = bolt::embedding_stride(dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data            = data;
+        c.validity        = validity;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::Embedding;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.stats.all_valid = (validity == nullptr);
+        return c;
+    }
+
+    /// Flat vector column allocated from arena.
+    static BoltColumn make_flat_vector_alloc(int64_t length, uint32_t dim,
+                                              Arena* arena) noexcept {
+        if (dim == 0u) return make_empty();
+        const size_t stride = bolt::embedding_stride(dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data = arena->allocate(static_cast<size_t>(length) * stride);
+        if (!c.data) return c;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::Embedding;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.arena           = arena;
+        c.stats.all_valid = true;
+        return c;
+    }
+
+    /// Recover the per-row dim of an Embedding column. Returns 0 for
+    /// non-vector columns or for columns that haven't had their stride
+    /// initialised (e.g. zero-init or wire-recovered without dim).
+    BOLT_FORCE_INLINE uint32_t vector_dim() const noexcept {
+        if (type != BoltType::Embedding) return 0u;
+        return static_cast<uint32_t>(type_size_bytes) / sizeof(float);
+    }
+
+    /// Row pointer for an Embedding column (typed). No bounds check —
+    /// callers assert `row < length` and `type == Embedding`.
+    BOLT_FORCE_INLINE const float* vector_row(int64_t row) const noexcept {
+        return reinterpret_cast<const float*>(
+            static_cast<const uint8_t*>(data) +
+            static_cast<size_t>(row) * type_size_bytes);
+    }
+    BOLT_FORCE_INLINE float* vector_row_mut(int64_t row) noexcept {
+        return reinterpret_cast<float*>(
+            static_cast<uint8_t*>(data) +
+            static_cast<size_t>(row) * type_size_bytes);
     }
 
     /// Constant column
@@ -562,6 +649,17 @@ struct BoltColumn {
     /// Template dispatch via BOLT_NUMERIC_TYPES X-macro.
     void compute_stats_numeric() noexcept;
 
+    /// Compute per-dim min/max/mean/variance for an Embedding column.
+    /// Allocates a `VectorStats` POD from `arena` and stores it on
+    /// `sidecars.vector_stats`. Returns `nullptr` if the column is not
+    /// a Flat Embedding column, dim is zero, or the arena rejects
+    /// allocation. Subsequent calls reuse the existing sidecar slot
+    /// (the caller is responsible for resetting the slot when the
+    /// underlying data is mutated). One-pass per-dim Welford —
+    /// vertical traversal (rows outer, dim inner) so the inner loop
+    /// auto-vectorises on AVX2 / NEON.
+    VectorStats* compute_stats_vector(Arena* arena) noexcept;
+
     /// Try to promote format based on stats (e.g., Flat → Constant)
     bool try_promote(Arena* arena) noexcept;
 
@@ -884,6 +982,66 @@ inline void BoltColumn::compute_stats_numeric() noexcept {
             // Non-numeric type: leave stats untouched.
             break;
     }
+}
+
+// ============================================================================
+// BoltColumn::compute_stats_vector — per-dim Welford for Embedding columns
+// ============================================================================
+//
+// Vertical traversal: outer loop over rows, inner loop over dims. This
+// keeps the inner sweep over `dim` contiguous floats, which AVX2 /
+// NEON auto-vectorise. Welford recurrence per dim is numerically
+// stable for f32 accumulation across millions of rows. Single pass —
+// the caller is expected to invalidate the sidecar slot whenever the
+// underlying data mutates.
+inline VectorStats* BoltColumn::compute_stats_vector(Arena* arena) noexcept {
+    assert(arena != nullptr);
+    if (type != BoltType::Embedding) return nullptr;
+    if (format != ColumnFormat::Flat) return nullptr;
+    const uint32_t dim = vector_dim();
+    if (dim == 0u || length <= 0) return nullptr;
+
+    auto* vs = static_cast<VectorStats*>(
+        arena->allocate(sizeof(VectorStats)));
+    if (vs == nullptr) return nullptr;
+    const size_t lane_bytes = static_cast<size_t>(dim) * sizeof(float);
+    auto* mn = static_cast<float*>(arena->allocate(lane_bytes));
+    auto* mx = static_cast<float*>(arena->allocate(lane_bytes));
+    auto* mu = static_cast<float*>(arena->allocate(lane_bytes));
+    auto* m2 = static_cast<float*>(arena->allocate(lane_bytes));
+    if (!mn || !mx || !mu || !m2) return nullptr;
+
+    const float* BOLT_RESTRICT row0 = vector_row(0);
+    for (uint32_t d = 0; d < dim; ++d) {
+        const float v = row0[d];
+        mn[d] = v; mx[d] = v;
+        mu[d] = v; m2[d] = 0.0f;
+    }
+    for (int64_t r = 1; r < length; ++r) {
+        const float* BOLT_RESTRICT row = vector_row(r);
+        const float inv_n = 1.0f / static_cast<float>(r + 1);
+        for (uint32_t d = 0; d < dim; ++d) {
+            const float v = row[d];
+            if (v < mn[d]) mn[d] = v;
+            if (v > mx[d]) mx[d] = v;
+            const float delta = v - mu[d];
+            mu[d] += delta * inv_n;
+            m2[d] += delta * (v - mu[d]);
+        }
+    }
+    const float denom = (length > 1)
+        ? static_cast<float>(length - 1)
+        : 1.0f;
+    for (uint32_t d = 0; d < dim; ++d) m2[d] /= denom;
+
+    vs->min       = mn;
+    vs->max       = mx;
+    vs->mean      = mu;
+    vs->variance  = m2;
+    vs->dim       = dim;
+    vs->row_count = static_cast<uint32_t>(length);
+    sidecars.vector_stats = vs;
+    return vs;
 }
 
 // ============================================================================
