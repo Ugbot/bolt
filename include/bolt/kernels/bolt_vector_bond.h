@@ -62,7 +62,17 @@ BOLT_FORCE_INLINE uint32_t bond_zone_rank_scores_f32(
         const uint32_t lo = z * zone_size;
         const uint32_t hi = (lo + zone_size <= dim) ? (lo + zone_size) : dim;
         float acc = 0.0f;
-        for (uint32_t d = lo; d < hi; ++d) {
+        uint32_t d = lo;
+#if BOLT_SIMD_NEON
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= hi; d += 4u) {
+            const float32x4_t vq = vld1q_f32(q + d);
+            const float32x4_t vm = vld1q_f32(cluster_means + d);
+            vacc = vaddq_f32(vacc, vabdq_f32(vq, vm));
+        }
+        acc = vaddvq_f32(vacc);
+#endif
+        for (; d < hi; ++d) {
             const float diff = q[d] - cluster_means[d];
             acc += (diff >= 0.0f) ? diff : -diff;
         }
@@ -99,7 +109,26 @@ BOLT_FORCE_INLINE float box_lower_bound_l2_f32(
     assert(q != nullptr); assert(min_d != nullptr); assert(max_d != nullptr);
     assert(dim <= kBondMaxDim);
     float acc = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) {
+    uint32_t d = 0;
+#if BOLT_SIMD_NEON
+    if (visited_mask == nullptr) {
+        // Branchless 4-lane:
+        //   gap = max(min_d - q, q - max_d, 0)  (one side is ≤ 0 inside box)
+        const float32x4_t vzero = vdupq_n_f32(0.0f);
+        float32x4_t vacc = vzero;
+        for (; d + 4u <= dim; d += 4u) {
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vmn = vld1q_f32(min_d + d);
+            const float32x4_t vmx = vld1q_f32(max_d + d);
+            const float32x4_t lo  = vsubq_f32(vmn, vq);   // > 0 if q < min
+            const float32x4_t hi  = vsubq_f32(vq,  vmx);  // > 0 if q > max
+            const float32x4_t gap = vmaxq_f32(vmaxq_f32(lo, hi), vzero);
+            vacc = vfmaq_f32(vacc, gap, gap);
+        }
+        acc = vaddvq_f32(vacc);
+    }
+#endif
+    for (; d < dim; ++d) {
         if (visited_mask != nullptr &&
             ((visited_mask[d >> 3] >> (d & 7u)) & 1u) != 0u) {
             continue;
@@ -139,7 +168,49 @@ BOLT_FORCE_INLINE float sigma_bound_remaining_minmax_f32(
     assert(q != nullptr); assert(min_d != nullptr); assert(max_d != nullptr);
     assert(dim <= kBondMaxDim);
     float acc = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) {
+    uint32_t d = 0;
+#if BOLT_SIMD_NEON
+    if (visited_mask == nullptr) {
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vmn = vld1q_f32(min_d + d);
+            const float32x4_t vmx = vld1q_f32(max_d + d);
+            const float32x4_t lo  = vsubq_f32(vq, vmn);
+            const float32x4_t hi  = vsubq_f32(vq, vmx);
+            const float32x4_t lo2 = vmulq_f32(lo, lo);
+            const float32x4_t hi2 = vmulq_f32(hi, hi);
+            vacc = vaddq_f32(vacc, vmaxq_f32(lo2, hi2));
+        }
+        acc = vaddvq_f32(vacc);
+    } else {
+        // Masked 4-lane: build lane-keep mask from up to 8 bits of one byte.
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const uint8_t  byte  = visited_mask[d >> 3];
+            const uint32_t shift = d & 7u;
+            uint32_t m[4];
+            for (uint32_t i = 0; i < 4u; ++i) {
+                const uint32_t bit = (byte >> (shift + i)) & 1u;
+                m[i] = bit ? 0u : 0xFFFFFFFFu;
+            }
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vmn = vld1q_f32(min_d + d);
+            const float32x4_t vmx = vld1q_f32(max_d + d);
+            const float32x4_t lo  = vsubq_f32(vq, vmn);
+            const float32x4_t hi  = vsubq_f32(vq, vmx);
+            const float32x4_t lo2 = vmulq_f32(lo, lo);
+            const float32x4_t hi2 = vmulq_f32(hi, hi);
+            const float32x4_t ub  = vmaxq_f32(lo2, hi2);
+            const uint32x4_t  keep = vld1q_u32(m);
+            const uint32x4_t  ub_u = vreinterpretq_u32_f32(ub);
+            const uint32x4_t  masked = vandq_u32(ub_u, keep);
+            vacc = vaddq_f32(vacc, vreinterpretq_f32_u32(masked));
+        }
+        acc = vaddvq_f32(vacc);
+    }
+#endif
+    for (; d < dim; ++d) {
         if (visited_mask != nullptr &&
             ((visited_mask[d >> 3] >> (d & 7u)) & 1u) != 0u) {
             continue;
@@ -172,7 +243,46 @@ BOLT_FORCE_INLINE float sigma_bound_remaining_chebyshev_f32(
     assert(dim <= kBondMaxDim); assert(k_sigma >= 0.0f);
     const float factor = (1.0f + k_sigma) * (1.0f + k_sigma);
     float acc = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) {
+    uint32_t d = 0;
+#if BOLT_SIMD_NEON
+    const float32x4_t vfactor = vdupq_n_f32(factor);
+    if (visited_mask == nullptr) {
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vm  = vld1q_f32(mean_d + d);
+            const float32x4_t vv  = vld1q_f32(var_d + d);
+            const float32x4_t df  = vsubq_f32(vq, vm);
+            float32x4_t term = vmulq_f32(df, df);
+            term = vfmaq_f32(term, vfactor, vv);
+            vacc = vaddq_f32(vacc, term);
+        }
+        acc = vaddvq_f32(vacc);
+    } else {
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const uint8_t  byte  = visited_mask[d >> 3];
+            const uint32_t shift = d & 7u;
+            uint32_t m[4];
+            for (uint32_t i = 0; i < 4u; ++i) {
+                const uint32_t bit = (byte >> (shift + i)) & 1u;
+                m[i] = bit ? 0u : 0xFFFFFFFFu;
+            }
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vm  = vld1q_f32(mean_d + d);
+            const float32x4_t vv  = vld1q_f32(var_d + d);
+            const float32x4_t df  = vsubq_f32(vq, vm);
+            float32x4_t term = vmulq_f32(df, df);
+            term = vfmaq_f32(term, vfactor, vv);
+            const uint32x4_t keep = vld1q_u32(m);
+            const uint32x4_t term_u = vreinterpretq_u32_f32(term);
+            const uint32x4_t masked = vandq_u32(term_u, keep);
+            vacc = vaddq_f32(vacc, vreinterpretq_f32_u32(masked));
+        }
+        acc = vaddvq_f32(vacc);
+    }
+#endif
+    for (; d < dim; ++d) {
         if (visited_mask != nullptr &&
             ((visited_mask[d >> 3] >> (d & 7u)) & 1u) != 0u) {
             continue;

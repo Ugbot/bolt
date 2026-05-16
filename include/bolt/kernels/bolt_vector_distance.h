@@ -57,6 +57,15 @@ BOLT_FORCE_INLINE void l2_vertical_f32_accumulate(
         const __m256 out = _mm256_fmadd_ps(d, d, acc);
         _mm256_storeu_ps(dists + i, out);
     }
+#elif BOLT_SIMD_NEON
+    const float32x4_t q = vdupq_n_f32(q_broadcast);
+    for (; i + 4 <= n_vectors; i += 4) {
+        const float32x4_t x   = vld1q_f32(dim_col + i);
+        const float32x4_t acc = vld1q_f32(dists   + i);
+        const float32x4_t d   = vsubq_f32(q, x);
+        const float32x4_t out = vfmaq_f32(acc, d, d);
+        vst1q_f32(dists + i, out);
+    }
 #endif
     for (; i < n_vectors; ++i) {
         const float d = q_broadcast - dim_col[i];
@@ -69,7 +78,25 @@ BOLT_FORCE_INLINE void ip_vertical_f32_accumulate(
     float* BOLT_RESTRICT dists, size_t n_vectors) noexcept {
     assert(dim_col != nullptr || n_vectors == 0);
     assert(dists   != nullptr || n_vectors == 0);
-    for (size_t i = 0; i < n_vectors; ++i) {
+    size_t i = 0;
+#if BOLT_SIMD_AVX2
+    const __m256 q = _mm256_set1_ps(q_broadcast);
+    for (; i + 8 <= n_vectors; i += 8) {
+        const __m256 x   = _mm256_loadu_ps(dim_col + i);
+        const __m256 acc = _mm256_loadu_ps(dists   + i);
+        const __m256 out = _mm256_fmadd_ps(q, x, acc);
+        _mm256_storeu_ps(dists + i, out);
+    }
+#elif BOLT_SIMD_NEON
+    const float32x4_t q = vdupq_n_f32(q_broadcast);
+    for (; i + 4 <= n_vectors; i += 4) {
+        const float32x4_t x   = vld1q_f32(dim_col + i);
+        const float32x4_t acc = vld1q_f32(dists   + i);
+        const float32x4_t out = vfmaq_f32(acc, q, x);
+        vst1q_f32(dists + i, out);
+    }
+#endif
+    for (; i < n_vectors; ++i) {
         dists[i] += q_broadcast * dim_col[i];
     }
 }
@@ -81,7 +108,31 @@ BOLT_FORCE_INLINE void cosine_vertical_f32_accumulate_sxqx(
     assert(dim_col != nullptr || n_vectors == 0);
     assert(sxqx    != nullptr || n_vectors == 0);
     assert(sxx     != nullptr || n_vectors == 0);
-    for (size_t i = 0; i < n_vectors; ++i) {
+    size_t i = 0;
+#if BOLT_SIMD_AVX2
+    const __m256 q = _mm256_set1_ps(q_broadcast);
+    for (; i + 8 <= n_vectors; i += 8) {
+        const __m256 x   = _mm256_loadu_ps(dim_col + i);
+        const __m256 a   = _mm256_loadu_ps(sxqx    + i);
+        const __m256 b   = _mm256_loadu_ps(sxx     + i);
+        const __m256 oa  = _mm256_fmadd_ps(q, x, a);
+        const __m256 ob  = _mm256_fmadd_ps(x, x, b);
+        _mm256_storeu_ps(sxqx + i, oa);
+        _mm256_storeu_ps(sxx  + i, ob);
+    }
+#elif BOLT_SIMD_NEON
+    const float32x4_t q = vdupq_n_f32(q_broadcast);
+    for (; i + 4 <= n_vectors; i += 4) {
+        const float32x4_t x   = vld1q_f32(dim_col + i);
+        const float32x4_t a   = vld1q_f32(sxqx    + i);
+        const float32x4_t b   = vld1q_f32(sxx     + i);
+        const float32x4_t oa  = vfmaq_f32(a, q, x);
+        const float32x4_t ob  = vfmaq_f32(b, x, x);
+        vst1q_f32(sxqx + i, oa);
+        vst1q_f32(sxx  + i, ob);
+    }
+#endif
+    for (; i < n_vectors; ++i) {
         const float x = dim_col[i];
         sxqx[i] += q_broadcast * x;
         sxx[i]  += x * x;
@@ -115,6 +166,15 @@ BOLT_FORCE_INLINE float l2_pair_f32(
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
     acc = _mm_cvtss_f32(s);
+#elif BOLT_SIMD_NEON
+    float32x4_t vacc = vdupq_n_f32(0.0f);
+    for (; i + 4 <= D; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        const float32x4_t vd = vsubq_f32(va, vb);
+        vacc = vfmaq_f32(vacc, vd, vd);
+    }
+    acc = vaddvq_f32(vacc);
 #endif
     for (; i < D; ++i) {
         const float d = a[i] - b[i];
@@ -129,8 +189,31 @@ BOLT_FORCE_INLINE float ip_pair_f32(
     size_t D) noexcept {
     assert(a != nullptr || D == 0);
     assert(b != nullptr || D == 0);
+    size_t i = 0;
     float acc = 0.0f;
-    for (size_t i = 0; i < D; ++i) {
+#if BOLT_SIMD_AVX2
+    __m256 vacc = _mm256_setzero_ps();
+    for (; i + 8 <= D; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        vacc = _mm256_fmadd_ps(va, vb, vacc);
+    }
+    __m128 lo = _mm256_castps256_ps128(vacc);
+    __m128 hi = _mm256_extractf128_ps(vacc, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    acc = _mm_cvtss_f32(s);
+#elif BOLT_SIMD_NEON
+    float32x4_t vacc = vdupq_n_f32(0.0f);
+    for (; i + 4 <= D; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        vacc = vfmaq_f32(vacc, va, vb);
+    }
+    acc = vaddvq_f32(vacc);
+#endif
+    for (; i < D; ++i) {
         acc += a[i] * b[i];
     }
     return acc;
@@ -142,8 +225,46 @@ BOLT_FORCE_INLINE float cosine_pair_f32(
     size_t D) noexcept {
     assert(a != nullptr || D == 0);
     assert(b != nullptr || D == 0);
+    size_t i = 0;
     float dot = 0.0f, na = 0.0f, nb = 0.0f;
-    for (size_t i = 0; i < D; ++i) {
+#if BOLT_SIMD_AVX2
+    __m256 vdot = _mm256_setzero_ps();
+    __m256 vna  = _mm256_setzero_ps();
+    __m256 vnb  = _mm256_setzero_ps();
+    for (; i + 8 <= D; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        vdot = _mm256_fmadd_ps(va, vb, vdot);
+        vna  = _mm256_fmadd_ps(va, va, vna);
+        vnb  = _mm256_fmadd_ps(vb, vb, vnb);
+    }
+    auto hsum256 = [](__m256 v) noexcept -> float {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 s  = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        return _mm_cvtss_f32(s);
+    };
+    dot = hsum256(vdot);
+    na  = hsum256(vna);
+    nb  = hsum256(vnb);
+#elif BOLT_SIMD_NEON
+    float32x4_t vdot = vdupq_n_f32(0.0f);
+    float32x4_t vna  = vdupq_n_f32(0.0f);
+    float32x4_t vnb  = vdupq_n_f32(0.0f);
+    for (; i + 4 <= D; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        vdot = vfmaq_f32(vdot, va, vb);
+        vna  = vfmaq_f32(vna,  va, va);
+        vnb  = vfmaq_f32(vnb,  vb, vb);
+    }
+    dot = vaddvq_f32(vdot);
+    na  = vaddvq_f32(vna);
+    nb  = vaddvq_f32(vnb);
+#endif
+    for (; i < D; ++i) {
         const float ai = a[i];
         const float bi = b[i];
         dot += ai * bi;
