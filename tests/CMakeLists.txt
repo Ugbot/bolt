@@ -630,3 +630,12 @@ target_link_libraries(test_bolt_utf8
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_utf8)
 add_test(NAME test_bolt_utf8 COMMAND test_bolt_utf8)
+
+# SQL INTERVAL arithmetic kernels (date32 + months/days, sub_date, mul, filter).
+# Tiny semantic, ubiquitous in TPC-H predicates like
+# `l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY`.
+add_executable(test_bolt_interval test_bolt_interval.cpp)
+target_link_libraries(test_bolt_interval
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_interval)
+add_test(NAME test_bolt_interval COMMAND test_bolt_interval)

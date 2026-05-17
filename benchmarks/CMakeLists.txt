@@ -74,3 +74,11 @@ if(NOT MSVC)
 endif()
 bolt_apply_hardening(bench_utf8)
 bolt_apply_bench_tuning(bench_utf8)
+
+# -----------------------------------------------------------------------
+# INTERVAL arithmetic microbenchmark — date32 + (months, days) paths.
+# -----------------------------------------------------------------------
+add_executable(bench_interval bench_interval.cpp)
+target_link_libraries(bench_interval PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_interval)
+bolt_apply_bench_tuning(bench_interval)
