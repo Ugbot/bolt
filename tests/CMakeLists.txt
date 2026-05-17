@@ -611,3 +611,13 @@ target_link_libraries(test_bolt_window
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_window)
 add_test(NAME test_bolt_window COMMAND test_bolt_window)
+
+# Decimal128 kernel family (add/sub/mul/div, filter_{gt,lt,eq,ne,ge,le},
+# sum/min/max). Backs SQL Decimal monetary columns (l_extendedprice,
+# o_totalprice, p_retailprice). Branchless scalar with cross-checks
+# against __int128 where available.
+add_executable(test_bolt_decimal test_bolt_decimal.cpp)
+target_link_libraries(test_bolt_decimal
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_decimal)
+add_test(NAME test_bolt_decimal COMMAND test_bolt_decimal)
