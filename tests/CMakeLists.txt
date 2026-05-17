@@ -601,3 +601,13 @@ target_link_libraries(test_bolt_pfor_simd
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_pfor_simd)
 add_test(NAME test_bolt_pfor_simd COMMAND test_bolt_pfor_simd)
+
+# Window function ranking kernels — ROW_NUMBER / RANK / DENSE_RANK / LAG /
+# LEAD / FIRST_VALUE / LAST_VALUE / NTILE. Operate on already-partitioned +
+# sorted input; the kernel walks the sequence and emits ranks / offsets,
+# detecting partition breaks by key change. TPC-DS prerequisite.
+add_executable(test_bolt_window test_bolt_window.cpp)
+target_link_libraries(test_bolt_window
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_window)
+add_test(NAME test_bolt_window COMMAND test_bolt_window)
