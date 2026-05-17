@@ -621,3 +621,12 @@ target_link_libraries(test_bolt_decimal
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_decimal)
 add_test(NAME test_bolt_decimal COMMAND test_bolt_decimal)
+
+# UTF-8 native operator kernels — compare/eq/ne/hash/LIKE (compiled)/SUBSTRING/
+# TRIM/UPPER/LOWER/LENGTH/POSITION/CONCAT/REPLACE.  Backs SQL VARCHAR/TEXT
+# without falling back to Arrow compute (TPC-H Q14, Q16, Q19, Q20).
+add_executable(test_bolt_utf8 test_bolt_utf8.cpp)
+target_link_libraries(test_bolt_utf8
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_utf8)
+add_test(NAME test_bolt_utf8 COMMAND test_bolt_utf8)
