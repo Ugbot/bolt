@@ -639,3 +639,9 @@ target_link_libraries(test_bolt_interval
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_interval)
 add_test(NAME test_bolt_interval COMMAND test_bolt_interval)
+
+# Date32 extract kernel (year/month/day/quarter/week/dow/doy + filter wrappers).
+add_executable(test_bolt_date test_bolt_date.cpp)
+target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_date PRIVATE)
+add_test(NAME bolt_date COMMAND test_bolt_date)
