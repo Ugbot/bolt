@@ -79,6 +79,17 @@ target_link_libraries(test_bolt_topk
 bolt_apply_hardening(test_bolt_topk)
 add_test(NAME test_bolt_topk COMMAND test_bolt_topk)
 
+# HyperLogLog++ sketch — approximate COUNT(DISTINCT) / NDV estimation.
+add_executable(test_bolt_hll test_bolt_hll.cpp)
+target_link_libraries(test_bolt_hll
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_hll)
+add_test(NAME test_bolt_hll COMMAND test_bolt_hll)
+
 # K-means kernel — assign / update / convergence delta. Wave 19 Plan D.
 add_executable(test_bolt_kmeans test_bolt_kmeans.cpp)
 target_link_libraries(test_bolt_kmeans
