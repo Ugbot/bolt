@@ -360,6 +360,21 @@ bolt_apply_hardening(test_bolt_wire_stream)
 
 add_test(NAME test_bolt_wire_stream COMMAND test_bolt_wire_stream)
 
+# Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
+# both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
+add_executable(test_bolt_setop test_bolt_setop.cpp)
+
+target_link_libraries(test_bolt_setop
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_setop)
+
+add_test(NAME test_bolt_setop COMMAND test_bolt_setop)
+
 add_executable(test_bolt_kmerge test_bolt_kmerge.cpp)
 
 target_link_libraries(test_bolt_kmerge

@@ -54,3 +54,11 @@ if(NOT MSVC)
 endif()
 bolt_apply_hardening(bench_1brc)
 bolt_apply_bench_tuning(bench_1brc)
+
+# -----------------------------------------------------------------------
+# Two-input sorted-merge set ops — UNION/INTERSECT/EXCEPT, DISTINCT+ALL.
+# -----------------------------------------------------------------------
+add_executable(bench_setop bench_setop.cpp)
+target_link_libraries(bench_setop PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_setop)
+bolt_apply_bench_tuning(bench_setop)
