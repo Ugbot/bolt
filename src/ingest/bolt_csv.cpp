@@ -12,6 +12,8 @@
 // ---------------------------------------------------------------------------
 #include "bolt/ingest/bolt_csv.h"
 #include "bolt/parse/bolt_ascii.h"
+#include "bolt/kernels/bolt_date.h"
+#include "bolt/kernels/bolt_decimal.h"
 
 #include <cassert>
 #include <cstdint>
@@ -169,6 +171,181 @@ static int64_t field_to_int64(const char* p, int len) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Date32 field — ISO YYYY-MM-DD (10 bytes, fixed width).
+// ---------------------------------------------------------------------------
+
+// Validate a 4-digit ASCII year, write into `*out`. Branch-free digit fold.
+// Returns false if any character is not [0-9].
+static bool fold_year4(const char* p, int32_t* out) noexcept {
+    assert(p   != nullptr);
+    assert(out != nullptr);
+    uint32_t d0 = static_cast<uint8_t>(p[0]) - '0';
+    uint32_t d1 = static_cast<uint8_t>(p[1]) - '0';
+    uint32_t d2 = static_cast<uint8_t>(p[2]) - '0';
+    uint32_t d3 = static_cast<uint8_t>(p[3]) - '0';
+    uint32_t bad = (d0 | d1 | d2 | d3) >> 4;  // any digit > 9 sets a high bit
+    *out = static_cast<int32_t>(d0 * 1000u + d1 * 100u + d2 * 10u + d3);
+    return bad == 0u;
+}
+
+// Validate a 2-digit ASCII run, write into `*out`. Branch-free digit fold.
+static bool fold_two(const char* p, uint32_t* out) noexcept {
+    assert(p   != nullptr);
+    assert(out != nullptr);
+    uint32_t d0 = static_cast<uint8_t>(p[0]) - '0';
+    uint32_t d1 = static_cast<uint8_t>(p[1]) - '0';
+    uint32_t bad = (d0 | d1) >> 4;
+    *out = d0 * 10u + d1;
+    return bad == 0u;
+}
+
+// Parse "YYYY-MM-DD" -> int32 days since 1970-01-01. Returns false on bad
+// format / out-of-range components. `flen` is the post-CRLF-strip length.
+static bool field_to_date32(const char* p, size_t flen, int32_t* out) noexcept {
+    assert(out != nullptr);
+    assert(p != nullptr || flen == 0);
+    if (flen != 10) return false;
+    if (p[4] != '-' || p[7] != '-') return false;
+    int32_t  y = 0;
+    uint32_t m = 0, d = 0;
+    if (!fold_year4(p, &y))        return false;
+    if (!fold_two(p + 5, &m))      return false;
+    if (!fold_two(p + 8, &d))      return false;
+    if (m < 1u || m > 12u)         return false;
+    if (d < 1u || d > 31u)         return false;
+    int64_t z = bolt::kernels::date::days_from_civil(y, m, d);
+    if (z < INT32_MIN || z > INT32_MAX) return false;
+    *out = static_cast<int32_t>(z);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Decimal128 field — sign + integer + optional '.' + fractional digits.
+// ---------------------------------------------------------------------------
+
+using bolt::kernels::decimal::Decimal128;
+using bolt::kernels::decimal::d128_neg;
+using bolt::kernels::decimal::mul_u64_u64;
+
+// Unsigned 128-bit multiply-by-10-add-digit. Branch-free on the hot path.
+BOLT_FORCE_INLINE void d128u_mul10_add(Decimal128* v, uint32_t digit) noexcept {
+    assert(v != nullptr);
+    assert(digit < 10u);
+    const uint64_t lo = static_cast<uint64_t>(v->lo);
+    const uint64_t hi = static_cast<uint64_t>(v->hi);
+    uint64_t prod_lo, prod_hi;
+    mul_u64_u64(lo, 10ull, &prod_lo, &prod_hi);
+    const uint64_t new_lo  = prod_lo + static_cast<uint64_t>(digit);
+    const uint64_t carry   = (new_lo < prod_lo) ? 1ull : 0ull;
+    const uint64_t new_hi  = hi * 10ull + prod_hi + carry;
+    v->lo = static_cast<int64_t>(new_lo);
+    v->hi = static_cast<int64_t>(new_hi);
+}
+
+// Scan a run of decimal digits [p, end). Folds into `*acc`. Returns the
+// number of digits consumed. Stops at first non-digit. Branch-free per byte.
+static size_t fold_digits(const char* p, const char* end,
+                          Decimal128* acc) noexcept {
+    assert(acc != nullptr);
+    assert(end >= p);
+    const char* q = p;
+    while (q < end) {
+        const uint32_t c = static_cast<uint8_t>(*q) - static_cast<uint32_t>('0');
+        if (c > 9u) break;
+        d128u_mul10_add(acc, c);
+        ++q;
+    }
+    return static_cast<size_t>(q - p);
+}
+
+// Multiply unsigned 128-bit by a small constant (10..10^18). Branch-free.
+BOLT_FORCE_INLINE void d128u_mul_small(Decimal128* v, uint64_t k) noexcept {
+    assert(v != nullptr);
+    assert(k > 0);
+    const uint64_t lo = static_cast<uint64_t>(v->lo);
+    const uint64_t hi = static_cast<uint64_t>(v->hi);
+    uint64_t prod_lo, prod_hi;
+    mul_u64_u64(lo, k, &prod_lo, &prod_hi);
+    v->lo = static_cast<int64_t>(prod_lo);
+    v->hi = static_cast<int64_t>(hi * k + prod_hi);
+}
+
+// Power-of-ten table up to 10^18 (fits uint64). Higher powers chain.
+static constexpr uint64_t kPow10U64[19] = {
+    1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull,
+    10000000ull, 100000000ull, 1000000000ull, 10000000000ull,
+    100000000000ull, 1000000000000ull, 10000000000000ull,
+    100000000000000ull, 1000000000000000ull, 10000000000000000ull,
+    100000000000000000ull, 1000000000000000000ull,
+};
+
+// Multiply unsigned 128-bit by 10^n. n in [0..38]. Chains 10^18 steps.
+static void d128u_mul_pow10(Decimal128* v, uint32_t n) noexcept {
+    assert(v != nullptr);
+    assert(n <= 38u);
+    while (n >= 18u) {
+        d128u_mul_small(v, kPow10U64[18]);
+        n -= 18u;
+    }
+    if (n > 0u) d128u_mul_small(v, kPow10U64[n]);
+}
+
+// Parse a decimal string into a Decimal128 at the column's declared scale.
+// Returns false on malformed input or (strict_scale && extra fractional digits).
+// Empty field => zero.
+static bool field_to_decimal128(const char* p, size_t flen, uint8_t out_scale,
+                                bool strict_scale, Decimal128* out) noexcept {
+    assert(out != nullptr);
+    assert(p != nullptr || flen == 0);
+    out->lo = 0;
+    out->hi = 0;
+    if (flen == 0) return true;
+    if (out_scale > 38u) return false;
+
+    const char* q   = p;
+    const char* end = p + flen;
+    bool neg = false;
+    if (q < end && (*q == '-' || *q == '+')) { neg = (*q == '-'); ++q; }
+
+    Decimal128 acc{0, 0};
+    const size_t int_digits  = fold_digits(q, end, &acc);
+    q += int_digits;
+    size_t frac_digits = 0;
+    size_t frac_have   = 0;
+    if (q < end && *q == '.') {
+        ++q;
+        // Fold up to out_scale fractional digits into acc.
+        const char* fs = q;
+        const char* fe = end;
+        const char* limit = (static_cast<size_t>(fe - fs) > out_scale)
+                          ? fs + out_scale : fe;
+        frac_have = fold_digits(fs, limit, &acc);
+        q += frac_have;
+        // Skip any remaining fractional digits (truncate) and count them.
+        frac_digits = frac_have;
+        while (q < end) {
+            const uint32_t c = static_cast<uint8_t>(*q) - static_cast<uint32_t>('0');
+            if (c > 9u) break;
+            ++frac_digits;
+            ++q;
+        }
+    }
+    if (q != end)                       return false;  // garbage after digits
+    if (int_digits == 0 && frac_have == 0 && frac_digits == 0) {
+        // Sign with no digits at all is a parse error.
+        if (neg || (p < end && *p == '+')) return false;
+    }
+    if (strict_scale && frac_digits > out_scale) return false;
+
+    // Pad with zeros if we have fewer fractional digits than the column scale.
+    const uint32_t pad = static_cast<uint32_t>(out_scale) -
+                         static_cast<uint32_t>(frac_have);
+    if (pad > 0u) d128u_mul_pow10(&acc, pad);
+    *out = neg ? d128_neg(acc) : acc;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Column setup.
 // ---------------------------------------------------------------------------
 
@@ -180,7 +357,8 @@ static bool alloc_columns(const CsvSchema& schema, int64_t row_count,
 
     for (uint32_t c = 0; c < schema.num_cols; ++c) {
         const BoltType t = schema.col_types[c];
-        if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8) {
+        if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8 &&
+            t != BoltType::Date32 && t != BoltType::Decimal128) {
             return false;
         }
         if (row_count == 0) {
@@ -222,6 +400,18 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
     } else if (t == BoltType::Int64) {
         int64_t v = field_to_int64(f_start, static_cast<int>(flen));
         static_cast<int64_t*>(cols[c].data)[row] = v;
+    } else if (t == BoltType::Date32) {
+        int32_t v = 0;
+        if (flen != 0 && !field_to_date32(f_start, flen, &v)) return false;
+        static_cast<int32_t*>(cols[c].data)[row] = v;
+    } else if (t == BoltType::Decimal128) {
+        Decimal128 v{0, 0};
+        if (!field_to_decimal128(f_start, flen,
+                                 schema.col_scales[c],
+                                 schema.strict_decimal_scale, &v)) {
+            return false;
+        }
+        static_cast<Decimal128*>(cols[c].data)[row] = v;
     } else {
         assert(t == BoltType::Utf8);
         StringView sv;
