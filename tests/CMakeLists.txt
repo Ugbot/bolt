@@ -35,6 +35,19 @@ target_link_libraries(test_bolt_vector_distance
 bolt_apply_hardening(test_bolt_vector_distance)
 add_test(NAME test_bolt_vector_distance COMMAND test_bolt_vector_distance)
 
+# Wave 9.4 ζ.3 — half-precision (f16) vector distance kernels.
+# Cross-checks NEON FP16 / AVX2 cvtph / scalar fallback against the
+# well-tested f32 path, modulo f16 quantisation error.
+add_executable(test_bolt_vector_distance_f16 test_bolt_vector_distance_f16.cpp)
+target_link_libraries(test_bolt_vector_distance_f16
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_distance_f16)
+add_test(NAME test_bolt_vector_distance_f16 COMMAND test_bolt_vector_distance_f16)
+
 # Rotation kernels — Householder QR + DCT-II.
 add_executable(test_bolt_rotation test_bolt_rotation.cpp)
 target_link_libraries(test_bolt_rotation
