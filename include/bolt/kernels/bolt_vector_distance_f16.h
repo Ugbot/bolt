@@ -281,5 +281,62 @@ BOLT_FORCE_INLINE void dequantise_f16_to_f32(
     }
 }
 
+// ===========================================================================
+// zone_walk_l2_f16_with_prune — BOND-ordered zone-walk L2² + early reject
+// ===========================================================================
+//
+// f16 counterpart to MarbleDB's `zone_walk_l2_with_prune` (f32). Walks
+// `n_zones` contiguous zones of width `zone_size` (last zone may be
+// short), accumulating per-zone L2² via `l2_pair_f16`. Squared L2 is
+// monotone non-decreasing in zones, so the moment `partial >
+// prune_threshold` (typically current kth-best), the row cannot enter
+// top-K — short-circuit with sentinel `-1.0f`. Recall is preserved
+// exactly. `zone_order`: nullptr ⇒ natural order; non-null ⇒
+// permutation of [0,n_zones) (BOND order maximises prune rate).
+// Tiger Style: noexcept, ≥ 2 asserts, bounded outer loop.
+
+inline constexpr uint32_t kBondMaxZones = 128u;
+
+BOLT_FORCE_INLINE float zone_walk_l2_f16_with_prune(
+    const uint16_t* BOLT_RESTRICT q,
+    const uint16_t* BOLT_RESTRICT row,
+    uint32_t dim,
+    uint32_t zone_size,
+    const uint8_t* BOLT_RESTRICT zone_order,
+    uint32_t n_zones,
+    float prune_threshold) noexcept {
+    assert(q != nullptr);
+    assert(row != nullptr);
+    assert(dim > 0u);
+    assert(zone_size > 0u);
+    assert(n_zones > 0u);
+    assert(n_zones <= kBondMaxZones);
+    float partial = 0.0f;
+    for (uint32_t zi = 0; zi < n_zones; ++zi) {
+        const uint32_t zid =
+            (zone_order != nullptr) ? static_cast<uint32_t>(zone_order[zi]) : zi;
+        assert(zid < n_zones);
+        const uint32_t d_lo = zid * zone_size;
+        if (d_lo >= dim) continue;   // defensive: zone fully past tail
+        const uint32_t d_hi =
+            (d_lo + zone_size <= dim) ? d_lo + zone_size : dim;
+        partial += l2_pair_f16(q + d_lo, row + d_lo,
+                               static_cast<size_t>(d_hi - d_lo));
+        if (partial > prune_threshold) {
+            return -1.0f;   // monotone-pruned
+        }
+    }
+    return partial;
+}
+
+// i8-via-u8 reinterpret note: `l2_pair_u8` treats inputs as unsigned
+// (vabdq_u8 / unsigned subtract). Naked `reinterpret_cast<const uint8_t*>
+// (int8_t*)` is **wrong** when inputs straddle zero (a=-1,b=+1 → bytes
+// 0xFF,0x01 → unsigned abs-diff 254² = 64516 vs. signed truth 4).
+// Callers must XOR-128 first (`u8 = static_cast<uint8_t>(i8) ^ 0x80`),
+// which maps [-128,+127] → [0,255] monotonically and preserves diffs
+// since (a+128)-(b+128) = a-b. Locked in by
+// `L2PairI8MatchesL2PairU8ReinterpretCast`.
+
 }  // namespace vec
 }  // namespace bolt
