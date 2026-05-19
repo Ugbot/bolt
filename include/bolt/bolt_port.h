@@ -473,6 +473,26 @@ BOLT_FORCE_INLINE bool bolt_set_numa_preferred(int node) noexcept {
     #define BOLT_SIMD_SCALAR 0
 #endif
 
+// ARMv8.2-A FP16 vector arithmetic (vfmaq_f16 + float16x8_t native FMA).
+// Detect via the ACLE feature macro; Apple Silicon (M1/M2/M3) and recent
+// ARM Cortex-A75+ set this. AVX2 falls back via _mm256_cvtph_ps in the
+// f16 kernels; this macro guards the NEON-native FP16 arms only.
+#if BOLT_SIMD_NEON && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && \
+    __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    #define BOLT_SIMD_NEON_FP16 1
+#else
+    #define BOLT_SIMD_NEON_FP16 0
+#endif
+
+// ARMv8.4-A DOTPROD (vdotq_u32 + vdotq_s32 — 4-way u8/i8 dot product
+// into 32-bit accumulator). M1/M2/M3 set this; older NEON cores don't.
+// Required for the u8 vector kernels' fast path.
+#if BOLT_SIMD_NEON && defined(__ARM_FEATURE_DOTPROD) && __ARM_FEATURE_DOTPROD
+    #define BOLT_SIMD_NEON_DOTPROD 1
+#else
+    #define BOLT_SIMD_NEON_DOTPROD 0
+#endif
+
 // Headers for each ISA. immintrin.h on x86 already pulled in above.
 #if BOLT_SIMD_NEON
     #include <arm_neon.h>
