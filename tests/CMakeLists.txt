@@ -48,6 +48,20 @@ target_link_libraries(test_bolt_vector_distance_f16
 bolt_apply_hardening(test_bolt_vector_distance_f16)
 add_test(NAME test_bolt_vector_distance_f16 COMMAND test_bolt_vector_distance_f16)
 
+# Wave 9.4 ζ.4 — 8-bit scalar-quantised vector distance kernels.
+# Cross-checks NEON DOTPROD / AVX2 / NEON baseline / scalar against
+# a hand-rolled integer reference. Exact-equality assertions (no
+# rounding tolerance — u8 L2² is integer arithmetic end-to-end).
+add_executable(test_bolt_vector_distance_u8 test_bolt_vector_distance_u8.cpp)
+target_link_libraries(test_bolt_vector_distance_u8
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_distance_u8)
+add_test(NAME test_bolt_vector_distance_u8 COMMAND test_bolt_vector_distance_u8)
+
 # Rotation kernels — Householder QR + DCT-II.
 add_executable(test_bolt_rotation test_bolt_rotation.cpp)
 target_link_libraries(test_bolt_rotation
