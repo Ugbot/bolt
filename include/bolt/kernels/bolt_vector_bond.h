@@ -294,6 +294,98 @@ BOLT_FORCE_INLINE float sigma_bound_remaining_chebyshev_f32(
 }
 
 // ===========================================================================
+// sigma_bound_remaining_chebyshev_lb_f32 — probabilistic σk LOWER bound
+// ===========================================================================
+//
+// Returns Σ_{d ∉ visited} max(0, |q_d − μ_d| − k_σ × σ_d)².
+// Probabilistic lower bound on the remaining-dim contribution to L2².
+//
+// Cf. Chebyshev–Cantelli: P(|X − μ| ≥ k σ) ≤ 1/k². With k_σ = 1, the
+// LB holds for ≥ 0 fraction of values; with k_σ = 3, ≥ 88.9 %. The
+// caller chooses k_σ as a recall/speed knob: higher k_σ → looser LB
+// → fewer false drops but less aggressive prune.
+//
+// Recall: combining with `box_lower_bound_l2_f32` via
+//   LB_combined = max(LB_box, LB_chebyshev(k_σ))
+// is recall-preserving only when LB_chebyshev ≤ LB_box. The caller is
+// responsible for ensuring that invariant by choosing k_σ high enough
+// that the Chebyshev tail probability fits the data; default
+// k_σ = 3 is the safe paper-canonical choice.
+//
+// Per-dim contribution (let s = √var_d[d], df = q[d] − μ_d[d]):
+//   gap = |df| − k_σ × s
+//   contrib = (gap > 0) ? gap² : 0
+//
+// At k_σ = 0 this reduces to Σ (q_d − μ_d)² (centroid-LB, deterministic).
+
+BOLT_FORCE_INLINE float sigma_bound_remaining_chebyshev_lb_f32(
+    const float* BOLT_RESTRICT q,
+    const float* BOLT_RESTRICT mean_d,
+    const float* BOLT_RESTRICT var_d,
+    const uint8_t* visited_mask,
+    uint32_t dim, float k_sigma) noexcept {
+    assert(q != nullptr); assert(mean_d != nullptr); assert(var_d != nullptr);
+    assert(dim <= kBondMaxDim); assert(k_sigma >= 0.0f);
+    float acc = 0.0f;
+    uint32_t d = 0;
+#if BOLT_SIMD_NEON
+    const float32x4_t vk    = vdupq_n_f32(k_sigma);
+    const float32x4_t vzero = vdupq_n_f32(0.0f);
+    if (visited_mask == nullptr) {
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vm  = vld1q_f32(mean_d + d);
+            const float32x4_t vv  = vld1q_f32(var_d + d);
+            const float32x4_t vs  = vsqrtq_f32(vv);
+            const float32x4_t df  = vabdq_f32(vq, vm);
+            const float32x4_t ks  = vmulq_f32(vk, vs);
+            const float32x4_t gap = vmaxq_f32(vsubq_f32(df, ks), vzero);
+            vacc = vfmaq_f32(vacc, gap, gap);
+        }
+        acc = vaddvq_f32(vacc);
+    } else {
+        float32x4_t vacc = vdupq_n_f32(0.0f);
+        for (; d + 4u <= dim; d += 4u) {
+            const uint8_t  byte  = visited_mask[d >> 3];
+            const uint32_t shift = d & 7u;
+            uint32_t m[4];
+            for (uint32_t i = 0; i < 4u; ++i) {
+                const uint32_t bit = (byte >> (shift + i)) & 1u;
+                m[i] = bit ? 0u : 0xFFFFFFFFu;
+            }
+            const float32x4_t vq  = vld1q_f32(q + d);
+            const float32x4_t vm  = vld1q_f32(mean_d + d);
+            const float32x4_t vv  = vld1q_f32(var_d + d);
+            const float32x4_t vs  = vsqrtq_f32(vv);
+            const float32x4_t df  = vabdq_f32(vq, vm);
+            const float32x4_t ks  = vmulq_f32(vk, vs);
+            const float32x4_t gap = vmaxq_f32(vsubq_f32(df, ks), vzero);
+            const float32x4_t term = vmulq_f32(gap, gap);
+            const uint32x4_t keep = vld1q_u32(m);
+            const uint32x4_t term_u = vreinterpretq_u32_f32(term);
+            const uint32x4_t masked = vandq_u32(term_u, keep);
+            vacc = vaddq_f32(vacc, vreinterpretq_f32_u32(masked));
+        }
+        acc = vaddvq_f32(vacc);
+    }
+#endif
+    for (; d < dim; ++d) {
+        if (visited_mask != nullptr &&
+            ((visited_mask[d >> 3] >> (d & 7u)) & 1u) != 0u) {
+            continue;
+        }
+        const float diff = q[d] - mean_d[d];
+        const float abs_diff = (diff >= 0.0f) ? diff : -diff;
+        const float sigma = __builtin_sqrtf(var_d[d]);
+        const float gap = abs_diff - k_sigma * sigma;
+        if (gap > 0.0f) acc += gap * gap;
+    }
+    assert(acc >= 0.0f);
+    return acc;
+}
+
+// ===========================================================================
 // adsampling_threshold_f32 — ADSampling per-vector prune gate
 // ===========================================================================
 //

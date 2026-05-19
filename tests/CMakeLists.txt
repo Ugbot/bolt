@@ -130,6 +130,18 @@ target_link_libraries(test_bolt_vector_column
 bolt_apply_hardening(test_bolt_vector_column)
 add_test(NAME test_bolt_vector_column COMMAND test_bolt_vector_column)
 
+# Wave 9.4 ζ.5b — PDX-BOND probabilistic Chebyshev LOWER bound kernel.
+# Tightens the box-LB block-skip in the canonical PDX-64 walker.
+add_executable(test_bolt_vector_bond test_bolt_vector_bond.cpp)
+target_link_libraries(test_bolt_vector_bond
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_bond)
+add_test(NAME test_bolt_vector_bond COMMAND test_bolt_vector_bond)
+
 # Quantized distance kernels — SQ8 / RaBitQ / F16, scalar-first
 # (Wave 19 plan B; AVX2 specialisations deferred).
 add_executable(test_bolt_quantized_distance test_bolt_quantized_distance.cpp)
