@@ -149,6 +149,45 @@ BOLT_FORCE_INLINE int32_t sv_compare(
                          sv_bytes(b, b_base), b.length);
 }
 
+// SQL LIKE match over raw bytes. `%` matches any (possibly empty) run of
+// bytes, `_` matches exactly one byte, every other pattern byte is literal.
+// Iterative two-pointer with single-star backtracking — O(slen * plen) worst
+// case, no recursion (Tiger Style: bounded, no stack growth). Returns true on
+// a full match.
+BOLT_FORCE_INLINE bool bytes_like(
+        const char* BOLT_RESTRICT s, uint32_t slen,
+        const char* BOLT_RESTRICT p, uint32_t plen) noexcept {
+    uint32_t si = 0, pi = 0;
+    uint32_t star_p = 0xFFFFFFFFu;   // last '%' position in pattern (+1)
+    uint32_t star_s = 0;             // string position when '%' was taken
+    while (si < slen) {
+        if (pi < plen && (p[pi] == '_' || p[pi] == s[si])) {
+            ++si; ++pi;
+        } else if (pi < plen && p[pi] == '%') {
+            star_p = pi;             // remember star; it matches empty for now
+            star_s = si;
+            ++pi;
+        } else if (star_p != 0xFFFFFFFFu) {
+            pi = star_p + 1;         // backtrack: let the star eat one more byte
+            ++star_s;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while (pi < plen && p[pi] == '%') ++pi;   // trailing stars match empty
+    return pi == plen;
+}
+
+// SQL LIKE over two StringViews. `s_base`/`p_base` resolve spilled views;
+// pass nullptr when known inline.
+BOLT_FORCE_INLINE bool sv_like(
+        const StringView& s, const char* s_base,
+        const StringView& p, const char* p_base) noexcept {
+    return bytes_like(sv_bytes(s, s_base), s.length,
+                      sv_bytes(p, p_base), p.length);
+}
+
 // memmem byte search (naive; small needles dominate SQL workloads).
 // Returns 0-based byte index or -1.
 BOLT_FORCE_INLINE int32_t bytes_find(
