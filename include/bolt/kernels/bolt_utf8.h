@@ -138,6 +138,17 @@ BOLT_FORCE_INLINE int32_t bytes_compare(
     return 0;
 }
 
+// Scalar lexicographic compare of two StringViews. Returns <0 / 0 / >0.
+// `a_base` / `b_base` resolve spilled (>12-byte) views; pass nullptr when the
+// views are known inline. Reuses sv_bytes + bytes_compare so the byte math
+// stays in one place.
+BOLT_FORCE_INLINE int32_t sv_compare(
+        const StringView& a, const char* a_base,
+        const StringView& b, const char* b_base) noexcept {
+    return bytes_compare(sv_bytes(a, a_base), a.length,
+                         sv_bytes(b, b_base), b.length);
+}
+
 // memmem byte search (naive; small needles dominate SQL workloads).
 // Returns 0-based byte index or -1.
 BOLT_FORCE_INLINE int32_t bytes_find(

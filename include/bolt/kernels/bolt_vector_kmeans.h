@@ -26,6 +26,7 @@
 #include "bolt/kernels/bolt_topk.h"             // argmin_f32
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -316,7 +317,7 @@ BOLT_FORCE_INLINE float centroid_lower_bound_l2_f32(
     // Convert to an L2 distance (sqrt) so the radius subtraction is
     // dimensionally correct; the caller compares against an L2 tau,
     // not an L2² tau.
-    const float dist = (d2 > 0.0f) ? __builtin_sqrtf(d2) : 0.0f;
+    const float dist = (d2 > 0.0f) ? std::sqrt(d2) : 0.0f;
     const float lb = dist - radius;
     return (lb > 0.0f) ? lb : 0.0f;
 }

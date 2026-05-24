@@ -214,6 +214,49 @@ BOLT_FORCE_INLINE Decimal128 d128_div(Decimal128 a, Decimal128 b) noexcept {
 }
 
 // ----------------------------------------------------------------------------
+// Scale helpers — align a Decimal128 between scales. d128_add/sub/cmp require
+// matching scales; rescaling is the caller's job (see the header note). The
+// pow10 table covers scales 0..18 (each fits in uint64); larger deltas chain.
+// ----------------------------------------------------------------------------
+BOLT_FORCE_INLINE Decimal128 d128_from_i64(int64_t v) noexcept {
+    Decimal128 d;
+    d.lo = v;
+    d.hi = (v < 0) ? -1 : 0;
+    return d;
+}
+
+BOLT_FORCE_INLINE Decimal128 d128_pow10(int n) noexcept {
+    assert(n >= 0);
+    static const uint64_t kPow10[19] = {
+        1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull,
+        10000000ull, 100000000ull, 1000000000ull, 10000000000ull,
+        100000000000ull, 1000000000000ull, 10000000000000ull,
+        100000000000000ull, 1000000000000000ull, 10000000000000000ull,
+        100000000000000000ull, 1000000000000000000ull,
+    };
+    if (n <= 18) return d128_from_i64(static_cast<int64_t>(kPow10[n]));
+    Decimal128 r = d128_from_i64(static_cast<int64_t>(kPow10[18]));
+    for (int rem = n - 18; rem > 0; ) {
+        const int step = (rem <= 18) ? rem : 18;
+        r = d128_mul(r, d128_from_i64(static_cast<int64_t>(kPow10[step])));
+        rem -= step;
+    }
+    return r;
+}
+
+// Rescale `v` from `from_scale` to `to_scale`. Scaling up multiplies by a
+// power of ten (exact); scaling down divides (truncates toward zero). Most
+// callers only scale up to align operands — a single multiply.
+BOLT_FORCE_INLINE Decimal128 d128_rescale(Decimal128 v, int from_scale,
+                                          int to_scale) noexcept {
+    assert(from_scale >= 0 && to_scale >= 0);
+    if (to_scale == from_scale) return v;
+    if (to_scale > from_scale)
+        return d128_mul(v, d128_pow10(to_scale - from_scale));
+    return d128_div(v, d128_pow10(from_scale - to_scale));
+}
+
+// ----------------------------------------------------------------------------
 // Comparison primitives — branchless, signed-hi / unsigned-lo lexicographic.
 // ----------------------------------------------------------------------------
 BOLT_FORCE_INLINE int d128_cmp(Decimal128 a, Decimal128 b) noexcept {

@@ -166,6 +166,11 @@ struct BoltColumn {
     ColumnFormat format;
     BoltType     type;
     uint16_t     type_size_bytes; // Cached from kTypeSize or user-specified
+    uint8_t      decimal_scale;   // Decimal128/256: digits after the point
+                                  // (Arrow stores scale in the type; we carry
+                                  // it on the column so it travels with the
+                                  // value through operators). 0 for non-decimal.
+    uint8_t      _scale_pad[3];   // keep stats alignment explicit
 
     // --- Inline stats (always present) ---
     ColumnStats stats;
