@@ -230,6 +230,255 @@ TEST(BoltVectorKmeans, RecoversSyntheticClusters) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 9.4 z.5 — multi-precision Embedding family.
+// Round-trip f16 / u8 / i8 columns through wire → deserialise. Every test
+// asserts bit-exact recovery (no quantisation error at the wire layer — the
+// payload is just bytes; the wire format never interprets element values).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Deterministic byte / half fill, independent of the f32 PRNG in `Rng`.
+// Returns a value in [0, 65535] mapped via a simple LCG so the same seed
+// produces the same payload across runs.
+struct ByteRng {
+    uint64_t state;
+    explicit ByteRng(uint64_t s) noexcept : state(s ? s : 1ull) {}
+    uint16_t next_u16() noexcept {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<uint16_t>(state >> 48);
+    }
+    uint8_t next_u8() noexcept {
+        return static_cast<uint8_t>(next_u16() & 0xFFu);
+    }
+};
+
+// Build a BoltBatch with a single vector column of the given type. Caller
+// owns the arena and the underlying payload (allocated inside `arena`).
+void build_vector_batch(bolt::BoltBatch* b,
+                        bolt::Arena* arena,
+                        const bolt::BoltColumn& c,
+                        uint32_t dim,
+                        const char* col_name) noexcept {
+    bolt::BoltBatch::init_empty(b);
+    b->arena    = arena;
+    b->num_cols = 1;
+    b->num_rows = c.length;
+    b->schema.num_fields = 1;
+    std::memset(&b->schema.fields[0], 0, sizeof(b->schema.fields[0]));
+    const size_t nlen = std::strlen(col_name);
+    std::memcpy(b->schema.fields[0].name, col_name,
+                nlen < bolt::kMaxFieldName ? nlen : bolt::kMaxFieldName);
+    b->schema.fields[0].type       = c.type;
+    b->schema.fields[0].fixed_size = dim;
+    b->columns[0][0] = c;
+    b->columns[1][0] = c;
+}
+
+}  // namespace
+
+TEST(BoltVectorColumn, FactoriesEncodeStrideAndDim_F16_U8_I8) {
+    bolt::Arena arena;
+    constexpr uint32_t kRows = 11u;
+    constexpr uint32_t kD    = 128u;
+
+    bolt::BoltColumn cf16 =
+        bolt::BoltColumn::make_flat_vector_f16_alloc(kRows, kD, &arena);
+    ASSERT_NE(cf16.data, nullptr);
+    EXPECT_EQ(cf16.type, bolt::BoltType::EmbeddingF16);
+    EXPECT_EQ(cf16.format, bolt::ColumnFormat::Flat);
+    EXPECT_EQ(cf16.type_size_bytes, kD * 2u);
+    EXPECT_EQ(cf16.vector_dim(), kD);
+
+    bolt::BoltColumn cu8 =
+        bolt::BoltColumn::make_flat_vector_u8_alloc(kRows, kD, &arena);
+    ASSERT_NE(cu8.data, nullptr);
+    EXPECT_EQ(cu8.type, bolt::BoltType::EmbeddingU8);
+    EXPECT_EQ(cu8.type_size_bytes, kD * 1u);
+    EXPECT_EQ(cu8.vector_dim(), kD);
+
+    bolt::BoltColumn ci8 =
+        bolt::BoltColumn::make_flat_vector_i8_alloc(kRows, kD, &arena);
+    ASSERT_NE(ci8.data, nullptr);
+    EXPECT_EQ(ci8.type, bolt::BoltType::EmbeddingI8);
+    EXPECT_EQ(ci8.type_size_bytes, kD * 1u);
+    EXPECT_EQ(ci8.vector_dim(), kD);
+
+    // Zero-dim guard works on every variant.
+    EXPECT_EQ(bolt::BoltColumn::make_flat_vector_f16_alloc(kRows, 0u, &arena).data,
+              nullptr);
+    EXPECT_EQ(bolt::BoltColumn::make_flat_vector_u8_alloc(kRows, 0u, &arena).data,
+              nullptr);
+    EXPECT_EQ(bolt::BoltColumn::make_flat_vector_i8_alloc(kRows, 0u, &arena).data,
+              nullptr);
+}
+
+TEST(BoltVectorColumn, WireRoundTripPreservesF16Payload) {
+    bolt::Arena arena;
+    constexpr uint32_t kRows = 19u;          // non-power-of-two on purpose
+    constexpr uint32_t kD    = 384u;
+    bolt::BoltColumn c =
+        bolt::BoltColumn::make_flat_vector_f16_alloc(kRows, kD, &arena);
+    ASSERT_NE(c.data, nullptr);
+
+    // Fill with deterministic u16 payload (the wire never reinterprets
+    // these as floats — it's just bytes — but using realistic f16 bit
+    // patterns documents the intent).
+    ByteRng rng(0xF16D'EAD0'BEEFull);
+    uint16_t* src = static_cast<uint16_t*>(c.data);
+    for (uint32_t i = 0; i < kRows * kD; ++i) src[i] = rng.next_u16();
+
+    bolt::BoltBatch b;
+    build_vector_batch(&b, &arena, c, kD, "emb16");
+
+    const size_t sz = bolt::wire::bolt_wire_size(&b);
+    ASSERT_GT(sz, 0u);
+    uint8_t* buf = static_cast<uint8_t*>(arena.allocate(sz, 64));
+    ASSERT_NE(buf, nullptr);
+    ASSERT_EQ(bolt::wire::bolt_wire_serialize(&b, buf, sz), sz);
+
+    bolt::Arena rd_arena;
+    bolt::BoltBatch out;
+    ASSERT_TRUE(bolt::wire::bolt_wire_deserialize(buf, sz, &out, &rd_arena));
+    EXPECT_EQ(out.num_cols, 1u);
+    EXPECT_EQ(out.num_rows, static_cast<int64_t>(kRows));
+    EXPECT_EQ(out.schema.fields[0].type, bolt::BoltType::EmbeddingF16);
+    EXPECT_EQ(out.schema.fields[0].fixed_size, kD);
+    const bolt::BoltColumn& rc = out.col(0);
+    EXPECT_EQ(rc.type, bolt::BoltType::EmbeddingF16);
+    EXPECT_EQ(rc.vector_dim(), kD);
+    EXPECT_EQ(rc.type_size_bytes, kD * 2u);
+    // Exact bit-for-bit recover on the f16 storage.
+    ASSERT_EQ(std::memcmp(c.data, rc.data,
+                          static_cast<size_t>(kRows) * kD * 2u), 0);
+}
+
+TEST(BoltVectorColumn, WireRoundTripPreservesU8Payload) {
+    bolt::Arena arena;
+    constexpr uint32_t kRows = 23u;
+    constexpr uint32_t kD    = 512u;
+    bolt::BoltColumn c =
+        bolt::BoltColumn::make_flat_vector_u8_alloc(kRows, kD, &arena);
+    ASSERT_NE(c.data, nullptr);
+
+    ByteRng rng(0xC0FFEE'0008ull);
+    uint8_t* src = static_cast<uint8_t*>(c.data);
+    for (uint32_t i = 0; i < kRows * kD; ++i) src[i] = rng.next_u8();
+
+    bolt::BoltBatch b;
+    build_vector_batch(&b, &arena, c, kD, "emb_u8");
+
+    const size_t sz = bolt::wire::bolt_wire_size(&b);
+    ASSERT_GT(sz, 0u);
+    uint8_t* buf = static_cast<uint8_t*>(arena.allocate(sz, 64));
+    ASSERT_NE(buf, nullptr);
+    ASSERT_EQ(bolt::wire::bolt_wire_serialize(&b, buf, sz), sz);
+
+    bolt::Arena rd_arena;
+    bolt::BoltBatch out;
+    ASSERT_TRUE(bolt::wire::bolt_wire_deserialize(buf, sz, &out, &rd_arena));
+    const bolt::BoltColumn& rc = out.col(0);
+    EXPECT_EQ(rc.type, bolt::BoltType::EmbeddingU8);
+    EXPECT_EQ(rc.vector_dim(), kD);
+    EXPECT_EQ(rc.type_size_bytes, kD * 1u);
+    ASSERT_EQ(std::memcmp(c.data, rc.data,
+                          static_cast<size_t>(kRows) * kD), 0);
+}
+
+TEST(BoltVectorColumn, WireRoundTripPreservesI8Payload) {
+    bolt::Arena arena;
+    constexpr uint32_t kRows = 7u;
+    constexpr uint32_t kD    = 256u;
+    bolt::BoltColumn c =
+        bolt::BoltColumn::make_flat_vector_i8_alloc(kRows, kD, &arena);
+    ASSERT_NE(c.data, nullptr);
+
+    ByteRng rng(0xDEADBEEF'0008ull);
+    int8_t* src = static_cast<int8_t*>(c.data);
+    for (uint32_t i = 0; i < kRows * kD; ++i) {
+        src[i] = static_cast<int8_t>(rng.next_u8());
+    }
+
+    bolt::BoltBatch b;
+    build_vector_batch(&b, &arena, c, kD, "emb_i8");
+
+    const size_t sz = bolt::wire::bolt_wire_size(&b);
+    ASSERT_GT(sz, 0u);
+    uint8_t* buf = static_cast<uint8_t*>(arena.allocate(sz, 64));
+    ASSERT_NE(buf, nullptr);
+    ASSERT_EQ(bolt::wire::bolt_wire_serialize(&b, buf, sz), sz);
+
+    bolt::Arena rd_arena;
+    bolt::BoltBatch out;
+    ASSERT_TRUE(bolt::wire::bolt_wire_deserialize(buf, sz, &out, &rd_arena));
+    const bolt::BoltColumn& rc = out.col(0);
+    EXPECT_EQ(rc.type, bolt::BoltType::EmbeddingI8);
+    EXPECT_EQ(rc.vector_dim(), kD);
+    EXPECT_EQ(rc.type_size_bytes, kD * 1u);
+    ASSERT_EQ(std::memcmp(c.data, rc.data,
+                          static_cast<size_t>(kRows) * kD), 0);
+}
+
+TEST(BoltVectorColumn, WireRejectsUnsupportedFormatPair) {
+    // Only (Embedding*, Flat) is legal. The wire layer must reject any
+    // (Embedding*, VarBinary) labelling at both sides — sizing returns 0
+    // and serialize fails up front. We poke the schema byte directly to
+    // simulate a corrupt / mislabelled stream.
+    using namespace bolt::wire::detail;
+    EXPECT_FALSE(is_supported_format_pair(bolt::BoltType::EmbeddingF16,
+                                          bolt::ColumnFormat::VarBinary));
+    EXPECT_FALSE(is_supported_format_pair(bolt::BoltType::EmbeddingU8,
+                                          bolt::ColumnFormat::VarBinary));
+    EXPECT_FALSE(is_supported_format_pair(bolt::BoltType::EmbeddingI8,
+                                          bolt::ColumnFormat::VarBinary));
+    // Constant / Dictionary etc. are also illegal for the embedding family.
+    EXPECT_FALSE(is_supported_format_pair(bolt::BoltType::EmbeddingF16,
+                                          bolt::ColumnFormat::Constant));
+    EXPECT_FALSE(is_supported_format_pair(bolt::BoltType::EmbeddingU8,
+                                          bolt::ColumnFormat::Dictionary));
+    // The Flat pair *is* legal — guards against accidentally narrowing
+    // the supported set.
+    EXPECT_TRUE(is_supported_format_pair(bolt::BoltType::EmbeddingF16,
+                                         bolt::ColumnFormat::Flat));
+    EXPECT_TRUE(is_supported_format_pair(bolt::BoltType::EmbeddingU8,
+                                         bolt::ColumnFormat::Flat));
+    EXPECT_TRUE(is_supported_format_pair(bolt::BoltType::EmbeddingI8,
+                                         bolt::ColumnFormat::Flat));
+}
+
+TEST(BoltVectorColumn, WireRejectsMislabelledFormatByteOnRead) {
+    // Construct a valid f16 wire payload, then flip the format byte in
+    // both the schema entry (offset 65 of the entry) and the descriptor
+    // (offset 48 of the descriptor) so the deserialiser sees
+    // (EmbeddingF16, VarBinary). Expect rejection.
+    bolt::Arena arena;
+    constexpr uint32_t kRows = 4u;
+    constexpr uint32_t kD    = 64u;
+    bolt::BoltColumn c =
+        bolt::BoltColumn::make_flat_vector_f16_alloc(kRows, kD, &arena);
+    ASSERT_NE(c.data, nullptr);
+    std::memset(c.data, 0xAB, static_cast<size_t>(kRows) * kD * 2u);
+
+    bolt::BoltBatch b;
+    build_vector_batch(&b, &arena, c, kD, "emb16");
+
+    const size_t sz = bolt::wire::bolt_wire_size(&b);
+    ASSERT_GT(sz, 0u);
+    uint8_t* buf = static_cast<uint8_t*>(arena.allocate(sz, 64));
+    ASSERT_NE(buf, nullptr);
+    ASSERT_EQ(bolt::wire::bolt_wire_serialize(&b, buf, sz), sz);
+
+    // Corrupt the schema's format byte. Header is 32 bytes; schema entry
+    // 0 starts at offset 32; format byte sits at offset 65.
+    buf[32u + 65u] = static_cast<uint8_t>(bolt::ColumnFormat::VarBinary);
+
+    bolt::Arena rd_arena;
+    bolt::BoltBatch out;
+    EXPECT_FALSE(bolt::wire::bolt_wire_deserialize(buf, sz, &out, &rd_arena))
+        << "deserialiser must reject (EmbeddingF16, VarBinary)";
+}
+
 TEST(BoltVectorBond, ZoneRankAndMinMaxBound) {
     constexpr uint32_t kD = 16u;
     float q[kD], mu[kD], mn[kD], mx[kD];

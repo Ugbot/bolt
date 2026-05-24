@@ -274,12 +274,145 @@ struct BoltColumn {
         return c;
     }
 
+    // ------------------------------------------------------------------
+    // Wave 9.4 z.5 — multi-precision vector factories.
+    //
+    // Same wire shape as `make_flat_vector`: borrows the caller's `data`
+    // buffer (no allocation), encodes the per-row stride into
+    // `type_size_bytes`, and tags the column with the precision-specific
+    // BoltType. Distance kernels in `bolt::vec::` consume the matching
+    // ElementTraits<T> specialisation.
+    //
+    // Stride caps: f16 ≤ 32 768 dims; u8/i8 ≤ 65 535 dims (limited by
+    // uint16 type_size_bytes — well above the 4 096 / 1 024 head-room
+    // any realistic embedding workload needs).
+    // ------------------------------------------------------------------
+
+    static BoltColumn make_flat_vector_f16(void* data, uint8_t* validity,
+                                            int64_t length,
+                                            uint32_t dim) noexcept {
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingF16, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data            = data;
+        c.validity        = validity;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingF16;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.stats.all_valid = (validity == nullptr);
+        return c;
+    }
+
+    static BoltColumn make_flat_vector_u8(void* data, uint8_t* validity,
+                                           int64_t length,
+                                           uint32_t dim) noexcept {
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingU8, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data            = data;
+        c.validity        = validity;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingU8;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.stats.all_valid = (validity == nullptr);
+        return c;
+    }
+
+    static BoltColumn make_flat_vector_i8(void* data, uint8_t* validity,
+                                           int64_t length,
+                                           uint32_t dim) noexcept {
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingI8, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data            = data;
+        c.validity        = validity;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingI8;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.stats.all_valid = (validity == nullptr);
+        return c;
+    }
+
+    // Arena-allocating variants — mirror `make_flat_vector_alloc`.
+
+    static BoltColumn make_flat_vector_f16_alloc(int64_t length,
+                                                  uint32_t dim,
+                                                  Arena* arena) noexcept {
+        assert(arena != nullptr);
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingF16, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data = arena->allocate(static_cast<size_t>(length) * stride);
+        if (!c.data) return c;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingF16;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.arena           = arena;
+        c.stats.all_valid = true;
+        return c;
+    }
+
+    static BoltColumn make_flat_vector_u8_alloc(int64_t length,
+                                                 uint32_t dim,
+                                                 Arena* arena) noexcept {
+        assert(arena != nullptr);
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingU8, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data = arena->allocate(static_cast<size_t>(length) * stride);
+        if (!c.data) return c;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingU8;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.arena           = arena;
+        c.stats.all_valid = true;
+        return c;
+    }
+
+    static BoltColumn make_flat_vector_i8_alloc(int64_t length,
+                                                 uint32_t dim,
+                                                 Arena* arena) noexcept {
+        assert(arena != nullptr);
+        if (dim == 0u) return make_empty();
+        const size_t stride =
+            bolt::embedding_stride_for_type(BoltType::EmbeddingI8, dim);
+        if (stride > UINT16_MAX) return make_empty();
+        BoltColumn c = make_empty();
+        c.data = arena->allocate(static_cast<size_t>(length) * stride);
+        if (!c.data) return c;
+        c.length          = length;
+        c.format          = ColumnFormat::Flat;
+        c.type            = BoltType::EmbeddingI8;
+        c.type_size_bytes = static_cast<uint16_t>(stride);
+        c.arena           = arena;
+        c.stats.all_valid = true;
+        return c;
+    }
+
     /// Recover the per-row dim of an Embedding column. Returns 0 for
     /// non-vector columns or for columns that haven't had their stride
     /// initialised (e.g. zero-init or wire-recovered without dim).
+    /// Multi-precision aware: divides `type_size_bytes` by the element
+    /// width of the column's `type` (4 for f32 / 2 for f16 / 1 for u8/i8).
     BOLT_FORCE_INLINE uint32_t vector_dim() const noexcept {
-        if (type != BoltType::Embedding) return 0u;
-        return static_cast<uint32_t>(type_size_bytes) / sizeof(float);
+        const uint32_t bpe = bolt::embedding_element_bytes(type);
+        if (bpe == 0u) return 0u;
+        return static_cast<uint32_t>(type_size_bytes) / bpe;
     }
 
     /// Row pointer for an Embedding column (typed). No bounds check —

@@ -32,6 +32,13 @@ enum class BoltType : uint8_t {
     FixedSizeBinary = 41, Decimal128 = 42, Decimal256 = 43,
     // Bolt extensions
     UUID      = 50, IPv4   = 51, Embedding = 52, Symbol = 53,
+    // Wave 9.4 z.5 — multi-precision Embedding variants. Same wire shape
+    // as `Embedding` (kTypeSize sentinel 0 → runtime-dynamic stride =
+    // dim * bytes_per_elt). Element type traits live in
+    // `bolt/kernels/bolt_vector_traits.h`. Allocated at 54/55/56 because
+    // slot 53 is already taken by `Symbol` — renumbering Symbol would
+    // shift a wire-persisted enum byte and break old payloads.
+    EmbeddingF16 = 54, EmbeddingU8 = 55, EmbeddingI8 = 56,
     NUM_TYPES = 64,
 };
 
@@ -52,7 +59,8 @@ inline constexpr uint8_t kTypeSize[64] = {
     0, 0, 16, 32,           // Dictionary, FixedSizeBinary, Decimal128, Decimal256
     0, 0, 0, 0, 0, 0,       // 44-49 reserved
     16, 4, 0, 0,             // UUID, IPv4, Embedding, Symbol
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 54-63 reserved
+    0, 0, 0,                 // EmbeddingF16, EmbeddingU8, EmbeddingI8 (runtime stride)
+    0, 0, 0, 0, 0, 0, 0,    // 57-63 reserved
 };
 
 inline constexpr size_t type_size(BoltType t) noexcept {
@@ -63,17 +71,47 @@ inline constexpr bool is_numeric(BoltType t) noexcept {
     auto v = static_cast<uint8_t>(t); return v >= 2 && v <= 12;
 }
 inline constexpr bool is_vector(BoltType t) noexcept {
-    return t == BoltType::Embedding;
+    return t == BoltType::Embedding ||
+           t == BoltType::EmbeddingF16 ||
+           t == BoltType::EmbeddingU8 ||
+           t == BoltType::EmbeddingI8;
 }
 
-// Vector / Embedding columns carry a runtime-dynamic stride: their
-// physical row size is `dim * sizeof(float)`. `kTypeSize[Embedding]`
-// stays 0 (the "dynamic" sentinel that `is_fixed_width` already
-// recognises); callers that need the byte stride must consult the
+// Vector / Embedding columns carry a runtime-dynamic stride. For the
+// legacy f32 `Embedding` type the row size is `dim * 4`; the Wave 9.4
+// z.5 multi-precision variants use 2 bytes (f16) or 1 byte (u8/i8) per
+// element. `kTypeSize[]` stays 0 for all four (the "dynamic" sentinel
+// that `is_fixed_width` already recognises) — callers must consult the
 // dimension explicitly via this helper.
 BOLT_FORCE_INLINE size_t
 embedding_stride(uint32_t dim) noexcept {
     return static_cast<size_t>(dim) * sizeof(float);
+}
+
+// Per-element-precision stride. Returns 0 for any non-vector type so
+// callers can branch on a single non-zero result. Header-only kernel:
+// branchless on the common case (cold switch on a compile-time-constant
+// `t` collapses to a single multiply at -O2).
+BOLT_FORCE_INLINE size_t
+embedding_stride_for_type(BoltType t, uint32_t dim) noexcept {
+    switch (t) {
+        case BoltType::Embedding:    return static_cast<size_t>(dim) * 4u;
+        case BoltType::EmbeddingF16: return static_cast<size_t>(dim) * 2u;
+        case BoltType::EmbeddingU8:  return static_cast<size_t>(dim) * 1u;
+        case BoltType::EmbeddingI8:  return static_cast<size_t>(dim) * 1u;
+        default:                     return 0u;
+    }
+}
+
+// Element-width helper for the multi-precision vector family. Returns 0
+// for non-vector types. Used by `vector_dim()` to decode the runtime
+// stride stored in `BoltColumn::type_size_bytes`.
+BOLT_FORCE_INLINE constexpr uint32_t
+embedding_element_bytes(BoltType t) noexcept {
+    return (t == BoltType::Embedding)    ? 4u :
+           (t == BoltType::EmbeddingF16) ? 2u :
+           (t == BoltType::EmbeddingU8)  ? 1u :
+           (t == BoltType::EmbeddingI8)  ? 1u : 0u;
 }
 inline constexpr bool is_integer(BoltType t) noexcept {
     auto v = static_cast<uint8_t>(t); return v >= 2 && v <= 9;
@@ -120,6 +158,9 @@ inline const char* type_name(BoltType t) noexcept {
         case BoltType::IPv4:     return "ipv4";
         case BoltType::Embedding:return "embedding";
         case BoltType::Symbol:   return "symbol";
+        case BoltType::EmbeddingF16: return "embedding_f16";
+        case BoltType::EmbeddingU8:  return "embedding_u8";
+        case BoltType::EmbeddingI8:  return "embedding_i8";
         default:                 return "unknown";
     }
 }
@@ -150,6 +191,18 @@ inline const char* arrow_format_string(BoltType t) noexcept {
         case BoltType::Decimal128:return "d:38,10"; // default precision/scale
         case BoltType::UUID:     return "w:16";     // fixed-size binary 16
         case BoltType::IPv4:     return "I";        // stored as uint32
+        // Embedding family: no canonical Arrow short name (would be a
+        // fixed-size-list child schema, which the C Data Interface
+        // export builds out separately). Returning "" keeps every
+        // Embedding variant consistent with the existing `Embedding`
+        // entry; consumers that need Arrow round-trip resolve through
+        // the full ArrowSchema child-schema path, not this short name.
+        // TODO(wave-9.4 z.6): emit "+w:<dim>:e"/"+w:<dim>:C"/"+w:<dim>:c"
+        // when the FFI surface grows fixed-size-list export.
+        case BoltType::Embedding:    return "";
+        case BoltType::EmbeddingF16: return "";
+        case BoltType::EmbeddingU8:  return "";
+        case BoltType::EmbeddingI8:  return "";
         default:                 return "";
     }
 }

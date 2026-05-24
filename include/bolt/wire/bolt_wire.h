@@ -94,18 +94,21 @@ BOLT_FORCE_INLINE size_t align_up(size_t x, size_t a) noexcept {
 }
 
 BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
-    if (t == BoltType::Bool)      return true;
-    if (t == BoltType::Utf8)      return true;
-    if (t == BoltType::Binary)    return true;
-    if (t == BoltType::Symbol)    return true;
-    if (t == BoltType::Embedding) return true;
+    if (t == BoltType::Bool)         return true;
+    if (t == BoltType::Utf8)         return true;
+    if (t == BoltType::Binary)       return true;
+    if (t == BoltType::Symbol)       return true;
+    if (t == BoltType::Embedding)    return true;
+    if (t == BoltType::EmbeddingF16) return true;
+    if (t == BoltType::EmbeddingU8)  return true;
+    if (t == BoltType::EmbeddingI8)  return true;
     auto v = static_cast<uint8_t>(t);
     return v >= static_cast<uint8_t>(BoltType::Int8)
         && v <= static_cast<uint8_t>(BoltType::Float64);
 }
 
 // True if (`type`, `format`) is a legal pair for the wire format. v2:
-//   Format::Flat       + numeric / Bool
+//   Format::Flat       + numeric / Bool / Embedding{,F16,U8,I8}
 //   Format::VarBinary  + Utf8 / Binary / Symbol
 BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
                                                  ColumnFormat f) noexcept {
@@ -134,13 +137,18 @@ BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
 }
 
 // 3-arg overload — supplies the per-row stride directly so vector
-// Embedding columns (whose `type_size_bytes` is `dim * 4`) reuse the
-// same caller shape as scalar Flat columns. Falls through to the
-// 2-arg form for non-Embedding types.
+// Embedding columns (whose `type_size_bytes` is `dim * bytes_per_elt`)
+// reuse the same caller shape as scalar Flat columns. Falls through to
+// the 2-arg form for non-Embedding types. Wave 9.4 z.5: covers the
+// f16 / u8 / i8 multi-precision variants — each carries a different
+// stride but the row-product math is identical.
 BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n,
                                            uint16_t type_size_bytes) noexcept {
     assert(n >= 0);
-    if (t == BoltType::Embedding) {
+    if (t == BoltType::Embedding ||
+        t == BoltType::EmbeddingF16 ||
+        t == BoltType::EmbeddingU8 ||
+        t == BoltType::EmbeddingI8) {
         return static_cast<size_t>(type_size_bytes) * static_cast<size_t>(n);
     }
     return data_buffer_size(t, n);
@@ -441,8 +449,8 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
         if (!detail::is_supported_format_pair(f.type, schema_fmt)) return false;
         // Embedding columns require a non-zero dim; reject corrupt /
         // pre-vector payloads that label a column Embedding without
-        // carrying the stride.
-        if (f.type == BoltType::Embedding && f.fixed_size == 0u) return false;
+        // carrying the stride. Same for the multi-precision variants.
+        if (is_vector(f.type) && f.fixed_size == 0u) return false;
 
         const uint8_t* d = p + desc_off + i * kWireDescSize;
         const uint64_t o0 = detail::read_u64_le(d +  0);
@@ -472,11 +480,15 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
             c.length  = num_rows;
             c.format  = ColumnFormat::Flat;
             c.type    = f.type;
-            // Embedding columns store stride = dim * 4; everything
-            // else falls back to the static `kTypeSize[]` lookup.
-            if (f.type == BoltType::Embedding) {
-                const size_t stride = embedding_stride(f.fixed_size);
-                if (stride > UINT16_MAX) return false;
+            // Embedding columns store a runtime stride = dim *
+            // bytes_per_elt (4 for f32 / 2 for f16 / 1 for u8|i8);
+            // everything else falls back to the static `kTypeSize[]`
+            // lookup. Wave 9.4 z.5: use `embedding_stride_for_type` so
+            // every precision variant is decoded uniformly.
+            if (is_vector(f.type)) {
+                const size_t stride =
+                    embedding_stride_for_type(f.type, f.fixed_size);
+                if (stride == 0u || stride > UINT16_MAX) return false;
                 c.type_size_bytes = static_cast<uint16_t>(stride);
             } else {
                 c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));

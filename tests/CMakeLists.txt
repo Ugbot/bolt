@@ -35,6 +35,33 @@ target_link_libraries(test_bolt_vector_distance
 bolt_apply_hardening(test_bolt_vector_distance)
 add_test(NAME test_bolt_vector_distance COMMAND test_bolt_vector_distance)
 
+# Wave 9.4 ζ.3 — half-precision (f16) vector distance kernels.
+# Cross-checks NEON FP16 / AVX2 cvtph / scalar fallback against the
+# well-tested f32 path, modulo f16 quantisation error.
+add_executable(test_bolt_vector_distance_f16 test_bolt_vector_distance_f16.cpp)
+target_link_libraries(test_bolt_vector_distance_f16
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_distance_f16)
+add_test(NAME test_bolt_vector_distance_f16 COMMAND test_bolt_vector_distance_f16)
+
+# Wave 9.4 ζ.4 — 8-bit scalar-quantised vector distance kernels.
+# Cross-checks NEON DOTPROD / AVX2 / NEON baseline / scalar against
+# a hand-rolled integer reference. Exact-equality assertions (no
+# rounding tolerance — u8 L2² is integer arithmetic end-to-end).
+add_executable(test_bolt_vector_distance_u8 test_bolt_vector_distance_u8.cpp)
+target_link_libraries(test_bolt_vector_distance_u8
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_distance_u8)
+add_test(NAME test_bolt_vector_distance_u8 COMMAND test_bolt_vector_distance_u8)
+
 # Rotation kernels — Householder QR + DCT-II.
 add_executable(test_bolt_rotation test_bolt_rotation.cpp)
 target_link_libraries(test_bolt_rotation
@@ -113,6 +140,18 @@ target_link_libraries(test_bolt_vector_column
 )
 bolt_apply_hardening(test_bolt_vector_column)
 add_test(NAME test_bolt_vector_column COMMAND test_bolt_vector_column)
+
+# Wave 9.4 ζ.5b — PDX-BOND probabilistic Chebyshev LOWER bound kernel.
+# Tightens the box-LB block-skip in the canonical PDX-64 walker.
+add_executable(test_bolt_vector_bond test_bolt_vector_bond.cpp)
+target_link_libraries(test_bolt_vector_bond
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_vector_bond)
+add_test(NAME test_bolt_vector_bond COMMAND test_bolt_vector_bond)
 
 # Quantized distance kernels — SQ8 / RaBitQ / F16, scalar-first
 # (Wave 19 plan B; AVX2 specialisations deferred).
