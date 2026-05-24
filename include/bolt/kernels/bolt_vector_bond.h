@@ -378,7 +378,7 @@ BOLT_FORCE_INLINE float sigma_bound_remaining_chebyshev_lb_f32(
         }
         const float diff = q[d] - mean_d[d];
         const float abs_diff = (diff >= 0.0f) ? diff : -diff;
-        const float sigma = __builtin_sqrtf(var_d[d]);
+        const float sigma = std::sqrt(var_d[d]);
         const float gap = abs_diff - k_sigma * sigma;
         if (gap > 0.0f) acc += gap * gap;
     }

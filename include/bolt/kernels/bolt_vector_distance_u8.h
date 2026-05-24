@@ -32,6 +32,7 @@
 #include "bolt/kernels/bolt_vector_traits.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -207,7 +208,7 @@ BOLT_FORCE_INLINE void quantise_f32_to_u8(
         if (q < 0.0f)        q = 0.0f;
         else if (q > 255.0f) q = 255.0f;
         // Banker's rounding via lrintf — matches PDXearch's convention.
-        const int32_t qi = static_cast<int32_t>(__builtin_rintf(q));
+        const int32_t qi = static_cast<int32_t>(std::rintf(q));
         dst[i] = static_cast<uint8_t>(qi);
     }
 }

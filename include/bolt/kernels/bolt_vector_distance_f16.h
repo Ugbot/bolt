@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #if BOLT_SIMD_AVX2 && !BOLT_SIMD_NEON
     // _mm256_cvtph_ps lives in immintrin.h, already pulled in via bolt_port.h
@@ -61,7 +62,7 @@ BOLT_FORCE_INLINE float bits_to_float_from_f16(uint16_t h) noexcept {
         f = sign | (fexp << 23) | (mant << 13);
     }
     float out;
-    __builtin_memcpy(&out, &f, 4);
+    std::memcpy(&out, &f, 4);
     return out;
 }
 
@@ -235,7 +236,7 @@ BOLT_FORCE_INLINE void quantise_f32_to_f16(
     for (; i < n; ++i) {
         const __fp16 h = static_cast<__fp16>(src[i]);
         uint16_t bits;
-        __builtin_memcpy(&bits, &h, 2);
+        std::memcpy(&bits, &h, 2);
         dst[i] = bits;
     }
 #elif BOLT_SIMD_AVX2
@@ -257,7 +258,7 @@ BOLT_FORCE_INLINE void quantise_f32_to_f16(
         // Best-effort: use single-precision storage of the rounded
         // value. This path isn't hit on M1/Skylake+ benches.
         const float f = src[i];
-        uint32_t fb; __builtin_memcpy(&fb, &f, 4);
+        uint32_t fb; std::memcpy(&fb, &f, 4);
         const uint32_t sign = (fb >> 16) & 0x8000u;
         const int32_t  exp  = static_cast<int32_t>(((fb >> 23) & 0xFFu)) - 127 + 15;
         uint32_t mant = (fb >> 13) & 0x3FFu;
