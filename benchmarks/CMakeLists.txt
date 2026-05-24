@@ -54,3 +54,31 @@ if(NOT MSVC)
 endif()
 bolt_apply_hardening(bench_1brc)
 bolt_apply_bench_tuning(bench_1brc)
+
+# -----------------------------------------------------------------------
+# Two-input sorted-merge set ops — UNION/INTERSECT/EXCEPT, DISTINCT+ALL.
+# -----------------------------------------------------------------------
+add_executable(bench_setop bench_setop.cpp)
+target_link_libraries(bench_setop PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_setop)
+bolt_apply_bench_tuning(bench_setop)
+
+# UTF-8 native operator kernel microbenchmarks
+add_executable(bench_utf8 bench_utf8.cpp)
+target_link_libraries(bench_utf8 PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_utf8 PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_utf8)
+bolt_apply_bench_tuning(bench_utf8)
+
+# -----------------------------------------------------------------------
+# INTERVAL arithmetic microbenchmark — date32 + (months, days) paths.
+# -----------------------------------------------------------------------
+add_executable(bench_interval bench_interval.cpp)
+target_link_libraries(bench_interval PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_interval)
+bolt_apply_bench_tuning(bench_interval)

@@ -27,6 +27,7 @@
 #include "bolt/bolt_port.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -407,7 +408,7 @@ BOLT_FORCE_INLINE float adsampling_threshold_f32(
     if (d_visited == 0u) return 0.0f;
     const float frac = static_cast<float>(d_visited) /
                        static_cast<float>(dim);
-    const float root = __builtin_sqrtf(static_cast<float>(d_visited));
+    const float root = std::sqrt(static_cast<float>(d_visited));
     const float bend = 1.0f + epsilon / root;
     return kth * frac * bend * bend;
 }

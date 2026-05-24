@@ -21,9 +21,17 @@ inline constexpr uint32_t kCsvMaxCols = kMaxBatchColumns;
 
 struct CsvSchema {
     BoltType col_types[kCsvMaxCols];
+    // Per-column scale. Only meaningful for Decimal128 columns: the parser
+    // multiplies parsed values up to (or truncates down to) this scale.
+    // Range: [0..38]. Ignored for all other types. Zero-init friendly.
+    uint8_t  col_scales[kCsvMaxCols];
     uint32_t num_cols;
     char     delimiter;   // typically ';' or ','
     bool     has_header;  // skip first line if true
+    // If true, Decimal128 fields with MORE fractional digits than the
+    // declared scale cause parse_csv to fail. If false (default), extra
+    // fractional digits are silently truncated (DuckDB CSV default).
+    bool     strict_decimal_scale;
 };
 
 // Parse a contiguous CSV buffer into columns. The buffer is owned by the
@@ -31,7 +39,8 @@ struct CsvSchema {
 //   - schema mismatch (mid-row column count != schema.num_cols)
 //   - arena OOM
 //   - unsupported BoltType in schema
-// Supported types in v0: Int32 (int10ths interpretation), Int64, Utf8.
+// Supported types: Int32 (int10ths interpretation), Int64, Date32
+// (ISO YYYY-MM-DD), Decimal128 (per-column scale), Utf8.
 //
 // Inner loop uses bolt_swar_find_byte_u64 for delimiter / line scanning
 // and bolt::parse::parse_int10th for numeric fields. No floats.

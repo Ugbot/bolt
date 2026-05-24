@@ -174,6 +174,249 @@ int64_t filter_gt_selected_branchless(
     return count;
 }
 
+template <typename T>
+int64_t filter_eq_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        T scalar,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (data[idx] == scalar);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ne_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        T scalar,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (data[idx] != scalar);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_lt_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        T scalar,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (data[idx] < scalar);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_le_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        T scalar,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (data[idx] <= scalar);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ge_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        T scalar,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (data[idx] >= scalar);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_eq_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] == rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ne_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] != rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_lt_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] < rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_le_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] <= rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_gt_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] > rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ge_col_branchless(
+        const T* BOLT_RESTRICT lhs,
+        const T* BOLT_RESTRICT rhs,
+        int64_t n,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[count] = static_cast<int32_t>(i);
+        count += (lhs[i] >= rhs[i]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_eq_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] == rhs[idx]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ne_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] != rhs[idx]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_lt_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] < rhs[idx]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_le_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] <= rhs[idx]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_gt_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] > rhs[idx]);
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_ge_col_selected_branchless(
+        const T* BOLT_RESTRICT lhs, const T* BOLT_RESTRICT rhs,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        sel_out[count] = idx;
+        count += (lhs[idx] >= rhs[idx]);
+    }
+    return count;
+}
+
 // ============================================================================
 // Branchless Null-Aware Filter
 // ============================================================================

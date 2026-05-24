@@ -12,6 +12,8 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
 #include "bolt/ingest/bolt_csv.h"
+#include "bolt/kernels/bolt_date.h"
+#include "bolt/kernels/bolt_decimal.h"
 
 namespace {
 
@@ -240,6 +242,183 @@ TEST(BoltCsv, ParseNoTrailingNewline) {
     const auto* vals = static_cast<const int32_t*>(batch.col(1).data);
     EXPECT_EQ(vals[0], 123);
     EXPECT_EQ(vals[1], -89);
+}
+
+// ---------------------------------------------------------------------------
+// Date32 round-trip.
+// ---------------------------------------------------------------------------
+TEST(BoltCsv, ParseDate32RoundTrip) {
+    // 1970-01-01 -> 0 ; 1994-01-01 -> 8766 ; 1970-01-02 -> 1 ; 2000-02-29 -> 11016
+    const char* input = "1970-01-01\n1994-01-01\n1970-01-02\n2000-02-29\n";
+    CsvSchema schema{};
+    schema.col_types[0] = BoltType::Date32;
+    schema.num_cols     = 1;
+    schema.delimiter    = ';';
+    schema.has_header   = false;
+
+    Arena arena;
+    BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 4);
+    const auto* d = static_cast<const int32_t*>(batch.col(0).data);
+    EXPECT_EQ(d[0], 0);
+    EXPECT_EQ(d[1], static_cast<int32_t>(
+        bolt::kernels::date::days_from_civil(1994, 1, 1)));
+    EXPECT_EQ(d[2], 1);
+    EXPECT_EQ(d[3], static_cast<int32_t>(
+        bolt::kernels::date::days_from_civil(2000, 2, 29)));
+}
+
+TEST(BoltCsv, ParseDate32Reject) {
+    // 9-byte fields, malformed dashes, non-digit junk -> parse_csv fails.
+    {
+        const char* input = "1994-1-01\n";
+        CsvSchema schema{};
+        schema.col_types[0] = BoltType::Date32;
+        schema.num_cols = 1; schema.delimiter = ';'; schema.has_header = false;
+        Arena arena; BoltBatch batch;
+        EXPECT_FALSE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    }
+    {
+        const char* input = "1994/01/01\n";
+        CsvSchema schema{};
+        schema.col_types[0] = BoltType::Date32;
+        schema.num_cols = 1; schema.delimiter = ';'; schema.has_header = false;
+        Arena arena; BoltBatch batch;
+        EXPECT_FALSE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decimal128 round-trip at multiple scales.
+// ---------------------------------------------------------------------------
+using bolt::kernels::decimal::Decimal128;
+
+TEST(BoltCsv, ParseDecimal128Scale2) {
+    const char* input = "123.45\n-1234567.89\n0\n0.50\n-0.05\n";
+    CsvSchema schema{};
+    schema.col_types[0]  = BoltType::Decimal128;
+    schema.col_scales[0] = 2;
+    schema.num_cols      = 1;
+    schema.delimiter     = ';';
+    schema.has_header    = false;
+
+    Arena arena;
+    BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 5);
+    const auto* d = static_cast<const Decimal128*>(batch.col(0).data);
+    EXPECT_EQ(d[0].lo, 12345);   EXPECT_EQ(d[0].hi, 0);
+    EXPECT_EQ(d[1].lo, static_cast<int64_t>(-123456789LL));
+    EXPECT_EQ(d[1].hi, -1);  // sign-extended
+    EXPECT_EQ(d[2].lo, 0);       EXPECT_EQ(d[2].hi, 0);
+    EXPECT_EQ(d[3].lo, 50);      EXPECT_EQ(d[3].hi, 0);
+    EXPECT_EQ(d[4].lo, -5);      EXPECT_EQ(d[4].hi, -1);
+}
+
+TEST(BoltCsv, ParseDecimal128Scale4Padding) {
+    // scale=4: "100.005" has 3 fractional digits -> pad with one 0 -> 1000050
+    // "100.0050" has 4 fractional digits -> 1000050 directly.
+    const char* input = "100.005\n100.0050\n42\n";
+    CsvSchema schema{};
+    schema.col_types[0]  = BoltType::Decimal128;
+    schema.col_scales[0] = 4;
+    schema.num_cols      = 1;
+    schema.delimiter     = ';';
+    schema.has_header    = false;
+
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 3);
+    const auto* d = static_cast<const Decimal128*>(batch.col(0).data);
+    EXPECT_EQ(d[0].lo, 1000050); EXPECT_EQ(d[0].hi, 0);
+    EXPECT_EQ(d[1].lo, 1000050); EXPECT_EQ(d[1].hi, 0);
+    EXPECT_EQ(d[2].lo, 420000);  EXPECT_EQ(d[2].hi, 0);
+}
+
+TEST(BoltCsv, ParseDecimal128TruncateVsStrict) {
+    // scale=2; input has 4 fractional digits.
+    const char* input = "1.2345\n";
+    CsvSchema schema{};
+    schema.col_types[0]  = BoltType::Decimal128;
+    schema.col_scales[0] = 2;
+    schema.num_cols      = 1;
+    schema.delimiter     = ';';
+    schema.has_header    = false;
+
+    // Non-strict (default): truncate to "1.23" -> 123.
+    {
+        Arena arena; BoltBatch batch;
+        ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+        const auto* d = static_cast<const Decimal128*>(batch.col(0).data);
+        EXPECT_EQ(d[0].lo, 123);
+    }
+    // Strict: reject.
+    {
+        schema.strict_decimal_scale = true;
+        Arena arena; BoltBatch batch;
+        EXPECT_FALSE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    }
+}
+
+TEST(BoltCsv, ParseDecimal128LargeMagnitude) {
+    // Value 10^20 at scale=0 — exercises the >18-digit chain via mul_pow10.
+    const char* input = "100000000000000000000\n";
+    CsvSchema schema{};
+    schema.col_types[0]  = BoltType::Decimal128;
+    schema.col_scales[0] = 0;
+    schema.num_cols      = 1;
+    schema.delimiter     = ';';
+    schema.has_header    = false;
+
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    const auto* d = static_cast<const Decimal128*>(batch.col(0).data);
+    // 10^20 = 0x5_6BC75E2D_63100000
+    EXPECT_EQ(static_cast<uint64_t>(d[0].lo), 0x6BC75E2D63100000ull);
+    EXPECT_EQ(static_cast<uint64_t>(d[0].hi), 0x5ull);
+}
+
+// ---------------------------------------------------------------------------
+// Mixed schema: Int64 + Date32 + Decimal128 + Utf8.
+// ---------------------------------------------------------------------------
+TEST(BoltCsv, ParseMixedSchema) {
+    // header skipped; two data rows
+    const char* input =
+        "id;d;price;name\n"
+        "1;1994-01-01;123.4500;widget\n"
+        "2;1995-12-31;-9.0050;a-longer-name-spilled\n";
+    CsvSchema schema{};
+    schema.col_types[0]  = BoltType::Int64;
+    schema.col_types[1]  = BoltType::Date32;
+    schema.col_types[2]  = BoltType::Decimal128;
+    schema.col_scales[2] = 4;
+    schema.col_types[3]  = BoltType::Utf8;
+    schema.num_cols      = 4;
+    schema.delimiter     = ';';
+    schema.has_header    = true;
+
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 2);
+
+    const auto* ids   = static_cast<const int64_t*>(batch.col(0).data);
+    const auto* dates = static_cast<const int32_t*>(batch.col(1).data);
+    const auto* decs  = static_cast<const Decimal128*>(batch.col(2).data);
+    const auto* names = static_cast<const StringView*>(batch.col(3).data);
+
+    EXPECT_EQ(ids[0], 1);
+    EXPECT_EQ(ids[1], 2);
+    EXPECT_EQ(dates[0], static_cast<int32_t>(
+        bolt::kernels::date::days_from_civil(1994, 1, 1)));
+    EXPECT_EQ(dates[1], static_cast<int32_t>(
+        bolt::kernels::date::days_from_civil(1995, 12, 31)));
+    EXPECT_EQ(decs[0].lo, 1234500);
+    EXPECT_EQ(decs[0].hi, 0);
+    EXPECT_EQ(decs[1].lo, -90050);
+    EXPECT_EQ(decs[1].hi, -1);
+    EXPECT_EQ(sv_to_string(names[0], nullptr), "widget");
+    EXPECT_EQ(names[1].length, 21u);  // spilled (>12)
 }
 
 }  // namespace

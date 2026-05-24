@@ -106,6 +106,17 @@ target_link_libraries(test_bolt_topk
 bolt_apply_hardening(test_bolt_topk)
 add_test(NAME test_bolt_topk COMMAND test_bolt_topk)
 
+# HyperLogLog++ sketch — approximate COUNT(DISTINCT) / NDV estimation.
+add_executable(test_bolt_hll test_bolt_hll.cpp)
+target_link_libraries(test_bolt_hll
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_hll)
+add_test(NAME test_bolt_hll COMMAND test_bolt_hll)
+
 # K-means kernel — assign / update / convergence delta. Wave 19 Plan D.
 add_executable(test_bolt_kmeans test_bolt_kmeans.cpp)
 target_link_libraries(test_bolt_kmeans
@@ -388,6 +399,21 @@ bolt_apply_hardening(test_bolt_wire_stream)
 
 add_test(NAME test_bolt_wire_stream COMMAND test_bolt_wire_stream)
 
+# Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
+# both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
+add_executable(test_bolt_setop test_bolt_setop.cpp)
+
+target_link_libraries(test_bolt_setop
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_setop)
+
+add_test(NAME test_bolt_setop COMMAND test_bolt_setop)
+
 add_executable(test_bolt_kmerge test_bolt_kmerge.cpp)
 
 target_link_libraries(test_bolt_kmerge
@@ -614,3 +640,47 @@ target_link_libraries(test_bolt_pfor_simd
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_pfor_simd)
 add_test(NAME test_bolt_pfor_simd COMMAND test_bolt_pfor_simd)
+
+# Window function ranking kernels — ROW_NUMBER / RANK / DENSE_RANK / LAG /
+# LEAD / FIRST_VALUE / LAST_VALUE / NTILE. Operate on already-partitioned +
+# sorted input; the kernel walks the sequence and emits ranks / offsets,
+# detecting partition breaks by key change. TPC-DS prerequisite.
+add_executable(test_bolt_window test_bolt_window.cpp)
+target_link_libraries(test_bolt_window
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_window)
+add_test(NAME test_bolt_window COMMAND test_bolt_window)
+
+# Decimal128 kernel family (add/sub/mul/div, filter_{gt,lt,eq,ne,ge,le},
+# sum/min/max). Backs SQL Decimal monetary columns (l_extendedprice,
+# o_totalprice, p_retailprice). Branchless scalar with cross-checks
+# against __int128 where available.
+add_executable(test_bolt_decimal test_bolt_decimal.cpp)
+target_link_libraries(test_bolt_decimal
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_decimal)
+add_test(NAME test_bolt_decimal COMMAND test_bolt_decimal)
+
+# UTF-8 native operator kernels — compare/eq/ne/hash/LIKE (compiled)/SUBSTRING/
+# TRIM/UPPER/LOWER/LENGTH/POSITION/CONCAT/REPLACE.  Backs SQL VARCHAR/TEXT
+# without falling back to Arrow compute (TPC-H Q14, Q16, Q19, Q20).
+add_executable(test_bolt_utf8 test_bolt_utf8.cpp)
+target_link_libraries(test_bolt_utf8
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_utf8)
+add_test(NAME test_bolt_utf8 COMMAND test_bolt_utf8)
+
+# SQL INTERVAL arithmetic kernels (date32 + months/days, sub_date, mul, filter).
+# Tiny semantic, ubiquitous in TPC-H predicates like
+# `l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY`.
+add_executable(test_bolt_interval test_bolt_interval.cpp)
+target_link_libraries(test_bolt_interval
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_interval)
+add_test(NAME test_bolt_interval COMMAND test_bolt_interval)
+
+# Date32 extract kernel (year/month/day/quarter/week/dow/doy + filter wrappers).
+add_executable(test_bolt_date test_bolt_date.cpp)
+target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_date PRIVATE)
+add_test(NAME bolt_date COMMAND test_bolt_date)
