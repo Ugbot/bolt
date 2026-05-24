@@ -10,6 +10,14 @@
 #include <cassert>
 #include <thread>
 
+// POSIX mmap/munmap/madvise are used by the huge-page allocator further down
+// (bolt_aligned_alloc_huge / _free_huge). The platform thread includes below pull
+// <sys/mman.h> in too late — include it here, before first use, so the huge-page
+// path compiles on Linux/macOS when BOLT_ENABLE_HUGE_PAGES is set.
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Compiler detection
 // ---------------------------------------------------------------------------
