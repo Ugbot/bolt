@@ -499,6 +499,14 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
         overflow_cap = buf_len;
         overflow_buf = static_cast<char*>(arena->allocate(overflow_cap, 1));
         if (!overflow_buf) return false;
+        // Expose the spill base on every Utf8 column so downstream operators
+        // can resolve >12-char (spilled) StringViews (sv_bytes/sv_compare/
+        // sv_like). buf_idx is always 0 here (single overflow buffer).
+        for (uint32_t c = 0; c < schema.num_cols; ++c) {
+            if (schema.col_types[c] == BoltType::Utf8) {
+                cols[c].str_overflow_base = overflow_buf;
+            }
+        }
     }
 
     // Skip header if present.

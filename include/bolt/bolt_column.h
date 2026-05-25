@@ -189,6 +189,13 @@ struct BoltColumn {
     // Dictionary: pointer to value column (arena-allocated)
     BoltColumn* dict_child;
 
+    // Utf8 (StringView) spilled-bytes base. For a Utf8 column whose >12-char
+    // values spill into a shared overflow buffer (e.g. CSV ingest), this is the
+    // base pointer that resolves StringView::ref.offset. nullptr ⇒ all views
+    // are inline (no spill) or the producer didn't expose a base. Consumers
+    // pass it as the `spilled_base` arg to utf8::sv_bytes / sv_compare / sv_like.
+    void* str_overflow_base;
+
     // Owning arena
     Arena* arena;
 
