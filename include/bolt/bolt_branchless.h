@@ -571,6 +571,32 @@ void gather_branchless(const T* BOLT_RESTRICT data,
     }
 }
 
+/// Width-templated POD gather: gathers `Bytes`-wide elements
+/// `data[indices[i]]` into contiguous `output[i]`, for callers that
+/// dispatch on a runtime element width (e.g. join/collect-sink payload
+/// materialisation over Int64 / Decimal128 / StringView). Routes through
+/// the generic `gather_branchless<T>` prefetch pipeline; the element type
+/// is an align-1 byte POD so any source pointer (Decimal128 8-byte-aligned,
+/// StringView 4-byte-aligned) is valid to reinterpret. For `Bytes == 8`
+/// prefer `gather_branchless<int64_t>` directly (it has an AVX2 path).
+///
+/// ns/row: inherits the generic `gather_branchless<T>` floor — scalar load
+/// + software prefetch; a 16-byte copy is ~2× the 8-byte element cost.
+/// StringView lifetime: a gathered StringView copies its inline bytes or
+/// its {buf_idx, offset} ref verbatim; spilled views still resolve against
+/// the *source* column's `str_overflow_base`, so the destination column
+/// must carry that same base (no deep copy here).
+template <int Bytes>
+BOLT_FORCE_INLINE void gather_pod(const void* BOLT_RESTRICT data,
+                                  const int32_t* BOLT_RESTRICT indices,
+                                  int64_t count,
+                                  void* BOLT_RESTRICT output) noexcept {
+    static_assert(Bytes >= 1, "gather_pod: element width must be positive");
+    struct Pod { unsigned char b[Bytes]; };
+    gather_branchless<Pod>(static_cast<const Pod*>(data), indices, count,
+                           static_cast<Pod*>(output));
+}
+
 #if BOLT_SIMD_AVX2 || BOLT_SIMD_AVX512
 
 // ----------------------------------------------------------------------
