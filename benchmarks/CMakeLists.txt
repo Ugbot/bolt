@@ -76,9 +76,37 @@ bolt_apply_hardening(bench_utf8)
 bolt_apply_bench_tuning(bench_utf8)
 
 # -----------------------------------------------------------------------
+# K-JOIN-MM: chained hash-join multi-match + composite-key microbench.
+# -----------------------------------------------------------------------
+add_executable(bench_hashjoin_multi_match bench_hashjoin_multi_match.cpp)
+target_link_libraries(bench_hashjoin_multi_match PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_hashjoin_multi_match PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_hashjoin_multi_match)
+bolt_apply_bench_tuning(bench_hashjoin_multi_match)
+
+# -----------------------------------------------------------------------
 # INTERVAL arithmetic microbenchmark — date32 + (months, days) paths.
 # -----------------------------------------------------------------------
 add_executable(bench_interval bench_interval.cpp)
 target_link_libraries(bench_interval PRIVATE bolt::bolt)
 bolt_apply_hardening(bench_interval)
 bolt_apply_bench_tuning(bench_interval)
+
+# -----------------------------------------------------------------------
+# Indirect multi-key sort + Top-K microbench (K-SORT-A)
+# -----------------------------------------------------------------------
+add_executable(bench_indirect_sort bench_indirect_sort.cpp)
+target_link_libraries(bench_indirect_sort PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_indirect_sort PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_indirect_sort)
+bolt_apply_bench_tuning(bench_indirect_sort)

@@ -239,4 +239,170 @@ private:
 #endif
 };
 
+// ---------------------------------------------------------------------------
+// Card K-JOIN-MM — chained build + multi-match probe + composite key (N≤8).
+//
+// Rationale: the default `HashJoinBuild` stores hash→slot in a SwissTable,
+// so duplicate-key inserts overwrite — only one build row per key survives.
+// Q13 (customer⨝orders avg 10 orders/customer), and the foundation test
+// `test_sql_join_on_int64`, both require multi-match probe (one probe row
+// emits one output per matching build row). This API adds a chained build:
+// each bucket points at the head of a singly-linked list of build-row ids;
+// the probe walks the chain and emits one (build_idx, probe_idx) per match.
+//
+// Composite key: up to `kHJMaxKeys = 8` int64 columns. Hash is `swiss_mix`
+// folded over each key with a wyhash3-style mix. Compare on hit is N inline
+// integer compares reduced with branchless AND.
+//
+// Chain arena: caller-owned slab sized at init from
+// `build_rows × expected_dup_factor` (default 4). Over-cap returns false
+// from build_chained (no silent growth — Tiger Style).
+// ---------------------------------------------------------------------------
+
+inline constexpr uint8_t  kHJMaxKeys                = 8;
+inline constexpr uint32_t kHJDefaultExpectedDupFact = 4;
+inline constexpr uint32_t kHJMaxChainLen            = 4096;
+
+struct HashJoinChainNode {
+    uint32_t build_idx;   // build-side row id
+    int32_t  next;        // index into chain_nodes[], or -1 = end
+};
+
+struct HashJoinBuildCfgChained {
+    BoltType keys[kHJMaxKeys];          // composite key types (Int64/UInt64)
+    uint8_t  n_keys;                    // 1..kHJMaxKeys
+    uint8_t  _pad[7];
+    uint64_t build_rows;                // total build rows (for size hint)
+    uint32_t expected_dup_factor;       // chain-arena multiplier; default 4
+    uint32_t max_chain_len;             // assertion cap; default kHJMaxChainLen
+};
+
+struct HashJoinBuildChained {
+    SwissTable        partitions[kHJNumPartitions];  // hash → head chain idx
+    HashJoinChainNode* chain_nodes;                  // per-shard slab
+    uint32_t          chain_size;                    // live node count
+    uint32_t          chain_cap;                     // hard cap (fixed at init)
+    uint64_t          build_rows;
+    uint8_t           n_keys;
+    uint8_t           _pad[7];
+};
+
+// Hash N composite int64 keys row-by-row. Folded wyhash3-style mix.
+BOLT_FORCE_INLINE uint64_t hj_composite_hash_int64(
+        const uint64_t* const* BOLT_RESTRICT key_cols,
+        uint8_t  n_keys,
+        int64_t  row) noexcept {
+    assert(key_cols != nullptr);
+    assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
+    uint64_t h = 0x9E3779B97F4A7C15ULL;  // golden-ratio seed
+    for (uint8_t k = 0; k < n_keys; ++k) {
+        h ^= swiss_mix(key_cols[k][row]);
+        h  = swiss_mix(h);
+    }
+    return h;
+}
+
+// Branchless N-key Int64 equality at (build_row, probe_row).
+BOLT_FORCE_INLINE bool hj_keys_equal_int64(
+        const uint64_t* const* BOLT_RESTRICT lkeys,
+        const uint64_t* const* BOLT_RESTRICT rkeys,
+        uint8_t  n_keys,
+        int64_t  lrow,
+        int64_t  rrow) noexcept {
+    assert(lkeys != nullptr && rkeys != nullptr);
+    assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
+    // Branchless AND-reduction of per-key compares.
+    uint32_t acc = 0;
+    for (uint8_t k = 0; k < n_keys; ++k) {
+        acc += static_cast<uint32_t>(lkeys[k][lrow] == rkeys[k][rrow]);
+    }
+    return acc == n_keys;
+}
+
+// Build the chained hash table. `key_cols[k]` is the int64 column data
+// pointer for the k-th composite-key column on the build side.
+inline bool hash_join_build_chained(
+        const uint64_t* const* BOLT_RESTRICT key_cols,
+        HashJoinBuildCfgChained cfg,
+        Arena*                   arena,
+        HashJoinBuildChained*    out) noexcept {
+    assert(key_cols != nullptr);
+    assert(arena != nullptr && out != nullptr);
+    assert(cfg.n_keys >= 1 && cfg.n_keys <= kHJMaxKeys);
+    const uint64_t n = cfg.build_rows;
+    out->chain_cap = static_cast<uint32_t>(n);  // exactly one node per row
+    out->chain_nodes = static_cast<HashJoinChainNode*>(
+        arena->allocate(sizeof(HashJoinChainNode) *
+                            (n == 0 ? 1 : static_cast<size_t>(n)),
+                        alignof(HashJoinChainNode)));
+    if (out->chain_nodes == nullptr) return false;
+    out->chain_size = 0;
+    out->build_rows = n;
+    out->n_keys     = cfg.n_keys;
+    uint32_t counts[kHJNumPartitions]; memset(counts, 0, sizeof(counts));
+    for (uint64_t i = 0; i < n; ++i) {
+        const uint64_t h = hj_composite_hash_int64(key_cols, cfg.n_keys,
+                                                   static_cast<int64_t>(i));
+        counts[hj_partition_of(h)]++;
+    }
+    for (uint32_t p = 0; p < kHJNumPartitions; ++p) {
+        const uint64_t hint = counts[p] == 0 ? 1 : counts[p];
+        if (!SwissTable::create(&out->partitions[p], hint, arena)) return false;
+    }
+    for (uint64_t i = 0; i < n; ++i) {
+        const uint64_t h = hj_composite_hash_int64(key_cols, cfg.n_keys,
+                                                   static_cast<int64_t>(i));
+        const uint32_t p = hj_partition_of(h);
+        const int32_t prev_head = out->partitions[p].find(h);
+        const uint32_t node_idx = out->chain_size++;
+        assert(node_idx < out->chain_cap);
+        out->chain_nodes[node_idx].build_idx = static_cast<uint32_t>(i);
+        out->chain_nodes[node_idx].next      = prev_head;
+        if (!out->partitions[p].insert(h, node_idx)) return false;
+    }
+    return true;
+}
+
+// Multi-match probe: walk each probe row's chain and emit ALL matching
+// (build_idx, probe_idx) pairs. Returns total pairs written. Over-cap is a
+// hard assert — caller pre-sizes `pairs_cap` (default: probe_rows × 8).
+inline size_t hash_join_probe_multi_match(
+        const HashJoinBuildChained* build_side,
+        const uint64_t* const* BOLT_RESTRICT lkeys,
+        const uint64_t* const* BOLT_RESTRICT rkeys,
+        size_t   n_probe_rows,
+        uint32_t* BOLT_RESTRICT pairs_out_build,
+        uint32_t* BOLT_RESTRICT pairs_out_probe,
+        size_t   pairs_cap) noexcept {
+    assert(build_side != nullptr);
+    assert(lkeys != nullptr && rkeys != nullptr);
+    assert(pairs_out_build != nullptr && pairs_out_probe != nullptr);
+    const uint8_t nk = build_side->n_keys;
+    size_t out = 0;
+    for (size_t r = 0; r < n_probe_rows; ++r) {
+        const uint64_t h = hj_composite_hash_int64(rkeys, nk,
+                                                   static_cast<int64_t>(r));
+        const uint32_t p = hj_partition_of(h);
+        int32_t node = build_side->partitions[p].find(h);
+        uint32_t chain_len = 0;
+        while (node >= 0) {
+            assert(chain_len < kHJMaxChainLen);
+            const HashJoinChainNode& nd =
+                build_side->chain_nodes[static_cast<uint32_t>(node)];
+            const uint32_t bi = nd.build_idx;
+            if (hj_keys_equal_int64(lkeys, rkeys, nk,
+                                    static_cast<int64_t>(bi),
+                                    static_cast<int64_t>(r))) {
+                assert(out < pairs_cap);
+                pairs_out_build[out] = bi;
+                pairs_out_probe[out] = static_cast<uint32_t>(r);
+                ++out;
+            }
+            node = nd.next;
+            ++chain_len;
+        }
+    }
+    return out;
+}
+
 }  // namespace bolt
