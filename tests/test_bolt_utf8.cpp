@@ -373,4 +373,79 @@ TEST_F(Utf8Test, ReplaceGrows) {
     EXPECT_EQ(out[0].length, 12u);  // 3 * 4 = 12 (still inline)
 }
 
+// ===========================================================================
+// StringView::cmp_prefix + sv_bytelex_{min,max} — byte-lex semantics for
+// typed GROUP BY MIN/MAX over Utf8 keys. Regression coverage for the
+// "short string beats long string regardless of content" bug in the old
+// length-first cmp_prefix shortcut.
+// ===========================================================================
+}  // namespace
+
+#include "bolt/join/bolt_groupby.h"
+
+namespace {
+
+TEST_F(Utf8Test, CmpPrefix_ByteLexNotLengthFirst) {
+    // "b" vs "aa" — byte-lex: "aa" < "b" because 'a' < 'b' on the first byte.
+    // Old (broken) cmp_prefix returned 'b' < 'aa' (length-first: 1 < 2).
+    auto sb  = make_inline("b");
+    auto saa = make_inline("aa");
+    EXPECT_LT(StringView::cmp_prefix(saa, sb), 0);
+    EXPECT_GT(StringView::cmp_prefix(sb, saa), 0);
+
+    // Equal-length prefixes that differ in content.
+    auto a = make_inline("apple");
+    auto b = make_inline("banana");
+    EXPECT_LT(StringView::cmp_prefix(a, b), 0);
+
+    // Identical 4-byte prefix, lengths differ → undecidable (0); caller
+    // must fall back to a full byte compare on the spilled tail.
+    auto p1 = make_inline("hello");
+    auto p2 = make_inline("help");
+    EXPECT_NE(StringView::cmp_prefix(p1, p2), 0);  // 5th byte not seen, but
+                                                    // 4-byte prefix differs.
+
+    auto same_prefix_short = make_inline("abcd");
+    auto same_prefix_long  = make_inline("abcdef");
+    EXPECT_EQ(StringView::cmp_prefix(same_prefix_short, same_prefix_long), 0);
+}
+
+// Helper: assert two StringViews are bit-equal (16-byte POD compare).
+static void expect_sv_eq(const StringView& got, const StringView& want) {
+    EXPECT_EQ(0, memcmp(&got, &want, sizeof(StringView)));
+}
+
+TEST_F(Utf8Test, SvBytelexMinMax_InlineByteLex) {
+    auto apple  = make_inline("apple");
+    auto banana = make_inline("banana");
+    auto cherry = make_inline("cherry");
+
+    StringView mn1 = bolt::sv_bytelex_min(banana, nullptr, apple,  nullptr);
+    StringView mn2 = bolt::sv_bytelex_min(apple,  nullptr, banana, nullptr);
+    StringView mx1 = bolt::sv_bytelex_max(apple,  nullptr, cherry, nullptr);
+    expect_sv_eq(mn1, apple);
+    expect_sv_eq(mn2, apple);
+    expect_sv_eq(mx1, cherry);
+
+    // Regression: short string vs long string with smaller first byte.
+    // Byte-lex "aa" < "b"; the broken length-first shortcut said "b" < "aa".
+    auto aa = make_inline("aa");
+    auto b  = make_inline("b");
+    StringView mn_ab = bolt::sv_bytelex_min(b,  nullptr, aa, nullptr);
+    StringView mx_ab = bolt::sv_bytelex_max(aa, nullptr, b,  nullptr);
+    expect_sv_eq(mn_ab, aa);
+    expect_sv_eq(mx_ab, b);
+}
+
+TEST_F(Utf8Test, SvBytelexMinMax_TailDisambiguation) {
+    // Identical 4-byte prefix; length differs → falls back to byte compare.
+    // "abcd" vs "abcdef": "abcd" is a strict prefix → "abcd" < "abcdef".
+    auto s4 = make_inline("abcd");
+    auto s6 = make_inline("abcdef");
+    StringView mn = bolt::sv_bytelex_min(s6, nullptr, s4, nullptr);
+    StringView mx = bolt::sv_bytelex_max(s4, nullptr, s6, nullptr);
+    expect_sv_eq(mn, s4);
+    expect_sv_eq(mx, s6);
+}
+
 }  // namespace

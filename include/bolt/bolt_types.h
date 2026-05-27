@@ -251,11 +251,34 @@ struct StringView {
     bool is_inline()   const noexcept { return length <= 12; }
     bool is_empty()    const noexcept { return length == 0; }
 
-    /// Fast equality: check length + 4-byte prefix first. Resolves
-    /// >99% of distinct-string comparisons without pointer chase.
+    /// Byte-lexicographic prefilter on (length, prefix[0..4]).
+    ///
+    /// Returns the *byte-lex* sign if the comparison is decidable from just
+    /// the 4-byte prefix; returns 0 ("undecidable") when both views agree on
+    /// `min(length, 4)` prefix bytes — caller must fall back to a full byte
+    /// compare on the remaining tail. This is the cheap branch-predicted
+    /// screen that resolves >99% of distinct-string comparisons in TPC-H
+    /// without a pointer chase.
+    ///
+    /// NOTE: This used to length-first-compare ("short < long regardless of
+    /// content"), which is correct only for equality, NOT for MIN/MAX. The
+    /// prior semantics broke byte-lex ordering for any caller that read the
+    /// sign (e.g. typed GROUP BY MIN/MAX). Tiger Style: the cheap shortcut
+    /// must agree with the slow path on sign.
     static int cmp_prefix(const StringView& a, const StringView& b) noexcept {
-        if (a.length != b.length) return (a.length < b.length) ? -1 : 1;
-        return memcmp(a.prefix, b.prefix, 4);
+        const uint32_t na = (a.length < 4u) ? a.length : 4u;
+        const uint32_t nb = (b.length < 4u) ? b.length : 4u;
+        const uint32_t n  = (na < nb) ? na : nb;
+        if (n > 0) {
+            const int c = memcmp(a.prefix, b.prefix, n);
+            if (c != 0) return (c < 0) ? -1 : 1;
+        }
+        // First `n` bytes are equal. If one view is shorter than `n` we
+        // would have stopped earlier; the only way to land here is na==nb
+        // (same number of prefix bytes considered). Lengths still differ →
+        // we cannot decide the sign without the tail. Return 0 to signal
+        // "fall back to a full byte compare on the spilled tail".
+        return 0;
     }
 
     /// Full inline equality (only valid when both are inline)
