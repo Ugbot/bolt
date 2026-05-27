@@ -99,14 +99,5 @@ bolt_apply_bench_tuning(bench_interval)
 
 # -----------------------------------------------------------------------
 # Indirect multi-key sort + Top-K microbench (K-SORT-A)
+# Removed: bench_indirect_sort.cpp not present on this branch.
 # -----------------------------------------------------------------------
-add_executable(bench_indirect_sort bench_indirect_sort.cpp)
-target_link_libraries(bench_indirect_sort PRIVATE bolt::bolt)
-if(NOT MSVC)
-    if(NOT TARGET Threads::Threads)
-        find_package(Threads REQUIRED)
-    endif()
-    target_link_libraries(bench_indirect_sort PRIVATE Threads::Threads)
-endif()
-bolt_apply_hardening(bench_indirect_sort)
-bolt_apply_bench_tuning(bench_indirect_sort)
