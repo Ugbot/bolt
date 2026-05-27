@@ -705,3 +705,10 @@ target_link_libraries(test_bolt_work_stealing_deque
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_work_stealing_deque)
 add_test(NAME test_bolt_work_stealing_deque COMMAND test_bolt_work_stealing_deque)
+
+# COUNT(DISTINCT) / SUM(DISTINCT) per-cell tracker — K-AGG-B substrate.
+add_executable(test_bolt_groupby_distinct test_bolt_groupby_distinct.cpp)
+target_link_libraries(test_bolt_groupby_distinct
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_distinct)
+add_test(NAME test_bolt_groupby_distinct COMMAND test_bolt_groupby_distinct)
