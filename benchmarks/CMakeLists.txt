@@ -90,6 +90,20 @@ bolt_apply_hardening(bench_hashjoin_multi_match)
 bolt_apply_bench_tuning(bench_hashjoin_multi_match)
 
 # -----------------------------------------------------------------------
+# K-AGG-A: typed multi-key GROUP BY kernel microbench.
+# -----------------------------------------------------------------------
+add_executable(bench_groupby bench_groupby.cpp)
+target_link_libraries(bench_groupby PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_groupby PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_groupby)
+bolt_apply_bench_tuning(bench_groupby)
+
+# -----------------------------------------------------------------------
 # INTERVAL arithmetic microbenchmark — date32 + (months, days) paths.
 # -----------------------------------------------------------------------
 add_executable(bench_interval bench_interval.cpp)

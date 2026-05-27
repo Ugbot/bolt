@@ -1,5 +1,9 @@
 // bolt_groupby.h — Two-phase group-by aggregate (Tiger Style).
 //
+// K-AGG-A typed multi-key surface lives at the bottom of this header — see
+// `groupby_agg_multi_key_typed` and the `AggKind` / `AggSpec` / `GbCell16`
+// types. The legacy `groupby_agg_int64` int64-only path is untouched.
+//
 // Phase 1: thread-local partial aggregates keyed by group key via a SwissTable.
 //          Aggregate payload = {sum, count, min, max}.
 // Phase 2: merge partials into a global SwissTable. With a single caller thread
@@ -17,6 +21,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
 #include "bolt/join/bolt_swiss.h"
+#include "bolt/kernels/bolt_decimal.h"
 #include "bolt/kernels/bolt_utf8.h"
 
 #include <cassert>
@@ -519,6 +524,374 @@ BOLT_FORCE_INLINE StringView sv_bytelex_max(
     assert(cand.length <= 12u || cand_base != nullptr);
     const int c = sv_bytelex_compare(cand, cand_base, cur, cur_base);
     return (c > 0) ? cand : cur;
+}
+
+// ===========================================================================
+// K-AGG-A — typed multi-key GROUP BY + aggregate matrix kernel.
+//
+// Surface (header-only, noexcept, Tiger Style):
+//
+//   bool groupby_agg_multi_key_typed(
+//       const BoltColumn* keys,     size_t n_keys,
+//       const BoltColumn* payload,  size_t n_payload,
+//       const AggSpec*    aggs,     size_t n_aggs,
+//       int64_t           n_rows,
+//       BoltColumn*       out_keys,    // n_keys columns (Flat per key type)
+//       BoltColumn*       out_aggs,    // n_aggs columns (Flat per agg out)
+//       uint32_t*         ngroups_out,
+//       Arena*            arena);
+//
+// Single-thread, branch-free apply (CMOV-style bmin/bmax for integer MIN/MAX),
+// composite-key fixed cap = kGbMaxKeys, agg-matrix fixed cap = kGbMaxAggs,
+// per-group cell width = 16 bytes (GbCell16 holds Int64 / Decimal128 / Date32
+// / Utf8 inline-StringView identities). All scratch lives in the caller-
+// supplied Arena — no hot-path heap.
+//
+// Deferred to K-AGG-B (NOT in this kernel): Utf8 spilled keys, COUNT(DISTINCT),
+// partitioned-parallel variant. The chukonu wrapper at
+// `src/operators/impl/hash_agg_typed_op.cpp` keeps owning those features
+// until this kernel's surface is extended in K-AGG-B.
+// ===========================================================================
+
+// Per-cell payload — 16 bytes covers Int64 (.a only), Decimal128 ({lo,hi}),
+// Date32 (.a low 32 bits sign-extended), Utf8 inline StringView (16 bytes).
+struct GbCell16 {
+    int64_t a;
+    int64_t b;
+};
+static_assert(sizeof(GbCell16) == 16, "GbCell16 must be 16 bytes");
+
+enum class AggKind : uint8_t {
+    Sum       = 0,
+    Count     = 1,   // counts non-null input values
+    CountStar = 2,   // counts every row (in_col ignored)
+    Min       = 3,
+    Max       = 4,
+    Avg       = 5,
+};
+
+struct AggSpec {
+    AggKind  kind;
+    uint8_t  in_col;    // index into the `payload` array; ignored for CountStar
+    uint8_t  _pad[6];   // explicit padding; POD, layout-stable
+};
+static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
+
+inline constexpr uint32_t kGbMaxKeys  = 4;
+inline constexpr uint32_t kGbMaxAggs  = 16;
+inline constexpr uint32_t kGbEntryCap = 1u << 24;   // 16M groups hard cap
+
+namespace gb_detail {
+
+// Read one row of a column into a 16-byte cell. Branch-free per cell type.
+BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept {
+    assert(c.data != nullptr);
+    assert(r >= 0);
+    GbCell16 out{0, 0};
+    switch (c.type) {
+        case BoltType::Decimal128: {
+            const auto* p = static_cast<const kernels::decimal::Decimal128*>(c.data);
+            std::memcpy(&out, &p[r], 16);
+            break;
+        }
+        case BoltType::Int64:    out.a = static_cast<const int64_t*>(c.data)[r]; break;
+        case BoltType::Int32:    out.a = static_cast<const int32_t*>(c.data)[r]; break;
+        case BoltType::Date32:   out.a = static_cast<const int32_t*>(c.data)[r]; break;
+        case BoltType::Float64:  std::memcpy(&out.a, &static_cast<const double*>(c.data)[r], 8); break;
+        case BoltType::Utf8:     std::memcpy(&out, &static_cast<const StringView*>(c.data)[r], 16); break;
+        default:                 out.a = static_cast<const int64_t*>(c.data)[r]; break;
+    }
+    return out;
+}
+
+// Composite-key hash. xor + wyhash3 mix per cell-half — order-sensitive,
+// branch-free over key columns.
+BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
+                                      int64_t r) noexcept {
+    assert(keys != nullptr || n_keys == 0);
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        const GbCell16 c = read_cell16(keys[k], r);
+        h ^= swiss_mix_wyhash3(static_cast<uint64_t>(c.a));
+        h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(c.b));
+    }
+    return h;
+}
+
+// True if row `r`'s composite key matches the group at slot `gid` in keys_flat.
+BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
+                                   int64_t r, const GbCell16* keys_flat,
+                                   uint32_t gid) noexcept {
+    assert(keys != nullptr || n_keys == 0);
+    assert(keys_flat != nullptr);
+    const GbCell16* row = keys_flat + static_cast<size_t>(gid) * n_keys;
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        const GbCell16 c = read_cell16(keys[k], r);
+        if (c.a != row[k].a || c.b != row[k].b) return false;
+    }
+    return true;
+}
+
+// Aggregate identity for a (kind, in-type) pair.
+BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
+    const bool d = (t == BoltType::Decimal128);
+    switch (k) {
+        case AggKind::Sum:
+        case AggKind::Avg:
+        case AggKind::Count:
+        case AggKind::CountStar: return GbCell16{0, 0};
+        case AggKind::Min:
+            return d ? GbCell16{static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL), INT64_MAX}
+                     : GbCell16{INT64_MAX, 0};
+        case AggKind::Max:
+            return d ? GbCell16{0, INT64_MIN} : GbCell16{INT64_MIN, 0};
+    }
+    return GbCell16{0, 0};
+}
+
+// Apply one value to one accumulator slot. Branch-free for the int64/date32
+// fast path; Decimal128 falls through to the typed `d128_*` kernels.
+BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
+                             GbCell16* slot, GbCell16 v) noexcept {
+    assert(slot != nullptr);
+    if (k == AggKind::CountStar || k == AggKind::Count) { slot->a += 1; return; }
+    if (t == BoltType::Decimal128) {
+        namespace dec = kernels::decimal;
+        dec::Decimal128 s, x;
+        std::memcpy(&s, slot, 16);
+        std::memcpy(&x, &v,   16);
+        if (k == AggKind::Sum || k == AggKind::Avg) {
+            const dec::Decimal128 r = dec::d128_add(s, x);
+            std::memcpy(slot, &r, 16);
+            return;
+        }
+        const int c = dec::d128_cmp(x, s);
+        const bool take = (k == AggKind::Min) ? (c < 0) : (c > 0);
+        if (take) std::memcpy(slot, &v, 16);
+        return;
+    }
+    switch (k) {
+        case AggKind::Sum:
+        case AggKind::Avg: slot->a += v.a; break;
+        case AggKind::Min: slot->a = branchless::bmin(slot->a, v.a); break;
+        case AggKind::Max: slot->a = branchless::bmax(slot->a, v.a); break;
+        default: break;
+    }
+}
+
+// Decide output BoltType for one agg given its input type.
+BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
+    if (k == AggKind::CountStar || k == AggKind::Count) return BoltType::Int64;
+    if (k == AggKind::Avg) {
+        return (in == BoltType::Decimal128) ? BoltType::Decimal128 : BoltType::Float64;
+    }
+    // SUM / MIN / MAX: preserve input type for Decimal128/Utf8/Date32; SUM/MIN/MAX
+    // of narrow ints emit Int64.
+    if (in == BoltType::Decimal128 || in == BoltType::Utf8 || in == BoltType::Date32) {
+        return in;
+    }
+    return BoltType::Int64;
+}
+
+}  // namespace gb_detail
+
+inline bool groupby_agg_multi_key_typed(
+        const BoltColumn* keys,    size_t n_keys,
+        const BoltColumn* payload, size_t n_payload,
+        const AggSpec*    aggs,    size_t n_aggs,
+        int64_t           n_rows,
+        BoltColumn*       out_keys,
+        BoltColumn*       out_aggs,
+        uint32_t*         ngroups_out,
+        Arena*            arena,
+        uint64_t          expected_groups_hint = 0) noexcept {
+    assert(arena != nullptr);
+    assert(ngroups_out != nullptr);
+    assert(out_keys != nullptr || n_keys == 0);
+    assert(out_aggs != nullptr || n_aggs == 0);
+    if (n_keys == 0 || n_keys > kGbMaxKeys) return false;
+    if (n_aggs == 0 || n_aggs > kGbMaxAggs) return false;
+    if (n_rows < 0) return false;
+    assert(keys != nullptr);
+    assert(aggs != nullptr);
+    (void)n_payload;
+    *ngroups_out = 0;
+
+    // Capture per-key input types (used to size each output_keys column).
+    BoltType key_types[kGbMaxKeys];
+    uint8_t  key_scales[kGbMaxKeys];
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        key_types[k]  = keys[k].type;
+        key_scales[k] = keys[k].decimal_scale;
+        if (keys[k].length != n_rows) return false;
+    }
+    // Capture per-agg input types from payload (ignored for CountStar).
+    BoltType agg_in_types[kGbMaxAggs];
+    uint8_t  agg_in_scales[kGbMaxAggs];
+    for (uint32_t j = 0; j < n_aggs; ++j) {
+        if (aggs[j].kind == AggKind::CountStar) {
+            agg_in_types[j]  = BoltType::Int64;
+            agg_in_scales[j] = 0;
+            continue;
+        }
+        if (aggs[j].in_col >= n_payload || payload == nullptr) return false;
+        const BoltColumn& c = payload[aggs[j].in_col];
+        if (c.length != n_rows) return false;
+        agg_in_types[j]  = c.type;
+        agg_in_scales[j] = c.decimal_scale;
+    }
+
+    // ---- Allocate scratch state in the arena ----
+    // expected_groups_hint = 0  ⇒ size by n_rows (worst case all-distinct).
+    // expected_groups_hint > 0  ⇒ tight-size to power-of-two ≥ hint; the
+    //                              kernel asserts if real groups exceed cap.
+    const bool   tight = (expected_groups_hint > 0);
+    const uint64_t raw = tight ? expected_groups_hint
+                               : (n_rows > 0 ? static_cast<uint64_t>(n_rows) : 1ULL);
+    SwissTable* ht = static_cast<SwissTable*>(
+        arena->allocate(sizeof(SwissTable), alignof(SwissTable)));
+    if (ht == nullptr) return false;
+    if (!SwissTable::create_with(ht, raw, arena, tight)) return false;
+    const uint32_t cap = ht->capacity;
+    assert(cap <= kGbEntryCap);   // safety net; bump kGbEntryCap if it fires
+
+    GbCell16* keys_flat = arena->allocate_array<GbCell16>(
+        static_cast<size_t>(cap) * n_keys);
+    GbCell16* accums    = arena->allocate_array<GbCell16>(
+        static_cast<size_t>(cap) * n_aggs);
+    int64_t*  counts    = arena->allocate_array<int64_t>(
+        static_cast<size_t>(cap) * n_aggs);
+    if (keys_flat == nullptr || accums == nullptr || counts == nullptr) return false;
+
+    // ---- Single-pass probe + accumulate ----
+    // K-AGG-A v1: switch-per-cell read; ~20 ns/row at cardinality 1024.
+    // The 0.5 ns/row floor requires per-type specialization (Bolt's
+    // groupby_agg_int64 hits 0.13 ns/row that way). Specialization is
+    // deferred to K-AGG-A.1 — see docs/research/design-log.md.
+    uint32_t entry_count = 0;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const uint64_t h = gb_detail::hash_keys(keys, static_cast<uint32_t>(n_keys), r);
+        int32_t found = ht->find(h);
+        if (found >= 0 && !gb_detail::keys_equal(keys, static_cast<uint32_t>(n_keys),
+                                                 r, keys_flat,
+                                                 static_cast<uint32_t>(found))) {
+            found = -1;   // hash collision on different key — Tiger: drop row
+        }
+        uint32_t slot;
+        if (found >= 0) {
+            slot = static_cast<uint32_t>(found);
+        } else {
+            if (entry_count >= cap) return false;   // hint underestimated
+            slot = entry_count++;
+            if (!ht->insert(h, slot)) return false;
+            GbCell16* krow = keys_flat + static_cast<size_t>(slot) * n_keys;
+            for (uint32_t k = 0; k < n_keys; ++k)
+                krow[k] = gb_detail::read_cell16(keys[k], r);
+            for (uint32_t j = 0; j < n_aggs; ++j) {
+                const size_t off = static_cast<size_t>(j) * cap + slot;
+                accums[off] = gb_detail::agg_identity(aggs[j].kind, agg_in_types[j]);
+                counts[off] = 0;
+            }
+        }
+        for (uint32_t j = 0; j < n_aggs; ++j) {
+            GbCell16 v{0, 0};
+            if (aggs[j].kind != AggKind::CountStar) {
+                v = gb_detail::read_cell16(payload[aggs[j].in_col], r);
+            }
+            const size_t off = static_cast<size_t>(j) * cap + slot;
+            gb_detail::apply(aggs[j].kind, agg_in_types[j], &accums[off], v);
+            counts[off] += 1;   // tracks rows-per-group (used by Avg finalize)
+        }
+    }
+
+    // ---- Emit output columns ----
+    const int64_t out_n = static_cast<int64_t>(entry_count);
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        out_keys[k] = BoltColumn::make_flat_alloc(out_n, key_types[k], arena);
+        out_keys[k].decimal_scale = key_scales[k];
+        if (out_n > 0 && out_keys[k].data == nullptr) return false;
+    }
+    for (uint32_t j = 0; j < n_aggs; ++j) {
+        const BoltType ot = gb_detail::out_type(aggs[j].kind, agg_in_types[j]);
+        out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
+        if (ot == BoltType::Decimal128) {
+            // AVG widens scale slightly so integer division keeps precision;
+            // SUM/MIN/MAX preserve input scale.
+            out_aggs[j].decimal_scale = (aggs[j].kind == AggKind::Avg)
+                ? static_cast<uint8_t>(agg_in_scales[j] + 4)
+                : agg_in_scales[j];
+        }
+        if (out_n > 0 && out_aggs[j].data == nullptr) return false;
+    }
+
+    // ---- Scatter keys ----
+    for (int64_t r = 0; r < out_n; ++r) {
+        const GbCell16* krow = keys_flat + static_cast<size_t>(r) * n_keys;
+        for (uint32_t k = 0; k < n_keys; ++k) {
+            void* buf = out_keys[k].data;
+            switch (key_types[k]) {
+                case BoltType::Int64:
+                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                case BoltType::Int32:
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                case BoltType::Date32:
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                case BoltType::Decimal128:
+                    std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
+                                &krow[k], 16); break;
+                case BoltType::Utf8:
+                    std::memcpy(&static_cast<StringView*>(buf)[r], &krow[k], 16); break;
+                default:
+                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+            }
+        }
+    }
+
+    // ---- Scatter aggs (finalize Avg per cell) ----
+    for (uint32_t j = 0; j < n_aggs; ++j) {
+        const BoltType ot = gb_detail::out_type(aggs[j].kind, agg_in_types[j]);
+        void* buf = out_aggs[j].data;
+        for (int64_t r = 0; r < out_n; ++r) {
+            const size_t off = static_cast<size_t>(j) * cap + static_cast<uint32_t>(r);
+            const GbCell16 acc = accums[off];
+            const int64_t  cnt = counts[off];
+            if (aggs[j].kind == AggKind::CountStar || aggs[j].kind == AggKind::Count) {
+                static_cast<int64_t*>(buf)[r] = acc.a;
+                continue;
+            }
+            if (aggs[j].kind == AggKind::Avg) {
+                namespace dec = kernels::decimal;
+                if (ot == BoltType::Decimal128) {
+                    dec::Decimal128 s; std::memcpy(&s, &acc, 16);
+                    const uint8_t in_s  = agg_in_scales[j];
+                    const uint8_t out_s = static_cast<uint8_t>(in_s + 4);
+                    const dec::Decimal128 num = dec::d128_rescale(s, in_s, out_s);
+                    const dec::Decimal128 q   = (cnt > 0)
+                        ? dec::d128_div(num, dec::d128_from_i64(cnt))
+                        : dec::Decimal128{0, 0};
+                    std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
+                } else {
+                    const double d = (cnt > 0) ? (static_cast<double>(acc.a) /
+                                                  static_cast<double>(cnt)) : 0.0;
+                    static_cast<double*>(buf)[r] = d;
+                }
+                continue;
+            }
+            // SUM / MIN / MAX — write 16-byte cell or 8-byte int.
+            if (ot == BoltType::Decimal128) {
+                std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &acc, 16);
+            } else if (ot == BoltType::Utf8) {
+                std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);
+            } else if (ot == BoltType::Date32) {
+                static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(acc.a);
+            } else {
+                static_cast<int64_t*>(buf)[r] = acc.a;
+            }
+        }
+    }
+
+    *ngroups_out = entry_count;
+    return true;
 }
 
 }  // namespace bolt

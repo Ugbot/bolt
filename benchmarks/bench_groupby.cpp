@@ -57,7 +57,8 @@ double bench_sum_int64_single_key(int64_t n) noexcept {
         auto t0 = std::chrono::high_resolution_clock::now();
         bool ok = groupby_agg_multi_key_typed(&key_col, 1, &val_col, 1,
                                               &spec, 1, n,
-                                              out_keys, out_aggs, &groups, &work);
+                                              out_keys, out_aggs, &groups, &work,
+                                              kCardinality);
         auto t1 = std::chrono::high_resolution_clock::now();
         assert(ok); (void)ok;
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -96,7 +97,8 @@ double bench_sum_dec128_multi_key2(int64_t n) noexcept {
         work.reset();
         auto t0 = std::chrono::high_resolution_clock::now();
         bool ok = groupby_agg_multi_key_typed(keys, 2, &pay, 1, &spec, 1, n,
-                                              out_keys, out_aggs, &groups, &work);
+                                              out_keys, out_aggs, &groups, &work,
+                                              1024);
         auto t1 = std::chrono::high_resolution_clock::now();
         assert(ok); (void)ok;
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -126,7 +128,8 @@ double bench_count_star_single_key(int64_t n) noexcept {
         auto t0 = std::chrono::high_resolution_clock::now();
         bool ok = groupby_agg_multi_key_typed(&key_col, 1, nullptr, 0,
                                               &spec, 1, n,
-                                              out_keys, out_aggs, &groups, &work);
+                                              out_keys, out_aggs, &groups, &work,
+                                              kCardinality);
         auto t1 = std::chrono::high_resolution_clock::now();
         assert(ok); (void)ok;
         double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -149,8 +152,16 @@ int main(int argc, char** argv) {
     std::printf("(rows=%lld, distinct=%u)\n",
                 static_cast<long long>(n), kCardinality);
 
-    bench_sum_int64_single_key(n);
-    bench_sum_dec128_multi_key2(n);
-    bench_count_star_single_key(n);
+    const double s = bench_sum_int64_single_key(n);
+    const double d = bench_sum_dec128_multi_key2(n);
+    const double c = bench_count_star_single_key(n);
+    // K-AGG-A floors (single-thread, AVX2, RelWithDebInfo). Specialized
+    // single-key int64 path hits 0.13 ns/row in groupby_agg_int64; the typed
+    // multi-key kernel here is the general fallback. K-AGG-A.1 follow-up:
+    // X-macro key-type specialization to close the gap.
+    std::printf("== floors (general typed kernel) ==\n");
+    std::printf("  sum_i64_single_key   measured=%.3f ns/row   floor<=20.0\n", s);
+    std::printf("  sum_dec128_multi_k2  measured=%.3f ns/row   floor<=30.0\n", d);
+    std::printf("  count_star_single    measured=%.3f ns/row   floor<=20.0\n", c);
     return 0;
 }

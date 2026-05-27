@@ -712,3 +712,10 @@ target_link_libraries(test_bolt_groupby_distinct
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_groupby_distinct)
 add_test(NAME test_bolt_groupby_distinct COMMAND test_bolt_groupby_distinct)
+
+# K-AGG-A typed multi-key GROUP BY kernel — correctness on small inputs.
+add_executable(test_bolt_groupby_typed test_bolt_groupby_typed.cpp)
+target_link_libraries(test_bolt_groupby_typed
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_typed)
+add_test(NAME test_bolt_groupby_typed COMMAND test_bolt_groupby_typed)
