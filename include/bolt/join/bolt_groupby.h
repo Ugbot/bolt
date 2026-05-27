@@ -20,6 +20,7 @@
 #include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
+#include "bolt/join/bolt_groupby_distinct.h"
 #include "bolt/join/bolt_swiss.h"
 #include "bolt/kernels/bolt_decimal.h"
 #include "bolt/kernels/bolt_utf8.h"
@@ -572,8 +573,9 @@ enum class AggKind : uint8_t {
 
 struct AggSpec {
     AggKind  kind;
-    uint8_t  in_col;    // index into the `payload` array; ignored for CountStar
-    uint8_t  _pad[6];   // explicit padding; POD, layout-stable
+    uint8_t  in_col;     // index into the `payload` array; ignored for CountStar
+    uint8_t  distinct;   // K-AGG-A.2 item 2: 1 = fold duplicates per (agg, group)
+    uint8_t  _pad[5];    // explicit padding; POD, layout-stable
 };
 static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 
@@ -650,11 +652,24 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
 }
 
 // Apply one value to one accumulator slot. Branch-free for the int64/date32
-// fast path; Decimal128 falls through to the typed `d128_*` kernels.
+// fast path; Decimal128 falls through to the typed `d128_*` kernels; Utf8
+// MIN/MAX go through `sv_bytelex_{min,max}` (K-AGG-A.2 item 3).
+//
+// `valid` (K-AGG-A.2 item 1) is the input value's non-NULL status:
+//   - CountStar : ignores `valid` (always +1 — counts every row).
+//   - Count     : +1 iff valid; +0 otherwise.
+//   - Sum/Avg   : skip the value when !valid (no slot mutation).
+//   - Min/Max   : skip the value when !valid (identity preserved).
+// With `valid = true` always, behaviour is identical to the pre-K-AGG-A.2
+// surface (no asserts fire, no extra branches in the hot path because
+// the per-call `valid` is hoisted into a constant by the wrapper for
+// columns lacking a validity bitmap).
 BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
-                             GbCell16* slot, GbCell16 v) noexcept {
+                             GbCell16* slot, GbCell16 v, bool valid) noexcept {
     assert(slot != nullptr);
-    if (k == AggKind::CountStar || k == AggKind::Count) { slot->a += 1; return; }
+    if (k == AggKind::CountStar) { slot->a += 1; return; }
+    if (k == AggKind::Count)     { slot->a += valid ? 1 : 0; return; }
+    if (!valid) return;   // Sum/Min/Max/Avg ignore NULLs (SQL semantics)
     if (t == BoltType::Decimal128) {
         namespace dec = kernels::decimal;
         dec::Decimal128 s, x;
@@ -670,6 +685,22 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         if (take) std::memcpy(slot, &v, 16);
         return;
     }
+    if (t == BoltType::Utf8 && (k == AggKind::Min || k == AggKind::Max)) {
+        // Inline-only invariant: the typed kernel does not yet resolve
+        // spilled keys (>12 byte content), so the cell carries the full
+        // 16-byte StringView for inline strings. Asserts in
+        // `sv_bytelex_{min,max}` guard the inline-only precondition.
+        StringView cur, cand;
+        std::memcpy(&cur,  slot, sizeof(cur));
+        std::memcpy(&cand, &v,   sizeof(cand));
+        assert(cur.length  <= 12u);
+        assert(cand.length <= 12u);
+        const StringView out = (k == AggKind::Min)
+            ? sv_bytelex_min(cur, nullptr, cand, nullptr)
+            : sv_bytelex_max(cur, nullptr, cand, nullptr);
+        std::memcpy(slot, &out, sizeof(out));
+        return;
+    }
     switch (k) {
         case AggKind::Sum:
         case AggKind::Avg: slot->a += v.a; break;
@@ -677,6 +708,15 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         case AggKind::Max: slot->a = branchless::bmax(slot->a, v.a); break;
         default: break;
     }
+}
+
+// Arrow-convention validity: validity==nullptr means all-valid; otherwise the
+// bit at (validity_offset + r) is set when the value is non-NULL.
+BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept {
+    assert(r >= 0);
+    if (c.validity == nullptr) return true;
+    const int64_t bit = c.validity_offset + r;
+    return ((c.validity[bit >> 3] >> (bit & 7)) & 1) != 0;
 }
 
 // Decide output BoltType for one agg given its input type.
@@ -763,6 +803,42 @@ inline bool groupby_agg_multi_key_typed(
         static_cast<size_t>(cap) * n_aggs);
     if (keys_flat == nullptr || accums == nullptr || counts == nullptr) return false;
 
+    // K-AGG-A.2 item 2: per-(distinct agg, group) DISTINCT folding cells.
+    // Two parallel arrays — 8B cells for non-Utf8 distinct aggs, 16B cells
+    // for Utf8 distinct aggs (full StringView dedup). Indexed by a compact
+    // remap `distinct_idx[j]` / `distinct16_idx[j]` so total memory is
+    // proportional to the count of distinct-flagged aggs, not n_aggs.
+    uint16_t distinct_idx[kGbMaxAggs];     // 0xFFFF = "not 8B-distinct"
+    uint16_t distinct16_idx[kGbMaxAggs];   // 0xFFFF = "not Utf8-distinct"
+    uint16_t n_distinct   = 0;
+    uint16_t n_distinct16 = 0;
+    bool any_distinct = false;
+    for (uint32_t j = 0; j < n_aggs; ++j) {
+        distinct_idx[j]   = 0xFFFFu;
+        distinct16_idx[j] = 0xFFFFu;
+        if (aggs[j].distinct == 0) continue;
+        any_distinct = true;
+        if (agg_in_types[j] == BoltType::Utf8) distinct16_idx[j] = n_distinct16++;
+        else                                   distinct_idx[j]   = n_distinct++;
+    }
+    DistinctCell*   distinct_cells   = nullptr;
+    DistinctCell16* distinct_cells16 = nullptr;
+    if (n_distinct > 0) {
+        distinct_cells = arena->allocate_array<DistinctCell>(
+            static_cast<size_t>(n_distinct) * cap);
+        if (distinct_cells == nullptr) return false;
+        std::memset(distinct_cells, 0,
+                    sizeof(DistinctCell) * static_cast<size_t>(n_distinct) * cap);
+    }
+    if (n_distinct16 > 0) {
+        distinct_cells16 = arena->allocate_array<DistinctCell16>(
+            static_cast<size_t>(n_distinct16) * cap);
+        if (distinct_cells16 == nullptr) return false;
+        std::memset(distinct_cells16, 0,
+                    sizeof(DistinctCell16) * static_cast<size_t>(n_distinct16) * cap);
+    }
+    (void)any_distinct;   // future: zero-overhead skip when no distinct aggs
+
     // ---- Single-pass probe + accumulate ----
     // K-AGG-A v1: switch-per-cell read; ~20 ns/row at cardinality 1024.
     // The 0.5 ns/row floor requires per-type specialization (Bolt's
@@ -795,12 +871,38 @@ inline bool groupby_agg_multi_key_typed(
         }
         for (uint32_t j = 0; j < n_aggs; ++j) {
             GbCell16 v{0, 0};
+            bool valid = true;
             if (aggs[j].kind != AggKind::CountStar) {
-                v = gb_detail::read_cell16(payload[aggs[j].in_col], r);
+                const BoltColumn& pc = payload[aggs[j].in_col];
+                v     = gb_detail::read_cell16(pc, r);
+                valid = gb_detail::cell_valid(pc, r);
+            }
+            // K-AGG-A.2 item 2: DISTINCT — drop duplicates per (agg, group)
+            // before the accumulator sees them. NULLs never enter the
+            // dedup set; they short-circuit through the !valid branch in
+            // `apply`. Phase-A scope: linear-scan inline cells with hard
+            // cap (`k_distinct_cell_cap`); over-cap inserts silently drop.
+            if (valid && aggs[j].distinct != 0) {
+                const uint16_t i16 = distinct16_idx[j];
+                if (i16 != 0xFFFFu) {
+                    const size_t doff =
+                        static_cast<size_t>(i16) * cap + slot;
+                    std::uint8_t buf[16];
+                    std::memcpy(buf, &v, 16);
+                    if (!distinct_cells16[doff].insert(buf)) continue;
+                } else {
+                    const uint16_t i8 = distinct_idx[j];
+                    assert(i8 != 0xFFFFu);
+                    const size_t doff =
+                        static_cast<size_t>(i8) * cap + slot;
+                    if (!distinct_cells[doff].insert(v.a)) continue;
+                }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;
-            gb_detail::apply(aggs[j].kind, agg_in_types[j], &accums[off], v);
-            counts[off] += 1;   // tracks rows-per-group (used by Avg finalize)
+            gb_detail::apply(aggs[j].kind, agg_in_types[j], &accums[off], v, valid);
+            // Avg's row-per-group counter must also skip NULLs (denominator
+            // is "rows with non-NULL value", not raw arrival count).
+            counts[off] += (valid ? 1 : 0);
         }
     }
 

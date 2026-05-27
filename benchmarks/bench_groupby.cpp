@@ -46,7 +46,7 @@ double bench_sum_int64_single_key(int64_t n) noexcept {
     }
     BoltColumn key_col = BoltColumn::make_flat(ks, nullptr, n, BoltType::Int64);
     BoltColumn val_col = BoltColumn::make_flat(vs, nullptr, n, BoltType::Int64);
-    AggSpec spec; spec.kind = AggKind::Sum; spec.in_col = 0;
+    AggSpec spec{}; spec.kind = AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
     BoltColumn out_keys[1], out_aggs[1];
 
     double best_ns = 1e30;
@@ -87,7 +87,7 @@ double bench_sum_dec128_multi_key2(int64_t n) noexcept {
     keys[1] = BoltColumn::make_flat(k1, nullptr, n, BoltType::Int64);
     BoltColumn pay = BoltColumn::make_flat(vs, nullptr, n, BoltType::Decimal128);
     pay.decimal_scale = 2;
-    AggSpec spec; spec.kind = AggKind::Sum; spec.in_col = 0;
+    AggSpec spec{}; spec.kind = AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
     BoltColumn out_keys[2], out_aggs[1];
 
     double best_ns = 1e30;
@@ -117,7 +117,7 @@ double bench_count_star_single_key(int64_t n) noexcept {
     assert(ks);
     for (int64_t i = 0; i < n; ++i) ks[i] = static_cast<int64_t>(i) % kCardinality;
     BoltColumn key_col = BoltColumn::make_flat(ks, nullptr, n, BoltType::Int64);
-    AggSpec spec; spec.kind = AggKind::CountStar; spec.in_col = 0;
+    AggSpec spec{}; spec.kind = AggKind::CountStar; spec.in_col = 0; spec.distinct = 0;
     BoltColumn out_keys[1], out_aggs[1];
 
     double best_ns = 1e30;
