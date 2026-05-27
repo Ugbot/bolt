@@ -684,3 +684,24 @@ add_executable(test_bolt_date test_bolt_date.cpp)
 target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_date PRIVATE)
 add_test(NAME bolt_date COMMAND test_bolt_date)
+
+# Lock-free queue zoo (Wave: morsel-distribution substrate).
+# Borrowed from chukonu-v1 lockfree_queue.h, stripped of Arrow / shared_ptr
+# and rebuilt to Bolt's Tiger-Style header-only rules.
+add_executable(test_bolt_sharded_mpsc test_bolt_sharded_mpsc.cpp)
+target_link_libraries(test_bolt_sharded_mpsc
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_sharded_mpsc)
+add_test(NAME test_bolt_sharded_mpsc COMMAND test_bolt_sharded_mpsc)
+
+add_executable(test_bolt_node_pool test_bolt_node_pool.cpp)
+target_link_libraries(test_bolt_node_pool
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_node_pool)
+add_test(NAME test_bolt_node_pool COMMAND test_bolt_node_pool)
+
+add_executable(test_bolt_work_stealing_deque test_bolt_work_stealing_deque.cpp)
+target_link_libraries(test_bolt_work_stealing_deque
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_work_stealing_deque)
+add_test(NAME test_bolt_work_stealing_deque COMMAND test_bolt_work_stealing_deque)
