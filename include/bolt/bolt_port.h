@@ -19,6 +19,33 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Platform headers (POSIX / Win32). Hoisted above the huge-page allocator
+// below, which calls mmap / VirtualAlloc — those must be declared before
+// first use, otherwise enabling huge pages (Linux default) fails to compile.
+// bolt_port.h is Bolt's single platform shim; the rest of the core stays
+// POSIX-free.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#elif defined(__linux__)
+    #include <pthread.h>
+    #include <sched.h>
+    #include <sys/mman.h>
+    #include <sys/syscall.h>
+    #include <unistd.h>
+#elif defined(__APPLE__)
+    #include <mach/mach_init.h>
+    #include <mach/thread_act.h>
+    #include <mach/thread_policy.h>
+#endif
+
+// ---------------------------------------------------------------------------
 // Compiler detection
 // ---------------------------------------------------------------------------
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -265,29 +292,9 @@ BOLT_FORCE_INLINE void bolt_aligned_free_huge(void* p, size_t size) noexcept {
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Platform headers needed by the thread-affinity / NUMA shims below.
-// Kept inside their own #ifdef branches so non-host platforms stay clean.
-// ---------------------------------------------------------------------------
-#if defined(_WIN32)
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #include <windows.h>
-#elif defined(__linux__)
-    #include <pthread.h>
-    #include <sched.h>
-    #include <sys/mman.h>
-    #include <sys/syscall.h>
-    #include <unistd.h>
-#elif defined(__APPLE__)
-    #include <mach/mach_init.h>
-    #include <mach/thread_act.h>
-    #include <mach/thread_policy.h>
-#endif
+// Platform headers (POSIX / Win32) are included near the top of this file —
+// hoisted there so the huge-page allocator above (mmap / VirtualAlloc) sees
+// them. The thread-affinity / NUMA shims below rely on the same includes.
 
 // ---------------------------------------------------------------------------
 // Thread affinity, NUMA, hardware concurrency
