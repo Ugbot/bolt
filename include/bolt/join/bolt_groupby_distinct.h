@@ -92,6 +92,60 @@ static_assert(sizeof(DistinctCell) == 8 + k_distinct_cell_cap * 8,
 // mirrors `accums_flat`: cell for (agg j, group g) lives at
 //   distinct_cells[j * entry_cap + g]
 // Caller seeds via `cell_at(...)->init()` lazily on first touch.
+// 16-byte-wide DistinctCell variant for inline Utf8 keys (and any other
+// 16-byte-key DISTINCT semantics that arrive). Same linear-scan dedup as
+// the int64 version; 64-entry inline cap; saturates silently after cap.
+// Callers pad unused bytes to zero (e.g. StringView's inline_data tail) —
+// equality is a flat 16-byte memcmp.
+struct DistinctCell16 {
+    std::uint32_t n;                              // live entries (≤ cap)
+    std::uint32_t overflow_seen;                  // inserts attempted past cap
+    std::uint8_t values[k_distinct_cell_cap * 16];   // 64 * 16 B (no align pad)
+
+    BOLT_FORCE_INLINE void init() noexcept {
+        n = 0; overflow_seen = 0;
+    }
+
+    BOLT_FORCE_INLINE bool saturated() const noexcept {
+        return n >= k_distinct_cell_cap;
+    }
+
+    // Insert a 16-byte value if not already present. Returns true if it
+    // was a NEW value, false on duplicate or saturation.
+    BOLT_FORCE_INLINE bool insert(const std::uint8_t value[16]) noexcept {
+        assert(value != nullptr);
+        assert(n <= k_distinct_cell_cap);
+        const std::uint32_t cur = n;
+        for (std::uint32_t i = 0; i < cur; ++i) {
+            if (std::memcmp(&values[i * 16], value, 16) == 0) return false;
+        }
+        if (cur >= k_distinct_cell_cap) {
+            overflow_seen += 1;
+            return false;
+        }
+        std::memcpy(&values[cur * 16], value, 16);
+        n = cur + 1;
+        assert(n <= k_distinct_cell_cap);
+        return true;
+    }
+};
+
+static_assert(sizeof(DistinctCell16) == 8 + k_distinct_cell_cap * 16,
+              "DistinctCell16 layout — packed (8B header + N*16B values)");
+
+// Free-function helpers — match the API shape described in the K-AGG-B plan
+// (some callers prefer C-style; the methods above are kept for parity with
+// DistinctCell).
+BOLT_FORCE_INLINE bool distinct_cell16_insert(DistinctCell16* c,
+                                              const std::uint8_t value[16]) noexcept {
+    assert(c != nullptr);
+    return c->insert(value);
+}
+BOLT_FORCE_INLINE void distinct_cell16_reset(DistinctCell16* c) noexcept {
+    assert(c != nullptr);
+    c->init();
+}
+
 struct DistinctCellArray {
     DistinctCell* cells;     // [n_aggs_distinct * entry_cap]
     std::uint32_t entry_cap; // rows per agg

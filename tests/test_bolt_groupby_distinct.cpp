@@ -101,4 +101,74 @@ TEST(BoltGroupbyDistinct, ArrayIndexingPerCellIndependent) {
     EXPECT_EQ(arr.cell_at(1, 1)->n, 0u);
 }
 
+// ---- DistinctCell16 (Phase-B: inline-Utf8 keys) ----------------------------
+
+namespace {
+void fill16(std::uint8_t out[16], std::uint8_t a, std::uint8_t b) noexcept {
+    std::memset(out, 0, 16);
+    out[0] = a; out[1] = b;
+}
+}  // namespace
+
+TEST(BoltGroupbyDistinct16, InsertNewAndDedupes) {
+    bolt::DistinctCell16 c{};
+    c.init();
+    std::uint8_t v[16];
+    fill16(v, 'A', 0); EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'B', 0); EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'C', 0); EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'D', 0); EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'E', 0); EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    // 3 duplicates — must all return false, n stays at 5.
+    fill16(v, 'A', 0); EXPECT_FALSE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'C', 0); EXPECT_FALSE(bolt::distinct_cell16_insert(&c, v));
+    fill16(v, 'E', 0); EXPECT_FALSE(bolt::distinct_cell16_insert(&c, v));
+    EXPECT_EQ(c.n, 5u);
+}
+
+// Two 16-byte payloads that share the first 8 bytes but differ in the tail
+// — exactly the StringView shape (length+prefix shared, inline_data tail
+// differs) that the chukonu Phase-A 8-byte dedup misclassifies as equal.
+// DistinctCell16 must compare all 16 bytes and keep them distinct.
+TEST(BoltGroupbyDistinct16, SharedFirst8BytesAreDistinct) {
+    bolt::DistinctCell16 c{};
+    c.init();
+    std::uint8_t a[16];
+    std::uint8_t b[16];
+    std::memset(a, 0, 16);
+    std::memset(b, 0, 16);
+    // Shared first 8 bytes: pretend it's StringView{length=9,prefix="alph"}.
+    const std::uint8_t shared[8] = {9, 0, 0, 0, 'a', 'l', 'p', 'h'};
+    std::memcpy(a,     shared, 8);
+    std::memcpy(b,     shared, 8);
+    // Diverging tails — "abet1" vs "abet2".
+    std::memcpy(a + 8, "abet1", 5);
+    std::memcpy(b + 8, "abet2", 5);
+    EXPECT_EQ(0, std::memcmp(a, b, 8));        // sanity: prefix collides
+    EXPECT_NE(0, std::memcmp(a, b, 16));       // sanity: full payload differs
+    EXPECT_TRUE(bolt::distinct_cell16_insert(&c, a));   // new
+    EXPECT_TRUE(bolt::distinct_cell16_insert(&c, b));   // new — not a dup
+    EXPECT_FALSE(bolt::distinct_cell16_insert(&c, a));  // dup of first
+    EXPECT_FALSE(bolt::distinct_cell16_insert(&c, b));  // dup of second
+    EXPECT_EQ(c.n, 2u);
+    EXPECT_EQ(c.overflow_seen, 0u);
+}
+
+TEST(BoltGroupbyDistinct16, SaturationMarksOverflow) {
+    bolt::DistinctCell16 c{};
+    c.init();
+    std::uint8_t v[16];
+    for (std::uint32_t i = 0; i < bolt::k_distinct_cell_cap; ++i) {
+        fill16(v, static_cast<std::uint8_t>(i >> 8),
+                  static_cast<std::uint8_t>(i & 0xFF));
+        EXPECT_TRUE(bolt::distinct_cell16_insert(&c, v));
+    }
+    EXPECT_TRUE(c.saturated());
+    EXPECT_EQ(c.n, bolt::k_distinct_cell_cap);
+    fill16(v, 0xFF, 0xFE);
+    EXPECT_FALSE(bolt::distinct_cell16_insert(&c, v));
+    EXPECT_EQ(c.overflow_seen, 1u);
+    EXPECT_EQ(c.n, bolt::k_distinct_cell_cap);
+}
+
 }  // namespace
