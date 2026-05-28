@@ -341,4 +341,133 @@ TEST(BoltGroupbyTyped, Utf8DistinctCount) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// K-AGG-A.3 - cross-morsel begin/ingest/finalize + selection-vector ingest.
+// ---------------------------------------------------------------------------
+namespace xmorsel_anon {
+using namespace bolt;
+}
+
+TEST(BoltGroupbyTypedXMorsel, ThreeMorselsSameAsOneShot) {
+    int64_t ks_all[] = {1, 2, 1, 2, 1, 3, 3, 2, 1, 4};
+    int64_t vs_all[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    constexpr int64_t N = 10;
+    bolt::Arena a_one;
+    uint32_t ng_one = 0;
+    bolt::BoltColumn ok_one[1], oa_one[1];
+    {
+        bolt::BoltColumn key = bolt::BoltColumn::make_flat(ks_all, nullptr, N, bolt::BoltType::Int64);
+        bolt::BoltColumn val = bolt::BoltColumn::make_flat(vs_all, nullptr, N, bolt::BoltType::Int64);
+        bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+        ASSERT_TRUE(bolt::groupby_agg_multi_key_typed(&key, 1, &val, 1, &spec, 1, N,
+                                                ok_one, oa_one, &ng_one, &a_one, 8));
+    }
+    bolt::Arena a;
+    bolt::GroupbyTypedState st{};
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(ks_all, nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(vs_all, nullptr, 0, bolt::BoltType::Int64);
+    bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 8));
+    const int64_t splits[3] = {4, 3, 3};
+    int64_t off = 0;
+    for (int s = 0; s < 3; ++s) {
+        bolt::BoltColumn k = bolt::BoltColumn::make_flat(ks_all + off, nullptr, splits[s], bolt::BoltType::Int64);
+        bolt::BoltColumn v = bolt::BoltColumn::make_flat(vs_all + off, nullptr, splits[s], bolt::BoltType::Int64);
+        bolt::groupby_agg_multi_key_typed_ingest(&st, &k, &v, nullptr, 0, splits[s]);
+        ASSERT_FALSE(st.oom);
+        off += splits[s];
+    }
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    EXPECT_EQ(ng, ng_one);
+    int64_t* k_one = static_cast<int64_t*>(ok_one[0].data);
+    int64_t* s_one = static_cast<int64_t*>(oa_one[0].data);
+    int64_t* k_x   = static_cast<int64_t*>(ok[0].data);
+    int64_t* s_x   = static_cast<int64_t*>(oa[0].data);
+    int64_t sum_one[8] = {0}, sum_x[8] = {0};
+    for (uint32_t i = 0; i < ng_one; ++i) sum_one[k_one[i]] = s_one[i];
+    for (uint32_t i = 0; i < ng;     ++i) sum_x[k_x[i]]     = s_x[i];
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(sum_one[i], sum_x[i]) << "k=" << i;
+}
+
+TEST(BoltGroupbyTypedXMorsel, SelectionVectorIngestSumsOnlySelected) {
+    int64_t ks[] = {1, 2, 1, 2, 1, 2, 1, 2};
+    int64_t vs[] = {10, 20, 30, 40, 50, 60, 70, 80};
+    uint32_t sel[] = {1, 3, 5, 7};
+    bolt::Arena a;
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(ks, nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(vs, nullptr, 0, bolt::BoltType::Int64);
+    bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 4));
+    bolt::BoltColumn k = bolt::BoltColumn::make_flat(ks, nullptr, 8, bolt::BoltType::Int64);
+    bolt::BoltColumn v = bolt::BoltColumn::make_flat(vs, nullptr, 8, bolt::BoltType::Int64);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k, &v, sel, 4, 8);
+    ASSERT_FALSE(st.oom);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    EXPECT_EQ(ng, 1u);
+    EXPECT_EQ(static_cast<int64_t*>(ok[0].data)[0], 2);
+    EXPECT_EQ(static_cast<int64_t*>(oa[0].data)[0], 200);
+}
+
+TEST(BoltGroupbyTypedXMorsel, MixedDenseAndSparseMorselsMergeCorrectly) {
+    bolt::Arena a;
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 4));
+    int64_t ks1[] = {1, 2, 1};
+    int64_t vs1[] = {10, 20, 30};
+    bolt::BoltColumn k1 = bolt::BoltColumn::make_flat(ks1, nullptr, 3, bolt::BoltType::Int64);
+    bolt::BoltColumn v1 = bolt::BoltColumn::make_flat(vs1, nullptr, 3, bolt::BoltType::Int64);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k1, &v1, nullptr, 0, 3);
+    int64_t ks2[] = {2, 99, 2};
+    int64_t vs2[] = {7, 0, 7};
+    uint32_t sel2[] = {0, 2};
+    bolt::BoltColumn k2 = bolt::BoltColumn::make_flat(ks2, nullptr, 3, bolt::BoltType::Int64);
+    bolt::BoltColumn v2 = bolt::BoltColumn::make_flat(vs2, nullptr, 3, bolt::BoltType::Int64);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k2, &v2, sel2, 2, 3);
+    ASSERT_FALSE(st.oom);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    EXPECT_EQ(ng, 2u);
+    int64_t sums[3] = {0, 0, 0};
+    int64_t* okp = static_cast<int64_t*>(ok[0].data);
+    int64_t* oap = static_cast<int64_t*>(oa[0].data);
+    for (uint32_t i = 0; i < ng; ++i) sums[okp[i]] = oap[i];
+    EXPECT_EQ(sums[1], 40);
+    EXPECT_EQ(sums[2], 34);
+}
+
+TEST(BoltGroupbyTypedXMorsel, AvgAccumulatesDenominatorAcrossMorsels) {
+    bolt::Arena a;
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Avg; spec.in_col = 0; spec.distinct = 0;
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 4));
+    int64_t ks[] = {1, 1};
+    int64_t v1[] = {2, 4};
+    int64_t v2[] = {6, 8};
+    bolt::BoltColumn k = bolt::BoltColumn::make_flat(ks, nullptr, 2, bolt::BoltType::Int64);
+    bolt::BoltColumn V1 = bolt::BoltColumn::make_flat(v1, nullptr, 2, bolt::BoltType::Int64);
+    bolt::BoltColumn V2 = bolt::BoltColumn::make_flat(v2, nullptr, 2, bolt::BoltType::Int64);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k, &V1, nullptr, 0, 2);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k, &V2, nullptr, 0, 2);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    EXPECT_EQ(ng, 1u);
+    EXPECT_DOUBLE_EQ(static_cast<double*>(oa[0].data)[0], 5.0);
+}
 }  // namespace

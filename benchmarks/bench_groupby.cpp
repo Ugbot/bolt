@@ -141,6 +141,59 @@ double bench_count_star_single_key(int64_t n) noexcept {
     return best_ns;
 }
 
+
+// K-AGG-A.3: cross-morsel begin/ingest/finalize at the same scale.
+// Slices the same input into kMorselSlices morsels and feeds them through
+// the begin/ingest/finalize API. Should match the one-shot floor within
+// a few percent.
+double bench_sum_int64_xmorsel(int64_t n) noexcept {
+    assert(n > 0);
+    constexpr int kMorselSlices = 16;
+    Arena setup;
+    int64_t* ks = setup.allocate_array<int64_t>(static_cast<size_t>(n));
+    int64_t* vs = setup.allocate_array<int64_t>(static_cast<size_t>(n));
+    assert(ks && vs);
+    for (int64_t i = 0; i < n; ++i) {
+        ks[i] = static_cast<int64_t>(i) % kCardinality;
+        vs[i] = i * 3 + 1;
+    }
+    BoltColumn key_desc = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn val_desc = BoltColumn::make_flat(vs, nullptr, 0, BoltType::Int64);
+    AggSpec spec{}; spec.kind = AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+
+    double best_ns = 1e30;
+    uint32_t groups = 0;
+    Arena work;
+    BoltColumn out_keys[1], out_aggs[1];
+    for (int it = 0; it < kMaxIters; ++it) {
+        work.reset();
+        GroupbyTypedState st{};
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = groupby_agg_multi_key_typed_begin(
+            &st, &work, &key_desc, 1, &val_desc, 1, &spec, 1, kCardinality);
+        assert(ok); (void)ok;
+        const int64_t slice = n / kMorselSlices;
+        int64_t off = 0;
+        for (int s = 0; s < kMorselSlices; ++s) {
+            const int64_t len = (s == kMorselSlices - 1) ? (n - off) : slice;
+            BoltColumn k = BoltColumn::make_flat(ks + off, nullptr, len, BoltType::Int64);
+            BoltColumn v = BoltColumn::make_flat(vs + off, nullptr, len, BoltType::Int64);
+            groupby_agg_multi_key_typed_ingest(&st, &k, &v, nullptr, 0, len);
+            assert(!st.oom);
+            off += len;
+        }
+        ok = groupby_agg_multi_key_typed_finalize(&st, out_keys, out_aggs, &groups);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        assert(ok); (void)ok;
+        double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        double per = ns / static_cast<double>(n);
+        if (per < best_ns) best_ns = per;
+    }
+    std::printf("  sum_i64_xmorsel         rows=%lld  groups=%u  slices=%d  ns/row=%.3f\n",
+                static_cast<long long>(n), groups, kMorselSlices, best_ns);
+    return best_ns;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -155,6 +208,7 @@ int main(int argc, char** argv) {
     const double s = bench_sum_int64_single_key(n);
     const double d = bench_sum_dec128_multi_key2(n);
     const double c = bench_count_star_single_key(n);
+    const double x = bench_sum_int64_xmorsel(n);
     // K-AGG-A floors (single-thread, AVX2, RelWithDebInfo). Specialized
     // single-key int64 path hits 0.13 ns/row in groupby_agg_int64; the typed
     // multi-key kernel here is the general fallback. K-AGG-A.1 follow-up:
@@ -163,5 +217,8 @@ int main(int argc, char** argv) {
     std::printf("  sum_i64_single_key   measured=%.3f ns/row   floor<=20.0\n", s);
     std::printf("  sum_dec128_multi_k2  measured=%.3f ns/row   floor<=30.0\n", d);
     std::printf("  count_star_single    measured=%.3f ns/row   floor<=20.0\n", c);
+    // K-AGG-A.3: cross-morsel must stay within 5% of one-shot.
+    std::printf("  sum_i64_xmorsel      measured=%.3f ns/row   (vs one-shot %.3f, ratio=%.2fx)\n",
+                x, s, (s > 0.0) ? (x / s) : 0.0);
     return 0;
 }
