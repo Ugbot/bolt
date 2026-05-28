@@ -341,4 +341,45 @@ TEST(BoltGroupbyTyped, Utf8DistinctCount) {
     }
 }
 
+// --- K-AGG-A.4-PREREQ: Utf8 agg_identity must encode a valid inline StringView.
+//
+// Before the fix `agg_identity(Min, Utf8)` returned {INT64_MAX, 0}, aliased as
+// a StringView with length = (INT64_MAX & 0xFFFFFFFF) = 0xFFFFFFFF — far above
+// the 12-byte inline cap. The very first `apply()` against that identity
+// asserted in `cur.length <= 12u`. In release builds NDEBUG hid the bug, but
+// the StringView was still malformed. This test asserts the encoded identity
+// is a well-formed inline StringView regardless of NDEBUG.
+TEST(BoltGroupbyTyped, Utf8AggIdentityIsValidInlineStringView) {
+    const GbCell16 id_min =
+        gb_detail::agg_identity(AggKind::Min, BoltType::Utf8);
+    const GbCell16 id_max =
+        gb_detail::agg_identity(AggKind::Max, BoltType::Utf8);
+    StringView sv_min{}, sv_max{};
+    std::memcpy(&sv_min, &id_min, sizeof(sv_min));
+    std::memcpy(&sv_max, &id_max, sizeof(sv_max));
+    // Inline invariant: length must be ≤ 12.
+    EXPECT_LE(sv_min.length, 12u);
+    EXPECT_LE(sv_max.length, 12u);
+    // MIN identity must be byte-lex-greater than any real ASCII string (a 12-
+    // byte all-0xFF inline view is the byte-lex max among inline StringViews
+    // built from ASCII input).
+    EXPECT_EQ(sv_min.length, 12u);
+    for (int i = 0; i < 4; ++i) EXPECT_EQ(static_cast<unsigned char>(sv_min.prefix[i]), 0xFFu);
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(static_cast<unsigned char>(sv_min.inline_data[i]), 0xFFu);
+    // MAX identity must be byte-lex-less than any real string — empty works.
+    EXPECT_EQ(sv_max.length, 0u);
+    // Round-trip through apply(): the identity must not assert and must be
+    // replaced by any real value on the very first application.
+    GbCell16 slot = id_min;
+    StringView v = sv_inline("apple", 5);
+    GbCell16 vc{};
+    std::memcpy(&vc, &v, sizeof(v));
+    gb_detail::apply(AggKind::Min, BoltType::Utf8, &slot, vc, /*valid=*/true);
+    StringView out{};
+    std::memcpy(&out, &slot, sizeof(out));
+    EXPECT_EQ(out.length, 5u);
+    EXPECT_EQ(std::memcmp(out.prefix, "appl", 4), 0);
+    EXPECT_EQ(out.inline_data[0], 'e');
+}
+
 }  // namespace
