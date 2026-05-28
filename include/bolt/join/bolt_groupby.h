@@ -635,17 +635,32 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
 }
 
 // Aggregate identity for a (kind, in-type) pair.
+//
+// Utf8 MIN/MAX identities (K-AGG-A.4-PREREQ):
+//   The cell aliases a 16-byte inline StringView {length, prefix[4], inline_data[8]}.
+//   `apply()` asserts `cur.length <= 12u` on every step (inline-only invariant),
+//   so identities MUST encode as valid inline StringViews.
+//   * MIN identity: a 12-byte all-0xFF string — byte-lex maximum of any real
+//     ASCII/UTF-8 value (real values are < 0xFF in every byte). Encoded as
+//     length=12, prefix=0xFF×4 ⇒ a = (0xFFFFFFFF<<32) | 12; inline_data=0xFF×8
+//     ⇒ b = 0xFFFFFFFFFFFFFFFF.
+//   * MAX identity: the empty string (length=0, all zeros) — byte-lex minimum.
+//     {0, 0} is already correct; share it with the Sum/Count path.
 BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
     const bool d = (t == BoltType::Decimal128);
+    const bool s = (t == BoltType::Utf8);
     switch (k) {
         case AggKind::Sum:
         case AggKind::Avg:
         case AggKind::Count:
         case AggKind::CountStar: return GbCell16{0, 0};
         case AggKind::Min:
+            if (s) return GbCell16{static_cast<int64_t>(0xFFFFFFFF0000000CULL),
+                                   static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL)};
             return d ? GbCell16{static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL), INT64_MAX}
                      : GbCell16{INT64_MAX, 0};
         case AggKind::Max:
+            if (s) return GbCell16{0, 0};   // empty string — byte-lex min
             return d ? GbCell16{0, INT64_MIN} : GbCell16{INT64_MIN, 0};
     }
     return GbCell16{0, 0};
