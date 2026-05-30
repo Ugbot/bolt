@@ -90,6 +90,21 @@ bolt_apply_hardening(bench_hashjoin_multi_match)
 bolt_apply_bench_tuning(bench_hashjoin_multi_match)
 
 # -----------------------------------------------------------------------
+# Card A2: typed all-shapes SwissTable join kernel microbench
+# (int64 fast path + composite + spilled-Utf8 key).
+# -----------------------------------------------------------------------
+add_executable(bench_joinkernel bench_joinkernel.cpp)
+target_link_libraries(bench_joinkernel PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_joinkernel PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_joinkernel)
+bolt_apply_bench_tuning(bench_joinkernel)
+
+# -----------------------------------------------------------------------
 # K-AGG-A: typed multi-key GROUP BY kernel microbench.
 # -----------------------------------------------------------------------
 add_executable(bench_groupby bench_groupby.cpp)
