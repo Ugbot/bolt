@@ -34,6 +34,9 @@
 #if __has_include("bolt/join/bolt_groupby.h")
     #include "bolt/join/bolt_groupby.h"
 #endif
+#if __has_include("bolt/join/bolt_joinkernel.h")
+    #include "bolt/join/bolt_joinkernel.h"
+#endif
 #if __has_include("bolt/wire/bolt_wire.h")
     #include "bolt/wire/bolt_wire.h"
 #endif

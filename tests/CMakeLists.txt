@@ -719,3 +719,10 @@ target_link_libraries(test_bolt_groupby_typed
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_groupby_typed)
 add_test(NAME test_bolt_groupby_typed COMMAND test_bolt_groupby_typed)
+
+# Typed all-shapes SwissTable join kernel (bolt/join/bolt_joinkernel.h).
+add_executable(test_bolt_joinkernel test_bolt_joinkernel.cpp)
+target_link_libraries(test_bolt_joinkernel
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_joinkernel)
+add_test(NAME test_bolt_joinkernel COMMAND test_bolt_joinkernel)
