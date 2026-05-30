@@ -840,9 +840,14 @@ struct alignas(64) BoltBatch {
     alignas(64) std::atomic<uint64_t> dirty_mask_hi;  // Columns 64-127
     // (Columns 128-255 rarely mutated, no atomic tracking needed)
 
-    // Epoch
-    uint8_t  read_epoch;
-    uint8_t  write_epoch;
+    // Epoch — atomic (W6.0): the tick-tock `swap()` flips these on the
+    // owner/apply thread while pinned readers concurrently pick an epoch
+    // to index `columns[epoch]`. Plain uint8_t raced on ARM (TSan). 1 byte,
+    // align 1 — no layout/ABI change. Accesses default to seq_cst via the
+    // implicit operator; hot sites may opt down to relaxed after profiling
+    // (the swap uses release / reader epoch-pick uses acquire — the race pair).
+    std::atomic<uint8_t> read_epoch;
+    std::atomic<uint8_t> write_epoch;
     uint64_t generation[2];
 
     // Dimensions
