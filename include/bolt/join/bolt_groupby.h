@@ -606,13 +606,44 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
     return out;
 }
 
-// Composite-key hash. xor + wyhash3 mix per cell-half — order-sensitive,
-// branch-free over key columns.
+// Card S: hash a Utf8 key's CONTENT bytes (length + bytes) so spilled and
+// inline views with equal content hash equal regardless of where the bytes
+// physically live. `base` resolves spilled (>12) views; ignored for inline.
+BOLT_FORCE_INLINE uint64_t hash_utf8_content(const StringView& sv,
+                                             const char* base) noexcept {
+    const char* p = kernels::utf8::sv_bytes(sv, base);
+    uint64_t h = swiss_mix_wyhash3(0x9E3779B97F4A7C15ULL ^
+                                   static_cast<uint64_t>(sv.length));
+    uint32_t i = 0;
+    for (; i + 8u <= sv.length; i += 8u) {
+        uint64_t chunk;
+        std::memcpy(&chunk, p + i, 8);
+        h = swiss_mix_wyhash3(h ^ chunk);
+    }
+    if (i < sv.length) {
+        uint64_t tail = 0;
+        std::memcpy(&tail, p + i, static_cast<size_t>(sv.length - i));
+        h = swiss_mix_wyhash3(h ^ tail);
+    }
+    return h;
+}
+
+// Composite-key hash. Utf8 keys hash by content bytes (Card S) so spilled
+// (>12-char) keys group by value; other types hash the 16-byte cell halves.
+// Order-sensitive mix over key columns.
 BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
                                       int64_t r) noexcept {
     assert(keys != nullptr || n_keys == 0);
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (uint32_t k = 0; k < n_keys; ++k) {
+        if (keys[k].type == BoltType::Utf8) {
+            StringView sv;
+            std::memcpy(&sv,
+                        &static_cast<const StringView*>(keys[k].data)[r], 16);
+            h = swiss_mix_wyhash3(h ^ hash_utf8_content(
+                sv, static_cast<const char*>(keys[k].str_overflow_base)));
+            continue;
+        }
         const GbCell16 c = read_cell16(keys[k], r);
         h ^= swiss_mix_wyhash3(static_cast<uint64_t>(c.a));
         h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(c.b));
@@ -620,14 +651,32 @@ BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
     return h;
 }
 
-// True if row `r`'s composite key matches the group at slot `gid` in keys_flat.
+// True if row `r`'s composite key matches the group stored at `gid`. Utf8 keys
+// compare by CONTENT bytes (Card S): the input row resolves via its column's
+// str_overflow_base, the stored representative via `stored_bases[k]` (the
+// groupby's per-key deep-copy buffer). Other types compare the cell halves.
 BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
                                    int64_t r, const GbCell16* keys_flat,
-                                   uint32_t gid) noexcept {
+                                   uint32_t gid,
+                                   char* const* stored_bases) noexcept {
     assert(keys != nullptr || n_keys == 0);
     assert(keys_flat != nullptr);
     const GbCell16* row = keys_flat + static_cast<size_t>(gid) * n_keys;
     for (uint32_t k = 0; k < n_keys; ++k) {
+        if (keys[k].type == BoltType::Utf8) {
+            StringView in_sv;
+            std::memcpy(&in_sv,
+                        &static_cast<const StringView*>(keys[k].data)[r], 16);
+            StringView st_sv;
+            std::memcpy(&st_sv, &row[k], 16);
+            if (in_sv.length != st_sv.length) return false;
+            if (in_sv.length == 0) continue;
+            const char* ib = kernels::utf8::sv_bytes(
+                in_sv, static_cast<const char*>(keys[k].str_overflow_base));
+            const char* sb = kernels::utf8::sv_bytes(st_sv, stored_bases[k]);
+            if (std::memcmp(ib, sb, in_sv.length) != 0) return false;
+            continue;
+        }
         const GbCell16 c = read_cell16(keys[k], r);
         if (c.a != row[k].a || c.b != row[k].b) return false;
     }
@@ -785,6 +834,16 @@ struct GroupbyTypedState {
     BoltType        agg_in_types[kGbMaxAggs];
     uint8_t         agg_in_scales[kGbMaxAggs];
 
+    // Card S: per-Utf8-key spilled-byte buffer. A spilled (>12-char) group key
+    // lives in the input column's overflow buffer, which is freed after the
+    // morsel; the stored representative key must own its bytes. On new-group
+    // insert we deep-copy spilled key bytes here and re-point the stored cell's
+    // offset; hash/equal resolve spilled keys by these bytes; finalize hands
+    // this base to the output column. nullptr for inline-only / non-Utf8 keys.
+    char*           key_str_buf[kGbMaxKeys];
+    size_t          key_str_used[kGbMaxKeys];
+    size_t          key_str_cap[kGbMaxKeys];
+
     Arena*          arena;
     uint32_t        cap;                // SwissTable capacity (== keys_flat / accums stride)
     uint32_t        entry_count;
@@ -903,6 +962,39 @@ inline bool groupby_agg_multi_key_typed_begin(
     state->entry_count      = 0;
     state->n_rows_in        = 0;
     state->oom              = false;
+    for (uint8_t k = 0; k < n_keys; ++k) {        // Card S: spilled-key buffers
+        state->key_str_buf[k]  = nullptr;
+        state->key_str_used[k] = 0;
+        state->key_str_cap[k]  = 0;
+    }
+    return true;
+}
+
+// Card S: append `len` spilled key bytes to key column k's deep-copy buffer,
+// growing geometrically in the arena (one realloc-and-copy per doubling; the
+// arena reclaims the old buffer at reset). Writes the byte offset to *out_off.
+// Returns false on OOM / 32-bit-offset overflow. Tiger Style: bounded, asserts.
+BOLT_FORCE_INLINE bool gb_key_str_append(GroupbyTypedState* state, uint32_t k,
+                                         const char* bytes, uint32_t len,
+                                         uint32_t* out_off) noexcept {
+    assert(state != nullptr && out_off != nullptr);
+    assert(bytes != nullptr || len == 0);
+    if (state->key_str_used[k] + len > state->key_str_cap[k]) {
+        size_t newcap = (state->key_str_cap[k] != 0) ? state->key_str_cap[k] * 2u
+                                                      : size_t{4096};
+        while (newcap < state->key_str_used[k] + len) newcap *= 2u;
+        char* nb = static_cast<char*>(state->arena->allocate(newcap, 16));
+        if (nb == nullptr) return false;
+        if (state->key_str_used[k] > 0) {
+            std::memcpy(nb, state->key_str_buf[k], state->key_str_used[k]);
+        }
+        state->key_str_buf[k] = nb;
+        state->key_str_cap[k] = newcap;
+    }
+    if (state->key_str_used[k] > 0xFFFFFFFFull) return false;
+    *out_off = static_cast<uint32_t>(state->key_str_used[k]);
+    std::memcpy(state->key_str_buf[k] + state->key_str_used[k], bytes, len);
+    state->key_str_used[k] += len;
     return true;
 }
 
@@ -938,7 +1030,8 @@ inline void groupby_agg_multi_key_typed_ingest(
         int32_t found = state->table->find(h);
         if (found >= 0 && !gb_detail::keys_equal(keys, n_keys, r,
                                                  state->keys_flat,
-                                                 static_cast<uint32_t>(found))) {
+                                                 static_cast<uint32_t>(found),
+                                                 state->key_str_buf)) {
             found = -1;
         }
         uint32_t slot;
@@ -949,8 +1042,27 @@ inline void groupby_agg_multi_key_typed_ingest(
             slot = state->entry_count++;
             if (!state->table->insert(h, slot)) { state->oom = true; return; }
             GbCell16* krow = state->keys_flat + static_cast<size_t>(slot) * n_keys;
-            for (uint32_t k = 0; k < n_keys; ++k)
+            for (uint32_t k = 0; k < n_keys; ++k) {
                 krow[k] = gb_detail::read_cell16(keys[k], r);
+                // Card S: deep-copy a spilled (>12-char) Utf8 key so the stored
+                // group representative owns its bytes — the input overflow
+                // buffer is freed after this morsel. hash/equal + finalize then
+                // resolve via the groupby's own per-key buffer.
+                if (keys[k].type == BoltType::Utf8) {
+                    StringView* sv = reinterpret_cast<StringView*>(&krow[k]);
+                    if (sv->length > 12u) {
+                        const char* sb = kernels::utf8::sv_bytes(*sv,
+                            static_cast<const char*>(keys[k].str_overflow_base));
+                        uint32_t off = 0;
+                        if (!gb_key_str_append(state, k, sb, sv->length, &off)) {
+                            state->oom = true;
+                            return;
+                        }
+                        sv->ref.buf_idx = 0;
+                        sv->ref.offset  = off;
+                    }
+                }
+            }
             for (uint32_t j = 0; j < n_aggs; ++j) {
                 const size_t off = static_cast<size_t>(j) * cap + slot;
                 state->accums[off] =
@@ -1011,6 +1123,10 @@ inline bool groupby_agg_multi_key_typed_finalize(
     for (uint8_t k = 0; k < n_keys; ++k) {
         out_keys[k] = BoltColumn::make_flat_alloc(out_n, state->key_types[k], arena);
         out_keys[k].decimal_scale = state->key_scales[k];
+        // Card S: spilled Utf8 group keys point into our deep-copy buffer; hand
+        // the base to the output column so the sink/sort resolves them (nullptr
+        // for non-Utf8 / inline-only keys, which need no base).
+        out_keys[k].str_overflow_base = state->key_str_buf[k];
         if (out_n > 0 && out_keys[k].data == nullptr) return false;
     }
     for (uint8_t j = 0; j < n_aggs; ++j) {
@@ -1203,12 +1319,20 @@ inline bool groupby_agg_multi_key_typed(
     // groupby_agg_int64 hits 0.13 ns/row that way). Specialization is
     // deferred to K-AGG-A.1 — see docs/research/design-log.md.
     uint32_t entry_count = 0;
+    // Card S: this one-shot path keeps stored keys pointing into the input
+    // columns (alive for the whole call), so a stored key's spilled-byte base
+    // IS the input column's base. (Multi-morsel stateful grouping deep-copies
+    // instead; see groupby_agg_multi_key_typed_ingest.)
+    char* in_bases[kGbMaxKeys];
+    for (uint8_t k = 0; k < n_keys; ++k)
+        in_bases[k] = static_cast<char*>(keys[k].str_overflow_base);
     for (int64_t r = 0; r < n_rows; ++r) {
         const uint64_t h = gb_detail::hash_keys(keys, static_cast<uint32_t>(n_keys), r);
         int32_t found = ht->find(h);
         if (found >= 0 && !gb_detail::keys_equal(keys, static_cast<uint32_t>(n_keys),
                                                  r, keys_flat,
-                                                 static_cast<uint32_t>(found))) {
+                                                 static_cast<uint32_t>(found),
+                                                 in_bases)) {
             found = -1;   // hash collision on different key — Tiger: drop row
         }
         uint32_t slot;
