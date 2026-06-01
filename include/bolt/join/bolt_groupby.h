@@ -579,7 +579,7 @@ struct AggSpec {
 };
 static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 
-inline constexpr uint32_t kGbMaxKeys  = 4;
+inline constexpr uint32_t kGbMaxKeys  = 8;   // was 4; TPC-H Q10 GROUP BYs 7 cols
 inline constexpr uint32_t kGbMaxAggs  = 16;
 inline constexpr uint32_t kGbEntryCap = 1u << 24;   // 16M groups hard cap
 
