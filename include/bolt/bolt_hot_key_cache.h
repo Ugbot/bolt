@@ -79,10 +79,23 @@ struct alignas(64) HotKeyCache {
         // single atomic so readers can load the whole metadata in
         // one op.
         std::atomic<uint64_t> key_tag;
+        // Seqlock sequence (W4) — the ABA-free torn-read guard. Even = stable,
+        // odd = write in progress. `insert` bumps it odd before the payload and
+        // even after; `lookup_copy` samples it before+after the copy and rejects
+        // the read unless it is unchanged. 32 bits never wraps within a copy
+        // window (the old 8-bit tag "version" could ABA-alias after 256 inserts
+        // if the reader was preempted mid-copy — the actual torn-read cause).
+        std::atomic<uint32_t> seq;
         // Access counter — relaxed atomic, bumped on every hit.
         std::atomic<uint64_t> access_count;
         // Layout generation at insert time. Stale layout → miss.
         uint64_t              layout_gen;
+        // Commit LSN of the cached row (the writer's monotonic version).
+        // `lookup_copy` rejects a slot whose commit_lsn is older than the
+        // caller's freshness horizon, so a cache that lags the authoritative
+        // store by a write is treated as a miss (caller reads the store)
+        // rather than serving a stale row. Written under the seqlock.
+        uint64_t              commit_lsn;
         // Row data copy.
         uint8_t               row_data[RowBytes];
     };
@@ -91,17 +104,30 @@ struct alignas(64) HotKeyCache {
     Slot    slots[Capacity];
     // Monotonic access-tick counter for LRU scoring.
     Sequence access_tick;
+    // Cache-global monotonic write counter. Its low 8 bits are stamped into
+    // every written tag's [7:0] "version" field — now a SECONDARY torn-read
+    // guard only. The PRIMARY guard is the per-slot 32-bit `Slot::seq` seqlock
+    // (even/odd), which is ABA-free. The 8-bit tag version is NOT: it aliases
+    // after 256 inserts, and a reader preempted mid-copy while 256 inserts land
+    // on its slot would see tag2==tag1 on a torn row — the bug `Slot::seq`
+    // fixes. Kept because the full-tag compare still cheaply rejects same-key
+    // re-inserts in the common (non-preempted) case.
+    alignas(64) std::atomic<uint64_t> write_seq;
 
     static constexpr uint32_t kMask = Capacity - 1;
+    static constexpr uint64_t kKeyMask48 = 0xFFFFFFFFFFFFull;
 
     BOLT_FORCE_INLINE void init() noexcept {
         for (uint32_t i = 0; i < Capacity; ++i) {
             slots[i].key_tag.store(0, std::memory_order_relaxed);
+            slots[i].seq.store(0, std::memory_order_relaxed);
             slots[i].access_count.store(0, std::memory_order_relaxed);
             slots[i].layout_gen = 0;
+            slots[i].commit_lsn = 0;
             std::memset(slots[i].row_data, 0, RowBytes);
         }
         access_tick.store_relaxed(0);
+        write_seq.store(0, std::memory_order_relaxed);
     }
 
     BOLT_FORCE_INLINE uint32_t bucket(uint64_t key_u64) const noexcept {
@@ -133,12 +159,86 @@ struct alignas(64) HotKeyCache {
         return nullptr;
     }
 
+    // Seqlock-validated copy. Like `lookup`, but copies the matched row's
+    // bytes into the caller's buffer under a seqlock re-check so a concurrent
+    // `insert` / `invalidate_key` overwriting the slot mid-copy is detected
+    // and reported as a miss (return false) rather than yielding a TORN row.
+    //
+    // Returning the raw `row_data` pointer (as `lookup` does) is unsafe for
+    // readers that then dereference it — the slot has no pin count, so a
+    // writer can overwrite it during the read. Callers that need the row
+    // bytes (the MarbleDB get path) MUST use this instead of `lookup`.
+    //
+    // Protocol: load key_tag (tag1, acquire); require occupied + not-writing
+    // + key match + layout_gen match + commit_lsn ≥ `min_commit_lsn`; memcpy
+    // `len` bytes; acquire-fence; re-load key_tag (tag2). Success iff
+    // tag2 == tag1 (the slot did not change identity/version during the copy).
+    // `len` must be ≤ RowBytes.
+    //
+    // `min_commit_lsn` is the caller's freshness horizon (e.g. the store's
+    // committed LSN at read start): a slot whose cached row predates it has
+    // been superseded by a newer committed write not yet reflected here, so
+    // it is reported as a miss and the caller reads the authoritative store.
+    BOLT_FORCE_INLINE bool lookup_copy(K key, uint64_t layout_gen,
+                                       uint64_t min_commit_lsn,
+                                       uint8_t* dst, uint32_t len) noexcept {
+        assert(dst != nullptr);
+        assert(len <= RowBytes);
+        const uint64_t ku = static_cast<uint64_t>(key);
+        uint32_t idx = bucket(ku);
+        for (uint32_t probe = 0; probe < kHotKeyProbeDist; ++probe) {
+            Slot& s = slots[idx];
+            const uint64_t tag1 = s.key_tag.load(std::memory_order_acquire);
+            const uint8_t  flags1 = static_cast<uint8_t>((tag1 >> 8) & 0xFFu);
+            if ((flags1 & kHotKeyFlagOccupied) == 0u) return false;
+            if ((flags1 & kHotKeyFlagWriting) != 0u) {
+                idx = (idx + 1) & kMask;
+                continue;
+            }
+            if ((tag1 >> 16) != (ku & kKeyMask48) ||
+                s.layout_gen != layout_gen) {
+                idx = (idx + 1) & kMask;
+                continue;
+            }
+            // Sample the seqlock sequence AFTER confirming the slot is stable
+            // (occupied, not writing, key+layout match). Odd here → a writer
+            // started since the tag1 load → treat as a miss. The acquire orders
+            // the row_data copy below after this sample.
+            const uint32_t s1 = s.seq.load(std::memory_order_acquire);
+            if ((s1 & 1u) != 0u) return false;   // write in progress → miss
+            // Freshness gate: the row read here is consistent (tag1/seq stable,
+            // so commit_lsn is from a completed insert, validated by s2 below).
+            if (s.commit_lsn < min_commit_lsn) return false;   // lagging → miss
+            std::memcpy(dst, s.row_data, len);
+            // Full barrier: an ACQUIRE fence only stops later ops from moving
+            // BEFORE it — it would NOT stop the row_data copy (prior loads)
+            // from sinking BELOW the tag2 reload on weak memory (ARM), which
+            // let a torn copy slip past the seqlock re-check. A seq_cst fence
+            // orders the copy strictly before tag2, so any concurrent
+            // overwrite is detected.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            // Re-validate: the per-slot sequence must be unchanged (and the
+            // full tag, for key identity). `s2 == s1` is the ABA-free guard —
+            // any insert that overlapped the copy bumped seq (odd then even, by
+            // 2), so s2 != s1 even when the wrappable tag "version" aliases.
+            const uint32_t s2 = s.seq.load(std::memory_order_acquire);
+            const uint64_t tag2 = s.key_tag.load(std::memory_order_acquire);
+            if (s2 == s1 && tag2 == tag1) {
+                s.access_count.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            return false;   // slot changed under us → treat as a miss
+        }
+        return false;
+    }
+
     // Insert a row into the cache, evicting the LRU victim if needed.
     // Caller is expected to gate this with their own access-count
     // tracker (promote only if threshold met). Single-writer contract
     // is NOT required — concurrent inserts on different slots are
     // fine; concurrent inserts on the same slot race via seqlock bits.
     BOLT_FORCE_INLINE void insert(K key, uint64_t layout_gen,
+                                   uint64_t commit_lsn,
                                    const uint8_t* row, uint32_t row_len) noexcept {
         assert(row != nullptr);
         assert(row_len <= RowBytes);
@@ -170,22 +270,46 @@ struct alignas(64) HotKeyCache {
             idx = (idx + 1) & kMask;
         }
         // Seqlock write: set writing bit, memcpy, clear writing bit +
-        // install final tag.
+        // install final tag. The tag carries a per-write version in [7:0]
+        // (cache-global monotonic) so `lookup_copy` detects a same-key
+        // overwrite that completed inside its copy window.
         Slot& v = slots[victim_idx];
-        const uint64_t write_tag =
-            ((ku & 0xFFFFFFFFFFFFu) << 16) |
-            (static_cast<uint64_t>(kHotKeyFlagWriting) << 8);
+        // Seqlock entry: bump the per-slot sequence ODD (write in progress).
+        // `lookup_copy` validates this is unchanged + even across its copy, so
+        // a concurrent insert is always detected — ABA-free, unlike the 8-bit
+        // tag "version" below which wraps after 256 inserts (a reader preempted
+        // mid-copy while 256 inserts land could see tag2==tag1 on a torn row).
+        const uint32_t s0 = v.seq.load(std::memory_order_relaxed);
+        v.seq.store(s0 + 1u, std::memory_order_relaxed);   // odd
+        const uint64_t ver =
+            (write_seq.fetch_add(1, std::memory_order_relaxed) + 1u) & 0xFFu;
+        const uint64_t key_bits = (ku & kKeyMask48) << 16;
+        const uint64_t write_tag = key_bits |
+            (static_cast<uint64_t>(kHotKeyFlagWriting) << 8) | ver;
         v.key_tag.store(write_tag, std::memory_order_release);
+        // StoreStore barrier: publish the seq-odd + WRITING tag BEFORE any
+        // slot-payload write. A release STORE only orders prior writes before
+        // itself — it does NOT stop these subsequent plain writes (layout_gen /
+        // commit_lsn / row_data) from being reordered ahead of it on weak memory
+        // (ARM). The release fence orders seq-odd + WRITING ahead of the payload
+        // writes, so any reader that observes a changed byte also observes a
+        // changed sequence (and its s2==s1 re-check fails → miss). Pairs with
+        // lookup_copy's seq_cst fence on the read side.
+        std::atomic_thread_fence(std::memory_order_release);
         v.layout_gen = layout_gen;
+        v.commit_lsn = commit_lsn;
         std::memcpy(v.row_data, row, row_len);
         if (row_len < RowBytes) {
             std::memset(v.row_data + row_len, 0, RowBytes - row_len);
         }
         v.access_count.store(1, std::memory_order_relaxed);
-        const uint64_t stable_tag =
-            ((ku & 0xFFFFFFFFFFFFu) << 16) |
-            (static_cast<uint64_t>(kHotKeyFlagOccupied) << 8);
+        const uint64_t stable_tag = key_bits |
+            (static_cast<uint64_t>(kHotKeyFlagOccupied) << 8) | ver;
+        // Both release-stores order the payload writes before themselves, so a
+        // reader acquiring either the OCCUPIED tag or the even sequence sees the
+        // complete row.
         v.key_tag.store(stable_tag, std::memory_order_release);
+        v.seq.store(s0 + 2u, std::memory_order_release);   // even: done
     }
 
     // Invalidate all entries for a layout_gen mismatch — used when an
@@ -277,6 +401,23 @@ struct alignas(64) AccessTracker {
             idx = (idx + 1) & kMask;
         }
         return 0;  // tracker full — caller treats as below threshold
+    }
+
+    // Read the current count for `key` WITHOUT incrementing it. Returns 0 if
+    // the key is absent. Used by a write-side promoter to decide whether a
+    // key is hot enough to cache, without polluting the access counts that
+    // the read side maintains.
+    BOLT_FORCE_INLINE uint32_t peek(K key) const noexcept {
+        const uint64_t ku = static_cast<uint64_t>(key);
+        uint32_t idx = static_cast<uint32_t>(hotkey_detail::mix64(ku)) & kMask;
+        for (uint32_t probe = 0; probe < 4; ++probe) {
+            const Slot& s = slots[idx];
+            const uint64_t existing = s.key.load(std::memory_order_acquire);
+            if (existing == ku) return s.count.load(std::memory_order_relaxed);
+            if (existing == 0u) return 0u;
+            idx = (idx + 1) & kMask;
+        }
+        return 0u;
     }
 
     BOLT_FORCE_INLINE void reset() noexcept {
