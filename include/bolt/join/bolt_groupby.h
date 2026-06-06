@@ -504,6 +504,33 @@ BOLT_FORCE_INLINE int sv_bytelex_compare(
     return kernels::utf8::sv_compare(a, a_base, b, b_base);
 }
 
+// Column compare of two StringView columns → int64 {0,1} (the engine's boolean
+// column), for the column-at-a-time expression evaluator's Utf8 predicates
+// (e.g. p_brand = 'Brand#12'). `op`: 0=eq 1=ne 2=lt 3=le 4=gt 5=ge. Spilled
+// (>12-byte) views resolve via the per-column base; inline views ignore it.
+// Each element runs the same length+prefix-screened sv_bytelex_compare the
+// per-row path uses, so ordering is identical. Caller owns `out`.
+BOLT_FORCE_INLINE void sv_cmp_col(
+        const StringView* BOLT_RESTRICT a, const char* a_base,
+        const StringView* BOLT_RESTRICT b, const char* b_base,
+        int64_t n, int op, int64_t* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0 && op >= 0 && op <= 5);
+    for (int64_t i = 0; i < n; ++i) {
+        const int c = sv_bytelex_compare(a[i], a_base, b[i], b_base);
+        int64_t r;
+        switch (op) {
+            case 0:  r = (c == 0); break;
+            case 1:  r = (c != 0); break;
+            case 2:  r = (c <  0); break;
+            case 3:  r = (c <= 0); break;
+            case 4:  r = (c >  0); break;
+            default: r = (c >= 0); break;
+        }
+        out[i] = r;
+    }
+}
+
 // Branch-free byte-lex MIN over two StringViews. Returns the smaller of
 // (cur, cand) under byte-lex order. Caller passes spilled bases (nullptr
 // when both views are known inline). Predicated select compiles to CMOV.

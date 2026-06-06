@@ -320,6 +320,30 @@ BOLT_FORCE_INLINE int64_t date32_filter_ne(
     return bolt::kernels::filter_ne<int32_t>(data, n, scalar, sel_out);
 }
 
+// ---------------------------------------------------------------------------
+// Unified int64-output EXTRACT — for the column-at-a-time expression evaluator
+// (chukonu represents EXTRACT results as int64). One pass; `field` selects:
+// 0=year 1=month(1..12) 2=day(1..31) 3=quarter(1..4). ~5 ns/row. Caller owns
+// `out`. Other fields (week/dow) keep their dedicated int32 kernels above.
+// ---------------------------------------------------------------------------
+BOLT_FORCE_INLINE void date32_extract_i64(
+        const int32_t* BOLT_RESTRICT days_in, int64_t n, int field,
+        int64_t* BOLT_RESTRICT out) noexcept {
+    assert((days_in != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0 && field >= 0 && field <= 3);
+    for (int64_t i = 0; i < n; ++i) {
+        const YMDDoy r = civil_from_days32(days_in[i]);
+        int64_t v;
+        switch (field) {
+            case 0:  v = r.y; break;
+            case 1:  v = r.m; break;
+            case 2:  v = r.d; break;
+            default: v = (static_cast<int64_t>(r.m) - 1) / 3 + 1; break;  // quarter
+        }
+        out[i] = v;
+    }
+}
+
 } // namespace date
 } // namespace kernels
 } // namespace bolt
