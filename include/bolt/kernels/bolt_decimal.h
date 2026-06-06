@@ -530,6 +530,71 @@ inline Decimal128SumCount decimal128_sum_count(
     return r;
 }
 
+// ============================================================================
+// Column-at-a-time decimal arithmetic — for the vectorized expression
+// evaluator (e.g. TPC-H revenue = l_extendedprice * (1 - l_discount) over
+// millions of rows). Scalar branchless bodies (see file header: AoS i128 has
+// no profitable SIMD permute), auto-vectorized where the compiler can.
+// Caller owns `out`. ~2-4 ns/row. Scale convention mirrors the scalar ops:
+// mul adds scales; add/sub rescale both operands to max(sa, sb).
+// ============================================================================
+
+// out[i] = a[i] * b[i]. Result scale = sa + sb (caller stamps the column meta).
+inline void d128_mul_col(const Decimal128* BOLT_RESTRICT a,
+                         const Decimal128* BOLT_RESTRICT b,
+                         int64_t n, Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = d128_mul(a[i], b[i]);
+}
+
+// out[i] = rescale(a,sa→t) ± rescale(b,sb→t), t = max(sa,sb). Result scale = t.
+inline void d128_add_col(const Decimal128* BOLT_RESTRICT a, int sa,
+                         const Decimal128* BOLT_RESTRICT b, int sb,
+                         int64_t n, Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const int t = (sa > sb) ? sa : sb;
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = d128_add(d128_rescale(a[i], sa, t), d128_rescale(b[i], sb, t));
+    }
+}
+
+inline void d128_sub_col(const Decimal128* BOLT_RESTRICT a, int sa,
+                         const Decimal128* BOLT_RESTRICT b, int sb,
+                         int64_t n, Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const int t = (sa > sb) ? sa : sb;
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = d128_sub(d128_rescale(a[i], sa, t), d128_rescale(b[i], sb, t));
+    }
+}
+
+// out[i] = (rescale(a,sa→t) CMP rescale(b,sb→t)) ? 1 : 0, into an int64 column
+// (the engine's boolean representation). `op`: 0=eq 1=ne 2=lt 3=le 4=gt 5=ge.
+inline void d128_cmp_col(const Decimal128* BOLT_RESTRICT a, int sa,
+                         const Decimal128* BOLT_RESTRICT b, int sb,
+                         int64_t n, int op, int64_t* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0 && op >= 0 && op <= 5);
+    const int t = (sa > sb) ? sa : sb;
+    for (int64_t i = 0; i < n; ++i) {
+        const int c = d128_cmp(d128_rescale(a[i], sa, t),
+                               d128_rescale(b[i], sb, t));
+        int64_t r = 0;
+        switch (op) {
+            case 0: r = (c == 0); break;
+            case 1: r = (c != 0); break;
+            case 2: r = (c <  0); break;
+            case 3: r = (c <= 0); break;
+            case 4: r = (c >  0); break;
+            default: r = (c >= 0); break;
+        }
+        out[i] = r;
+    }
+}
+
 }  // namespace decimal
 }  // namespace kernels
 }  // namespace bolt

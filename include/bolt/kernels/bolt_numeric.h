@@ -391,6 +391,80 @@ inline void div(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,
 }
 
 // ============================================================================
+// Elementwise comparison kernels — column op column → int64 {0,1} column.
+// Used by the column-at-a-time expression evaluator (a hash-join/agg input
+// `WHERE`/`SELECT` predicate over millions of rows). BOLT_RESTRICT + a tight
+// branch-predicated body auto-vectorize. Output is int64 0/1 (the engine's
+// boolean column representation), so And/Or/Not compose over the same buffers.
+// ~0.3-0.5 ns/row (memory-bound on two streams). Caller owns `out`.
+// ============================================================================
+
+#define BOLT_DEFINE_CMP(NAME, OP)                                              \
+template <typename T>                                                          \
+inline void NAME(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,           \
+                 int64_t n, int64_t* BOLT_RESTRICT out) noexcept {             \
+    assert(a != nullptr || n == 0);                                           \
+    assert(b != nullptr || n == 0);                                           \
+    assert(out != nullptr || n == 0);                                         \
+    assert(n >= 0);                                                            \
+    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] OP b[i]) ? 1 : 0;           \
+}
+
+BOLT_DEFINE_CMP(cmp_eq, ==)
+BOLT_DEFINE_CMP(cmp_ne, !=)
+BOLT_DEFINE_CMP(cmp_lt, <)
+BOLT_DEFINE_CMP(cmp_le, <=)
+BOLT_DEFINE_CMP(cmp_gt, >)
+BOLT_DEFINE_CMP(cmp_ge, >=)
+
+#undef BOLT_DEFINE_CMP
+
+// ============================================================================
+// Boolean column kernels — over int64 {0,1} columns (nonzero == true). The
+// column-at-a-time evaluator's And/Or/Not. ~0.3 ns/row. Caller owns `out`.
+// ============================================================================
+
+inline void logical_and(const int64_t* BOLT_RESTRICT a,
+                        const int64_t* BOLT_RESTRICT b,
+                        int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] != 0 && b[i] != 0) ? 1 : 0;
+}
+
+inline void logical_or(const int64_t* BOLT_RESTRICT a,
+                       const int64_t* BOLT_RESTRICT b,
+                       int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] != 0 || b[i] != 0) ? 1 : 0;
+}
+
+inline void logical_not(const int64_t* BOLT_RESTRICT a,
+                        int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] == 0) ? 1 : 0;
+}
+
+// Negate a numeric column (unary minus). ~0.2 ns/row.
+template <typename T>
+inline void negate(const T* BOLT_RESTRICT a, int64_t n,
+                   T* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<T>(-a[i]);
+}
+
+// Broadcast a scalar across a column (literal materialization). ~0.2 ns/row.
+template <typename T>
+inline void broadcast(T scalar, int64_t n, T* BOLT_RESTRICT out) noexcept {
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = scalar;
+}
+
+// ============================================================================
 // Cast kernels — saturating on narrowing, IEEE round-to-nearest for int↔float
 // ============================================================================
 
