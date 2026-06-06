@@ -1045,7 +1045,13 @@ inline void groupby_agg_multi_key_typed_ingest(
     assert(n_aggs >= 1 && n_aggs <= kGbMaxAggs);
 
     // Branch once outside the inner row loop: dense vs sparse iteration.
-    const bool sparse = (sel != nullptr && sel_len > 0);
+    // sel != nullptr ALWAYS means sparse (the morsel convention), even when
+    // sel_len == 0 (a filter that matched nothing in THIS morsel). The old
+    // `&& sel_len > 0` misread an empty-selection morsel as dense and ingested
+    // all n_rows — so a selective WHERE under GROUP BY aggregated unfiltered
+    // rows (caught by fuzz_vs_duckdb --tpch seed 3; Q1 hid it because its filter
+    // passes rows in every morsel).
+    const bool sparse = (sel != nullptr);
     const int64_t iter_n = sparse ? static_cast<int64_t>(sel_len) : n_rows;
     for (int64_t i = 0; i < iter_n; ++i) {
         const int64_t r = sparse ? static_cast<int64_t>(sel[i]) : i;
