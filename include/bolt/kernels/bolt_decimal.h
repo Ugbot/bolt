@@ -579,19 +579,15 @@ inline void d128_cmp_col(const Decimal128* BOLT_RESTRICT a, int sa,
     assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
     assert(n >= 0 && op >= 0 && op <= 5);
     const int t = (sa > sb) ? sa : sb;
+    // BRANCH-FREE: `op` is loop-invariant, so the (op==K) guards fold to compile-
+    // time constants and only the selected predicate survives — no per-row branch.
     for (int64_t i = 0; i < n; ++i) {
         const int c = d128_cmp(d128_rescale(a[i], sa, t),
                                d128_rescale(b[i], sb, t));
-        int64_t r = 0;
-        switch (op) {
-            case 0: r = (c == 0); break;
-            case 1: r = (c != 0); break;
-            case 2: r = (c <  0); break;
-            case 3: r = (c <= 0); break;
-            case 4: r = (c >  0); break;
-            default: r = (c >= 0); break;
-        }
-        out[i] = r;
+        out[i] = static_cast<int64_t>(
+            ((op == 0) & (c == 0)) | ((op == 1) & (c != 0)) |
+            ((op == 2) & (c <  0)) | ((op == 3) & (c <= 0)) |
+            ((op == 4) & (c >  0)) | ((op == 5) & (c >= 0)));
     }
 }
 

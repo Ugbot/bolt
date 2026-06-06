@@ -516,18 +516,14 @@ BOLT_FORCE_INLINE void sv_cmp_col(
         int64_t n, int op, int64_t* BOLT_RESTRICT out) noexcept {
     assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
     assert(n >= 0 && op >= 0 && op <= 5);
+    // BRANCH-FREE final map: `op` is loop-invariant so only one predicate term
+    // survives constant-folding (the byte compare itself screens length+prefix).
     for (int64_t i = 0; i < n; ++i) {
         const int c = sv_bytelex_compare(a[i], a_base, b[i], b_base);
-        int64_t r;
-        switch (op) {
-            case 0:  r = (c == 0); break;
-            case 1:  r = (c != 0); break;
-            case 2:  r = (c <  0); break;
-            case 3:  r = (c <= 0); break;
-            case 4:  r = (c >  0); break;
-            default: r = (c >= 0); break;
-        }
-        out[i] = r;
+        out[i] = static_cast<int64_t>(
+            ((op == 0) & (c == 0)) | ((op == 1) & (c != 0)) |
+            ((op == 2) & (c <  0)) | ((op == 3) & (c <= 0)) |
+            ((op == 4) & (c >  0)) | ((op == 5) & (c >= 0)));
     }
 }
 

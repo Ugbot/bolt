@@ -399,6 +399,8 @@ inline void div(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,
 // ~0.3-0.5 ns/row (memory-bound on two streams). Caller owns `out`.
 // ============================================================================
 
+// BRANCH-FREE: `a OP b` yields a 0/1 bool that we widen to int64 — the compiler
+// lowers it to a predicated setcc, no data-dependent branch (Pirk DaMoN 2014).
 #define BOLT_DEFINE_CMP(NAME, OP)                                              \
 template <typename T>                                                          \
 inline void NAME(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,           \
@@ -407,7 +409,8 @@ inline void NAME(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,           \
     assert(b != nullptr || n == 0);                                           \
     assert(out != nullptr || n == 0);                                         \
     assert(n >= 0);                                                            \
-    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] OP b[i]) ? 1 : 0;           \
+    for (int64_t i = 0; i < n; ++i)                                            \
+        out[i] = static_cast<int64_t>(a[i] OP b[i]);                           \
 }
 
 BOLT_DEFINE_CMP(cmp_eq, ==)
@@ -421,7 +424,9 @@ BOLT_DEFINE_CMP(cmp_ge, >=)
 
 // ============================================================================
 // Boolean column kernels — over int64 {0,1} columns (nonzero == true). The
-// column-at-a-time evaluator's And/Or/Not. ~0.3 ns/row. Caller owns `out`.
+// column-at-a-time evaluator's And/Or/Not. BRANCH-FREE: normalise to 0/1 with
+// `(x != 0)` (setne) then combine with BITWISE &/| (no short-circuit branch).
+// ~0.3 ns/row. Caller owns `out`.
 // ============================================================================
 
 inline void logical_and(const int64_t* BOLT_RESTRICT a,
@@ -429,7 +434,8 @@ inline void logical_and(const int64_t* BOLT_RESTRICT a,
                         int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
     assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
     assert(n >= 0);
-    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] != 0 && b[i] != 0) ? 1 : 0;
+    for (int64_t i = 0; i < n; ++i)
+        out[i] = static_cast<int64_t>((a[i] != 0) & (b[i] != 0));
 }
 
 inline void logical_or(const int64_t* BOLT_RESTRICT a,
@@ -437,14 +443,15 @@ inline void logical_or(const int64_t* BOLT_RESTRICT a,
                        int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
     assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
     assert(n >= 0);
-    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] != 0 || b[i] != 0) ? 1 : 0;
+    for (int64_t i = 0; i < n; ++i)
+        out[i] = static_cast<int64_t>((a[i] != 0) | (b[i] != 0));
 }
 
 inline void logical_not(const int64_t* BOLT_RESTRICT a,
                         int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
     assert((a != nullptr && out != nullptr) || n == 0);
     assert(n >= 0);
-    for (int64_t i = 0; i < n; ++i) out[i] = (a[i] == 0) ? 1 : 0;
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<int64_t>(a[i] == 0);
 }
 
 // Negate a numeric column (unary minus). ~0.2 ns/row.
