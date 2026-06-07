@@ -127,6 +127,14 @@ bolt_apply_hardening(bench_interval)
 bolt_apply_bench_tuning(bench_interval)
 
 # -----------------------------------------------------------------------
+# LSD radix sort vs merge argsort microbench — pure-int64-key fast path.
+# -----------------------------------------------------------------------
+add_executable(bench_radixsort bench_radixsort.cpp)
+target_link_libraries(bench_radixsort PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_radixsort)
+bolt_apply_bench_tuning(bench_radixsort)
+
+# -----------------------------------------------------------------------
 # Indirect multi-key sort + Top-K microbench (K-SORT-A)
 # Removed: bench_indirect_sort.cpp not present on this branch.
 # -----------------------------------------------------------------------

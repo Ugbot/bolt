@@ -12,6 +12,20 @@ bolt_apply_hardening(test_bolt_primitives)
 add_test(NAME test_bolt_primitives COMMAND test_bolt_primitives)
 
 # ZoneMap primitive — MarbleDB Wave 10.1 consolidation.
+# Byte/string hash primitive — bolt::hash_bytes (RDF term interner backbone).
+# Single scalar wyhash/xxh3-style block reader finalized through swiss_mix so
+# it composes with SwissTable. No SIMD divergence (predecessor join-corruption).
+add_executable(test_bolt_hash_bytes test_bolt_hash_bytes.cpp)
+target_link_libraries(test_bolt_hash_bytes
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_hash_bytes)
+add_test(NAME test_bolt_hash_bytes COMMAND test_bolt_hash_bytes)
+
+# ZoneMap primitive — MarbleDB Wave 10.1 consolidation.
 add_executable(test_bolt_zonemap test_bolt_zonemap.cpp)
 target_link_libraries(test_bolt_zonemap
     PRIVATE
@@ -105,6 +119,18 @@ target_link_libraries(test_bolt_topk
 )
 bolt_apply_hardening(test_bolt_topk)
 add_test(NAME test_bolt_topk COMMAND test_bolt_topk)
+
+# Explicit-comparator permutation merge sort — the std::sort replacement on
+# chukonu's ORDER BY / agg-spill / window hot paths (stable, no-alloc).
+add_executable(test_bolt_msort_perm test_bolt_msort_perm.cpp)
+target_link_libraries(test_bolt_msort_perm
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_msort_perm)
+add_test(NAME test_bolt_msort_perm COMMAND test_bolt_msort_perm)
 
 # HyperLogLog++ sketch — approximate COUNT(DISTINCT) / NDV estimation.
 add_executable(test_bolt_hll test_bolt_hll.cpp)
@@ -414,6 +440,39 @@ bolt_apply_hardening(test_bolt_setop)
 
 add_test(NAME test_bolt_setop COMMAND test_bolt_setop)
 
+# Indirect / argsort kernels — return a sorted index permutation (single
+# key + lexicographic multi-key) for the triple-store index build and
+# ORDER BY (sort perm, then gather columns). Stable, allocation-free.
+add_executable(test_bolt_argsort test_bolt_argsort.cpp)
+
+target_link_libraries(test_bolt_argsort
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_argsort)
+
+add_test(NAME test_bolt_argsort COMMAND test_bolt_argsort)
+
+# LSD radix sort — pure-int64-key fast path (direct value sort + indirect
+# permutation sort). The linear-time speed upgrade promised by bolt_argsort.h
+# for triple-store index build + single-int64-key ORDER BY. Scalar==SIMD
+# digit-extract parity is asserted (DigitExtractParity test).
+add_executable(test_bolt_radixsort test_bolt_radixsort.cpp)
+
+target_link_libraries(test_bolt_radixsort
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_radixsort)
+
+add_test(NAME test_bolt_radixsort COMMAND test_bolt_radixsort)
+
 add_executable(test_bolt_kmerge test_bolt_kmerge.cpp)
 
 target_link_libraries(test_bolt_kmerge
@@ -567,6 +626,15 @@ if(BOLT_BUILD_IO)
     bolt_apply_hardening(test_bolt_binsearch_crc32c)
     add_test(NAME test_bolt_binsearch_crc32c COMMAND test_bolt_binsearch_crc32c)
 endif()
+
+# Scan/scatter + CSR graph kernels — exclusive_scan / histogram / scatter
+# (bolt_scan.h) and csr_build / csr_expand (bolt_csr.h). The array + graph
+# primitives under chukonu's CSR adjacency build and 1-hop expand operators.
+add_executable(test_bolt_csr test_bolt_csr.cpp)
+target_link_libraries(test_bolt_csr
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csr)
+add_test(NAME test_bolt_csr COMMAND test_bolt_csr)
 
 # Variable-width payload column — Layer 1.1 of the parse / JSON / doc work.
 add_executable(test_bolt_var_column test_bolt_var_column.cpp)
