@@ -116,6 +116,11 @@ BOLT_FORCE_INLINE bool bytes_equal_simd(
         if (mask != all) return false;
         i += static_cast<uint32_t>(LANES);
     }
+#if BOLT_SIMD_AVX2
+    // Clear the upper 128 bits of all YMM regs before the SSE/scalar
+    // memcmp tail to dodge the AVX→non-AVX transition penalty.
+    _mm256_zeroupper();
+#endif
     if (i < n) return memcmp(a + i, b + i, n - i) == 0;
     return true;
 #else

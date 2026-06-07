@@ -173,6 +173,46 @@ TEST(BoltSetOp, Unbalanced) {
     check(set_union_distinct_sorted<int64_t>, ref_union_distinct, a, b, "ud");
 }
 
+// Adversarial perfectly-interleaved inputs — every step alternates which
+// pointer advances, the worst case for the (now branchless) two-pointer loop.
+// Exercises all four converted kernels against the std reference.
+TEST(BoltSetOp, AlternatingInterleave) {
+    // a = evens, b = odds → cmp alternates +/-, zero matches.
+    std::vector<int64_t> a, b;
+    for (int64_t x = 0; x < 256; x += 2) a.push_back(x);
+    for (int64_t x = 1; x < 256; x += 2) b.push_back(x);
+    check(set_intersect_sorted<int64_t>,     ref_intersect_distinct, a, b, "id");
+    check(set_intersect_all_sorted<int64_t>, ref_intersect_all,      a, b, "ia");
+    check(set_except_sorted<int64_t>,        ref_except_distinct,    a, b, "ed");
+    check(set_except_all_sorted<int64_t>,    ref_except_all,         a, b, "ea");
+
+    // Heavy interleave WITH matches + within-run duplicates on both sides.
+    std::vector<int64_t> c = {0, 1, 1, 2, 4, 4, 4, 5, 7, 8, 8};
+    std::vector<int64_t> d = {1, 2, 2, 3, 4, 6, 7, 7, 8};
+    check(set_intersect_sorted<int64_t>,     ref_intersect_distinct, c, d, "id2");
+    check(set_intersect_all_sorted<int64_t>, ref_intersect_all,      c, d, "ia2");
+    check(set_except_sorted<int64_t>,        ref_except_distinct,    c, d, "ed2");
+    check(set_except_all_sorted<int64_t>,    ref_except_all,         c, d, "ea2");
+}
+
+// Dedicated adversarial random fuzz with HIGH overlap probability — tight key
+// range so cmp==0 lands ~50% of the time (max branch-mispredict in the old
+// code) and the branchless rewrite must still match the std reference exactly.
+TEST(BoltSetOp, RandomOverlapHeavyFuzz) {
+    std::mt19937_64 rng(0xBADC0FFEE0DDF00DULL);
+    for (int trial = 0; trial < 300; ++trial) {
+        const size_t na = rng() % 300;
+        const size_t nb = rng() % 300;
+        const int64_t hi = 1 + (int64_t)(rng() % 12);  // very small → ~50% ties
+        auto a = mk_sorted(rng, na, 0, hi);
+        auto b = mk_sorted(rng, nb, 0, hi);
+        check(set_intersect_sorted<int64_t>,     ref_intersect_distinct, a, b, "id");
+        check(set_intersect_all_sorted<int64_t>, ref_intersect_all,      a, b, "ia");
+        check(set_except_sorted<int64_t>,        ref_except_distinct,    a, b, "ed");
+        check(set_except_all_sorted<int64_t>,    ref_except_all,         a, b, "ea");
+    }
+}
+
 TEST(BoltSetOp, Int32AndDouble) {
     // Smoke-test alternative T instantiations: int32 + double.
     std::vector<int32_t> a32 = {1, 2, 2, 3};

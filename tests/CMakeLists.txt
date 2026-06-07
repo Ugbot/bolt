@@ -440,6 +440,22 @@ bolt_apply_hardening(test_bolt_setop)
 
 add_test(NAME test_bolt_setop COMMAND test_bolt_setop)
 
+# Null-bitmap-aware filter kernels (SQL three-valued logic): cmp / cmp_scalar
+# with validity bitmaps, cmp_is_null / cmp_is_not_null, dense + sparse paths,
+# all-valid fast path == no-validity path.
+add_executable(test_bolt_filter_null test_bolt_filter_null.cpp)
+
+target_link_libraries(test_bolt_filter_null
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_filter_null)
+
+add_test(NAME test_bolt_filter_null COMMAND test_bolt_filter_null)
+
 # Indirect / argsort kernels — return a sorted index permutation (single
 # key + lexicographic multi-key) for the triple-store index build and
 # ORDER BY (sort perm, then gather columns). Stable, allocation-free.

@@ -152,7 +152,26 @@ BOLT_FORCE_INLINE float l2_pair_f32(
     size_t i = 0;
     float acc = 0.0f;
 #if BOLT_SIMD_AVX2
-    __m256 vacc = _mm256_setzero_ps();
+    // Four independent accumulators break the FMA loop-carried dep chain
+    // (~4-cyc latency, 0.5-cyc throughput) for ~2× on long dims. FP
+    // reassociation is acceptable here — Bolt-local kernel, not on a
+    // bit-exact SQL path.
+    __m256 vacc0 = _mm256_setzero_ps();
+    __m256 vacc1 = _mm256_setzero_ps();
+    __m256 vacc2 = _mm256_setzero_ps();
+    __m256 vacc3 = _mm256_setzero_ps();
+    for (; i + 32 <= D; i += 32) {
+        const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i));
+        const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8));
+        const __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
+        const __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24));
+        vacc0 = _mm256_fmadd_ps(d0, d0, vacc0);
+        vacc1 = _mm256_fmadd_ps(d1, d1, vacc1);
+        vacc2 = _mm256_fmadd_ps(d2, d2, vacc2);
+        vacc3 = _mm256_fmadd_ps(d3, d3, vacc3);
+    }
+    __m256 vacc = _mm256_add_ps(_mm256_add_ps(vacc0, vacc1),
+                                _mm256_add_ps(vacc2, vacc3));
     for (; i + 8 <= D; i += 8) {
         const __m256 va = _mm256_loadu_ps(a + i);
         const __m256 vb = _mm256_loadu_ps(b + i);
@@ -192,7 +211,20 @@ BOLT_FORCE_INLINE float ip_pair_f32(
     size_t i = 0;
     float acc = 0.0f;
 #if BOLT_SIMD_AVX2
-    __m256 vacc = _mm256_setzero_ps();
+    // Four independent accumulators break the FMA loop-carried dep chain.
+    // FP reassociation is acceptable here (Bolt-local kernel).
+    __m256 vacc0 = _mm256_setzero_ps();
+    __m256 vacc1 = _mm256_setzero_ps();
+    __m256 vacc2 = _mm256_setzero_ps();
+    __m256 vacc3 = _mm256_setzero_ps();
+    for (; i + 32 <= D; i += 32) {
+        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      vacc0);
+        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  vacc1);
+        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), vacc2);
+        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), vacc3);
+    }
+    __m256 vacc = _mm256_add_ps(_mm256_add_ps(vacc0, vacc1),
+                                _mm256_add_ps(vacc2, vacc3));
     for (; i + 8 <= D; i += 8) {
         const __m256 va = _mm256_loadu_ps(a + i);
         const __m256 vb = _mm256_loadu_ps(b + i);
@@ -228,9 +260,27 @@ BOLT_FORCE_INLINE float cosine_pair_f32(
     size_t i = 0;
     float dot = 0.0f, na = 0.0f, nb = 0.0f;
 #if BOLT_SIMD_AVX2
-    __m256 vdot = _mm256_setzero_ps();
-    __m256 vna  = _mm256_setzero_ps();
-    __m256 vnb  = _mm256_setzero_ps();
+    // Two independent accumulators per reduction target break the three
+    // FMA dep chains (dot / ‖a‖² / ‖b‖²). FP reassociation is acceptable
+    // here (Bolt-local kernel).
+    __m256 vdot0 = _mm256_setzero_ps(), vdot1 = _mm256_setzero_ps();
+    __m256 vna0  = _mm256_setzero_ps(), vna1  = _mm256_setzero_ps();
+    __m256 vnb0  = _mm256_setzero_ps(), vnb1  = _mm256_setzero_ps();
+    for (; i + 16 <= D; i += 16) {
+        const __m256 a0 = _mm256_loadu_ps(a + i);
+        const __m256 b0 = _mm256_loadu_ps(b + i);
+        const __m256 a1 = _mm256_loadu_ps(a + i + 8);
+        const __m256 b1 = _mm256_loadu_ps(b + i + 8);
+        vdot0 = _mm256_fmadd_ps(a0, b0, vdot0);
+        vdot1 = _mm256_fmadd_ps(a1, b1, vdot1);
+        vna0  = _mm256_fmadd_ps(a0, a0, vna0);
+        vna1  = _mm256_fmadd_ps(a1, a1, vna1);
+        vnb0  = _mm256_fmadd_ps(b0, b0, vnb0);
+        vnb1  = _mm256_fmadd_ps(b1, b1, vnb1);
+    }
+    __m256 vdot = _mm256_add_ps(vdot0, vdot1);
+    __m256 vna  = _mm256_add_ps(vna0,  vna1);
+    __m256 vnb  = _mm256_add_ps(vnb0,  vnb1);
     for (; i + 8 <= D; i += 8) {
         const __m256 va = _mm256_loadu_ps(a + i);
         const __m256 vb = _mm256_loadu_ps(b + i);

@@ -76,7 +76,31 @@ BOLT_FORCE_INLINE uint32_t l2_pair_u8(
     // x[2j+1])` per i32 lane; for sum-of-squares we feed (diff, diff)
     // so each lane is `sum(diff[2j]² + diff[2j+1]²)`. 16 elements
     // per iteration.
-    __m256i vacc = _mm256_setzero_si256();
+    // Four independent i32 accumulators break the loop-carried add chain
+    // (madd→add latency) so the pipeline can overlap iterations. They are
+    // exact integer sums, so reassociating them changes nothing.
+    __m256i vacc0 = _mm256_setzero_si256();
+    __m256i vacc1 = _mm256_setzero_si256();
+    __m256i vacc2 = _mm256_setzero_si256();
+    __m256i vacc3 = _mm256_setzero_si256();
+    for (; i + 64 <= D; i += 64) {
+        const __m256i d0 = _mm256_sub_epi16(
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i))),
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
+        const __m256i d1 = _mm256_sub_epi16(
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 16))),
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 16))));
+        const __m256i d2 = _mm256_sub_epi16(
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 32))),
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 32))));
+        const __m256i d3 = _mm256_sub_epi16(
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 48))),
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 48))));
+        vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(d0, d0));
+        vacc1 = _mm256_add_epi32(vacc1, _mm256_madd_epi16(d1, d1));
+        vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(d2, d2));
+        vacc3 = _mm256_add_epi32(vacc3, _mm256_madd_epi16(d3, d3));
+    }
     for (; i + 16 <= D; i += 16) {
         const __m128i va8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
         const __m128i vb8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
@@ -86,8 +110,10 @@ BOLT_FORCE_INLINE uint32_t l2_pair_u8(
         // vd16 lanes are i16 in [-255, 255]; madd squares + pairwise
         // sums into i32. Maxes out at 2 * 255² = 130050 per i32 lane
         // per iteration — fits in i32 for D ≤ 32k iterations.
-        vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(vd16, vd16));
+        vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(vd16, vd16));
     }
+    const __m256i vacc = _mm256_add_epi32(_mm256_add_epi32(vacc0, vacc1),
+                                          _mm256_add_epi32(vacc2, vacc3));
     // Horizontal sum of 8 i32 lanes.
     const __m128i lo = _mm256_castsi256_si128(vacc);
     const __m128i hi = _mm256_extracti128_si256(vacc, 1);
@@ -161,19 +187,23 @@ BOLT_FORCE_INLINE void l2_vertical_u8_accumulate(
         vst1q_u32(dists + i + 12, acc3);
     }
 #elif BOLT_SIMD_AVX2
-    const __m256i vq16 = _mm256_set1_epi16(static_cast<int16_t>(q_broadcast));
+    // Vertical accumulate needs PER-ELEMENT squares (each row i is an
+    // independent accumulator), so `madd` (which pairwise-sums adjacent
+    // lanes) is NOT usable here — that would merge rows i and i+1.
+    // Widen the u8 diff to i32 BEFORE squaring so the square is computed
+    // in 32-bit lanes. d ∈ [-255,255] ⇒ d² ≤ 65025, and the i32 square
+    // is always exact (no reliance on the d² < 2^16 invariant that the
+    // old `mullo_epi16` low-16-bits trick silently depended on).
+    const __m256i vq32 = _mm256_set1_epi32(static_cast<int32_t>(q_broadcast));
     for (; i + 16 <= n_vectors; i += 16) {
         const __m128i vx8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dim_col + i));
-        const __m256i vx16 = _mm256_cvtepu8_epi16(vx8);
-        const __m256i vd16 = _mm256_sub_epi16(vq16, vx16);
-        // Square + widen to i32. madd(diff, diff) collapses pairs;
-        // we need per-element squares — use mullo + extend.
-        const __m256i sq_lo = _mm256_mullo_epi16(vd16, vd16);
-        // Convert 16-lane i16 squares → two 8-lane i32 vectors.
-        const __m128i sq16_lo = _mm256_castsi256_si128(sq_lo);
-        const __m128i sq16_hi = _mm256_extracti128_si256(sq_lo, 1);
-        const __m256i sq32_lo = _mm256_cvtepu16_epi32(sq16_lo);
-        const __m256i sq32_hi = _mm256_cvtepu16_epi32(sq16_hi);
+        // Split the 16 u8 lanes into two 8-lane i32 vectors.
+        const __m256i vx32_lo = _mm256_cvtepu8_epi32(vx8);
+        const __m256i vx32_hi = _mm256_cvtepu8_epi32(_mm_srli_si128(vx8, 8));
+        const __m256i vd_lo = _mm256_sub_epi32(vq32, vx32_lo);
+        const __m256i vd_hi = _mm256_sub_epi32(vq32, vx32_hi);
+        const __m256i sq32_lo = _mm256_mullo_epi32(vd_lo, vd_lo);
+        const __m256i sq32_hi = _mm256_mullo_epi32(vd_hi, vd_hi);
         __m256i acc_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dists + i));
         __m256i acc_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dists + i + 8));
         acc_lo = _mm256_add_epi32(acc_lo, sq32_lo);

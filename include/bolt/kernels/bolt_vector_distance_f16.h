@@ -101,8 +101,33 @@ BOLT_FORCE_INLINE float l2_pair_f16(
     }
     acc = vaddvq_f32(vaddq_f32(acc_lo, acc_hi));
 #elif BOLT_SIMD_AVX2
-    // 8-lane f32 FMA over `_mm256_cvtph_ps`-promoted halves.
-    __m256 vacc = _mm256_setzero_ps();
+    // 8-lane f32 FMA over `_mm256_cvtph_ps`-promoted halves. Four
+    // independent accumulators break the FMA loop-carried dep chain for
+    // ~2× on long dims. FP reassociation is acceptable here (Bolt-local).
+    __m256 vacc0 = _mm256_setzero_ps();
+    __m256 vacc1 = _mm256_setzero_ps();
+    __m256 vacc2 = _mm256_setzero_ps();
+    __m256 vacc3 = _mm256_setzero_ps();
+    for (; i + 32 <= D; i += 32) {
+        const __m256 d0 = _mm256_sub_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i))),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
+        const __m256 d1 = _mm256_sub_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 8))),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 8))));
+        const __m256 d2 = _mm256_sub_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 16))),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 16))));
+        const __m256 d3 = _mm256_sub_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i + 24))),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 24))));
+        vacc0 = _mm256_fmadd_ps(d0, d0, vacc0);
+        vacc1 = _mm256_fmadd_ps(d1, d1, vacc1);
+        vacc2 = _mm256_fmadd_ps(d2, d2, vacc2);
+        vacc3 = _mm256_fmadd_ps(d3, d3, vacc3);
+    }
+    __m256 vacc = _mm256_add_ps(_mm256_add_ps(vacc0, vacc1),
+                                _mm256_add_ps(vacc2, vacc3));
     for (; i + 8 <= D; i += 8) {
         const __m256 va = _mm256_cvtph_ps(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));

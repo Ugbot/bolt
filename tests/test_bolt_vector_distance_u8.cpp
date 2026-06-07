@@ -110,6 +110,53 @@ TEST(BoltVectorDistanceU8, VerticalAccumulateMatchesPair) {
     }
 }
 
+// Scalar reference for the vertical accumulate: per-element square of
+// (q - col[i]) added into the running u32 accumulator. Independent of
+// the kernel — a kernel bug cannot paper over itself.
+uint32_t ref_vertical_one(uint32_t prev, uint8_t q, uint8_t x) {
+    const int32_t d = static_cast<int32_t>(q) - static_cast<int32_t>(x);
+    return prev + static_cast<uint32_t>(d * d);
+}
+
+// Bit-parity gate for the SIMD paths. Length 1021 is prime (NOT a
+// multiple of any lane count: 16/32/64) so both the vector body and the
+// scalar tail run. q and a column entry are forced to 0 and 255 so the
+// diff is 255 (>181) — the exact case the old `mullo_epi16` square would
+// have mis-handled had it not been backed by the d²<2^16 invariant. The
+// rest is seeded-random. SIMD output must equal an all-scalar recompute.
+TEST(BoltVectorDistanceU8, VerticalSimdBitParityWithLargeDiff) {
+    constexpr size_t N = 1021;            // prime length → body + tail
+    std::vector<uint8_t> col(N);
+    fill_random_u8(col, 0x5151);
+    col[0]     = 255u;                    // force a 255-diff vs q=0
+    col[N - 1] = 255u;                    // force a 255-diff in the tail
+    col[7]     = 200u;                    // diff 200 (>181) mid-body
+
+    const uint8_t q = 0u;
+    std::vector<uint32_t> got(N, 0u);
+    bolt::vec::l2_vertical_u8_accumulate(col.data(), q, got.data(), N);
+
+    for (size_t i = 0; i < N; ++i) {
+        const uint32_t want = ref_vertical_one(0u, q, col[i]);
+        ASSERT_EQ(got[i], want) << "i=" << i << " col=" << int(col[i]);
+    }
+}
+
+// Pair bit-parity gate over the multi-accumulator AVX2 path. Length 1021
+// exercises the 64-wide unroll, the 16-wide remainder, and the scalar
+// tail in one shot. Integer arithmetic → exact equality.
+TEST(BoltVectorDistanceU8, PairSimdBitParityMultiAccum) {
+    constexpr size_t D = 1021;            // prime → all three code paths
+    std::vector<uint8_t> a(D), b(D);
+    fill_random_u8(a, 0x9001);
+    fill_random_u8(b, 0x9002);
+    a[3] = 255u; b[3] = 0u;               // 255-diff inside the unroll
+    a[D - 1] = 0u; b[D - 1] = 255u;       // 255-diff in the scalar tail
+    const uint32_t got = bolt::vec::l2_pair_u8(a.data(), b.data(), D);
+    const uint32_t ref = ref_l2_u8(a, b);
+    EXPECT_EQ(got, ref);
+}
+
 TEST(BoltVectorDistanceU8, QuantizationRoundTrip) {
     // f32 → u8 → f32: round-trip error bounded by half-step of the
     // u8 quantisation grid.

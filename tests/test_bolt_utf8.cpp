@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -446,6 +447,46 @@ TEST_F(Utf8Test, SvBytelexMinMax_TailDisambiguation) {
     StringView mx = bolt::sv_bytelex_max(s4, nullptr, s6, nullptr);
     expect_sv_eq(mn, s4);
     expect_sv_eq(mx, s6);
+}
+
+// Scalar reference: plain bytewise equality (no SIMD, no early width
+// shortcut) — a kernel bug cannot paper over itself.
+static bool ref_bytes_equal(const char* a, const char* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+// Bit-parity gate for bytes_equal_simd. Length 1021 is prime → exercises
+// the SIMD body (16/32-lane) AND the scalar/memcmp tail. Random data with
+// a single planted mismatch swept across both the body and the tail; the
+// SIMD result must equal the all-scalar recompute at every position.
+TEST_F(Utf8Test, BytesEqualSimdParityBodyAndTail) {
+    constexpr uint32_t N = 1021;
+    std::vector<char> a(N), b(N);
+    std::mt19937 rng(0xB17E5);
+    std::uniform_int_distribution<int> dist(0, 255);
+    for (uint32_t i = 0; i < N; ++i) {
+        a[i] = static_cast<char>(dist(rng));
+        b[i] = a[i];                       // start fully equal
+    }
+    // Equal case.
+    EXPECT_TRUE(ku::bytes_equal_simd(a.data(), b.data(), N));
+    EXPECT_EQ(ref_bytes_equal(a.data(), b.data(), N), true);
+
+    // Sweep a single-byte mismatch across body + tail boundaries.
+    const uint32_t probes[] = {0u, 1u, 15u, 16u, 17u, 31u, 32u, 33u,
+                               512u, 1008u, 1019u, 1020u};
+    for (uint32_t p : probes) {
+        const char saved = b[p];
+        b[p] = static_cast<char>(saved ^ 0x01);     // flip one bit
+        const bool got = ku::bytes_equal_simd(a.data(), b.data(), N);
+        const bool ref = ref_bytes_equal(a.data(), b.data(), N);
+        EXPECT_EQ(got, ref) << "mismatch at p=" << p;
+        EXPECT_FALSE(got)   << "planted mismatch must be detected, p=" << p;
+        b[p] = saved;                                // restore
+    }
 }
 
 }  // namespace

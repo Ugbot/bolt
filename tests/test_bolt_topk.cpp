@@ -113,6 +113,58 @@ TEST(BoltTopK, ArgminI32_MinSentinel) {
     EXPECT_EQ(mn, INT32_MIN);
 }
 
+// Tie-break across the 4-lane split: [3,1,1,5] -> the FIRST minimum (index 1)
+// must win even though the equal value at index 2 lands in a different lane.
+TEST(BoltTopK, ArgminTieAcrossLanes) {
+    const int32_t i32[] = {3, 1, 1, 5};
+    int32_t mn_i = 0;
+    EXPECT_EQ(bolt::argmin_i32(i32, 4, &mn_i), 1u);
+    EXPECT_EQ(mn_i, 1);
+
+    const float f32[] = {3.0f, 1.0f, 1.0f, 5.0f};
+    float mn_f = 0.0f;
+    EXPECT_EQ(bolt::argmin_f32(f32, 4, &mn_f), 1u);
+    EXPECT_FLOAT_EQ(mn_f, 1.0f);
+
+    // Larger case where the global min appears at an index whose lane differs
+    // from the lane of an equal-valued later element (exercises the unrolled
+    // body + cross-lane lowest-index combine).
+    const int32_t big[] = {9, 9, 9, 9, 2, 2, 9, 9, 2, 2};
+    int32_t mn_b = 0;
+    EXPECT_EQ(bolt::argmin_i32(big, 10, &mn_b), 4u);  // first 2 is at index 4
+    EXPECT_EQ(mn_b, 2);
+}
+
+// Randomized parity: the 4-lane argmin must return the SAME (value, index) as a
+// plain serial strict-`<` scan for every length class (n%4 = 0,1,2,3) and many
+// duplicate values (forcing the tie-break path frequently).
+TEST(BoltTopK, ArgminFourLaneMatchesSerial) {
+    std::mt19937_64 rng(0xA12C0FFEEULL);
+    std::uniform_int_distribution<int32_t> d(0, 7);  // tiny range -> many ties
+    for (size_t n = 1; n <= 257; ++n) {
+        std::vector<int32_t> v(n);
+        for (auto& x : v) x = d(rng);
+        // Serial reference (first index wins on ties).
+        int32_t rmn = v[0]; size_t rmi = 0;
+        for (size_t i = 1; i < n; ++i)
+            if (v[i] < rmn) { rmn = v[i]; rmi = i; }
+        int32_t mn = 0;
+        const size_t mi = bolt::argmin_i32(v.data(), n, &mn);
+        EXPECT_EQ(mi, rmi) << "n=" << n;
+        EXPECT_EQ(mn, rmn) << "n=" << n;
+
+        // Float lane parity (NaN-free data -> serial == 4-lane bit-identical).
+        std::vector<float> vf(v.begin(), v.end());
+        float rmnf = vf[0]; size_t rmif = 0;
+        for (size_t i = 1; i < n; ++i)
+            if (vf[i] < rmnf) { rmnf = vf[i]; rmif = i; }
+        float mnf = 0.0f;
+        const size_t mif = bolt::argmin_f32(vf.data(), n, &mnf);
+        EXPECT_EQ(mif, rmif) << "n=" << n;
+        EXPECT_FLOAT_EQ(mnf, rmnf) << "n=" << n;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // topk_update_f32
 // ---------------------------------------------------------------------------

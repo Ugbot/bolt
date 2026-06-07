@@ -163,18 +163,19 @@ int64_t set_intersect_sorted(const T* BOLT_RESTRICT a, int64_t na,
         const T av = a[i];
         const T bv = b[j];
         const int cmp = setop_cmp3<T>(av, bv);
-        if (cmp == 0) {
-            const bool is_new = !have_last || setop_cmp3<T>(av, last) != 0;
-            out[k] = av;
-            k += static_cast<int64_t>(is_new);
-            last = av;
-            have_last = true;
-            ++i;
-            ++j;
-        } else {
-            i += static_cast<int64_t>(cmp < 0);
-            j += static_cast<int64_t>(cmp > 0);
-        }
+        // Branchless two-pointer: advance i on cmp<=0, j on cmp>=0 (both on
+        // tie). Same {<,=,>} → {i++, both++, j++} dispatch as the 3-way branch,
+        // but data-independent. Emit only on a match (cmp==0), deduped against
+        // the previous emitted key. The dedup state (`last`/`have_last`) updates
+        // only when we emit, exactly as the branched version did.
+        const bool match  = (cmp == 0);
+        const bool is_new = match && (!have_last || setop_cmp3<T>(av, last) != 0);
+        out[k] = av;                       // speculative store; consumed iff is_new
+        k += static_cast<int64_t>(is_new);
+        last = match ? av : last;
+        have_last = have_last | match;
+        i += static_cast<int64_t>(cmp <= 0);
+        j += static_cast<int64_t>(cmp >= 0);
     }
     return k;
 }
@@ -199,21 +200,19 @@ int64_t set_except_sorted(const T* BOLT_RESTRICT a, int64_t na,
         const T av = a[i];
         const T bv = b[j];
         const int cmp = setop_cmp3<T>(av, bv);
-        if (cmp < 0) {
-            const bool is_new = !have_last || setop_cmp3<T>(av, last) != 0;
-            out[k] = av;
-            k += static_cast<int64_t>(is_new);
-            last = av;
-            have_last = true;
-            ++i;
-        } else if (cmp == 0) {
-            // Skip a duplicates that equal current b[j]; do NOT advance j
-            // (subsequent equal a's would otherwise leak past as cmp<0
-            // emissions against the next b key).
-            ++i;
-        } else {
-            ++j;
-        }
+        // Branchless: i advances on cmp<=0 (both the emit case cmp<0 and the
+        // cancel case cmp==0), j advances only on cmp>0. Emit a[i] (deduped)
+        // only on the strict-less case. j is NOT advanced on a tie — matching
+        // the original comment: equal a-duplicates must keep cancelling against
+        // the same b[j] rather than leaking past as cmp<0 emissions.
+        const bool emit   = (cmp < 0);
+        const bool is_new = emit && (!have_last || setop_cmp3<T>(av, last) != 0);
+        out[k] = av;                       // speculative store; consumed iff is_new
+        k += static_cast<int64_t>(is_new);
+        last = emit ? av : last;
+        have_last = have_last | emit;
+        i += static_cast<int64_t>(cmp <= 0);
+        j += static_cast<int64_t>(cmp > 0);
     }
     while (i < na) {
         const T v = a[i++];
@@ -244,14 +243,14 @@ int64_t set_intersect_all_sorted(const T* BOLT_RESTRICT a, int64_t na,
         const T av = a[i];
         const T bv = b[j];
         const int cmp = setop_cmp3<T>(av, bv);
-        if (cmp == 0) {
-            out[k++] = av;
-            ++i;
-            ++j;
-        } else {
-            i += static_cast<int64_t>(cmp < 0);
-            j += static_cast<int64_t>(cmp > 0);
-        }
+        // Branchless: advance i on cmp<=0, j on cmp>=0 (both on tie). Emit one
+        // copy per matched pair (cmp==0). Identical {<,=,>} dispatch as the
+        // 3-way branch, data-independent.
+        const bool match = (cmp == 0);
+        out[k] = av;                       // speculative store; consumed iff match
+        k += static_cast<int64_t>(match);
+        i += static_cast<int64_t>(cmp <= 0);
+        j += static_cast<int64_t>(cmp >= 0);
     }
     return k;
 }
@@ -275,15 +274,14 @@ int64_t set_except_all_sorted(const T* BOLT_RESTRICT a, int64_t na,
         const T av = a[i];
         const T bv = b[j];
         const int cmp = setop_cmp3<T>(av, bv);
-        if (cmp < 0) {
-            out[k++] = av;
-            ++i;
-        } else if (cmp == 0) {
-            ++i;
-            ++j;
-        } else {
-            ++j;
-        }
+        // Branchless: i advances on cmp<=0 (emit case cmp<0 + cancel case
+        // cmp==0), j advances on cmp>=0 (cancel + skip). Emit a[i] only on the
+        // strict-less case. Same dispatch as the 3-way branch, data-independent.
+        const bool emit = (cmp < 0);
+        out[k] = av;                       // speculative store; consumed iff emit
+        k += static_cast<int64_t>(emit);
+        i += static_cast<int64_t>(cmp <= 0);
+        j += static_cast<int64_t>(cmp >= 0);
     }
     while (i < na) out[k++] = a[i++];
     return k;

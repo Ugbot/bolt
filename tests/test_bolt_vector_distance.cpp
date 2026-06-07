@@ -8,6 +8,9 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <random>
+#include <vector>
 
 namespace {
 
@@ -69,6 +72,42 @@ TEST(BoltVectorDistance, L2PairWideMatchesScalar) {
 
 // Vertical L2 accumulator across 3 dims. dim_col is column-major: each call
 // passes one row of the column-major slab. dists must be pre-zeroed.
+float ref_cosine_pair(const float* a, const float* b, size_t D) {
+    const float dot = ref_ip_pair(a, b, D);
+    const float na  = std::sqrt(ref_ip_pair(a, a, D));
+    const float nb  = std::sqrt(ref_ip_pair(b, b, D));
+    const float denom = na * nb;
+    return (denom > 0.0f) ? (dot / denom) : 0.0f;
+}
+
+void fill_random_f32(std::vector<float>& v, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    for (auto& x : v) x = dist(rng);
+}
+
+// Parity gate for the 4-way multi-accumulator AVX2 pair kernels. Length
+// 1021 is prime → it exercises the 32-wide unroll, the 8-wide remainder
+// body, AND the scalar tail simultaneously. FP reassociation is allowed
+// here (Bolt-local), so the gate is close-match (relative tol) against a
+// left-to-right scalar recompute, not bit-identical.
+TEST(BoltVectorDistance, PairMultiAccumMatchesScalarPrimeLen) {
+    constexpr size_t D = 1021;
+    std::vector<float> a(D), b(D);
+    fill_random_f32(a, 0x1111);
+    fill_random_f32(b, 0x2222);
+
+    const float l2_ref = ref_l2_pair(a.data(), b.data(), D);
+    const float ip_ref = ref_ip_pair(a.data(), b.data(), D);
+    const float cs_ref = ref_cosine_pair(a.data(), b.data(), D);
+
+    EXPECT_NEAR(bolt::l2_pair_f32(a.data(), b.data(), D), l2_ref,
+                std::abs(l2_ref) * 1e-4f + 1e-3f);
+    EXPECT_NEAR(bolt::ip_pair_f32(a.data(), b.data(), D), ip_ref,
+                std::abs(ip_ref) * 1e-4f + 1e-3f);
+    EXPECT_NEAR(bolt::cosine_pair_f32(a.data(), b.data(), D), cs_ref, 1e-4f);
+}
+
 TEST(BoltVectorDistance, VerticalL2AccumulateAcross3Dims) {
     constexpr size_t N = 4;
     constexpr size_t D = 3;

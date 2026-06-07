@@ -101,6 +101,28 @@ TEST(BoltVectorDistanceF16, L2PairMatchesF32RefAt1536) {
     EXPECT_NEAR(got, ref, ref * 5e-3f);
 }
 
+TEST(BoltVectorDistanceF16, L2PairMultiAccumPrimeLen) {
+    // Prime length 1021 forces the 32-wide multi-accumulator unroll, the
+    // 8-wide remainder body, AND the scalar tail to all run. FP
+    // reassociation is allowed (Bolt-local), so the gate is close-match
+    // against the f32 reference on the f16-rounded input.
+    constexpr size_t D = 1021;
+    std::vector<float> a(D), b(D);
+    fill_random(a, 0x7A1A);
+    fill_random(b, 0x7B2B);
+
+    const auto a_q = f32_via_f16(a);
+    const auto b_q = f32_via_f16(b);
+    const float ref = ref_l2(a_q, b_q);
+
+    std::vector<uint16_t> a_f16(D), b_f16(D);
+    bolt::vec::quantise_f32_to_f16(a.data(), a_f16.data(), D);
+    bolt::vec::quantise_f32_to_f16(b.data(), b_f16.data(), D);
+
+    const float got = bolt::vec::l2_pair_f16(a_f16.data(), b_f16.data(), D);
+    EXPECT_NEAR(got, ref, ref * 5e-3f);
+}
+
 TEST(BoltVectorDistanceF16, ZoneWalkL2F16PruneAt384) {
     // f16 zone-walk: mirrors MarbleDB's f32 zone_walk_l2_with_prune
     // contract. Two probes — prune fires (returns -1) vs. prune does

@@ -160,27 +160,96 @@ template <typename T>
 inline accum_t<T> sum(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     assert(data != nullptr || n == 0);
     assert(n >= 0);
-    accum_t<T> s = accum_t<T>{0};
-    for (int64_t i = 0; i < n; ++i) s += static_cast<accum_t<T>>(data[i]);
-    return s;
+    using A = accum_t<T>;
+    if constexpr (std::is_integral_v<T>) {
+        // Integer add is associative → 4 independent accumulators give a
+        // BYTE-IDENTICAL result to the serial sum (any grouping of integer
+        // additions yields the same value, including on wrap-around since
+        // two's-complement add is associative modulo 2^width). Splitting the
+        // single serial dependency chain into 4 lets the OoO core overlap the
+        // adds. The scalar tail folds the remainder into lane 0, and the final
+        // combine reduces left-to-right (a0+a1+a2+a3) — order is irrelevant for
+        // integers, so the bits match the old `s += data[i]` loop exactly.
+        A a0 = A{0}, a1 = A{0}, a2 = A{0}, a3 = A{0};
+        int64_t i = 0;
+        const int64_t n4 = n & ~int64_t{3};
+        for (; i < n4; i += 4) {
+            a0 += static_cast<A>(data[i + 0]);
+            a1 += static_cast<A>(data[i + 1]);
+            a2 += static_cast<A>(data[i + 2]);
+            a3 += static_cast<A>(data[i + 3]);
+        }
+        for (; i < n; ++i) a0 += static_cast<A>(data[i]);
+        assert(i == n);
+        return (a0 + a1) + (a2 + a3);
+    } else {
+        // DEFERRED: floating-point sum is NOT reassociated. 4-accumulator
+        // splitting changes the order of FP additions, which changes the
+        // last-ULP result. TPC-H sums are golden-contractual, so flipping this
+        // needs a gated, separately-validated decision. Keep the serial chain.
+        A s = A{0};
+        for (int64_t i = 0; i < n; ++i) s += static_cast<A>(data[i]);
+        return s;
+    }
 }
 
 template <typename T>
 inline T min(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     assert(data != nullptr);
     assert(n > 0);
-    T m = data[0];
-    for (int64_t i = 1; i < n; ++i) m = (data[i] < m) ? data[i] : m;
-    return m;
+    if constexpr (std::is_integral_v<T>) {
+        // Integer min is associative + commutative with no rounding, so 4
+        // independent lanes combined left-to-right are BYTE-IDENTICAL to the
+        // serial scan. (FP min via `<`-select is left serial below: NaN makes
+        // the select non-associative, which could change which value/bits win
+        // vs the golden serial order.)
+        T m0 = data[0], m1 = data[0], m2 = data[0], m3 = data[0];
+        int64_t i = 0;
+        const int64_t n4 = n & ~int64_t{3};
+        for (; i < n4; i += 4) {
+            m0 = (data[i + 0] < m0) ? data[i + 0] : m0;
+            m1 = (data[i + 1] < m1) ? data[i + 1] : m1;
+            m2 = (data[i + 2] < m2) ? data[i + 2] : m2;
+            m3 = (data[i + 3] < m3) ? data[i + 3] : m3;
+        }
+        for (; i < n; ++i) m0 = (data[i] < m0) ? data[i] : m0;
+        assert(i == n);
+        const T a = (m1 < m0) ? m1 : m0;
+        const T b = (m3 < m2) ? m3 : m2;
+        return (b < a) ? b : a;
+    } else {
+        T m = data[0];
+        for (int64_t i = 1; i < n; ++i) m = (data[i] < m) ? data[i] : m;
+        return m;
+    }
 }
 
 template <typename T>
 inline T max(const T* BOLT_RESTRICT data, int64_t n) noexcept {
     assert(data != nullptr);
     assert(n > 0);
-    T m = data[0];
-    for (int64_t i = 1; i < n; ++i) m = (data[i] > m) ? data[i] : m;
-    return m;
+    if constexpr (std::is_integral_v<T>) {
+        // Integer max: same associative/commutative argument as min above →
+        // BYTE-IDENTICAL to the serial scan. FP max stays serial (NaN).
+        T m0 = data[0], m1 = data[0], m2 = data[0], m3 = data[0];
+        int64_t i = 0;
+        const int64_t n4 = n & ~int64_t{3};
+        for (; i < n4; i += 4) {
+            m0 = (data[i + 0] > m0) ? data[i + 0] : m0;
+            m1 = (data[i + 1] > m1) ? data[i + 1] : m1;
+            m2 = (data[i + 2] > m2) ? data[i + 2] : m2;
+            m3 = (data[i + 3] > m3) ? data[i + 3] : m3;
+        }
+        for (; i < n; ++i) m0 = (data[i] > m0) ? data[i] : m0;
+        assert(i == n);
+        const T a = (m1 > m0) ? m1 : m0;
+        const T b = (m3 > m2) ? m3 : m2;
+        return (b > a) ? b : a;
+    } else {
+        T m = data[0];
+        for (int64_t i = 1; i < n; ++i) m = (data[i] > m) ? data[i] : m;
+        return m;
+    }
 }
 
 template <typename T>

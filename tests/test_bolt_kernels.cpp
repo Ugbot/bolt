@@ -118,6 +118,68 @@ TEST(BoltKernels, MinMaxInt64) {
     EXPECT_EQ(max<int64_t>(data, 5), 9);
 }
 
+// 4-accumulator integer sum must be byte-identical to a serial reference for
+// random data of every length class (including n%4 tails). Negative values and
+// the full int range exercise two's-complement wrap (still associative).
+TEST(BoltKernels, SumInt64FourAccumMatchesSerial) {
+    std::mt19937_64 rng(0x5044ACC123ULL ^ 0x9E3779B97F4A7C15ULL);
+    std::uniform_int_distribution<int64_t> d(
+        std::numeric_limits<int64_t>::min() / 4,
+        std::numeric_limits<int64_t>::max() / 4);
+    for (int64_t n : {0, 1, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33, 127, 1000, 4097}) {
+        std::vector<int64_t> v(n);
+        for (auto& x : v) x = d(rng);
+        int64_t ref = 0;
+        for (int64_t x : v) ref += x;  // serial reference
+        const int64_t* p = v.empty() ? nullptr : v.data();
+        EXPECT_EQ(sum<int64_t>(p, n), ref) << "n=" << n;
+    }
+}
+
+TEST(BoltKernels, SumInt32FourAccumMatchesSerial) {
+    std::mt19937_64 rng(0xABCDEF0123456789ULL);
+    std::uniform_int_distribution<int32_t> d(-1000000, 1000000);
+    for (int64_t n : {0, 1, 3, 4, 6, 100, 4099}) {
+        std::vector<int32_t> v(n);
+        for (auto& x : v) x = d(rng);
+        int64_t ref = 0;
+        for (int32_t x : v) ref += static_cast<int64_t>(x);
+        const int32_t* p = v.empty() ? nullptr : v.data();
+        EXPECT_EQ(sum<int32_t>(p, n), ref) << "n=" << n;
+    }
+}
+
+// Integer min/max 4-accumulator path must equal the serial scan exactly.
+TEST(BoltKernels, MinMaxInt64FourAccumMatchesSerial) {
+    std::mt19937_64 rng(0x1234ABCD9999ULL);
+    std::uniform_int_distribution<int64_t> d(-1000000000LL, 1000000000LL);
+    for (int64_t n : {1, 2, 3, 4, 5, 8, 9, 31, 32, 33, 1000, 4099}) {
+        std::vector<int64_t> v(n);
+        for (auto& x : v) x = d(rng);
+        int64_t rmin = v[0], rmax = v[0];
+        for (int64_t x : v) { rmin = (x < rmin) ? x : rmin;
+                              rmax = (x > rmax) ? x : rmax; }
+        EXPECT_EQ(min<int64_t>(v.data(), n), rmin) << "n=" << n;
+        EXPECT_EQ(max<int64_t>(v.data(), n), rmax) << "n=" << n;
+    }
+}
+
+// Float/double sum is intentionally NOT reassociated — assert it still equals
+// the plain serial left-to-right accumulation bit-for-bit (guards against an
+// accidental future 4-accum split breaking the golden contract).
+TEST(BoltKernels, SumFloatNotReassociated) {
+    std::mt19937_64 rng(0xF10A7);
+    std::uniform_real_distribution<double> d(-1e6, 1e6);
+    for (int64_t n : {1, 4, 5, 8, 33, 1000, 4099}) {
+        std::vector<double> v(n);
+        for (auto& x : v) x = d(rng);
+        double ref = 0.0;
+        for (double x : v) ref += x;  // serial, same order as the kernel
+        const double got = sum<double>(v.data(), n);
+        EXPECT_EQ(std::memcmp(&got, &ref, sizeof(double)), 0) << "n=" << n;
+    }
+}
+
 TEST(BoltKernels, CountIsN) {
     const int32_t data[] = {0, 0, 0};
     EXPECT_EQ(count<int32_t>(data, 3), 3);
