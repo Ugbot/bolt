@@ -390,11 +390,34 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     return total;
 }
 
-/// Parse a wire blob into out + arena. Returns false on any validation error.
-inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
-                                  BoltBatch* out, Arena* arena) noexcept {
+namespace detail {
+
+// Materialize a [p+off, off+len) wire span into a BoltColumn buffer pointer.
+//   kView == false  → copy into `arena` (owning, aligned) — bolt_wire_deserialize.
+//   kView == true   → ALIAS the source bytes in place (zero-copy) — bolt_wire_view.
+// The view variant returns a mutable pointer into a const buffer: the const_cast
+// is sound ONLY because every view consumer treats the column as read-only and
+// copies OUT of it (e.g. MarbleDB's memtable apply memcpy's into the zone). The
+// aliased bytes carry the source's alignment, NOT kWireAlign — consumers must
+// memcpy rather than reinterpret as a typed array. `len == 0` ⇒ nullptr.
+template <bool kView>
+BOLT_FORCE_INLINE void* wire_span(const uint8_t* p, uint64_t off, uint64_t len,
+                                  Arena* arena) noexcept {
+    if (len == 0u) return nullptr;
+    if (kView) return const_cast<void*>(static_cast<const void*>(p + off));
+    return arena->copy_into(p + off, len, kWireAlign);
+}
+
+}  // namespace detail
+
+/// Shared parse for bolt_wire_deserialize (kView=false, copies into `arena`) and
+/// bolt_wire_view (kView=true, zero-copy alias into `buf`; `arena` may be null).
+/// Returns false on any validation error.
+template <bool kView>
+inline bool bolt_wire_parse(const void* buf, size_t buf_len,
+                            BoltBatch* out, Arena* arena) noexcept {
     assert(out != nullptr);
-    assert(arena != nullptr);
+    assert(kView || arena != nullptr);
 
     if (buf == nullptr || buf_len < kWireHeaderSize) return false;
     const uint8_t* p = static_cast<const uint8_t*>(buf);
@@ -469,7 +492,7 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
         uint8_t* validity = nullptr;
         bool all_valid = true;
         if (l0) {
-            void* v = arena->copy_into(p + o0, l0, kWireAlign);
+            void* v = detail::wire_span<kView>(p, o0, l0, arena);
             if (!v) return false;
             validity = static_cast<uint8_t*>(v);
             all_valid = false;
@@ -493,28 +516,32 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
             } else {
                 c.type_size_bytes = static_cast<uint16_t>(type_size(f.type));
             }
-            c.arena   = arena;
+            c.arena   = arena;   // nullptr for a view (non-owning, read-only)
             c.validity = validity;
             c.stats.all_valid = all_valid;
             if (l1) {
-                c.data = arena->copy_into(p + o1, l1, kWireAlign);
+                c.data = detail::wire_span<kView>(p, o1, l1, arena);
                 if (!c.data) return false;
             }
             out->columns[0][i] = c;
             out->columns[1][i] = c;
         } else {
-            // VarBinary: rebuild via make_var_binary with arena-resident
-            // copies of the offsets + data buffers.
+            // VarBinary needs make_var_binary, which allocates a child offset
+            // column from `arena`. A zero-copy view has no arena, so it declines
+            // var columns — the caller (e.g. mt_apply_entry) falls back to the
+            // copying deserialize path. Fixed-width (Flat) tables — the P6 target
+            // and the common ingest case — view fully zero-copy above.
+            if (kView) return false;
+            // VarBinary: rebuild via make_var_binary over the offsets + data
+            // buffers (arena-copied for deserialize; aliased for a view).
             int32_t* offs = nullptr;
             uint8_t* data = nullptr;
             if (l1) {
-                offs = static_cast<int32_t*>(
-                    arena->copy_into(p + o1, l1, kWireAlign));
+                offs = static_cast<int32_t*>(detail::wire_span<kView>(p, o1, l1, arena));
                 if (!offs) return false;
             }
             if (l2) {
-                data = static_cast<uint8_t*>(
-                    arena->copy_into(p + o2, l2, kWireAlign));
+                data = static_cast<uint8_t*>(detail::wire_span<kView>(p, o2, l2, arena));
                 if (!data) return false;
             }
             // num_rows == 0 → make_var_binary with a nullptr offsets is OK
@@ -531,6 +558,24 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
         }
     }
     return true;
+}
+
+/// Parse a wire blob, copying every column buffer into `arena`. The result owns
+/// its data and outlives `buf`. Returns false on any validation error.
+inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
+                                  BoltBatch* out, Arena* arena) noexcept {
+    return bolt_wire_parse<false>(buf, buf_len, out, arena);
+}
+
+/// Zero-copy parse: `out`'s column buffers ALIAS into `buf` (no allocation, no
+/// arena). The result is READ-ONLY and valid only while `buf` stays alive and
+/// unmodified — consumers must copy out before `buf` is recycled, and must
+/// memcpy rather than assume typed alignment. Halves the apply-path memory
+/// traffic vs deserialize+apply (one copy into the sink instead of two). Returns
+/// false on any validation error. See MarbleDB's mt_apply_entry kBatch path.
+inline bool bolt_wire_view(const void* buf, size_t buf_len,
+                           BoltBatch* out) noexcept {
+    return bolt_wire_parse<true>(buf, buf_len, out, nullptr);
 }
 
 }  // namespace wire
