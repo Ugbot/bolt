@@ -111,6 +111,13 @@
     #define BOLT_GROUPBY_SERIAL_MERGE_THRESHOLD 4096
 #endif
 
+// K-AGG-C: the typed multi-key groupby ingest runs a two-pass windowed
+// path (per-window shape classify -> gid materialisation -> columnar
+// accumulate) by default; define BOLT_GROUPBY_TWOPASS_DISABLE to force
+// the per-row fallback for every window (debug/AB-testing only — the
+// fallback is 2-3x slower on TPC-H Q1-shape aggregations).
+//   #define BOLT_GROUPBY_TWOPASS_DISABLE
+
 // Lookahead prefetch distance for the groupby ingest loop. Default = 0
 // (DISABLED) because the workloads we measure (1BRC-shape low
 // cardinality, ~413 distinct keys hit repeatedly) keep the actual

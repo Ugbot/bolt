@@ -1878,3 +1878,64 @@ docs/research/json-skip-architecture.md.
 Tests: test_bolt_parse_json 20/20 (SAX event-sequence vs tape, abort,
 null-callback skip, plain-run boundary stress at 40 offsets, NDJSON
 clean/dirty/strict/abort). Bench: benchmarks/bench_json.cpp.
+
+## 2026-06-11 / K-AGG-C — two-pass typed GROUP BY ingest (windowed gid materialisation + columnar accumulate)
+
+Context: chukonu TPC-H Q1 @ SF1 spent 1034 ms (175 ns/row) in
+`groupby_agg_multi_key_typed_ingest` — one per-row loop doing a Utf8
+content hash, a SwissTable probe, and a runtime (AggKind × BoltType)
+dispatch per aggregate per row.
+
+What we tried (bench_groupby `q1_shape_xmorsel` 6M rows / 4 groups /
+2 short-Utf8 keys / 3×d128 SUM + COUNT(*) + AVG(d128), and
+`i64key_10k_xmorsel` 6M rows / 10k int64 groups / d128 SUM + COUNT(*)):
+
+- **Two-pass restructure** (pass 1 materialises `gid[]` per ≤65536-row
+  window with per-window shape classify; pass 2 one dispatch per
+  (kind,type) per window): 77.0 → 39.8 ns/row Q1, 30.6 → 19.5 10k. KEPT.
+- **Pre-hash phase + SwissTable prefetch at distance 8** (separate
+  phase-A loop into a 64KB hash scratch): no measurable win over fused —
+  BACKED OUT in favour of a software-pipelined ring (below).
+- **Fused pack+hash ring (kGbPfDist=8)** — pack each row once, prefetch
+  8 ahead from a stack ring: pass-1 20.3 → 16.2 ns/row Q1. KEPT.
+- **Counts only for Avg**: `counts` has exactly one reader (finalize's
+  Avg divisor); skipping the per-row `cnt[g] += valid` chain for
+  Sum/Min/Max/Count/CountStar. KEPT (combined with the next two ~28.3).
+- **Scalar-lane d128 accumulate (`gb_d128_acc`)**: MSVC routes by-value
+  16-byte `Decimal128` through stack temps even under `__forceinline`,
+  turning `a[g] = d128_add(a[g], p[r])` into a store-forwarding chain —
+  ~5.0 ns/row for ONE sum loop. Writing the lo/hi lanes in place:
+  ~2.4 ns/row. Biggest single win; KEPT (loop-local helper; the
+  general-purpose `d128_add` API is unchanged).
+- **Bank-split accumulators** (4 banks × ≤1024 groups, rows cycle banks,
+  merge per window; eligibility `count >= 64*entry_count`): breaks
+  same-group RMW serialisation for low-cardinality GROUP BYs. Neutral
+  before the scalar-lane fix (the spills dominated), additive after.
+  KEPT.
+- **Branchless 4-entry MRU pass-1** (entry_count ≤ 64 at window start):
+  packed-key compare mask + ctz, round-robin replace, sentinel init —
+  resolves rows with NO hash and NO table touch. An early-exit
+  move-to-front variant mispredicted on every random key change and was
+  ~1 ns SLOWER than the ring — BACKED OUT for the branchless mask. KEPT.
+
+Final: **Q1 shape 77.0 → ~24 ns/row (3.2×, gate ≤25), 10k-int 30.6 →
+~16 ns/row (1.9×, gate ≤18)**. The 10k gate is a no-regression
+watermark, not an aspiration: SwissTable find floor ~5.4 + hash ~1.7 +
+pack/memo/gid ~3.5 + pass-2 into L2-resident accums ~5.0.
+
+Correctness invariants (test_bolt_groupby_twopass, 15 tests): the
+specialised hash is a byte-exact replica of `gb_detail::hash_keys`
+(fuzzed 20k cases incl. garbage StringView padding) because a window
+may run two-pass while the next runs the fallback against the SAME
+SwissTable; inline-Utf8 cells are canonicalised (padding zeroed) at
+insert in BOTH paths so raw-u128 equality == content equality.
+`apply(Sum, Float64)` integer-adds the double's bit pattern — a
+PRE-EXISTING bug preserved bit-for-bit via gb_p2_generic (filed, not
+fixed silently). Opt-out: `BOLT_GROUPBY_TWOPASS_DISABLE`.
+
+Window-size sweep (BOLT_GROUPBY_INGEST_WINDOW now a config knob): Q1
+shape measured 23.6 / 24.1 / 24.1 / 24.1 ns/row at 32k / 64k / 128k /
+256k windows — flat within run noise, so the 65536 default stands (the
+per-window costs — classify scan, bank zeroing, dispatch — already
+amortise fully at 32k; the gid scratch is the only footprint that
+scales, 4B/row).

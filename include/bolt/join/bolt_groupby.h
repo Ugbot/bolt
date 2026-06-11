@@ -605,6 +605,17 @@ static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 inline constexpr uint32_t kGbMaxKeys  = 8;   // was 4; TPC-H Q10 GROUP BYs 7 cols
 inline constexpr uint32_t kGbMaxAggs  = 16;
 inline constexpr uint32_t kGbEntryCap = 1u << 24;   // 16M groups hard cap
+// K-AGG-C: ingest processes rows in windows of this size; the gid
+// scratch (one int32 per window row) is allocated once in _begin.
+#ifndef BOLT_GROUPBY_INGEST_WINDOW
+#define BOLT_GROUPBY_INGEST_WINDOW 65536u
+#endif
+inline constexpr uint32_t kGbIngestWindow = BOLT_GROUPBY_INGEST_WINDOW;
+// K-AGG-C: bank-split accumulation. 4 banks of up to 1024 groups; a window
+// is bank-eligible when entry_count <= kGbBankGroups and the window is big
+// enough that zeroing the bank slices amortises (see gb_pass2_one).
+inline constexpr uint32_t kGbBankCount  = 4u;
+inline constexpr uint32_t kGbBankGroups = 1024u;
 
 namespace gb_detail {
 
@@ -846,6 +857,18 @@ struct GroupbyTypedState {
     GbCell16*       keys_flat;          // [cap * n_keys]
     GbCell16*       accums;             // [n_aggs * cap]
     int64_t*        counts;             // [n_aggs * cap] - AVG denominators
+    int32_t*        gid_scratch;        // K-AGG-C: [kGbIngestWindow] pass-1 gids
+    // K-AGG-C: bank-split accumulator scratch for low-cardinality windows
+    // (entry_count <= kGbBankGroups). Rows cycle 4 banks so consecutive
+    // same-group rows never serialize on the same accumulator; banks merge
+    // into accums/counts once per window. Optional: null => plain loops.
+    GbCell16*       bank_acc;           // [kGbBankCount * kGbBankGroups]
+    int64_t*        bank_cnt;           // [kGbBankCount * kGbBankGroups]
+    // K-AGG-C: direct-mapped (hash -> gid) cache. Low-cardinality GROUP
+    // BYs (TPC-H Q1's 4-6 groups) hit ~100% after warm-up and skip the
+    // SwissTable probe; verification against keys_flat keeps it exact.
+    uint64_t        gid_cache_h[64];
+    int32_t         gid_cache_g[64];
     DistinctCell*   distinct_cells;     // optional [n_distinct * cap]
     DistinctCell16* distinct_cells16;   // optional [n_distinct16 * cap]
     uint16_t        distinct_idx[kGbMaxAggs];     // 0xFFFF = "not 8B-distinct"
@@ -952,7 +975,21 @@ inline bool groupby_agg_multi_key_typed_begin(
         static_cast<size_t>(cap) * n_aggs);
     int64_t*  counts    = arena->allocate_array<int64_t>(
         static_cast<size_t>(cap) * n_aggs);
-    if (keys_flat == nullptr || accums == nullptr || counts == nullptr) return false;
+    // K-AGG-C: per-window gid scratch — the ONLY required two-pass
+    // allocation, done once here so _ingest stays allocation-free.
+    int32_t*  gid_scratch  = arena->allocate_array<int32_t>(kGbIngestWindow);
+    if (keys_flat == nullptr || accums == nullptr || counts == nullptr ||
+        gid_scratch == nullptr) return false;
+    // Bank scratch is optional: null banks just disable the banked pass-2
+    // loops (plain gid-driven loops remain correct).
+    GbCell16* bank_acc = arena->allocate_array<GbCell16>(
+        static_cast<size_t>(kGbBankCount) * kGbBankGroups);
+    int64_t*  bank_cnt = arena->allocate_array<int64_t>(
+        static_cast<size_t>(kGbBankCount) * kGbBankGroups);
+    if (bank_acc == nullptr || bank_cnt == nullptr) {
+        bank_acc = nullptr;
+        bank_cnt = nullptr;
+    }
     std::memset(counts, 0, sizeof(int64_t) * static_cast<size_t>(cap) * n_aggs);
 
     DistinctCell*   distinct_cells   = nullptr;
@@ -977,6 +1014,9 @@ inline bool groupby_agg_multi_key_typed_begin(
     state->keys_flat        = keys_flat;
     state->accums           = accums;
     state->counts           = counts;
+    state->gid_scratch      = gid_scratch;
+    state->bank_acc         = bank_acc;
+    state->bank_cnt         = bank_cnt;
     state->distinct_cells   = distinct_cells;
     state->distinct_cells16 = distinct_cells16;
     state->cap              = cap;
@@ -1021,40 +1061,34 @@ BOLT_FORCE_INLINE bool gb_key_str_append(GroupbyTypedState* state, uint32_t k,
     return true;
 }
 
-// Ingest one morsel. `keys` / `payload` are the live column pointers for
-// THIS morsel - types must match descriptors passed to `_begin`. When
-// `sel != nullptr && sel_len > 0` the morsel is sparse and the kernel
-// iterates over `sel[0..sel_len]`; otherwise it iterates `[0, n_rows)`.
-//
-// Hot-path allocation-free. Sets `state->oom = true` (and returns early)
-// if the SwissTable hits its cap; caller checks before continuing.
-inline void groupby_agg_multi_key_typed_ingest(
+// K-AGG-C: the two-pass specialised ingest (pass-1 gid materialisation +
+// pass-2 columnar accumulate). Kept in an .inc so this header stays
+// navigable; included only here.
+#include "bolt/join/bolt_groupby_twopass.inc"
+
+// K-AGG-C fallback: the original per-row ingest loop, VERBATIM in
+// behaviour, operating on the window [start, start+count) of the
+// iteration space (dense rows when sel == nullptr, else sel positions).
+// This stays the path for spilled Utf8 keys, DISTINCT aggregates,
+// >2 keys, and exotic key types/formats. The one addition is
+// canonicalise-at-insert for inline Utf8 stored cells (padding bytes
+// zeroed) so the specialised path's raw-u128 equality agrees with this
+// path's content equality across windows.
+inline void gb_ingest_fallback(
         GroupbyTypedState* state,
         const BoltColumn*  keys,
         const BoltColumn*  payload,
         const uint32_t*    sel,
-        uint32_t           sel_len,
-        int64_t            n_rows) noexcept {
+        int64_t            start,
+        int64_t            count) noexcept {
     assert(state != nullptr);
-    assert(state->table != nullptr);
-    if (state->oom) return;
+    assert(count >= 0);
     const uint32_t n_keys = state->n_keys;
     const uint32_t n_aggs = state->n_aggs;
     const uint32_t cap    = state->cap;
-    assert(n_keys >= 1 && n_keys <= kGbMaxKeys);
-    assert(n_aggs >= 1 && n_aggs <= kGbMaxAggs);
-
-    // Branch once outside the inner row loop: dense vs sparse iteration.
-    // sel != nullptr ALWAYS means sparse (the morsel convention), even when
-    // sel_len == 0 (a filter that matched nothing in THIS morsel). The old
-    // `&& sel_len > 0` misread an empty-selection morsel as dense and ingested
-    // all n_rows — so a selective WHERE under GROUP BY aggregated unfiltered
-    // rows (caught by fuzz_vs_duckdb --tpch seed 3; Q1 hid it because its filter
-    // passes rows in every morsel).
-    const bool sparse = (sel != nullptr);
-    const int64_t iter_n = sparse ? static_cast<int64_t>(sel_len) : n_rows;
-    for (int64_t i = 0; i < iter_n; ++i) {
-        const int64_t r = sparse ? static_cast<int64_t>(sel[i]) : i;
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t r = (sel != nullptr)
+            ? static_cast<int64_t>(sel[start + i]) : (start + i);
         const uint64_t h = gb_detail::hash_keys(keys, n_keys, r);
         int32_t found = state->table->find(h);
         if (found >= 0 && !gb_detail::keys_equal(keys, n_keys, r,
@@ -1089,6 +1123,9 @@ inline void groupby_agg_multi_key_typed_ingest(
                         }
                         sv->ref.buf_idx = 0;
                         sv->ref.offset  = off;
+                    } else {
+                        // K-AGG-C: canonicalise inline padding (see above).
+                        gb_twopass::gb_sv_canon_inline(&krow[k]);
                     }
                 }
             }
@@ -1128,7 +1165,55 @@ inline void groupby_agg_multi_key_typed_ingest(
             state->counts[off] += (valid ? 1 : 0);
         }
     }
-    state->n_rows_in += static_cast<uint32_t>(iter_n);
+}
+
+// Ingest one morsel. `keys` / `payload` are the live column pointers for
+// THIS morsel - types must match descriptors passed to `_begin`. When
+// `sel != nullptr` the morsel is sparse and the kernel iterates over
+// `sel[0..sel_len]` — even when sel_len == 0 (a filter that matched
+// nothing in THIS morsel; the old `&& sel_len > 0` misread that as dense
+// and aggregated unfiltered rows — fuzz_vs_duckdb --tpch seed 3).
+//
+// K-AGG-C: rows are processed in <=kGbIngestWindow windows; each window
+// classifies its key shape ONCE and runs the two-pass specialised path
+// (gid materialisation + per-(kind,type) columnar accumulate) or the
+// verbatim per-row fallback. Hot-path allocation-free. Sets
+// `state->oom = true` if the SwissTable hits cap; caller checks.
+inline void groupby_agg_multi_key_typed_ingest(
+        GroupbyTypedState* state,
+        const BoltColumn*  keys,
+        const BoltColumn*  payload,
+        const uint32_t*    sel,
+        uint32_t           sel_len,
+        int64_t            n_rows) noexcept {
+    assert(state != nullptr);
+    assert(state->table != nullptr);
+    if (state->oom) return;
+    assert(state->n_keys >= 1 && state->n_keys <= kGbMaxKeys);
+    assert(state->n_aggs >= 1 && state->n_aggs <= kGbMaxAggs);
+
+    const bool sparse = (sel != nullptr);
+    const int64_t total = sparse ? static_cast<int64_t>(sel_len) : n_rows;
+    for (int64_t start = 0; start < total;
+         start += static_cast<int64_t>(kGbIngestWindow)) {
+        int64_t count = total - start;
+        if (count > static_cast<int64_t>(kGbIngestWindow)) {
+            count = static_cast<int64_t>(kGbIngestWindow);
+        }
+#ifndef BOLT_GROUPBY_TWOPASS_DISABLE
+        if (!gb_twopass::gb_try_twopass(state, keys, payload,
+                                        sparse ? sel : nullptr,
+                                        start, count)) {
+            gb_ingest_fallback(state, keys, payload,
+                               sparse ? sel : nullptr, start, count);
+        }
+#else
+        gb_ingest_fallback(state, keys, payload,
+                           sparse ? sel : nullptr, start, count);
+#endif
+        if (state->oom) return;
+    }
+    state->n_rows_in += static_cast<uint32_t>(total);
 }
 
 // Emit accumulated groups into typed output columns. Allocates output
