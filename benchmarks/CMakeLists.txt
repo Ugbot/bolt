@@ -135,6 +135,14 @@ bolt_apply_hardening(bench_radixsort)
 bolt_apply_bench_tuning(bench_radixsort)
 
 # -----------------------------------------------------------------------
+# JSON parse throughput — tape / SAX / NDJSON (fionn-parity wave).
+# -----------------------------------------------------------------------
+add_executable(bench_json bench_json.cpp)
+target_link_libraries(bench_json PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_json)
+bolt_apply_bench_tuning(bench_json)
+
+# -----------------------------------------------------------------------
 # Indirect multi-key sort + Top-K microbench (K-SORT-A)
 # Removed: bench_indirect_sort.cpp not present on this branch.
 # -----------------------------------------------------------------------

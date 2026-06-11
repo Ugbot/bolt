@@ -1,16 +1,21 @@
 // ---------------------------------------------------------------------------
 // bolt::parse::json — skip-aware JSON parser implementation.
 //
-// Layer 1.3. Four stages composed in this file:
-//   1. structural-index scan — single linear pass over `src`, scalar
-//      fallback. UTF-8 validated DFA-style.
-//   2. tape — Token entries written into the arena.
+// Layer 1.3 (+ fionn-parity wave). Stages composed in this file:
+//   1. structural-index scan — single linear pass over `src`. String
+//      bodies ride a SIMD/SWAR plain-run accelerator (AVX2 when
+//      compiled in, SWAR everywhere); UTF-8 validated DFA-style on the
+//      slow path only.
+//   2. sinks — the SAME scanner feeds two sinks via compile-time
+//      dispatch: TapeSink (Token entries into the arena → tape) and
+//      SaxSink (event callbacks, no tape, O(depth) memory — fionn's
+//      native streaming mode).
 //   3. iterator — cursor over tokens with O(tokens-skipped) skip_to_close.
-//   4. path filter — perfect-hash table over slash-prefixed interest paths;
-//      build_index_filtered traverses without emitting tokens for subtrees
-//      that aren't a prefix of any interest path.
-//
-// SIMD is deferred. See docs/research/json-skip-architecture.md.
+//   4. path filter — hash table over slash-prefixed interest paths;
+//      build_index_filtered traverses without emitting tokens for
+//      subtrees that aren't a prefix of any interest path.
+//   5. NDJSON — SWAR newline framing + per-record tape (scratch arena
+//      reset per record) or per-record SAX (no arena).
 // ---------------------------------------------------------------------------
 #include "bolt/parse/bolt_json.h"
 
@@ -18,6 +23,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+
+#if BOLT_SIMD_AVX2
+#include <immintrin.h>
+#endif
 
 namespace bolt {
 namespace parse {
@@ -216,7 +225,29 @@ struct Parser {
     int32_t               depth;
 };
 
-BOLT_FORCE_INLINE bool emit(Parser* p, TokenType t, int32_t s, int32_t l) noexcept {
+// Initialise only the fields the parse reads before writing. Zeroing
+// the whole Parser (memset) writes the ~17 KB path_stack on every call —
+// a 100x write amplification for small NDJSON records that dominated
+// the first bench run. path_stack / seg_start / array_index are always
+// written before they are read (path_len / seg_count gate them).
+BOLT_FORCE_INLINE void parser_init(Parser* p, const uint8_t* src,
+                                   int32_t src_len, Token* tokens,
+                                   int32_t token_cap,
+                                   const PathFilterImpl* filter) noexcept {
+    assert(p != nullptr);
+    p->src         = src;
+    p->src_len     = src_len;
+    p->pos         = 0;
+    p->tokens      = tokens;
+    p->token_cap   = token_cap;
+    p->token_count = 0;
+    p->filter      = filter;
+    p->seg_count   = 0;
+    p->path_len    = 0;
+    p->depth       = 0;
+}
+
+BOLT_FORCE_INLINE bool tape_emit(Parser* p, TokenType t, int32_t s, int32_t l) noexcept {
     assert(p != nullptr);
     if (p->token_count >= p->token_cap) return false;
     Token& tok = p->tokens[p->token_count++];
@@ -227,6 +258,94 @@ BOLT_FORCE_INLINE bool emit(Parser* p, TokenType t, int32_t s, int32_t l) noexce
     return true;
 }
 
+// Defined with the scanner helpers below; the SAX sink materialises
+// numbers through the same slice parsers the tape iterators use.
+bool parse_int64_slice(const uint8_t* src, int32_t start, int32_t length,
+                       int64_t* out) noexcept;
+bool parse_float64_slice(const uint8_t* src, int32_t start, int32_t length,
+                         double* out) noexcept;
+
+// ---------------------------------------------------------------------------
+// Sinks — compile-time dispatch so ONE scanner serves both output modes
+// (Bolt's X-macro/template rule: no runtime function-pointer dispatch on
+// the hot path).
+//
+// TapeSink  → Token entries on the arena tape (build_index*).
+// SaxSink   → event callbacks, no tape, O(depth) memory (sax_parse).
+//             `aborted` distinguishes a consumer abort (callback said
+//             stop) from malformed input — NDJSON ignore_errors must
+//             not swallow consumer aborts.
+// ---------------------------------------------------------------------------
+
+struct TapeSink {
+    BOLT_FORCE_INLINE bool emit(Parser* p, TokenType t, int32_t s,
+                                int32_t l) noexcept {
+        return tape_emit(p, t, s, l);
+    }
+};
+
+struct SaxSink {
+    const SaxHandler* h;
+    const uint8_t*    src;
+    bool              aborted;
+
+    bool emit(Parser* p, TokenType t, int32_t s, int32_t l) noexcept {
+        assert(h != nullptr);
+        (void)p;
+        const char* bytes = reinterpret_cast<const char*>(src) + s;
+        bool ok = true;
+        switch (t) {
+            case TokenType::BeginObject:
+                if (h->on_begin_object) ok = h->on_begin_object(h->ctx);
+                break;
+            case TokenType::EndObject:
+                if (h->on_end_object) ok = h->on_end_object(h->ctx);
+                break;
+            case TokenType::BeginArray:
+                if (h->on_begin_array) ok = h->on_begin_array(h->ctx);
+                break;
+            case TokenType::EndArray:
+                if (h->on_end_array) ok = h->on_end_array(h->ctx);
+                break;
+            case TokenType::Key:
+                if (h->on_key) ok = h->on_key(h->ctx, bytes, l);
+                break;
+            case TokenType::String:
+                if (h->on_string) ok = h->on_string(h->ctx, bytes, l);
+                break;
+            case TokenType::Int64: {
+                if (h->on_int64) {
+                    int64_t v = 0;
+                    if (!parse_int64_slice(src, s, l, &v)) return false;
+                    ok = h->on_int64(h->ctx, v, bytes, l);
+                }
+                break;
+            }
+            case TokenType::Float64: {
+                if (h->on_float64) {
+                    double v = 0;
+                    if (!parse_float64_slice(src, s, l, &v)) return false;
+                    ok = h->on_float64(h->ctx, v, bytes, l);
+                }
+                break;
+            }
+            case TokenType::BoolTrue:
+                if (h->on_bool) ok = h->on_bool(h->ctx, true);
+                break;
+            case TokenType::BoolFalse:
+                if (h->on_bool) ok = h->on_bool(h->ctx, false);
+                break;
+            case TokenType::Null:
+                if (h->on_null) ok = h->on_null(h->ctx);
+                break;
+            case TokenType::End:
+                break;
+        }
+        if (!ok) aborted = true;
+        return ok;
+    }
+};
+
 BOLT_FORCE_INLINE void skip_ws(Parser* p) noexcept {
     assert(p != nullptr);
     while (p->pos < p->src_len) {
@@ -236,9 +355,106 @@ BOLT_FORCE_INLINE void skip_ws(Parser* p) noexcept {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SIMD/SWAR plain-run accelerator (fionn-parity wave).
+//
+// Counts leading bytes that are "plain" string content: not '"', not
+// '\\', not a control byte (< 0x20), not >= 0x80 (UTF-8 lead/cont).
+// Plain bytes need no DFA step and no per-byte branching, and they are
+// the overwhelming majority of real-world JSON string content — this
+// is where fionn's skip-scanners earn their GiB/s.
+//
+// AVX2 path (when compiled with /arch:AVX2 or -mavx2) processes 32
+// bytes per step with exact byte compares. The SWAR path processes 8
+// bytes per step with Mycroft has-byte masks; Mycroft false positives
+// can only appear in lanes AFTER a real hit (the borrow chain starts
+// at a real-hit lane), so (a) hits == 0 proves the whole word plain and
+// (b) ctz lands on a real hit. Both facts keep the fast path exact.
+// ---------------------------------------------------------------------------
+BOLT_FORCE_INLINE int32_t string_plain_run(const uint8_t* BOLT_RESTRICT s,
+                                           int32_t n) noexcept {
+    assert(s != nullptr || n == 0);
+    assert(n >= 0);
+    int32_t i = 0;
+#if BOLT_SIMD_AVX2
+    const __m256i vq  = _mm256_set1_epi8('"');
+    const __m256i vbs = _mm256_set1_epi8('\\');
+    const __m256i vsp = _mm256_set1_epi8(0x20);
+    while (i + 32 <= n) {
+        const __m256i c = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(s + i));
+        // Signed compare: bytes >= 0x80 are negative, so (0x20 > c) also
+        // flags them — harmless, they're flagged via movemask(c) anyway.
+        const __m256i hit = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(c, vq),
+                            _mm256_cmpeq_epi8(c, vbs)),
+            _mm256_cmpgt_epi8(vsp, c));
+        const uint32_t m =
+            static_cast<uint32_t>(_mm256_movemask_epi8(hit)) |
+            static_cast<uint32_t>(_mm256_movemask_epi8(c));
+        if (m != 0) return i + bolt_ctz32(m);
+        i += 32;
+    }
+#endif
+    while (i + 8 <= n) {
+        uint64_t w;
+        memcpy(&w, s + i, 8);
+        const uint64_t high  = w & 0x8080808080808080ull;
+        const uint64_t quote = bolt_swar_has_byte_u64(w, '"');
+        const uint64_t bsl   = bolt_swar_has_byte_u64(w, '\\');
+        const uint64_t ctrl  =
+            (w - 0x2020202020202020ull) & ~w & 0x8080808080808080ull;
+        const uint64_t hits = high | quote | bsl | ctrl;
+        if (hits != 0) return i + (bolt_ctz64(hits) >> 3);
+        i += 8;
+    }
+    while (i < n) {
+        const uint8_t c = s[i];
+        if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80) return i;
+        ++i;
+    }
+    return i;
+}
+
+// Materialise a number slice. Shared by the tape iterators and the SAX
+// sink — one parser, two consumers. Slices are bounded at 64 bytes
+// (no legal JSON number the scanner emits is longer in practice; the
+// bound keeps the stack copy fixed).
+bool parse_int64_slice(const uint8_t* src, int32_t start, int32_t length,
+                       int64_t* out) noexcept {
+    assert(src != nullptr);
+    assert(out != nullptr);
+    if (length <= 0 || length > 64) return false;
+    char buf[65];
+    memcpy(buf, src + start, static_cast<size_t>(length));
+    buf[length] = '\0';
+    char* end = nullptr;
+    const long long v = std::strtoll(buf, &end, 10);
+    if (end != buf + length) return false;
+    *out = static_cast<int64_t>(v);
+    return true;
+}
+
+bool parse_float64_slice(const uint8_t* src, int32_t start, int32_t length,
+                         double* out) noexcept {
+    assert(src != nullptr);
+    assert(out != nullptr);
+    if (length <= 0 || length > 64) return false;
+    char buf[65];
+    memcpy(buf, src + start, static_cast<size_t>(length));
+    buf[length] = '\0';
+    char* end = nullptr;
+    const double v = std::strtod(buf, &end);
+    if (end != buf + length) return false;
+    *out = v;
+    return true;
+}
+
 // Consume a JSON string starting at `*p->pos == '"'`. Sets out_start /
 // out_length to the bytes inside the quotes (exclusive of the quotes).
-// Validates UTF-8 and rejects bare control bytes < 0x20.
+// Validates UTF-8 and rejects bare control bytes < 0x20. Plain ASCII
+// runs are skipped via string_plain_run (SIMD/SWAR); the byte-at-a-time
+// DFA path only runs for quotes, escapes, controls, and UTF-8 bytes.
 bool scan_string(Parser* p, int32_t* out_start, int32_t* out_length) noexcept {
     assert(p != nullptr);
     assert(p->pos < p->src_len && p->src[p->pos] == '"');
@@ -246,6 +462,10 @@ bool scan_string(Parser* p, int32_t* out_start, int32_t* out_length) noexcept {
     const int32_t start = p->pos;
     uint8_t state = kUtf8Accept;
     while (p->pos < p->src_len) {
+        if (state == kUtf8Accept) {
+            p->pos += string_plain_run(p->src + p->pos, p->src_len - p->pos);
+            if (p->pos >= p->src_len) break;   // unterminated
+        }
         const uint8_t c = p->src[p->pos];
         if (c == '"' && state == kUtf8Accept) {
             *out_start = start;
@@ -270,26 +490,54 @@ bool scan_string(Parser* p, int32_t* out_start, int32_t* out_length) noexcept {
     return false;  // unterminated
 }
 
+// SWAR digit-run: count leading ASCII digits in s[0..n). A byte b is a
+// digit iff (b ^ 0x30) <= 9; flag = ((x + 0x06) | x) & 0xF0 per lane.
+// The x-term is carry-free and exact; the (x + 0x06) carry can only
+// contaminate lanes ABOVE a lane whose own x-term already flags, so
+// flags == 0 proves all-digits and ctz lands on a real non-digit.
+BOLT_FORCE_INLINE int32_t digit_run(const uint8_t* BOLT_RESTRICT s,
+                                    int32_t n) noexcept {
+    assert(s != nullptr || n == 0);
+    int32_t i = 0;
+    while (i + 8 <= n) {
+        uint64_t w;
+        memcpy(&w, s + i, 8);
+        const uint64_t x = w ^ 0x3030303030303030ull;
+        const uint64_t flags =
+            ((x + 0x0606060606060606ull) | x) & 0xF0F0F0F0F0F0F0F0ull;
+        if (flags != 0) return i + (bolt_ctz64(flags) >> 3);
+        i += 8;
+    }
+    while (i < n && s[i] >= '0' && s[i] <= '9') ++i;
+    return i;
+}
+
 bool scan_number(Parser* p, int32_t* out_start, int32_t* out_length, bool* is_float) noexcept {
     assert(p != nullptr);
     const int32_t start = p->pos;
     *is_float = false;
     if (p->src[p->pos] == '-') ++p->pos;
     if (p->pos >= p->src_len) return false;
-    if (p->src[p->pos] < '0' || p->src[p->pos] > '9') return false;
-    while (p->pos < p->src_len && p->src[p->pos] >= '0' && p->src[p->pos] <= '9') ++p->pos;
+    {
+        const int32_t run = digit_run(p->src + p->pos, p->src_len - p->pos);
+        if (run == 0) return false;
+        p->pos += run;
+    }
     if (p->pos < p->src_len && p->src[p->pos] == '.') {
         *is_float = true;
         ++p->pos;
-        if (p->pos >= p->src_len || p->src[p->pos] < '0' || p->src[p->pos] > '9') return false;
-        while (p->pos < p->src_len && p->src[p->pos] >= '0' && p->src[p->pos] <= '9') ++p->pos;
+        const int32_t run = digit_run(p->src + p->pos, p->src_len - p->pos);
+        if (run == 0) return false;
+        p->pos += run;
     }
     if (p->pos < p->src_len && (p->src[p->pos] == 'e' || p->src[p->pos] == 'E')) {
         *is_float = true;
         ++p->pos;
         if (p->pos < p->src_len && (p->src[p->pos] == '+' || p->src[p->pos] == '-')) ++p->pos;
-        if (p->pos >= p->src_len || p->src[p->pos] < '0' || p->src[p->pos] > '9') return false;
-        while (p->pos < p->src_len && p->src[p->pos] >= '0' && p->src[p->pos] <= '9') ++p->pos;
+        const int32_t run = (p->pos < p->src_len)
+            ? digit_run(p->src + p->pos, p->src_len - p->pos) : 0;
+        if (run == 0) return false;
+        p->pos += run;
     }
     *out_start = start;
     *out_length = p->pos - start;
@@ -344,23 +592,26 @@ void path_pop(Parser* p) noexcept {
     p->path_len = p->seg_start[p->seg_count];
 }
 
-// Forward decl.
-bool parse_value(Parser* p, bool emit_tokens) noexcept;
+// Forward decl. Templated on the sink so the tape and SAX modes share
+// one scanner with zero runtime dispatch.
+template <typename Sink>
+bool parse_value(Parser* p, Sink* sink, bool emit_tokens) noexcept;
 
-bool parse_object(Parser* p, bool emit_tokens) noexcept {
+template <typename Sink>
+bool parse_object(Parser* p, Sink* sink, bool emit_tokens) noexcept {
     assert(p != nullptr);
     assert(p->src[p->pos] == '{');
     if (p->depth >= kJsonMaxDepth) return false;
     ++p->depth;
     if (emit_tokens) {
-        if (!emit(p, TokenType::BeginObject, p->pos, 0)) { --p->depth; return false; }
+        if (!sink->emit(p, TokenType::BeginObject, p->pos, 0)) { --p->depth; return false; }
     }
     ++p->pos;
     p->array_index[p->depth - 1] = -1;
     skip_ws(p);
     if (p->pos < p->src_len && p->src[p->pos] == '}') {
         if (emit_tokens) {
-            if (!emit(p, TokenType::EndObject, p->pos, 0)) { --p->depth; return false; }
+            if (!sink->emit(p, TokenType::EndObject, p->pos, 0)) { --p->depth; return false; }
         }
         ++p->pos;
         --p->depth;
@@ -379,7 +630,7 @@ bool parse_object(Parser* p, bool emit_tokens) noexcept {
                                                        p->path_stack, p->path_len);
         }
         if (child_emit) {
-            if (!emit(p, TokenType::Key, ks, kl)) { if (p->filter) path_pop(p); --p->depth; return false; }
+            if (!sink->emit(p, TokenType::Key, ks, kl)) { if (p->filter) path_pop(p); --p->depth; return false; }
         }
         skip_ws(p);
         if (p->pos >= p->src_len || p->src[p->pos] != ':') {
@@ -387,7 +638,7 @@ bool parse_object(Parser* p, bool emit_tokens) noexcept {
         }
         ++p->pos;
         skip_ws(p);
-        if (!parse_value(p, child_emit)) {
+        if (!parse_value(p, sink, child_emit)) {
             if (p->filter) path_pop(p); --p->depth; return false;
         }
         if (p->filter) path_pop(p);
@@ -396,7 +647,7 @@ bool parse_object(Parser* p, bool emit_tokens) noexcept {
         if (p->src[p->pos] == ',') { ++p->pos; continue; }
         if (p->src[p->pos] == '}') {
             if (emit_tokens) {
-                if (!emit(p, TokenType::EndObject, p->pos, 0)) { --p->depth; return false; }
+                if (!sink->emit(p, TokenType::EndObject, p->pos, 0)) { --p->depth; return false; }
             }
             ++p->pos;
             --p->depth;
@@ -409,20 +660,21 @@ bool parse_object(Parser* p, bool emit_tokens) noexcept {
     return false;
 }
 
-bool parse_array(Parser* p, bool emit_tokens) noexcept {
+template <typename Sink>
+bool parse_array(Parser* p, Sink* sink, bool emit_tokens) noexcept {
     assert(p != nullptr);
     assert(p->src[p->pos] == '[');
     if (p->depth >= kJsonMaxDepth) return false;
     ++p->depth;
     if (emit_tokens) {
-        if (!emit(p, TokenType::BeginArray, p->pos, 0)) { --p->depth; return false; }
+        if (!sink->emit(p, TokenType::BeginArray, p->pos, 0)) { --p->depth; return false; }
     }
     ++p->pos;
     int32_t idx = 0;
     skip_ws(p);
     if (p->pos < p->src_len && p->src[p->pos] == ']') {
         if (emit_tokens) {
-            if (!emit(p, TokenType::EndArray, p->pos, 0)) { --p->depth; return false; }
+            if (!sink->emit(p, TokenType::EndArray, p->pos, 0)) { --p->depth; return false; }
         }
         ++p->pos;
         --p->depth;
@@ -436,7 +688,7 @@ bool parse_array(Parser* p, bool emit_tokens) noexcept {
             child_emit = emit_tokens && path_is_prefix(p->filter,
                                                        p->path_stack, p->path_len);
         }
-        if (!parse_value(p, child_emit)) {
+        if (!parse_value(p, sink, child_emit)) {
             if (p->filter) path_pop(p); --p->depth; return false;
         }
         if (p->filter) path_pop(p);
@@ -446,7 +698,7 @@ bool parse_array(Parser* p, bool emit_tokens) noexcept {
         if (p->src[p->pos] == ',') { ++p->pos; continue; }
         if (p->src[p->pos] == ']') {
             if (emit_tokens) {
-                if (!emit(p, TokenType::EndArray, p->pos, 0)) { --p->depth; return false; }
+                if (!sink->emit(p, TokenType::EndArray, p->pos, 0)) { --p->depth; return false; }
             }
             ++p->pos;
             --p->depth;
@@ -459,39 +711,40 @@ bool parse_array(Parser* p, bool emit_tokens) noexcept {
     return false;
 }
 
-bool parse_value(Parser* p, bool emit_tokens) noexcept {
+template <typename Sink>
+bool parse_value(Parser* p, Sink* sink, bool emit_tokens) noexcept {
     assert(p != nullptr);
     skip_ws(p);
     if (p->pos >= p->src_len) return false;
     const uint8_t c = p->src[p->pos];
-    if (c == '{') return parse_object(p, emit_tokens);
-    if (c == '[') return parse_array(p, emit_tokens);
+    if (c == '{') return parse_object(p, sink, emit_tokens);
+    if (c == '[') return parse_array(p, sink, emit_tokens);
     if (c == '"') {
         int32_t s, l;
         if (!scan_string(p, &s, &l)) return false;
-        if (emit_tokens) return emit(p, TokenType::String, s, l);
+        if (emit_tokens) return sink->emit(p, TokenType::String, s, l);
         return true;
     }
     if (c == 't') {
         if (!match_keyword(p, "true", 4)) return false;
-        if (emit_tokens) return emit(p, TokenType::BoolTrue, p->pos - 4, 4);
+        if (emit_tokens) return sink->emit(p, TokenType::BoolTrue, p->pos - 4, 4);
         return true;
     }
     if (c == 'f') {
         if (!match_keyword(p, "false", 5)) return false;
-        if (emit_tokens) return emit(p, TokenType::BoolFalse, p->pos - 5, 5);
+        if (emit_tokens) return sink->emit(p, TokenType::BoolFalse, p->pos - 5, 5);
         return true;
     }
     if (c == 'n') {
         if (!match_keyword(p, "null", 4)) return false;
-        if (emit_tokens) return emit(p, TokenType::Null, p->pos - 4, 4);
+        if (emit_tokens) return sink->emit(p, TokenType::Null, p->pos - 4, 4);
         return true;
     }
     if (c == '-' || (c >= '0' && c <= '9')) {
         int32_t s, l; bool is_float;
         if (!scan_number(p, &s, &l, &is_float)) return false;
         if (emit_tokens) {
-            return emit(p, is_float ? TokenType::Float64 : TokenType::Int64, s, l);
+            return sink->emit(p, is_float ? TokenType::Float64 : TokenType::Int64, s, l);
         }
         return true;
     }
@@ -520,28 +773,26 @@ static bool build_index_impl(const uint8_t* src, int32_t src_len,
     if (tokens == nullptr) return false;
 
     Parser p;
-    memset(&p, 0, sizeof(p));
-    p.src = src;
-    p.src_len = src_len;
-    p.tokens = tokens;
-    p.token_cap = cap;
-    p.filter = (filter != nullptr) ? static_cast<const PathFilterImpl*>(filter->impl)
-                                   : nullptr;
+    parser_init(&p, src, src_len, tokens, cap,
+                (filter != nullptr)
+                    ? static_cast<const PathFilterImpl*>(filter->impl)
+                    : nullptr);
 
+    TapeSink sink{};
     skip_ws(&p);
     if (p.pos >= p.src_len) {
         // Empty doc — emit only End.
-        if (!emit(&p, TokenType::End, p.pos, 0)) return false;
+        if (!tape_emit(&p, TokenType::End, p.pos, 0)) return false;
         out->src = src;
         out->src_len = src_len;
         out->tokens = tokens;
         out->token_count = p.token_count;
         return true;
     }
-    if (!parse_value(&p, /*emit_tokens=*/true)) return false;
+    if (!parse_value(&p, &sink, /*emit_tokens=*/true)) return false;
     skip_ws(&p);
     if (p.pos != p.src_len) return false;  // trailing junk
-    if (!emit(&p, TokenType::End, p.pos, 0)) return false;
+    if (!tape_emit(&p, TokenType::End, p.pos, 0)) return false;
 
     out->src = src;
     out->src_len = src_len;
@@ -559,6 +810,145 @@ bool build_index_filtered(const uint8_t* src, int32_t src_len,
                           const PathFilter* filter,
                           Arena* arena, StructuralIndex* out) noexcept {
     return build_index_impl(src, src_len, filter, arena, out);
+}
+
+// ===========================================================================
+// SAX surface — event-driven streaming parse, no tape, no arena.
+// ===========================================================================
+
+namespace {
+
+// Internal tri-state so NDJSON can tell "malformed record" (skippable
+// under ignore_errors) apart from "consumer aborted" (never skippable).
+enum class SaxResult : uint8_t { Ok = 0, Malformed = 1, Aborted = 2 };
+
+SaxResult sax_parse_impl(const uint8_t* src, int32_t src_len,
+                         const SaxHandler* handler) noexcept {
+    assert(handler != nullptr);
+    if (src_len < 0) return SaxResult::Malformed;
+    if (src_len > 0 && src == nullptr) return SaxResult::Malformed;
+
+    Parser p;
+    // No tape: tokens/token_cap null/0 — TapeSink is never invoked.
+    parser_init(&p, src, src_len, nullptr, 0, nullptr);
+
+    SaxSink sink{handler, src, false};
+    skip_ws(&p);
+    if (p.pos >= p.src_len) return SaxResult::Ok;   // empty doc, no events
+    if (!parse_value(&p, &sink, /*emit_tokens=*/true)) {
+        return sink.aborted ? SaxResult::Aborted : SaxResult::Malformed;
+    }
+    skip_ws(&p);
+    if (p.pos != p.src_len) return SaxResult::Malformed;  // trailing junk
+    return SaxResult::Ok;
+}
+
+// SWAR newline scan — the SimdLineSeparator role. Returns the index of
+// the next '\n' at/after `pos`, or `len` when none remains. Mycroft's
+// first hit is exact, so the returned index is always a real newline.
+int64_t find_newline(const uint8_t* s, int64_t len, int64_t pos) noexcept {
+    assert(s != nullptr || len == 0);
+    assert(pos >= 0);
+    while (pos + 8 <= len) {
+        uint64_t w;
+        memcpy(&w, s + pos, 8);
+        const int idx = bolt_swar_find_byte_u64(w, '\n');
+        if (idx >= 0) return pos + idx;
+        pos += 8;
+    }
+    while (pos < len && s[pos] != '\n') ++pos;
+    return pos;
+}
+
+// Trim one NDJSON line to its record payload: drop leading/trailing
+// spaces, tabs, and a trailing '\r' (CRLF input). Returns false when
+// the line is blank.
+bool trim_line(const uint8_t* s, int64_t* b, int64_t* t) noexcept {
+    assert(s != nullptr);
+    assert(b != nullptr && t != nullptr);
+    while (*b < *t && (s[*b] == ' ' || s[*b] == '\t' || s[*b] == '\r')) ++*b;
+    while (*t > *b && (s[*t - 1] == ' ' || s[*t - 1] == '\t' ||
+                       s[*t - 1] == '\r')) --*t;
+    return *b < *t;
+}
+
+}  // namespace
+
+bool sax_parse(const uint8_t* src, int32_t src_len,
+               const SaxHandler* handler) noexcept {
+    if (handler == nullptr) return false;
+    return sax_parse_impl(src, src_len, handler) == SaxResult::Ok;
+}
+
+// ===========================================================================
+// NDJSON surface.
+// ===========================================================================
+
+bool ndjson_for_each(const uint8_t* src, int64_t src_len,
+                     bool ignore_errors, Arena* scratch,
+                     void* ctx, NdjsonRecordFn on_record,
+                     NdjsonStats* out_stats) noexcept {
+    assert(scratch != nullptr);
+    assert(on_record != nullptr);
+    if (src_len < 0) return false;
+    if (src_len > 0 && src == nullptr) return false;
+    NdjsonStats local{0, 0};
+    NdjsonStats* st = (out_stats != nullptr) ? out_stats : &local;
+    st->records = 0;
+    st->skipped = 0;
+
+    int64_t pos = 0;
+    while (pos < src_len) {
+        const int64_t eol = find_newline(src, src_len, pos);
+        int64_t b = pos;
+        int64_t t = eol;
+        pos = eol + 1;
+        if (!trim_line(src, &b, &t)) continue;
+        if (t - b > INT32_MAX) return false;
+        scratch->reset();   // record tape valid only inside the callback
+        StructuralIndex rec;
+        if (!build_index(src + b, static_cast<int32_t>(t - b),
+                         scratch, &rec)) {
+            if (!ignore_errors) return false;
+            st->skipped += 1;
+            continue;
+        }
+        if (!on_record(ctx, &rec, st->records)) return false;
+        st->records += 1;
+    }
+    return true;
+}
+
+bool ndjson_for_each_sax(const uint8_t* src, int64_t src_len,
+                         bool ignore_errors, const SaxHandler* handler,
+                         NdjsonStats* out_stats) noexcept {
+    assert(handler != nullptr);
+    if (src_len < 0) return false;
+    if (src_len > 0 && src == nullptr) return false;
+    NdjsonStats local{0, 0};
+    NdjsonStats* st = (out_stats != nullptr) ? out_stats : &local;
+    st->records = 0;
+    st->skipped = 0;
+
+    int64_t pos = 0;
+    while (pos < src_len) {
+        const int64_t eol = find_newline(src, src_len, pos);
+        int64_t b = pos;
+        int64_t t = eol;
+        pos = eol + 1;
+        if (!trim_line(src, &b, &t)) continue;
+        if (t - b > INT32_MAX) return false;
+        const SaxResult r = sax_parse_impl(
+            src + b, static_cast<int32_t>(t - b), handler);
+        if (r == SaxResult::Aborted) return false;
+        if (r == SaxResult::Malformed) {
+            if (!ignore_errors) return false;
+            st->skipped += 1;
+            continue;
+        }
+        st->records += 1;
+    }
+    return true;
 }
 
 // ===========================================================================
@@ -674,15 +1064,7 @@ bool iter_int64(const Iterator* it, int64_t* out) noexcept {
     if (it->cursor >= it->idx->token_count) return false;
     const Token& t = it->idx->tokens[it->cursor];
     if (t.type != TokenType::Int64 && t.type != TokenType::Float64) return false;
-    if (t.length <= 0 || t.length > 64) return false;
-    char buf[65];
-    memcpy(buf, it->idx->src + t.start, static_cast<size_t>(t.length));
-    buf[t.length] = '\0';
-    char* end = nullptr;
-    long long v = std::strtoll(buf, &end, 10);
-    if (end != buf + t.length) return false;
-    *out = static_cast<int64_t>(v);
-    return true;
+    return parse_int64_slice(it->idx->src, t.start, t.length, out);
 }
 
 bool iter_float64(const Iterator* it, double* out) noexcept {
@@ -691,15 +1073,7 @@ bool iter_float64(const Iterator* it, double* out) noexcept {
     if (it->cursor >= it->idx->token_count) return false;
     const Token& t = it->idx->tokens[it->cursor];
     if (t.type != TokenType::Int64 && t.type != TokenType::Float64) return false;
-    if (t.length <= 0 || t.length > 64) return false;
-    char buf[65];
-    memcpy(buf, it->idx->src + t.start, static_cast<size_t>(t.length));
-    buf[t.length] = '\0';
-    char* end = nullptr;
-    double v = std::strtod(buf, &end);
-    if (end != buf + t.length) return false;
-    *out = v;
-    return true;
+    return parse_float64_slice(it->idx->src, t.start, t.length, out);
 }
 
 }  // namespace json

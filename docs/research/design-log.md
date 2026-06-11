@@ -1842,3 +1842,39 @@ Open question: `atomic_bitmap_clear_all` uses release stores
 non-atomically with respect to concurrent writers. A correct
 "reset-while-others-write" path needs a per-word CAS loop — defer
 until a consumer actually needs concurrent-reset semantics (none today).
+
+---
+
+## bolt::parse::json fionn-parity wave — SAX + NDJSON + SIMD plain-run
+
+Decision: ONE scanner, two sinks via compile-time template dispatch
+(`TapeSink` for the structural-index tape, `SaxSink` for event
+callbacks). The alternative — a separate hand-written SAX scanner —
+would duplicate string/number/keyword scanning and drift; the template
+keeps zero runtime dispatch on the hot path (Bolt's one-default rule:
+the tape stays the default consumer surface, SAX is the streaming
+opt-in for constant-memory pipelines).
+
+Landed:
+- `sax_parse` (events, no tape, no arena, O(depth) memory; abort via
+  callback-false, distinguished from malformed input so NDJSON
+  ignore_errors never swallows a consumer abort).
+- `ndjson_for_each` / `ndjson_for_each_sax` (SWAR newline framing,
+  CRLF trim, scratch-arena reset per record, ignore_errors + stats).
+- `string_plain_run` (AVX2 behind BOLT_SIMD_AVX2 + SWAR fallback) and
+  `digit_run` (SWAR) accelerating string bodies and number bodies.
+- `parser_init` replacing the whole-Parser memset: the 17 KB
+  path_stack zeroing per parse was a 100x write amplification on
+  ~170-byte NDJSON records (NDJSON throughput +48% from this alone).
+
+Measured (bench_json, MSVC Release AVX2): full tokenization
+0.62–0.84 GB/s; NDJSON tape-per-record ~0.56 GB/s. fionn's 4–8 GiB/s
+headline is selective skip-scanning, not full tokenization — the next
+lever is a simdjson-style stage-1 structural bitmap with folded UTF-8
+validation, slotting in behind the same sink seam. Deferred until a
+consumer profile demands it; tracked in
+docs/research/json-skip-architecture.md.
+
+Tests: test_bolt_parse_json 20/20 (SAX event-sequence vs tape, abort,
+null-callback skip, plain-run boundary stress at 40 offsets, NDJSON
+clean/dirty/strict/abort). Bench: benchmarks/bench_json.cpp.

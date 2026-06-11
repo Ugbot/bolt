@@ -283,3 +283,259 @@ TEST(BoltParseJson, FilterTokenDelta) {
                 full.token_count - filt.token_count);
     EXPECT_LT(filt.token_count, full.token_count);
 }
+
+// ===========================================================================
+// fionn-parity wave: SAX streaming + NDJSON framing + SIMD plain-run.
+// ===========================================================================
+
+namespace {
+
+// Event recorder — turns SAX callbacks into a comparable string trace.
+struct SaxTrace {
+    std::string events;
+    int64_t     abort_after = -1;   // abort when event count reaches this
+    int64_t     count = 0;
+
+    bool tick() {
+        ++count;
+        return abort_after < 0 || count < abort_after;
+    }
+    static bool obj_b(void* c) noexcept { auto* t = static_cast<SaxTrace*>(c); t->events += "{"; return t->tick(); }
+    static bool obj_e(void* c) noexcept { auto* t = static_cast<SaxTrace*>(c); t->events += "}"; return t->tick(); }
+    static bool arr_b(void* c) noexcept { auto* t = static_cast<SaxTrace*>(c); t->events += "["; return t->tick(); }
+    static bool arr_e(void* c) noexcept { auto* t = static_cast<SaxTrace*>(c); t->events += "]"; return t->tick(); }
+    static bool key(void* c, const char* b, int32_t n) noexcept {
+        auto* t = static_cast<SaxTrace*>(c);
+        t->events += "K(" + std::string(b, static_cast<size_t>(n)) + ")";
+        return t->tick();
+    }
+    static bool str(void* c, const char* b, int32_t n) noexcept {
+        auto* t = static_cast<SaxTrace*>(c);
+        t->events += "S(" + std::string(b, static_cast<size_t>(n)) + ")";
+        return t->tick();
+    }
+    static bool i64(void* c, int64_t v, const char*, int32_t) noexcept {
+        auto* t = static_cast<SaxTrace*>(c);
+        t->events += "I(" + std::to_string(v) + ")";
+        return t->tick();
+    }
+    static bool f64(void* c, double v, const char*, int32_t) noexcept {
+        auto* t = static_cast<SaxTrace*>(c);
+        t->events += "F(" + std::to_string(static_cast<int64_t>(v * 1000)) + ")";
+        return t->tick();
+    }
+    static bool boolean(void* c, bool v) noexcept {
+        auto* t = static_cast<SaxTrace*>(c);
+        t->events += v ? "T" : "f";
+        return t->tick();
+    }
+    static bool null_cb(void* c) noexcept {
+        auto* t = static_cast<SaxTrace*>(c); t->events += "N"; return t->tick();
+    }
+
+    bolt::parse::json::SaxHandler handler() {
+        bolt::parse::json::SaxHandler h{};
+        h.ctx = this;
+        h.on_begin_object = &obj_b; h.on_end_object = &obj_e;
+        h.on_begin_array = &arr_b;  h.on_end_array = &arr_e;
+        h.on_key = &key;            h.on_string = &str;
+        h.on_int64 = &i64;          h.on_float64 = &f64;
+        h.on_bool = &boolean;       h.on_null = &null_cb;
+        return h;
+    }
+};
+
+bool sax(const std::string& s, SaxTrace* t) {
+    auto h = t->handler();
+    return bolt::parse::json::sax_parse(
+        reinterpret_cast<const uint8_t*>(s.data()),
+        static_cast<int32_t>(s.size()), &h);
+}
+
+}  // namespace
+
+TEST(BoltParseJsonSax, EventSequence) {
+    SaxTrace t;
+    ASSERT_TRUE(sax("{\"a\": 1, \"b\": [true, null, \"x\"], \"c\": 2.5}", &t));
+    EXPECT_EQ(t.events, "{K(a)I(1)K(b)[TNS(x)]K(c)F(2500)}");
+}
+
+TEST(BoltParseJsonSax, EmptyAndScalars) {
+    SaxTrace t1;
+    EXPECT_TRUE(sax("", &t1));
+    EXPECT_EQ(t1.events, "");
+    SaxTrace t2;
+    EXPECT_TRUE(sax("42", &t2));
+    EXPECT_EQ(t2.events, "I(42)");
+}
+
+TEST(BoltParseJsonSax, MalformedRejects) {
+    SaxTrace t;
+    EXPECT_FALSE(sax("{\"a\": }", &t));
+    SaxTrace t2;
+    EXPECT_FALSE(sax("[1, 2", &t2));
+}
+
+TEST(BoltParseJsonSax, CallbackAbortStopsParse) {
+    SaxTrace t;
+    t.abort_after = 3;
+    EXPECT_FALSE(sax("[1, 2, 3, 4, 5, 6, 7, 8]", &t));
+    // Got the begin-array + first two ints, then aborted.
+    EXPECT_EQ(t.events, "[I(1)I(2)");
+}
+
+TEST(BoltParseJsonSax, NullCallbacksSkipEvents) {
+    // Only on_int64 wired; everything else nullptr — must not crash and
+    // must still validate structure.
+    struct Sum { int64_t total = 0; } s;
+    bolt::parse::json::SaxHandler h{};
+    h.ctx = &s;
+    h.on_int64 = [](void* c, int64_t v, const char*, int32_t) noexcept {
+        static_cast<Sum*>(c)->total += v;
+        return true;
+    };
+    const std::string doc = "{\"a\": [1, 2, 3], \"b\": {\"c\": 4}}";
+    EXPECT_TRUE(bolt::parse::json::sax_parse(
+        reinterpret_cast<const uint8_t*>(doc.data()),
+        static_cast<int32_t>(doc.size()), &h));
+    EXPECT_EQ(s.total, 10);
+}
+
+TEST(BoltParseJsonSax, MatchesTapeOnLongStrings) {
+    // SIMD plain-run stress: strings spanning the 8/32-byte boundaries
+    // with escapes, quotes-at-every-offset, controls and UTF-8 mixed in.
+    Arena a = make_arena();
+    for (int pad = 0; pad < 40; ++pad) {
+        std::string val(static_cast<size_t>(pad), 'x');
+        val += "\\\"q\\\\";          // escaped quote + escaped backslash
+        val += std::string(17, 'y');
+        val += "\xC3\xA9";            // 2-byte UTF-8
+        val += std::string(9, 'z');
+        const std::string doc = "{\"k\": \"" + val + "\"}";
+
+        StructuralIndex idx;
+        ASSERT_TRUE(build(a, doc, &idx)) << "pad=" << pad;
+        // tokens: BeginObject Key String EndObject End
+        ASSERT_EQ(idx.token_count, 5) << "pad=" << pad;
+        EXPECT_EQ(idx.tokens[2].type, TokenType::String);
+        EXPECT_EQ(idx.tokens[2].length, static_cast<int32_t>(val.size()));
+
+        SaxTrace t;
+        ASSERT_TRUE(sax(doc, &t)) << "pad=" << pad;
+        EXPECT_EQ(t.events, "{K(k)S(" + val + ")}") << "pad=" << pad;
+    }
+}
+
+TEST(BoltParseJsonSax, RejectsBareControlAndBadUtf8AcrossRuns) {
+    SaxTrace t1;
+    std::string ctrl = "{\"k\": \"" + std::string(20, 'a');
+    ctrl += '\x01';
+    ctrl += "tail\"}";
+    EXPECT_FALSE(sax(ctrl, &t1));
+
+    SaxTrace t2;
+    std::string bad = "{\"k\": \"" + std::string(20, 'a');
+    bad += "\xC0\x80";   // overlong NUL
+    bad += "\"}";
+    EXPECT_FALSE(sax(bad, &t2));
+}
+
+TEST(BoltParseJsonNdjson, ForEachTape) {
+    Arena scratch = make_arena();
+    const std::string src =
+        "{\"a\": 1}\n"
+        "\n"
+        "  {\"a\": 2}  \r\n"
+        "{\"a\": 3}";   // no trailing newline
+    struct Ctx { int64_t sum = 0; int64_t seen = 0; } c;
+    bolt::parse::json::NdjsonStats st{};
+    ASSERT_TRUE(bolt::parse::json::ndjson_for_each(
+        reinterpret_cast<const uint8_t*>(src.data()),
+        static_cast<int64_t>(src.size()),
+        /*ignore_errors=*/false, &scratch, &c,
+        [](void* ctx, const StructuralIndex* rec, int64_t) noexcept {
+            auto* cc = static_cast<Ctx*>(ctx);
+            // rec: BeginObject Key Int EndObject End
+            Iterator it{rec, 2, 0};
+            int64_t v = 0;
+            if (!bolt::parse::json::iter_int64(&it, &v)) return false;
+            cc->sum += v;
+            cc->seen += 1;
+            return true;
+        },
+        &st));
+    EXPECT_EQ(st.records, 3);
+    EXPECT_EQ(st.skipped, 0);
+    EXPECT_EQ(c.sum, 6);
+    EXPECT_EQ(c.seen, 3);
+}
+
+TEST(BoltParseJsonNdjson, IgnoreErrorsSkipsBadLines) {
+    Arena scratch = make_arena();
+    const std::string src =
+        "{\"a\": 1}\n"
+        "{BROKEN\n"
+        "{\"a\": 3}\n";
+    bolt::parse::json::NdjsonStats st{};
+    int64_t sum = 0;
+    ASSERT_TRUE(bolt::parse::json::ndjson_for_each(
+        reinterpret_cast<const uint8_t*>(src.data()),
+        static_cast<int64_t>(src.size()),
+        /*ignore_errors=*/true, &scratch, &sum,
+        [](void* ctx, const StructuralIndex* rec, int64_t) noexcept {
+            Iterator it{rec, 2, 0};
+            int64_t v = 0;
+            if (!bolt::parse::json::iter_int64(&it, &v)) return false;
+            *static_cast<int64_t*>(ctx) += v;
+            return true;
+        },
+        &st));
+    EXPECT_EQ(st.records, 2);
+    EXPECT_EQ(st.skipped, 1);
+    EXPECT_EQ(sum, 4);
+
+    // Strict mode fails on the same input.
+    EXPECT_FALSE(bolt::parse::json::ndjson_for_each(
+        reinterpret_cast<const uint8_t*>(src.data()),
+        static_cast<int64_t>(src.size()),
+        /*ignore_errors=*/false, &scratch, &sum,
+        [](void*, const StructuralIndex*, int64_t) noexcept { return true; },
+        nullptr));
+}
+
+TEST(BoltParseJsonNdjson, ForEachSax) {
+    const std::string src =
+        "{\"v\": 10}\n"
+        "{BROKEN}\n"
+        "{\"v\": 32}\n";
+    struct Sum { int64_t total = 0; } s;
+    bolt::parse::json::SaxHandler h{};
+    h.ctx = &s;
+    h.on_int64 = [](void* c, int64_t v, const char*, int32_t) noexcept {
+        static_cast<Sum*>(c)->total += v;
+        return true;
+    };
+    bolt::parse::json::NdjsonStats st{};
+    ASSERT_TRUE(bolt::parse::json::ndjson_for_each_sax(
+        reinterpret_cast<const uint8_t*>(src.data()),
+        static_cast<int64_t>(src.size()),
+        /*ignore_errors=*/true, &h, &st));
+    EXPECT_EQ(st.records, 2);
+    EXPECT_EQ(st.skipped, 1);
+    EXPECT_EQ(s.total, 42);
+}
+
+TEST(BoltParseJsonNdjson, SaxAbortIsNotSkipped) {
+    // A consumer abort must fail the run even under ignore_errors —
+    // it is not a malformed record.
+    const std::string src = "{\"v\": 1}\n{\"v\": 2}\n";
+    bolt::parse::json::SaxHandler h{};
+    h.on_int64 = [](void*, int64_t, const char*, int32_t) noexcept {
+        return false;   // abort immediately
+    };
+    bolt::parse::json::NdjsonStats st{};
+    EXPECT_FALSE(bolt::parse::json::ndjson_for_each_sax(
+        reinterpret_cast<const uint8_t*>(src.data()),
+        static_cast<int64_t>(src.size()),
+        /*ignore_errors=*/true, &h, &st));
+}

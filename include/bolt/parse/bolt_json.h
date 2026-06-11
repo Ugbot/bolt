@@ -115,6 +115,71 @@ bool      iter_advance(Iterator* it) noexcept;
 bool      iter_skip_to_close(Iterator* it) noexcept;
 bool      iter_next_key(Iterator* it, StringView* key) noexcept;
 
+// ---------------------------------------------------------------------------
+// SAX — event-driven streaming parse (fionn's native mode). NO tape, NO
+// arena: O(depth) stack memory, one pass over the bytes, events fired as
+// they are scanned. Same validation as build_index (UTF-8 DFA, depth cap,
+// trailing-junk rejection); the SIMD plain-run accelerator applies here
+// too since both modes share one scanner.
+//
+// Any callback may be nullptr — that event is simply not delivered.
+// A callback returning false aborts the parse (sax_parse returns false).
+// String/key slices point into the caller's source buffer (zero-copy);
+// escape sequences are NOT decoded. Numbers arrive materialised AND as
+// raw slices, so consumers can keep fionn's number-as-byte-slice model.
+// ---------------------------------------------------------------------------
+struct SaxHandler {
+    void* ctx;
+    bool (*on_begin_object)(void* ctx) noexcept;
+    bool (*on_end_object)(void* ctx) noexcept;
+    bool (*on_begin_array)(void* ctx) noexcept;
+    bool (*on_end_array)(void* ctx) noexcept;
+    bool (*on_key)(void* ctx, const char* bytes, int32_t len) noexcept;
+    bool (*on_string)(void* ctx, const char* bytes, int32_t len) noexcept;
+    bool (*on_int64)(void* ctx, int64_t v,
+                     const char* bytes, int32_t len) noexcept;
+    bool (*on_float64)(void* ctx, double v,
+                       const char* bytes, int32_t len) noexcept;
+    bool (*on_bool)(void* ctx, bool v) noexcept;
+    bool (*on_null)(void* ctx) noexcept;
+};
+
+bool sax_parse(const uint8_t* src, int32_t src_len,
+               const SaxHandler* handler) noexcept;
+
+// ---------------------------------------------------------------------------
+// NDJSON — newline-delimited records (fionn's SimdLineSeparator role).
+// Lines are split with the SWAR newline scan; blank lines are skipped;
+// a trailing '\r' (CRLF input) is trimmed per record.
+//
+// ndjson_for_each: per record, a tape is built into `scratch` and handed
+// to `on_record`; the scratch arena is RESET between records, so memory
+// stays O(largest record), and the record tape is only valid inside the
+// callback. With `ignore_errors`, records that fail to tokenize are
+// counted into stats->skipped instead of failing the run. A callback
+// returning false aborts (returns false).
+//
+// ndjson_for_each_sax: same record framing, but each record is delivered
+// as SAX events — no arena at all. A handler-callback returning false
+// aborts the whole run; tokenize failures honour `ignore_errors`.
+// ---------------------------------------------------------------------------
+struct NdjsonStats {
+    int64_t records;   // records delivered
+    int64_t skipped;   // records dropped by ignore_errors
+};
+
+using NdjsonRecordFn = bool (*)(void* ctx, const StructuralIndex* record,
+                                int64_t record_index) noexcept;
+
+bool ndjson_for_each(const uint8_t* src, int64_t src_len,
+                     bool ignore_errors, Arena* scratch,
+                     void* ctx, NdjsonRecordFn on_record,
+                     NdjsonStats* out_stats) noexcept;
+
+bool ndjson_for_each_sax(const uint8_t* src, int64_t src_len,
+                         bool ignore_errors, const SaxHandler* handler,
+                         NdjsonStats* out_stats) noexcept;
+
 // Materialise the scalar at the cursor. The cursor is not advanced — caller
 // uses iter_advance() afterward. Numbers parsed lazily here.
 bool iter_string  (const Iterator* it, StringView* out) noexcept;

@@ -113,16 +113,65 @@ Token counts:
 The reduction matches the structural ratio of the document — the parser
 walks the bytes but the tape only carries what the consumer asked for.
 
-## SIMD deferred
+## fionn-parity wave (landed)
 
-The structural-index scan is scalar in this wave. A `find any of `"\:,{}[]
-in 32 bytes` AVX2 kernel and an SSE4.2 fallback are the natural next step,
-following the Bolt convention of `BOLT_SIMD_*` compile-time selection. The
-TODO marker is in `src/parse/bolt_json.cpp` — search for `// SIMD`.
+Four upgrades landed together; the scanner now serves two sinks via
+compile-time dispatch (`TapeSink` / `SaxSink` templates — no runtime
+function pointers on the hot path).
 
-UTF-8 validation already runs on the scalar path; the AVX2 lookup-table
-approach (Lemire 2018) folds it into the structural scan. That's a single
-unified upgrade.
+### SAX streaming (`sax_parse`)
+
+fionn's native mode: event callbacks (`SaxHandler` — begin/end object/
+array, key, string, int64, float64, bool, null), NO tape, NO arena,
+O(depth) memory. Any callback may be nullptr (event skipped); returning
+false aborts. Numbers arrive materialised AND as raw slices, so
+consumers can keep fionn's number-as-byte-slice model. Same validation
+as `build_index` (UTF-8 DFA, depth cap, trailing-junk reject).
+
+### NDJSON framing (`ndjson_for_each` / `ndjson_for_each_sax`)
+
+The SimdLineSeparator role: SWAR newline scan, blank-line skip, CRLF
+trim. Tape mode resets the caller's scratch arena per record (memory
+stays O(largest record); the record tape is valid only inside the
+callback). SAX mode uses no arena at all. `ignore_errors` skips
+malformed records and counts them (`NdjsonStats.skipped`); a consumer
+abort is distinguished from a malformed record and is never skipped.
+
+### SIMD/SWAR scan acceleration
+
+- `string_plain_run` — AVX2 (32 B/step, exact compares, behind
+  `BOLT_SIMD_AVX2`) with a SWAR 8-byte fallback: skips plain ASCII
+  string content (not `"`, not `\`, ≥0x20, <0x80) so the UTF-8 DFA and
+  per-byte branches only run on special bytes. Mycroft-mask soundness:
+  false positives only appear in lanes after a real hit, so hits==0
+  proves the word plain and ctz lands on a real hit.
+- `digit_run` — SWAR digit scan for number bodies (`(b^0x30)+6 | x`
+  nibble trick; same first-hit-exact argument).
+- `parser_init` — replaced the whole-struct memset that was writing the
+  ~17 KB path_stack per parse; for ~170-byte NDJSON records that was a
+  100x write amplification and the single biggest cost in the first
+  bench run (NDJSON +48% from this fix alone).
+
+### Measured (bench_json, MSVC Release, AVX2, 32.5 MiB corpus)
+
+| Path | GB/s |
+|---|---|
+| build_index (array → tape) | 0.62–0.84 |
+| sax_parse (events, no tape) | ~0.6 |
+| ndjson_for_each (tape/record) | ~0.56 |
+| ndjson_for_each_sax | ~0.49 |
+| build_index_filtered (skip ~all) | ~0.7 |
+
+### Honest gap vs fionn's headline
+
+fionn's 4–8 GiB/s figures are SELECTIVE skip-scanning (skipping subtrees
+without tokenizing); our numbers above are FULL tokenization with UTF-8
+validation. The next lever for multi-GiB/s is a simdjson-style stage-1
+structural bitmap (SIMD classify all of `"\:,{}[]` + quote-parity prefix
+XOR + folded Lemire UTF-8 validation), which replaces the branchy
+recursive scanner rather than accelerating inside it. That is a
+standalone kernel project; the sink/template seam landed in this wave is
+the boundary it would slot into.
 
 ## What we didn't take from Fionn
 
