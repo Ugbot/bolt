@@ -358,7 +358,8 @@ static bool alloc_columns(const CsvSchema& schema, int64_t row_count,
     for (uint32_t c = 0; c < schema.num_cols; ++c) {
         const BoltType t = schema.col_types[c];
         if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8 &&
-            t != BoltType::Date32 && t != BoltType::Decimal128) {
+            t != BoltType::Date32 && t != BoltType::Decimal128 &&
+            t != BoltType::Decimal64) {
             return false;
         }
         if (row_count == 0) {
@@ -412,6 +413,21 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
             return false;
         }
         static_cast<Decimal128*>(cols[c].data)[row] = v;
+    } else if (t == BoltType::Decimal64) {
+        // W-DEC: int64-mantissa decimal. Same parse as Decimal128; the
+        // caller chose Decimal64 because the column's precision <= 18,
+        // so the mantissa always fits the low limb. A field that
+        // nevertheless overflows (schema lied / unprofiled row) fails
+        // the parse — same strictness contract as Date32 above.
+        Decimal128 v{0, 0};
+        if (!field_to_decimal128(f_start, flen,
+                                 schema.col_scales[c],
+                                 schema.strict_decimal_scale, &v)) {
+            return false;
+        }
+        const bool fits = (v.hi == 0 && v.lo >= 0) || (v.hi == -1 && v.lo < 0);
+        if (!fits) return false;
+        static_cast<int64_t*>(cols[c].data)[row] = v.lo;
     } else {
         assert(t == BoltType::Utf8);
         StringView sv;

@@ -30,6 +30,12 @@ enum class BoltType : uint8_t {
     List      = 30, Struct = 31, Map    = 32,
     Dictionary= 40,
     FixedSizeBinary = 41, Decimal128 = 42, Decimal256 = 43,
+    // W-DEC: exact decimal with an int64 MANTISSA (scale lives on the
+    // column, same as Decimal128). Internal physical refinement chosen
+    // when precision <= 18 — mantissa math is plain int64 math, so every
+    // SIMD int kernel applies. Code that doesn't know this type fails
+    // SAFE (no match -> per-row/Decimal128 fallback paths).
+    Decimal64 = 44,
     // Bolt extensions
     UUID      = 50, IPv4   = 51, Embedding = 52, Symbol = 53,
     // Wave 9.4 z.5 — multi-precision Embedding variants. Same wire shape
@@ -57,7 +63,8 @@ inline constexpr uint8_t kTypeSize[64] = {
     0, 0, 0,                 // List, Struct, Map
     0, 0, 0, 0, 0, 0, 0,   // 33-39 reserved
     0, 0, 16, 32,           // Dictionary, FixedSizeBinary, Decimal128, Decimal256
-    0, 0, 0, 0, 0, 0,       // 44-49 reserved
+    8,                       // Decimal64 (int64 mantissa; scale on the column)
+    0, 0, 0, 0, 0,          // 45-49 reserved
     16, 4, 0, 0,             // UUID, IPv4, Embedding, Symbol
     0, 0, 0,                 // EmbeddingF16, EmbeddingU8, EmbeddingI8 (runtime stride)
     0, 0, 0, 0, 0, 0, 0,    // 57-63 reserved

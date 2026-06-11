@@ -1128,6 +1128,16 @@ inline void BoltColumn::compute_stats_numeric() noexcept {
             break;
         BOLT_NUMERIC_TYPES
 #undef X
+        // W-DEC: Decimal64 stats scan on the int64 mantissa. Mantissa
+        // order == decimal order at a fixed scale, so min/max/monotonic
+        // are exact; mean/variance are in mantissa units (consumers that
+        // need decimal units divide by 10^scale). Deliberately NOT added
+        // to BOLT_NUMERIC_TYPES — kernels opt in surface by surface so
+        // unaware code falls back instead of ignoring the scale.
+        case BoltType::Decimal64:
+            detail::stats_scan_typed<int64_t>(
+                static_cast<const int64_t*>(data), v, length, &stats);
+            break;
         default:
             // Non-numeric type: leave stats untouched.
             break;
