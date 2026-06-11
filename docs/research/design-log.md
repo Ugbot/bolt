@@ -1939,3 +1939,31 @@ shape measured 23.6 / 24.1 / 24.1 / 24.1 ns/row at 32k / 64k / 128k /
 per-window costs — classify scan, bank zeroing, dispatch — already
 amortise fully at 32k; the gid scratch is the only footprint that
 scales, 4B/row).
+
+## 2026-06-11 / W-DEC inc 2 — Decimal64 flows through the typed groupby + dec64 kernels
+
+Context: chukonu now LOADS p<=18 decimal columns as `Decimal64` (int64
+mantissa). The typed groupby must aggregate them exactly with NO
+plan-time overflow proof available yet (the proof/lane stamp is the next
+increment).
+
+Decision: Decimal64 cells WIDEN to d128 at `read_cell16` (sign-extend),
+so every existing Decimal128 accumulate/compare path applies verbatim;
+`out_type` widens SUM(Decimal64) -> Decimal128 and keeps MIN/MAX at
+Decimal64 (they cannot grow); AVG reuses the d128 rescale(+4)/div
+finalize bit-for-bit. The two-pass pass-2 gains `gb_p2_sum_dec64` — a
+columnar loop reading 8-byte mantissas and accumulating into the FULL
+d128 cell lanes in place (the gb_d128_acc lesson applied) — so unproven
+Decimal64 sums keep K-AGG-C's columnar perf instead of falling to the
+per-row apply() dispatch. Banked variant deliberately omitted: once the
+lane stamp lands, PROVEN sums route to gb_p2_sum_int<int64_t> (+banks)
+and the dec64 loop remains only for unprovable cases.
+
+New `bolt/kernels/bolt_decimal64.h`: `widen_to_d128` (<=0.6 ns/row
+target), `rescale_up` (exact x10^pow, caller-proved, debug re-check),
+`widen_one`, `k_dec64_pow10`. Test: Decimal64PayloadSumOverflowsIntoD128
+(per-group sum = 2^64 — exactness REQUIRES the d128 accumulator; Sum
+widens, Avg divides exactly, Min/Max stay Decimal64). Suite 16/16; the
+chukonu SF1 golden gate is 22/22 data-level with Decimal64-loaded money
+columns at unchanged query times (memory traffic on those columns
+halved).

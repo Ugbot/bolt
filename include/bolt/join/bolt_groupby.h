@@ -633,6 +633,15 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
         case BoltType::Int64:    out.a = static_cast<const int64_t*>(c.data)[r]; break;
         case BoltType::Int32:    out.a = static_cast<const int32_t*>(c.data)[r]; break;
         case BoltType::Date32:   out.a = static_cast<const int32_t*>(c.data)[r]; break;
+        case BoltType::Decimal64: {
+            // W-DEC: widen the int64 mantissa to a full d128 cell (sign-
+            // extended) so the Decimal128 accumulate/compare paths apply
+            // verbatim — sums can grow past int64 with zero proof needed.
+            const int64_t m = static_cast<const int64_t*>(c.data)[r];
+            out.a = m;
+            out.b = (m < 0) ? -1 : 0;
+            break;
+        }
         case BoltType::Float64:  std::memcpy(&out.a, &static_cast<const double*>(c.data)[r], 8); break;
         case BoltType::Utf8:     std::memcpy(&out, &static_cast<const StringView*>(c.data)[r], 16); break;
         default:                 out.a = static_cast<const int64_t*>(c.data)[r]; break;
@@ -730,7 +739,9 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
 //   * MAX identity: the empty string (length=0, all zeros) — byte-lex minimum.
 //     {0, 0} is already correct; share it with the Sum/Count path.
 BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
-    const bool d = (t == BoltType::Decimal128);
+    // W-DEC: Decimal64 cells are widened d128 (read_cell16), so their
+    // Min/Max identities are the d128 extremes too.
+    const bool d = (t == BoltType::Decimal128 || t == BoltType::Decimal64);
     const bool s = (t == BoltType::Utf8);
     switch (k) {
         case AggKind::Sum:
@@ -768,7 +779,9 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
     if (k == AggKind::CountStar) { slot->a += 1; return; }
     if (k == AggKind::Count)     { slot->a += valid ? 1 : 0; return; }
     if (!valid) return;   // Sum/Min/Max/Avg ignore NULLs (SQL semantics)
-    if (t == BoltType::Decimal128) {
+    // W-DEC: Decimal64 cells arrive WIDENED to d128 (read_cell16), so the
+    // Decimal128 arm is exact for them — sums grow past int64 safely.
+    if (t == BoltType::Decimal128 || t == BoltType::Decimal64) {
         namespace dec = kernels::decimal;
         dec::Decimal128 s, x;
         std::memcpy(&s, slot, 16);
@@ -821,7 +834,18 @@ BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept {
 BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     if (k == AggKind::CountStar || k == AggKind::Count) return BoltType::Int64;
     if (k == AggKind::Avg) {
-        return (in == BoltType::Decimal128) ? BoltType::Decimal128 : BoltType::Float64;
+        // W-DEC: Avg(Decimal64) accumulates in the widened d128 cell and
+        // finalizes through the SAME d128 rescale(+4)/div path, so the
+        // result is Decimal128 — bit-identical to the pre-Decimal64 output.
+        return (in == BoltType::Decimal128 || in == BoltType::Decimal64)
+                   ? BoltType::Decimal128 : BoltType::Float64;
+    }
+    // W-DEC: SUM(Decimal64) can exceed the int64 mantissa with no plan-time
+    // proof at this layer — the accumulator is the widened d128 cell and
+    // the output WIDENS to Decimal128 (exact, no overflow ever). MIN/MAX
+    // never grow: they keep Decimal64.
+    if (in == BoltType::Decimal64) {
+        return (k == AggKind::Sum) ? BoltType::Decimal128 : BoltType::Decimal64;
     }
     // SUM / MIN / MAX: preserve input type for Decimal128/Utf8/Date32; SUM/MIN/MAX
     // of narrow ints emit Int64.
@@ -1247,7 +1271,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
         const BoltType ot = gb_detail::out_type(state->specs[j].kind,
                                                 state->agg_in_types[j]);
         out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
-        if (ot == BoltType::Decimal128) {
+        if (ot == BoltType::Decimal128 || ot == BoltType::Decimal64) {
             out_aggs[j].decimal_scale = (state->specs[j].kind == AggKind::Avg)
                 ? static_cast<uint8_t>(state->agg_in_scales[j] + 4)
                 : state->agg_in_scales[j];
@@ -1268,6 +1292,8 @@ inline bool groupby_agg_multi_key_typed_finalize(
                 case BoltType::Decimal128:
                     std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
                                 &krow[k], 16); break;
+                case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
+                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
                 case BoltType::Utf8:
                     std::memcpy(&static_cast<StringView*>(buf)[r], &krow[k], 16); break;
                 default:
@@ -1512,7 +1538,7 @@ inline bool groupby_agg_multi_key_typed(
     for (uint32_t j = 0; j < n_aggs; ++j) {
         const BoltType ot = gb_detail::out_type(aggs[j].kind, agg_in_types[j]);
         out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
-        if (ot == BoltType::Decimal128) {
+        if (ot == BoltType::Decimal128 || ot == BoltType::Decimal64) {
             // AVG widens scale slightly so integer division keeps precision;
             // SUM/MIN/MAX preserve input scale.
             out_aggs[j].decimal_scale = (aggs[j].kind == AggKind::Avg)
@@ -1537,6 +1563,8 @@ inline bool groupby_agg_multi_key_typed(
                 case BoltType::Decimal128:
                     std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
                                 &krow[k], 16); break;
+                case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
+                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
                 case BoltType::Utf8:
                     std::memcpy(&static_cast<StringView*>(buf)[r], &krow[k], 16); break;
                 default:

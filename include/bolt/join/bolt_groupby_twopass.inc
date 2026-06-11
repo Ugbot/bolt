@@ -402,6 +402,34 @@ inline void gb_p2_sum_d128(GbCell16* BOLT_RESTRICT acc,
     }
 }
 
+// W-DEC: Decimal64 payload — int64 mantissas accumulated into the FULL
+// d128 cell (lo/hi lanes in place), so sums grow past int64 with no
+// plan-time proof needed. Columnar like sum_d128; reads 8B/row not 16B.
+template <bool Sparse, bool HasValid, bool Cnt>
+inline void gb_p2_sum_dec64(GbCell16* BOLT_RESTRICT acc,
+                            int64_t* BOLT_RESTRICT cnt,
+                            const BoltColumn& pc, const uint32_t* sel,
+                            int64_t start, int64_t count,
+                            const int32_t* BOLT_RESTRICT gid) noexcept {
+    assert(acc != nullptr && cnt != nullptr && gid != nullptr);
+    const auto* p = static_cast<const int64_t*>(pc.data);
+    auto* a = reinterpret_cast<kernels::decimal::Decimal128*>(acc);
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t r = gb_p2_row<Sparse>(sel, start, i);
+        const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
+        const int32_t g = gid[i];
+        if (valid) {
+            const int64_t m = p[r];
+            const uint64_t alo = static_cast<uint64_t>(a[g].lo);
+            const uint64_t lo  = alo + static_cast<uint64_t>(m);
+            a[g].lo = static_cast<int64_t>(lo);
+            a[g].hi = a[g].hi + (m >> 63) +
+                      static_cast<int64_t>((lo < alo) ? 1 : 0);
+        }
+        if (Cnt) cnt[g] += valid ? 1 : 0;
+    }
+}
+
 template <bool Sparse, bool HasValid, typename SrcT, bool Cnt>
 inline void gb_p2_sum_int(GbCell16* BOLT_RESTRICT acc,
                           int64_t* BOLT_RESTRICT cnt,
@@ -671,6 +699,15 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
             if (is_avg) BOLT_GB_P2(gb_p2_sum_d128, true);
             else        BOLT_GB_P2(gb_p2_sum_d128, false);
         }
+        return true;
+    }
+    if (t == BoltType::Decimal64) {
+        // W-DEC: unproven Decimal64 sums accumulate into the full d128
+        // cell (overflow-safe, columnar). Proven lanes route to
+        // gb_p2_sum_int via the inc-4 AggSpec lane stamp instead. Banked
+        // variant deliberately omitted: the lane path supersedes it.
+        if (is_avg) BOLT_GB_P2(gb_p2_sum_dec64, true);
+        else        BOLT_GB_P2(gb_p2_sum_dec64, false);
         return true;
     }
     if (t == BoltType::Int64) {

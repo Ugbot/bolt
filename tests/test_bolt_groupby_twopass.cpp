@@ -664,6 +664,65 @@ TEST(BoltGroupbyTwopass, SingleIngestPastWindowBoundary) {
 }
 
 // ---------------------------------------------------------------------------
+// W-DEC: Decimal64 payloads — the columnar dec64 sum accumulates into the
+// FULL d128 cell, so a sum that exceeds int64 stays exact and the output
+// WIDENS to Decimal128. Avg divides via the d128 finalize; Min/Max keep
+// Decimal64 (generic path).
+// ---------------------------------------------------------------------------
+
+TEST(BoltGroupbyTwopass, Decimal64PayloadSumOverflowsIntoD128) {
+    constexpr int64_t N = 8192;
+    static int64_t ks[N];
+    static int64_t mant[N];   // Decimal64 mantissas (scale 2)
+    // Each row adds 2^52 — the per-group sum (4096 rows) is 2^64, well
+    // past int64; exactness requires the d128 accumulator.
+    const int64_t big = (1LL << 52);
+    for (int64_t i = 0; i < N; ++i) { ks[i] = i % 2; mant[i] = big; }
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn vd = BoltColumn::make_flat(mant, nullptr, 0, BoltType::Decimal64);
+    vd.decimal_scale = 2;
+    AggSpec specs[4];
+    specs[0] = make_spec(AggKind::Sum, 0);
+    specs[1] = make_spec(AggKind::Avg, 0);
+    specs[2] = make_spec(AggKind::Min, 0);
+    specs[3] = make_spec(AggKind::Max, 0);
+    GroupbyTypedState st{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &kd, 1, &vd, 1,
+                                                  specs, 4, 4));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, N, BoltType::Int64);
+    BoltColumn v = BoltColumn::make_flat(mant, nullptr, N, BoltType::Decimal64);
+    v.decimal_scale = 2;
+    groupby_agg_multi_key_typed_ingest(&st, &k, &v, nullptr, 0, N);
+    ASSERT_FALSE(st.oom);
+    BoltColumn ok[1], oa[4];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 2u);
+    EXPECT_EQ(oa[0].type, BoltType::Decimal128);   // Sum widened
+    EXPECT_EQ(oa[0].decimal_scale, 2);
+    EXPECT_EQ(oa[1].type, BoltType::Decimal128);   // Avg via d128 divide
+    EXPECT_EQ(oa[1].decimal_scale, 6);
+    EXPECT_EQ(oa[2].type, BoltType::Decimal64);    // Min stays Decimal64
+    EXPECT_EQ(oa[3].type, BoltType::Decimal64);
+    // Expected per-group sum = 4096 * 2^52 = 2^64 (needs hi limb = 1).
+    const dec::Decimal128 expect_sum{0, 1};
+    const auto* sums = static_cast<const dec::Decimal128*>(oa[0].data);
+    const auto* avgs = static_cast<const dec::Decimal128*>(oa[1].data);
+    const auto* mins = static_cast<const int64_t*>(oa[2].data);
+    const auto* maxs = static_cast<const int64_t*>(oa[3].data);
+    for (uint32_t i = 0; i < ng; ++i) {
+        EXPECT_EQ(dec::d128_cmp(sums[i], expect_sum), 0);
+        // Avg = rescale(sum, 2->6) / 4096 = (2^64 * 10^4) / 4096.
+        const dec::Decimal128 num = dec::d128_rescale(expect_sum, 2, 6);
+        const dec::Decimal128 q = dec::d128_div(num, dec::d128_from_i64(4096));
+        EXPECT_EQ(dec::d128_cmp(avgs[i], q), 0);
+        EXPECT_EQ(mins[i], big);
+        EXPECT_EQ(maxs[i], big);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cap overflow: more groups than the (tight) SwissTable capacity must set
 // state->oom and finalize must fail — same contract as the fallback.
 // ---------------------------------------------------------------------------
