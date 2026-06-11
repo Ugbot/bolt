@@ -593,6 +593,53 @@ inline void gb_p2_sum_int_bank(GroupbyTypedState* st,
     }
 }
 
+// W-DEC inc 4: lane-PROVEN Decimal64 sum, banked. CALLER CONTRACT
+// (AggSpec::lane == 1): row_bound × max|mantissa| ≤ INT64_MAX, so every
+// partial sum — including each bank's window subtotal, mixed signs and
+// all (|partial| ≤ Σ|values| ≤ row_bound × max|value|) — fits an int64.
+// The win over gb_p2_sum_dec64 is dropping the per-row carry chain:
+// banks accumulate pure int64; the once-per-window merge widens each
+// per-group subtotal to d128 via gb_d128_acc, so the PERSISTENT cell
+// stays a true Decimal128 and composes freely with lane-0 / fallback
+// windows (no cross-path representation hazard, no finalize changes).
+template <bool Sparse, bool HasValid, bool Cnt>
+inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
+                                      GbCell16* BOLT_RESTRICT acc,
+                                      int64_t* BOLT_RESTRICT cnt,
+                                      const BoltColumn& pc,
+                                      const uint32_t* sel,
+                                      int64_t start, int64_t count,
+                                      const int32_t* BOLT_RESTRICT gid,
+                                      uint32_t ec) noexcept {
+    assert(acc != nullptr && gid != nullptr);
+    assert(st->bank_acc != nullptr);
+    gb_p2_bank_zero<Cnt>(st, ec);
+    GbCell16* bk = st->bank_acc;
+    int64_t*  bc = st->bank_cnt;
+    const auto* p = static_cast<const int64_t*>(pc.data);
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t r = gb_p2_row<Sparse>(sel, start, i);
+        const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
+        const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
+                         kGbBankGroups + static_cast<uint32_t>(gid[i]);
+        bk[o].a += valid ? p[r] : 0;
+        if (Cnt) bc[o] += valid ? 1 : 0;
+    }
+    auto* a = reinterpret_cast<kernels::decimal::Decimal128*>(acc);
+    for (uint32_t g = 0; g < ec; ++g) {
+        int64_t s = bk[g].a;
+        for (uint32_t b = 1; b < kGbBankCount; ++b)
+            s += bk[static_cast<size_t>(b) * kGbBankGroups + g].a;
+        gb_d128_acc(&a[g], kernels::decimal::d128_from_i64(s));
+        if (Cnt) {
+            int64_t c = bc[g];
+            for (uint32_t b = 1; b < kGbBankCount; ++b)
+                c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
+            cnt[g] += c;
+        }
+    }
+}
+
 template <bool Sparse>
 inline void gb_p2_count_star_bank(GroupbyTypedState* st,
                                   GbCell16* BOLT_RESTRICT acc,
@@ -674,7 +721,7 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
                               const uint32_t* sel, int64_t start,
                               int64_t count, const int32_t* gid,
                               uint32_t ec, bool banked, BoltType t,
-                              bool is_avg) noexcept {
+                              bool is_avg, uint8_t lane) noexcept {
     assert(st != nullptr && acc != nullptr);
     const bool hv = (pc.validity != nullptr);
 #define BOLT_GB_P2(FN, ...)                                                  \
@@ -702,12 +749,19 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
         return true;
     }
     if (t == BoltType::Decimal64) {
-        // W-DEC: unproven Decimal64 sums accumulate into the full d128
-        // cell (overflow-safe, columnar). Proven lanes route to
-        // gb_p2_sum_int via the inc-4 AggSpec lane stamp instead. Banked
-        // variant deliberately omitted: the lane path supersedes it.
-        if (is_avg) BOLT_GB_P2(gb_p2_sum_dec64, true);
-        else        BOLT_GB_P2(gb_p2_sum_dec64, false);
+        // W-DEC inc 4: lane==1 (caller-proved int64 fit) + banked window
+        // → pure-int64 bank accumulation with a d128-widening merge (the
+        // cell stays a true d128; see gb_p2_sum_dec64_lane_bank). All
+        // other windows — unproven, or too few rows/groups to bank —
+        // keep the overflow-safe columnar d128 loop, which is already
+        // fast for the non-banked shape.
+        if (lane == 1u && banked) {
+            if (is_avg) BOLT_GB_P2B(gb_p2_sum_dec64_lane_bank, true);
+            else        BOLT_GB_P2B(gb_p2_sum_dec64_lane_bank, false);
+        } else {
+            if (is_avg) BOLT_GB_P2(gb_p2_sum_dec64, true);
+            else        BOLT_GB_P2(gb_p2_sum_dec64, false);
+        }
         return true;
     }
     if (t == BoltType::Int64) {
@@ -761,7 +815,8 @@ inline void gb_pass2_one(GroupbyTypedState* st, uint32_t j,
     const bool sum_like = (kind == AggKind::Sum || kind == AggKind::Avg);
     if (sum_like &&
         gb_pass2_sum_like<Sparse>(st, acc, cnt, pc, sel, start, count, gid,
-                                  ec, banked, t, kind == AggKind::Avg)) {
+                                  ec, banked, t, kind == AggKind::Avg,
+                                  st->specs[j].lane)) {
         return;
     }
 #define BOLT_GB_P2(FN, ...)                                                  \

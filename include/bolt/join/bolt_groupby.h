@@ -598,7 +598,18 @@ struct AggSpec {
     AggKind  kind;
     uint8_t  in_col;     // index into the `payload` array; ignored for CountStar
     uint8_t  distinct;   // K-AGG-A.2 item 2: 1 = fold duplicates per (agg, group)
-    uint8_t  _pad[5];    // explicit padding; POD, layout-stable
+    // W-DEC inc 4: accumulator-lane stamp for Decimal64 Sum/Avg.
+    //   0 = auto/unproven (default) — overflow-safe widened-d128 sum loops.
+    //   1 = CALLER CONTRACT: the planner PROVED at plan time that
+    //       row_bound × max|value| ≤ INT64_MAX, hence EVERY partial sum of
+    //       this aggregate (any subset, any sign mix) fits an int64. The
+    //       kernel never verifies this in release (debug-asserts at
+    //       finalize); it only selects faster pure-int64 window loops.
+    // Representation invariant: lane NEVER changes what the accumulator
+    // cell stores — it stays a true Decimal128 — so lane-1 windows, lane-0
+    // windows, and per-row fallback windows compose freely.
+    uint8_t  lane;
+    uint8_t  _pad[4];    // explicit padding; POD, layout-stable
 };
 static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 
@@ -1309,6 +1320,14 @@ inline bool groupby_agg_multi_key_typed_finalize(
             const size_t off = static_cast<size_t>(j) * cap + static_cast<uint32_t>(r);
             const GbCell16 acc = state->accums[off];
             const int64_t  cnt = state->counts[off];
+            // W-DEC inc 4: lane=1 caller contract (planner-proved int64
+            // fit). Debug-only: the d128 total must be a pure
+            // sign-extension of its low limb. Release never verifies.
+            assert(state->specs[j].lane != 1 ||
+                   state->agg_in_types[j] != BoltType::Decimal64 ||
+                   (state->specs[j].kind != AggKind::Sum &&
+                    state->specs[j].kind != AggKind::Avg) ||
+                   acc.b == (acc.a >> 63));
             if (state->specs[j].kind == AggKind::CountStar ||
                 state->specs[j].kind == AggKind::Count) {
                 static_cast<int64_t*>(buf)[r] = acc.a;

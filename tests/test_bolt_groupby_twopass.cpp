@@ -723,6 +723,183 @@ TEST(BoltGroupbyTwopass, Decimal64PayloadSumOverflowsIntoD128) {
 }
 
 // ---------------------------------------------------------------------------
+// W-DEC inc 4: lane=1 (planner-proved int64 fit) must be BIT-IDENTICAL to
+// lane=0 on the same data. lane only selects which pass-2 loop runs; the
+// accumulator cell stays a true d128 in both, so outputs match exactly —
+// including when fallback windows (spilled keys) interleave.
+// ---------------------------------------------------------------------------
+
+struct Dec64LaneOut {
+    uint32_t ng;
+    uint8_t  key[16 * 16];   // raw output-key bytes (8B or 16B stride)
+    uint8_t  sum[16 * 16];   // Decimal128 sums
+    uint8_t  avg[16 * 16];   // Decimal128 avgs
+    int64_t  cnt[16];        // CountStar
+};
+
+void expect_lane_parity(const Dec64LaneOut& l0, const Dec64LaneOut& l1) {
+    ASSERT_EQ(l0.ng, l1.ng);
+    EXPECT_EQ(std::memcmp(l0.key, l1.key, sizeof(l0.key)), 0);
+    EXPECT_EQ(std::memcmp(l0.sum, l1.sum, sizeof(l0.sum)), 0);
+    EXPECT_EQ(std::memcmp(l0.avg, l1.avg, sizeof(l0.avg)), 0);
+    EXPECT_EQ(std::memcmp(l0.cnt, l1.cnt, sizeof(l0.cnt)), 0);
+}
+
+// One run: 1 int64 key, {Sum, Avg, CountStar} over a Decimal64 column,
+// `lane` stamped on Sum + Avg. Captures raw output bytes for parity.
+void run_dec64_lane_i64key(uint8_t lane, int64_t* ks, int64_t* mant,
+                           int64_t n, const uint32_t* sel, uint32_t sel_len,
+                           Dec64LaneOut* out) {
+    assert(out != nullptr);
+    assert(n > 0);
+    std::memset(out, 0, sizeof(*out));
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn vd = BoltColumn::make_flat(mant, nullptr, 0, BoltType::Decimal64);
+    vd.decimal_scale = 2;
+    AggSpec specs[3];
+    specs[0] = make_spec(AggKind::Sum, 0);  specs[0].lane = lane;
+    specs[1] = make_spec(AggKind::Avg, 0);  specs[1].lane = lane;
+    specs[2] = make_spec(AggKind::CountStar, 0);
+    GroupbyTypedState st{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &kd, 1, &vd, 1,
+                                                  specs, 3, 16));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, n, BoltType::Int64);
+    BoltColumn v = BoltColumn::make_flat(mant, nullptr, n, BoltType::Decimal64);
+    v.decimal_scale = 2;
+    groupby_agg_multi_key_typed_ingest(&st, &k, &v, sel, sel_len, n);
+    ASSERT_FALSE(st.oom);
+    BoltColumn ok[1], oa[3];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_LE(ng, 16u);
+    EXPECT_EQ(oa[0].type, BoltType::Decimal128);
+    EXPECT_EQ(oa[1].type, BoltType::Decimal128);
+    out->ng = ng;
+    std::memcpy(out->key, ok[0].data, ng * 8u);
+    std::memcpy(out->sum, oa[0].data, ng * 16u);
+    std::memcpy(out->avg, oa[1].data, ng * 16u);
+    std::memcpy(out->cnt, oa[2].data, ng * 8u);
+}
+
+// Mixed-sign mantissas + Avg + >65536 rows in one ingest: window split,
+// bank-merge composition across windows, negative subtotals.
+TEST(BoltGroupbyTwopass, Decimal64LaneSumParity) {
+    constexpr int64_t N = 200000;   // 4 windows
+    static int64_t ks[N];
+    static int64_t mant[N];
+    for (int64_t i = 0; i < N; ++i) {
+        ks[i] = static_cast<int64_t>((i * 2654435761u) % 8);
+        mant[i] = ((i * 37) % 2001) - 1000;   // mixed sign
+    }
+    Dec64LaneOut l0, l1;
+    run_dec64_lane_i64key(0, ks, mant, N, nullptr, 0, &l0);
+    run_dec64_lane_i64key(1, ks, mant, N, nullptr, 0, &l1);
+    ASSERT_EQ(l0.ng, 8u);
+    expect_lane_parity(l0, l1);
+}
+
+// Total near INT64_MAX, in-contract: 8192 rows × (INT64_MAX / 8192).
+// Single group so the whole proof budget lands on one accumulator.
+TEST(BoltGroupbyTwopass, Decimal64LaneSumParityNearInt64Max) {
+    constexpr int64_t N = 8192;
+    const int64_t step = INT64_MAX / 8192;   // N * step <= INT64_MAX
+    static int64_t ks[N];
+    static int64_t mant[N];
+    for (int64_t i = 0; i < N; ++i) { ks[i] = 7; mant[i] = step; }
+    Dec64LaneOut l0, l1;
+    run_dec64_lane_i64key(0, ks, mant, N, nullptr, 0, &l0);
+    run_dec64_lane_i64key(1, ks, mant, N, nullptr, 0, &l1);
+    ASSERT_EQ(l0.ng, 1u);
+    expect_lane_parity(l0, l1);
+    dec::Decimal128 got;
+    std::memcpy(&got, l1.sum, 16);
+    EXPECT_EQ(dec::d128_cmp(got, dec::d128_from_i64(step * N)), 0);
+}
+
+// Sparse sel through the lane-banked loop.
+TEST(BoltGroupbyTwopass, Decimal64LaneSumParitySparseSel) {
+    constexpr int64_t N = 16384;
+    static int64_t  ks[N];
+    static int64_t  mant[N];
+    static uint32_t sel[N / 2];
+    for (int64_t i = 0; i < N; ++i) {
+        ks[i] = i % 4;
+        mant[i] = ((i * 13) % 999) - 499;
+    }
+    for (int64_t j = 0; j < N / 2; ++j) sel[j] = static_cast<uint32_t>(2 * j + 1);
+    Dec64LaneOut l0, l1;
+    run_dec64_lane_i64key(0, ks, mant, N, sel, static_cast<uint32_t>(N / 2), &l0);
+    run_dec64_lane_i64key(1, ks, mant, N, sel, static_cast<uint32_t>(N / 2), &l1);
+    ASSERT_EQ(l0.ng, 2u);   // odd rows only -> keys 1 and 3
+    expect_lane_parity(l0, l1);
+}
+
+// Utf8 keys with a spilled (>12-char) key morsel mixed in: that morsel's
+// windows run the per-row FALLBACK (apply()'s d128 arm writes {a,b})
+// while the inline morsels run the lane-1 banked loop. The shared-d128
+// representation rule makes the mix exact; outputs must equal lane=0.
+void run_dec64_lane_utf8key(uint8_t lane, Dec64LaneOut* out) {
+    assert(out != nullptr);
+    assert(lane <= 1u);
+    constexpr int64_t NI = 70000;   // > one window
+    static StringView inl[NI];
+    static int64_t    inl_m[NI];
+    static char       longbuf[32];
+    std::memset(longbuf, 'q', sizeof(longbuf));
+    for (int64_t i = 0; i < NI; ++i) {
+        inl[i] = (i & 1) ? sv_clean("BB", 2) : sv_clean("AA", 2);
+        inl_m[i] = ((i * 31) % 1501) - 750;   // mixed sign
+    }
+    StringView lk{};
+    lk.length = 20;
+    std::memcpy(lk.prefix, longbuf, 4);
+    lk.ref.buf_idx = 0;
+    lk.ref.offset = 0;
+    StringView mix[3] = {sv_clean("AA", 2), lk, sv_clean("BB", 2)};
+    int64_t mix_m[3] = {-12345, 777, 4242};
+    std::memset(out, 0, sizeof(*out));
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(inl, nullptr, 0, BoltType::Utf8);
+    BoltColumn vd = BoltColumn::make_flat(inl_m, nullptr, 0, BoltType::Decimal64);
+    vd.decimal_scale = 2;
+    AggSpec specs[3];
+    specs[0] = make_spec(AggKind::Sum, 0);  specs[0].lane = lane;
+    specs[1] = make_spec(AggKind::Avg, 0);  specs[1].lane = lane;
+    specs[2] = make_spec(AggKind::CountStar, 0);
+    GroupbyTypedState st{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &kd, 1, &vd, 1,
+                                                  specs, 3, 16));
+    BoltColumn ki = BoltColumn::make_flat(inl, nullptr, NI, BoltType::Utf8);
+    BoltColumn vi = BoltColumn::make_flat(inl_m, nullptr, NI, BoltType::Decimal64);
+    vi.decimal_scale = 2;
+    BoltColumn km = BoltColumn::make_flat(mix, nullptr, 3, BoltType::Utf8);
+    km.str_overflow_base = longbuf;
+    BoltColumn vm = BoltColumn::make_flat(mix_m, nullptr, 3, BoltType::Decimal64);
+    vm.decimal_scale = 2;
+    groupby_agg_multi_key_typed_ingest(&st, &ki, &vi, nullptr, 0, NI);
+    groupby_agg_multi_key_typed_ingest(&st, &km, &vm, nullptr, 0, 3);
+    groupby_agg_multi_key_typed_ingest(&st, &ki, &vi, nullptr, 0, NI);
+    ASSERT_FALSE(st.oom);
+    BoltColumn ok[1], oa[3];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 3u);   // AA, BB, spilled
+    out->ng = ng;
+    std::memcpy(out->key, ok[0].data, ng * 16u);   // StringView stride
+    std::memcpy(out->sum, oa[0].data, ng * 16u);
+    std::memcpy(out->avg, oa[1].data, ng * 16u);
+    std::memcpy(out->cnt, oa[2].data, ng * 8u);
+}
+
+TEST(BoltGroupbyTwopass, Decimal64LaneSumParitySpilledFallbackMix) {
+    Dec64LaneOut l0, l1;
+    run_dec64_lane_utf8key(0, &l0);
+    run_dec64_lane_utf8key(1, &l1);
+    expect_lane_parity(l0, l1);
+}
+
+// ---------------------------------------------------------------------------
 // Cap overflow: more groups than the (tight) SwissTable capacity must set
 // state->oom and finalize must fail — same contract as the fallback.
 // ---------------------------------------------------------------------------

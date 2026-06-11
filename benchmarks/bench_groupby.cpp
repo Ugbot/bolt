@@ -237,6 +237,13 @@ double bench_q1_shape_xmorsel(int64_t n) noexcept {
     specs[2].kind = AggKind::Sum;       specs[2].in_col = 2;
     specs[3].kind = AggKind::CountStar; specs[3].in_col = 0;
     specs[4].kind = AggKind::Avg;       specs[4].in_col = 2;
+    // W-DEC inc 4: Q1's plan-time interval proof passes in the real
+    // engine, so the engine stamps lane=1 on these Sum/Avg specs. With
+    // Decimal128 payloads the stamp is ignored (lane only selects loops
+    // for Decimal64) — the gate workload is unchanged; the Decimal64
+    // lane path is measured by bench_q1_shape_dec64_xmorsel below.
+    specs[0].lane = 1; specs[1].lane = 1; specs[2].lane = 1;
+    specs[4].lane = 1;
 
     double best_ns = 1e30;
     uint32_t groups = 0;
@@ -272,6 +279,108 @@ double bench_q1_shape_xmorsel(int64_t n) noexcept {
     }
     std::printf("  q1_shape_xmorsel        rows=%lld  groups=%u  ns/row=%.3f\n",
                 static_cast<long long>(n), groups, best_ns);
+    return best_ns;
+}
+
+// W-DEC inc 4: the Q1 shape with DECIMAL64 payloads — same 2 inline-Utf8
+// keys / 4 combos / 3 SUM + COUNT(*) + AVG, but int64-mantissa columns.
+// `lane` stamps the Sum/Avg specs: 0 = unproven (overflow-safe d128
+// loop), 1 = planner-proved int64 fit (banked pure-int64 window loops
+// with a d128-widening merge). The value ranges here keep the proof
+// genuinely true (max mantissa 90099 × 6M rows ≪ INT64_MAX).
+struct Q1Dec64Data {
+    StringView* rf;
+    StringView* ls;
+    int64_t*    p0;
+    int64_t*    p1;
+    int64_t*    p2;
+};
+
+bool q1_dec64_fill(Q1Dec64Data* d, int64_t n, Arena* setup) noexcept {
+    assert(d != nullptr && setup != nullptr);
+    assert(n > 0);
+    d->rf = setup->allocate_array<StringView>(static_cast<size_t>(n));
+    d->ls = setup->allocate_array<StringView>(static_cast<size_t>(n));
+    d->p0 = setup->allocate_array<int64_t>(static_cast<size_t>(n));
+    d->p1 = setup->allocate_array<int64_t>(static_cast<size_t>(n));
+    d->p2 = setup->allocate_array<int64_t>(static_cast<size_t>(n));
+    if (!d->rf || !d->ls || !d->p0 || !d->p1 || !d->p2) return false;
+    const StringView rfv[3] = {StringView::from_cstr("A"),
+                               StringView::from_cstr("N"),
+                               StringView::from_cstr("R")};
+    const StringView lsv[2] = {StringView::from_cstr("F"),
+                               StringView::from_cstr("O")};
+    for (int64_t i = 0; i < n; ++i) {
+        const int c = static_cast<int>(i & 3);
+        d->rf[i] = rfv[(c == 0) ? 0 : (c == 3) ? 2 : 1];
+        d->ls[i] = lsv[(c == 2) ? 1 : 0];
+        d->p0[i] = (i % 5000) + 1;
+        d->p1[i] = (i % 90000) + 100;
+        d->p2[i] = (i % 11) + 1;
+    }
+    return true;
+}
+
+double bench_q1_shape_dec64_xmorsel(int64_t n, uint8_t lane) noexcept {
+    assert(n > 0);
+    assert(lane <= 1u);
+    constexpr int64_t kSlice = 65536;
+    Arena setup;
+    Q1Dec64Data dd{};
+    const bool filled = q1_dec64_fill(&dd, n, &setup);
+    assert(filled); (void)filled;
+    StringView* rf = dd.rf; StringView* ls = dd.ls;
+    int64_t* p0 = dd.p0; int64_t* p1 = dd.p1; int64_t* p2 = dd.p2;
+    BoltColumn keyd[2], payd[3];
+    keyd[0] = BoltColumn::make_flat(rf, nullptr, 0, BoltType::Utf8);
+    keyd[1] = BoltColumn::make_flat(ls, nullptr, 0, BoltType::Utf8);
+    payd[0] = BoltColumn::make_flat(p0, nullptr, 0, BoltType::Decimal64);
+    payd[1] = BoltColumn::make_flat(p1, nullptr, 0, BoltType::Decimal64);
+    payd[2] = BoltColumn::make_flat(p2, nullptr, 0, BoltType::Decimal64);
+    payd[0].decimal_scale = 2; payd[1].decimal_scale = 2;
+    payd[2].decimal_scale = 2;
+    AggSpec specs[5]{};
+    specs[0].kind = AggKind::Sum;       specs[0].in_col = 0; specs[0].lane = lane;
+    specs[1].kind = AggKind::Sum;       specs[1].in_col = 1; specs[1].lane = lane;
+    specs[2].kind = AggKind::Sum;       specs[2].in_col = 2; specs[2].lane = lane;
+    specs[3].kind = AggKind::CountStar; specs[3].in_col = 0;
+    specs[4].kind = AggKind::Avg;       specs[4].in_col = 2; specs[4].lane = lane;
+
+    double best_ns = 1e30;
+    uint32_t groups = 0;
+    Arena work;
+    BoltColumn out_keys[2], out_aggs[5];
+    for (int it = 0; it < kMaxIters; ++it) {
+        work.reset();
+        GroupbyTypedState st{};
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = groupby_agg_multi_key_typed_begin(
+            &st, &work, keyd, 2, payd, 3, specs, 5, 64);
+        assert(ok); (void)ok;
+        for (int64_t off = 0; off < n; off += kSlice) {
+            const int64_t len = (off + kSlice > n) ? (n - off) : kSlice;
+            BoltColumn k[2], p[3];
+            k[0] = BoltColumn::make_flat(rf + off, nullptr, len, BoltType::Utf8);
+            k[1] = BoltColumn::make_flat(ls + off, nullptr, len, BoltType::Utf8);
+            p[0] = BoltColumn::make_flat(p0 + off, nullptr, len, BoltType::Decimal64);
+            p[1] = BoltColumn::make_flat(p1 + off, nullptr, len, BoltType::Decimal64);
+            p[2] = BoltColumn::make_flat(p2 + off, nullptr, len, BoltType::Decimal64);
+            p[0].decimal_scale = 2; p[1].decimal_scale = 2;
+            p[2].decimal_scale = 2;
+            groupby_agg_multi_key_typed_ingest(&st, k, p, nullptr, 0, len);
+            assert(!st.oom);
+        }
+        ok = groupby_agg_multi_key_typed_finalize(&st, out_keys, out_aggs,
+                                                  &groups);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        assert(ok); (void)ok;
+        double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        double per = ns / static_cast<double>(n);
+        if (per < best_ns) best_ns = per;
+    }
+    std::printf("  q1_dec64_lane%u         rows=%lld  groups=%u  ns/row=%.3f\n",
+                static_cast<unsigned>(lane), static_cast<long long>(n), groups,
+                best_ns);
     return best_ns;
 }
 
@@ -347,6 +456,9 @@ int main(int argc, char** argv) {
     const double x = bench_sum_int64_xmorsel(n);
     // K-AGG-C headline shapes (6M rows regardless of n arg for stability).
     const double q1 = bench_q1_shape_xmorsel(6'000'000);
+    // W-DEC inc 4: Decimal64 Q1 shape, unproven vs planner-proved lane.
+    const double q1d0 = bench_q1_shape_dec64_xmorsel(6'000'000, 0);
+    const double q1d1 = bench_q1_shape_dec64_xmorsel(6'000'000, 1);
     const double tk = bench_i64key_10k_groups_xmorsel(6'000'000);
     // K-AGG-A floors (single-thread, AVX2, RelWithDebInfo). Specialized
     // single-key int64 path hits 0.13 ns/row in groupby_agg_int64; the typed
@@ -367,6 +479,11 @@ int main(int argc, char** argv) {
     // with CI-noise margin, NOT an aspiration (revisit only with a faster
     // probe, e.g. vectorized multi-probe).
     std::printf("  q1_shape_xmorsel     measured=%.3f ns/row   gate<=25.0\n", q1);
+    // W-DEC inc 4: lane=1 must hold or improve on lane=0 (same workload).
+    std::printf("  q1_dec64_lane0       measured=%.3f ns/row   (unproven d128 loop)\n",
+                q1d0);
+    std::printf("  q1_dec64_lane1       measured=%.3f ns/row   (vs lane0 %.3f, ratio=%.2fx)\n",
+                q1d1, q1d0, (q1d0 > 0.0) ? (q1d1 / q1d0) : 0.0);
     std::printf("  i64key_10k_xmorsel   measured=%.3f ns/row   gate<=18.0\n", tk);
     return 0;
 }

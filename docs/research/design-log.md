@@ -1967,3 +1967,22 @@ widens, Avg divides exactly, Min/Max stay Decimal64). Suite 16/16; the
 chukonu SF1 golden gate is 22/22 data-level with Decimal64-loaded money
 columns at unchanged query times (memory traffic on those columns
 halved).
+
+## 2026-06-12 / W-DEC inc 4 — AggSpec.lane: proof-carrying int64 sum accumulation
+
+`AggSpec.lane` (u8; 1 = caller proved row_bound x max|value| <= INT64_MAX
+at plan time). Lane-1 Decimal64 sums run `gb_p2_sum_dec64_lane_bank`:
+pure-int64 bank accumulation per window, merge widens each per-group
+window subtotal into the persistent cell via gb_d128_acc — the cell
+stays a TRUE Decimal128 always, so lane-1/lane-0/fallback windows
+compose with one accumulator representation (no finalize
+reconciliation). Window subtotals fit int64 under the contract because
+every partial sum is bounded by sum|values| <= row_bound x max_abs.
+Finalize debug-asserts the contract (total == sign-extension of lo).
+Measured: q1_shape 24.43 ns/row (gate <= 25 holds); dec64 lane0 21.28 vs
+lane1 20.97 — parity-to-slight-win at 4 groups (the carry chain is not
+the bottleneck there; the lane loop's value is proof-routed safety at
+zero cost, and wins grow with group count). Tests 20/20 incl. bit-exact
+lane on/off parity at near-INT64_MAX totals and forced-fallback mixing.
+New dec64 kernels: sum_to_d128(_selected) — streaming global-sum folds,
+bit-identical to the per-row d128 fold by associativity.

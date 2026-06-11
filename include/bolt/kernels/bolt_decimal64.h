@@ -73,6 +73,44 @@ BOLT_FORCE_INLINE decimal::Decimal128 widen_one(int64_t v) noexcept {
     return r;
 }
 
+// W-DEC inc 4: streaming SUM of Decimal64 mantissas INTO a Decimal128
+// accumulator — widen + exact wrapping 128-bit add per element, i.e. the
+// SAME math the per-row aggregate fold performs (d128 add is associative
+// two's-complement), so any chunking/grouping of calls is bit-identical
+// to the row-at-a-time fold. Dense variant; floor target: <= 1 ns/row
+// (the add carry chain is the dependency; lane-1 callers that proved the
+// int64 box should prefer plain int64 parallel_sum upstream).
+inline void sum_to_d128(const int64_t* BOLT_RESTRICT a, int64_t n,
+                        decimal::Decimal128* BOLT_RESTRICT acc) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(acc != nullptr);
+    assert(n >= 0);
+    decimal::Decimal128 s = *acc;
+    for (int64_t i = 0; i < n; ++i) {
+        s = decimal::d128_add(s, widen_one(a[i]));
+    }
+    *acc = s;
+}
+
+// Selection-vector variant of sum_to_d128: folds a[sel[i]] for
+// i in [0, sel_n). sel entries must index valid rows of `a` (caller's
+// morsel invariant — asserted per element in debug via the gather read).
+inline void sum_to_d128_selected(const int64_t* BOLT_RESTRICT a,
+                                 const int32_t* BOLT_RESTRICT sel,
+                                 int64_t sel_n,
+                                 decimal::Decimal128* BOLT_RESTRICT acc) noexcept {
+    assert(a != nullptr || sel_n == 0);
+    assert(sel != nullptr || sel_n == 0);
+    assert(acc != nullptr);
+    assert(sel_n >= 0);
+    decimal::Decimal128 s = *acc;
+    for (int64_t i = 0; i < sel_n; ++i) {
+        assert(sel[i] >= 0);
+        s = decimal::d128_add(s, widen_one(a[sel[i]]));
+    }
+    *acc = s;
+}
+
 // Narrow Decimal128 values to int64 mantissas. The CALLER proved every
 // value fits (plan-time interval certificate) — debug-asserts the
 // contract, never checks in release. Inverse of widen_to_d128.
