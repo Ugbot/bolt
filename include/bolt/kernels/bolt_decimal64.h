@@ -73,6 +73,23 @@ BOLT_FORCE_INLINE decimal::Decimal128 widen_one(int64_t v) noexcept {
     return r;
 }
 
+// Narrow Decimal128 values to int64 mantissas. The CALLER proved every
+// value fits (plan-time interval certificate) — debug-asserts the
+// contract, never checks in release. Inverse of widen_to_d128.
+// Floor target: <= 0.6 ns/row (strided load + store).
+inline void narrow_from_d128(const decimal::Decimal128* BOLT_RESTRICT a,
+                             int64_t n,
+                             int64_t* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    for (int64_t i = 0; i < n; ++i) {
+        assert(((a[i].hi == 0 && a[i].lo >= 0) ||
+                (a[i].hi == -1 && a[i].lo < 0)) &&
+               "narrow_from_d128: caller's int64 proof violated");
+        out[i] = a[i].lo;
+    }
+}
+
 }  // namespace dec64
 }  // namespace kernels
 }  // namespace bolt
