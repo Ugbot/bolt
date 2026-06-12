@@ -925,4 +925,256 @@ TEST(BoltGroupbyTwopass, CapOverflowSetsOom) {
     EXPECT_FALSE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
 }
 
+// ===========================================================================
+// W4 — groupby_agg_multi_key_typed_merge parity tests.
+//
+// Contract: merge(two half-states) == single-state ingest of all rows,
+// group-for-group (order may differ — compare by key), including spilled
+// (>12B) Utf8 keys (deep-copied across states), AVG counts, Decimal128
+// sums, and Decimal64 lane-1 accumulators.
+// ===========================================================================
+
+// Compare two finalized outputs group-by-group, keyed on an int64 key col.
+static void expect_merge_parity_i64key(const BoltColumn& ka, const BoltColumn& aa0,
+                                       const BoltColumn* aggs_a,
+                                       const BoltColumn& kb,
+                                       const BoltColumn* aggs_b,
+                                       uint32_t ng, uint8_t n_aggs) {
+    (void)aa0;
+    const int64_t* ak = static_cast<const int64_t*>(ka.data);
+    const int64_t* bk = static_cast<const int64_t*>(kb.data);
+    for (uint32_t i = 0; i < ng; ++i) {
+        int found = -1;
+        for (uint32_t j = 0; j < ng; ++j) {
+            if (bk[j] == ak[i]) { found = static_cast<int>(j); break; }
+        }
+        ASSERT_GE(found, 0) << "key " << ak[i] << " missing after merge";
+        for (uint8_t c = 0; c < n_aggs; ++c) {
+            const size_t es = (aggs_a[c].type == BoltType::Decimal128) ? 16
+                            : (aggs_a[c].type == BoltType::Float64)    ? 8
+                            : static_cast<size_t>(type_size(aggs_a[c].type));
+            const char* pa = static_cast<const char*>(aggs_a[c].data) +
+                             static_cast<size_t>(i) * es;
+            const char* pb = static_cast<const char*>(aggs_b[c].data) +
+                             static_cast<size_t>(found) * es;
+            EXPECT_EQ(std::memcmp(pa, pb, es), 0)
+                << "agg " << int(c) << " differs at key " << ak[i];
+        }
+    }
+}
+
+// merge(two halves) == one-state ingest, int64 key, all five agg kinds
+// (Sum / CountStar / Min / Max / Avg over int64 — Avg checks counts merge).
+TEST(BoltGroupbyMerge, HalvesEqualSingleStateIntKeys) {
+    constexpr int64_t N = 20000;
+    static int64_t ks[N];
+    static int64_t vs[N];
+    uint64_t seed = 0xC0FFEE;
+    for (int64_t i = 0; i < N; ++i) {
+        ks[i] = static_cast<int64_t>(splitmix64(&seed) % 37u);
+        vs[i] = static_cast<int64_t>(splitmix64(&seed) % 100000u) - 50000;
+    }
+    AggSpec specs[5] = {make_spec(AggKind::Sum, 0),
+                        make_spec(AggKind::CountStar, 0),
+                        make_spec(AggKind::Min, 0),
+                        make_spec(AggKind::Max, 0),
+                        make_spec(AggKind::Avg, 0)};
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn vd = BoltColumn::make_flat(vs, nullptr, 0, BoltType::Int64);
+    GroupbyTypedState full{}, h0{}, h1{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&full, &a, &kd, 1, &vd, 1, specs, 5, 64));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&h0, &a, &kd, 1, &vd, 1, specs, 5, 64));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&h1, &a, &kd, 1, &vd, 1, specs, 5, 64));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, N, BoltType::Int64);
+    BoltColumn v = BoltColumn::make_flat(vs, nullptr, N, BoltType::Int64);
+    groupby_agg_multi_key_typed_ingest(&full, &k, &v, nullptr, 0, N);
+    BoltColumn k0 = BoltColumn::make_flat(ks, nullptr, N / 2, BoltType::Int64);
+    BoltColumn v0 = BoltColumn::make_flat(vs, nullptr, N / 2, BoltType::Int64);
+    BoltColumn k1 = BoltColumn::make_flat(ks + N / 2, nullptr, N - N / 2, BoltType::Int64);
+    BoltColumn v1 = BoltColumn::make_flat(vs + N / 2, nullptr, N - N / 2, BoltType::Int64);
+    groupby_agg_multi_key_typed_ingest(&h0, &k0, &v0, nullptr, 0, N / 2);
+    groupby_agg_multi_key_typed_ingest(&h1, &k1, &v1, nullptr, 0, N - N / 2);
+    ASSERT_FALSE(full.oom);
+    ASSERT_FALSE(h0.oom);
+    ASSERT_FALSE(h1.oom);
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&h0, &h1));
+    EXPECT_EQ(h0.n_rows_in, full.n_rows_in);
+    BoltColumn fk[1], fa[5], mk[1], ma[5];
+    uint32_t fng = 0, mng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&full, fk, fa, &fng));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&h0, mk, ma, &mng));
+    ASSERT_EQ(fng, mng);
+    ASSERT_EQ(fng, 37u);
+    expect_merge_parity_i64key(fk[0], fa[0], fa, mk[0], ma, fng, 5);
+}
+
+// Spilled (>12B) Utf8 keys + Decimal128 SUM/AVG + Decimal64 lane-1 SUM:
+// each half deep-copies its spilled key bytes from a DIFFERENT overflow
+// buffer; the merged state must group them by content and the d128 /
+// lane-1 accumulator cells must be bit-identical to the one-state fold.
+TEST(BoltGroupbyMerge, SpilledKeysDecimalLanes) {
+    constexpr int64_t N = 4096;
+    // Two spilled keys (20 chars) + two inline keys, cycling.
+    static char ovf_full[64], ovf_h[64];
+    std::memset(ovf_full, 0, sizeof(ovf_full));
+    std::memcpy(ovf_full, "AAAAAAAAAAAAAAAAAAAA", 20);
+    std::memcpy(ovf_full + 20, "BBBBBBBBBBBBBBBBBBBB", 20);
+    std::memcpy(ovf_h, ovf_full, sizeof(ovf_full));
+    auto spilled = [](uint32_t off, const char* base) {
+        StringView sv{};
+        sv.length = 20;
+        std::memcpy(sv.prefix, base + off, 4);
+        sv.ref.buf_idx = 0;
+        sv.ref.offset = off;
+        return sv;
+    };
+    static StringView keys_full[N], keys_h[N];
+    static dec::Decimal128 d128v[N];
+    static int64_t d64v[N];
+    uint64_t seed = 0xBADF00D;
+    for (int64_t i = 0; i < N; ++i) {
+        const uint32_t m = static_cast<uint32_t>(i) % 4u;
+        keys_full[i] = (m == 0) ? spilled(0, ovf_full)
+                     : (m == 1) ? spilled(20, ovf_full)
+                     : (m == 2) ? sv_garbage("xy", 2, 0x3C)
+                                : sv_garbage("zw", 2, 0xC3);
+        keys_h[i] = (m == 0) ? spilled(0, ovf_h)
+                  : (m == 1) ? spilled(20, ovf_h)
+                  : (m == 2) ? sv_garbage("xy", 2, 0x11)
+                             : sv_garbage("zw", 2, 0x22);
+        const int64_t raw = static_cast<int64_t>(splitmix64(&seed) % 1000000u);
+        d128v[i] = dec::d128_from_i64(raw - 500000);
+        d64v[i]  = raw % 10000;
+    }
+    AggSpec specs[4] = {make_spec(AggKind::Sum, 0),   // d128 sum
+                        make_spec(AggKind::Avg, 0),   // d128 avg (counts)
+                        make_spec(AggKind::Sum, 1),   // dec64 sum (lane 1)
+                        make_spec(AggKind::Min, 0)};  // d128 min
+    specs[2].lane = 1;
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(keys_full, nullptr, 0, BoltType::Utf8);
+    BoltColumn pd[2];
+    pd[0] = BoltColumn::make_flat(d128v, nullptr, 0, BoltType::Decimal128);
+    pd[0].decimal_scale = 2;
+    pd[1] = BoltColumn::make_flat(d64v, nullptr, 0, BoltType::Decimal64);
+    pd[1].decimal_scale = 2;
+    pd[1].type_size_bytes = 8;
+    GroupbyTypedState full{}, h0{}, h1{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&full, &a, &kd, 1, pd, 2, specs, 4, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&h0, &a, &kd, 1, pd, 2, specs, 4, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&h1, &a, &kd, 1, pd, 2, specs, 4, 8));
+    BoltColumn kf = BoltColumn::make_flat(keys_full, nullptr, N, BoltType::Utf8);
+    kf.str_overflow_base = ovf_full;
+    BoltColumn p[2];
+    p[0] = pd[0]; p[0].length = N;
+    p[1] = pd[1]; p[1].length = N;
+    groupby_agg_multi_key_typed_ingest(&full, &kf, p, nullptr, 0, N);
+    BoltColumn k0 = BoltColumn::make_flat(keys_h, nullptr, N / 2, BoltType::Utf8);
+    k0.str_overflow_base = ovf_h;
+    BoltColumn p0[2];
+    p0[0] = BoltColumn::make_flat(d128v, nullptr, N / 2, BoltType::Decimal128);
+    p0[0].decimal_scale = 2;
+    p0[1] = BoltColumn::make_flat(d64v, nullptr, N / 2, BoltType::Decimal64);
+    p0[1].decimal_scale = 2;
+    groupby_agg_multi_key_typed_ingest(&h0, &k0, p0, nullptr, 0, N / 2);
+    BoltColumn k1 = BoltColumn::make_flat(keys_h + N / 2, nullptr, N - N / 2,
+                                          BoltType::Utf8);
+    k1.str_overflow_base = ovf_h;
+    BoltColumn p1[2];
+    p1[0] = BoltColumn::make_flat(d128v + N / 2, nullptr, N - N / 2,
+                                  BoltType::Decimal128);
+    p1[0].decimal_scale = 2;
+    p1[1] = BoltColumn::make_flat(d64v + N / 2, nullptr, N - N / 2,
+                                  BoltType::Decimal64);
+    p1[1].decimal_scale = 2;
+    groupby_agg_multi_key_typed_ingest(&h1, &k1, p1, nullptr, 0, N - N / 2);
+    ASSERT_FALSE(full.oom);
+    ASSERT_FALSE(h0.oom);
+    ASSERT_FALSE(h1.oom);
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&h0, &h1));
+    BoltColumn fk[1], fa[4], mk[1], ma[4];
+    uint32_t fng = 0, mng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&full, fk, fa, &fng));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&h0, mk, ma, &mng));
+    ASSERT_EQ(fng, 4u);
+    ASSERT_EQ(mng, 4u);
+    // Match groups by key CONTENT (spilled keys resolve via each output's
+    // own str_overflow_base) and compare every agg cell bit-exactly.
+    const StringView* fkv = static_cast<const StringView*>(fk[0].data);
+    const StringView* mkv = static_cast<const StringView*>(mk[0].data);
+    for (uint32_t i = 0; i < fng; ++i) {
+        const char* fb = kernels::utf8::sv_bytes(
+            fkv[i], static_cast<const char*>(fk[0].str_overflow_base));
+        int found = -1;
+        for (uint32_t j = 0; j < mng; ++j) {
+            if (mkv[j].length != fkv[i].length) continue;
+            const char* mb = kernels::utf8::sv_bytes(
+                mkv[j], static_cast<const char*>(mk[0].str_overflow_base));
+            if (std::memcmp(fb, mb, fkv[i].length) == 0) { found = static_cast<int>(j); break; }
+        }
+        ASSERT_GE(found, 0) << "merged state lost a key";
+        for (int c = 0; c < 4; ++c) {
+            const size_t es = (fa[c].type == BoltType::Decimal128) ? 16 : 8;
+            EXPECT_EQ(std::memcmp(
+                          static_cast<const char*>(fa[c].data) + i * es,
+                          static_cast<const char*>(ma[c].data) +
+                              static_cast<size_t>(found) * es,
+                          es),
+                      0)
+                << "agg " << c << " differs for group " << i;
+        }
+    }
+}
+
+// Merging into a freshly-begun EMPTY dst (the partition driver's main-graph
+// agg never ingests) and merging an EMPTY src must both be exact no-ops /
+// pure copies.
+TEST(BoltGroupbyMerge, EmptyDstAndEmptySrc) {
+    static int64_t ks[256], vs[256];
+    for (int64_t i = 0; i < 256; ++i) { ks[i] = i % 5; vs[i] = i; }
+    AggSpec spec = make_spec(AggKind::Sum, 0);
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn vd = BoltColumn::make_flat(vs, nullptr, 0, BoltType::Int64);
+    GroupbyTypedState full{}, dst{}, src{}, empty{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&full, &a, &kd, 1, &vd, 1, &spec, 1, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&dst, &a, &kd, 1, &vd, 1, &spec, 1, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&src, &a, &kd, 1, &vd, 1, &spec, 1, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&empty, &a, &kd, 1, &vd, 1, &spec, 1, 8));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, 256, BoltType::Int64);
+    BoltColumn v = BoltColumn::make_flat(vs, nullptr, 256, BoltType::Int64);
+    groupby_agg_multi_key_typed_ingest(&full, &k, &v, nullptr, 0, 256);
+    groupby_agg_multi_key_typed_ingest(&src, &k, &v, nullptr, 0, 256);
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&dst, &src));    // empty dst
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&dst, &empty));  // empty src
+    BoltColumn fk[1], fa[1], mk[1], ma[1];
+    uint32_t fng = 0, mng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&full, fk, fa, &fng));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&dst, mk, ma, &mng));
+    ASSERT_EQ(fng, mng);
+    expect_merge_parity_i64key(fk[0], fa[0], fa, mk[0], ma, fng, 1);
+}
+
+// Cap overflow during merge: dst sized below the merged group count must
+// set oom and return false (Tiger: no growth on the merge path).
+TEST(BoltGroupbyMerge, CapOverflowSetsOom) {
+    constexpr int64_t N = 512;
+    static int64_t ks[N], vs[N];
+    for (int64_t i = 0; i < N; ++i) { ks[i] = i; vs[i] = 1; }   // all distinct
+    AggSpec spec = make_spec(AggKind::Sum, 0);
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn vd = BoltColumn::make_flat(vs, nullptr, 0, BoltType::Int64);
+    GroupbyTypedState dst{}, src{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&dst, &a, &kd, 1, &vd, 1, &spec, 1, /*hint=*/64));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&src, &a, &kd, 1, &vd, 1, &spec, 1, /*hint=*/1024));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, N, BoltType::Int64);
+    BoltColumn v = BoltColumn::make_flat(vs, nullptr, N, BoltType::Int64);
+    groupby_agg_multi_key_typed_ingest(&src, &k, &v, nullptr, 0, N);
+    ASSERT_FALSE(src.oom);
+    EXPECT_FALSE(groupby_agg_multi_key_typed_merge(&dst, &src));
+    EXPECT_TRUE(dst.oom);
+}
+
 }  // namespace
