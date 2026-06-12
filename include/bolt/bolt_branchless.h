@@ -189,6 +189,54 @@ int64_t filter_eq_selected_branchless(
     return count;
 }
 
+// ============================================================================
+// IN-list membership filters (W-J1b). Row passes iff data[i] equals ANY of
+// vals[0..k). BRANCH-FREE: the k equality bits OR-accumulate (bitwise |, no
+// short-circuit), then the standard speculative-write emit. k is small and
+// loop-invariant (SQL IN lists; callers cap at <= 16), so the inner compare
+// loop unrolls per value lane. Output indices ASCENDING (filter_eq contract).
+// ============================================================================
+
+constexpr int32_t kFilterInListMaxVals = 16;
+
+template <typename T>
+int64_t filter_in_list_branchless(
+        const T* BOLT_RESTRICT data, int64_t n,
+        const T* BOLT_RESTRICT vals, int32_t k,
+        int32_t* BOLT_RESTRICT out) noexcept {
+    assert((data != nullptr && out != nullptr) || n == 0);
+    assert(vals != nullptr && k > 0 && k <= kFilterInListMaxVals);
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const T x = data[i];
+        int hit = 0;
+        for (int32_t v = 0; v < k; ++v) hit |= (x == vals[v]);
+        out[count] = static_cast<int32_t>(i);
+        count += hit;
+    }
+    return count;
+}
+
+template <typename T>
+int64_t filter_in_list_selected_branchless(
+        const T* BOLT_RESTRICT data,
+        const int32_t* BOLT_RESTRICT sel_in, int64_t sel_count,
+        const T* BOLT_RESTRICT vals, int32_t k,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    assert((data != nullptr && sel_out != nullptr) || sel_count == 0);
+    assert(vals != nullptr && k > 0 && k <= kFilterInListMaxVals);
+    int64_t count = 0;
+    for (int64_t i = 0; i < sel_count; ++i) {
+        const int32_t idx = sel_in[i];
+        const T x = data[idx];
+        int hit = 0;
+        for (int32_t v = 0; v < k; ++v) hit |= (x == vals[v]);
+        sel_out[count] = idx;
+        count += hit;
+    }
+    return count;
+}
+
 template <typename T>
 int64_t filter_ne_selected_branchless(
         const T* BOLT_RESTRICT data,
