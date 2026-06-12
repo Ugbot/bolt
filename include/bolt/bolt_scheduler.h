@@ -530,12 +530,23 @@ static_assert(sizeof(ColumnTaskPayload) <= 128, "ColumnTaskPayload must fit pool
 static constexpr size_t   kSchedulerPoolSlot     = config::kSchedulerPoolSlotBytes;
 static constexpr uint32_t kSchedulerPoolCapacity = config::kSchedulerPoolCapacity;
 
+/// Worker index of the current scheduler thread (UINT32_MAX off-pool).
+/// Set by scheduler_worker_loop alongside tl_arena; the task trampolines
+/// pass it as the RangeTaskFn/ColumnTaskFn `thread_id` so tasks can index
+/// per-worker resources. Before this existed every task received the
+/// payload's constant 0 ("not per-worker yet") — callers that indexed
+/// per-thread scratch by thread_id silently shared slot 0 across ALL
+/// workers (measured: chukonu W-J5 parallel-probe pair-buffer race -> AV).
+inline thread_local uint32_t tl_worker_index = UINT32_MAX;
+
 inline void scheduler_range_trampoline(void* arg) noexcept {
     assert(arg != nullptr);
     RangeTaskPayload* p = static_cast<RangeTaskPayload*>(arg);
     assert(p->fn != nullptr);
     assert(p->end >= p->start);
-    p->fn(p->user_data, p->start, p->end, p->thread_id);
+    const uint32_t tid =
+        (tl_worker_index != UINT32_MAX) ? tl_worker_index : p->thread_id;
+    p->fn(p->user_data, p->start, p->end, tid);
     Scheduler* sched = p->owning_sched;
     TaskPool* pool = p->owning_pool;
     pool->release(p);
@@ -549,7 +560,9 @@ inline void scheduler_column_trampoline(void* arg) noexcept {
     ColumnTaskPayload* p = static_cast<ColumnTaskPayload*>(arg);
     assert(p->fn != nullptr);
     assert(p->end >= p->start);
-    p->fn(p->read_batch, p->write_batch, p->start, p->end, p->delta_time, p->thread_id);
+    const uint32_t tid =
+        (tl_worker_index != UINT32_MAX) ? tl_worker_index : p->thread_id;
+    p->fn(p->read_batch, p->write_batch, p->start, p->end, p->delta_time, tid);
     Scheduler* sched = p->owning_sched;
     TaskPool* pool = p->owning_pool;
     pool->release(p);
@@ -587,6 +600,7 @@ inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept
     }
 
     tl_arena = sched->worker_arenas[worker_id];
+    tl_worker_index = worker_id;   // per-worker task thread_id (see trampolines)
     const SpinPolicy policy = sched->worker_configs[worker_id].spin_policy;
     const uint32_t max_spins = sched->worker_configs[worker_id].spin_count;
     uint32_t spins = 0;
@@ -622,6 +636,7 @@ inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept
     while (sched->ring.try_claim_and_execute()) { /* drain */ }
 
     tl_arena = nullptr;
+    tl_worker_index = UINT32_MAX;
 }
 
 // Build the CPU assignment list: prefer P-cores first when requested, then
