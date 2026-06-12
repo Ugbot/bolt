@@ -591,6 +591,259 @@ inline void d128_cmp_col(const Decimal128* BOLT_RESTRICT a, int sa,
     }
 }
 
+// ============================================================================
+// Column-LITERAL Decimal128 arithmetic (Perf Wave 2).
+// ============================================================================
+// One column + one PRE-RESCALED literal (the caller aligns the literal's
+// scale ONCE per batch; these kernels never rescale per row). Replaces the
+// "broadcast literal into a 2048-row Decimal128 temp" pattern in chukonu's
+// PhysicalCompute.
+//
+// MSVC hazard (measured, see memory note on K-AGG-C): by-value 16-byte
+// Decimal128 round-trips through stack temps in loops even under
+// __forceinline. So the loop bodies below operate on lo/hi int64 LANES
+// directly — d128_add's body inlined by hand — never `out[i] = d128_add(
+// a[i], lit)`. bench_decimal.cpp measures both shapes to keep us honest.
+
+// out[i] = a[i] + lit.
+inline void d128_add_lit(const Decimal128* BOLT_RESTRICT a, int64_t n,
+                         Decimal128 lit,
+                         Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const uint64_t llo = static_cast<uint64_t>(lit.lo);
+    const int64_t  lhi = lit.hi;
+#if defined(_MSC_VER) && defined(_M_X64)
+    for (int64_t i = 0; i < n; ++i) {
+        uint64_t lo;
+        unsigned char c = _addcarry_u64(0, static_cast<uint64_t>(a[i].lo), llo, &lo);
+        uint64_t hi;
+        _addcarry_u64(c, static_cast<uint64_t>(a[i].hi),
+                         static_cast<uint64_t>(lhi), &hi);
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = static_cast<int64_t>(hi);
+    }
+#else
+    for (int64_t i = 0; i < n; ++i) {
+        const uint64_t alo = static_cast<uint64_t>(a[i].lo);
+        const uint64_t lo  = alo + llo;
+        const uint64_t carry = (lo < alo) ? 1ull : 0ull;
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = a[i].hi + lhi + static_cast<int64_t>(carry);
+    }
+#endif
+}
+
+// out[i] = a[i] - lit.
+inline void d128_sub_lit(const Decimal128* BOLT_RESTRICT a, int64_t n,
+                         Decimal128 lit,
+                         Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const uint64_t llo = static_cast<uint64_t>(lit.lo);
+    const int64_t  lhi = lit.hi;
+#if defined(_MSC_VER) && defined(_M_X64)
+    for (int64_t i = 0; i < n; ++i) {
+        uint64_t lo;
+        unsigned char br = _subborrow_u64(0, static_cast<uint64_t>(a[i].lo), llo, &lo);
+        uint64_t hi;
+        _subborrow_u64(br, static_cast<uint64_t>(a[i].hi),
+                           static_cast<uint64_t>(lhi), &hi);
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = static_cast<int64_t>(hi);
+    }
+#else
+    for (int64_t i = 0; i < n; ++i) {
+        const uint64_t alo = static_cast<uint64_t>(a[i].lo);
+        const uint64_t lo  = alo - llo;
+        const uint64_t borrow = (alo < llo) ? 1ull : 0ull;
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = a[i].hi - lhi - static_cast<int64_t>(borrow);
+    }
+#endif
+}
+
+// out[i] = lit - a[i] (reversed order, e.g. `1.00 - l_discount`).
+inline void d128_lit_sub_col(Decimal128 lit,
+                             const Decimal128* BOLT_RESTRICT a, int64_t n,
+                             Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const uint64_t llo = static_cast<uint64_t>(lit.lo);
+    const int64_t  lhi = lit.hi;
+#if defined(_MSC_VER) && defined(_M_X64)
+    for (int64_t i = 0; i < n; ++i) {
+        uint64_t lo;
+        unsigned char br = _subborrow_u64(0, llo, static_cast<uint64_t>(a[i].lo), &lo);
+        uint64_t hi;
+        _subborrow_u64(br, static_cast<uint64_t>(lhi),
+                           static_cast<uint64_t>(a[i].hi), &hi);
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = static_cast<int64_t>(hi);
+    }
+#else
+    for (int64_t i = 0; i < n; ++i) {
+        const uint64_t alo = static_cast<uint64_t>(a[i].lo);
+        const uint64_t lo  = llo - alo;
+        const uint64_t borrow = (llo < alo) ? 1ull : 0ull;
+        out[i].lo = static_cast<int64_t>(lo);
+        out[i].hi = lhi - a[i].hi - static_cast<int64_t>(borrow);
+    }
+#endif
+}
+
+// out[i] = a[i] * lit (truncated low 128 bits; result scale = sa + s_lit,
+// caller stamps the column meta — same convention as d128_mul_col).
+//
+// LANE MATH, NO PER-ROW SIGN HANDLING: the low 128 bits of a two's-complement
+// product are sign-agnostic ((a*b) mod 2^128 is identical whether the
+// operands are read signed or unsigned), so the abs/negate dance in d128_mul
+// is unnecessary here — multiply the raw lanes directly. Bit-identical to
+// d128_mul(a[i], lit); the tests assert it.
+inline void d128_mul_lit(const Decimal128* BOLT_RESTRICT a, int64_t n,
+                         Decimal128 lit,
+                         Decimal128* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    const uint64_t llo = static_cast<uint64_t>(lit.lo);
+    const uint64_t lhi = static_cast<uint64_t>(lit.hi);
+    for (int64_t i = 0; i < n; ++i) {
+        const uint64_t alo = static_cast<uint64_t>(a[i].lo);
+        const uint64_t ahi = static_cast<uint64_t>(a[i].hi);
+        uint64_t p_lo, p_hi;
+        mul_u64_u64(alo, llo, &p_lo, &p_hi);
+        const uint64_t cross = alo * lhi + ahi * llo;  // high cross parts drop
+        out[i].lo = static_cast<int64_t>(p_lo);
+        out[i].hi = static_cast<int64_t>(p_hi + cross);
+    }
+}
+
+// ============================================================================
+// Scale-aware Decimal128 col-col compare-filter (Perf Wave 2).
+// ============================================================================
+// Replaces chukonu filter_op.cpp's scalar dense/sparse_filter_decimal_col
+// loops. Semantics MATCH that loop exactly: rescale both sides to
+// t = max(sa, sb) via d128_rescale, then d128_cmp. Since t >= both scales,
+// the rescale is always an up-scale (a single d128_mul by 10^delta) — we
+// hoist the pow10 multiplier out of the loop, and when sa == sb we skip
+// rescaling entirely (the dominant TPC-H case).
+// op encoding (matches d128_cmp_col): 0=eq 1=ne 2=lt 3=le 4=gt 5=ge.
+
+// Branchless op→keep fold; `op` is loop-invariant at every call site, so the
+// (op==K) guards hoist and only the selected predicate survives.
+BOLT_FORCE_INLINE int d128_keep(int op, int c) noexcept {
+    assert(op >= 0 && op <= 5);
+    assert(c >= -1 && c <= 1);
+    return ((op == 0) & (c == 0)) | ((op == 1) & (c != 0)) |
+           ((op == 2) & (c <  0)) | ((op == 3) & (c <= 0)) |
+           ((op == 4) & (c >  0)) | ((op == 5) & (c >= 0));
+}
+
+// Dense input → selection vector. Returns the number of rows kept.
+inline int64_t d128_filter_cmp_col(const Decimal128* BOLT_RESTRICT a, uint8_t sa,
+                                   const Decimal128* BOLT_RESTRICT b, uint8_t sb,
+                                   int64_t n, int op,
+                                   int32_t* BOLT_RESTRICT out_sel) noexcept {
+    assert((a != nullptr && b != nullptr && out_sel != nullptr) || n == 0);
+    assert(n >= 0);
+    assert(op >= 0 && op <= 5);
+    int64_t kept = 0;
+    if (sa == sb) {  // fast path: no rescale at all
+        for (int64_t i = 0; i < n; ++i) {
+            out_sel[kept] = static_cast<int32_t>(i);
+            kept += static_cast<int64_t>(d128_keep(op, d128_cmp(a[i], b[i])));
+        }
+    } else if (sa < sb) {  // only `a` up-scales; multiplier hoisted
+        const Decimal128 m = d128_pow10(static_cast<int>(sb) - static_cast<int>(sa));
+        for (int64_t i = 0; i < n; ++i) {
+            const int c = d128_cmp(d128_mul(a[i], m), b[i]);
+            out_sel[kept] = static_cast<int32_t>(i);
+            kept += static_cast<int64_t>(d128_keep(op, c));
+        }
+    } else {  // only `b` up-scales
+        const Decimal128 m = d128_pow10(static_cast<int>(sa) - static_cast<int>(sb));
+        for (int64_t i = 0; i < n; ++i) {
+            const int c = d128_cmp(a[i], d128_mul(b[i], m));
+            out_sel[kept] = static_cast<int32_t>(i);
+            kept += static_cast<int64_t>(d128_keep(op, c));
+        }
+    }
+    assert(kept <= n);
+    return kept;
+}
+
+// Sparse (pre-selected) input → refined selection vector.
+inline int64_t d128_filter_cmp_col_selected(
+        const Decimal128* BOLT_RESTRICT a, uint8_t sa,
+        const Decimal128* BOLT_RESTRICT b, uint8_t sb,
+        const int32_t* BOLT_RESTRICT sel, int64_t sel_n, int op,
+        int32_t* BOLT_RESTRICT out_sel) noexcept {
+    assert((a != nullptr && b != nullptr && sel != nullptr &&
+            out_sel != nullptr) || sel_n == 0);
+    assert(sel_n >= 0);
+    assert(op >= 0 && op <= 5);
+    int64_t kept = 0;
+    if (sa == sb) {
+        for (int64_t i = 0; i < sel_n; ++i) {
+            const int32_t r = sel[i];
+            out_sel[kept] = r;
+            kept += static_cast<int64_t>(d128_keep(op, d128_cmp(a[r], b[r])));
+        }
+    } else if (sa < sb) {
+        const Decimal128 m = d128_pow10(static_cast<int>(sb) - static_cast<int>(sa));
+        for (int64_t i = 0; i < sel_n; ++i) {
+            const int32_t r = sel[i];
+            const int c = d128_cmp(d128_mul(a[r], m), b[r]);
+            out_sel[kept] = r;
+            kept += static_cast<int64_t>(d128_keep(op, c));
+        }
+    } else {
+        const Decimal128 m = d128_pow10(static_cast<int>(sa) - static_cast<int>(sb));
+        for (int64_t i = 0; i < sel_n; ++i) {
+            const int32_t r = sel[i];
+            const int c = d128_cmp(a[r], d128_mul(b[r], m));
+            out_sel[kept] = r;
+            kept += static_cast<int64_t>(d128_keep(op, c));
+        }
+    }
+    assert(kept <= sel_n);
+    return kept;
+}
+
+// ============================================================================
+// Decimal → f64 coercion (Perf Wave 2) — feeds f64_filter_cmp_col in
+// bolt_numeric.h for MIXED numeric-type compares. Semantics match chukonu's
+// numeric_as_double exactly: value = (hi * 2^64 + (u64)lo) / 10^scale, with
+// the divisor built by repeated `*= 10.0` (kept identical so the bits match
+// the scalar loop being replaced; division by 1.0 is an exact identity, so
+// scale==0 needs no branch).
+// ============================================================================
+
+inline void d128_to_f64(const Decimal128* BOLT_RESTRICT a, uint8_t scale,
+                        int64_t n, double* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    double p = 1.0;
+    for (uint8_t s = 0; s < scale; ++s) p *= 10.0;  // bounded: scale <= ~38
+    for (int64_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(a[i].hi) * 18446744073709551616.0
+                       + static_cast<double>(static_cast<uint64_t>(a[i].lo));
+        out[i] = v / p;
+    }
+}
+
+// Decimal64 (raw int64 mantissa column) → f64 at `scale`.
+inline void d64_to_f64(const int64_t* BOLT_RESTRICT mantissa, uint8_t scale,
+                       int64_t n, double* BOLT_RESTRICT out) noexcept {
+    assert((mantissa != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0);
+    double p = 1.0;
+    for (uint8_t s = 0; s < scale; ++s) p *= 10.0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = static_cast<double>(mantissa[i]) / p;
+    }
+}
+
 }  // namespace decimal
 }  // namespace kernels
 }  // namespace bolt

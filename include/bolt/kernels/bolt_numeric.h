@@ -460,6 +460,123 @@ inline void div(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,
 }
 
 // ============================================================================
+// Column-LITERAL arithmetic kernels (Perf Wave 2).
+// ============================================================================
+// One column input + one scalar literal, write-into-buffer. Replaces the
+// "broadcast literal into a 2048-row temp, then col-col kernel" pattern in
+// chukonu's PhysicalCompute: the literal stays in a register, the loop reads
+// ONE stream instead of two and auto-vectorizes identically to add/sub/mul.
+// Naming: <op>_lit = column OP literal; lit_sub = literal - column (the only
+// non-commutative order chukonu needs besides sub_lit).
+
+#define BOLT_DEFINE_ARITH_LIT(NAME, OP)                                        \
+template <typename T>                                                          \
+inline void NAME(const T* BOLT_RESTRICT a, int64_t n, T lit,                   \
+                 T* BOLT_RESTRICT out) noexcept {                              \
+    assert(a != nullptr || n == 0);                                            \
+    assert(out != nullptr || n == 0);                                          \
+    assert(n >= 0);                                                            \
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<T>(a[i] OP lit);      \
+}
+
+BOLT_DEFINE_ARITH_LIT(add_lit, +)
+BOLT_DEFINE_ARITH_LIT(sub_lit, -)
+BOLT_DEFINE_ARITH_LIT(mul_lit, *)
+
+#undef BOLT_DEFINE_ARITH_LIT
+
+// out[i] = lit - a[i] (reversed operand order; subtraction is the only
+// non-commutative op of the three, e.g. `1 - l_discount`).
+template <typename T>
+inline void lit_sub(T lit, const T* BOLT_RESTRICT a, int64_t n,
+                    T* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<T>(lit - a[i]);
+}
+
+// ============================================================================
+// Mixed-numeric-type col-col compare-filter (Perf Wave 2).
+// ============================================================================
+// Design: a kernel per (Ta, Tb) type pair would explode the matrix (7 numeric
+// types → 49 combos × 6 ops). Instead chukonu coerces EACH side once per
+// batch into f64 scratch (widen_i64_to_f64 / widen_i32_to_f64 below, plus
+// d128_to_f64 / d64_to_f64 in bolt_decimal.h — semantics match chukonu's
+// numeric_as_double), then this ONE branchless kernel does the compare and
+// the selection-vector emit. Coercion is a sequential auto-vectorized pass;
+// the compare loses its per-row type switch entirely.
+//
+// op encoding (matches d128_cmp_col): 0=eq 1=ne 2=lt 3=le 4=gt 5=ge.
+// NaN follows IEEE semantics: every compare false except `ne`.
+// `op` is loop-invariant, so the (op==K) guards hoist out of the loop and
+// only the selected predicate survives — no per-row branch (Pirk DaMoN 2014).
+
+inline int64_t f64_filter_cmp_col(const double* BOLT_RESTRICT a,
+                                  const double* BOLT_RESTRICT b,
+                                  int64_t n, int op,
+                                  int32_t* BOLT_RESTRICT out_sel) noexcept {
+    assert((a != nullptr && b != nullptr && out_sel != nullptr) || n == 0);
+    assert(n >= 0);
+    assert(op >= 0 && op <= 5);
+    int64_t kept = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const double x = a[i];
+        const double y = b[i];
+        const int pred =
+            ((op == 0) & (x == y)) | ((op == 1) & (x != y)) |
+            ((op == 2) & (x <  y)) | ((op == 3) & (x <= y)) |
+            ((op == 4) & (x >  y)) | ((op == 5) & (x >= y));
+        out_sel[kept] = static_cast<int32_t>(i);
+        kept += static_cast<int64_t>(pred);
+    }
+    assert(kept <= n);
+    return kept;
+}
+
+inline int64_t f64_filter_cmp_col_selected(
+        const double* BOLT_RESTRICT a, const double* BOLT_RESTRICT b,
+        const int32_t* BOLT_RESTRICT sel, int64_t sel_n, int op,
+        int32_t* BOLT_RESTRICT out_sel) noexcept {
+    assert((a != nullptr && b != nullptr && sel != nullptr &&
+            out_sel != nullptr) || sel_n == 0);
+    assert(sel_n >= 0);
+    assert(op >= 0 && op <= 5);
+    int64_t kept = 0;
+    for (int64_t i = 0; i < sel_n; ++i) {
+        const int32_t r = sel[i];
+        const double x = a[r];
+        const double y = b[r];
+        const int pred =
+            ((op == 0) & (x == y)) | ((op == 1) & (x != y)) |
+            ((op == 2) & (x <  y)) | ((op == 3) & (x <= y)) |
+            ((op == 4) & (x >  y)) | ((op == 5) & (x >= y));
+        out_sel[kept] = r;
+        kept += static_cast<int64_t>(pred);
+    }
+    assert(kept <= sel_n);
+    return kept;
+}
+
+// Coercion helpers for the mixed-compare path. Exact for |v| < 2^53 (all
+// TPC-H magnitudes); larger values round-to-nearest like any i64→f64 cast.
+inline void widen_i64_to_f64(const int64_t* BOLT_RESTRICT a, int64_t n,
+                             double* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<double>(a[i]);
+}
+
+inline void widen_i32_to_f64(const int32_t* BOLT_RESTRICT a, int64_t n,
+                             double* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<double>(a[i]);
+}
+
+// ============================================================================
 // Elementwise comparison kernels — column op column → int64 {0,1} column.
 // Used by the column-at-a-time expression evaluator (a hash-join/agg input
 // `WHERE`/`SELECT` predicate over millions of rows). BOLT_RESTRICT + a tight

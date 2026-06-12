@@ -817,3 +817,41 @@ target_link_libraries(test_bolt_joinkernel
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_joinkernel)
 add_test(NAME test_bolt_joinkernel COMMAND test_bolt_joinkernel)
+
+# Perf Wave 2 kernels — col-literal arithmetic (numeric + Decimal128),
+# scale-aware d128 col-col compare-filter, f64 mixed-compare filter and
+# the widen/d128_to_f64 coercion helpers. Every kernel vs a scalar oracle
+# (the oracle replicates chukonu filter_op.cpp dense_filter_decimal_col).
+add_executable(test_bolt_decimal_kernels test_bolt_decimal_kernels.cpp)
+target_link_libraries(test_bolt_decimal_kernels
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_decimal_kernels)
+add_test(NAME test_bolt_decimal_kernels COMMAND test_bolt_decimal_kernels)
+
+# W3 — parallel CSV parse parity vs the serial parser (value-identical
+# output; spilled Utf8 compares by content since overflow offsets differ
+# by design between the sequential and chunk-windowed writers).
+add_executable(test_bolt_csv_parallel test_bolt_csv_parallel.cpp)
+target_link_libraries(test_bolt_csv_parallel
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csv_parallel)
+add_test(NAME test_bolt_csv_parallel COMMAND test_bolt_csv_parallel)
+
+# W-PQ — Parquet footer metadata reader (hand-rolled thrift compact subset)
+# vs pyarrow goldens + corrupt-input fuzzing (truncations, byte flips).
+add_executable(test_bolt_parquet_meta test_bolt_parquet_meta.cpp)
+target_link_libraries(test_bolt_parquet_meta
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_meta PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_meta)
+add_test(NAME test_bolt_parquet_meta COMMAND test_bolt_parquet_meta)
+
+# W-PQ — snappy block decompressor vs cramjam vectors + corrupt fuzzing.
+add_executable(test_bolt_snappy test_bolt_snappy.cpp)
+target_link_libraries(test_bolt_snappy
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_snappy PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_snappy)
+add_test(NAME test_bolt_snappy COMMAND test_bolt_snappy)

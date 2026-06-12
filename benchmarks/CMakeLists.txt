@@ -146,3 +146,18 @@ bolt_apply_bench_tuning(bench_json)
 # Indirect multi-key sort + Top-K microbench (K-SORT-A)
 # Removed: bench_indirect_sort.cpp not present on this branch.
 # -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Perf Wave 2: col-literal arithmetic (numeric + Decimal128), scale-aware
+# d128 compare-filter, f64 mixed-compare filter + coercion helpers.
+# -----------------------------------------------------------------------
+add_executable(bench_decimal bench_decimal.cpp)
+target_link_libraries(bench_decimal PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_decimal PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_decimal)
+bolt_apply_bench_tuning(bench_decimal)
