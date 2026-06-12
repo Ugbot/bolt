@@ -430,7 +430,7 @@ TEST(BoltJoinKernel, OneInt64FastPathAgreesWithGeneral) {
 
     static int32_t fb[NB * NP], fp[NB * NP], gb[NB * NP], gp[NB * NP];
     const size_t nf = join_probe_typed(&fast, &p, NP, fb, fp, NB * NP);
-    const size_t ng = jk_probe_general(&gen, &p, NP, gb, gp, NB * NP);
+    const size_t ng = jk_probe_general<false>(&gen, &p, NP, gb, gp, NB * NP);
     ASSERT_EQ(nf, ng);
     // Both walk build chains head-first in the same insertion order, so the
     // emitted pair sequences are identical element-for-element.
@@ -445,6 +445,70 @@ TEST(BoltJoinKernel, OneInt64FastPathAgreesWithGeneral) {
         for (int s = 0; s < NB; ++s)
             if (pk[r] == bk[s]) ++expect;
     EXPECT_EQ(nf, expect);
+}
+
+// ===========================================================================
+// W-J4 — bloom-gated probe agreement.
+// ===========================================================================
+
+// use_bloom=true must emit the SAME pair sequence as use_bloom=false (the
+// SBBF has no false negatives; only lookup cost changes). Exercised on BOTH
+// key shapes, with a probe set dominated by non-members so the bloom path's
+// skip arm actually runs (members ~10%).
+TEST(BoltJoinKernel, BloomProbeAgreesOneInt64) {
+    Arena a;
+    constexpr int NB = 300, NP = 2000;
+    static int64_t bk[NB], pk[NP];
+    for (int i = 0; i < NB; ++i) bk[i] = i * 7;                  // members: 0,7,14,…
+    for (int i = 0; i < NP; ++i) pk[i] = (i % 10 == 0) ? (i % NB) * 7
+                                                       : 1000000 + i;  // ~90% misses
+    BoltColumn b = BoltColumn::make_flat(bk, nullptr, NB, BoltType::Int64);
+    BoltColumn p = BoltColumn::make_flat(pk, nullptr, NP, BoltType::Int64);
+    JoinBuildTyped jb{};
+    ASSERT_TRUE(join_build_typed(&b, 1, NB, &a, &jb));
+    EXPECT_EQ(jb.has_bloom, 1);
+    static int32_t nb_[NP * 4], np_[NP * 4], bb_[NP * 4], bp_[NP * 4];
+    const size_t n0 = join_probe_typed(&jb, &p, NP, nb_, np_, NP * 4, false);
+    const size_t n1 = join_probe_typed(&jb, &p, NP, bb_, bp_, NP * 4, true);
+    ASSERT_EQ(n0, n1);
+    ASSERT_GT(n0, 0u);
+    for (size_t i = 0; i < n0; ++i) {
+        EXPECT_EQ(nb_[i], bb_[i]);
+        EXPECT_EQ(np_[i], bp_[i]);
+    }
+}
+
+// Same agreement over the General (composite-key) path: two-key composite so
+// key_shape stays General; ~10% members.
+TEST(BoltJoinKernel, BloomProbeAgreesGeneral) {
+    Arena a;
+    constexpr int NB = 200, NP = 1500;
+    static int64_t bk0[NB], bk1[NB], pk0[NP], pk1[NP];
+    for (int i = 0; i < NB; ++i) { bk0[i] = i; bk1[i] = i * 3; }
+    for (int i = 0; i < NP; ++i) {
+        const bool member = (i % 10 == 0);
+        pk0[i] = member ? (i % NB)     : 500000 + i;
+        pk1[i] = member ? (i % NB) * 3 : 900000 + i;
+    }
+    BoltColumn b[2] = {
+        BoltColumn::make_flat(bk0, nullptr, NB, BoltType::Int64),
+        BoltColumn::make_flat(bk1, nullptr, NB, BoltType::Int64)};
+    BoltColumn p[2] = {
+        BoltColumn::make_flat(pk0, nullptr, NP, BoltType::Int64),
+        BoltColumn::make_flat(pk1, nullptr, NP, BoltType::Int64)};
+    JoinBuildTyped jb{};
+    ASSERT_TRUE(join_build_typed(b, 2, NB, &a, &jb));
+    EXPECT_EQ(jb.key_shape, static_cast<uint8_t>(JoinKeyShape::General));
+    EXPECT_EQ(jb.has_bloom, 1);
+    static int32_t nb_[NP * 2], np_[NP * 2], bb_[NP * 2], bp_[NP * 2];
+    const size_t n0 = join_probe_typed(&jb, p, NP, nb_, np_, NP * 2, false);
+    const size_t n1 = join_probe_typed(&jb, p, NP, bb_, bp_, NP * 2, true);
+    ASSERT_EQ(n0, n1);
+    ASSERT_GT(n0, 0u);
+    for (size_t i = 0; i < n0; ++i) {
+        EXPECT_EQ(nb_[i], bb_[i]);
+        EXPECT_EQ(np_[i], bp_[i]);
+    }
 }
 
 // Date32 single key takes the OneInt64 fast path (it's a 32-bit int under the

@@ -50,6 +50,7 @@
 #include "bolt/bolt_types.h"
 #include "bolt/join/bolt_groupby.h"   // gb_detail::{read_cell16,hash_keys,keys_equal,cell_valid}, GbCell16
 #include "bolt/join/bolt_hashjoin.h"  // kHJNumPartitions, hj_partition_of, HashJoinChainNode, kHJMaxKeys, kHJMaxChainLen
+#include "bolt/join/bolt_sbbf.h"      // SplitBlockBloom (W-J4 probe prefilter)
 #include "bolt/join/bolt_swiss.h"
 #include "bolt/kernels/bolt_utf8.h"   // sv_bytes / sv_compare for spilled-Utf8 key resolution
 
@@ -204,6 +205,16 @@ struct JoinBuildTyped {
     const char* key_str_base[kHJMaxKeys];// Utf8 spilled-bytes base per key; null otherwise
     uint8_t     key_shape;               // JoinKeyShape (cached fast-path tag)
     uint8_t     _pad2[7];
+    // --- Additive (W-J4). Split-block Bloom over the reachable build keys'
+    // MIXED hashes (the same value used for partition selection, so the
+    // probe tests it for free before the SwissTable find). Built always —
+    // ~10 bits/key, one sbbf_add per inserted row — because the BUILD can't
+    // know the probe's match rate; the PROBE decides per call whether to
+    // consult it (join_probe_typed's use_bloom). has_bloom == 0 when the
+    // arena couldn't fit the filter (never fatal: probes skip the test). ---
+    SplitBlockBloom bloom;
+    uint8_t         has_bloom;
+    uint8_t         _pad3[7];
 };
 
 // Compile-/run-time key-shape tag. `OneInt64` (a single 64-bit-or-narrower
@@ -284,6 +295,11 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
         return false;
     }
     std::memset(out->matched, 0, n_alloc);
+    // W-J4 probe prefilter — sized to the row count (10 bits/key ≈ 1% FPR);
+    // allocation failure just disables it (probe correctness never depends
+    // on the bloom: it only skips DEFINITE non-members).
+    out->has_bloom = sbbf_create(&out->bloom,
+                                 static_cast<int64_t>(n_alloc), arena) ? 1 : 0;
 
     uint32_t counts[kHJNumPartitions];
     std::memset(counts, 0, sizeof(counts));
@@ -314,6 +330,7 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
                                       : jk_detail::hash_keys_typed(key_cols, n_keys, r);
         const uint64_t h = one_int ? swiss_mix(tkey) : tkey;
         const uint32_t p = hj_partition_of(h);
+        if (out->has_bloom != 0) sbbf_add(out->bloom, h);
         out->chain_nodes[slot].next = out->partitions[p].find(tkey);  // prev head/-1
         if (!out->partitions[p].insert(tkey, slot)) return false;
     }
@@ -372,6 +389,13 @@ BOLT_FORCE_INLINE bool join_decimal_scales_match(const JoinBuildTyped* build,
 // (no GbCell16, no composite hash fold). Mirrors bolt_hashjoin.h's int64 probe
 // but multi-match over the chain. NULL keys skipped (handled by caller's
 // validity). Emits one (build_idx, probe_idx) per chain hit.
+//
+// UseBloom (W-J4): tests the build's split-block bloom on the mixed hash
+// BEFORE the SwissTable find — one 256-bit load vs a table walk — so at low
+// match rates most probe rows never touch the table. Compile-time flag (one
+// instantiation per arm, zero per-row dispatch); caller gates on
+// build->has_bloom.
+template <bool UseBloom>
 BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
                                             const BoltColumn* probe_keys,
                                             int64_t n_probe,
@@ -380,13 +404,18 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
                                             size_t pairs_cap) noexcept {
     assert(build != nullptr && probe_keys != nullptr);
     assert(jk_is_int64_shape_type(probe_keys[0].type));
+    assert(!UseBloom || build->has_bloom != 0);
     (void)pairs_cap;
     const BoltColumn& pk = probe_keys[0];
     size_t out = 0;
     for (int64_t r = 0; r < n_probe; ++r) {
         if (!gb_detail::cell_valid(pk, r)) continue;  // NULL != NULL
-        const uint64_t key = jk_read_int64_key(pk, r);
-        const uint32_t p   = hj_partition_of(swiss_mix(key));
+        const uint64_t key   = jk_read_int64_key(pk, r);
+        const uint64_t mixed = swiss_mix(key);
+        if constexpr (UseBloom) {
+            if (!sbbf_test(build->bloom, mixed)) continue;  // definitely absent
+        }
+        const uint32_t p = hj_partition_of(mixed);
         int32_t  node = build->partitions[p].find(key);
         uint32_t walk = 0;
         while (node >= 0) {
@@ -406,7 +435,9 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
 }
 
 // General typed probe: composite hash + typed (Float64-canonical, Utf8
-// byte-resolved, Decimal128 raw-128-bit) equality on hit.
+// byte-resolved, Decimal128 raw-128-bit) equality on hit. UseBloom as above
+// (tests the composite hash, which the loop computes anyway).
+template <bool UseBloom>
 BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
                                           const BoltColumn* probe_keys,
                                           int64_t n_probe,
@@ -415,12 +446,16 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
                                           size_t pairs_cap) noexcept {
     assert(build != nullptr);
     assert(out_build != nullptr && out_probe != nullptr);
+    assert(!UseBloom || build->has_bloom != 0);
     (void)pairs_cap;
     const uint8_t nk = build->n_keys;
     size_t out = 0;
     for (int64_t r = 0; r < n_probe; ++r) {
         if (join_row_has_null(probe_keys, nk, r)) continue;  // NULL != NULL
         const uint64_t h = jk_detail::hash_keys_typed(probe_keys, nk, r);
+        if constexpr (UseBloom) {
+            if (!sbbf_test(build->bloom, h)) continue;  // definitely absent
+        }
         const uint32_t p = hj_partition_of(h);
         int32_t  node = build->partitions[p].find(h);
         uint32_t walk = 0;
@@ -451,21 +486,35 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
 // Dispatches once on the build's cached key shape: a single integer key takes
 // the raw-value fast path (jk_probe_one_int64); everything else takes the typed
 // general path. Behaviour is identical across both for integer keys.
+//
+// `use_bloom` (W-J4, default off = byte-identical legacy behaviour): consult
+// the build-side split-block bloom before each table lookup. EMITS THE SAME
+// PAIRS either way (the bloom has no false negatives); only the lookup cost
+// changes. Profitable when the probe match rate is low (misses skip the table
+// walk for one 256-bit load); pure overhead near 100% match — the CALLER
+// decides, ideally adaptively from observed pair/row rates, NOT from
+// optimizer estimates.
 inline size_t join_probe_typed(const JoinBuildTyped* build,
                                const BoltColumn* probe_keys, int64_t n_probe,
                                int32_t* BOLT_RESTRICT out_build,
                                int32_t* BOLT_RESTRICT out_probe,
-                               size_t pairs_cap) noexcept {
+                               size_t pairs_cap,
+                               bool use_bloom = false) noexcept {
     assert(build != nullptr);
     assert(out_build != nullptr && out_probe != nullptr);
     // Decimal128 scale invariant (no-op unless a key is Decimal128).
     assert(join_decimal_scales_match(build, probe_keys));
+    const bool bloom = use_bloom && build->has_bloom != 0;
     if (build->key_shape == static_cast<uint8_t>(JoinKeyShape::OneInt64)) {
-        return jk_probe_one_int64(build, probe_keys, n_probe,
-                                  out_build, out_probe, pairs_cap);
+        return bloom ? jk_probe_one_int64<true>(build, probe_keys, n_probe,
+                                                out_build, out_probe, pairs_cap)
+                     : jk_probe_one_int64<false>(build, probe_keys, n_probe,
+                                                 out_build, out_probe, pairs_cap);
     }
-    return jk_probe_general(build, probe_keys, n_probe,
-                            out_build, out_probe, pairs_cap);
+    return bloom ? jk_probe_general<true>(build, probe_keys, n_probe,
+                                          out_build, out_probe, pairs_cap)
+                 : jk_probe_general<false>(build, probe_keys, n_probe,
+                                           out_build, out_probe, pairs_cap);
 }
 
 // Drain build-side rows by matched flag, for the finalize phase of the
