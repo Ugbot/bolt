@@ -179,7 +179,8 @@ if(BOLT_BUILD_INGEST)
     endif()
     add_library(bolt_ingest STATIC
         src/ingest/bolt_csv.cpp
-        src/ingest/bolt_parquet_meta.cpp)
+        src/ingest/bolt_parquet_meta.cpp
+        src/ingest/bolt_parquet_read.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)
     target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse)
     target_include_directories(bolt_ingest PUBLIC

@@ -1,0 +1,78 @@
+// bolt/ingest/bolt_parquet_read.h — W-PQ increment 2: Parquet page reader.
+//
+// Decodes the FLAT-schema subset located by bolt_parquet_meta.h into
+// BoltBatch columns (caller Arena owns all storage).
+//
+// Scope v1:
+//   - pages:     DATA_PAGE (v1) + DICTIONARY_PAGE. DATA_PAGE_V2 rejected.
+//   - codecs:    UNCOMPRESSED, SNAPPY (bolt_snappy.h).
+//   - encodings: PLAIN; RLE/bit-packed hybrid for definition levels
+//                (max_def_level <= 1) and for RLE_DICTIONARY /
+//                PLAIN_DICTIONARY indices (bit-width byte prefix).
+//   - types:     INT64 -> Int64 (DECIMAL converted -> Decimal64 mantissa),
+//                INT32 -> Int32 (DATE converted -> Date32),
+//                DOUBLE -> Float64,
+//                BYTE_ARRAY -> Utf8 StringViews (inline <= 12 bytes; longer
+//                  values spill into ONE per-column overflow buffer,
+//                  exposed via BoltColumn::str_overflow_base),
+//                FIXED_LEN_BYTE_ARRAY DECIMAL(p<=18) -> Decimal64 (W-DEC:
+//                  big-endian two's-complement mantissa -> int64,
+//                  decimal_scale stamped on the column); p>18 -> Decimal128.
+//   - OPTIONAL columns: validity bitmap built from definition levels.
+//     All-valid shortcut: when every chunk of a column reports
+//     statistics null_count == 0 the bitmap is not allocated at all.
+//
+// Safety contract: every read is bounds-checked against the file slice;
+// corrupt/truncated/hostile input returns false, never UB (fuzzed under
+// ASAN in tests/test_bolt_parquet_read.cpp).
+//
+// Tiger Style: noexcept, no allocation outside the caller Arena, fixed
+// caps, bounded loops, >=2 asserts and <=70 lines per function.
+
+#pragma once
+
+#include <cstdint>
+
+#include "bolt/bolt_types.h"
+#include "bolt/ingest/bolt_parquet_meta.h"
+
+namespace bolt {
+
+class Arena;
+struct BoltBatch;
+struct BoltColumn;
+
+namespace ingest {
+namespace parquet {
+
+// Map one parquet leaf column to its Bolt materialization. Returns false
+// when the column shape is outside the v1 subset (BOOLEAN, INT96, FLOAT,
+// non-DECIMAL FLBA, INT32 DECIMAL, FLBA wider than 16 bytes).
+bool parquet_map_type(const PqColumn* col, BoltType* out_type,
+                      uint8_t* out_scale) noexcept;
+
+// Locate the footer and parse FileMetaData. The chunk table behind
+// out->chunks is allocated from `arena` (sized 4096 first, retried once
+// at the kPqMaxRowGroups * kPqMaxColumns hard cap for chunk-heavy files).
+bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
+                       PqMeta* out) noexcept;
+
+// Decode ONE row group into caller-preallocated column descriptors
+// (out_cols[meta->n_columns]; the structs are descriptors only — all
+// data buffers come from `arena`). *out_rows receives the group's row
+// count. Designed so a scheduler can submit_range over row groups:
+// every call touches disjoint output storage.
+bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
+                            const PqMeta* meta, uint32_t row_group,
+                            Arena* arena, BoltColumn* out_cols,
+                            int64_t* out_rows) noexcept;
+
+// Whole file: locate + parse meta, allocate full-length columns, then
+// decode every row group into its row offset (serial v1; the row-group
+// function above is the future parallel unit).
+bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
+                       BoltBatch* out_batch) noexcept;
+
+}  // namespace parquet
+}  // namespace ingest
+}  // namespace bolt

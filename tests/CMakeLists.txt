@@ -855,3 +855,14 @@ target_compile_definitions(test_bolt_snappy PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_snappy)
 add_test(NAME test_bolt_snappy COMMAND test_bolt_snappy)
+
+# W-PQ increment 2 — Parquet page reader: all-1000-row value verification
+# against both goldens (snappy+dict and plain), row-group-granular reads,
+# and corrupt-page fuzzing (truncate / flip / zero -> false, never crash).
+add_executable(test_bolt_parquet_read test_bolt_parquet_read.cpp)
+target_link_libraries(test_bolt_parquet_read
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_read PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_read)
+add_test(NAME test_bolt_parquet_read COMMAND test_bolt_parquet_read)
