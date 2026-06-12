@@ -1508,11 +1508,22 @@ inline void gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
     }
 }
 
-inline bool groupby_agg_multi_key_typed_merge(
-        GroupbyTypedState* dst, const GroupbyTypedState* src) noexcept {
+// HASH-CLASS-RESTRICTED merge (chukonu W-J5 parallel partial merge): fold
+// only src groups whose stored-key hash falls in class `class_idx` of
+// `n_classes`. N workers each folding a DISJOINT class of every partial
+// into a PRIVATE dst produce disjoint dst tables whose union equals the
+// full merge — merge cost parallelizes as sum_groups / N instead of the
+// serial sum (measured 1010 ms for 16 x 169k partials on TPC-H Q17).
+// The class projection MUST be the stored-key hash (the same value the
+// dst table is keyed by) so every worker classifies a group identically.
+// (class_idx 0 of 1 == the full merge; the public merge delegates here.)
+inline bool groupby_agg_multi_key_typed_merge_class(
+        GroupbyTypedState* dst, const GroupbyTypedState* src,
+        uint32_t class_idx, uint32_t n_classes) noexcept {
     assert(dst != nullptr && src != nullptr);
     assert(dst->n_keys == src->n_keys);
     assert(dst->n_aggs == src->n_aggs);
+    assert(n_classes >= 1 && class_idx < n_classes);
     assert(!dst->any_distinct && !src->any_distinct &&
            "DISTINCT partials are not mergeable (v1)");
     if (dst->oom || src->oom) return false;
@@ -1532,6 +1543,7 @@ inline bool groupby_agg_multi_key_typed_merge(
     const uint32_t n_src = src->entry_count;
     for (uint32_t g = 0; g < n_src; ++g) {
         const uint64_t h = gb_merge_hash_stored(src, g);
+        if (n_classes > 1u && (h % n_classes) != class_idx) continue;
         int32_t found = dst->table->find(h);
         if (found >= 0 &&
             !gb_merge_keys_equal(dst, static_cast<uint32_t>(found), src, g)) {
@@ -1545,7 +1557,56 @@ inline bool groupby_agg_multi_key_typed_merge(
         }
         gb_merge_combine(dst, slot, src, g);
     }
-    dst->n_rows_in += src->n_rows_in;
+    // n_rows_in is write-only bookkeeping; credit it once (class 0) so the
+    // sum across class states matches the full-merge total.
+    if (class_idx == 0) dst->n_rows_in += src->n_rows_in;
+    return true;
+}
+
+inline bool groupby_agg_multi_key_typed_merge(
+        GroupbyTypedState* dst, const GroupbyTypedState* src) noexcept {
+    return groupby_agg_multi_key_typed_merge_class(dst, src, 0, 1);
+}
+
+// PRE-HASHED LIST merge: fold the src groups listed in gids[0..n) into
+// dst, reading each group's stored-key hash from the GID-INDEXED array
+// hashes_by_gid (hashes_by_gid[g] for group g). The fast path for the
+// parallel class merge: a bucket pre-pass hashes every entry ONCE
+// (parallel by partial) and partitions gids by class, so the N class
+// workers stop re-hashing all entries N times (measured: the
+// rescan-and-rehash variant spent ~5x the insert cost in hashing).
+// hashes_by_gid[g] MUST equal gb_merge_hash_stored(src, g).
+inline bool groupby_agg_multi_key_typed_merge_list(
+        GroupbyTypedState* dst, const GroupbyTypedState* src,
+        const uint32_t* gids, const uint64_t* hashes_by_gid,
+        uint32_t n) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(gids != nullptr || n == 0);
+    assert(hashes_by_gid != nullptr || n == 0);
+    assert(dst->n_keys == src->n_keys);
+    assert(dst->n_aggs == src->n_aggs);
+    assert(!dst->any_distinct && !src->any_distinct &&
+           "DISTINCT partials are not mergeable (v1)");
+    if (dst->oom || src->oom) return false;
+    if (dst->any_distinct || src->any_distinct) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t g = gids[i];
+        assert(g < src->entry_count);
+        const uint64_t h = hashes_by_gid[g];
+        assert(h == gb_merge_hash_stored(src, g));
+        int32_t found = dst->table->find(h);
+        if (found >= 0 &&
+            !gb_merge_keys_equal(dst, static_cast<uint32_t>(found), src, g)) {
+            found = -1;   // 64-bit hash collision: mirror ingest (dup entry)
+        }
+        uint32_t slot;
+        if (found >= 0) {
+            slot = static_cast<uint32_t>(found);
+        } else if (!gb_merge_insert_group(dst, src, g, h, &slot)) {
+            return false;
+        }
+        gb_merge_combine(dst, slot, src, g);
+    }
     return true;
 }
 
