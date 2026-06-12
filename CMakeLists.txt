@@ -177,7 +177,9 @@ if(BOLT_BUILD_INGEST)
     if(NOT BOLT_BUILD_PARSE)
         message(FATAL_ERROR "BOLT_BUILD_INGEST requires BOLT_BUILD_PARSE=ON")
     endif()
-    add_library(bolt_ingest STATIC src/ingest/bolt_csv.cpp)
+    add_library(bolt_ingest STATIC
+        src/ingest/bolt_csv.cpp
+        src/ingest/bolt_parquet_meta.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)
     target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse)
     target_include_directories(bolt_ingest PUBLIC

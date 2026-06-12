@@ -50,6 +50,26 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
                BoltBatch*       out_batch) noexcept;
 
 }  // namespace ingest
+
+struct Scheduler;   // bolt_scheduler.h — fwd-declared to keep this header light
+
+namespace ingest {
+
+// W3 — parallel CSV parse over line-aligned ~1 MiB chunks: parallel SWAR
+// newline counts -> prefix-summed absolute row indices -> parallel per-
+// chunk parsing straight into the final column buffers (disjoint row
+// ranges; one shared Utf8 overflow buffer windowed per chunk by source
+// bytes, so StringView offsets stay global and windows never collide).
+// Byte-identical output to parse_csv. Falls back to the serial parser
+// when `sched` is null, the input is small (< 4 MiB), or any row-count
+// accounting cross-check fails (defensive).
+bool parse_csv_parallel(const char* BOLT_RESTRICT buf, size_t buf_len,
+                        const CsvSchema& schema,
+                        Arena*           arena,
+                        Scheduler*       sched,
+                        BoltBatch*       out_batch) noexcept;
+
+}  // namespace ingest
 }  // namespace bolt
 
 extern "C" {

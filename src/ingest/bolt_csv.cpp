@@ -11,6 +11,7 @@
 // per hot-path function, ≤70 LOC per function, helpers split freely.
 // ---------------------------------------------------------------------------
 #include "bolt/ingest/bolt_csv.h"
+#include "bolt/bolt_scheduler.h"
 #include "bolt/parse/bolt_ascii.h"
 #include "bolt/kernels/bolt_date.h"
 #include "bolt/kernels/bolt_decimal.h"
@@ -546,6 +547,206 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
 
     // Guard against off-by-one between pass 1 and pass 2.
     if (row != row_count) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// W3 — parallel CSV parse. Two passes over line-aligned ~1 MiB chunks:
+//   pass A: per-chunk SWAR newline counts (parallel) -> serial prefix sum
+//           gives each chunk its absolute first row index;
+//   pass B: per-chunk row parsing (parallel) straight into the FINAL
+//           column buffers at absolute row indices (disjoint ranges — the
+//           write-once/disjoint "fearless parallelism" pattern; no locks).
+// ONE shared Utf8 overflow buffer: chunk c owns the byte window
+// [c.begin - data_start, c.end - data_start) — spilled bytes are at most
+// the chunk's SOURCE bytes, so windows never collide and StringView
+// ref.offsets stay global. Falls back to the serial parser for small
+// buffers, a null scheduler, or any accounting mismatch (defensive).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr size_t   kCsvParChunkBytes = 1u << 20;   // 1 MiB target
+constexpr uint32_t kCsvParMaxChunks  = 4096;       // bounded: ~4 GiB input
+
+struct CsvParShared {
+    const CsvSchema* schema;
+    const char*      buf;
+    size_t           buf_len;
+    BoltColumn*      cols;
+    char*            overflow_buf;
+    const size_t*    c_begin;       // [n] chunk byte ranges (line-aligned)
+    const size_t*    c_end;
+    const int64_t*   c_row0;        // [n] absolute first row per chunk
+    const size_t*    c_spill_off;   // [n] chunk's overflow window start
+    const size_t*    c_spill_cap;   // [n] chunk's overflow window end (abs)
+    size_t*          c_nl;          // [n] pass-A newline counts
+    uint8_t*         c_ok;          // [n] pass-B results
+};
+
+void csv_par_count_worker(void* ud, uint32_t s, uint32_t e,
+                          uint32_t /*tid*/) noexcept {
+    auto* t = static_cast<CsvParShared*>(ud);
+    assert(t != nullptr);
+    assert(s <= e);
+    for (uint32_t i = s; i < e; ++i) {
+        t->c_nl[i] = count_newlines(t->buf + t->c_begin[i],
+                                    t->c_end[i] - t->c_begin[i]);
+    }
+}
+
+void csv_par_parse_worker(void* ud, uint32_t s, uint32_t e,
+                          uint32_t /*tid*/) noexcept {
+    auto* t = static_cast<CsvParShared*>(ud);
+    assert(t != nullptr);
+    assert(s <= e);
+    for (uint32_t i = s; i < e; ++i) {
+        size_t  pos    = t->c_begin[i];
+        const size_t end = t->c_end[i];
+        int64_t row    = t->c_row0[i];
+        size_t  cursor = t->c_spill_off[i];
+        bool ok = true;
+        while (pos < end) {
+            const size_t nl = find_newline(t->buf, end, pos);
+            if (!parse_line(*t->schema, row, t->buf, t->buf_len, pos, nl,
+                            t->cols, t->overflow_buf, t->c_spill_cap[i],
+                            &cursor)) {
+                ok = false;
+                break;
+            }
+            pos = (nl < end) ? nl + 1 : end;
+            ++row;
+        }
+        t->c_ok[i] = ok ? 1 : 0;
+    }
+}
+
+}  // namespace
+
+bool parse_csv_parallel(const char* BOLT_RESTRICT buf, size_t buf_len,
+                        const CsvSchema& schema,
+                        Arena*           arena,
+                        Scheduler*       sched,
+                        BoltBatch*       out_batch) noexcept {
+    assert(arena != nullptr);
+    assert(out_batch != nullptr);
+    // Serial fallback: no scheduler, small input, or pathological shapes.
+    if (sched == nullptr || buf_len < 4 * kCsvParChunkBytes) {
+        return parse_csv(buf, buf_len, schema, arena, out_batch);
+    }
+    if (schema.num_cols == 0 || schema.num_cols > kCsvMaxCols) return false;
+    if (schema.delimiter == '\n' || schema.delimiter == '\r') return false;
+
+    // Data section starts after the optional header line.
+    size_t data_start = 0;
+    if (schema.has_header && buf_len > 0) {
+        const size_t nl = find_newline(buf, buf_len, 0);
+        data_start = (nl < buf_len) ? nl + 1 : buf_len;
+    }
+    const size_t data_len = buf_len - data_start;
+    if (data_len == 0) return parse_csv(buf, buf_len, schema, arena, out_batch);
+
+    // Line-aligned chunk boundaries (each chunk ends just past a '\n', or
+    // at buf_len). Bounded chunk table from the load arena.
+    auto* c_begin = arena->allocate_array<size_t>(kCsvParMaxChunks);
+    auto* c_end   = arena->allocate_array<size_t>(kCsvParMaxChunks);
+    if (c_begin == nullptr || c_end == nullptr) return false;
+    uint32_t n_chunks = 0;
+    size_t pos = data_start;
+    while (pos < buf_len && n_chunks < kCsvParMaxChunks) {
+        const size_t want = pos + kCsvParChunkBytes;
+        size_t end;
+        if (want >= buf_len) {
+            end = buf_len;
+        } else {
+            const size_t nl = find_newline(buf, buf_len, want);
+            end = (nl < buf_len) ? nl + 1 : buf_len;
+        }
+        c_begin[n_chunks] = pos;
+        c_end[n_chunks]   = end;
+        ++n_chunks;
+        pos = end;
+    }
+    if (pos < buf_len) {   // > kCsvParMaxChunks * 1MiB: extend the last chunk
+        c_end[n_chunks - 1] = buf_len;
+    }
+    if (n_chunks <= 1) return parse_csv(buf, buf_len, schema, arena, out_batch);
+
+    auto* c_row0      = arena->allocate_array<int64_t>(n_chunks);
+    auto* c_spill_off = arena->allocate_array<size_t>(n_chunks);
+    auto* c_spill_cap = arena->allocate_array<size_t>(n_chunks);
+    auto* c_nl        = arena->allocate_array<size_t>(n_chunks);
+    auto* c_ok        = arena->allocate_array<uint8_t>(n_chunks);
+    if (c_row0 == nullptr || c_spill_off == nullptr ||
+        c_spill_cap == nullptr || c_nl == nullptr || c_ok == nullptr) {
+        return false;
+    }
+
+    CsvParShared sh{};
+    sh.schema  = &schema;
+    sh.buf     = buf;
+    sh.buf_len = buf_len;
+    sh.c_begin = c_begin;
+    sh.c_end   = c_end;
+    sh.c_nl    = c_nl;
+
+    // Pass A: parallel newline counts -> serial prefix sum -> row0 per chunk.
+    sched->submit_range(&csv_par_count_worker, &sh, n_chunks, 1);
+    sched->wait_all();
+    int64_t row_acc = 0;
+    for (uint32_t i = 0; i < n_chunks; ++i) {
+        c_row0[i] = row_acc;
+        int64_t rows = static_cast<int64_t>(c_nl[i]);
+        // The final chunk may end without a trailing newline: one more row.
+        if (i == n_chunks - 1 && buf[c_end[i] - 1] != '\n') rows += 1;
+        row_acc += rows;
+    }
+    // Defensive cross-check against the serial row accounting; mismatch
+    // means a convention drift — take the proven path instead of guessing.
+    const int64_t row_count = compute_row_count(buf, buf_len, schema.has_header);
+    if (row_acc != row_count) {
+        return parse_csv(buf, buf_len, schema, arena, out_batch);
+    }
+
+    BoltBatch::init_empty(out_batch);
+    out_batch->arena    = arena;
+    out_batch->num_cols = schema.num_cols;
+    out_batch->num_rows = row_count;
+    BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
+    if (!alloc_columns(schema, row_count, arena, cols)) return false;
+    sh.cols = cols;
+
+    bool any_utf8 = false;
+    for (uint32_t c = 0; c < schema.num_cols; ++c) {
+        if (schema.col_types[c] == BoltType::Utf8) { any_utf8 = true; break; }
+    }
+    char* overflow_buf = nullptr;
+    if (any_utf8 && row_count > 0) {
+        overflow_buf = static_cast<char*>(arena->allocate(data_len, 1));
+        if (overflow_buf == nullptr) return false;
+        for (uint32_t c = 0; c < schema.num_cols; ++c) {
+            if (schema.col_types[c] == BoltType::Utf8) {
+                cols[c].str_overflow_base = overflow_buf;
+            }
+        }
+    }
+    sh.overflow_buf = overflow_buf;
+    for (uint32_t i = 0; i < n_chunks; ++i) {
+        c_spill_off[i] = c_begin[i] - data_start;
+        c_spill_cap[i] = c_end[i]   - data_start;
+        c_ok[i] = 0;
+    }
+    sh.c_row0      = c_row0;
+    sh.c_spill_off = c_spill_off;
+    sh.c_spill_cap = c_spill_cap;
+    sh.c_ok        = c_ok;
+
+    // Pass B: parallel per-chunk parsing into disjoint row ranges.
+    sched->submit_range(&csv_par_parse_worker, &sh, n_chunks, 1);
+    sched->wait_all();
+    for (uint32_t i = 0; i < n_chunks; ++i) {
+        if (c_ok[i] == 0) return false;
+    }
     return true;
 }
 
