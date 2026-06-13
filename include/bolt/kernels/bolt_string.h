@@ -17,6 +17,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
+#include "bolt/kernels/bolt_utf8.h"   // sv_bytes / sv_make_inline (substr)
 
 namespace bolt {
 namespace kernels {
@@ -158,6 +159,56 @@ BOLT_FORCE_INLINE int64_t utf8_contains(
         count += match ? 1 : 0;
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// utf8_substr_const: vectorized SUBSTRING(col, start1, len) with COMPILE-TIME
+// CONSTANT 1-based `start1` and byte `take`, producing one output StringView
+// per row. The hot case in OLAP — extracting a fixed prefix/field (TPC-H Q22's
+// substring(c_phone,1,2) country code) — is a tight, branch-light column loop.
+//
+// Bolt/DuckDB/ClickHouse "inline prefix" insight: the first <=4 bytes of any
+// StringView live in its inline prefix and the next 8 in inline_data, so a
+// short substring that starts within the first 12 bytes NEVER chases the
+// spilled buffer. When the requested window is fully inside [0,12) we read
+// straight from the source view's inline bytes; only a window reaching past
+// byte 12 of a spilled source consults `spilled_base`. Output is always
+// inline when `take <= 12` (the OLAP case); a longer take is clamped to the
+// caller's contract (asserted) — substring-to-spill is a separate path.
+//
+// Semantics match the per-row evaluator: start1 < 1 clamps to 1; a start past
+// the string yields empty; `take` saturates at the remaining bytes. Bytes, not
+// code points (ASCII/Latin TPC-H data). NULL handling is the caller's (it
+// vectorizes only null-free columns, like the numeric kernels).
+// ---------------------------------------------------------------------------
+BOLT_FORCE_INLINE void utf8_substr_const(
+        const StringView* BOLT_RESTRICT data, int64_t n,
+        const char* spilled_base, uint32_t start1, uint32_t take,
+        StringView* BOLT_RESTRICT out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(out  != nullptr || n == 0);
+    assert(n >= 0);
+    assert(take <= 12u && "utf8_substr_const targets inline (<=12B) results");
+    const uint32_t s0 = (start1 < 1u) ? 0u : (start1 - 1u);
+    for (int64_t i = 0; i < n; ++i) {
+        const StringView& s = data[i];
+        const uint32_t slen = s.length;
+        const uint32_t start = (s0 >= slen) ? slen : s0;
+        const uint32_t rem   = slen - start;
+        const uint32_t t     = (take < rem) ? take : rem;
+        // Inline-fast: window entirely within the 12 inline bytes (covers
+        // every inline source, and every spilled source whose window stays in
+        // the prefix — the country-code/fixed-field case). &s.prefix[0] is the
+        // canonical inline byte pointer.
+        const char* p;
+        if (s.length <= 12u || start + t <= 12u) {
+            p = s.prefix + start;
+        } else {
+            assert(spilled_base != nullptr);
+            p = utf8::sv_bytes(s, spilled_base) + start;
+        }
+        out[i] = utf8::sv_make_inline(p, t);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -380,6 +380,64 @@ TEST_F(Utf8Test, ReplaceGrows) {
 // "short string beats long string regardless of content" bug in the old
 // length-first cmp_prefix shortcut.
 // ===========================================================================
+
+// ===========================================================================
+// utf8_substr_const (bolt_string.h) — vectorized fixed-window SUBSTRING.
+// ===========================================================================
+}  // namespace
+
+#include "bolt/kernels/bolt_string.h"
+
+namespace {
+
+TEST_F(Utf8Test, SubstrConst_PrefixInline) {
+    // The TPC-H Q22 shape: substring(x, 1, 2) — country code from a phone.
+    StringView in[4] = {
+        make_inline("13-456-789"),  // -> "13"
+        make_inline("31-000"),      // -> "31"
+        make_inline("7"),           // start past end of the 2-window -> "7"
+        make_inline(""),            // empty -> empty
+    };
+    StringView out[4];
+    bolt::kernels::utf8_substr_const(in, 4, nullptr, /*start1=*/1, /*take=*/2, out);
+    EXPECT_EQ(out[0].length, 2u);
+    EXPECT_EQ(memcmp(out[0].prefix, "13", 2), 0);
+    EXPECT_EQ(out[1].length, 2u);
+    EXPECT_EQ(memcmp(out[1].prefix, "31", 2), 0);
+    EXPECT_EQ(out[2].length, 1u);             // saturated at remaining bytes
+    EXPECT_EQ(out[2].prefix[0], '7');
+    EXPECT_EQ(out[3].length, 0u);             // empty source -> empty
+}
+
+TEST_F(Utf8Test, SubstrConst_MidWindowAndClamp) {
+    StringView in[3] = {
+        make_inline("abcdefgh"),    // substring(.,3,4) -> "cdef"
+        make_inline("ab"),          // start 3 past end -> empty
+        make_inline("abcdefgh"),    // substring(.,7,9) -> "gh" (saturate)
+    };
+    StringView o1[3], o2[3];
+    bolt::kernels::utf8_substr_const(in, 3, nullptr, 3, 4, o1);
+    EXPECT_EQ(o1[0].length, 4u);
+    EXPECT_EQ(memcmp(o1[0].prefix, "cdef", 4), 0);
+    EXPECT_EQ(o1[1].length, 0u);
+    bolt::kernels::utf8_substr_const(in, 3, nullptr, 7, 9, o2);
+    EXPECT_EQ(o2[2].length, 2u);
+    EXPECT_EQ(memcmp(o2[2].prefix, "gh", 2), 0);
+}
+
+TEST_F(Utf8Test, SubstrConst_SpilledSourcePrefixWindow) {
+    // A spilled (>12B) source: a window inside the first 12 bytes must read
+    // the inline prefix WITHOUT consulting the spill base (the inline-fast
+    // path). prefix[] holds the first 4 bytes; the window [1,2] is in range.
+    const char* big = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";   // 26 bytes
+    StringView sp = make_spilled(big, 26, 0);
+    StringView out[1];
+    // start1=1 take=2 -> "AB", entirely in the 4-byte prefix, base unused.
+    bolt::kernels::utf8_substr_const(&sp, 1, /*spilled_base=*/nullptr, 1, 2, out);
+    EXPECT_EQ(out[0].length, 2u);
+    EXPECT_EQ(memcmp(out[0].prefix, "AB", 2), 0);
+}
+
 }  // namespace
 
 #include "bolt/join/bolt_groupby.h"
