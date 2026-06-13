@@ -313,6 +313,82 @@ inline bool gb_pass1(GroupbyTypedState* st, const BoltColumn* keys,
     return true;
 }
 
+// PASS 1, DENSE variant (W-P): a single int-like key with a certified
+// dense gid index. The hot path NEVER hashes and NEVER touches the
+// SwissTable — it packs the key, computes idx = key - dense_min, and
+// reads dense_gid[idx] (one load), software-prefetching that slot
+// kGbPfDist rows ahead (the dense array is now the random-access
+// structure, so it gets the prefetch the table used to get). The hash
+// is computed LAZILY, only on a cold first-touch (dense_gid[idx] < 0)
+// or a key outside the certified range (corrupt stats) — those take the
+// authoritative hash insert/probe and publish the gid. A run-length
+// memo short-circuits key repeats. Fills gid[0..count); false on oom.
+// Q17's 200k-group l_partkey aggregate is exactly this shape; the ring
+// pass-1's per-row wyhash + table prefetch were its cost.
+template <bool HasSel>
+inline bool gb_pass1_dense(GroupbyTypedState* st, const BoltColumn* keys,
+                           const uint32_t* sel, int64_t start, int64_t count,
+                           int32_t* gid) noexcept {
+    static_assert((kGbPfDist & (kGbPfDist - 1)) == 0, "ring is pow2");
+    assert(st != nullptr && gid != nullptr && st->dense_gid != nullptr);
+    assert(st->n_keys == 1u && count > 0);
+    const uint64_t dmin   = static_cast<uint64_t>(st->dense_min);
+    const uint64_t drange = st->dense_range;
+    int32_t* BOLT_RESTRICT didx = st->dense_gid;
+    uint64_t rkey[kGbPfDist];     // packed key value (a[0]); b is always 0
+    uint64_t ridx[kGbPfDist];     // key - dense_min
+    const int64_t lead = (count < kGbPfDist) ? count : kGbPfDist;
+    for (int64_t i = 0; i < lead; ++i) {
+        const int64_t r = HasSel ? static_cast<int64_t>(sel[start + i])
+                                 : (start + i);
+        uint64_t a[1], b[1];
+        gb_pack_row<1, false>(st, keys, r, a, b);
+        rkey[i] = a[0];
+        const uint64_t di = a[0] - dmin;
+        ridx[i] = di;
+        if (di < drange) BOLT_PREFETCH_READ(&didx[di]);
+    }
+    uint64_t prev_key = 0;
+    int32_t  prev_gid = -1;
+    bool     have_prev = false;
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t slot = i & (kGbPfDist - 1);
+        const uint64_t a0 = rkey[slot];
+        const uint64_t di = ridx[slot];
+        const int64_t nxt = i + kGbPfDist;          // refill the vacated slot
+        if (nxt < count) {
+            const int64_t rn = HasSel ? static_cast<int64_t>(sel[start + nxt])
+                                      : (start + nxt);
+            uint64_t a[1], b[1];
+            gb_pack_row<1, false>(st, keys, rn, a, b);
+            rkey[slot] = a[0];
+            const uint64_t dn = a[0] - dmin;
+            ridx[slot] = dn;
+            if (dn < drange) BOLT_PREFETCH_READ(&didx[dn]);
+        }
+        if (have_prev && a0 == prev_key) { gid[i] = prev_gid; continue; }
+        int32_t found;
+        if (di < drange) {
+            found = didx[di];
+            if (found < 0) {                        // cold first-touch: insert
+                uint64_t a[1] = {a0}, b[1] = {0};
+                const uint64_t h = gb_hash_packed<1, false>(a, b);
+                found = gb_probe_hash<1>(st, h, a, b);
+                if (found < 0) return false;        // oom
+                didx[di] = found;
+            }
+        } else {                                    // out of certified range
+            uint64_t a[1] = {a0}, b[1] = {0};
+            const uint64_t h = gb_hash_packed<1, false>(a, b);
+            found = gb_probe_hash<1>(st, h, a, b);
+            if (found < 0) return false;            // oom
+        }
+        gid[i] = found;
+        prev_key = a0; prev_gid = found; have_prev = true;
+    }
+    return true;
+}
+
 // PASS 1, MRU variant (low cardinality): when the table holds at most
 // kGbMruWindowMax groups at window start, a 4-entry MRU of packed canonical
 // keys resolves almost every row WITHOUT hashing or touching the table (the
@@ -888,7 +964,17 @@ inline bool gb_try_twopass(GroupbyTypedState* st, const BoltColumn* keys,
     int32_t* gid = st->gid_scratch;
     const bool mru = (st->entry_count <= kGbMruWindowMax);
     bool ok;
-    if (shape == GbShape::IntKeys) {
+    // W-P dense fast path: a single int-like key with a certified gid
+    // index resolves with one array load and never hashes — strictly
+    // cheaper than both the ring and MRU variants, so it takes priority
+    // for IntKeys whenever enabled (gb_classify already proved the int
+    // shape; dense_gid != nullptr proves single-key + certified bounds).
+    if (shape == GbShape::IntKeys && st->dense_gid != nullptr &&
+        st->n_keys == 1u) {
+        ok = (sel != nullptr)
+            ? gb_pass1_dense<true>(st, keys, sel, start, count, gid)
+            : gb_pass1_dense<false>(st, keys, sel, start, count, gid);
+    } else if (shape == GbShape::IntKeys) {
         if (mru) {
             ok = (st->n_keys == 1u)
                 ? gb_pass1_mru<1, false>(st, keys, sel, start, count, gid)
