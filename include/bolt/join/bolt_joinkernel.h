@@ -365,6 +365,137 @@ inline bool join_build_typed_general(const BoltColumn* key_cols, uint8_t n_keys,
                          /*force_general=*/true, out);
 }
 
+// ===========================================================================
+// W-PAR: PARALLEL hash-join build. JoinBuildTyped is ALREADY partitioned by
+// hj_partition_of into kHJNumPartitions (64) independent SwissTables, and the
+// probe routes a key to its one partition — so a table whose partitions were
+// each built by a different worker is PROBE-IDENTICAL to a serial build. We
+// split the build in two phases: Phase 1 (calling thread) hashes every key
+// once to histogram per partition, add to the bloom, init every chain node,
+// write every key cell, and SCATTER the non-null row indices into per-
+// partition groups IN ROW ORDER; Phase 2 (one task per partition range,
+// worker threads) inserts each partition's rows into its own SwissTable +
+// sets each row's chain next. Partitions are DISJOINT (a key hashes to one
+// partition; all rows of a key share it), so workers touch disjoint tables +
+// disjoint chain/insert slots — NO locks, NO atomics. Insert order within a
+// partition is row order (the scatter preserves it), so chains are byte-
+// identical to serial -> the probe emits identical pairs. The expensive
+// cache-miss-bound SwissTable inserts parallelise; the cheap sequential
+// Phase-1 work stays serial.
+// ===========================================================================
+
+// Row indices grouped by partition (Phase-1 output, Phase-2 input). row_ids
+// holds only NON-NULL-key rows (null keys are present-but-unreachable); the
+// `offsets` prefix-sum bounds each partition's slice in row_ids.
+struct JoinBuildScatterCtx {
+    int32_t* row_ids;                          // [<= build_rows], by partition
+    uint32_t offsets[kHJNumPartitions + 1];    // prefix-sum boundaries
+};
+
+// Phase 1 (calling thread): capture meta, allocate the global arrays, init
+// every chain node + key cell, fold the bloom over every reachable key, and
+// scatter non-null row indices into per-partition groups in row order; then
+// create the per-partition SwissTables sized to their counts. After this the
+// tables are EMPTY (Phase 2 fills them). Returns false on OOM.
+inline bool jk_build_scatter_and_alloc(const BoltColumn* key_cols,
+        uint8_t n_keys, uint64_t build_rows, Arena* arena,
+        JoinBuildTyped* out, JoinBuildScatterCtx* scat) noexcept {
+    assert(arena != nullptr && out != nullptr && scat != nullptr);
+    assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
+    const uint64_t n = build_rows;
+    const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
+    out->build_rows = n;
+    out->n_keys     = n_keys;
+    jk_capture_key_meta(key_cols, n_keys, out);
+    const bool one_int = (out->key_shape ==
+                          static_cast<uint8_t>(JoinKeyShape::OneInt64));
+    out->chain_nodes = arena->allocate_array<HashJoinChainNode>(n_alloc);
+    out->keys_flat   = arena->allocate_array<GbCell16>(n_alloc * n_keys);
+    out->matched     = static_cast<uint8_t*>(arena->allocate(n_alloc, 1));
+    scat->row_ids    = arena->allocate_array<int32_t>(n_alloc);
+    if (out->chain_nodes == nullptr || out->keys_flat == nullptr ||
+        out->matched == nullptr || scat->row_ids == nullptr) {
+        return false;
+    }
+    std::memset(out->matched, 0, n_alloc);
+    out->has_bloom = sbbf_create(&out->bloom,
+                                 static_cast<int64_t>(n_alloc), arena) ? 1 : 0;
+    uint32_t counts[kHJNumPartitions];
+    std::memset(counts, 0, sizeof(counts));
+    // Pass 1: init chain node + write key cell for EVERY row (SEQUENTIAL —
+    // cache-friendly streaming read of key_cols, streaming write of keys_flat;
+    // null rows must still drain for OUTER/ANTI); histogram + bloom over the
+    // reachable rows. Phase 2 (parallel) then only does the random-access
+    // SwissTable inserts — the cache-miss-bound part worth splitting.
+    for (uint64_t i = 0; i < n; ++i) {
+        const int64_t  r    = static_cast<int64_t>(i);
+        const uint32_t slot = static_cast<uint32_t>(i);
+        GbCell16* krow = out->keys_flat + static_cast<size_t>(slot) * n_keys;
+        for (uint8_t k = 0; k < n_keys; ++k) {
+            krow[k] = jk_detail::read_cell16_canon(key_cols[k], r);
+        }
+        out->chain_nodes[slot].build_idx = slot;
+        out->chain_nodes[slot].next      = kJoinNullIndex;
+        if (join_row_has_null(key_cols, n_keys, r)) continue;
+        const uint64_t tkey = one_int ? jk_read_int64_key(key_cols[0], r)
+                                      : jk_detail::hash_keys_typed(key_cols, n_keys, r);
+        const uint64_t h = one_int ? swiss_mix(tkey) : tkey;
+        counts[hj_partition_of(h)]++;
+        if (out->has_bloom != 0) sbbf_add(out->bloom, h);
+    }
+    // Prefix-sum -> offsets; create tables sized to counts.
+    uint32_t acc = 0;
+    for (uint32_t p = 0; p < kHJNumPartitions; ++p) {
+        scat->offsets[p] = acc;
+        acc += counts[p];
+        const uint64_t hint = counts[p] == 0 ? 1 : counts[p];
+        if (!SwissTable::create(&out->partitions[p], hint, arena)) return false;
+    }
+    scat->offsets[kHJNumPartitions] = acc;
+    // Pass 2: scatter non-null rows into per-partition groups IN ROW ORDER
+    // (a moving cursor per partition over the prefix-sum slices).
+    uint32_t cursor[kHJNumPartitions];
+    std::memcpy(cursor, scat->offsets, sizeof(uint32_t) * kHJNumPartitions);
+    for (uint64_t i = 0; i < n; ++i) {
+        const int64_t r = static_cast<int64_t>(i);
+        if (join_row_has_null(key_cols, n_keys, r)) continue;
+        const uint64_t tkey = one_int ? jk_read_int64_key(key_cols[0], r)
+                                      : jk_detail::hash_keys_typed(key_cols, n_keys, r);
+        const uint64_t h = one_int ? swiss_mix(tkey) : tkey;
+        scat->row_ids[cursor[hj_partition_of(h)]++] = static_cast<int32_t>(i);
+    }
+    return true;
+}
+
+// Phase 2 (TASK BODY, parallel): insert the rows of partitions [p_lo, p_hi)
+// from the scatter into their SwissTables + set each row's chain next. Rows
+// arrive in ascending order within a partition, so the chain order is
+// byte-identical to serial jk_build_core. Disjoint tables + disjoint chain
+// slots across partitions -> no synchronisation. Returns false on table-full.
+inline bool jk_build_partition_range(const BoltColumn* key_cols, uint8_t n_keys,
+        const JoinBuildScatterCtx* scat, uint32_t p_lo, uint32_t p_hi,
+        JoinBuildTyped* out) noexcept {
+    assert(out != nullptr && scat != nullptr);
+    assert(p_lo <= p_hi && p_hi <= kHJNumPartitions);
+    const bool one_int = (out->key_shape ==
+                          static_cast<uint8_t>(JoinKeyShape::OneInt64));
+    for (uint32_t p = p_lo; p < p_hi; ++p) {
+        const uint32_t lo = scat->offsets[p];
+        const uint32_t hi = scat->offsets[p + 1];
+        for (uint32_t idx = lo; idx < hi; ++idx) {
+            const int32_t slot = scat->row_ids[idx];
+            const int64_t r    = slot;
+            const uint64_t tkey = one_int ? jk_read_int64_key(key_cols[0], r)
+                                          : jk_detail::hash_keys_typed(key_cols, n_keys, r);
+            out->chain_nodes[slot].next = out->partitions[p].find(tkey);
+            if (!out->partitions[p].insert(tkey, static_cast<uint32_t>(slot))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Decimal128 scale precondition: assert every Decimal128 key column's probe
 // scale matches the build scale captured at build time. Equal nominal values
 // stored at different scales (e.g. 12.30@2 vs 12.300@3) have different integer

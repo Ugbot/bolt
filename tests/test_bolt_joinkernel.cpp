@@ -210,6 +210,49 @@ TEST(BoltJoinKernel, BruteForceInnerCrossCheck) {
 }
 
 // ===========================================================================
+// W-PAR — parallel build (scatter + per-partition-range) == serial build.
+// The kernel builds the 64 partitions in disjoint ranges (as N workers
+// would); the resulting table must probe BYTE-IDENTICALLY to a serial build.
+// ===========================================================================
+TEST(BoltJoinKernel, ParallelBuildEqualsSerial) {
+    constexpr int NB = 4000, NP = 6000;
+    int64_t bk[NB], pk[NP];
+    for (int i = 0; i < NB; ++i) bk[i] = (i * 2654435761u) % 800;   // dup keys
+    for (int i = 0; i < NP; ++i) pk[i] = (i * 40503u) % 850;
+    BoltColumn b = BoltColumn::make_flat(bk, nullptr, NB, BoltType::Int64);
+    BoltColumn p = BoltColumn::make_flat(pk, nullptr, NP, BoltType::Int64);
+
+    // Serial reference. Output buffers are STATIC (NB*16 int32 each would
+    // overflow the 1MB stack).
+    constexpr int kCap = NB * 16;
+    static int32_t obs[kCap], ops_[kCap], obp[kCap], opp[kCap];
+    Arena as;
+    JoinBuildTyped jb_s{};
+    ASSERT_TRUE(join_build_typed(&b, 1, NB, &as, &jb_s));
+    const size_t ns = join_probe_typed(&jb_s, &p, NP, obs, ops_, kCap);
+
+    // Parallel build: scatter, then build partitions in 4 disjoint ranges.
+    Arena ap;
+    JoinBuildTyped jb_p{};
+    JoinBuildScatterCtx scat{};
+    ASSERT_TRUE(jk_build_scatter_and_alloc(&b, 1, NB, &ap, &jb_p, &scat));
+    const uint32_t step = kHJNumPartitions / 4;
+    for (uint32_t w = 0; w < 4; ++w) {
+        const uint32_t lo = w * step;
+        const uint32_t hi = (w == 3) ? kHJNumPartitions : (w + 1) * step;
+        ASSERT_TRUE(jk_build_partition_range(&b, 1, &scat, lo, hi, &jb_p));
+    }
+    const size_t np = join_probe_typed(&jb_p, &p, NP, obp, opp, kCap);
+
+    // Same pair count AND same pair sequence (chain order preserved).
+    ASSERT_EQ(np, ns);
+    for (size_t i = 0; i < ns; ++i) {
+        EXPECT_EQ(obp[i], obs[i]);
+        EXPECT_EQ(opp[i], ops_[i]);
+    }
+}
+
+// ===========================================================================
 // Card A2 — Float64 key canonicalization.
 // ===========================================================================
 
