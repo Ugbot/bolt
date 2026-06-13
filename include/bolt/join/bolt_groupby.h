@@ -936,6 +936,20 @@ struct GroupbyTypedState {
     // merge-insert boundaries, so a junk cardinality estimate is only a
     // bad STARTING size, never an oom or a 4M-entry init for 7 groups.
     uint32_t        grow_cap;
+    // W-P dense gid index (perfect-hash fast path): for a SINGLE int-like
+    // group key with caller-certified [min, min+range) bounds,
+    // dense_gid[key - dense_min] maps key -> gid, replacing the gid-cache
+    // + SwissTable probe + key compare with ONE array load (the 200k-group
+    // TPC-H Q17 aggregate is cache-miss bound in exactly that probe).
+    // nullptr = disabled. CONSISTENCY: a dense MISS falls through to the
+    // full hash find-or-insert and PUBLISHES the resulting gid, so paths
+    // that insert without publishing (per-row fallback windows) can never
+    // create duplicate groups — under-coverage only costs first-touch
+    // misses. The SwissTable stays authoritative (inserts always go there
+    // too: merge rehash + growth depend on it).
+    int32_t*        dense_gid;          // [dense_range], -1 = empty
+    int64_t         dense_min;
+    uint32_t        dense_range;
     uint16_t        n_distinct;
     uint16_t        n_distinct16;
     uint8_t         n_keys;
@@ -1075,6 +1089,33 @@ inline bool groupby_agg_multi_key_typed_begin(
         state->key_str_used[k] = 0;
         state->key_str_cap[k]  = 0;
     }
+    return true;
+}
+
+// W-P: enable the dense gid index AFTER begin and BEFORE the first
+// ingest (see the state-field note). Single int-like key only; `range`
+// = key_max - key_min + 1, certified by the caller from load-time
+// column stats. Index cost = 4 bytes/slot; the ceiling bounds it at
+// 64 MiB. Returns false (dense stays off, hash path unchanged) on any
+// ineligible shape.
+inline bool groupby_typed_enable_dense(GroupbyTypedState* state,
+                                       int64_t key_min,
+                                       uint64_t range) noexcept {
+    assert(state != nullptr);
+    assert(state->entry_count == 0 && "enable dense before the first ingest");
+    if (state == nullptr || state->arena == nullptr) return false;
+    if (state->n_keys != 1 || range == 0) return false;
+    if (range > (1ull << 24)) return false;        // 64 MiB index ceiling
+    const BoltType kt = state->key_types[0];
+    if (kt != BoltType::Int64 && kt != BoltType::Int32 &&
+        kt != BoltType::Date32) return false;
+    auto* idx =
+        state->arena->allocate_array<int32_t>(static_cast<size_t>(range));
+    if (idx == nullptr) return false;
+    std::memset(idx, 0xFF, sizeof(int32_t) * static_cast<size_t>(range));
+    state->dense_gid   = idx;
+    state->dense_min   = key_min;
+    state->dense_range = static_cast<uint32_t>(range);
     return true;
 }
 

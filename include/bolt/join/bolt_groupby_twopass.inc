@@ -188,11 +188,11 @@ BOLT_FORCE_INLINE uint64_t gb_hash_packed(const uint64_t* a,
     return h;
 }
 
-// Full probe for one packed row: 64-entry direct-mapped (hash -> gid)
+// Hash probe for one packed row: 64-entry direct-mapped (hash -> gid)
 // cache verified against the stored canonical cells, then SwissTable
 // find, then insert. Returns the gid, or -1 on oom.
 template <uint32_t NK>
-BOLT_FORCE_INLINE int32_t gb_probe_full(GroupbyTypedState* st, uint64_t h,
+BOLT_FORCE_INLINE int32_t gb_probe_hash(GroupbyTypedState* st, uint64_t h,
                                         const uint64_t* a,
                                         const uint64_t* b) noexcept {
     assert(st != nullptr);
@@ -232,6 +232,30 @@ BOLT_FORCE_INLINE int32_t gb_probe_full(GroupbyTypedState* st, uint64_t h,
     st->gid_cache_h[ci] = h;
     st->gid_cache_g[ci] = found;
     return found;
+}
+
+// Full probe = dense gid index fast path (W-P: single int-like key with
+// certified bounds — ONE array load replaces cache + Swiss probe + key
+// compare), falling through to the hash probe. A dense MISS takes the
+// hash path and PUBLISHES the resulting gid, so groups inserted by any
+// other path (per-row fallback windows) can never be duplicated; keys
+// outside the certified range (corrupt stats) use the hash path — sound.
+template <uint32_t NK>
+BOLT_FORCE_INLINE int32_t gb_probe_full(GroupbyTypedState* st, uint64_t h,
+                                        const uint64_t* a,
+                                        const uint64_t* b) noexcept {
+    assert(st != nullptr);
+    if (NK == 1 && st->dense_gid != nullptr) {
+        const uint64_t idx = a[0] - static_cast<uint64_t>(st->dense_min);
+        if (idx < st->dense_range) {
+            const int32_t dg = st->dense_gid[idx];
+            if (dg >= 0) return dg;
+            const int32_t ng = gb_probe_hash<NK>(st, h, a, b);
+            if (ng >= 0) st->dense_gid[idx] = ng;
+            return ng;
+        }
+    }
+    return gb_probe_hash<NK>(st, h, a, b);
 }
 
 // PASS 1, ring variant (general cardinality): a software pipeline packs +
