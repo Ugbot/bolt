@@ -228,6 +228,36 @@ int main() {
         DoNotOptimize(n);
     });
 
+    // --- 5. BUILD cost (the Q05/Q07/Q09/Q18 tail driver). The probe rows above
+    //     are untimed-build; here we time join_build_typed itself. Each iter uses
+    //     a dedicated arena reset to its first block so allocation is amortized
+    //     out and we measure the kernel's per-row insert cost, not malloc. ---
+    std::printf("  --- build cost (ns per BUILD row) ---\n");
+    bolt::Arena barena{acfg};
+    auto bench_build = [&](const char* name, const bolt::BoltColumn* cols,
+                           uint8_t n_keys) {
+        bolt::JoinBuildTyped jb{};
+        // warmup (also faults in the arena blocks)
+        if (!bolt::join_build_typed(cols, n_keys, kBuild, &barena, &jb)) return;
+        int64_t best = INT64_MAX;
+        for (int it = 0; it < kIters; ++it) {
+            barena.reset();
+            bolt::JoinBuildTyped jbi{};
+            auto t0 = Clock::now();
+            bool ok = bolt::join_build_typed(cols, n_keys, kBuild, &barena, &jbi);
+            auto t1 = Clock::now();
+            DoNotOptimize(ok);
+            int64_t dt = std::chrono::duration_cast<ns>(t1 - t0).count();
+            if (dt < best) best = dt;
+        }
+        std::printf("  %-44s %8.2f ns/row (best %8lld ns)\n", name,
+                    static_cast<double>(best) / static_cast<double>(kBuild),
+                    static_cast<long long>(best));
+    };
+    bench_build("BUILD 1xint64 uniq (OneInt64, chain-1)", &b_uniq, 1);
+    bench_build("BUILD 1xint64 dup  (OneInt64, chain-4)", &b_dup, 1);
+    bench_build("BUILD composite 2-key Int64 (General)", bcols, 2);
+
     std::printf("OK bench_joinkernel\n");
     return 0;
 }
