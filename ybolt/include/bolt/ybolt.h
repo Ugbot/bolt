@@ -25,17 +25,16 @@
 
 #include "bolt/bolt_arena.h"
 
-#include "ycpp/ycpp_arena.h"   // ycpp::Allocator concept
+#include "ycpp/ycpp_arena.h"        // ycpp::Allocator concept
 #include "ycpp/ycpp_byteview.h"
 #include "ycpp/ycpp_delete_set.h"
+#include "ycpp/ycpp_doc.h"          // Doc<A> + encode_diff_v1<A>
+#include "ycpp/ycpp_state_vector.h"
 #include "ycpp/ycpp_status.h"
 #include "ycpp/ycpp_struct_store.h"
-#include "ycpp/ycpp_update.h"  // DecodedUpdate (template; decoder TU in W3)
-// NOTE: ycpp_doc.h is W3-in-progress; once tested it adds:
-//   using Doc        = ::ycpp::Doc<BoltArenaAllocator>;
-//   using StateVector = ::ycpp::StateVector<BoltArenaAllocator>;
-//   using YMap        = ::ycpp::YMap<BoltArenaAllocator>;
-// For now ybolt exposes only the W1+W2 surface — proven solid above.
+#include "ycpp/ycpp_update.h"
+#include "ycpp/ycpp_writer.h"
+#include "ycpp/ycpp_ymap.h"
 
 namespace bolt::ybolt {
 
@@ -92,14 +91,41 @@ static_assert(::ycpp::Allocator<BoltArenaAllocator>,
               "BoltArenaAllocator must satisfy ycpp::Allocator");
 
 // -----------------------------------------------------------------------
-// Type aliases — production W2 surface backed by bolt::Arena.
-// W3 (in flight) adds Doc, YMap, StateVector once their tests are green.
-// `decode_update_v1` lands here once the impl moves to an .inl so non-
-// default-allocator instantiations are visible at the call site.
+// Full production type aliases — every ycpp template instantiated against
+// the bolt-arena-backed allocator. Decoder + encoder bodies live in the
+// ycpp headers, so they monomorphise + inline at every call site here.
 // -----------------------------------------------------------------------
-using DeleteSet    = ::ycpp::DeleteSet<BoltArenaAllocator>;
-using StructStore  = ::ycpp::StructStore<BoltArenaAllocator>;
+using DeleteSet     = ::ycpp::DeleteSet    <BoltArenaAllocator>;
+using StructStore   = ::ycpp::StructStore  <BoltArenaAllocator>;
 using DecodedUpdate = ::ycpp::DecodedUpdate<BoltArenaAllocator>;
+using StateVector   = ::ycpp::StateVector  <BoltArenaAllocator>;
+using YMap          = ::ycpp::YMap         <BoltArenaAllocator>;
+using Doc           = ::ycpp::Doc          <BoltArenaAllocator>;
+
+// -----------------------------------------------------------------------
+// Wire-format helpers — thin wrappers that pin the allocator parameter to
+// BoltArenaAllocator so callers don't have to spell the template each time.
+// -----------------------------------------------------------------------
+[[nodiscard]] inline ::ycpp::Status decode_update_v1(::ycpp::ByteView bytes,
+                                                     DecodedUpdate*   out) noexcept {
+    assert(out != nullptr);
+    return ::ycpp::decode_update_v1<BoltArenaAllocator>(bytes, out);
+}
+
+[[nodiscard]] inline ::ycpp::Status encode_diff_v1(const Doc&         src,
+                                                   const StateVector* since,
+                                                   ::ycpp::Writer*    out) noexcept {
+    assert(out != nullptr);
+    return ::ycpp::encode_diff_v1<BoltArenaAllocator>(src, since, out);
+}
+
+// One-shot Doc construction: bolt::Arena + client_id → Doc. The arena
+// MUST outlive the Doc; gestaltd typically scopes the arena to the
+// session / room lifetime.
+[[nodiscard]] inline Doc make_doc(::bolt::Arena& arena,
+                                  std::uint64_t  client_id) noexcept {
+    return Doc{client_id, BoltArenaAllocator{&arena}};
+}
 
 // -----------------------------------------------------------------------
 // ByteView adapters. Layout is identical, but we expose explicit casts
