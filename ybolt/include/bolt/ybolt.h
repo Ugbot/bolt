@@ -35,7 +35,10 @@
 #include "ycpp/ycpp_state_vector.h"
 #include "ycpp/ycpp_status.h"
 #include "ycpp/ycpp_struct_store.h"
+#include "ycpp/ycpp_subdoc.h"
+#include "ycpp/ycpp_undo.h"
 #include "ycpp/ycpp_update.h"
+#include "ycpp/ycpp_update_v2.h"
 #include "ycpp/ycpp_writer.h"
 #include "ycpp/ycpp_yarray.h"
 #include "ycpp/ycpp_ymap.h"
@@ -100,15 +103,17 @@ static_assert(::ycpp::Allocator<BoltArenaAllocator>,
 // the bolt-arena-backed allocator. Decoder + encoder bodies live in the
 // ycpp headers, so they monomorphise + inline at every call site here.
 // -----------------------------------------------------------------------
-using DeleteSet     = ::ycpp::DeleteSet    <BoltArenaAllocator>;
-using StructStore   = ::ycpp::StructStore  <BoltArenaAllocator>;
-using DecodedUpdate = ::ycpp::DecodedUpdate<BoltArenaAllocator>;
-using StateVector   = ::ycpp::StateVector  <BoltArenaAllocator>;
-using YMap          = ::ycpp::YMap         <BoltArenaAllocator>;
-using YArray        = ::ycpp::YArray       <BoltArenaAllocator>;
-using YText         = ::ycpp::YText        <BoltArenaAllocator>;
-using Doc           = ::ycpp::Doc          <BoltArenaAllocator>;
-using Awareness     = ::ycpp::Awareness    <BoltArenaAllocator>;
+using DeleteSet     = ::ycpp::DeleteSet     <BoltArenaAllocator>;
+using StructStore   = ::ycpp::StructStore   <BoltArenaAllocator>;
+using DecodedUpdate = ::ycpp::DecodedUpdate <BoltArenaAllocator>;
+using StateVector   = ::ycpp::StateVector   <BoltArenaAllocator>;
+using YMap          = ::ycpp::YMap          <BoltArenaAllocator>;
+using YArray        = ::ycpp::YArray        <BoltArenaAllocator>;
+using YText         = ::ycpp::YText         <BoltArenaAllocator>;
+using Doc           = ::ycpp::Doc           <BoltArenaAllocator>;
+using Awareness     = ::ycpp::Awareness     <BoltArenaAllocator>;
+using UndoManager   = ::ycpp::UndoManager   <BoltArenaAllocator>;
+using SubDocRegistry = ::ycpp::SubDocRegistry<BoltArenaAllocator>;
 
 // Re-export the envelope + protocol surface verbatim so consumers can
 // build RPC layers without naming `ycpp::` directly.
