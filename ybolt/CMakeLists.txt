@@ -31,3 +31,11 @@ target_link_libraries(bolt_ybolt INTERFACE
 if(BOLT_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
+
+# Yjs interop CLI — exercises ycpp's algorithm through bolt::Arena.
+# Driven by extern/ycpp/tools/yjs_interop/test.js with `node test.js path/to/ybolt_cli`.
+add_executable(ybolt_cli tools/ybolt_cli.cpp)
+target_link_libraries(ybolt_cli PRIVATE bolt::ybolt)
+if(COMMAND bolt_apply_hardening)
+    bolt_apply_hardening(ybolt_cli)
+endif()

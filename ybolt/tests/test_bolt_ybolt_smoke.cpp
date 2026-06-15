@@ -234,3 +234,71 @@ TEST(YboltDoc, ConcurrentWriteToSameKeyResolvesByLamport) {
         EXPECT_TRUE(d->delete_set().contains(ycpp::Id{1, 0}));
     }
 }
+
+// ---------------------------------------------------------------------
+// Collaborative text editing through bolt::Arena. Y.Text rides on top
+// of Y.Array; the YATA integration converges concurrent appends.
+// ---------------------------------------------------------------------
+
+namespace {
+
+std::string text_dump(const bolt::ybolt::YText& t) {
+    std::string out;
+    t.for_each_chunk([&](ycpp::ByteView b) noexcept {
+        out.append(reinterpret_cast<const char*>(b.data), b.size);
+    });
+    return out;
+}
+
+} // namespace
+
+TEST(YboltText, CollaborativeTextConvergesThroughBoltArena) {
+    bolt::Arena arena_a;
+    bolt::Arena arena_b;
+    Doc alice = make_doc(arena_a, /*client_id=*/1);
+    Doc bob   = make_doc(arena_b, /*client_id=*/2);
+
+    ASSERT_EQ(alice.text_append("doc", "Hello, "), ycpp::Status::kOk);
+    ASSERT_EQ(alice.text_append("doc", "world"),   ycpp::Status::kOk);
+    ASSERT_EQ(bob  .text_append("doc", "!"),       ycpp::Status::kOk);
+
+    ASSERT_EQ(sync_via_bolt(alice, bob),   ycpp::Status::kOk);
+    ASSERT_EQ(sync_via_bolt(bob,   alice), ycpp::Status::kOk);
+
+    const std::string a_text = text_dump(alice.get_or_create_text("doc"));
+    const std::string b_text = text_dump(bob  .get_or_create_text("doc"));
+    EXPECT_EQ(a_text, b_text);
+    EXPECT_NE(a_text.find("Hello, "), std::string::npos);
+    EXPECT_NE(a_text.find("world"),   std::string::npos);
+    EXPECT_NE(a_text.find("!"),       std::string::npos);
+}
+
+// ---------------------------------------------------------------------
+// Awareness through bolt::Arena — peers publish cursor presence,
+// awareness map converges via apply().
+// ---------------------------------------------------------------------
+
+TEST(YboltAwareness, PresenceRoundTripThroughBoltArena) {
+    bolt::Arena                     arena;
+    bolt::ybolt::BoltArenaAllocator a_loc{&arena};
+    bolt::ybolt::Awareness          local{&a_loc};
+
+    ASSERT_EQ(local.publish(1, bolt::ybolt::from_cstr("alice@5:13")),
+              ycpp::Status::kOk);
+    ASSERT_EQ(local.publish(7, bolt::ybolt::from_cstr("bot")),
+              ycpp::Status::kOk);
+
+    std::array<uint8_t, 256> buf{};
+    ycpp::Writer w{buf.data(), buf.size()};
+    ASSERT_EQ(local.encode_all(w), ycpp::Status::kOk);
+
+    bolt::Arena                     arena2;
+    bolt::ybolt::BoltArenaAllocator a_rem{&arena2};
+    bolt::ybolt::Awareness          remote{&a_rem};
+    ASSERT_EQ(remote.apply(ycpp::ByteView{buf.data(), w.pos()}),
+              ycpp::Status::kOk);
+
+    auto* e = remote.get(1);
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(as_sv(e->state), std::string_view{"alice@5:13"});
+}

@@ -26,15 +26,20 @@
 #include "bolt/bolt_arena.h"
 
 #include "ycpp/ycpp_arena.h"        // ycpp::Allocator concept
+#include "ycpp/ycpp_awareness.h"
 #include "ycpp/ycpp_byteview.h"
 #include "ycpp/ycpp_delete_set.h"
 #include "ycpp/ycpp_doc.h"          // Doc<A> + encode_diff_v1<A>
+#include "ycpp/ycpp_envelope.h"
+#include "ycpp/ycpp_protocol.h"
 #include "ycpp/ycpp_state_vector.h"
 #include "ycpp/ycpp_status.h"
 #include "ycpp/ycpp_struct_store.h"
 #include "ycpp/ycpp_update.h"
 #include "ycpp/ycpp_writer.h"
+#include "ycpp/ycpp_yarray.h"
 #include "ycpp/ycpp_ymap.h"
+#include "ycpp/ycpp_ytext.h"
 
 namespace bolt::ybolt {
 
@@ -100,7 +105,18 @@ using StructStore   = ::ycpp::StructStore  <BoltArenaAllocator>;
 using DecodedUpdate = ::ycpp::DecodedUpdate<BoltArenaAllocator>;
 using StateVector   = ::ycpp::StateVector  <BoltArenaAllocator>;
 using YMap          = ::ycpp::YMap         <BoltArenaAllocator>;
+using YArray        = ::ycpp::YArray       <BoltArenaAllocator>;
+using YText         = ::ycpp::YText        <BoltArenaAllocator>;
 using Doc           = ::ycpp::Doc          <BoltArenaAllocator>;
+using Awareness     = ::ycpp::Awareness    <BoltArenaAllocator>;
+
+// Re-export the envelope + protocol surface verbatim so consumers can
+// build RPC layers without naming `ycpp::` directly.
+using ::ycpp::Envelope;
+using ::ycpp::MessageKind;
+using ::ycpp::encode_envelope;
+using ::ycpp::decode_envelope;
+using ::ycpp::emit_sync_update;
 
 // -----------------------------------------------------------------------
 // Wire-format helpers — thin wrappers that pin the allocator parameter to
@@ -125,6 +141,31 @@ using Doc           = ::ycpp::Doc          <BoltArenaAllocator>;
 [[nodiscard]] inline Doc make_doc(::bolt::Arena& arena,
                                   std::uint64_t  client_id) noexcept {
     return Doc{client_id, BoltArenaAllocator{&arena}};
+}
+
+// Pinned wrappers for the sync-protocol emitters: hide the template
+// allocator parameters so call sites stay clean. The `scratch` arena
+// is used only for the SV staging; it never touches the Docs' arenas.
+[[nodiscard]] inline ::ycpp::Status emit_sync_step1(const Doc&     doc,
+                                                     ::bolt::Arena& scratch,
+                                                     std::uint64_t  request_id,
+                                                     ::ycpp::Writer* out) noexcept {
+    BoltArenaAllocator a{&scratch};
+    return ::ycpp::emit_sync_step1<BoltArenaAllocator, BoltArenaAllocator>(
+        doc, a, request_id, out);
+}
+
+[[nodiscard]] inline ::ycpp::Status emit_sync_step2(const Doc&         doc,
+                                                     const StateVector* peer_sv,
+                                                     std::uint64_t      request_id,
+                                                     ::ycpp::Writer*    out) noexcept {
+    return ::ycpp::emit_sync_step2<BoltArenaAllocator>(doc, peer_sv, request_id, out);
+}
+
+[[nodiscard]] inline ::ycpp::Status apply_sync_message(Doc&             dst,
+                                                       const Envelope&  env,
+                                                       StateVector*     peer_sv_out) noexcept {
+    return ::ycpp::apply_sync_message<BoltArenaAllocator>(dst, env, peer_sv_out);
 }
 
 // -----------------------------------------------------------------------
