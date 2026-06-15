@@ -192,6 +192,18 @@ if(BOLT_BUILD_INGEST)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::ybolt — Y CRDT runtime adapter (ycpp + bolt::Arena).
+# Header-only; builds only when ycpp::headers is present. Provides
+# `bolt::ybolt::BoltArenaAllocator` (satisfies ycpp::Allocator), type
+# aliases (DeleteSet / StructStore / DecodedUpdate over the bolt arena),
+# and a `make_doc(arena, client_id)` helper once ycpp W3 ships. The seam
+# is policy-based templates — every alloc inlines through bolt::Arena.
+# ---------------------------------------------------------------------------
+if(TARGET ycpp::headers OR TARGET ycpp::ycpp)
+    add_subdirectory(ybolt)
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(BOLT_BUILD_TESTS)
