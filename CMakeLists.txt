@@ -173,6 +173,45 @@ endif()
 # ---------------------------------------------------------------------------
 option(BOLT_BUILD_INGEST "Build bolt::ingest compiled library" ${BOLT_IS_TOPLEVEL})
 
+# ---------------------------------------------------------------------------
+# Optional codec libraries (lakehouse W1). Each is opt-in via find_package;
+# default ON when found, OFF otherwise. When unavailable the codec .cpp still
+# compiles (stubbed) and tests GTEST_SKIP. BOLT_HAS_* compile defs gate the
+# library include + calls inside the .cpp.
+# ---------------------------------------------------------------------------
+find_package(zstd QUIET)
+if(NOT zstd_FOUND)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ZSTD_PC QUIET libzstd)
+    endif()
+endif()
+if(zstd_FOUND OR ZSTD_PC_FOUND)
+    option(BOLT_WITH_ZSTD "Build bolt codecs with libzstd" ON)
+else()
+    option(BOLT_WITH_ZSTD "Build bolt codecs with libzstd" OFF)
+endif()
+
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    option(BOLT_WITH_ZLIB "Build bolt codecs with zlib" ON)
+else()
+    option(BOLT_WITH_ZLIB "Build bolt codecs with zlib" OFF)
+endif()
+
+find_package(lz4 QUIET)
+if(NOT lz4_FOUND)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LZ4_PC QUIET liblz4)
+    endif()
+endif()
+if(lz4_FOUND OR LZ4_PC_FOUND)
+    option(BOLT_WITH_LZ4 "Build bolt codecs with liblz4" ON)
+else()
+    option(BOLT_WITH_LZ4 "Build bolt codecs with liblz4" OFF)
+endif()
+
 if(BOLT_BUILD_INGEST)
     if(NOT BOLT_BUILD_PARSE)
         message(FATAL_ERROR "BOLT_BUILD_INGEST requires BOLT_BUILD_PARSE=ON")
@@ -181,7 +220,12 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_csv.cpp
         src/ingest/bolt_parquet_meta.cpp
         src/ingest/bolt_parquet_read.cpp
-        src/ingest/bolt_parquet_write.cpp)
+        src/ingest/bolt_parquet_write.cpp
+        src/ingest/bolt_avro.cpp
+        src/ingest/bolt_roaring.cpp
+        src/ingest/bolt_zstd.cpp
+        src/ingest/bolt_gzip.cpp
+        src/ingest/bolt_lz4.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)
     target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse)
     target_include_directories(bolt_ingest PUBLIC
@@ -189,8 +233,69 @@ if(BOLT_BUILD_INGEST)
         $<INSTALL_INTERFACE:include>)
     bolt_apply_hardening(bolt_ingest)
     bolt_apply_simd(bolt_ingest ${BOLT_SIMD_TIER})
+
+    if(BOLT_WITH_ZSTD)
+        target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_ZSTD=1)
+        if(TARGET zstd::libzstd_shared)
+            target_link_libraries(bolt_ingest PRIVATE zstd::libzstd_shared)
+        elseif(TARGET zstd::libzstd_static)
+            target_link_libraries(bolt_ingest PRIVATE zstd::libzstd_static)
+        elseif(TARGET zstd::libzstd)
+            target_link_libraries(bolt_ingest PRIVATE zstd::libzstd)
+        elseif(ZSTD_PC_FOUND)
+            target_include_directories(bolt_ingest PRIVATE ${ZSTD_PC_INCLUDE_DIRS})
+            target_link_libraries(bolt_ingest PRIVATE ${ZSTD_PC_LIBRARIES})
+        endif()
+    endif()
+    if(BOLT_WITH_ZLIB)
+        target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_ZLIB=1)
+        target_link_libraries(bolt_ingest PRIVATE ZLIB::ZLIB)
+    endif()
+    if(BOLT_WITH_LZ4)
+        target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_LZ4=1)
+        if(TARGET lz4::lz4)
+            target_link_libraries(bolt_ingest PRIVATE lz4::lz4)
+        elseif(TARGET LZ4::lz4_shared)
+            target_link_libraries(bolt_ingest PRIVATE LZ4::lz4_shared)
+        elseif(LZ4_PC_FOUND)
+            target_include_directories(bolt_ingest PRIVATE ${LZ4_PC_INCLUDE_DIRS})
+            target_link_libraries(bolt_ingest PRIVATE ${LZ4_PC_LIBRARIES})
+        endif()
+    endif()
+
     target_link_libraries(bolt INTERFACE bolt::ingest)
 endif()
+
+# ---------------------------------------------------------------------------
+# bolt::crypto — compiled static library (lakehouse W1). Self-contained
+# SHA-256 + HMAC-SHA256 + AWS SigV4 signing. Zero external dependency (no
+# OpenSSL) so bolt stays a leaf library.
+# ---------------------------------------------------------------------------
+add_library(bolt_crypto STATIC src/crypto/sigv4.cpp)
+add_library(bolt::crypto ALIAS bolt_crypto)
+target_link_libraries(bolt_crypto PUBLIC bolt::core)
+target_include_directories(bolt_crypto PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_crypto)
+target_link_libraries(bolt INTERFACE bolt::crypto)
+
+# ---------------------------------------------------------------------------
+# bolt::lakehouse — compiled static library (lakehouse W1 foundations):
+# ObjectStore (filesystem + S3-stub) + Catalog (filesystem). Depends on
+# bolt::crypto for SigV4. Delta/Iceberg read/write land in later waves.
+# ---------------------------------------------------------------------------
+add_library(bolt_lakehouse STATIC
+    src/lakehouse/object_store_filesystem.cpp
+    src/lakehouse/object_store_s3.cpp
+    src/lakehouse/catalog_filesystem.cpp)
+add_library(bolt::lakehouse ALIAS bolt_lakehouse)
+target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto)
+target_include_directories(bolt_lakehouse PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_lakehouse)
+target_link_libraries(bolt INTERFACE bolt::lakehouse)
 
 # ---------------------------------------------------------------------------
 # bolt::net — TLS client (OpenSSL 3.x, TLS 1.3 only).
@@ -260,7 +365,7 @@ install(DIRECTORY include/bolt
     FILES_MATCHING PATTERN "*.h"
 )
 
-set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon bolt_net)
+set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon bolt_net bolt_crypto bolt_lakehouse)
 if(BOLT_BUILD_IO)
     list(APPEND _bolt_install_targets bolt_io)
 endif()

@@ -885,3 +885,51 @@ if(WIN32)
 endif()
 bolt_apply_hardening(test_bolt_tls)
 add_test(NAME test_bolt_tls COMMAND test_bolt_tls)
+
+# ---------------------------------------------------------------------------
+# Lakehouse W1 — Avro OCF, Roaring bitmap, codecs (zstd/gzip/lz4), SigV4,
+# ObjectStore + Catalog. (G2CLUS-184)
+# ---------------------------------------------------------------------------
+if(BOLT_BUILD_INGEST)
+    add_executable(test_bolt_avro test_bolt_avro.cpp)
+    target_link_libraries(test_bolt_avro
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_avro)
+    add_test(NAME test_bolt_avro COMMAND test_bolt_avro)
+
+    add_executable(test_bolt_roaring test_bolt_roaring.cpp)
+    target_link_libraries(test_bolt_roaring
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_roaring)
+    add_test(NAME test_bolt_roaring COMMAND test_bolt_roaring)
+
+    add_executable(test_bolt_zstd test_bolt_zstd.cpp)
+    target_link_libraries(test_bolt_zstd
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_zstd)
+    add_test(NAME test_bolt_zstd COMMAND test_bolt_zstd)
+
+    add_executable(test_bolt_gzip test_bolt_gzip.cpp)
+    target_link_libraries(test_bolt_gzip
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_gzip)
+    add_test(NAME test_bolt_gzip COMMAND test_bolt_gzip)
+
+    add_executable(test_bolt_lz4 test_bolt_lz4.cpp)
+    target_link_libraries(test_bolt_lz4
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_lz4)
+    add_test(NAME test_bolt_lz4 COMMAND test_bolt_lz4)
+endif()
+
+add_executable(test_bolt_sigv4 test_bolt_sigv4.cpp)
+target_link_libraries(test_bolt_sigv4
+    PRIVATE bolt::crypto GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_sigv4)
+add_test(NAME test_bolt_sigv4 COMMAND test_bolt_sigv4)
+
+add_executable(test_bolt_lakehouse_catalog test_bolt_lakehouse_catalog.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog)
+add_test(NAME test_bolt_lakehouse_catalog COMMAND test_bolt_lakehouse_catalog)
