@@ -981,3 +981,10 @@ target_link_libraries(test_bolt_lakehouse_catalog_glue_sign
 bolt_apply_hardening(test_bolt_lakehouse_catalog_glue_sign)
 add_test(NAME test_bolt_lakehouse_catalog_glue_sign
          COMMAND test_bolt_lakehouse_catalog_glue_sign)
+
+# W4 — Iceberg read path.
+add_executable(test_bolt_lakehouse_iceberg_read test_bolt_lakehouse_iceberg_read.cpp)
+target_link_libraries(test_bolt_lakehouse_iceberg_read
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_iceberg_read)
+add_test(NAME test_bolt_lakehouse_iceberg_read COMMAND test_bolt_lakehouse_iceberg_read)

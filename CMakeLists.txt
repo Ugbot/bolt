@@ -335,11 +335,22 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/catalog_glue.cpp
     src/lakehouse/catalog_polaris.cpp
     src/lakehouse/catalog_nessie.cpp
-    src/lakehouse/catalog_gravitino.cpp)
+    src/lakehouse/catalog_gravitino.cpp
+    src/lakehouse/iceberg_transform.cpp
+    src/lakehouse/iceberg_metadata.cpp
+    src/lakehouse/iceberg_snapshot.cpp
+    src/lakehouse/iceberg_manifest.cpp
+    src/lakehouse/iceberg_partition.cpp
+    src/lakehouse/iceberg_statistics.cpp
+    src/lakehouse/iceberg_delete_file.cpp
+    src/lakehouse/iceberg_scan.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
 if(TARGET bolt::parse)
     target_link_libraries(bolt_lakehouse PUBLIC bolt::parse)
+endif()
+if(TARGET bolt::ingest)
+    target_link_libraries(bolt_lakehouse PUBLIC bolt::ingest)
 endif()
 target_include_directories(bolt_lakehouse PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
