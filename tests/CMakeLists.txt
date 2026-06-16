@@ -958,3 +958,26 @@ target_link_libraries(test_bolt_lakehouse_prefetch
     PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_prefetch)
 add_test(NAME test_bolt_lakehouse_prefetch COMMAND test_bolt_lakehouse_prefetch)
+add_executable(test_bolt_lakehouse_catalog_iceberg_rest
+    test_bolt_lakehouse_catalog_iceberg_rest.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_iceberg_rest
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_iceberg_rest)
+add_test(NAME test_bolt_lakehouse_catalog_iceberg_rest
+         COMMAND test_bolt_lakehouse_catalog_iceberg_rest)
+
+add_executable(test_bolt_lakehouse_catalog_hive_thrift
+    test_bolt_lakehouse_catalog_hive_thrift.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_hive_thrift
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_hive_thrift)
+add_test(NAME test_bolt_lakehouse_catalog_hive_thrift
+         COMMAND test_bolt_lakehouse_catalog_hive_thrift)
+
+add_executable(test_bolt_lakehouse_catalog_glue_sign
+    test_bolt_lakehouse_catalog_glue_sign.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_glue_sign
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_glue_sign)
+add_test(NAME test_bolt_lakehouse_catalog_glue_sign
+         COMMAND test_bolt_lakehouse_catalog_glue_sign)
