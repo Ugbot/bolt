@@ -285,17 +285,7 @@ target_link_libraries(bolt INTERFACE bolt::crypto)
 # ObjectStore (filesystem + S3-stub) + Catalog (filesystem). Depends on
 # bolt::crypto for SigV4. Delta/Iceberg read/write land in later waves.
 # ---------------------------------------------------------------------------
-add_library(bolt_lakehouse STATIC
-    src/lakehouse/object_store_filesystem.cpp
-    src/lakehouse/object_store_s3.cpp
-    src/lakehouse/catalog_filesystem.cpp)
-add_library(bolt::lakehouse ALIAS bolt_lakehouse)
-target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto)
-target_include_directories(bolt_lakehouse PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-bolt_apply_hardening(bolt_lakehouse)
-target_link_libraries(bolt INTERFACE bolt::lakehouse)
+# Lakehouse declaration moved below bolt::net (it depends on bolt::net for HTTP).
 
 # ---------------------------------------------------------------------------
 # bolt::net — TLS client (OpenSSL 3.x, TLS 1.3 only).
@@ -310,7 +300,7 @@ else()
     option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" OFF)
 endif()
 
-add_library(bolt_net STATIC src/net/bolt_tls.cpp)
+add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp)
 add_library(bolt::net ALIAS bolt_net)
 target_link_libraries(bolt_net PUBLIC bolt::core)
 target_include_directories(bolt_net PUBLIC
@@ -325,6 +315,33 @@ if(WIN32)
     target_link_libraries(bolt_net PUBLIC ws2_32)
 endif()
 target_link_libraries(bolt INTERFACE bolt::net)
+
+# ---------------------------------------------------------------------------
+# bolt::lakehouse (W1 foundations + W6 catalogs). Depends on bolt::net for
+# the HTTP client + TLS used by the Iceberg REST / Unity / Glue / Polaris /
+# Nessie / Gravitino catalogs, and bolt::parse for fionn JSON.
+# ---------------------------------------------------------------------------
+add_library(bolt_lakehouse STATIC
+    src/lakehouse/object_store_filesystem.cpp
+    src/lakehouse/object_store_s3.cpp
+    src/lakehouse/catalog_filesystem.cpp
+    src/lakehouse/catalog_iceberg_rest.cpp
+    src/lakehouse/catalog_hive_metastore.cpp
+    src/lakehouse/catalog_unity.cpp
+    src/lakehouse/catalog_glue.cpp
+    src/lakehouse/catalog_polaris.cpp
+    src/lakehouse/catalog_nessie.cpp
+    src/lakehouse/catalog_gravitino.cpp)
+add_library(bolt::lakehouse ALIAS bolt_lakehouse)
+target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
+if(BOLT_BUILD_PARSE)
+    target_link_libraries(bolt_lakehouse PUBLIC bolt::parse)
+endif()
+target_include_directories(bolt_lakehouse PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_lakehouse)
+target_link_libraries(bolt INTERFACE bolt::lakehouse)
 
 # ---------------------------------------------------------------------------
 # bolt::ybolt — Y CRDT runtime adapter (ycpp + bolt::Arena).
