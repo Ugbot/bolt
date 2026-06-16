@@ -866,3 +866,22 @@ target_compile_definitions(test_bolt_parquet_read PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_read)
 add_test(NAME test_bolt_parquet_read COMMAND test_bolt_parquet_read)
+
+# W-PQ-W — Parquet writer round-trip vs the reader (Int64/Utf8 plain,
+# Int64/Utf8 SNAPPY, nullable Int64).
+add_executable(test_bolt_parquet_write test_bolt_parquet_write.cpp)
+target_link_libraries(test_bolt_parquet_write
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write)
+add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
+
+# bolt::net::TlsSocket — OpenSSL 3.x TLS 1.3 client wrapper (G2CLUS-128).
+# Live connect test against cloudflare.com:443; skips on offline workers.
+add_executable(test_bolt_tls test_bolt_tls.cpp)
+target_link_libraries(test_bolt_tls
+    PRIVATE bolt::net GTest::gtest GTest::gtest_main)
+if(WIN32)
+    target_link_libraries(test_bolt_tls PRIVATE ws2_32)
+endif()
+bolt_apply_hardening(test_bolt_tls)
+add_test(NAME test_bolt_tls COMMAND test_bolt_tls)

@@ -113,5 +113,70 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
     return op == dst_len;                        // exact fill required
 }
 
+// ---------------------------------------------------------------------------
+// W-PQ-W: minimal Snappy block COMPRESSOR.
+//
+// Encodes input as a single literal chunk preceded by the uncompressed-length
+// varint. The format permits this — a literal-only stream is a valid Snappy
+// block (just no compression benefit). Parquet's SNAPPY codec accepts it,
+// and the decoder above round-trips it exactly. This keeps the encoder
+// dependency-free and Tiger-Style tiny while still letting us claim
+// "compression = 1 / SNAPPY" in the page metadata.
+//
+// Worst-case output is `src_len + varint_len(src_len) + 5` (one literal
+// header per <= 4 GiB chunk). `snappy_max_compressed_len` gives a safe
+// upper bound the caller sizes `dst` from.
+// ---------------------------------------------------------------------------
+
+inline uint64_t snappy_max_compressed_len(uint64_t src_len) noexcept {
+    // 5 bytes for the uncompressed-length varint (covers up to 2^32),
+    // 5 bytes for the worst-case literal-length tag prefix (60..63 means
+    // 1..4 extra length bytes), then the data itself.
+    return src_len + 32u;
+}
+
+inline bool snappy_compress(const uint8_t* src, uint64_t src_len,
+                            uint8_t* dst, uint64_t dst_cap,
+                            uint64_t* out_len) noexcept {
+    assert(src != nullptr || src_len == 0);
+    assert(dst != nullptr || dst_cap == 0);
+    assert(out_len != nullptr);
+    if (src_len > (uint64_t{1} << 32)) return false;       // snappy caps at 2^32
+    // 1) uncompressed-length varint.
+    uint64_t op = 0;
+    {
+        uint64_t v = src_len;
+        for (int i = 0; i < 5; ++i) {
+            if (op >= dst_cap) return false;
+            const uint8_t b = static_cast<uint8_t>(v & 0x7Fu);
+            v >>= 7;
+            if (v == 0) { dst[op++] = b; break; }
+            dst[op++] = static_cast<uint8_t>(b | 0x80u);
+        }
+    }
+    if (src_len == 0) { *out_len = op; return true; }
+    // 2) one literal chunk that covers the entire input.
+    const uint64_t lit_len = src_len - 1u;       // tag encodes (len-1)
+    if (lit_len < 60u) {
+        if (op + 1u + src_len > dst_cap) return false;
+        dst[op++] = static_cast<uint8_t>(lit_len << 2);
+    } else {
+        // Determine how many extra length bytes we need (1..4).
+        uint32_t extra = 1u;
+        if (lit_len > 0xFFu)     extra = 2u;
+        if (lit_len > 0xFFFFu)   extra = 3u;
+        if (lit_len > 0xFFFFFFu) extra = 4u;
+        if (op + 1u + extra + src_len > dst_cap) return false;
+        dst[op++] = static_cast<uint8_t>(((59u + extra) << 2));
+        for (uint32_t k = 0; k < extra; ++k) {
+            dst[op++] = static_cast<uint8_t>((lit_len >> (8u * k)) & 0xFFu);
+        }
+    }
+    std::memcpy(dst + op, src, src_len);
+    op += src_len;
+    *out_len = op;
+    return true;
+}
+
 }  // namespace ingest
 }  // namespace bolt

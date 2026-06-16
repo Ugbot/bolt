@@ -180,7 +180,8 @@ if(BOLT_BUILD_INGEST)
     add_library(bolt_ingest STATIC
         src/ingest/bolt_csv.cpp
         src/ingest/bolt_parquet_meta.cpp
-        src/ingest/bolt_parquet_read.cpp)
+        src/ingest/bolt_parquet_read.cpp
+        src/ingest/bolt_parquet_write.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)
     target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse)
     target_include_directories(bolt_ingest PUBLIC
@@ -190,6 +191,35 @@ if(BOLT_BUILD_INGEST)
     bolt_apply_simd(bolt_ingest ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::ingest)
 endif()
+
+# ---------------------------------------------------------------------------
+# bolt::net — TLS client (OpenSSL 3.x, TLS 1.3 only).
+# Static lib so the OpenSSL link lives in one TU; consumers (boltapi,
+# MQTT, S3) link bolt::net to get bolt::net::TlsSocket. Toggle off if
+# OpenSSL is unavailable; the header still compiles via stubs.
+# ---------------------------------------------------------------------------
+find_package(OpenSSL 3.0 QUIET)
+if(OpenSSL_FOUND)
+    option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" ON)
+else()
+    option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" OFF)
+endif()
+
+add_library(bolt_net STATIC src/net/bolt_tls.cpp)
+add_library(bolt::net ALIAS bolt_net)
+target_link_libraries(bolt_net PUBLIC bolt::core)
+target_include_directories(bolt_net PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_net)
+if(BOLT_WITH_TLS AND OpenSSL_FOUND)
+    target_compile_definitions(bolt_net PUBLIC BOLT_WITH_TLS=1)
+    target_link_libraries(bolt_net PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
+if(WIN32)
+    target_link_libraries(bolt_net PUBLIC ws2_32)
+endif()
+target_link_libraries(bolt INTERFACE bolt::net)
 
 # ---------------------------------------------------------------------------
 # bolt::ybolt — Y CRDT runtime adapter (ycpp + bolt::Arena).
@@ -230,7 +260,7 @@ install(DIRECTORY include/bolt
     FILES_MATCHING PATTERN "*.h"
 )
 
-set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon)
+set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon bolt_net)
 if(BOLT_BUILD_IO)
     list(APPEND _bolt_install_targets bolt_io)
 endif()
