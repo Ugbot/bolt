@@ -933,3 +933,28 @@ target_link_libraries(test_bolt_lakehouse_catalog
     PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_catalog)
 add_test(NAME test_bolt_lakehouse_catalog COMMAND test_bolt_lakehouse_catalog)
+
+# W7 — Azure / GCS / prefetch.
+add_executable(test_bolt_lakehouse_azure_sign test_bolt_lakehouse_azure_sign.cpp)
+target_link_libraries(test_bolt_lakehouse_azure_sign
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_azure_sign)
+add_test(NAME test_bolt_lakehouse_azure_sign COMMAND test_bolt_lakehouse_azure_sign)
+
+add_executable(test_bolt_lakehouse_gcs_jwt test_bolt_lakehouse_gcs_jwt.cpp)
+target_link_libraries(test_bolt_lakehouse_gcs_jwt
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+# Test exercises the same OpenSSL EVP path as the lakehouse impl when TLS is on.
+find_package(OpenSSL 3.0 QUIET)
+if(OpenSSL_FOUND)
+    target_compile_definitions(test_bolt_lakehouse_gcs_jwt PRIVATE BOLT_WITH_TLS=1)
+    target_link_libraries(test_bolt_lakehouse_gcs_jwt PRIVATE OpenSSL::Crypto)
+endif()
+bolt_apply_hardening(test_bolt_lakehouse_gcs_jwt)
+add_test(NAME test_bolt_lakehouse_gcs_jwt COMMAND test_bolt_lakehouse_gcs_jwt)
+
+add_executable(test_bolt_lakehouse_prefetch test_bolt_lakehouse_prefetch.cpp)
+target_link_libraries(test_bolt_lakehouse_prefetch
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_prefetch)
+add_test(NAME test_bolt_lakehouse_prefetch COMMAND test_bolt_lakehouse_prefetch)

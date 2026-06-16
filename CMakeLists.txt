@@ -288,6 +288,10 @@ target_link_libraries(bolt INTERFACE bolt::crypto)
 add_library(bolt_lakehouse STATIC
     src/lakehouse/object_store_filesystem.cpp
     src/lakehouse/object_store_s3.cpp
+    src/lakehouse/object_store_azure.cpp
+    src/lakehouse/object_store_gcs.cpp
+    src/lakehouse/object_store_compat.cpp
+    src/lakehouse/object_store_prefetch.cpp
     src/lakehouse/catalog_filesystem.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto)
@@ -295,6 +299,14 @@ target_include_directories(bolt_lakehouse PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 bolt_apply_hardening(bolt_lakehouse)
+# W7: GCS RS256 signing uses OpenSSL EVP. Reuse the same find_package result
+# bolt::net relies on. When OpenSSL is unavailable the RS256 path returns 0
+# at runtime; nothing fails to link.
+find_package(OpenSSL 3.0 QUIET)
+if(OpenSSL_FOUND)
+    target_compile_definitions(bolt_lakehouse PRIVATE BOLT_WITH_TLS=1)
+    target_link_libraries(bolt_lakehouse PRIVATE OpenSSL::Crypto)
+endif()
 target_link_libraries(bolt INTERFACE bolt::lakehouse)
 
 # ---------------------------------------------------------------------------
