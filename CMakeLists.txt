@@ -343,7 +343,15 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_partition.cpp
     src/lakehouse/iceberg_statistics.cpp
     src/lakehouse/iceberg_delete_file.cpp
-    src/lakehouse/iceberg_scan.cpp)
+    src/lakehouse/iceberg_scan.cpp
+    src/lakehouse/delta_log.cpp
+    src/lakehouse/delta_snapshot.cpp
+    src/lakehouse/delta_deletion_vector.cpp
+    src/lakehouse/delta_column_mapping.cpp
+    src/lakehouse/delta_generated_column.cpp
+    src/lakehouse/delta_cdf.cpp
+    src/lakehouse/delta_checkpoint.cpp
+    src/lakehouse/delta_scan.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
 if(TARGET bolt::parse)
