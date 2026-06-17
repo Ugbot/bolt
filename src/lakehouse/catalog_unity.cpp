@@ -25,18 +25,18 @@ namespace {
 
 namespace bj = bolt::parse::json;
 
-struct Impl {
+struct UnityImpl {
     Config       cfg;
     bolt::Arena* arena;
 };
 
-bool add_auth(const Impl* impl, bolt::net::HttpRequest* req) noexcept {
+bool add_auth(const UnityImpl* impl, bolt::net::HttpRequest* req) noexcept {
     char buf[600];
     std::snprintf(buf, sizeof(buf), "Bearer %s", impl->cfg.bearer_token.value);
     return bolt::net::http_request_add_header(req, "Authorization", buf);
 }
 
-int do_req(Impl* impl, bolt::net::HttpRequest* req,
+int do_req(UnityImpl* impl, bolt::net::HttpRequest* req,
            bolt::net::HttpResponse* out) noexcept {
     add_auth(impl, req);
     int rc = bolt::net::http_send(impl->arena, req, out);
@@ -133,7 +133,7 @@ int vt_list_namespaces(void* impl_v, CatalogName* out, uint32_t cap,
                        uint32_t* out_n) noexcept {
     assert(impl_v != nullptr);
     assert(out != nullptr && out_n != nullptr);
-    Impl* impl = static_cast<Impl*>(impl_v);
+    UnityImpl* impl = static_cast<UnityImpl*>(impl_v);
     bolt::net::HttpRequest req;
     std::memset(&req, 0, sizeof(req));
     std::strncpy(req.method, "GET", sizeof(req.method) - 1u);
@@ -152,7 +152,7 @@ int vt_list_tables(void* impl_v, const char* ns, CatalogName* out,
                    uint32_t cap, uint32_t* out_n) noexcept {
     assert(impl_v != nullptr);
     assert(ns != nullptr);
-    Impl* impl = static_cast<Impl*>(impl_v);
+    UnityImpl* impl = static_cast<UnityImpl*>(impl_v);
     // ns is "catalog.schema" — split at the dot.
     char cat[128], sch[128];
     const char* dot = std::strchr(ns, '.');
@@ -198,7 +198,7 @@ int vt_create_table(void* impl_v, const char* ns, const char* name,
     assert(impl_v != nullptr);
     assert(ns != nullptr && name != nullptr);
     (void)layout;
-    Impl* impl = static_cast<Impl*>(impl_v);
+    UnityImpl* impl = static_cast<UnityImpl*>(impl_v);
     char cat[128], sch[128];
     const char* dot = std::strchr(ns, '.');
     if (dot == nullptr) {
@@ -236,7 +236,7 @@ int vt_create_table(void* impl_v, const char* ns, const char* name,
 int vt_drop_table(void* impl_v, const char* ns, const char* name) noexcept {
     assert(impl_v != nullptr);
     assert(ns != nullptr && name != nullptr);
-    Impl* impl = static_cast<Impl*>(impl_v);
+    UnityImpl* impl = static_cast<UnityImpl*>(impl_v);
     char cat[128], sch[128];
     const char* dot = std::strchr(ns, '.');
     if (dot == nullptr) {
@@ -278,7 +278,7 @@ const CatalogVT kVT = {
 bool open(Catalog* out, bolt::Arena* arena, const Config* cfg) noexcept {
     assert(out != nullptr);
     assert(arena != nullptr && cfg != nullptr);
-    Impl* impl = static_cast<Impl*>(arena->allocate(sizeof(Impl), alignof(Impl)));
+    UnityImpl* impl = static_cast<UnityImpl*>(arena->allocate(sizeof(UnityImpl), alignof(UnityImpl)));
     if (impl == nullptr) return false;
     std::memset(impl, 0, sizeof(*impl));
     impl->cfg = *cfg;
