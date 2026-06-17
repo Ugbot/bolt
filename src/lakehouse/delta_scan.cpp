@@ -13,6 +13,7 @@
 #include "bolt/lakehouse/delta/generated_column.h"
 #include "bolt/lakehouse/delta/log.h"
 #include "bolt/lakehouse/delta/snapshot.h"
+#include "delta_write_internal.h"
 
 namespace bolt {
 namespace lakehouse {
@@ -21,21 +22,9 @@ namespace dl = bolt::lakehouse::delta;
 namespace pq = bolt::ingest::parquet;
 
 namespace {
-constexpr uint32_t kMaxFsRootInTable = 1024u;
-constexpr uint32_t kMaxNsName        = 128u;
+constexpr uint32_t kMaxFsRootInTable = delta_writer_detail::kMaxFsRootInTable;
+constexpr uint32_t kMaxNsName        = delta_writer_detail::kMaxNsName;
 }  // namespace
-
-struct TableHandle {
-    Arena*               arena;
-    Catalog*             catalog;
-    char                 namespace_[kMaxNsName];
-    char                 name[kMaxNsName];
-    char                 table_rel[kMaxFsRootInTable];
-    FilesystemObjectStore fs_store;
-    ObjectStore           os;
-    bool                  os_ready;
-    uint8_t               _pad[7];
-};
 
 struct ScanHandle {
     TableHandle*       table;

@@ -344,6 +344,15 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_statistics.cpp
     src/lakehouse/iceberg_delete_file.cpp
     src/lakehouse/iceberg_scan.cpp
+    src/lakehouse/iceberg_writer.cpp
+    src/lakehouse/iceberg_metadata_writer.cpp
+    src/lakehouse/iceberg_manifest_writer.cpp
+    src/lakehouse/iceberg_data_file_writer.cpp
+    src/lakehouse/iceberg_compaction.cpp
+    src/lakehouse/iceberg_expire.cpp
+    src/lakehouse/iceberg_branches_tags.cpp
+    src/lakehouse/iceberg_view.cpp
+    src/lakehouse/iceberg_delete_writer.cpp
     src/lakehouse/delta_log.cpp
     src/lakehouse/delta_snapshot.cpp
     src/lakehouse/delta_deletion_vector.cpp
@@ -351,7 +360,21 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/delta_generated_column.cpp
     src/lakehouse/delta_cdf.cpp
     src/lakehouse/delta_checkpoint.cpp
-    src/lakehouse/delta_scan.cpp)
+    src/lakehouse/delta_scan.cpp
+    src/lakehouse/delta_writer.cpp
+    src/lakehouse/delta_update.cpp
+    src/lakehouse/delta_delete.cpp
+    src/lakehouse/delta_merge.cpp
+    src/lakehouse/delta_restore.cpp
+    src/lakehouse/delta_optimize.cpp
+    src/lakehouse/delta_vacuum.cpp
+    src/lakehouse/delta_checkpoint_write.cpp
+    src/lakehouse/scan_optimizer.cpp
+    src/lakehouse/column_pruning.cpp
+    src/lakehouse/predicate_pushdown.cpp
+    src/lakehouse/dv_inline_filter.cpp
+    src/lakehouse/simd_scan.cpp
+    src/lakehouse/parallel_scan.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
 if(TARGET bolt::parse)

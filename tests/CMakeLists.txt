@@ -958,6 +958,15 @@ target_link_libraries(test_bolt_lakehouse_prefetch
     PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_prefetch)
 add_test(NAME test_bolt_lakehouse_prefetch COMMAND test_bolt_lakehouse_prefetch)
+
+# W8 — scan optimisations (selection vectors, column prune, predicate
+# pushdown, DV inline filter, partition prune, SIMD dispatch, parallel
+# pool lifecycle).
+add_executable(test_bolt_lakehouse_scan_optim test_bolt_lakehouse_scan_optim.cpp)
+target_link_libraries(test_bolt_lakehouse_scan_optim
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_scan_optim)
+add_test(NAME test_bolt_lakehouse_scan_optim COMMAND test_bolt_lakehouse_scan_optim)
 add_executable(test_bolt_lakehouse_catalog_iceberg_rest
     test_bolt_lakehouse_catalog_iceberg_rest.cpp)
 target_link_libraries(test_bolt_lakehouse_catalog_iceberg_rest
@@ -989,9 +998,23 @@ target_link_libraries(test_bolt_lakehouse_iceberg_read
 bolt_apply_hardening(test_bolt_lakehouse_iceberg_read)
 add_test(NAME test_bolt_lakehouse_iceberg_read COMMAND test_bolt_lakehouse_iceberg_read)
 
+# W5 — Iceberg write path.
+add_executable(test_bolt_lakehouse_iceberg_write test_bolt_lakehouse_iceberg_write.cpp)
+target_link_libraries(test_bolt_lakehouse_iceberg_write
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_iceberg_write)
+add_test(NAME test_bolt_lakehouse_iceberg_write COMMAND test_bolt_lakehouse_iceberg_write)
+
 # W2 — Delta read path.
 add_executable(test_bolt_lakehouse_delta_read test_bolt_lakehouse_delta_read.cpp)
 target_link_libraries(test_bolt_lakehouse_delta_read
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_delta_read)
 add_test(NAME test_bolt_lakehouse_delta_read COMMAND test_bolt_lakehouse_delta_read)
+
+# W3 — Delta write path.
+add_executable(test_bolt_lakehouse_delta_write test_bolt_lakehouse_delta_write.cpp)
+target_link_libraries(test_bolt_lakehouse_delta_write
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_delta_write)
+add_test(NAME test_bolt_lakehouse_delta_write COMMAND test_bolt_lakehouse_delta_write)
