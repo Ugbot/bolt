@@ -67,6 +67,17 @@ bool open(Catalog* out, bolt::Arena* arena, const Config* cfg) noexcept;
 // Returns kCatOk / kCatNotImplemented (server lacks /config) / kCatIoError.
 int discover_config(Catalog* cat) noexcept;
 
+// Resolve the current bearer token (refreshing the OAuth2 token if needed) and
+// copy it into out[0..cap). For kAuthBearer it copies the static token; for
+// kAuthOAuth2 it triggers a refresh first. Returns kCatOk / kCatIoError /
+// kCatBadArg. Used by wrapper catalogs (Polaris/Nessie) that need the resolved
+// token to authenticate their native (non-Iceberg) endpoints.
+int resolve_bearer(Catalog* cat, char* out, uint32_t cap) noexcept;
+
+// Expose the catalog's base_url (no trailing slash). Returns nullptr if `cat`
+// is not an iceberg_rest catalog.
+const char* base_url_of(Catalog* cat) noexcept;
+
 // --- Snapshots ---
 struct SnapshotRef {
     int64_t snapshot_id;

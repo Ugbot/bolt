@@ -725,6 +725,31 @@ int discover_config(Catalog* cat) noexcept {
     return kCatOk;
 }
 
+int resolve_bearer(Catalog* cat, char* out, uint32_t cap) noexcept {
+    assert(cat != nullptr && out != nullptr);
+    if (cap == 0u) return kCatBadArg;
+    Impl* impl = impl_of(cat);
+    out[0] = '\0';
+    if (impl->cfg.auth_mode == kAuthOAuth2) {
+        if (!oauth2_refresh(impl)) return kCatIoError;
+        std::strncpy(out, impl->cached_token, cap - 1u);
+        out[cap - 1u] = '\0';
+        return out[0] != '\0' ? kCatOk : kCatIoError;
+    }
+    if (impl->cfg.auth_mode == kAuthBearer) {
+        std::strncpy(out, impl->cfg.bearer_token.value, cap - 1u);
+        out[cap - 1u] = '\0';
+        return kCatOk;
+    }
+    return kCatBadArg;
+}
+
+const char* base_url_of(Catalog* cat) noexcept {
+    assert(cat != nullptr);
+    if (cat->vt != &kVT || cat->impl == nullptr) return nullptr;
+    return static_cast<Impl*>(cat->impl)->cfg.base_url;
+}
+
 uint32_t irc_base64_std(const uint8_t* src, uint32_t n, char* out,
                         uint32_t cap) noexcept {
     return base64_std(src, n, out, cap);

@@ -1008,6 +1008,33 @@ bolt_apply_hardening(test_bolt_lakehouse_catalog_glue_ext)
 add_test(NAME test_bolt_lakehouse_catalog_glue_ext
          COMMAND test_bolt_lakehouse_catalog_glue_ext)
 
+# G2CLUS-180 — Polaris (Iceberg REST reuse + management API).
+add_executable(test_bolt_lakehouse_catalog_polaris
+    test_bolt_lakehouse_catalog_polaris.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_polaris
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_polaris)
+add_test(NAME test_bolt_lakehouse_catalog_polaris
+         COMMAND test_bolt_lakehouse_catalog_polaris)
+
+# G2CLUS-181 — Nessie (Iceberg REST reuse + native v2 tree API).
+add_executable(test_bolt_lakehouse_catalog_nessie
+    test_bolt_lakehouse_catalog_nessie.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_nessie
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_nessie)
+add_test(NAME test_bolt_lakehouse_catalog_nessie
+         COMMAND test_bolt_lakehouse_catalog_nessie)
+
+# G2CLUS-182 — Gravitino (metalake/catalog/schema/table CRUD).
+add_executable(test_bolt_lakehouse_catalog_gravitino
+    test_bolt_lakehouse_catalog_gravitino.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_gravitino
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_gravitino)
+add_test(NAME test_bolt_lakehouse_catalog_gravitino
+         COMMAND test_bolt_lakehouse_catalog_gravitino)
+
 # W4 — Iceberg read path.
 add_executable(test_bolt_lakehouse_iceberg_read test_bolt_lakehouse_iceberg_read.cpp)
 target_link_libraries(test_bolt_lakehouse_iceberg_read

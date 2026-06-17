@@ -343,6 +343,52 @@ bool parse_reply_list_of_string(const uint8_t* b, uint32_t L,
     return true;
 }
 
+// Parse a get_table REPLY: success field fid=0 is a Table STRUCT. Walk it to
+// field 7 (sd: StorageDescriptor STRUCT), then sd field 2 (location: STRING).
+// Copies the location into out[0..cap). Returns false on a malformed reply.
+bool parse_get_table_location(const uint8_t* b, uint32_t L, char* out,
+                              uint32_t cap) noexcept {
+    assert(b != nullptr && out != nullptr && cap > 0u);
+    out[0] = '\0';
+    uint32_t c = 0;
+    if (!tb_parse_reply(b, L, &c)) return false;
+    // Outer args struct: find field 0 (the Table struct).
+    while (true) {
+        uint8_t ft;
+        if (!be_read_u8(b, L, &c, &ft)) return false;
+        if (ft == 0) return true;                 // no success field present
+        int16_t fid;
+        if (!be_read_i16(b, L, &c, &fid)) return false;
+        if (ft == 12 && fid == 0) {
+            // Walk the Table struct fields.
+            while (true) {
+                uint8_t tf;
+                if (!be_read_u8(b, L, &c, &tf)) return false;
+                if (tf == 0) return true;
+                int16_t tfid;
+                if (!be_read_i16(b, L, &c, &tfid)) return false;
+                if (tf == 12 && tfid == 7) {       // sd: StorageDescriptor
+                    while (true) {
+                        uint8_t sf;
+                        if (!be_read_u8(b, L, &c, &sf)) return false;
+                        if (sf == 0) break;
+                        int16_t sfid;
+                        if (!be_read_i16(b, L, &c, &sfid)) return false;
+                        if (sf == 11 && sfid == 2) {  // location: STRING
+                            return hms_decode_string(b, L, &c, out, cap);
+                        }
+                        if (!tb_skip_value(b, L, &c, sf)) return false;
+                    }
+                } else if (!tb_skip_value(b, L, &c, tf)) {
+                    return false;
+                }
+            }
+        } else if (!tb_skip_value(b, L, &c, ft)) {
+            return false;
+        }
+    }
+}
+
 int vt_list_namespaces(void* impl_v, CatalogName* out, uint32_t cap,
                        uint32_t* out_n) noexcept {
     assert(impl_v != nullptr);
@@ -376,13 +422,29 @@ int vt_list_tables(void* impl_v, const char* ns, CatalogName* out,
     return kCatOk;
 }
 
+int hms_get_table_internal(Impl* impl, const char* ns, const char* name,
+                           char* out, uint32_t cap) noexcept {
+    assert(impl != nullptr && ns != nullptr && name != nullptr);
+    assert(out != nullptr && cap > 0u);
+    uint8_t args[2048];
+    uint32_t alen = hms_build_get_table_args(args, sizeof(args), ns, name);
+    if (alen == 0u) return kCatBadArg;
+    uint8_t reply[65536];
+    uint32_t rlen = 0;
+    if (hms_call(impl, "get_table", args, alen, reply, sizeof(reply),
+                 &rlen) != 0) return kCatIoError;
+    uint32_t probe = 0;
+    if (!tb_parse_reply(reply, rlen, &probe)) return kCatNotFound;
+    if (!parse_get_table_location(reply, rlen, out, cap)) return kCatIoError;
+    return kCatOk;
+}
+
 int vt_table_path(void* impl_v, const char* ns, const char* name, char* out,
                   uint32_t cap) noexcept {
     assert(impl_v != nullptr);
     assert(ns != nullptr && name != nullptr && out != nullptr);
-    (void)impl_v; (void)ns; (void)name; (void)out; (void)cap;
-    // TODO(W7+): get_table(db, name) → sd.location.
-    return kCatNotImplemented;
+    Impl* impl = static_cast<Impl*>(impl_v);
+    return hms_get_table_internal(impl, ns, name, out, cap);
 }
 
 int vt_create_table(void* impl_v, const char* ns, const char* name,
@@ -473,6 +535,77 @@ bool hms_encode_struct_stop(uint8_t* buf, uint32_t cap, uint32_t* cursor) noexce
     return be_write_u8(buf, cap, cursor, 0);
 }
 
+bool hms_encode_i32_field(uint8_t* buf, uint32_t cap, uint32_t* cursor,
+                          int16_t fid, int32_t value) noexcept {
+    assert(buf != nullptr && cursor != nullptr);
+    if (!be_write_u8(buf, cap, cursor, 8)) return false;     // I32
+    if (!be_write_i16(buf, cap, cursor, fid)) return false;
+    return be_write_i32(buf, cap, cursor, value);
+}
+
+bool hms_encode_bool_field(uint8_t* buf, uint32_t cap, uint32_t* cursor,
+                           int16_t fid, bool value) noexcept {
+    assert(buf != nullptr && cursor != nullptr);
+    if (!be_write_u8(buf, cap, cursor, 2)) return false;     // BOOL
+    if (!be_write_i16(buf, cap, cursor, fid)) return false;
+    return be_write_u8(buf, cap, cursor, value ? 1u : 0u);
+}
+
+bool hms_encode_string_list_field(uint8_t* buf, uint32_t cap, uint32_t* cursor,
+                                  int16_t fid, const char* const* items,
+                                  uint32_t n) noexcept {
+    assert(buf != nullptr && cursor != nullptr);
+    assert(items != nullptr || n == 0u);
+    if (!be_write_u8(buf, cap, cursor, 15)) return false;    // LIST
+    if (!be_write_i16(buf, cap, cursor, fid)) return false;
+    if (!be_write_u8(buf, cap, cursor, 11)) return false;    // element=STRING
+    if (!be_write_i32(buf, cap, cursor, static_cast<int32_t>(n))) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        assert(items[i] != nullptr);
+        uint32_t L = static_cast<uint32_t>(std::strlen(items[i]));
+        if (!be_write_i32(buf, cap, cursor, static_cast<int32_t>(L))) return false;
+        if (*cursor + L > cap) return false;
+        std::memcpy(buf + *cursor, items[i], L);
+        *cursor += L;
+    }
+    return true;
+}
+
+uint32_t hms_build_get_table_args(uint8_t* buf, uint32_t cap, const char* db,
+                                  const char* table) noexcept {
+    assert(buf != nullptr && db != nullptr && table != nullptr);
+    uint32_t c = 0;
+    if (!hms_encode_string_field(buf, cap, &c, 1, db,
+                                 static_cast<uint32_t>(std::strlen(db))))
+        return 0u;
+    if (!hms_encode_string_field(buf, cap, &c, 2, table,
+                                 static_cast<uint32_t>(std::strlen(table))))
+        return 0u;
+    if (!hms_encode_struct_stop(buf, cap, &c)) return 0u;
+    return c;
+}
+
+uint32_t hms_build_drop_partition_args(uint8_t* buf, uint32_t cap,
+                                       const char* db, const char* table,
+                                       const char* const* values,
+                                       uint32_t n_cols,
+                                       bool delete_data) noexcept {
+    assert(buf != nullptr && db != nullptr && table != nullptr);
+    assert(values != nullptr || n_cols == 0u);
+    uint32_t c = 0;
+    if (!hms_encode_string_field(buf, cap, &c, 1, db,
+                                 static_cast<uint32_t>(std::strlen(db))))
+        return 0u;
+    if (!hms_encode_string_field(buf, cap, &c, 2, table,
+                                 static_cast<uint32_t>(std::strlen(table))))
+        return 0u;
+    if (!hms_encode_string_list_field(buf, cap, &c, 3, values, n_cols))
+        return 0u;
+    if (!hms_encode_bool_field(buf, cap, &c, 4, delete_data)) return 0u;
+    if (!hms_encode_struct_stop(buf, cap, &c)) return 0u;
+    return c;
+}
+
 bool hms_decode_string(const uint8_t* buf, uint32_t len, uint32_t* cursor,
                        char* out, uint32_t cap) noexcept {
     assert(buf != nullptr);
@@ -495,6 +628,126 @@ bool hms_decode_field_header(const uint8_t* buf, uint32_t len, uint32_t* cursor,
     if (!be_read_u8(buf, len, cursor, out_type)) return false;
     if (*out_type == 0) { *out_fid = 0; return true; }
     return be_read_i16(buf, len, cursor, out_fid);
+}
+
+// ===========================================================================
+// High-level surface (G2CLUS-179).
+// ===========================================================================
+
+namespace {
+
+Impl* himpl(Catalog* cat) noexcept {
+    assert(cat != nullptr && cat->vt == &kVT && cat->impl != nullptr);
+    return static_cast<Impl*>(cat->impl);
+}
+
+}  // namespace
+
+int hms_get_table(Catalog* cat, const char* db, const char* table,
+                  char* out_loc, uint32_t cap) noexcept {
+    assert(cat != nullptr && db != nullptr && table != nullptr);
+    assert(out_loc != nullptr && cap > 0u);
+    return hms_get_table_internal(himpl(cat), db, table, out_loc, cap);
+}
+
+int hms_alter_table_location(Catalog* cat, const char* db, const char* table,
+                             const char* new_location) noexcept {
+    assert(cat != nullptr && db != nullptr && table != nullptr);
+    assert(new_location != nullptr);
+    Impl* impl = himpl(cat);
+    // alter_table(dbname, tbl_name, new_tbl). The Table struct carries
+    // tableName=1, dbName=2, sd=7{location=2}. We send a minimal Table with
+    // just the renamed location so HMS rewrites sd.location.
+    uint8_t args[4096];
+    uint32_t c = 0;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 1, db,
+                                 static_cast<uint32_t>(std::strlen(db))))
+        return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 2, table,
+                                 static_cast<uint32_t>(std::strlen(table))))
+        return kCatBadArg;
+    // field 3: new_tbl (Table STRUCT).
+    if (!be_write_u8(args, sizeof(args), &c, 12)) return kCatBadArg;
+    if (!be_write_i16(args, sizeof(args), &c, 3)) return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 1, table,
+                                 static_cast<uint32_t>(std::strlen(table))))
+        return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 2, db,
+                                 static_cast<uint32_t>(std::strlen(db))))
+        return kCatBadArg;
+    // sd (field 7) STRUCT with location (field 2).
+    if (!be_write_u8(args, sizeof(args), &c, 12)) return kCatBadArg;
+    if (!be_write_i16(args, sizeof(args), &c, 7)) return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 2, new_location,
+                                 static_cast<uint32_t>(std::strlen(new_location))))
+        return kCatBadArg;
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // sd
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // new_tbl
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // args
+    uint8_t reply[65536];
+    uint32_t rlen = 0;
+    if (hms_call(impl, "alter_table", args, c, reply, sizeof(reply),
+                 &rlen) != 0) return kCatIoError;
+    uint32_t rc = 0;
+    if (!tb_parse_reply(reply, rlen, &rc)) return kCatIoError;
+    return kCatOk;
+}
+
+int hms_add_partition(Catalog* cat, const char* db, const char* table,
+                      const char* const* values, uint32_t n_cols,
+                      const char* location) noexcept {
+    assert(cat != nullptr && db != nullptr && table != nullptr);
+    assert(values != nullptr || n_cols == 0u);
+    assert(location != nullptr);
+    Impl* impl = himpl(cat);
+    // add_partition(Partition): Partition{values=1 (list<string>), dbName=2,
+    // tableName=3, sd=4{location=2}}.
+    uint8_t args[8192];
+    uint32_t c = 0;
+    if (!be_write_u8(args, sizeof(args), &c, 12)) return kCatBadArg;   // arg=STRUCT
+    if (!be_write_i16(args, sizeof(args), &c, 1)) return kCatBadArg;
+    if (!hms_encode_string_list_field(args, sizeof(args), &c, 1, values, n_cols))
+        return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 2, db,
+                                 static_cast<uint32_t>(std::strlen(db))))
+        return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 3, table,
+                                 static_cast<uint32_t>(std::strlen(table))))
+        return kCatBadArg;
+    if (!be_write_u8(args, sizeof(args), &c, 12)) return kCatBadArg;   // sd=STRUCT
+    if (!be_write_i16(args, sizeof(args), &c, 4)) return kCatBadArg;
+    if (!hms_encode_string_field(args, sizeof(args), &c, 2, location,
+                                 static_cast<uint32_t>(std::strlen(location))))
+        return kCatBadArg;
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // sd
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // Partition
+    if (!hms_encode_struct_stop(args, sizeof(args), &c)) return kCatBadArg;  // args
+    uint8_t reply[65536];
+    uint32_t rlen = 0;
+    if (hms_call(impl, "add_partition", args, c, reply, sizeof(reply),
+                 &rlen) != 0) return kCatIoError;
+    uint32_t rc = 0;
+    if (!tb_parse_reply(reply, rlen, &rc)) return kCatIoError;
+    return kCatOk;
+}
+
+int hms_drop_partition(Catalog* cat, const char* db, const char* table,
+                       const char* const* values, uint32_t n_cols,
+                       bool delete_data) noexcept {
+    assert(cat != nullptr && db != nullptr && table != nullptr);
+    assert(values != nullptr || n_cols == 0u);
+    Impl* impl = himpl(cat);
+    uint8_t args[4096];
+    uint32_t alen = hms_build_drop_partition_args(args, sizeof(args), db, table,
+                                                  values, n_cols, delete_data);
+    if (alen == 0u) return kCatBadArg;
+    uint8_t reply[65536];
+    uint32_t rlen = 0;
+    if (hms_call(impl, "drop_partition", args, alen, reply, sizeof(reply),
+                 &rlen) != 0) return kCatIoError;
+    uint32_t rc = 0;
+    if (!tb_parse_reply(reply, rlen, &rc)) return kCatIoError;
+    return kCatOk;
 }
 
 }  // namespace hive_metastore
