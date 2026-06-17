@@ -332,7 +332,9 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/catalog_iceberg_rest.cpp
     src/lakehouse/catalog_hive_metastore.cpp
     src/lakehouse/catalog_unity.cpp
+    src/lakehouse/catalog_unity_rest.cpp
     src/lakehouse/catalog_glue.cpp
+    src/lakehouse/catalog_glue_ext.cpp
     src/lakehouse/catalog_polaris.cpp
     src/lakehouse/catalog_nessie.cpp
     src/lakehouse/catalog_gravitino.cpp

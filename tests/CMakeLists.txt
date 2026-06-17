@@ -975,6 +975,14 @@ bolt_apply_hardening(test_bolt_lakehouse_catalog_iceberg_rest)
 add_test(NAME test_bolt_lakehouse_catalog_iceberg_rest
          COMMAND test_bolt_lakehouse_catalog_iceberg_rest)
 
+add_executable(test_bolt_lakehouse_catalog_unity
+    test_bolt_lakehouse_catalog_unity.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_unity
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_unity)
+add_test(NAME test_bolt_lakehouse_catalog_unity
+         COMMAND test_bolt_lakehouse_catalog_unity)
+
 add_executable(test_bolt_lakehouse_catalog_hive_thrift
     test_bolt_lakehouse_catalog_hive_thrift.cpp)
 target_link_libraries(test_bolt_lakehouse_catalog_hive_thrift
@@ -990,6 +998,15 @@ target_link_libraries(test_bolt_lakehouse_catalog_glue_sign
 bolt_apply_hardening(test_bolt_lakehouse_catalog_glue_sign)
 add_test(NAME test_bolt_lakehouse_catalog_glue_sign
          COMMAND test_bolt_lakehouse_catalog_glue_sign)
+
+# G2CLUS-178 — extended Glue surface (partitions / schema registry / LF grants).
+add_executable(test_bolt_lakehouse_catalog_glue_ext
+    test_bolt_lakehouse_catalog_glue_ext.cpp)
+target_link_libraries(test_bolt_lakehouse_catalog_glue_ext
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_catalog_glue_ext)
+add_test(NAME test_bolt_lakehouse_catalog_glue_ext
+         COMMAND test_bolt_lakehouse_catalog_glue_ext)
 
 # W4 — Iceberg read path.
 add_executable(test_bolt_lakehouse_iceberg_read test_bolt_lakehouse_iceberg_read.cpp)
