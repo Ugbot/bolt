@@ -268,10 +268,11 @@ endif()
 
 # ---------------------------------------------------------------------------
 # bolt::crypto — compiled static library (lakehouse W1). Self-contained
-# SHA-256 + HMAC-SHA256 + AWS SigV4 signing. Zero external dependency (no
-# OpenSSL) so bolt stays a leaf library.
+# SHA-256 + HMAC-SHA256 + AWS SigV4 signing (zero external dependency), plus
+# the Noise XX handshake + ChaCha20-Poly1305 AEAD (noise.cpp), whose X25519 /
+# AEAD math is OpenSSL 3.x EVP — gated on OpenSSL being found below.
 # ---------------------------------------------------------------------------
-add_library(bolt_crypto STATIC src/crypto/sigv4.cpp)
+add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp)
 add_library(bolt::crypto ALIAS bolt_crypto)
 target_link_libraries(bolt_crypto PUBLIC bolt::core)
 target_include_directories(bolt_crypto PUBLIC
@@ -298,6 +299,14 @@ if(OpenSSL_FOUND)
     option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" ON)
 else()
     option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" OFF)
+endif()
+
+# bolt::crypto's Noise XX (X25519 + ChaCha20-Poly1305) needs OpenSSL EVP.
+# Without it, noise.cpp compiles to explicit-failure stubs (returns false)
+# so the link still succeeds; SigV4 stays dependency-free either way.
+if(BOLT_WITH_TLS AND OpenSSL_FOUND)
+    target_compile_definitions(bolt_crypto PUBLIC BOLT_WITH_TLS=1)
+    target_link_libraries(bolt_crypto PUBLIC OpenSSL::Crypto)
 endif()
 
 add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp)
