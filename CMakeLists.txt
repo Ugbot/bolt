@@ -272,7 +272,8 @@ endif()
 # the Noise XX handshake + ChaCha20-Poly1305 AEAD (noise.cpp), whose X25519 /
 # AEAD math is OpenSSL 3.x EVP — gated on OpenSSL being found below.
 # ---------------------------------------------------------------------------
-add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp)
+add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
+            src/crypto/ed25519.cpp)
 add_library(bolt::crypto ALIAS bolt_crypto)
 target_link_libraries(bolt_crypto PUBLIC bolt::core)
 target_include_directories(bolt_crypto PUBLIC
