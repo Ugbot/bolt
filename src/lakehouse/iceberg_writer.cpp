@@ -24,6 +24,7 @@
 #include "bolt/lakehouse/iceberg/view.h"
 
 #include <cassert>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
