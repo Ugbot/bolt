@@ -1,94 +1,123 @@
-# Bolt — High-Performance Columnar Execution Library
+# Bolt — High-Performance Columnar Execution Core
 
-## What Is This?
+Zero-dependency, header-heavy C++20 execution substrate underneath MarbleDB,
+Chukonu, and BoltAPI. Replaces Apache Arrow on the hot path with HFT-grade
+primitives; Arrow C Data Interface only at egress boundaries.
 
-Bolt is Chukonu's internal columnar execution layer. It replaces Apache Arrow's
-C++ runtime on the hot path with zero-dependency, HFT-grade primitives while
-maintaining Arrow format compatibility at I/O boundaries.
+## Why Not Arrow
 
-Arrow is an excellent specification. Arrow's C++ implementation has performance
-characteristics that are incompatible with low-latency streaming and quant
-workloads: atomic reference counting on every batch transit, mandatory heap
-allocation per buffer, mutex-backed inter-operator queues, and no support for
-in-place mutation or adaptive encoding.
-
-Bolt fixes all of this. It compiles in seconds (not the hours Arrow requires on
-Windows), has zero external dependencies, and enforces strict performance rules:
-no exceptions, no RTTI, no smart pointers, no heap allocation on the hot path.
-
-## Why Not Just Use Arrow?
-
-1. **Build cost.** Arrow C++ on Windows requires ~200GB of toolchain installs
-   (vcpkg, protobuf, gRPC, thrift, boost, etc). Bolt is 7 header files.
+1. **Build cost.** Arrow C++ on Windows requires hundreds of GB of toolchain
+   (vcpkg, protobuf, gRPC, thrift, Boost). Bolt is a collection of headers.
 
 2. **Runtime overhead.** Arrow uses `std::shared_ptr` for every Array, Buffer,
-   and RecordBatch. Each copy/destroy is an atomic increment/decrement.
-   Bolt uses arena allocation + epoch-based lifetime. Measured: 9,600x faster
-   allocation, 25x faster inter-operator transit.
+   and RecordBatch — atomic refcount on every transit. Bolt uses arena
+   allocation + epoch-based lifetime. Measured: **9,600× faster allocation,
+   25× faster inter-operator transit**.
 
-3. **No mutation path.** Arrow buffers are immutable. Modifying a column
-   requires full copy. Bolt uses Venus engine-style double-buffered
-   clone-on-write: first write to a column copies it, all subsequent writes
-   within the epoch are free.
+3. **No mutation path.** Arrow buffers are immutable; modifying a column
+   requires a full copy. Bolt uses Venus tick-tock COW: first write copies,
+   all subsequent writes within the epoch are free.
 
 4. **No adaptive encoding.** Arrow has one physical representation per type.
-   Bolt supports Flat, Constant, Dictionary, Sequence, and View formats.
-   A column detected as constant at scan time (one distinct value) becomes
-   a single-value representation — aggregation is a multiply, not a loop.
+   Bolt supports Flat, Constant, Dictionary, Sequence, and View formats. A
+   constant-valued column becomes a single scalar — aggregation is a multiply,
+   not a loop.
 
-5. **No inline statistics.** Arrow columns carry no min/max, cardinality,
-   or sort order information. Bolt columns carry a 64-byte ColumnStats block
-   that enables zone map skipping, join strategy selection, and micro-adaptive
-   kernel dispatch.
+5. **No inline statistics.** Arrow columns carry no min/max or cardinality.
+   Bolt `ColumnStats` enables zone-map skipping, join-strategy selection, and
+   micro-adaptive kernel dispatch.
 
 ## Arrow Compatibility
 
-Bolt is NOT anti-Arrow. It produces zero-copy Arrow views via the Arrow C Data
-Interface (`ArrowSchema` / `ArrowArray` structs) with no libarrow link. Any
-Arrow consumer (Polars, DuckDB, Pandas, PyArrow) can read Bolt columns directly.
+Bolt is not anti-Arrow. It produces zero-copy Arrow views via the Arrow C Data
+Interface (`ArrowSchema`/`ArrowArray`) with no libarrow link. Any Arrow consumer
+(Polars, DuckDB, Pandas, PyArrow) reads Bolt columns directly. Conversion to the
+full Arrow C++ representation is available at I/O boundaries when libarrow is
+present.
 
-When `BOLT_ENABLE_ARROW_INTEROP` is ON and libarrow is available, full
-`to_arrow()` / `from_arrow()` conversion is provided. This is used at I/O
-boundaries (Parquet read, Flight send, Python bindings) while the internal
-pipeline operates on BoltBatch.
-
-## Architecture
-
-```
-External (Parquet, Flight, Python)
-  ↕  Arrow C Data Interface / IPC (boundary conversion)
-BoltBatch (double-buffered, COW, arena-allocated)
-  ↕  SPSCChannel (lock-free ring buffer, 17ns/op)
-BoltColumn (Flat|Constant|Dict|Seq|View + ColumnStats + sidecars)
-  ↕  Branchless kernels (X-macro type dispatch, SIMD, micro-adaptive)
-Arena (per-thread bump allocator, 3ns/alloc, epoch reset)
-  ↕  TaskRing (SPMC job scheduler, Venus pattern)
-Workers (pinned cores, configurable spin policy)
-```
-
-## File Inventory
-
-```
-include/chukonu/bolt/
-├── bolt_types.h        Type system, schema, StringView, Arrow C Data Interface
-├── bolt_arena.h        Per-thread bump allocator, epoch reset
-├── bolt_channel.h      Lock-free SPSC/MPSC ring buffers
-├── bolt_column.h       Adaptive column + BoltBatch + BitmapIndex
-├── bolt_branchless.h   Branchless kernels, micro-adaptive dispatch, predicated partition
-├── bolt_scheduler.h    Task ring, worker pool, spin policy, phase barriers
-└── README.md           This file
-```
-
-## Performance (Measured)
+## Measured Performance
 
 | Metric | Arrow / malloc | Bolt | Speedup |
 |--------|---------------|------|---------|
-| Buffer allocation (16KB) | 24,982 ns | 2.6 ns | 9,600x |
-| Inter-operator transit | 439 ns (mutex) | 17 ns (SPSC) | 25x |
-| Batch transit (8 operators) | 6.8 ns (shared_ptr) | 1.3 ns (epoch swap) | 5x |
-| Filter (16K rows) | 3,612 ns (materialize) | 0.3 ns (selection vector) | 12,000x |
-| Constant column scan | 1,783 ns (iterate) | 0.7 ns (multiply) | 2,500x |
+| Buffer allocation (16KB) | 24,982 ns | 2.6 ns | 9,600× |
+| Inter-operator transit | 439 ns (mutex) | 17 ns (SPSC) | 25× |
+| Batch transit (8 operators) | 6.8 ns (shared_ptr) | 1.3 ns (epoch swap) | 5× |
+| Filter (16K rows) | 3,612 ns (materialize) | 0.3 ns (selection vector) | 12,000× |
+| Constant column scan | 1,783 ns (iterate) | 0.7 ns (multiply) | 2,500× |
 | COW 64KB column | N/A | 1,941 ns (34 GB/s) | — |
+
+## What's in the Box
+
+Headers live under `include/bolt/`. All are compiled as part of the consumer
+build — there is no separate Bolt compile step.
+
+### Core execution
+
+| Header | What it provides |
+|--------|-----------------|
+| `bolt_types.h` | Type enum, StringView, Schema, Arrow C Data ABI structs |
+| `bolt_arena.h` | Bump allocator (~2.6 ns/alloc), ArenaGuard, `tl_arena` thread-local |
+| `bolt_arena_ring.h` | Ring-of-arenas for multi-generation scratch allocation |
+| `bolt_channel.h` | Lock-free SPSC/MPSC ring buffers, cache-line padded |
+| `bolt_column.h` | BoltColumn (Flat/Constant/Dict/Seq/View), ColumnStats, BoltBatch COW, BitmapIndex |
+| `bolt_branchless.h` | Filter/aggregate/hash/gather kernels, micro-adaptive dispatch, predicated partition |
+| `bolt_scheduler.h` | TaskRing, TaskPool, WorkerConfig, PhaseBarrier |
+| `bolt_swissmap.h` / `bolt_hash.h` | SwissTable, swiss_mix, FNV-1a, wyhash |
+| `bolt_ebr.h` | Epoch-Based Reclamation (lock-free snapshot lifetime) |
+| `bolt_disruptor.h` | LMAX-Disruptor-style bounded ring for cross-thread handoff |
+| `bolt_seqlock.h` | Seqlock for read-heavy shared state |
+| `bolt_ribbon.h` | Ribbon filter (compact Bloom alternative) |
+| `bolt_zonemap.h` | Zone-map (min/max block skip) |
+| `bolt_hot_key_cache.h` | Hot-key row cache (bounded, lock-free) |
+| `bolt_lock_free_clock_lru.h` | Clock-hand approximate LRU |
+| `bolt_port.h` | `BOLT_RESTRICT`, `BOLT_FORCE_INLINE`, `BOLT_PAUSE`, etc. |
+| `bolt_topology.h` | CPU topology, core affinity helpers |
+| `bolt_variant_column.h` | Heterogeneous column variant |
+| `bolt_row_view.h` | Zero-copy row view over a BoltBatch |
+| `bolt_work_stealing_deque.h` | Chase-Lev work-stealing deque |
+
+### Extended libraries
+
+| Directory | What it provides |
+|-----------|-----------------|
+| `ingest/` | Parquet write (`bolt_parquet_write.h`), Parquet read (`bolt_parquet_read.h`), Avro (`bolt_avro.h`), Roaring bitmap (`bolt_roaring.h`), CSV, codecs (gzip/lz4/snappy/zstd) |
+| `lakehouse/` | Delta + Iceberg readers/writers; object stores (local FS, S3, Azure Blob, GCS); parallel scan + scan optimizer; REST catalog fleet: Iceberg REST (full Apache spec — OAuth2/SigV4/pagination/multi-table-commit/views/snapshots/branches-tags/stats/vended-creds), Unity Catalog, AWS Glue, Hive Metastore (Thrift), Polaris, Nessie, Gravitino |
+| `crypto/` | Noise XX (X25519 + ChaCha20-Poly1305), Ed25519 sign/verify/keygen, SigV4 |
+| `net/` | `bolt_tls.h` (OpenSSL TLS socket), `bolt_http_client.h` (outbound HTTP/HTTPS) |
+| `kernels/` | Numeric, string, temporal, hash, sort, join (Swiss/HashJoin/GroupBy), SIMD, fintech (microstructure, volatility, risk, liquidity, cross-asset) |
+| `parse/` | `fionn` JSON parser (`bolt::parse`) — zero-copy, arena-allocated |
+| `wire/` | Bolt wire format for cross-process column transport |
+| `stream/` | Streaming column utilities |
+| `join/` | Build/probe helpers for hash and sort-merge join |
+| `io/` | Async I/O primitives |
+| `doc/` | Document column format |
+| `ybolt/` | ycpp/Yjs CRDT runtime binding using BoltArenaAllocator (`bolt::ybolt`) |
+
+## CMake Integration
+
+Bolt exposes two targets: `bolt::bolt` (the main static library) and
+`bolt::ybolt` (the ycpp Yjs binding — enabled when `extern/ycpp` is present).
+Consumers guard with `if(NOT TARGET bolt::bolt)` so the shared bolt wiring in
+Gestalt2's top-level CMake prevents duplicate definitions.
+
+```cmake
+add_subdirectory(extern/bolt)
+target_link_libraries(your_target PRIVATE bolt::bolt)
+```
+
+## Build
+
+Bolt is built as part of any consumer. To build and test standalone:
+
+```bash
+cmake -S . -B build -DBOLT_BUILD_TESTS=ON -DBOLT_BUILD_BENCHMARKS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Presets: `release`, `debug`, `msvc`, `ninja-msvc`, `clang-cl`.
+GTest is fetched via `FetchContent` if not found — the build is self-contained
+on Windows without vcpkg.
 
 ## Design Rules
 
@@ -96,72 +125,35 @@ Every line of code in `bolt/` follows these rules:
 
 - **No exceptions.** All functions are `noexcept`. OOM returns `nullptr`.
 - **No RTTI.** No `dynamic_cast`, no `typeid`, no virtual functions.
-- **No smart pointers.** Raw pointers. Arena-managed lifetime.
-- **No `std::string`.** Fixed-size `char[64]` field names. `StringView` for data.
+- **No smart pointers.** Raw pointers; arena-managed lifetime.
+- **No `std::string`.** Fixed-size `char[64]` field names; `StringView` for data.
 - **No `std::vector` in hot structs.** Fixed-capacity arrays.
-- **No heap on the hot path.** Arena bump allocation only. malloc only at init.
+- **No heap on the hot path.** Arena bump allocation only; malloc only at init.
 - **Cache-line padded atomics.** All shared state on separate 64-byte lines.
 - **Branchless inner loops.** Predicated execution, CMOV, SIMD masking.
-- **`__restrict__` on all kernel parameters.** Enables auto-vectorization.
+- **`BOLT_RESTRICT` on all kernel parameters.** Enables auto-vectorization.
+- **Compile-time type dispatch via X-macros.** One runtime switch at the boundary;
+  fully specialized template in the inner loop.
 
 ## Research Foundation
 
-Bolt's design draws on published research from CWI Amsterdam (MonetDB/VectorWise),
-MIT CSAIL, and Imperial College London. Key papers:
+- Pirk et al. "Database Cracking: Fancy Scan, Not Poor Man's Sort!" (DaMoN 2014) — predicated branchless partitioning
+- Pirk et al. "CPU and Cache Efficient Management of Memory-Resident DBs" (ICDE 2013) — cache-conscious layouts, prefetch
+- Pirk et al. "Voodoo: A Vector Algebra for Portable DB Performance" (VLDB 2016) — composable vector operation algebra
+- Mohr-Daurat, Sun, Pirk. "BOSS: Database Kernel Composition" (VLDB 2023) — Arrow-compatible kernel exchange, near-zero overhead
+- Pearce, Mohr-Daurat, Pirk. "White-Box Micro-Adaptive Query Processing" (ICDE 2025) — runtime kernel selection on observed selectivity
+- Theodorakis et al. "LightSaber: Window Aggregation on Multi-core" (SIGMOD 2020) — parallel aggregation tree with SIMD sub-chunking
+- Kersten et al. "Compiled and Vectorized Queries" (VLDB 2018) — vectorized vs compiled: <2× difference, vectorized is simpler
 
-- Pirk et al. "Database Cracking: Fancy Scan, Not Poor Man's Sort!" (DaMoN 2014)
-  → Predicated branchless partitioning
-- Pirk et al. "CPU and Cache Efficient Management of Memory-Resident DBs" (ICDE 2013)
-  → Cache-conscious layouts, prefetch strategies
-- Pirk et al. "Voodoo: A Vector Algebra for Portable DB Performance" (VLDB 2016)
-  → Composable vector operation algebra
-- Mohr-Daurat, Sun, Pirk. "BOSS: Database Kernel Composition" (VLDB 2023)
-  → Arrow-compatible kernel exchange with near-zero overhead
-- Pearce, Mohr-Daurat, Pirk. "White-Box Micro-Adaptive Query Processing" (ICDE 2025)
-  → Runtime kernel selection based on observed selectivity
-- Theodorakis et al. "LightSaber: Window Aggregation on Multi-core" (SIGMOD 2020)
-  → Parallel aggregation tree with SIMD sub-chunking
-- Kersten et al. "Compiled and Vectorized Queries" (VLDB 2018)
-  → Vectorized vs compiled: <2x difference, vectorized is simpler
+## Portability
 
-See `docs/research/` (indexed by `docs/research/README.md`) for the full
-technique catalogue, organised one file per topic — Pirk et al., cglm,
-DuckDB/Polars/Seastar scheduler design, CPU topology, AVX-512, 1BRC,
-fionn JSON.
+Builds on Windows (MSVC / clang-cl — never MinGW), macOS, and Linux.
+No vcpkg, no conan, no external dependencies in the core.
+OpenSSL (for `net/` and `crypto/`) is the one accepted external runtime dep.
 
-## Building
+## Related
 
-Bolt is header-only. No separate build step.
-
-```bash
-# Run tests (requires GTest, built as part of Chukonu)
-cd chukonu/build && cmake .. && make test_bolt_primitives && ./test_bolt_primitives
-
-# Run benchmarks
-make bench_bolt && ./bench_bolt
-```
-
-## CMake Integration
-
-Three lines added to `chukonu/CMakeLists.txt`:
-```cmake
-file(GLOB BOLT_TEST_SOURCES "tests/unit/bolt/*.cpp")
-list(APPEND UNIT_TEST_SOURCES ${BOLT_TEST_SOURCES})
-# And in BENCHMARK_SOURCES:
-benchmarks/bench_bolt.cpp
-```
-
-See `src/bolt/CMAKE_PATCH.md` for exact locations.
-
-## Roadmap
-
-| Phase | What | Status |
-|-------|------|--------|
-| 1. Foundation | Arena, Channel, Types, Column, Branchless | **Done** |
-| 2. Kernels | Filter, Hash, Gather, Sort, Cast, String ops | Next |
-| 3. Join | Swiss table, partitioned build/probe, bloom filter | Next |
-| 4. Aggregate | Hash group-by, streaming agg, window PAT | Planned |
-| 5. Pipeline | Source → Transform → Sink with BoltBatch | Planned |
-| 6. IPC | Bolt wire format, Arrow-layout-compatible | Planned |
-| 7. Transport | FasterAPI TCP/TLS integration | Planned |
-| 8. Parquet | Own reader or thin wrapper | Planned |
+- `../marbledb` — HTAP storage engine built on Bolt
+- `../chukonu` — distributed query engine executing Bolt operator graphs
+- `../boltapi` — HTTP/WS/SSE framework using Bolt primitives
+- `docs/` — design notes, research catalogue, decision log
