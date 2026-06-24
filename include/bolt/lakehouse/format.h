@@ -46,7 +46,7 @@ static constexpr uint32_t kLakeMaxProjection = 64u;
 static constexpr uint32_t kLakeMaxPartCols  = 8u;
 static constexpr uint32_t kLakeMaxLiveFiles = 4096u;
 static constexpr uint32_t kLakeMaxRowGroups = 4096u;
-static constexpr uint32_t kLakeMaxCommits   = 65536u;
+static constexpr uint32_t kLakeMaxCommits   = 512u;
 static constexpr uint32_t kLakeMaxExprBytes = 128u;
 
 struct PredicateValue {
