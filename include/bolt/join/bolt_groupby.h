@@ -630,6 +630,15 @@ inline constexpr uint32_t kGbBankGroups = 1024u;
 
 namespace gb_detail {
 
+// True for the IEEE-754 floating column types. Float aggregation accumulates
+// in `double` (the cell's `.a` lane holds the running double's bit pattern),
+// so identity / apply / out_type / finalize all key off this predicate.
+// Float32 is promoted to double at read time (read_cell16) so the whole
+// aggregate path is type-uniform — no separate f32 accumulator.
+BOLT_FORCE_INLINE bool is_float_type(BoltType t) noexcept {
+    return t == BoltType::Float64 || t == BoltType::Float32;
+}
+
 // Read one row of a column into a 16-byte cell. Branch-free per cell type.
 BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept {
     assert(c.data != nullptr);
@@ -654,6 +663,12 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
             break;
         }
         case BoltType::Float64:  std::memcpy(&out.a, &static_cast<const double*>(c.data)[r], 8); break;
+        case BoltType::Float32: {
+            // Promote f32 → double so the accumulate path is type-uniform.
+            const double d = static_cast<double>(static_cast<const float*>(c.data)[r]);
+            std::memcpy(&out.a, &d, 8);
+            break;
+        }
         case BoltType::Utf8:     std::memcpy(&out, &static_cast<const StringView*>(c.data)[r], 16); break;
         default:                 out.a = static_cast<const int64_t*>(c.data)[r]; break;
     }
@@ -754,17 +769,25 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
     // Min/Max identities are the d128 extremes too.
     const bool d = (t == BoltType::Decimal128 || t == BoltType::Decimal64);
     const bool s = (t == BoltType::Utf8);
+    const bool f = is_float_type(t);
+    // Float Min/Max identities are ±infinity stored as double bit patterns in
+    // the `.a` lane (the cell holds a double for float aggregation). Sum/Avg
+    // identity 0.0 == bits {0,0}, shared with the int path below.
+    constexpr int64_t kPosInfBits = static_cast<int64_t>(0x7FF0000000000000ULL);
+    constexpr int64_t kNegInfBits = static_cast<int64_t>(0xFFF0000000000000ULL);
     switch (k) {
         case AggKind::Sum:
         case AggKind::Avg:
         case AggKind::Count:
         case AggKind::CountStar: return GbCell16{0, 0};
         case AggKind::Min:
+            if (f) return GbCell16{kPosInfBits, 0};
             if (s) return GbCell16{static_cast<int64_t>(0xFFFFFFFF0000000CULL),
                                    static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL)};
             return d ? GbCell16{static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL), INT64_MAX}
                      : GbCell16{INT64_MAX, 0};
         case AggKind::Max:
+            if (f) return GbCell16{kNegInfBits, 0};
             if (s) return GbCell16{0, 0};   // empty string — byte-lex min
             return d ? GbCell16{0, INT64_MIN} : GbCell16{INT64_MIN, 0};
     }
@@ -823,6 +846,22 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         std::memcpy(slot, &out, sizeof(out));
         return;
     }
+    if (is_float_type(t)) {
+        // The cell holds a double (read_cell16 promoted f32 → double). Do the
+        // arithmetic in IEEE-754, never on the int64 bit pattern.
+        double s, x;
+        std::memcpy(&s, &slot->a, 8);
+        std::memcpy(&x, &v.a,    8);
+        switch (k) {
+            case AggKind::Sum:
+            case AggKind::Avg: s += x;                  break;
+            case AggKind::Min: s = (x < s) ? x : s;     break;
+            case AggKind::Max: s = (x > s) ? x : s;     break;
+            default: break;
+        }
+        std::memcpy(&slot->a, &s, 8);
+        return;
+    }
     switch (k) {
         case AggKind::Sum:
         case AggKind::Avg: slot->a += v.a; break;
@@ -851,6 +890,9 @@ BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
         return (in == BoltType::Decimal128 || in == BoltType::Decimal64)
                    ? BoltType::Decimal128 : BoltType::Float64;
     }
+    // Float SUM/MIN/MAX stay double (f32 is promoted to double — SUM(real)
+    // and AVG(real) widen to double, matching DuckDB/Polars semantics).
+    if (is_float_type(in)) return BoltType::Float64;
     // W-DEC: SUM(Decimal64) can exceed the int64 mantissa with no plan-time
     // proof at this layer — the accumulator is the widened d128 cell and
     // the output WIDENS to Decimal128 (exact, no overflow ever). MIN/MAX
@@ -1523,9 +1565,14 @@ inline bool groupby_agg_multi_key_typed_finalize(
                         : dec::Decimal128{0, 0};
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
-                    const double d = (cnt > 0)
-                        ? (static_cast<double>(acc.a) / static_cast<double>(cnt))
-                        : 0.0;
+                    // Float AVG: the accumulator holds a double bit pattern;
+                    // int AVG: a true int64 sum. Reinterpret accordingly.
+                    double sum;
+                    if (gb_detail::is_float_type(state->agg_in_types[j]))
+                        std::memcpy(&sum, &acc.a, 8);
+                    else
+                        sum = static_cast<double>(acc.a);
+                    const double d = (cnt > 0) ? (sum / static_cast<double>(cnt)) : 0.0;
                     static_cast<double*>(buf)[r] = d;
                 }
                 continue;
@@ -1536,6 +1583,9 @@ inline bool groupby_agg_multi_key_typed_finalize(
                 std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);
             } else if (ot == BoltType::Date32) {
                 static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(acc.a);
+            } else if (ot == BoltType::Float64) {
+                // acc.a holds the double's bit pattern — copy 8 bytes verbatim.
+                std::memcpy(&static_cast<double*>(buf)[r], &acc.a, 8);
             } else {
                 static_cast<int64_t*>(buf)[r] = acc.a;
             }
@@ -1798,8 +1848,14 @@ inline bool groupby_agg_multi_key_typed(
                         : dec::Decimal128{0, 0};
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
-                    const double d = (cnt > 0) ? (static_cast<double>(acc.a) /
-                                                  static_cast<double>(cnt)) : 0.0;
+                    // Float AVG: accumulator holds a double bit pattern;
+                    // int AVG: a true int64 sum. Reinterpret accordingly.
+                    double sum;
+                    if (gb_detail::is_float_type(agg_in_types[j]))
+                        std::memcpy(&sum, &acc.a, 8);
+                    else
+                        sum = static_cast<double>(acc.a);
+                    const double d = (cnt > 0) ? (sum / static_cast<double>(cnt)) : 0.0;
                     static_cast<double*>(buf)[r] = d;
                 }
                 continue;
@@ -1811,6 +1867,8 @@ inline bool groupby_agg_multi_key_typed(
                 std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);
             } else if (ot == BoltType::Date32) {
                 static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(acc.a);
+            } else if (ot == BoltType::Float64) {
+                std::memcpy(&static_cast<double*>(buf)[r], &acc.a, 8);
             } else {
                 static_cast<int64_t*>(buf)[r] = acc.a;
             }

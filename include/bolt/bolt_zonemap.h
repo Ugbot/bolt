@@ -228,6 +228,53 @@ BOLT_FORCE_INLINE bool zone_can_have_range_f32(const ZoneMap* z,
     return !(lo > mx || hi < mn);
 }
 
+// f64 (double) zones: min/max stored as the full 8 bytes of min_value /
+// max_value (bit-cast), so the zone holds a precise double extent.
+BOLT_FORCE_INLINE double zone_min_f64(const ZoneMap* z) noexcept {
+    assert(z != nullptr);
+    double d;
+    std::memcpy(&d, &z->min_value, sizeof(d));
+    return d;
+}
+
+BOLT_FORCE_INLINE double zone_max_f64(const ZoneMap* z) noexcept {
+    assert(z != nullptr);
+    double d;
+    std::memcpy(&d, &z->max_value, sizeof(d));
+    return d;
+}
+
+// Empty zone map ready for f64 accumulation: min = +inf, max = -inf.
+BOLT_FORCE_INLINE ZoneMap zone_make_empty_f64() noexcept {
+    ZoneMap z;
+    std::memset(&z, 0, sizeof(z));
+    const uint64_t pinf_bits = 0x7FF0000000000000ull;
+    const uint64_t ninf_bits = 0xFFF0000000000000ull;
+    std::memcpy(&z.min_value, &pinf_bits, sizeof(pinf_bits));
+    std::memcpy(&z.max_value, &ninf_bits, sizeof(ninf_bits));
+    uint32_t nb = kZoneNanBits;
+    std::memcpy(&z.mean, &nb, sizeof(nb));
+    std::memcpy(&z.variance, &nb, sizeof(nb));
+    return z;
+}
+
+BOLT_FORCE_INLINE bool zone_can_have_eq_f64(const ZoneMap* z,
+                                             double v) noexcept {
+    assert(z != nullptr);
+    const double mn = zone_min_f64(z);
+    const double mx = zone_max_f64(z);
+    return v >= mn && v <= mx;
+}
+
+BOLT_FORCE_INLINE bool zone_can_have_range_f64(const ZoneMap* z,
+                                                double lo,
+                                                double hi) noexcept {
+    assert(z != nullptr);
+    const double mn = zone_min_f64(z);
+    const double mx = zone_max_f64(z);
+    return !(lo > mx || hi < mn);
+}
+
 // ---------------------------------------------------------------------------
 // Vector-search distance bounds.
 //

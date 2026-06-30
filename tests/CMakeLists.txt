@@ -735,6 +735,16 @@ target_link_libraries(test_bolt_window
 bolt_apply_hardening(test_bolt_window)
 add_test(NAME test_bolt_window COMMAND test_bolt_window)
 
+# Holistic + two-input group-stats kernels — exact MEDIAN / QUANTILE
+# (sort-based, reuses the integer argsort over a sortable-key transform) and
+# single-pass Pearson CORRELATION / COVARIANCE moments. Back chukonu's
+# PhysicalHashAggregate holistic + 2-arg aggregate path.
+add_executable(test_bolt_group_stats test_bolt_group_stats.cpp)
+target_link_libraries(test_bolt_group_stats
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_group_stats)
+add_test(NAME test_bolt_group_stats COMMAND test_bolt_group_stats)
+
 # Decimal128 kernel family (add/sub/mul/div, filter_{gt,lt,eq,ne,ge,le},
 # sum/min/max). Backs SQL Decimal monetary columns (l_extendedprice,
 # o_totalprice, p_retailprice). Branchless scalar with cross-checks

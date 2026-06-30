@@ -511,4 +511,122 @@ TEST(BoltGroupbyTyped, Utf8AggIdentityIsValidInlineStringView) {
     EXPECT_EQ(out.inline_data[0], 'e');
 }
 
+// ---------------------------------------------------------------------------
+// Float64 aggregation. Before the fix, SUM/AVG/MIN/MAX over a Float64 payload
+// accumulated the IEEE-754 bit pattern as int64 (apply()/finalize had no float
+// arm) → garbage (~-1.5e17). These pin the corrected double-arithmetic path.
+// ---------------------------------------------------------------------------
+TEST(BoltGroupbyTyped, Float64SumAvgMinMax) {
+    Arena a;
+    int64_t ks[] = {1, 1, 1, 2, 2};
+    double  vs[] = {1.5, 2.5, 3.0, 10.25, 100.75};   // g1: {1.5,2.5,3.0} g2:{10.25,100.75}
+    BoltColumn key = BoltColumn::make_flat(ks, nullptr, 5, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 5, BoltType::Float64);
+    AggSpec specs[4];
+    specs[0] = make_spec(AggKind::Sum, 0);
+    specs[1] = make_spec(AggKind::Avg, 0);
+    specs[2] = make_spec(AggKind::Min, 0);
+    specs[3] = make_spec(AggKind::Max, 0);
+    BoltColumn ok[1], oa[4];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 4, 5,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    EXPECT_EQ(ng, 2u);
+    // SUM/MIN/MAX preserve Float64; AVG is Float64.
+    for (int j = 0; j < 4; ++j) EXPECT_EQ(oa[j].type, BoltType::Float64);
+    int64_t* outk = static_cast<int64_t*>(ok[0].data);
+    double*  sums = static_cast<double*>(oa[0].data);
+    double*  avgs = static_cast<double*>(oa[1].data);
+    double*  mins = static_cast<double*>(oa[2].data);
+    double*  maxs = static_cast<double*>(oa[3].data);
+    for (uint32_t i = 0; i < ng; ++i) {
+        if (outk[i] == 1) {
+            EXPECT_DOUBLE_EQ(sums[i], 7.0);
+            EXPECT_DOUBLE_EQ(avgs[i], 7.0 / 3.0);
+            EXPECT_DOUBLE_EQ(mins[i], 1.5);
+            EXPECT_DOUBLE_EQ(maxs[i], 3.0);
+        }
+        if (outk[i] == 2) {
+            EXPECT_DOUBLE_EQ(sums[i], 111.0);
+            EXPECT_DOUBLE_EQ(avgs[i], 55.5);
+            EXPECT_DOUBLE_EQ(mins[i], 10.25);
+            EXPECT_DOUBLE_EQ(maxs[i], 100.75);
+        }
+    }
+}
+
+// Negative floats: MIN/MAX must use IEEE compare, not int64 bit compare (a
+// negative double's sign bit makes it the int64-largest pattern).
+TEST(BoltGroupbyTyped, Float64NegativesMinMax) {
+    Arena a;
+    int64_t ks[] = {1, 1, 1};
+    double  vs[] = {-2.0, -10.0, 5.0};
+    BoltColumn key = BoltColumn::make_flat(ks, nullptr, 3, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 3, BoltType::Float64);
+    AggSpec specs[2] = { make_spec(AggKind::Min, 0), make_spec(AggKind::Max, 0) };
+    BoltColumn ok[1], oa[2];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 2, 3,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    EXPECT_EQ(ng, 1u);
+    EXPECT_DOUBLE_EQ(static_cast<double*>(oa[0].data)[0], -10.0);
+    EXPECT_DOUBLE_EQ(static_cast<double*>(oa[1].data)[0], 5.0);
+}
+
+// Large-N single-group SUM/AVG exercises the two-pass columnar path (gid
+// materialisation + gb_p2_generic → apply) rather than the per-row fallback.
+TEST(BoltGroupbyTyped, Float64LargeNTwoPassSum) {
+    Arena a;
+    constexpr int64_t N = 4096;
+    int64_t* ks = a.allocate_array<int64_t>(N);
+    double*  vs = a.allocate_array<double>(N);
+    ASSERT_NE(ks, nullptr);
+    ASSERT_NE(vs, nullptr);
+    double expect = 0.0;
+    for (int64_t i = 0; i < N; ++i) { ks[i] = 1; vs[i] = 0.25 * static_cast<double>(i); expect += vs[i]; }
+    BoltColumn key = BoltColumn::make_flat(ks, nullptr, N, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, N, BoltType::Float64);
+    AggSpec specs[2] = { make_spec(AggKind::Sum, 0), make_spec(AggKind::Avg, 0) };
+    BoltColumn ok[1], oa[2];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 2, N,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    EXPECT_EQ(ng, 1u);
+    EXPECT_DOUBLE_EQ(static_cast<double*>(oa[0].data)[0], expect);
+    EXPECT_DOUBLE_EQ(static_cast<double*>(oa[1].data)[0], expect / static_cast<double>(N));
+}
+
+// Cross-morsel partial merge over Float64 — exercises gb_merge_combine's
+// apply() add arm on float partial cells.
+TEST(BoltGroupbyTypedXMorsel, Float64TwoMorselsSumMerge) {
+    bolt::Arena a;
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(static_cast<double*>(nullptr), nullptr, 0, bolt::BoltType::Float64);
+    bolt::AggSpec spec{}; spec.kind = bolt::AggKind::Sum; spec.in_col = 0; spec.distinct = 0;
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 4));
+    int64_t ks1[] = {1, 2};
+    double  v1[]  = {1.5, 10.0};
+    int64_t ks2[] = {1, 2};
+    double  v2[]  = {2.5, 20.0};
+    bolt::BoltColumn k1 = bolt::BoltColumn::make_flat(ks1, nullptr, 2, bolt::BoltType::Int64);
+    bolt::BoltColumn V1 = bolt::BoltColumn::make_flat(v1, nullptr, 2, bolt::BoltType::Float64);
+    bolt::BoltColumn k2 = bolt::BoltColumn::make_flat(ks2, nullptr, 2, bolt::BoltType::Int64);
+    bolt::BoltColumn V2 = bolt::BoltColumn::make_flat(v2, nullptr, 2, bolt::BoltType::Float64);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k1, &V1, nullptr, 0, 2);
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &k2, &V2, nullptr, 0, 2);
+    ASSERT_FALSE(st.oom);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    EXPECT_EQ(ng, 2u);
+    int64_t* okp = static_cast<int64_t*>(ok[0].data);
+    double*  oap = static_cast<double*>(oa[0].data);
+    for (uint32_t i = 0; i < ng; ++i) {
+        if (okp[i] == 1) EXPECT_DOUBLE_EQ(oap[i], 4.0);
+        if (okp[i] == 2) EXPECT_DOUBLE_EQ(oap[i], 30.0);
+    }
+}
+
 }  // namespace

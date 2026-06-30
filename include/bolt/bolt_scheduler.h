@@ -477,6 +477,19 @@ struct Scheduler {
         return worker_arenas[worker_id];
     }
 
+    /// Reset (bump-pointer rewind, not free) every worker arena for reuse.
+    /// MUST be called only when NO tasks are in flight — it does not
+    /// synchronize. A long-lived warm pool otherwise only reclaims per-task
+    /// worker-arena allocations at shutdown(); a borrowing operator that
+    /// allocates output from tl_arena would grow memory per call. Callers that
+    /// reset between work units (e.g. per query, between scheduler-free points)
+    /// keep worker-arena usage bounded. (G2FEAT-146)
+    void reset_worker_arenas() noexcept {
+        for (uint32_t i = 0; i < num_workers; ++i) {
+            if (worker_arenas[i] != nullptr) worker_arenas[i]->reset();
+        }
+    }
+
     uint32_t thread_count() const noexcept { return num_workers; }
 
     uint32_t worker_cpu (uint32_t worker_id) const noexcept {
