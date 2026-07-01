@@ -34,7 +34,11 @@
 #include "bolt/join/bolt_groupby.h"
 #include "bolt/kernels/bolt_argsort.h"
 #include "bolt/kernels/bolt_argsort_parallel.h"
+#include "bolt/kernels/bolt_radixsort.h"
+#include "bolt/kernels/bolt_radixsort_parallel.h"
 #include "bolt/kernels/window_agg.h"
+
+#include <limits>
 
 #include <gtest/gtest.h>
 
@@ -253,6 +257,85 @@ TEST(BoltPerfGate, ArgsortParallelVsSerialNsPerElem) {
 
     EXPECT_LT(ns_serial, 400.0);  // baseline ~165 ns/elem
     EXPECT_LT(ns_par, 180.0);     // baseline ~59 ns/elem (serial fallback w/ 1 worker)
+}
+
+// ---------------------------------------------------------------------------
+// Gate 4 — radix argsort (G2FEAT-153/157): serial single-int64 LSD radix and
+// the parallel multi-key MSD radix. The serial radix is O(n) (linear passes),
+// so any regression to a comparison sort or a degenerate scatter blows past a
+// generous ns/row ceiling. The parallel radix is fed a FULL-RANGE int64 primary
+// (high top-byte entropy) so it PROCEEDS (a narrow primary self-declines to the
+// merge — gated in the kernel); a serialised parallel radix or the wrong-slice
+// histogram bug the unit test caught would trip the ceiling.
+//
+// Byte-identical correctness is owned by test_bolt_radixsort_parallel; this gate
+// only guards ns/row + that the high-entropy input proceeds.
+// ---------------------------------------------------------------------------
+TEST(BoltPerfGate, RadixArgsortNsPerRow) {
+    using namespace bolt::kernels;
+    constexpr std::int64_t kN = 1'000'000;
+
+    std::vector<std::int64_t> k0(kN), k1(kN), knar(kN);
+    std::mt19937_64 rng(0x4AD1);
+    std::uniform_int_distribution<std::int64_t> full(std::numeric_limits<std::int64_t>::min(),
+                                                     std::numeric_limits<std::int64_t>::max());
+    std::uniform_int_distribution<std::int64_t> small(0, 64);
+    std::uniform_int_distribution<std::int64_t> narrow(0, (1LL << 24));  // ~3 byte-passes
+    for (std::int64_t i = 0; i < kN; ++i) { k0[i] = full(rng); k1[i] = small(rng); knar[i] = narrow(rng); }
+
+    // Serial single-int64 indirect radix — gated on NARROW keys: that is its real
+    // use (the multi-key path routes serial only below the parallel floor, and
+    // narrow keys skip most passes). Full-range indirect radix is random-scatter
+    // bound and too flappy under memory load to gate on.
+    std::vector<std::int32_t> perm(kN), pscr(kN);
+    std::vector<std::int64_t> kscr(kN);
+    double best_serial = 1e30;
+    for (int rep = 0; rep < kReps; ++rep) {
+        auto t0 = Clock::now();
+        radix_sort_indirect_i64(perm.data(), knar.data(), pscr.data(), kscr.data(), kN);
+        auto t1 = Clock::now();
+        best_serial = std::min(best_serial,
+            std::chrono::duration<double, std::nano>(t1 - t0).count());
+        g_sink_u = static_cast<std::uint32_t>(perm[kN - 1]);
+    }
+
+    // Parallel multi-key MSD radix (full-range primary → proceeds).
+    std::vector<std::uint64_t> b0(kN), b1(kN);
+    radix_fill_biased_i64(b0.data(), k0.data(), kN, /*ascending=*/true);
+    radix_fill_biased_i64(b1.data(), k1.data(), kN, /*ascending=*/true);
+    const std::uint64_t* keyp[2] = {b0.data(), b1.data()};
+    std::vector<std::uint32_t> up(kN), us(kN);
+    bolt::Scheduler sched;
+    ASSERT_TRUE(sched.init(0));  // 0 -> hardware concurrency
+    bolt::Arena arena;
+    double best_par = 1e30;
+    bool proceeded = false;
+    for (int rep = 0; rep < kReps; ++rep) {
+        arena.reset();
+        auto t0 = Clock::now();
+        proceeded = parallel_radix_argsort_multikey_u64(
+            up.data(), us.data(), keyp, 2, kN, &sched, &arena);
+        auto t1 = Clock::now();
+        best_par = std::min(best_par,
+            std::chrono::duration<double, std::nano>(t1 - t0).count());
+        g_sink_u = up[kN - 1];
+    }
+    sched.shutdown();
+    ASSERT_TRUE(proceeded) << "full-range primary should proceed (not decline)";
+
+    const double ns_serial = ns_of(best_serial, kN);
+    const double ns_par = ns_of(best_par, kN);
+    std::printf("[perf-gate radix N=%lld] serial-1key=%.3f ns/row  parallel-2key=%.3f ns/row\n",
+                static_cast<long long>(kN), ns_serial, ns_par);
+    std::fflush(stdout);
+
+    // Baselines (MSVC Release, 16 workers, N=1e6): serial indirect radix on NARROW
+    // keys ~40-70 ns/row (~3 byte-passes); parallel MSD radix on FULL-RANGE keys
+    // ~16-25 ns/row (~3x the parallel merge's ~60 on the same data). Generous
+    // ceilings absorb thermal/machine noise but trip a real regression (a
+    // serialised parallel radix, or a scatter gone quadratic).
+    EXPECT_LT(ns_serial, 200.0);
+    EXPECT_LT(ns_par, 80.0);
 }
 
 }  // namespace
