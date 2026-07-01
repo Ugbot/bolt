@@ -467,6 +467,172 @@ inline bool jk_build_scatter_and_alloc(const BoltColumn* key_cols,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// W-PAR inc 3 — PARALLEL Phase 1 (task bodies + serial glue; the caller owns
+// the scheduler orchestration, exactly like jk_build_partition_range):
+//
+//   prepare (calling thread)  : meta capture + EVERY allocation (arena).
+//   pass A  (task, per chunk) : key cells + chain init for rows [b,e), stash
+//                               each non-null row's partition hash, fill a
+//                               PRIVATE per-chunk histogram.
+//   glue    (calling thread)  : bloom fold over the stashed hashes, column-
+//                               major prefix sum -> scat->offsets + per-
+//                               (chunk,partition) scatter bases, SwissTable
+//                               creates sized to the counts.
+//   pass B  (task, per chunk) : scatter row ids into the chunk's reserved
+//                               bases (local cursors — zero synchronisation).
+//
+// Result is byte-identical to jk_build_scatter_and_alloc: chunks ascend in
+// row order and each partition's slices are reserved in chunk order, so
+// row_ids stay in ascending row order within every partition (the chain-
+// order contract Phase 2 depends on); the bloom receives the same SET of
+// adds (SBBF add is an idempotent OR — order-free). Null-key rows are
+// re-checked per pass (the serial code paid the same check per pass);
+// hashes[] is only ever read for non-null rows.
+
+constexpr uint32_t kJkP1MaxChunks    = 64;     // hists/bases bound
+constexpr uint64_t kJkP1MinChunkRows = 65536;  // below this, chunking can't pay
+
+struct JkPhase1Ctx {
+    const BoltColumn*    key_cols;
+    JoinBuildTyped*      out;
+    JoinBuildScatterCtx* scat;
+    uint64_t*            hashes;   // [rows] partition hash per non-null row
+    uint32_t*            hists;    // [n_chunks][kHJNumPartitions] private
+    uint32_t*            bases;    // [n_chunks][kHJNumPartitions] scatter bases
+    uint64_t             rows;
+    uint64_t             chunk_rows;
+    uint32_t             n_chunks;
+    uint8_t              n_keys;
+    uint8_t              one_int;
+    uint8_t              _pad[2];
+};
+
+inline bool jk_build_phase1_prepare(const BoltColumn* key_cols, uint8_t n_keys,
+        uint64_t build_rows, uint32_t max_chunks, Arena* arena,
+        JoinBuildTyped* out, JoinBuildScatterCtx* scat,
+        JkPhase1Ctx* c) noexcept {
+    assert(arena != nullptr && out != nullptr && scat != nullptr);
+    assert(c != nullptr && n_keys >= 1 && n_keys <= kHJMaxKeys);
+    const uint64_t n = build_rows;
+    if (n < kJkP1MinChunkRows * 2u) return false;      // not worth chunking
+    const size_t n_alloc = static_cast<size_t>(n);
+    out->build_rows = n;
+    out->n_keys     = n_keys;
+    jk_capture_key_meta(key_cols, n_keys, out);
+    out->chain_nodes = arena->allocate_array<HashJoinChainNode>(n_alloc);
+    out->keys_flat   = arena->allocate_array<GbCell16>(n_alloc * n_keys);
+    out->matched     = static_cast<uint8_t*>(arena->allocate(n_alloc, 1));
+    scat->row_ids    = arena->allocate_array<int32_t>(n_alloc);
+    c->hashes        = arena->allocate_array<uint64_t>(n_alloc);
+    if (out->chain_nodes == nullptr || out->keys_flat == nullptr ||
+        out->matched == nullptr || scat->row_ids == nullptr ||
+        c->hashes == nullptr) {
+        return false;
+    }
+    std::memset(out->matched, 0, n_alloc);
+    out->has_bloom = sbbf_create(&out->bloom,
+                                 static_cast<int64_t>(n_alloc), arena) ? 1 : 0;
+    uint32_t nc = (max_chunks > kJkP1MaxChunks) ? kJkP1MaxChunks : max_chunks;
+    if (nc < 1u) nc = 1u;
+    uint64_t chunk = (n + nc - 1u) / nc;
+    if (chunk < kJkP1MinChunkRows) chunk = kJkP1MinChunkRows;
+    c->n_chunks   = static_cast<uint32_t>((n + chunk - 1u) / chunk);
+    c->chunk_rows = chunk;
+    assert(c->n_chunks >= 1 && c->n_chunks <= kJkP1MaxChunks);
+    const size_t hb = static_cast<size_t>(c->n_chunks) * kHJNumPartitions;
+    c->hists = arena->allocate_array<uint32_t>(hb);
+    c->bases = arena->allocate_array<uint32_t>(hb);
+    if (c->hists == nullptr || c->bases == nullptr) return false;
+    std::memset(c->hists, 0, hb * sizeof(uint32_t));
+    c->key_cols = key_cols;
+    c->out      = out;
+    c->scat     = scat;
+    c->rows     = n;
+    c->n_keys   = n_keys;
+    c->one_int  = (out->key_shape ==
+                   static_cast<uint8_t>(JoinKeyShape::OneInt64)) ? 1u : 0u;
+    return true;
+}
+
+// Pass A task body — rows [chunk*chunk_rows, ...): disjoint writes only.
+inline void jk_build_pass_a(const JkPhase1Ctx* c, uint32_t chunk) noexcept {
+    assert(c != nullptr && chunk < c->n_chunks);
+    const uint64_t b = static_cast<uint64_t>(chunk) * c->chunk_rows;
+    uint64_t e = b + c->chunk_rows;
+    if (e > c->rows) e = c->rows;
+    assert(b < e);
+    JoinBuildTyped* out = c->out;
+    uint32_t* BOLT_RESTRICT hist =
+        c->hists + static_cast<size_t>(chunk) * kHJNumPartitions;
+    const bool one_int = (c->one_int != 0);
+    for (uint64_t i = b; i < e; ++i) {
+        const int64_t  r    = static_cast<int64_t>(i);
+        const uint32_t slot = static_cast<uint32_t>(i);
+        GbCell16* krow = out->keys_flat + static_cast<size_t>(slot) * c->n_keys;
+        for (uint8_t k = 0; k < c->n_keys; ++k) {
+            krow[k] = jk_detail::read_cell16_canon(c->key_cols[k], r);
+        }
+        out->chain_nodes[slot].build_idx = slot;
+        out->chain_nodes[slot].next      = kJoinNullIndex;
+        if (join_row_has_null(c->key_cols, c->n_keys, r)) continue;
+        const uint64_t tkey = one_int
+            ? jk_read_int64_key(c->key_cols[0], r)
+            : jk_detail::hash_keys_typed(c->key_cols, c->n_keys, r);
+        const uint64_t h = one_int ? swiss_mix(tkey) : tkey;
+        c->hashes[i] = h;
+        hist[hj_partition_of(h)]++;
+    }
+}
+
+// Serial glue — bloom fold + column-major prefix sums + table creates.
+// Returns false on SwissTable OOM (caller falls back to the serial build).
+inline bool jk_build_phase1_glue(JkPhase1Ctx* c, Arena* arena) noexcept {
+    assert(c != nullptr && arena != nullptr);
+    assert(c->n_chunks >= 1);
+    JoinBuildTyped* out = c->out;
+    if (out->has_bloom != 0) {
+        for (uint64_t i = 0; i < c->rows; ++i) {
+            if (join_row_has_null(c->key_cols, c->n_keys,
+                                  static_cast<int64_t>(i))) continue;
+            sbbf_add(out->bloom, c->hashes[i]);
+        }
+    }
+    uint32_t acc = 0;
+    for (uint32_t p = 0; p < kHJNumPartitions; ++p) {
+        c->scat->offsets[p] = acc;
+        for (uint32_t k = 0; k < c->n_chunks; ++k) {
+            const size_t at = static_cast<size_t>(k) * kHJNumPartitions + p;
+            c->bases[at] = acc;
+            acc += c->hists[at];
+        }
+        const uint32_t count = acc - c->scat->offsets[p];
+        const uint64_t hint  = (count == 0u) ? 1u : count;
+        if (!SwissTable::create(&out->partitions[p], hint, arena)) return false;
+    }
+    c->scat->offsets[kHJNumPartitions] = acc;
+    return true;
+}
+
+// Pass B task body — scatter this chunk's non-null rows into its reserved
+// per-partition slices (local cursors; slices are disjoint across chunks).
+inline void jk_build_pass_b(const JkPhase1Ctx* c, uint32_t chunk) noexcept {
+    assert(c != nullptr && chunk < c->n_chunks);
+    const uint64_t b = static_cast<uint64_t>(chunk) * c->chunk_rows;
+    uint64_t e = b + c->chunk_rows;
+    if (e > c->rows) e = c->rows;
+    assert(b < e);
+    uint32_t cur[kHJNumPartitions];
+    std::memcpy(cur, c->bases + static_cast<size_t>(chunk) * kHJNumPartitions,
+                sizeof(cur));
+    for (uint64_t i = b; i < e; ++i) {
+        if (join_row_has_null(c->key_cols, c->n_keys,
+                              static_cast<int64_t>(i))) continue;
+        c->scat->row_ids[cur[hj_partition_of(c->hashes[i])]++] =
+            static_cast<int32_t>(i);
+    }
+}
+
 // Phase 2 (TASK BODY, parallel): insert the rows of partitions [p_lo, p_hi)
 // from the scatter into their SwissTables + set each row's chain next. Rows
 // arrive in ascending order within a partition, so the chain order is
