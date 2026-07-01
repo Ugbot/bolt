@@ -489,6 +489,20 @@ bolt_apply_hardening(test_bolt_radixsort)
 
 add_test(NAME test_bolt_radixsort COMMAND test_bolt_radixsort)
 
+# Parallel multi-key radix argsort (G2FEAT-157) — byte-identical to stable sort.
+add_executable(test_bolt_radixsort_parallel test_bolt_radixsort_parallel.cpp)
+
+target_link_libraries(test_bolt_radixsort_parallel
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_radixsort_parallel)
+
+add_test(NAME test_bolt_radixsort_parallel COMMAND test_bolt_radixsort_parallel)
+
 add_executable(test_bolt_kmerge test_bolt_kmerge.cpp)
 
 target_link_libraries(test_bolt_kmerge
