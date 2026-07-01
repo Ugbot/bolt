@@ -120,6 +120,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 
 namespace bolt {
 namespace kernels {
@@ -142,6 +143,20 @@ BOLT_FORCE_INLINE uint64_t radix_bias_i64(int64_t key) noexcept {
 }
 BOLT_FORCE_INLINE int64_t radix_unbias_u64(uint64_t u) noexcept {
     return static_cast<int64_t>(u ^ kRadixSignBit);
+}
+
+// Bias an IEEE-754 double into a radix-orderable uint64 so unsigned-ascending
+// order == double-ascending order. Positive (sign bit clear): flip the sign bit.
+// Negative (sign bit set): flip ALL bits (so more-negative sorts lower). The
+// mask is sign-bit-broadcast-to-mask | signbit: negative → 0xFF..FF, positive →
+// 0x80..00. NaN maps to a deterministic extreme (SQL NaN order is impl-defined;
+// finite data is exact). Argsort-only — there is no unbias (the perm carries the
+// result), so this need not be self-inverse.
+BOLT_FORCE_INLINE uint64_t radix_bias_f64(double d) noexcept {
+    uint64_t bits;
+    std::memcpy(&bits, &d, sizeof(bits));
+    const uint64_t mask = (static_cast<uint64_t>(0) - (bits >> 63)) | kRadixSignBit;
+    return bits ^ mask;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +372,66 @@ BOLT_FORCE_INLINE void radix_sort_indirect_i64(
         int32_t* tmp = pa; pa = pb; pb = tmp;
     }
     // Result is in `pa`; if that is perm_scratch, copy back into perm.
+    if (pa != perm) {
+        for (int64_t i = 0; i < n; ++i) perm[i] = pa[i];
+    }
+}
+
+// ===========================================================================
+// Public API — MULTI-KEY indirect sort (int64 / float64 keys, asc/desc)
+// ===========================================================================
+
+// Fill `bkeys[i]` with the radix-biased uint64 of int64 `keys[i]` for the given
+// direction (asc → bias as-is; desc → bitwise-NOT so unsigned-ascending order ==
+// descending). Indexed by ORIGINAL row id (never reordered).
+BOLT_FORCE_INLINE void radix_fill_biased_i64(uint64_t* BOLT_RESTRICT bkeys,
+                                             const int64_t* BOLT_RESTRICT keys,
+                                             int64_t n, bool ascending) noexcept {
+    assert((bkeys != nullptr && keys != nullptr) || n == 0);
+    if (ascending) {
+        for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_i64(keys[i]);
+    } else {
+        for (int64_t i = 0; i < n; ++i) bkeys[i] = ~radix_bias_i64(keys[i]);
+    }
+}
+
+// Float64 analogue of radix_fill_biased_i64.
+BOLT_FORCE_INLINE void radix_fill_biased_f64(uint64_t* BOLT_RESTRICT bkeys,
+                                             const double* BOLT_RESTRICT vals,
+                                             int64_t n, bool ascending) noexcept {
+    assert((bkeys != nullptr && vals != nullptr) || n == 0);
+    if (ascending) {
+        for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_f64(vals[i]);
+    } else {
+        for (int64_t i = 0; i < n; ++i) bkeys[i] = ~radix_bias_f64(vals[i]);
+    }
+}
+
+// Stable LSD radix that RE-SORTS the CURRENT `perm` (NOT reset to identity — it
+// is the identity for the first key of a multi-key sort, or the result of a
+// prior, more-junior key) by the caller-biased uint64 `bkeys` (indexed by
+// original row id; unsigned-ascending == the desired order). STABLE: rows with
+// equal bkeys keep their current perm order — so calling this once per sort key,
+// LEAST-significant key FIRST, yields full lexicographic multi-key order.
+// Constant byte-passes are skipped; result left in `perm` (copied back if an odd
+// number of scatter passes ran). All scratch caller-owned; no allocation.
+BOLT_FORCE_INLINE void radix_refine_perm_u64(
+        int32_t* BOLT_RESTRICT perm, const uint64_t* BOLT_RESTRICT bkeys,
+        int32_t* BOLT_RESTRICT perm_scratch, int64_t n) noexcept {
+    assert((perm != nullptr && bkeys != nullptr) || n == 0);
+    assert(perm_scratch != nullptr || n < 2);
+    if (n < 2) return;
+    int64_t hists[kRadixPasses * kRadixBuckets] = {0};
+    radix_histogram_all(bkeys, n, hists);
+    int32_t* pa = perm;
+    int32_t* pb = perm_scratch;
+    for (int pass = 0; pass < kRadixPasses; ++pass) {
+        int64_t* hist = hists + pass * kRadixBuckets;
+        if (radix_pass_is_constant(hist, n)) continue;  // identity pass
+        radix_prefix_sum(hist);
+        radix_scatter_indirect(pa, bkeys, pb, n, pass * kRadixBits, hist);
+        int32_t* tmp = pa; pa = pb; pb = tmp;
+    }
     if (pa != perm) {
         for (int64_t i = 0; i < n; ++i) perm[i] = pa[i];
     }
