@@ -388,11 +388,10 @@ BOLT_FORCE_INLINE void radix_fill_biased_i64(uint64_t* BOLT_RESTRICT bkeys,
                                              const int64_t* BOLT_RESTRICT keys,
                                              int64_t n, bool ascending) noexcept {
     assert((bkeys != nullptr && keys != nullptr) || n == 0);
-    if (ascending) {
-        for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_i64(keys[i]);
-    } else {
-        for (int64_t i = 0; i < n; ++i) bkeys[i] = ~radix_bias_i64(keys[i]);
-    }
+    // Descending = flip all bits of the ascending bias. Fold that into a mask
+    // XORed in the inner loop so the loop is branchless (no per-element `if`).
+    const uint64_t dir = ascending ? uint64_t{0} : ~uint64_t{0};
+    for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_i64(keys[i]) ^ dir;
 }
 
 // Float64 analogue of radix_fill_biased_i64.
@@ -400,11 +399,8 @@ BOLT_FORCE_INLINE void radix_fill_biased_f64(uint64_t* BOLT_RESTRICT bkeys,
                                              const double* BOLT_RESTRICT vals,
                                              int64_t n, bool ascending) noexcept {
     assert((bkeys != nullptr && vals != nullptr) || n == 0);
-    if (ascending) {
-        for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_f64(vals[i]);
-    } else {
-        for (int64_t i = 0; i < n; ++i) bkeys[i] = ~radix_bias_f64(vals[i]);
-    }
+    const uint64_t dir = ascending ? uint64_t{0} : ~uint64_t{0};  // branchless inner
+    for (int64_t i = 0; i < n; ++i) bkeys[i] = radix_bias_f64(vals[i]) ^ dir;
 }
 
 // Stable LSD radix that RE-SORTS the CURRENT `perm` (NOT reset to identity — it
