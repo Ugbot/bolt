@@ -123,7 +123,12 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept;
 
 // ---- parquet metadata subset ----------------------------------------------
 
-inline constexpr uint32_t kPqMaxColumns   = 64;    // flat leaf columns
+inline constexpr uint32_t kPqMaxColumns   = 128;   // flat leaf columns
+                                                    // (bumped 64->128 for
+                                                    // ClickBench's 105-col
+                                                    // `hits` table; PqMeta
+                                                    // stays arena-only, see
+                                                    // bolt_parquet_read.cpp)
 inline constexpr uint32_t kPqMaxRowGroups = 4096;
 inline constexpr uint32_t kPqMaxNameBytes = 64;
 inline constexpr uint32_t kPqMaxStatBytes = 64;    // min/max value bytes kept
