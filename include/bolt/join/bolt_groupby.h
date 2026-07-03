@@ -967,6 +967,21 @@ struct GroupbyTypedState {
     size_t          key_str_used[kGbMaxKeys];
     size_t          key_str_cap[kGbMaxKeys];
 
+    // G2FEAT-283: per-agg spilled-byte buffer for Utf8 MIN/MAX AGGREGATE
+    // VALUES (distinct from key_str_buf above, which is only for GROUP BY
+    // keys). A spilled (>12-char) MIN/MAX winner's tail bytes live in the
+    // PRODUCING morsel's overflow buffer, which is freed once the morsel is
+    // released — retaining a StringView that points there past this ingest
+    // call is a dangling-pointer bug (the crash this buffer fixes: a
+    // formerly-nullptr spilled base dereferenced as `nullptr + ref.offset`).
+    // On a new win we deep-copy the candidate's spilled tail here (Card S,
+    // mirrors key_str_buf) and re-point the accumulator cell's offset;
+    // finalize hands this base to the output column. nullptr for non-Utf8
+    // aggs / aggs whose winner has always been inline (<=12 bytes).
+    char*           agg_str_buf[kGbMaxAggs];
+    size_t          agg_str_used[kGbMaxAggs];
+    size_t          agg_str_cap[kGbMaxAggs];
+
     Arena*          arena;
     uint32_t        cap;                // SwissTable capacity (== keys_flat / accums stride)
     uint32_t        entry_count;
@@ -1131,6 +1146,11 @@ inline bool groupby_agg_multi_key_typed_begin(
         state->key_str_used[k] = 0;
         state->key_str_cap[k]  = 0;
     }
+    for (uint8_t j = 0; j < n_aggs; ++j) {   // G2FEAT-283: spilled-agg-value bufs
+        state->agg_str_buf[j]  = nullptr;
+        state->agg_str_used[j] = 0;
+        state->agg_str_cap[j]  = 0;
+    }
     return true;
 }
 
@@ -1186,6 +1206,81 @@ BOLT_FORCE_INLINE bool gb_key_str_append(GroupbyTypedState* state, uint32_t k,
     *out_off = static_cast<uint32_t>(state->key_str_used[k]);
     std::memcpy(state->key_str_buf[k] + state->key_str_used[k], bytes, len);
     state->key_str_used[k] += len;
+    return true;
+}
+
+// G2FEAT-283: append `len` spilled AGGREGATE-VALUE bytes to agg column j's
+// deep-copy buffer, growing geometrically in the arena. Byte-for-byte the
+// same shape as gb_key_str_append above (Card S), just keyed by agg index
+// instead of key index — MIN/MAX(Utf8) needs the identical own-your-bytes
+// treatment a GROUP BY key already gets. Tiger Style: bounded, asserts.
+BOLT_FORCE_INLINE bool gb_agg_str_append(GroupbyTypedState* state, uint32_t j,
+                                         const char* bytes, uint32_t len,
+                                         uint32_t* out_off) noexcept {
+    assert(state != nullptr && out_off != nullptr);
+    assert(bytes != nullptr || len == 0);
+    if (state->agg_str_used[j] + len > state->agg_str_cap[j]) {
+        size_t newcap = (state->agg_str_cap[j] != 0) ? state->agg_str_cap[j] * 2u
+                                                      : size_t{4096};
+        while (newcap < state->agg_str_used[j] + len) newcap *= 2u;
+        char* nb = static_cast<char*>(state->arena->allocate(newcap, 16));
+        if (nb == nullptr) return false;
+        if (state->agg_str_used[j] > 0) {
+            std::memcpy(nb, state->agg_str_buf[j], state->agg_str_used[j]);
+        }
+        state->agg_str_buf[j] = nb;
+        state->agg_str_cap[j] = newcap;
+    }
+    if (state->agg_str_used[j] > 0xFFFFFFFFull) return false;
+    *out_off = static_cast<uint32_t>(state->agg_str_used[j]);
+    std::memcpy(state->agg_str_buf[j] + state->agg_str_used[j], bytes, len);
+    state->agg_str_used[j] += len;
+    return true;
+}
+
+// G2FEAT-283: MIN/MAX over ONE Utf8 accumulator cell, resolving both operands'
+// spilled (>12-byte) tails through their OWN base — never nullptr. `slot` is
+// this state's own accumulator cell; its spilled tail (if any) already lives
+// in `state->agg_str_buf[j]` from a prior win, so it never dangles. `v` is the
+// candidate row's raw StringView bytes; `cand_base` resolves ITS spilled tail
+// (the producing morsel's / source partial's overflow buffer — valid only for
+// this call). If the candidate wins AND is spilled, its tail is deep-copied
+// into `state->agg_str_buf[j]` before being retained (Card S — mirrors the
+// GROUP BY key treatment in gb_ingest_fallback/gb_merge_insert_group), so the
+// retained winner survives past the source's lifetime. Returns false (and
+// sets `state->oom`) only on arena exhaustion; a no-op / cur-retained compare
+// always succeeds.
+inline bool gb_agg_utf8_minmax(GroupbyTypedState* state, uint32_t j,
+                               AggKind k, GbCell16* slot, GbCell16 v,
+                               bool valid, const char* cand_base) noexcept {
+    assert(state != nullptr && slot != nullptr);
+    assert(k == AggKind::Min || k == AggKind::Max);
+    if (!valid) return true;   // Min/Max ignore NULLs, same as gb_detail::apply
+    StringView cur, cand;
+    std::memcpy(&cur,  slot, sizeof(cur));
+    std::memcpy(&cand, &v,   sizeof(cand));
+    const char* cur_base = (cur.length > 12u) ? state->agg_str_buf[j] : nullptr;
+    assert(cur.length <= 12u || cur_base != nullptr);
+    const StringView out = (k == AggKind::Min)
+        ? sv_bytelex_min(cur, cur_base, cand, cand_base)
+        : sv_bytelex_max(cur, cur_base, cand, cand_base);
+    if (std::memcmp(&out, &cur, sizeof(out)) == 0) return true;   // cur retained
+    assert(std::memcmp(&out, &cand, sizeof(out)) == 0 &&
+           "sv_bytelex_min/max must return one of its two inputs");
+    if (out.length <= 12u) {
+        std::memcpy(slot, &out, sizeof(out));
+        return true;
+    }
+    const char* bytes = kernels::utf8::sv_bytes(cand, cand_base);
+    uint32_t off = 0;
+    if (!gb_agg_str_append(state, j, bytes, cand.length, &off)) {
+        state->oom = true;
+        return false;
+    }
+    StringView owned = cand;
+    owned.ref.buf_idx = 0;
+    owned.ref.offset  = off;
+    std::memcpy(slot, &owned, sizeof(owned));
     return true;
 }
 
@@ -1268,10 +1363,11 @@ inline void gb_ingest_fallback(
         for (uint32_t j = 0; j < n_aggs; ++j) {
             GbCell16 v{0, 0};
             bool valid = true;
+            const BoltColumn* pc_ptr = nullptr;
             if (state->specs[j].kind != AggKind::CountStar) {
-                const BoltColumn& pc = payload[state->specs[j].in_col];
-                v     = gb_detail::read_cell16(pc, r);
-                valid = gb_detail::cell_valid(pc, r);
+                pc_ptr = &payload[state->specs[j].in_col];
+                v     = gb_detail::read_cell16(*pc_ptr, r);
+                valid = gb_detail::cell_valid(*pc_ptr, r);
             }
             if (valid && state->specs[j].distinct != 0) {
                 const uint16_t i16 = state->distinct16_idx[j];
@@ -1288,8 +1384,25 @@ inline void gb_ingest_fallback(
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;
-            gb_detail::apply(state->specs[j].kind, state->agg_in_types[j],
-                             &state->accums[off], v, valid);
+            // G2FEAT-283: MIN/MAX(Utf8) cannot go through the generic
+            // gb_detail::apply — it hard-codes nullptr spilled-string bases,
+            // which segfaults the moment a real (>12-byte) string is compared.
+            // Resolve + deep-copy-on-win via the dedicated helper instead.
+            if (state->agg_in_types[j] == BoltType::Utf8 &&
+                (state->specs[j].kind == AggKind::Min ||
+                 state->specs[j].kind == AggKind::Max)) {
+                const char* cand_base = (pc_ptr != nullptr)
+                    ? static_cast<const char*>(pc_ptr->str_overflow_base)
+                    : nullptr;
+                if (!gb_agg_utf8_minmax(state, j, state->specs[j].kind,
+                                        &state->accums[off], v, valid,
+                                        cand_base)) {
+                    return;   // state->oom already set
+                }
+            } else {
+                gb_detail::apply(state->specs[j].kind, state->agg_in_types[j],
+                                 &state->accums[off], v, valid);
+            }
             state->counts[off] += (valid ? 1 : 0);
         }
     }
@@ -1506,6 +1619,12 @@ inline bool groupby_agg_multi_key_typed_finalize(
             out_aggs[j].decimal_scale = (state->specs[j].kind == AggKind::Avg)
                 ? static_cast<uint8_t>(state->agg_in_scales[j] + 4)
                 : state->agg_in_scales[j];
+        }
+        // G2FEAT-283: spilled Utf8 MIN/MAX winners point into our own per-agg
+        // deep-copy buffer (agg_str_buf); hand the base to the output column
+        // so the sink/sort/next-op resolves them, exactly like out_keys above.
+        if (ot == BoltType::Utf8) {
+            out_aggs[j].str_overflow_base = state->agg_str_buf[j];
         }
         if (out_n > 0 && out_aggs[j].data == nullptr) return false;
     }

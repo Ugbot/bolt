@@ -101,8 +101,11 @@ inline bool gb_merge_insert_group(GroupbyTypedState* dst,
     return true;
 }
 
-// Combine src group `sgid` into dst slot `dslot`, per agg kind.
-inline void gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
+// Combine src group `sgid` into dst slot `dslot`, per agg kind. Returns false
+// (dst->oom already set by the callee) only when a Utf8 MIN/MAX deep-copy hits
+// arena exhaustion; every other combine kind is allocation-free and always
+// succeeds.
+inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
                              const GroupbyTypedState* src,
                              uint32_t sgid) noexcept {
     assert(dst != nullptr && src != nullptr);
@@ -115,6 +118,21 @@ inline void gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
             // The src cell holds a partial COUNT — add the count itself
             // (apply() would add 1 per call, which is per-ROW semantics).
             dst->accums[doff].a += src->accums[soff].a;
+        } else if (dst->agg_in_types[j] == BoltType::Utf8 &&
+                   (k == AggKind::Min || k == AggKind::Max)) {
+            // G2FEAT-283: src's cell (if spilled) is owned by SRC's OWN
+            // agg_str_buf — resolve it there (never a transient producing
+            // morsel's buffer, long gone by merge time). If it wins here, it
+            // gets deep-copied into DST's own buffer by gb_agg_utf8_minmax.
+            StringView ssv;
+            std::memcpy(&ssv, &src->accums[soff], sizeof(ssv));
+            const char* cand_base =
+                (ssv.length > 12u) ? src->agg_str_buf[j] : nullptr;
+            if (!gb_agg_utf8_minmax(dst, j, k, &dst->accums[doff],
+                                    src->accums[soff], /*valid=*/true,
+                                    cand_base)) {
+                return false;   // dst->oom already set
+            }
         } else {
             // Sum/Avg: apply's add arm over the src PARTIAL cell == exact
             // partial-sum merge (d128_add is associative two's-complement
@@ -125,6 +143,7 @@ inline void gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
         }
         dst->counts[doff] += src->counts[soff];
     }
+    return true;
 }
 
 // HASH-CLASS-RESTRICTED merge (chukonu W-J5 parallel partial merge): fold
@@ -174,7 +193,7 @@ inline bool groupby_agg_multi_key_typed_merge_class(
         } else if (!gb_merge_insert_group(dst, src, g, h, &slot)) {
             return false;
         }
-        gb_merge_combine(dst, slot, src, g);
+        if (!gb_merge_combine(dst, slot, src, g)) return false;
     }
     // n_rows_in is write-only bookkeeping; credit it once (class 0) so the
     // sum across class states matches the full-merge total.
@@ -224,7 +243,7 @@ inline bool groupby_agg_multi_key_typed_merge_list(
         } else if (!gb_merge_insert_group(dst, src, g, h, &slot)) {
             return false;
         }
-        gb_merge_combine(dst, slot, src, g);
+        if (!gb_merge_combine(dst, slot, src, g)) return false;
     }
     return true;
 }

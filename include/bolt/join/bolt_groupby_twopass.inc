@@ -803,12 +803,27 @@ inline void gb_p2_generic(GroupbyTypedState* st, uint32_t j,
     int64_t*  cnt = st->counts + static_cast<size_t>(j) * st->cap;
     const AggKind kind = st->specs[j].kind;
     const BoltType t   = st->agg_in_types[j];
+    // G2FEAT-283: MIN/MAX(Utf8) cannot go through the generic gb_detail::apply
+    // — it hard-codes nullptr spilled-string bases, which segfaults the
+    // moment a real (>12-byte) string is compared. Resolve + deep-copy-on-win
+    // via the dedicated helper instead (same fix as gb_ingest_fallback).
+    const bool is_utf8_minmax = (t == BoltType::Utf8) &&
+        (kind == AggKind::Min || kind == AggKind::Max);
+    const char* cand_base = is_utf8_minmax
+        ? static_cast<const char*>(pc.str_overflow_base) : nullptr;
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
         const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
         const int32_t g = gid[i];
         const GbCell16 v = gb_detail::read_cell16(pc, r);
-        gb_detail::apply(kind, t, &acc[g], v, valid);
+        if (is_utf8_minmax) {
+            if (!gb_agg_utf8_minmax(st, j, kind, &acc[g], v, valid, cand_base)) {
+                return;   // st->oom already set; groupby_agg_multi_key_typed_
+                          // ingest checks state->oom right after this call
+            }
+        } else {
+            gb_detail::apply(kind, t, &acc[g], v, valid);
+        }
         cnt[g] += valid ? 1 : 0;
     }
 }
