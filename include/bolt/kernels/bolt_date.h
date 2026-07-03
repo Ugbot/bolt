@@ -344,6 +344,62 @@ BOLT_FORCE_INLINE void date32_extract_i64(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Time-of-day extraction from an Int64 NANOSECOND epoch timestamp (distinct
+// from the Date32-day-count family above). Matches chukonu's existing
+// date_trunc/time_bucket nanosecond convention. Wall-clock UTC components —
+// no timezone conversion (chukonu timestamps are timezone-naive throughout).
+// G2FEAT-283 ClickBench follow-up (EXTRACT(minute/hour/second FROM ts)).
+// Branch-free floor-division-then-modulo; correct for negative epoch
+// nanoseconds too (pre-1970 timestamps), unlike a plain C `%`.
+// ---------------------------------------------------------------------------
+inline constexpr int64_t kNsPerSecond = 1000000000LL;
+inline constexpr int64_t kNsPerMinute = 60LL * kNsPerSecond;
+inline constexpr int64_t kNsPerHour   = 60LL * kNsPerMinute;
+inline constexpr int64_t kNsPerDay    = 24LL * kNsPerHour;
+
+// Floor-mod: result always in [0, m), even for negative `a` (C's `%` would
+// return a negative remainder for negative `a`, wrong for epoch-before-1970
+// timestamps).
+BOLT_FORCE_INLINE int64_t floor_mod_i64(int64_t a, int64_t m) noexcept {
+    assert(m > 0);
+    const int64_t r = a % m;
+    return (r < 0) ? (r + m) : r;
+}
+
+BOLT_FORCE_INLINE int32_t hour_from_ns64(int64_t ns) noexcept {
+    return static_cast<int32_t>(floor_mod_i64(ns, kNsPerDay) / kNsPerHour);
+}
+
+BOLT_FORCE_INLINE int32_t minute_from_ns64(int64_t ns) noexcept {
+    return static_cast<int32_t>(
+        floor_mod_i64(ns, kNsPerHour) / kNsPerMinute);
+}
+
+BOLT_FORCE_INLINE int32_t second_from_ns64(int64_t ns) noexcept {
+    return static_cast<int32_t>(
+        floor_mod_i64(ns, kNsPerMinute) / kNsPerSecond);
+}
+
+// Batch int64-output form, mirroring date32_extract_i64's shape. `field`:
+// 0=hour(0..23) 1=minute(0..59) 2=second(0..59). ~2 ns/row (pure integer
+// div/mod, no civil-calendar algorithm needed for time-of-day).
+BOLT_FORCE_INLINE void ns64_extract_i64(
+        const int64_t* BOLT_RESTRICT ns_in, int64_t n, int field,
+        int64_t* BOLT_RESTRICT out) noexcept {
+    assert((ns_in != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0 && field >= 0 && field <= 2);
+    for (int64_t i = 0; i < n; ++i) {
+        int32_t v;
+        switch (field) {
+            case 0:  v = hour_from_ns64(ns_in[i]);   break;
+            case 1:  v = minute_from_ns64(ns_in[i]); break;
+            default: v = second_from_ns64(ns_in[i]); break;
+        }
+        out[i] = static_cast<int64_t>(v);
+    }
+}
+
 } // namespace date
 } // namespace kernels
 } // namespace bolt
