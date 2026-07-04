@@ -21,7 +21,7 @@
 // Binary layout:
 //   +------------------------------------------------+ offset 0
 //   |  magic[4]       = "BOLT"                       |
-//   |  version        = u32 (2 — VarBinary support)  |
+//   |  version        = u32 (3 — Flat Utf8 support)  |
 //   |  flags          = u32 (bit0=LE, bit1=aligned64)|
 //   |  num_rows       = i64                          |
 //   |  num_cols       = u32                          |
@@ -41,9 +41,19 @@
 //   +------------------------------------------------+
 //   | Data region (64-byte aligned per buffer)       |
 //   |   b0 = validity bitmap (may be empty)          |
-//   |   Flat:                                        |
+//   |   Flat (non-Utf8):                             |
 //   |     b1 = primitive data array                  |
 //   |     b2 = (unused; len 0)                       |
+//   |   Flat + Utf8 (v3+): StringView is a fixed 16-  |
+//   |   byte type, so it rides b1 like any other Flat |
+//   |   primitive; b2 carries the spilled overflow    |
+//   |   buffer (str_overflow_base) any >12-byte row's |
+//   |   ref.offset resolves against — same b1/b2      |
+//   |   split VarBinary uses below, b1 holding fixed- |
+//   |   width views instead of an offsets array:      |
+//   |     b1 = StringView[num_rows] (16 B/row)        |
+//   |     b2 = spilled bytes actually referenced      |
+//   |          (walked per-row; see flat_utf8_sizes)  |
 //   |   VarBinary:                                   |
 //   |     b1 = offsets array (int32 × (rows + 1))    |
 //   |     b2 = payload bytes (offsets[rows] long)    |
@@ -69,7 +79,7 @@ namespace wire {
 // ===========================================================================
 
 inline constexpr uint32_t kWireMagic    = 0x544C4F42u;  // 'BOLT' LE
-inline constexpr uint32_t kWireVersion  = 2u;            // bumped: VarBinary support
+inline constexpr uint32_t kWireVersion  = 3u;            // bumped: Flat Utf8 support
 inline constexpr uint32_t kWireFlagLE   = 1u << 0;
 inline constexpr uint32_t kWireFlagAln  = 1u << 1;
 
@@ -107,15 +117,24 @@ BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
         && v <= static_cast<uint8_t>(BoltType::Float64);
 }
 
-// True if (`type`, `format`) is a legal pair for the wire format. v2:
-//   Format::Flat       + numeric / Bool / Embedding{,F16,U8,I8}
+// True if (`type`, `format`) is a legal pair for the wire format. v3:
+//   Format::Flat       + numeric / Bool / Embedding{,F16,U8,I8} / Utf8
 //   Format::VarBinary  + Utf8 / Binary / Symbol
+//
+// Flat + Utf8 was excluded through v2 — `bolt_wire_size()` returned 0 for
+// any batch carrying a Flat-format Utf8 column (StringView row array +
+// separate str_overflow_base spill buffer), which meant `marbledb::put()`
+// (a direct, unconditional bolt_wire_size/serialize caller) failed cleanly
+// for every Utf8 column real Parquet ingestion decodes — parquet_read
+// always produces Flat StringViews, never VarBinary. Fixed at v3: see
+// `flat_utf8_sizes` below for the b1(StringView array)/b2(spilled bytes)
+// split, mirroring VarBinary's existing b1(offsets)/b2(payload) shape.
+// Binary/Symbol stay VarBinary-only (unchanged) — out of this fix's scope.
 BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
                                                  ColumnFormat f) noexcept {
     if (f == ColumnFormat::Flat) {
         return is_supported_type(t)
-            && t != BoltType::Utf8 && t != BoltType::Binary
-            && t != BoltType::Symbol;
+            && t != BoltType::Binary && t != BoltType::Symbol;
     }
     if (f == ColumnFormat::VarBinary) {
         return t == BoltType::Utf8 || t == BoltType::Binary
@@ -125,15 +144,40 @@ BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
 }
 
 // Byte length of the data buffer (buffer1) for a Flat column of the given
-// type and row count. Utf8 is handled separately (returns 0 here).
-// Embedding columns must use the 3-arg overload (their stride is
-// runtime-dynamic = dim * 4); the 2-arg form returns 0 for Embedding.
+// type and row count. Utf8's b1 (the fixed 16-byte StringView row array)
+// falls through to the generic `type_size(t) * n` path below like any
+// other fixed-width type — its SEPARATE b2 (spilled overflow bytes) is
+// sized by `flat_utf8_sizes()`, not here. Embedding columns must use the
+// 3-arg overload (their stride is runtime-dynamic = dim * 4); the 2-arg
+// form returns 0 for Embedding.
 BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
     assert(n >= 0);
-    if (t == BoltType::Utf8) return 0;
     if (t == BoltType::Bool) return static_cast<size_t>((n + 7) / 8);
     size_t tsz = type_size(t);
     return tsz * static_cast<size_t>(n);
+}
+
+// Sizes the (b1, b2) pair for a Flat-format Utf8 column: b1 is the fixed
+// StringView[length] row array (16 bytes/row, same as any other Flat
+// type); b2 is the spilled-overflow bytes ACTUALLY referenced by a valid
+// (non-null) row with length > 12 — there is no stored "bytes used" field
+// on BoltColumn, so this walks rows exactly like
+// `BoltColumn::clone_into()`'s own Utf8 deep-copy fix (shared helper,
+// `bolt::detail::utf8_overflow_used_bytes`, defined in bolt_column.h).
+// Returns b2 == 0 when every row is inline or str_overflow_base is null
+// (nothing to spill) — the caller decides whether a non-zero b2 with a
+// null str_overflow_base is a malformed-column error.
+BOLT_FORCE_INLINE void flat_utf8_sizes(const BoltColumn& c,
+                                       size_t* out_b1, size_t* out_b2) noexcept {
+    assert(out_b1 != nullptr && out_b2 != nullptr);
+    assert(c.type == BoltType::Utf8 && c.format == ColumnFormat::Flat);
+    *out_b1 = static_cast<size_t>(c.length) * sizeof(StringView);
+    *out_b2 = 0;
+    if (c.length > 0 && c.data != nullptr && c.str_overflow_base != nullptr) {
+        const auto* rows = static_cast<const StringView*>(c.data);
+        *out_b2 = bolt::detail::utf8_overflow_used_bytes(
+            rows, c.length, c.validity, c.validity_offset);
+    }
 }
 
 // 3-arg overload — supplies the per-row stride directly so vector
@@ -219,6 +263,9 @@ inline size_t collect_column_sizes(const BoltBatch* b,
             } else {
                 return 0;            // length > 0 but no offsets
             }
+        } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
+            flat_utf8_sizes(c, &d_len, &s_len);
+            if (s_len > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
         } else {
             // Flat numeric / Bool / Embedding. Embedding uses the 3-arg
             // overload so the runtime-dynamic stride (dim * 4) is taken
@@ -265,9 +312,7 @@ inline size_t bolt_wire_size(const BoltBatch* b) noexcept {
         // that every column is supported.
         for (uint32_t i = 0; i < b->num_cols; ++i) {
             const BoltColumn& c = b->col(i);
-            if (c.format != ColumnFormat::Flat) return 0;
-            if (!detail::is_supported_type(c.type)) return 0;
-            if (c.type == BoltType::Utf8) return 0;
+            if (!detail::is_supported_format_pair(c.type, c.format)) return 0;
         }
     }
 
@@ -313,6 +358,9 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
             } else {
                 return 0;
             }
+        } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
+            detail::flat_utf8_sizes(c, &b1[i], &b2[i]);
+            if (b2[i] > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
         } else {
             b1[i] = detail::data_buffer_size(c.type, c.length,
                                               c.type_size_bytes);
@@ -382,6 +430,13 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
             if (b2[i] > 0 && c.data != nullptr) {
                 memcpy(buf + off2, c.data, b2[i]);
             }
+        } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
+            // b1 = StringView row array (offsets inside are unchanged —
+            // b2 below copies the overflow buffer's [0, b2[i]) PREFIX
+            // verbatim, so every row's `ref.offset` still resolves
+            // correctly against the copy). b2 = spilled bytes.
+            if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
+            if (b2[i] && c.str_overflow_base) memcpy(buf + off2, c.str_overflow_base, b2[i]);
         } else {
             if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
         }
@@ -425,12 +480,14 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
     // --- Header validation ---
     if (memcmp(p, "BOLT", 4) != 0) return false;
     const uint32_t version = detail::read_u32_le(p + 4);
-    // v1 and v2 are wire-compatible at the header / descriptor level;
-    // v2 adds VarBinary support without changing the on-disk shape of
-    // existing v1 columns. Readers accept both. (Old readers compiled
-    // against kWireVersion=1 will reject v2 payloads — that is the
-    // intentional break for VarBinary writers.)
-    if (version != 1u && version != 2u) return false;
+    // v1/v2/v3 are wire-compatible at the header / descriptor level; each
+    // bump only widens which (type, format) pairs are legal, never the
+    // on-disk shape. v2 added VarBinary; v3 adds Flat Utf8 (StringView
+    // row array in b1 + spilled overflow in b2). Readers accept all three
+    // — an old reader compiled against a lower kWireVersion simply fails
+    // `is_supported_format_pair` for the newer pair it doesn't know about,
+    // which is the intentional break for that column's writer.
+    if (version != 1u && version != 2u && version != 3u) return false;
     const uint32_t flags = detail::read_u32_le(p + 8);
     if (!(flags & kWireFlagLE)) return false;
     const int64_t  num_rows     = detail::read_i64_le(p + 12);
@@ -522,6 +579,15 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
             if (l1) {
                 c.data = detail::wire_span<kView>(p, o1, l1, arena);
                 if (!c.data) return false;
+            }
+            // Flat Utf8 (v3+): b2 is the spilled-overflow byte buffer any
+            // >12-byte row's StringView::ref.offset resolves against.
+            // Offsets are unchanged relative values (serialize copied the
+            // overflow buffer's [0, len) prefix verbatim) — no re-basing
+            // needed, just point str_overflow_base at the resolved span.
+            if (f.type == BoltType::Utf8 && l2) {
+                c.str_overflow_base = detail::wire_span<kView>(p, o2, l2, arena);
+                if (!c.str_overflow_base) return false;
             }
             out->columns[0][i] = c;
             out->columns[1][i] = c;

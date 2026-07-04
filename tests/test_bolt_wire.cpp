@@ -221,7 +221,7 @@ TEST(BoltWire, VarBinaryRoundTrip) {
     }
 }
 
-TEST(BoltWire, VersionStampIsTwo) {
+TEST(BoltWire, VersionStampIsThree) {
     Arena arena;
     BoltBatch src;
     build_int32_batch(&src, &arena, 1, 1);
@@ -230,5 +230,108 @@ TEST(BoltWire, VersionStampIsTwo) {
     ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
     uint32_t version = 0;
     std::memcpy(&version, buf.data() + 4, sizeof(version));
-    EXPECT_EQ(version, 2u);
+    EXPECT_EQ(version, 3u);
+}
+
+// ---------------------------------------------------------------------------
+// Flat Utf8 round-trip (wire v3). Prior to this fix, `is_supported_format_pair`
+// excluded (Utf8, Flat) entirely, so `bolt_wire_size()` returned 0 for any
+// batch carrying a Flat-format Utf8 column — which is what every real
+// Parquet-decoded Utf8 column looks like (`bolt::ingest::parquet` always
+// emits Flat StringViews, never VarBinary). Mixes inline (<=12 byte) and
+// spilled (>12 byte) values, plus a null row holding garbage-looking bytes,
+// to exercise the same row-walk `flat_utf8_sizes`/`clone_into` share.
+// ---------------------------------------------------------------------------
+TEST(BoltWire, FlatUtf8RoundTrip) {
+    Arena arena_src, arena_dst;
+
+    BoltBatch src;
+    BoltBatch::init_empty(&src);
+    src.arena    = &arena_src;
+    src.num_cols = 1;
+    src.num_rows = 5;
+    src.schema.num_fields = 1;
+    {
+        BoltField& f0 = src.schema.fields[0];
+        std::memset(&f0, 0, sizeof(f0));
+        std::memcpy(f0.name, "phrase", 6);
+        f0.type = BoltType::Utf8;
+    }
+
+    const char* strA = "AAAAAAAAAAAAAAAAAAAA";  // 20 bytes, spilled
+    const char* strB = "BBBBBBBBBBBBBBBBBB";     // 18 bytes, spilled
+    ASSERT_EQ(std::strlen(strA), 20u);
+    ASSERT_EQ(std::strlen(strB), 18u);
+
+    constexpr size_t kOvfCap = 64;
+    auto* ovf = static_cast<char*>(arena_src.allocate(kOvfCap, 1));
+    std::memset(ovf, 0, kOvfCap);
+    std::memcpy(ovf, strA, 20);
+    std::memcpy(ovf + 20, strB, 18);
+
+    constexpr int64_t kN = 5;
+    auto* rows = arena_src.allocate_array<StringView>(kN);
+
+    auto make_inline = [](const char* bytes, uint32_t len) {
+        StringView v; std::memset(&v, 0, sizeof(v)); v.length = len;
+        const uint32_t p = (len < 4u) ? len : 4u;
+        if (p > 0) std::memcpy(v.prefix, bytes, p);
+        if (len > 4u) std::memcpy(v.inline_data, bytes + 4, len - 4u);
+        return v;
+    };
+    auto make_spilled = [](const char* bytes, uint32_t len, uint32_t off) {
+        StringView v; std::memset(&v, 0, sizeof(v)); v.length = len;
+        std::memcpy(v.prefix, bytes, 4);
+        v.ref.buf_idx = 0; v.ref.offset = off;
+        return v;
+    };
+
+    rows[0] = make_inline("hi", 2);
+    rows[1] = make_spilled(strA, 20, 0);
+    rows[2] = make_inline("twelve_chars", 12);
+    rows[3] = make_spilled(strB, 18, 20);
+    std::memset(&rows[4], 0xAB, sizeof(StringView));  // garbage; row is NULL
+
+    uint8_t* validity = static_cast<uint8_t*>(arena_src.allocate(1, 1));
+    *validity = 0b00001111u;  // bits 0-3 valid, bit 4 (row 4) null
+
+    BoltColumn c0 = BoltColumn::make_flat(rows, validity, kN, BoltType::Utf8);
+    c0.str_overflow_base = ovf;
+    src.columns[0][0] = c0;
+    src.columns[1][0] = c0;
+
+    const size_t need = wire::bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    std::vector<uint8_t> buf(need, 0);
+    ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
+
+    BoltBatch dst;
+    BoltBatch::init_empty(&dst);
+    ASSERT_TRUE(
+        wire::bolt_wire_deserialize(buf.data(), buf.size(), &dst, &arena_dst));
+    EXPECT_EQ(dst.num_cols, 1u);
+    EXPECT_EQ(dst.num_rows, kN);
+
+    const BoltColumn& d0 = dst.columns[dst.read_epoch][0];
+    EXPECT_EQ(d0.format, ColumnFormat::Flat);
+    EXPECT_EQ(d0.type, BoltType::Utf8);
+    ASSERT_NE(d0.str_overflow_base, nullptr);
+
+    const auto* drows = static_cast<const StringView*>(d0.data);
+    const auto* dbase = static_cast<const char*>(d0.str_overflow_base);
+
+    EXPECT_EQ(drows[0].length, 2u);
+    EXPECT_EQ(std::memcmp(drows[0].prefix, "hi", 2), 0);
+
+    EXPECT_EQ(drows[1].length, 20u);
+    EXPECT_EQ(std::memcmp(dbase + drows[1].ref.offset, strA, 20), 0);
+
+    EXPECT_EQ(drows[2].length, 12u);
+
+    EXPECT_EQ(drows[3].length, 18u);
+    EXPECT_EQ(std::memcmp(dbase + drows[3].ref.offset, strB, 18), 0);
+
+    // Null row's validity bit survived the round-trip.
+    ASSERT_NE(d0.validity, nullptr);
+    EXPECT_EQ((d0.validity[0] >> 4) & 1u, 0u);
 }
