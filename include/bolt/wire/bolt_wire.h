@@ -161,22 +161,31 @@ BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
 // StringView[length] row array (16 bytes/row, same as any other Flat
 // type); b2 is the spilled-overflow bytes ACTUALLY referenced by a valid
 // (non-null) row with length > 12 — there is no stored "bytes used" field
-// on BoltColumn, so this walks rows exactly like
-// `BoltColumn::clone_into()`'s own Utf8 deep-copy fix (shared helper,
-// `bolt::detail::utf8_overflow_used_bytes`, defined in bolt_column.h).
+// on BoltColumn, so this walks rows via the shared helper
+// `bolt::detail::utf8_overflow_span` (bolt_column.h). `*out_min_off` is the
+// LOWEST `ref.offset` referenced by any row in `c` — 0 for a whole (row-0-
+// based) column, but potentially large for a SLICE of a bigger column (a
+// chunk of a windowed/chunked wire-serialize): those rows' offsets are
+// still absolute into the ORIGINAL overflow buffer. The caller must copy
+// `str_overflow_base[*out_min_off, *out_min_off + *out_b2)` — NOT
+// `[0, *out_b2)` — and rebase each written row's `ref.offset` by
+// `-*out_min_off`, or a sliced column's b2 silently balloons to include
+// every earlier row's spilled bytes too (G2FEAT-308/311's finding).
 // Returns b2 == 0 when every row is inline or str_overflow_base is null
 // (nothing to spill) — the caller decides whether a non-zero b2 with a
 // null str_overflow_base is a malformed-column error.
 BOLT_FORCE_INLINE void flat_utf8_sizes(const BoltColumn& c,
-                                       size_t* out_b1, size_t* out_b2) noexcept {
-    assert(out_b1 != nullptr && out_b2 != nullptr);
+                                       size_t* out_b1, size_t* out_b2,
+                                       size_t* out_min_off) noexcept {
+    assert(out_b1 != nullptr && out_b2 != nullptr && out_min_off != nullptr);
     assert(c.type == BoltType::Utf8 && c.format == ColumnFormat::Flat);
     *out_b1 = static_cast<size_t>(c.length) * sizeof(StringView);
     *out_b2 = 0;
+    *out_min_off = 0;
     if (c.length > 0 && c.data != nullptr && c.str_overflow_base != nullptr) {
         const auto* rows = static_cast<const StringView*>(c.data);
-        *out_b2 = bolt::detail::utf8_overflow_used_bytes(
-            rows, c.length, c.validity, c.validity_offset);
+        bolt::detail::utf8_overflow_span(rows, c.length, c.validity,
+                                         c.validity_offset, out_min_off, out_b2);
     }
 }
 
@@ -264,7 +273,8 @@ inline size_t collect_column_sizes(const BoltBatch* b,
                 return 0;            // length > 0 but no offsets
             }
         } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
-            flat_utf8_sizes(c, &d_len, &s_len);
+            size_t min_off_unused = 0;
+            flat_utf8_sizes(c, &d_len, &s_len, &min_off_unused);
             if (s_len > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
         } else {
             // Flat numeric / Bool / Embedding. Embedding uses the 3-arg
@@ -335,9 +345,11 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     if (b->num_cols > kWireMaxCols) return 0;
 
     size_t b0[kWireMaxCols], b1[kWireMaxCols], b2[kWireMaxCols];
+    size_t utf8_min_off[kWireMaxCols];   // only meaningful for Flat+Utf8 cols
     memset(b0, 0, sizeof(b0));
     memset(b1, 0, sizeof(b1));
     memset(b2, 0, sizeof(b2));
+    memset(utf8_min_off, 0, sizeof(utf8_min_off));
 
     // Collect sizes + validate supported formats.
     for (uint32_t i = 0; i < b->num_cols; ++i) {
@@ -359,7 +371,7 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
                 return 0;
             }
         } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
-            detail::flat_utf8_sizes(c, &b1[i], &b2[i]);
+            detail::flat_utf8_sizes(c, &b1[i], &b2[i], &utf8_min_off[i]);
             if (b2[i] > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
         } else {
             b1[i] = detail::data_buffer_size(c.type, c.length,
@@ -431,12 +443,34 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
                 memcpy(buf + off2, c.data, b2[i]);
             }
         } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
-            // b1 = StringView row array (offsets inside are unchanged —
-            // b2 below copies the overflow buffer's [0, b2[i]) PREFIX
-            // verbatim, so every row's `ref.offset` still resolves
-            // correctly against the copy). b2 = spilled bytes.
-            if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
-            if (b2[i] && c.str_overflow_base) memcpy(buf + off2, c.str_overflow_base, b2[i]);
+            // b1 = StringView row array; b2 = spilled bytes. G2FEAT-308/311:
+            // `c` may be a SLICE of a larger column (a chunked/windowed
+            // batch), so spilled rows' `ref.offset` can be far from 0 —
+            // b2 was sized as [utf8_min_off[i], utf8_min_off[i]+b2[i]) by
+            // flat_utf8_sizes, NOT [0, b2[i]). Copy that span (not a [0,..)
+            // prefix) and REBASE each spilled row's offset by -utf8_min_off[i]
+            // so it resolves correctly against the copied span; inline rows
+            // (length <= 12, no ref.offset) pass through untouched. When
+            // utf8_min_off[i] == 0 (the common whole-column case) every
+            // rebased offset equals the original — no behavior change there.
+            if (b1[i] && c.data) {
+                const auto* src_rows = static_cast<const StringView*>(c.data);
+                auto* dst_rows = reinterpret_cast<StringView*>(buf + off1);
+                const size_t moff = utf8_min_off[i];
+                for (int64_t r = 0; r < c.length; ++r) {
+                    StringView v = src_rows[r];
+                    if (v.length > 12u) {
+                        v.ref.offset = static_cast<uint32_t>(
+                            static_cast<size_t>(v.ref.offset) - moff);
+                    }
+                    dst_rows[r] = v;
+                }
+            }
+            if (b2[i] && c.str_overflow_base) {
+                memcpy(buf + off2,
+                      static_cast<const uint8_t*>(c.str_overflow_base) + utf8_min_off[i],
+                      b2[i]);
+            }
         } else {
             if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
         }
@@ -582,9 +616,12 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
             }
             // Flat Utf8 (v3+): b2 is the spilled-overflow byte buffer any
             // >12-byte row's StringView::ref.offset resolves against.
-            // Offsets are unchanged relative values (serialize copied the
-            // overflow buffer's [0, len) prefix verbatim) — no re-basing
-            // needed, just point str_overflow_base at the resolved span.
+            // No re-basing needed HERE: `bolt_wire_serialize` already
+            // rebased every row's `ref.offset` (subtracting the source
+            // column's minimum spilled offset — see `flat_utf8_sizes` /
+            // G2FEAT-308/311) so offsets are relative to THIS b2 span's
+            // start, wherever in the ORIGINAL buffer that span came from —
+            // just point str_overflow_base at the resolved span.
             if (f.type == BoltType::Utf8 && l2) {
                 c.str_overflow_base = detail::wire_span<kView>(p, o2, l2, arena);
                 if (!c.str_overflow_base) return false;

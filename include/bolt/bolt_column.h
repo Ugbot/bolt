@@ -1248,6 +1248,49 @@ inline size_t utf8_overflow_used_bytes(const StringView* rows, int64_t n,
     return used;
 }
 
+// Like `utf8_overflow_used_bytes`, but ALSO reports the lowest referenced
+// `ref.offset` (not just the highest end). `utf8_overflow_used_bytes` alone
+// implicitly assumes `rows` is the FULL column starting at its own row 0 —
+// correct for a whole-column clone, where offset 0 IS the start of
+// `str_overflow_base`. It silently over-counts for a SLICE of a larger
+// column (e.g. one chunk of a windowed/chunked wire-serialize): a window
+// starting well past row 0 still has its rows' `ref.offset` values pointing
+// at their true (large, absolute) position in the ORIGINAL overflow buffer,
+// so `used = max(end)` alone reports "bytes from the start of the whole
+// buffer through this window" instead of "bytes this window's own rows
+// occupy" — a serializer that then copies `[0, used)` copies every earlier
+// row's spilled bytes too, growing without bound as the window moves
+// forward regardless of how few rows it contains. Callers that may see a
+// sliced column (`bolt/wire/bolt_wire.h`'s Flat-Utf8 wire support) use this
+// overload and copy `[*out_min, *out_min + *out_used)` instead.
+// `*out_min`/`*out_used` are both 0 when no row in `[rows, rows+n)` spills.
+inline void utf8_overflow_span(const StringView* rows, int64_t n,
+                               const uint8_t* validity,
+                               int64_t validity_offset,
+                               size_t* out_min, size_t* out_used) noexcept {
+    assert(rows != nullptr || n == 0);
+    assert(n >= 0);
+    assert(out_min != nullptr && out_used != nullptr);
+    size_t min_off = 0, max_end = 0;
+    bool any = false;
+    for (int64_t i = 0; i < n; ++i) {
+        if (validity != nullptr) {
+            const int64_t bit = validity_offset + i;
+            const uint8_t b = (validity[bit >> 3] >> (bit & 7)) & 1u;
+            if (b == 0u) continue;  // null row: slot may be uninitialized
+        }
+        if (rows[i].length > 12u) {
+            const size_t off = static_cast<size_t>(rows[i].ref.offset);
+            const size_t end = off + static_cast<size_t>(rows[i].length);
+            if (!any || off < min_off) min_off = off;
+            if (end > max_end) max_end = end;
+            any = true;
+        }
+    }
+    *out_min  = any ? min_off : 0u;
+    *out_used = any ? (max_end - min_off) : 0u;
+}
+
 }  // namespace detail
 
 inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
