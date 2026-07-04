@@ -697,6 +697,127 @@ TEST(BoltColumn, CloneIntoConstant) {
     EXPECT_EQ(c2.get_constant<int64_t>(), 77);
 }
 
+namespace {
+// Manually build a spilled (>12-byte) StringView; offset is relative to the
+// caller's own overflow buffer (0-based), mirroring how real producers
+// (bolt_parquet_read.cpp's sv_from_bytes) lay out a column-private spill pool.
+StringView make_spilled_sv(const char* bytes, uint32_t len, uint32_t offset) {
+    StringView v;
+    std::memset(&v, 0, sizeof(v));
+    v.length = len;
+    std::memcpy(v.prefix, bytes, 4);
+    v.ref.buf_idx = 0;
+    v.ref.offset = offset;
+    return v;
+}
+
+StringView make_inline_sv(const char* bytes, uint32_t len) {
+    StringView v;
+    std::memset(&v, 0, sizeof(v));
+    v.length = len;
+    const uint32_t p = (len < 4u) ? len : 4u;
+    if (p > 0) std::memcpy(v.prefix, bytes, p);
+    if (len > 4u) std::memcpy(v.inline_data, bytes + 4, len - 4u);
+    return v;
+}
+}  // namespace
+
+// G2FEAT-307 bug-class regression: clone_into() must deep-copy a Utf8
+// column's spilled-string overflow buffer (str_overflow_base), not just the
+// fixed-width StringView row array. Before the fix, a cloned column's
+// spilled rows kept pointing at the ORIGINAL producer's overflow buffer —
+// dangling as soon as that buffer was reclaimed (e.g. MarbleDB's next
+// scan_next() call). Mixes inline (<=12 byte) and spilled (>12 byte) rows,
+// plus one NULL row deliberately holding uninitialized-looking garbage (a
+// bogus huge length + offset) to prove the overflow-sizing walk skips null
+// rows rather than misreading garbage as a real spilled reference.
+TEST(BoltColumn, CloneIntoFlatUtf8SpilledStringsSurviveSourceOverwrite) {
+    const char strA[] = "AAAAAAAAAAAAAAAAAAAA";  // 20 bytes, spilled
+    const char strB[] = "BBBBBBBBBBBBBBBBBB";     // 18 bytes, spilled
+    ASSERT_EQ(std::strlen(strA), 20u);
+    ASSERT_EQ(std::strlen(strB), 18u);
+
+    // Column-private overflow pool: strA at offset 0, strB at offset 20.
+    constexpr size_t kOvfCap = 64;
+    auto* ovf = new char[kOvfCap];
+    std::memset(ovf, 0, kOvfCap);
+    std::memcpy(ovf, strA, 20);
+    std::memcpy(ovf + 20, strB, 18);
+
+    constexpr int64_t kN = 5;
+    auto* rows = new StringView[kN];
+    rows[0] = make_inline_sv("hi", 2);
+    rows[1] = make_spilled_sv(strA, 20, 0);
+    rows[2] = make_inline_sv("twelve_chars", 12);  // exactly 12: still inline
+    rows[3] = make_spilled_sv(strB, 18, 20);
+    std::memset(&rows[4], 0xAB, sizeof(StringView));  // garbage; row is NULL
+
+    // validity: bits 0-3 valid, bit 4 (row4) null.
+    uint8_t validity = 0b00001111u;
+
+    BoltColumn col = BoltColumn::make_flat(rows, &validity, kN, BoltType::Utf8);
+    col.str_overflow_base = ovf;
+
+    Arena dst_arena;
+    BoltColumn c2 = col.clone_into(&dst_arena);
+
+    ASSERT_EQ(c2.format, ColumnFormat::Flat);
+    ASSERT_EQ(c2.length, kN);
+    ASSERT_NE(c2.data, static_cast<void*>(rows));           // deep-copied
+    ASSERT_NE(c2.str_overflow_base, static_cast<void*>(ovf)); // deep-copied
+    ASSERT_NE(c2.str_overflow_base, nullptr);
+
+    // Poison the ORIGINAL buffers before reading back the clone — proves
+    // the clone no longer depends on either the row array or the overflow
+    // pool the producer owned.
+    std::memset(rows, 0xEE, kN * sizeof(StringView));
+    std::memset(ovf, 0xEE, kOvfCap);
+
+    const auto* crows = static_cast<const StringView*>(c2.data);
+    const auto* cbase = static_cast<const char*>(c2.str_overflow_base);
+
+    EXPECT_EQ(crows[0].length, 2u);
+    EXPECT_EQ(std::memcmp(crows[0].prefix, "hi", 2), 0);  // inline, in-struct
+
+    EXPECT_EQ(crows[1].length, 20u);
+    ASSERT_LE(static_cast<size_t>(crows[1].ref.offset) + crows[1].length, kOvfCap);
+    EXPECT_EQ(std::memcmp(cbase + crows[1].ref.offset, strA, 20), 0);
+
+    EXPECT_EQ(crows[2].length, 12u);
+
+    EXPECT_EQ(crows[3].length, 18u);
+    ASSERT_LE(static_cast<size_t>(crows[3].ref.offset) + crows[3].length, kOvfCap);
+    EXPECT_EQ(std::memcmp(cbase + crows[3].ref.offset, strB, 18), 0);
+
+    // Null row's bit survived the clone; its garbage content is never read.
+    EXPECT_EQ((c2.validity[0] >> 4) & 1u, 0u);
+
+    delete[] rows;
+    delete[] ovf;
+}
+
+// When every row is inline (or the only spilled rows are null), the clone
+// must not carry a stale str_overflow_base pointer forward.
+TEST(BoltColumn, CloneIntoFlatUtf8AllInlineHasNoOverflowPointer) {
+    auto* ovf = new char[16];
+    std::memset(ovf, 0, 16);
+
+    constexpr int64_t kN = 2;
+    auto* rows = new StringView[kN];
+    rows[0] = make_inline_sv("hi", 2);
+    rows[1] = make_inline_sv("bye", 3);
+
+    BoltColumn col = BoltColumn::make_flat(rows, nullptr, kN, BoltType::Utf8);
+    col.str_overflow_base = ovf;  // set, but never actually referenced
+
+    Arena dst_arena;
+    BoltColumn c2 = col.clone_into(&dst_arena);
+    EXPECT_EQ(c2.str_overflow_base, nullptr);
+
+    delete[] rows;
+    delete[] ovf;
+}
+
 TEST(BoltColumn, MaterializeConstant) {
     Arena a;
     auto col = BoltColumn::make_constant<int32_t>(9, 64, BoltType::Int32);

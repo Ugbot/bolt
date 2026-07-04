@@ -1208,6 +1208,48 @@ inline VectorStats* BoltColumn::compute_stats_vector(Arena* arena) noexcept {
 // BoltColumn::clone_into
 // ============================================================================
 
+namespace detail {
+
+// Utf8 spilled-bytes (`str_overflow_base`) sizing helper for `clone_into()`.
+//
+// `BoltColumn` has no "bytes actually used" field for the overflow buffer —
+// `str_overflow_base`'s allocated capacity (tracked only by the producer,
+// e.g. bolt_parquet_read.cpp's `ColCtx::overflow_cap`) is merely an upper
+// bound. So a correct deep-copy must walk the StringView row array and find
+// the highest `ref.offset + length` actually referenced by a VALID row —
+// mirroring the inline-vs-spilled row walk `bolt_parquet_write.cpp`'s
+// `encode_plain_byte_array` already performs for the same reason.
+//
+// Null rows are explicitly skipped (not merely `length <= 12` short-circuited):
+// producers such as `plain_utf8()` in bolt_parquet_read.cpp `continue` on a
+// null row WITHOUT writing that row's StringView slot at all, and
+// `Arena::allocate()` does not zero-fill, so a null slot may hold arbitrary
+// leftover bytes — including a `length` field that misreads as > 12 with a
+// garbage `ref.offset`. Reading only valid rows' lengths avoids treating that
+// garbage as a real spilled reference.
+inline size_t utf8_overflow_used_bytes(const StringView* rows, int64_t n,
+                                       const uint8_t* validity,
+                                       int64_t validity_offset) noexcept {
+    assert(rows != nullptr || n == 0);
+    assert(n >= 0);
+    size_t used = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (validity != nullptr) {
+            const int64_t bit = validity_offset + i;
+            const uint8_t b = (validity[bit >> 3] >> (bit & 7)) & 1u;
+            if (b == 0u) continue;  // null row: slot may be uninitialized
+        }
+        if (rows[i].length > 12u) {
+            const size_t end = static_cast<size_t>(rows[i].ref.offset) +
+                               static_cast<size_t>(rows[i].length);
+            if (end > used) used = end;
+        }
+    }
+    return used;
+}
+
+}  // namespace detail
+
 inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
     assert(arena_in != nullptr);
     assert(length >= 0);
@@ -1288,7 +1330,41 @@ inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
                 *nc = dict_child->clone_into(arena_in);
                 c.dict_child = nc;
             }
-            break;
+            // NOTE: a Dictionary-format column's own `data` holds integer
+            // keys, not StringViews, even when its logical `type` is Utf8 —
+            // the real StringView payload (and str_overflow_base) lives on
+            // `dict_child`, already deep-copied above. Do not run the Utf8
+            // overflow walk below against key data.
+            return c;
+        }
+    }
+
+    // Utf8 spilled-string overflow deep-copy (G2FEAT-307 bug class): Flat
+    // (including View, promoted to Flat above) and Constant are the only
+    // formats whose `data`/`inline_value` are StringView-shaped. Every other
+    // format either can't carry Utf8 payload directly (Dictionary handled
+    // via `return c` above) or is numeric-only (Sequence/RLE/BitPacked/
+    // FrameOfRef) — str_overflow_base stays whatever the shallow copy gave
+    // it (normally nullptr) for those.
+    if (type == BoltType::Utf8 && str_overflow_base != nullptr) {
+        size_t used = 0;
+        if (c.format == ColumnFormat::Flat) {
+            const auto* rows = static_cast<const StringView*>(c.data);
+            used = detail::utf8_overflow_used_bytes(rows, c.length, c.validity,
+                                                    c.validity_offset);
+        } else if (c.format == ColumnFormat::Constant) {
+            const auto* row = reinterpret_cast<const StringView*>(c.inline_value);
+            used = detail::utf8_overflow_used_bytes(row, 1, nullptr, 0);
+        }
+        if (used > 0) {
+            void* nspill = arena_in->copy_into(str_overflow_base, used);
+            if (!nspill) return make_empty();
+            c.str_overflow_base = nspill;
+        } else {
+            // No row actually references the spill buffer (all inline, or
+            // every referencing row was null) — do not carry a stale
+            // pointer into the destination arena's lifetime.
+            c.str_overflow_base = nullptr;
         }
     }
     return c;
