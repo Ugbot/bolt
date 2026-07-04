@@ -335,3 +335,112 @@ TEST(BoltWire, FlatUtf8RoundTrip) {
     ASSERT_NE(d0.validity, nullptr);
     EXPECT_EQ((d0.validity[0] >> 4) & 1u, 0u);
 }
+
+// G2FEAT-311: a chunked/windowed writer (e.g. chukonu's streaming
+// Parquet->MarbleDB loader) serializes a Flat-Utf8 column that is a SLICE
+// of a larger one -- `data` pointer advanced past row 0, `str_overflow_base`
+// left as the ORIGINAL (absolute) buffer. Before the fix, flat_utf8_sizes
+// measured spilled bytes as max(ref.offset+length) with an implicit "the
+// column starts at offset 0 of its own buffer" assumption, so a late slice
+// (whose rows reference large absolute offsets) serialized a b2 spanning
+// EVERY earlier row's bytes too -- unboundedly growing with the slice's
+// start position, not with its own row count. This proves a late 2-row
+// slice of a 4-row column wire-sizes/serializes proportionally to its own
+// 2 rows, and round-trips to the correct string content.
+TEST(BoltWire, FlatUtf8SlicedViewRoundTrip) {
+    Arena arena_src, arena_dst;
+
+    // Build a FULL 4-row column: two early spilled rows (small absolute
+    // offsets) and two late spilled rows (large absolute offsets, as if
+    // many earlier rows' worth of string data already precedes them).
+    const char* strEarly0 = "EARLY_ROW_ZERO_SPILLED_TEXT";       // 28 bytes
+    const char* strEarly1 = "EARLY_ROW_ONE_SPILLED_TEXT_TOO";    // 30 bytes
+    const char* strLate0  = "LATE_ROW_TWO_SPILLED_TEXT_HERE";    // 30 bytes
+    const char* strLate1  = "LATE_ROW_THREE_SPILLED_TEXT_END";   // 31 bytes
+    const uint32_t lenEarly0 = static_cast<uint32_t>(std::strlen(strEarly0));
+    const uint32_t lenEarly1 = static_cast<uint32_t>(std::strlen(strEarly1));
+    const uint32_t lenLate0  = static_cast<uint32_t>(std::strlen(strLate0));
+    const uint32_t lenLate1  = static_cast<uint32_t>(std::strlen(strLate1));
+
+    // Simulate a MUCH larger prefix (as if thousands of earlier rows'
+    // spilled bytes already occupy this space) before the two "late" rows'
+    // actual bytes -- large enough that pre-fix code (which would copy
+    // [0, max_end)) would produce a payload orders of magnitude bigger
+    // than these two rows' own ~60 bytes.
+    constexpr uint32_t kFakePrefixBytes = 200000;
+    const uint32_t off_early0 = 0;
+    const uint32_t off_early1 = off_early0 + lenEarly0;
+    const uint32_t off_late0  = kFakePrefixBytes;
+    const uint32_t off_late1  = off_late0 + lenLate0;
+
+    const uint32_t total_ovf = off_late1 + lenLate1;
+    auto* ovf = static_cast<char*>(arena_src.allocate(total_ovf, 1));
+    std::memset(ovf, 0, total_ovf);
+    std::memcpy(ovf + off_early0, strEarly0, lenEarly0);
+    std::memcpy(ovf + off_early1, strEarly1, lenEarly1);
+    std::memcpy(ovf + off_late0, strLate0, lenLate0);
+    std::memcpy(ovf + off_late1, strLate1, lenLate1);
+
+    auto make_spilled = [](const char* bytes, uint32_t len, uint32_t off) {
+        StringView v; std::memset(&v, 0, sizeof(v)); v.length = len;
+        std::memcpy(v.prefix, bytes, 4);
+        v.ref.buf_idx = 0; v.ref.offset = off;
+        return v;
+    };
+
+    constexpr int64_t kFullN = 4;
+    auto* full_rows = arena_src.allocate_array<StringView>(kFullN);
+    full_rows[0] = make_spilled(strEarly0, lenEarly0, off_early0);
+    full_rows[1] = make_spilled(strEarly1, lenEarly1, off_early1);
+    full_rows[2] = make_spilled(strLate0, lenLate0, off_late0);
+    full_rows[3] = make_spilled(strLate1, lenLate1, off_late1);
+
+    // The SLICE: rows [2, 4) only. `data` advances past rows 0-1;
+    // `str_overflow_base` stays the SAME absolute buffer (unchanged) --
+    // exactly how chukonu's row-group chunking builds a chunk view.
+    BoltBatch src;
+    BoltBatch::init_empty(&src);
+    src.arena    = &arena_src;
+    src.num_cols = 1;
+    src.num_rows = 2;
+    src.schema.num_fields = 1;
+    {
+        BoltField& f0 = src.schema.fields[0];
+        std::memset(&f0, 0, sizeof(f0));
+        std::memcpy(f0.name, "phrase", 6);
+        f0.type = BoltType::Utf8;
+    }
+    BoltColumn c0 = BoltColumn::make_flat(full_rows + 2, /*validity=*/nullptr,
+                                          /*length=*/2, BoltType::Utf8);
+    c0.str_overflow_base = ovf;   // unchanged absolute base
+    src.columns[0][0] = c0;
+    src.columns[1][0] = c0;
+
+    const size_t need = wire::bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    // The whole point of the fix: a 2-row slice must wire-size proportional
+    // to its OWN ~61 bytes of spilled content, not the ~200 KB fake prefix
+    // that precedes it in the original buffer.
+    EXPECT_LT(need, 4096u) << "sliced Flat-Utf8 column over-counted spilled "
+                              "bytes from rows outside the slice (min-offset "
+                              "rebasing regressed)";
+
+    std::vector<uint8_t> buf(need, 0);
+    ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
+
+    BoltBatch dst;
+    BoltBatch::init_empty(&dst);
+    ASSERT_TRUE(
+        wire::bolt_wire_deserialize(buf.data(), buf.size(), &dst, &arena_dst));
+    EXPECT_EQ(dst.num_rows, 2);
+
+    const BoltColumn& d0 = dst.columns[dst.read_epoch][0];
+    ASSERT_NE(d0.str_overflow_base, nullptr);
+    const auto* drows = static_cast<const StringView*>(d0.data);
+    const auto* dbase = static_cast<const char*>(d0.str_overflow_base);
+
+    EXPECT_EQ(drows[0].length, lenLate0);
+    EXPECT_EQ(std::memcmp(dbase + drows[0].ref.offset, strLate0, lenLate0), 0);
+    EXPECT_EQ(drows[1].length, lenLate1);
+    EXPECT_EQ(std::memcmp(dbase + drows[1].ref.offset, strLate1, lenLate1), 0);
+}
