@@ -165,6 +165,37 @@ inline void window_agg_f64(WinAgg kind, const double* BOLT_RESTRICT vals,
     }
 }
 
+// window_agg_f64_range — compute out[i] for i in [i0, i1) of one partition's
+// value slice, via the SAME general per-row [lo, hi] re-aggregation loop as
+// window_agg_f64's general path. Because agg_window re-aggregates every
+// window left-to-right from scratch, out[i] depends only on vals[lo..hi] and
+// carries NO cross-row state — so any row split of [0, n) produces results
+// bit-identical to the full-range call. (window_agg_f64's cumulative /
+// whole-partition fast paths are themselves left-associated re-statements of
+// this loop, value-identical by construction; callers wanting the O(n) fast
+// paths should still call window_agg_f64 for the full range.)
+//
+// The intended caller is a window operator splitting ONE partition's rows
+// across scheduler workers when the frame would take the O(n·w) general loop
+// anyway (bounded ROWS frames; cumulative VAR/STDDEV, which have no running
+// fold and are O(n^2) serial).
+inline void window_agg_f64_range(WinAgg kind, const double* BOLT_RESTRICT vals,
+                                 std::int64_t n, Frame fr,
+                                 double* BOLT_RESTRICT out,
+                                 std::int64_t i0, std::int64_t i1) noexcept {
+    assert((vals != nullptr && out != nullptr) || n == 0);
+    assert(fr.start_preceding >= 0 && fr.end_following >= 0);
+    assert(0 <= i0 && i0 <= i1 && i1 <= n);
+    for (std::int64_t i = i0; i < i1; ++i) {
+        std::int64_t lo = fr.start_unbounded ? 0 : (i - fr.start_preceding);
+        std::int64_t hi = fr.end_unbounded   ? (n - 1) : (i + fr.end_following);
+        if (lo < 0)     lo = 0;
+        if (hi > n - 1) hi = n - 1;
+        assert(lo <= hi);   // holds: lo<=i<=hi for all standard bounds
+        out[i] = agg_window(kind, vals, lo, hi);
+    }
+}
+
 }  // namespace window_agg
 }  // namespace kernels
 }  // namespace bolt
