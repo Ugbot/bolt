@@ -233,7 +233,58 @@ BOLT_FORCE_INLINE void utf8_compare(
 
 // ===========================================================================
 // 2. utf8_filter_eq / utf8_filter_ne — equality selection vector.
+//
+// Inline-scalar fast lane (InlineEqPattern): an INLINE (<= 12-byte)
+// equality literal — ticker symbols, exchange codes, country/status enums —
+// compares against a row view with THREE branchless data-independent ops:
+// length equal, 4-byte prefix equal under a length mask, 8-byte inline tail
+// equal under a length mask. Masks depend only on the scalar, so they are
+// computed ONCE per filter call; no per-row memcmp call, no per-row branch
+// on match. Masking (rather than whole-struct compare) keeps this exact
+// even for producers that do NOT zero-pad an inline view's unused bytes.
+// A spilled row view (length > 12) fails the length check and is never
+// dereferenced.
 // ===========================================================================
+struct InlineEqPattern {
+    uint32_t len;
+    uint32_t pfx;         // scalar prefix bytes, masked
+    uint32_t pfx_mask;    // low min(len,4) bytes
+    uint64_t tail;        // scalar inline_data bytes, masked
+    uint64_t tail_mask;   // low max(len-4,0) bytes (<= 8)
+};
+
+BOLT_FORCE_INLINE InlineEqPattern inline_eq_prepare(
+        const StringView& scalar) noexcept {
+    assert(scalar.length <= 12u);
+    InlineEqPattern p;
+    p.len = scalar.length;
+    const uint32_t plen = (p.len < 4u) ? p.len : 4u;
+    p.pfx_mask = (plen == 4u) ? 0xFFFFFFFFu
+                              : ((plen == 0u) ? 0u : ((1u << (8u * plen)) - 1u));
+    uint32_t pfx = 0;
+    memcpy(&pfx, scalar.prefix, 4);
+    p.pfx = pfx & p.pfx_mask;
+    const uint32_t tlen = (p.len > 4u) ? p.len - 4u : 0u;
+    assert(tlen <= 8u);
+    p.tail_mask = (tlen == 8u) ? ~0ull : ((1ull << (8u * tlen)) - 1ull);
+    uint64_t tail = 0;
+    memcpy(&tail, scalar.inline_data, 8);
+    p.tail = tail & p.tail_mask;
+    return p;
+}
+
+BOLT_FORCE_INLINE bool inline_eq_match(
+        const StringView& s, const InlineEqPattern& p) noexcept {
+    uint32_t pfx = 0;
+    memcpy(&pfx, s.prefix, 4);
+    uint64_t tail = 0;
+    memcpy(&tail, s.inline_data, 8);
+    // All three legs evaluate unconditionally — no per-row branch.
+    return (s.length == p.len) &
+           ((pfx & p.pfx_mask) == p.pfx) &
+           ((tail & p.tail_mask) == p.tail);
+}
+
 BOLT_FORCE_INLINE int64_t utf8_filter_eq(
         const StringView* BOLT_RESTRICT data, int64_t n,
         StringView scalar,
@@ -243,9 +294,18 @@ BOLT_FORCE_INLINE int64_t utf8_filter_eq(
     assert(data    != nullptr || n == 0);
     assert(sel_out != nullptr || n == 0);
     assert(n >= 0);
+    int64_t count = 0;
+    if (scalar.length <= 12u) {
+        // Inline literal: branchless masked compare (see InlineEqPattern).
+        const InlineEqPattern pat = inline_eq_prepare(scalar);
+        for (int64_t i = 0; i < n; ++i) {
+            sel_out[count] = static_cast<int32_t>(i);
+            count += inline_eq_match(data[i], pat) ? 1 : 0;
+        }
+        return count;
+    }
     const char* sb = sv_bytes(scalar, spilled_base_scalar);
     const uint32_t slen = scalar.length;
-    int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         const StringView& s = data[i];
         bool match = (s.length == slen);
@@ -272,9 +332,18 @@ BOLT_FORCE_INLINE int64_t utf8_filter_ne(
     assert(data    != nullptr || n == 0);
     assert(sel_out != nullptr || n == 0);
     assert(n >= 0);
+    int64_t count = 0;
+    if (scalar.length <= 12u) {
+        // Inline literal: branchless masked compare (see InlineEqPattern).
+        const InlineEqPattern pat = inline_eq_prepare(scalar);
+        for (int64_t i = 0; i < n; ++i) {
+            sel_out[count] = static_cast<int32_t>(i);
+            count += inline_eq_match(data[i], pat) ? 0 : 1;
+        }
+        return count;
+    }
     const char* sb = sv_bytes(scalar, spilled_base_scalar);
     const uint32_t slen = scalar.length;
-    int64_t count = 0;
     for (int64_t i = 0; i < n; ++i) {
         const StringView& s = data[i];
         bool eq = (s.length == slen);
@@ -286,6 +355,89 @@ BOLT_FORCE_INLINE int64_t utf8_filter_ne(
             }
         }
         sel_out[count] = static_cast<int32_t>(i);
+        count += eq ? 0 : 1;
+    }
+    return count;
+}
+
+// ===========================================================================
+// 2b. _selected filter variants — sparse-morsel siblings of
+// utf8_filter_eq/ne (same relationship as decimal128_filter_*_selected):
+// chunked sources emit identity-sel windows, so the sparse lane — not the
+// dense one — is what real scans hit (2026-07-10 TAQ ETW: the scalar
+// fallback lane was the top real leaf on every sym=/ex= predicate).
+// ===========================================================================
+BOLT_FORCE_INLINE int64_t utf8_filter_eq_selected(
+        const StringView* BOLT_RESTRICT data,
+        const int32_t*    BOLT_RESTRICT sel, int64_t in_n,
+        StringView scalar,
+        int32_t*   BOLT_RESTRICT sel_out,
+        const char* spilled_base_data = nullptr,
+        const char* spilled_base_scalar = nullptr) noexcept {
+    assert(data    != nullptr || in_n == 0);
+    assert(sel     != nullptr || in_n == 0);
+    assert(sel_out != nullptr || in_n == 0);
+    assert(in_n >= 0);
+    int64_t count = 0;
+    if (scalar.length <= 12u) {
+        const InlineEqPattern pat = inline_eq_prepare(scalar);
+        for (int64_t i = 0; i < in_n; ++i) {
+            const int32_t r = sel[i];
+            sel_out[count] = r;
+            count += inline_eq_match(data[r], pat) ? 1 : 0;
+        }
+        return count;
+    }
+    const char* sb = sv_bytes(scalar, spilled_base_scalar);
+    const uint32_t slen = scalar.length;
+    for (int64_t i = 0; i < in_n; ++i) {
+        const int32_t r = sel[i];
+        const StringView& s = data[r];
+        bool match = (s.length == slen) &&
+                     (memcmp(s.prefix, scalar.prefix, 4) == 0);
+        if (match) {
+            const char* pd = sv_bytes(s, spilled_base_data);
+            match = bytes_equal_simd(pd + 4, sb + 4, slen - 4u);
+        }
+        sel_out[count] = r;
+        count += match ? 1 : 0;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE int64_t utf8_filter_ne_selected(
+        const StringView* BOLT_RESTRICT data,
+        const int32_t*    BOLT_RESTRICT sel, int64_t in_n,
+        StringView scalar,
+        int32_t*   BOLT_RESTRICT sel_out,
+        const char* spilled_base_data = nullptr,
+        const char* spilled_base_scalar = nullptr) noexcept {
+    assert(data    != nullptr || in_n == 0);
+    assert(sel     != nullptr || in_n == 0);
+    assert(sel_out != nullptr || in_n == 0);
+    assert(in_n >= 0);
+    int64_t count = 0;
+    if (scalar.length <= 12u) {
+        const InlineEqPattern pat = inline_eq_prepare(scalar);
+        for (int64_t i = 0; i < in_n; ++i) {
+            const int32_t r = sel[i];
+            sel_out[count] = r;
+            count += inline_eq_match(data[r], pat) ? 0 : 1;
+        }
+        return count;
+    }
+    const char* sb = sv_bytes(scalar, spilled_base_scalar);
+    const uint32_t slen = scalar.length;
+    for (int64_t i = 0; i < in_n; ++i) {
+        const int32_t r = sel[i];
+        const StringView& s = data[r];
+        bool eq = (s.length == slen) &&
+                  (memcmp(s.prefix, scalar.prefix, 4) == 0);
+        if (eq) {
+            const char* pd = sv_bytes(s, spilled_base_data);
+            eq = bytes_equal_simd(pd + 4, sb + 4, slen - 4u);
+        }
+        sel_out[count] = r;
         count += eq ? 0 : 1;
     }
     return count;

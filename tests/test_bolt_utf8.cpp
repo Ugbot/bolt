@@ -106,6 +106,85 @@ TEST_F(Utf8Test, FilterNe) {
     EXPECT_EQ(sel[0], 1);
 }
 
+// G2FEAT-341 — the inline masked-compare lane must be exact even when a
+// producer leaves GARBAGE in an inline view's unused prefix/inline_data
+// bytes (the mask, not zero-padding, carries correctness).
+TEST_F(Utf8Test, FilterEqInlineGarbagePadding) {
+    StringView data[4] = {
+        make_inline("ZTEK"),
+        make_inline("ZETA"),
+        make_inline("ZTEK"),
+        make_inline("ZT"),      // shorter — length leg must reject
+    };
+    // Poison every unused byte past each view's logical length.
+    for (auto& v : data) {
+        for (uint32_t b = v.length; b < 4u; ++b) v.prefix[b] = char(0xA5);
+        const uint32_t tl = (v.length > 4u) ? v.length - 4u : 0u;
+        for (uint32_t b = tl; b < 8u; ++b) v.inline_data[b] = char(0x5A);
+    }
+    auto needle = make_inline("ZTEK");
+    for (uint32_t b = 0; b < 8u; ++b) needle.inline_data[b] = char(0x77);
+    int32_t sel[4];
+    int64_t c = ku::utf8_filter_eq(data, 4, needle, sel);
+    ASSERT_EQ(c, 2);
+    EXPECT_EQ(sel[0], 0);
+    EXPECT_EQ(sel[1], 2);
+    // Boundary lengths: 4 (prefix-only), 12 (full inline), 0 (empty).
+    StringView d2[3] = { make_inline("ABCD"), make_inline("ABCDEFGHIJKL"),
+                         make_inline("") };
+    int64_t c4 = ku::utf8_filter_eq(d2, 3, make_inline("ABCD"), sel);
+    ASSERT_EQ(c4, 1);
+    EXPECT_EQ(sel[0], 0);
+    int64_t c12 = ku::utf8_filter_eq(d2, 3, make_inline("ABCDEFGHIJKL"), sel);
+    ASSERT_EQ(c12, 1);
+    EXPECT_EQ(sel[0], 1);
+    int64_t c0 = ku::utf8_filter_eq(d2, 3, make_inline(""), sel);
+    ASSERT_EQ(c0, 1);
+    EXPECT_EQ(sel[0], 2);
+}
+
+// G2FEAT-341 — sparse (_selected) variants: same results as the dense
+// kernels restricted to the selection, with sel_out carrying ROW ids.
+TEST_F(Utf8Test, FilterEqNeSelected) {
+    StringView data[6] = {
+        make_inline("L"),  make_inline("T"), make_inline("L"),
+        make_inline("N"),  make_inline("L"), make_inline("LL"),
+    };
+    const int32_t sel_in[4] = {0, 2, 3, 5};   // window skips rows 1 and 4
+    auto needle = make_inline("L");
+    int32_t sel_out[6];
+    int64_t c = ku::utf8_filter_eq_selected(data, sel_in, 4, needle, sel_out);
+    ASSERT_EQ(c, 2);
+    EXPECT_EQ(sel_out[0], 0);
+    EXPECT_EQ(sel_out[1], 2);
+    c = ku::utf8_filter_ne_selected(data, sel_in, 4, needle, sel_out);
+    ASSERT_EQ(c, 2);
+    EXPECT_EQ(sel_out[0], 3);
+    EXPECT_EQ(sel_out[1], 5);
+}
+
+TEST_F(Utf8Test, FilterEqSelectedSpilledScalar) {
+    const char buf[] = "AAAAAAAAAAAAAAAA"    // 16
+                       "BBBBBBBBBBBBBBBB"
+                       "AAAAAAAAAAAAAAAA";
+    StringView data[3] = {
+        make_spilled(buf, 16, 0),
+        make_spilled(buf + 16, 16, 16),
+        make_spilled(buf + 32, 16, 32),
+    };
+    const int32_t sel_in[3] = {0, 1, 2};
+    auto needle = make_spilled(buf, 16, 0);
+    int32_t sel_out[3];
+    int64_t c = ku::utf8_filter_eq_selected(data, sel_in, 3, needle, sel_out,
+                                            buf, buf);
+    ASSERT_EQ(c, 2);
+    EXPECT_EQ(sel_out[0], 0);
+    EXPECT_EQ(sel_out[1], 2);
+    c = ku::utf8_filter_ne_selected(data, sel_in, 3, needle, sel_out, buf, buf);
+    ASSERT_EQ(c, 1);
+    EXPECT_EQ(sel_out[0], 1);
+}
+
 TEST_F(Utf8Test, HashStability) {
     auto a = make_inline("hello");
     auto b = make_inline("hello");
