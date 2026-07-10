@@ -297,6 +297,84 @@ bool plain_fixed(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     return src == nvalid;
 }
 
+// PLAIN FLOAT (4-byte f32 source) widened to Float64 output (elem 8).
+// The source stride differs from the output stride, so plain_fixed's
+// equal-width memcpy cannot be reused (G2FEAT-346).
+bool plain_f32_widen(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                     const uint32_t* def, int64_t row0, uint32_t nrows,
+                     uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem == 8u);
+    if (static_cast<uint64_t>(nvalid) * 4u > vlen) return false;
+    double* dst = reinterpret_cast<double*>(cx->out) + row0;
+    uint64_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
+        if (def != nullptr && def[i] == 0u) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        float f = 0.0f;
+        std::memcpy(&f, v + src * 4u, 4);
+        dst[i] = static_cast<double>(f);
+        ++src;
+    }
+    return src == nvalid;
+}
+
+// PLAIN BOOLEAN: bit-packed LSB-first, one bit per VALID value ->
+// Int64 0/1 output (elem 8). Invalid rows consume no source bit.
+bool plain_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                const uint32_t* def, int64_t row0, uint32_t nrows,
+                uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem == 8u);
+    if ((static_cast<uint64_t>(nvalid) + 7u) / 8u > vlen) return false;
+    int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
+    uint64_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
+        if (def != nullptr && def[i] == 0u) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        dst[i] = static_cast<int64_t>((v[src >> 3] >> (src & 7u)) & 1u);
+        ++src;
+    }
+    return src == nvalid;
+}
+
+// RLE-encoded BOOLEAN data page (Encoding::RLE is legal for data values
+// on BOOLEAN only): u32 LE byte length, then an RLE/bit-packed hybrid
+// stream of bit-width-1 values -> Int64 0/1 output, def-level aware.
+bool rle_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+              const uint32_t* def, int64_t row0, uint32_t nrows,
+              uint32_t nvalid, Arena* arena) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem == 8u);
+    assert(arena != nullptr);
+    uint32_t* bits = nullptr;
+    if (nvalid > 0) {
+        if (vlen < 4) return false;
+        uint32_t bl = 0;
+        std::memcpy(&bl, v, 4);
+        if (4ull + bl > vlen) return false;
+        bits = static_cast<uint32_t*>(
+            arena->allocate(uint64_t{nvalid} * 4u, 4));
+        if (bits == nullptr) return false;
+        if (!rle_hybrid_decode(v + 4, bl, 1, nvalid, bits)) return false;
+    }
+    int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
+        if (def != nullptr && def[i] == 0u) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        if (k >= nvalid) return false;
+        dst[i] = static_cast<int64_t>(bits[k++] & 1u);
+    }
+    return k == nvalid;
+}
+
 // FLBA DECIMAL -> Decimal64 mantissa (elem 8) or Decimal128 (elem 16).
 bool plain_flba(ColCtx* cx, const uint8_t* v, uint64_t vlen,
                 const uint32_t* def, int64_t row0, uint32_t nrows,
@@ -402,6 +480,11 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::Double:
             ok = plain_fixed(&tmp, v, vlen, nullptr, 0, n, n);
             break;
+        case PqType::Float:
+            // Dict entries widened f32 -> f64 ONCE here so data-page
+            // gathers stay bare 8-byte memcpys (G2FEAT-346).
+            ok = plain_f32_widen(&tmp, v, vlen, nullptr, 0, n, n);
+            break;
         case PqType::FixedLenByteArray:
             ok = plain_flba(&tmp, v, vlen, nullptr, 0, n, n);
             break;
@@ -457,6 +540,11 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
             case PqType::Int64:
             case PqType::Double:
                 return plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
+            case PqType::Float:
+                return plain_f32_widen(cx, v, vlen, def, row0, nvals,
+                                       nvalid);
+            case PqType::Boolean:
+                return plain_bool(cx, v, vlen, def, row0, nvals, nvalid);
             case PqType::FixedLenByteArray:
                 return plain_flba(cx, v, vlen, def, row0, nvals, nvalid);
             case PqType::ByteArray:
@@ -464,6 +552,9 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
             default:
                 return false;
         }
+    }
+    if (h->enc == kEncRle && cx->pc->physical == PqType::Boolean) {
+        return rle_bool(cx, v, vlen, def, row0, nvals, nvalid, arena);
     }
     if (h->enc == kEncPlainDict || h->enc == kEncRleDict) {
         if (nvalid == 0) return true;               // all-null page
@@ -624,6 +715,12 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
         case PqType::Double:
             *out_type = BoltType::Float64;
             return true;
+        case PqType::Float:                   // f32 widened at decode
+            *out_type = BoltType::Float64;
+            return true;
+        case PqType::Boolean:                 // 0/1
+            *out_type = BoltType::Int64;
+            return true;
         case PqType::ByteArray:
             *out_type = BoltType::Utf8;
             return true;
@@ -638,7 +735,7 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             }
             *out_scale = static_cast<uint8_t>(col->scale);
             return true;
-        default:                       // Boolean / Int96 / Float: outside v1
+        default:                       // Int96: outside v1
             return false;
     }
 }

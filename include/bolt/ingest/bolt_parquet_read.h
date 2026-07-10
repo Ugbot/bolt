@@ -7,11 +7,16 @@
 //   - pages:     DATA_PAGE (v1) + DICTIONARY_PAGE. DATA_PAGE_V2 rejected.
 //   - codecs:    UNCOMPRESSED, SNAPPY (bolt_snappy.h).
 //   - encodings: PLAIN; RLE/bit-packed hybrid for definition levels
-//                (max_def_level <= 1) and for RLE_DICTIONARY /
-//                PLAIN_DICTIONARY indices (bit-width byte prefix).
+//                (max_def_level <= 1), for RLE_DICTIONARY /
+//                PLAIN_DICTIONARY indices (bit-width byte prefix), and
+//                for RLE-encoded BOOLEAN data pages (u32 len prefix).
 //   - types:     INT64 -> Int64 (DECIMAL converted -> Decimal64 mantissa),
 //                INT32 -> Int32 (DATE converted -> Date32),
 //                DOUBLE -> Float64,
+//                FLOAT -> Float64 (f32 widened at decode; dictionary
+//                  entries converted once at dict-page decode — G2FEAT-346),
+//                BOOLEAN -> Int64 0/1 (PLAIN bit-packed LSB-first, or an
+//                  RLE data page),
 //                BYTE_ARRAY -> Utf8 StringViews (inline <= 12 bytes; longer
 //                  values spill into ONE per-column overflow buffer,
 //                  exposed via BoltColumn::str_overflow_base),
@@ -45,9 +50,10 @@ struct BoltColumn;
 namespace ingest {
 namespace parquet {
 
-// Map one parquet leaf column to its Bolt materialization. Returns false
-// when the column shape is outside the v1 subset (BOOLEAN, INT96, FLOAT,
-// non-DECIMAL FLBA, INT32 DECIMAL, FLBA wider than 16 bytes).
+// Map one parquet leaf column to its Bolt materialization (FLOAT widens
+// to Float64, BOOLEAN lands as Int64 0/1). Returns false when the column
+// shape is outside the supported subset (INT96, non-DECIMAL FLBA, INT32
+// DECIMAL, FLBA wider than 16 bytes).
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept;
 

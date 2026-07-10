@@ -181,8 +181,12 @@ TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
     PqColumn c{};
     bolt::BoltType t;
     uint8_t s = 0;
-    c.physical = PqType::Boolean;
-    EXPECT_FALSE(parquet_map_type(&c, &t, &s));
+    c.physical = PqType::Boolean;                  // -> Int64 0/1 (G2FEAT-346)
+    ASSERT_TRUE(parquet_map_type(&c, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::Int64);
+    c.physical = PqType::Float;                    // -> Float64 (widened)
+    ASSERT_TRUE(parquet_map_type(&c, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::Float64);
     c.physical = PqType::Int96;
     EXPECT_FALSE(parquet_map_type(&c, &t, &s));
     c.physical = PqType::FixedLenByteArray;        // FLBA without DECIMAL
@@ -200,6 +204,140 @@ TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
     ASSERT_TRUE(parquet_map_type(&c, &t, &s));
     EXPECT_EQ(t, bolt::BoltType::Decimal64);
     EXPECT_EQ(s, 2);
+}
+
+// ---- G2FEAT-346: KX NYSE TAQ rowgroup-shaped types ------------------------
+//
+// golden_taq_types.parquet: 9 cols, 1000 rows, UNCOMPRESSED, data page
+// v1, row_group_size=256 -> 4 row groups. Column shapes mirror the real
+// KX TAQ rowgroup files (parquet-cpp-arrow, UNCOMPRESSED, dict + PLAIN):
+//   f32_plain  FLOAT PLAIN            == i * 0.5           -> Float64
+//   f32_dict   FLOAT dict-encoded     == (i % 7) * 0.25    -> Float64
+//   f32_null   FLOAT dict, nulls      == null if i%11==0 else i*0.5
+//   flag       BOOLEAN PLAIN          == (i % 3 == 0)      -> Int64 0/1
+//   flag_null  BOOLEAN PLAIN, nulls   == null if i%5==0 else (i%2==0)
+//   u16        INT32 (UINT_16)        == i                 -> Int32
+//   u64        INT64 (UINT_64)        == (1<<63) + i (bit pattern)
+//   dur        INT64 (duration[ns])   == i * 1000000007
+//   s_dict     BYTE_ARRAY dict        == "SYM%d" % (i % 5) -> Utf8
+// golden_taq_types_rlebool.parquet: flag/flag_null written with
+// column_encoding="RLE" (RLE-encoded BOOLEAN data pages) + u16 PLAIN.
+//
+// Regenerate goldens (documented generator):
+//   python gen_taq_types.py  — inline here for the record:
+//     import pyarrow as pa, pyarrow.parquet as pq
+//     n = 1000
+//     t = pa.table({
+//       "f32_plain": pa.array([i*0.5 for i in range(n)], pa.float32()),
+//       "f32_dict":  pa.array([(i%7)*0.25 for i in range(n)], pa.float32()),
+//       "f32_null":  pa.array([None if i%11==0 else i*0.5
+//                              for i in range(n)], pa.float32()),
+//       "flag":      pa.array([i%3==0 for i in range(n)], pa.bool_()),
+//       "flag_null": pa.array([None if i%5==0 else (i%2==0)
+//                              for i in range(n)], pa.bool_()),
+//       "u16":       pa.array([i%65536 for i in range(n)], pa.uint16()),
+//       "u64":       pa.array([(1<<63)+i for i in range(n)], pa.uint64()),
+//       "dur":       pa.array([i*1000000007 for i in range(n)],
+//                             pa.duration('ns')),
+//       "s_dict":    pa.array(["SYM%d" % (i%5) for i in range(n)],
+//                             pa.string()),
+//     })
+//     pq.write_table(t, "golden_taq_types.parquet", row_group_size=256,
+//                    compression="none", data_page_version="1.0",
+//                    use_dictionary=["f32_dict","f32_null","s_dict"])
+//     pq.write_table(t.select(["flag","flag_null","u16"]),
+//                    "golden_taq_types_rlebool.parquet", row_group_size=256,
+//                    compression="none", use_dictionary=False,
+//                    data_page_version="1.0",
+//                    column_encoding={"flag":"RLE","flag_null":"RLE",
+//                                     "u16":"PLAIN"})
+
+bool row_valid(const bolt::BoltColumn& col, int64_t i) {
+    if (col.validity == nullptr) return true;
+    return ((col.validity[i >> 3] >> (i & 7)) & 1u) != 0u;
+}
+
+TEST(BoltParquetRead, TaqTypesFloatBoolWidening) {
+    const auto buf = slurp(data_path("golden_taq_types.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    bolt::BoltBatch* b = arena.allocate_array<bolt::BoltBatch>(1);
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &arena, b));
+    ASSERT_EQ(b->num_rows, 1000);
+    ASSERT_EQ(b->num_cols, 9u);
+    const bolt::BoltColumn* cols = b->columns[b->read_epoch];
+    ASSERT_EQ(cols[0].type, bolt::BoltType::Float64);   // f32_plain widened
+    ASSERT_EQ(cols[1].type, bolt::BoltType::Float64);   // f32_dict widened
+    ASSERT_EQ(cols[2].type, bolt::BoltType::Float64);   // f32_null widened
+    ASSERT_EQ(cols[3].type, bolt::BoltType::Int64);     // flag 0/1
+    ASSERT_EQ(cols[4].type, bolt::BoltType::Int64);     // flag_null 0/1
+    ASSERT_EQ(cols[5].type, bolt::BoltType::Int32);     // u16
+    ASSERT_EQ(cols[6].type, bolt::BoltType::Int64);     // u64 bit pattern
+    ASSERT_EQ(cols[7].type, bolt::BoltType::Int64);     // duration[ns]
+    ASSERT_EQ(cols[8].type, bolt::BoltType::Utf8);      // dict string
+    const auto* f32p = static_cast<const double*>(cols[0].data);
+    const auto* f32d = static_cast<const double*>(cols[1].data);
+    const auto* f32n = static_cast<const double*>(cols[2].data);
+    const auto* flag  = static_cast<const int64_t*>(cols[3].data);
+    const auto* flagn = static_cast<const int64_t*>(cols[4].data);
+    const auto* u16  = static_cast<const int32_t*>(cols[5].data);
+    const auto* u64c = static_cast<const int64_t*>(cols[6].data);
+    const auto* dur  = static_cast<const int64_t*>(cols[7].data);
+    const auto* sd   = static_cast<const bolt::StringView*>(cols[8].data);
+    ASSERT_NE(cols[2].validity, nullptr);
+    ASSERT_NE(cols[4].validity, nullptr);
+    for (int64_t i = 0; i < 1000; ++i) {
+        ASSERT_EQ(f32p[i], static_cast<double>(static_cast<float>(i) * 0.5f))
+            << "row " << i;
+        ASSERT_EQ(f32d[i], static_cast<double>(i % 7) * 0.25) << "row " << i;
+        ASSERT_EQ(row_valid(cols[2], i), i % 11 != 0) << "row " << i;
+        if (i % 11 != 0) {
+            ASSERT_EQ(f32n[i],
+                      static_cast<double>(static_cast<float>(i) * 0.5f))
+                << "row " << i;
+        }
+        ASSERT_EQ(flag[i], (i % 3 == 0) ? 1 : 0) << "row " << i;
+        ASSERT_EQ(row_valid(cols[4], i), i % 5 != 0) << "row " << i;
+        if (i % 5 != 0) {
+            ASSERT_EQ(flagn[i], (i % 2 == 0) ? 1 : 0) << "row " << i;
+        }
+        ASSERT_EQ(u16[i], static_cast<int32_t>(i));
+        ASSERT_EQ(u64c[i],
+                  static_cast<int64_t>((uint64_t{1} << 63) +
+                                       static_cast<uint64_t>(i)));
+        ASSERT_EQ(dur[i], i * 1000000007);
+        char want[16];
+        std::snprintf(want, sizeof(want), "SYM%lld", (long long)(i % 5));
+        ASSERT_EQ(sd[i].length, std::strlen(want)) << "row " << i;
+        ASSERT_EQ(std::memcmp(sv_bytes(sd[i], cols[8].str_overflow_base),
+                              want, sd[i].length), 0) << "row " << i;
+    }
+}
+
+TEST(BoltParquetRead, TaqTypesRleBooleanDataPages) {
+    const auto buf =
+        slurp(data_path("golden_taq_types_rlebool.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    bolt::BoltBatch* b = arena.allocate_array<bolt::BoltBatch>(1);
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &arena, b));
+    ASSERT_EQ(b->num_rows, 1000);
+    ASSERT_EQ(b->num_cols, 3u);
+    const bolt::BoltColumn* cols = b->columns[b->read_epoch];
+    ASSERT_EQ(cols[0].type, bolt::BoltType::Int64);
+    ASSERT_EQ(cols[1].type, bolt::BoltType::Int64);
+    const auto* flag  = static_cast<const int64_t*>(cols[0].data);
+    const auto* flagn = static_cast<const int64_t*>(cols[1].data);
+    ASSERT_NE(cols[1].validity, nullptr);
+    for (int64_t i = 0; i < 1000; ++i) {
+        ASSERT_EQ(flag[i], (i % 3 == 0) ? 1 : 0) << "row " << i;
+        ASSERT_EQ(row_valid(cols[1], i), i % 5 != 0) << "row " << i;
+        if (i % 5 != 0) {
+            ASSERT_EQ(flagn[i], (i % 2 == 0) ? 1 : 0) << "row " << i;
+        }
+    }
 }
 
 // Corrupt-page fuzzing: flips and truncations must never crash. The
