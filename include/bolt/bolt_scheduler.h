@@ -624,14 +624,33 @@ inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept
         // notify_one / notify_all; shutdown() calls notify_all.
         // Re-check ring after wake to cover the race where notify fires
         // between the ring check and the wait() call.
+        //
+        // Spin-then-park (2026-07-10): a bounded spin grace before each
+        // park. Pure ParkWait measured two-faced on the TAQ board: long
+        // idle stretches parked (idle spin was 57-75% of process CPU under
+        // SpinYield) but fork-join-heavy queries paid a futex wake per
+        // task wave (+15% on small queries — the same effect as the W-J
+        // neutral result on TPC-H). The grace (max_spins cpu_pause ~30 us,
+        // then kParkGraceYields yields) bridges intra-query task gaps at
+        // spin cost while whole-process idle still parks.
+        constexpr uint32_t kParkGraceYields = 16;
+        uint32_t grace = 0;
+        const uint32_t grace_max = max_spins + kParkGraceYields;
         while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
-            if (sched->ring.try_claim_and_execute()) continue;
+            if (sched->ring.try_claim_and_execute()) { grace = 0; continue; }
+            if (grace < grace_max) {
+                if (grace < max_spins) cpu_pause();
+                else                   std::this_thread::yield();
+                ++grace;
+                continue;
+            }
             const uint64_t seen = sched->submit_seq_.load(std::memory_order_acquire);
             // Re-check once after sampling the seq so we don't miss work
             // that arrived between the first try and the sample.
-            if (sched->ring.try_claim_and_execute()) continue;
+            if (sched->ring.try_claim_and_execute()) { grace = 0; continue; }
             if (sched->shutdown_flag.load(std::memory_order_acquire)) break;
             sched->submit_seq_.wait(seen, std::memory_order_acquire);
+            grace = 0;
         }
     } else {
         while (!sched->shutdown_flag.load(std::memory_order_acquire)) {
