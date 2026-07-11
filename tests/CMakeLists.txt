@@ -1086,3 +1086,12 @@ target_link_libraries(test_bolt_lakehouse_delta_write
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_delta_write)
 add_test(NAME test_bolt_lakehouse_delta_write COMMAND test_bolt_lakehouse_delta_write)
+
+# Plan E2 phase 2 — blocked parallel inclusive prefix scan (int64/float64):
+# the single-partition cumulative-window substrate (SUM/COUNT/AVG OVER
+# UNBOUNDED PRECEDING). Fixed-block determinism + exactness properties.
+add_executable(test_bolt_prefix_scan test_bolt_prefix_scan.cpp)
+target_link_libraries(test_bolt_prefix_scan
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_prefix_scan)
+add_test(NAME test_bolt_prefix_scan COMMAND test_bolt_prefix_scan)
