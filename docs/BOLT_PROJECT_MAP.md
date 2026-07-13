@@ -26,6 +26,12 @@ chukonu/
 │   │   ├── bolt_binsearch.h           Branchless binary search (i64/u64/f64) —
 │   │   │                               exact + lower_bound + upper_bound, cmov loop
 │   │   ├── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
+│   │   ├── promql.h                   PromQL kernels aggregator (rate/deriv/histogram)
+│   │   ├── promql_rate.h              rate/increase/delta/irate/idelta/resets/changes —
+│   │   │                               counter-reset-aware, boundary extrapolation
+│   │   ├── promql_deriv.h             deriv/predict_linear + OLS linear_regression
+│   │   ├── promql_histogram.h         histogram_quantile — classic le-bucket interpolation
+│   │   │                               (Prometheus-exact; oracle-tested test_promql_kernels)
 │   │   └── fintech/
 │   │       ├── column_primitives.h   Phase 1: diff/lag/log/sum_of_squares/running_max_drawdown
 │   │       ├── state.h               Phase 2: RollingRing / WelfordAccumulator / EmaState
