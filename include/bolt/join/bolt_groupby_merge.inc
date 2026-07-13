@@ -247,3 +247,74 @@ inline bool groupby_agg_multi_key_typed_merge_list(
     }
     return true;
 }
+
+// RANGE-SLICED dense merge (G2FEAT-362 dense-agg parallel merge): fold the
+// groups of `src` whose single int-like KEY lies in [key_lo, key_hi) into
+// `dst`. Both states MUST be dense-configured (single int-like key, a
+// certified [dense_min, dense_min+dense_range) perfect-hash index). For each
+// key K in the slice, src->dense_gid gives the source group in O(1) (no
+// hash, no SwissTable probe) and dst->dense_gid find-or-creates the output
+// group in O(1) (one hash only at first CREATION of K, never per fold). N
+// workers each folding a DISJOINT key sub-range of every partial into a
+// PRIVATE dst produce key-disjoint dst tables whose union equals the full
+// merge — merge cost parallelizes as range/N instead of the serial sum over
+// every partial entry.
+//
+// FP BIT-IDENTICAL requirement (non-associative float add): the CALLER folds
+// partials in ASCENDING index order for a given [key_lo,key_hi) — partial 0,
+// then 1, … — and each output cell K is owned by exactly ONE slice, so cell K
+// accumulates p=0..P-1 in the SAME order the serial fold uses. First-touch of
+// K CREATES the group (seeded to the agg identity), matching the serial fold
+// where the first partial containing K inserts it. Provably bit-identical.
+//
+// `dst` MUST be pre-sized (card-clamped, no growth) so the fold performs ZERO
+// arena allocations — task-safe when a different worker than the creator runs
+// the fold (mirrors the class-merge contract). Returns false (dst->oom set) on
+// a dst-capacity overflow; the caller then discards and serial-folds.
+inline bool groupby_typed_merge_dense_range(
+        GroupbyTypedState* dst, const GroupbyTypedState* src,
+        int64_t key_lo, int64_t key_hi) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(dst->n_keys == 1 && src->n_keys == 1);
+    assert(dst->dense_gid != nullptr && src->dense_gid != nullptr &&
+           "dense-range merge requires both states dense-configured");
+    assert(dst->n_aggs == src->n_aggs);
+    assert(key_lo <= key_hi);
+    assert(!dst->any_distinct && !src->any_distinct &&
+           "DISTINCT partials are not mergeable (v1)");
+    if (dst->oom || src->oom) return false;
+    if (dst->any_distinct || src->any_distinct) return false;
+    const int64_t src_lo = src->dense_min;
+    const int64_t src_hi = src_lo + static_cast<int64_t>(src->dense_range);
+    const int64_t dst_lo = dst->dense_min;
+    // Clamp the fold to the slice ∩ src's certified dense span (a partial
+    // never stored a key outside its own bounds — this only shrinks work).
+    const int64_t lo = (key_lo > src_lo) ? key_lo : src_lo;
+    const int64_t hi = (key_hi < src_hi) ? key_hi : src_hi;
+    assert(hi - lo <= static_cast<int64_t>(1u << 24) && "dense range ceiling");
+    for (int64_t k = lo; k < hi; ++k) {
+        const int64_t soff = k - src_lo;
+        assert(soff >= 0 && soff < static_cast<int64_t>(src->dense_range));
+        const int32_t sgid = src->dense_gid[soff];
+        if (sgid < 0) continue;                       // src has no group for K
+        const int64_t doff = k - dst_lo;
+        assert(doff >= 0 && doff < static_cast<int64_t>(dst->dense_range));
+        int32_t dgid = dst->dense_gid[doff];
+        if (dgid < 0) {
+            const uint64_t h =
+                gb_merge_hash_stored(src, static_cast<uint32_t>(sgid));
+            uint32_t slot = 0;
+            if (!gb_merge_insert_group(dst, src, static_cast<uint32_t>(sgid),
+                                       h, &slot)) {
+                return false;                         // dst->oom already set
+            }
+            dst->dense_gid[doff] = static_cast<int32_t>(slot);
+            dgid = static_cast<int32_t>(slot);
+        }
+        if (!gb_merge_combine(dst, static_cast<uint32_t>(dgid), src,
+                              static_cast<uint32_t>(sgid))) {
+            return false;
+        }
+    }
+    return true;
+}

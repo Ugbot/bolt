@@ -254,6 +254,10 @@ BOLT_FORCE_INLINE int32_t gb_probe_full(GroupbyTypedState* st, uint64_t h,
             if (ng >= 0) st->dense_gid[idx] = ng;
             return ng;
         }
+        // G2FEAT-362: out-of-range key (corrupt stats) — inserted hash-only,
+        // never published to dense_gid, so the range-sliced dense merge would
+        // drop it. Mark the state ineligible for that merge.
+        st->dense_overflow = true;
     }
     return gb_probe_hash<NK>(st, h, a, b);
 }
@@ -378,6 +382,9 @@ inline bool gb_pass1_dense(GroupbyTypedState* st, const BoltColumn* keys,
                 didx[di] = found;
             }
         } else {                                    // out of certified range
+            // G2FEAT-362: hash-only insert, never published to dense_gid — the
+            // range-sliced dense merge would drop this group, so flag the state.
+            st->dense_overflow = true;
             uint64_t a[1] = {a0}, b[1] = {0};
             const uint64_t h = gb_hash_packed<1, false>(a, b);
             found = gb_probe_hash<1>(st, h, a, b);

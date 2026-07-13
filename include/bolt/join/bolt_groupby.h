@@ -1013,7 +1013,14 @@ struct GroupbyTypedState {
     uint8_t         n_aggs;
     bool            oom;                // set true if any _ingest hit cap
     bool            any_distinct;
-    uint8_t         _pad[2];
+    // W-P / G2FEAT-362: set true iff a group MAY have been inserted while
+    // dense is enabled WITHOUT publishing its slot into dense_gid — an
+    // out-of-range key (corrupt stats) or a Fallback-shape window (nullable
+    // key). When false, dense_gid[key - dense_min] resolves EVERY group, so
+    // the range-sliced dense merge is sound; when true, that merge would drop
+    // the unpublished group and callers must use the hash/serial fold.
+    bool            dense_overflow;
+    uint8_t         _pad[1];
 };
 
 // Initialise state and allocate all scratch tables in `arena`. `key_descs`
@@ -1175,9 +1182,10 @@ inline bool groupby_typed_enable_dense(GroupbyTypedState* state,
         state->arena->allocate_array<int32_t>(static_cast<size_t>(range));
     if (idx == nullptr) return false;
     std::memset(idx, 0xFF, sizeof(int32_t) * static_cast<size_t>(range));
-    state->dense_gid   = idx;
-    state->dense_min   = key_min;
-    state->dense_range = static_cast<uint32_t>(range);
+    state->dense_gid      = idx;
+    state->dense_min      = key_min;
+    state->dense_range    = static_cast<uint32_t>(range);
+    state->dense_overflow = false;   // no un-published group inserted yet
     return true;
 }
 
@@ -1572,10 +1580,16 @@ inline void groupby_agg_multi_key_typed_ingest(
         if (!gb_twopass::gb_try_twopass(state, keys, payload,
                                         sparse ? sel : nullptr,
                                         start, count)) {
+            // G2FEAT-362: the per-row fallback inserts via the SwissTable and
+            // does not publish to dense_gid — any group it creates while dense
+            // is enabled is dense-unreachable, so mark the state ineligible for
+            // the range-sliced dense merge.
+            if (state->dense_gid != nullptr) state->dense_overflow = true;
             gb_ingest_fallback(state, keys, payload,
                                sparse ? sel : nullptr, start, count);
         }
 #else
+        if (state->dense_gid != nullptr) state->dense_overflow = true;
         gb_ingest_fallback(state, keys, payload,
                            sparse ? sel : nullptr, start, count);
 #endif
