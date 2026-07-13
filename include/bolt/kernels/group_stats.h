@@ -136,6 +136,41 @@ inline double covar_samp_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
     return (m->sxy - m->sx * m->sy / m->n) / (m->n - 1.0);
 }
 
+// Single-input POPULATION variance/stddev via Welford's online algorithm.
+// Reuses a CorrMoments' (n, sx, sxx) fields as Welford's (n, running mean,
+// running M2) so VarPop/StddevPop need NO separate per-group state from
+// Corr/Covar — a fresh corr_moments_init zeroes them (n=0, mean=0, M2=0). This
+// is IDENTICAL to Prometheus's stdvar/stddev recurrence and, crucially,
+// numerically stable: a zero-variance group (all inputs equal) yields M2
+// EXACTLY 0. The raw-moment form (Sxx - Sx^2/n) does NOT — it leaves a ~1e-13
+// residue that sqrt amplifies to ~1e-6, so it cannot be used for stddev. A NaN
+// sample propagates (mean/M2 become NaN -> variance NaN).
+BOLT_FORCE_INLINE void var_moments_update(CorrMoments* BOLT_RESTRICT m,
+                                          double x) noexcept {
+    assert(m != nullptr);
+    assert(m->n >= 0.0);
+    m->n += 1.0;
+    const double delta = x - m->sx;      // sx := running mean
+    m->sx += delta / m->n;
+    m->sxx += delta * (x - m->sx);       // sxx := running M2 (>= 0)
+}
+
+// VAR_POP = M2 / n. Returns 0.0 for n<1 (moot: a live group always has n>=1;
+// a single value yields exactly 0). A single value's M2 is exactly 0.
+inline double var_pop_welford_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
+    assert(m != nullptr);
+    assert(m->n >= 0.0);
+    if (m->n < 1.0) return 0.0;
+    return m->sxx / m->n;
+}
+
+// STDDEV_POP = sqrt(VAR_POP). M2 >= 0 by construction (Welford), so sqrt is
+// always defined; a zero-variance group yields exactly 0.
+inline double stddev_pop_welford_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
+    assert(m != nullptr);
+    return std::sqrt(var_pop_welford_finalize(m));
+}
+
 // Pearson r = (n*Sxy - Sx*Sy) / sqrt((n*Sxx - Sx^2)(n*Syy - Sy^2)).
 // Returns 0.0 for n<2 or a degenerate (zero-variance) input.
 inline double corr_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
