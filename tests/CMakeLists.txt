@@ -1108,3 +1108,13 @@ target_link_libraries(test_bolt_prefix_scan
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_prefix_scan)
 add_test(NAME test_bolt_prefix_scan COMMAND test_bolt_prefix_scan)
+
+# RE2 common-subset anchored FULL-MATCH regex engine (bolt_regex.h re2_*).
+# Thompson NFA: alternation / {m,n} / char-classes / (?i) inline flags —
+# the subset PromQL =~/!~ matchers need, cross-checked against the exact
+# PromQL corpus patterns (and reject-cleanly / ReDoS-safe cases).
+add_executable(test_bolt_regex_re2 test_bolt_regex_re2.cpp)
+target_link_libraries(test_bolt_regex_re2
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_regex_re2)
+add_test(NAME test_bolt_regex_re2 COMMAND test_bolt_regex_re2)
