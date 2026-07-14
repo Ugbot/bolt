@@ -171,6 +171,100 @@ inline double stddev_pop_welford_finalize(const CorrMoments* BOLT_RESTRICT m) no
     return std::sqrt(var_pop_welford_finalize(m));
 }
 
+// ---------------------------------------------------------------------------
+// Neumaier/Kahan COMPENSATED sum + Prometheus-faithful mean. Reuses a
+// CorrMoments' (n, sx, sy) as (count, sum, sum-compensation) and (sxy, sxx) as
+// (incremental mean, mean-compensation) — so a compensated SUM/AVG needs no new
+// per-group state alongside Corr/Covar (corr_moments_init zeroes them). Matches
+// Prometheus's sum/avg including large-magnitude cancellation (sum over
+// {2, 8, 1e100, -1e100} == 10, not the naive 0) and the ±Inf-overflow avg guard
+// (avg over ±9.988e307 == 0). This is a SEPARATE aggregate from the naive
+// SQL SUM/AVG — only a caller that asks for compensation folds through here.
+// ---------------------------------------------------------------------------
+
+// /fp:fast-immune tests (MSVC /fp:fast can fold std::isinf/isfinite on an
+// inlined value to a constant, assuming finiteness — these inspect the IEEE-754
+// exponent bits instead, so they survive aggressive optimisation).
+inline bool gs_is_inf(double x) noexcept {
+    std::uint64_t u; std::memcpy(&u, &x, sizeof(u));
+    return (u & 0x7FFFFFFFFFFFFFFFULL) == 0x7FF0000000000000ULL;  // exp all-1, mant 0
+}
+inline bool gs_is_finite(double x) noexcept {
+    std::uint64_t u; std::memcpy(&u, &x, sizeof(u));
+    return (u & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;  // exp not all-1
+}
+inline bool gs_is_nan(double x) noexcept {
+    std::uint64_t u; std::memcpy(&u, &x, sizeof(u));
+    return (u & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL &&
+           (u & 0x000FFFFFFFFFFFFFULL) != 0;
+}
+inline bool gs_signbit(double x) noexcept {
+    std::uint64_t u; std::memcpy(&u, &x, sizeof(u));
+    return (u >> 63) != 0;
+}
+
+BOLT_FORCE_INLINE void neumaier_add(double* BOLT_RESTRICT sum,
+                                    double* BOLT_RESTRICT c, double v) noexcept {
+    assert(sum != nullptr && c != nullptr);
+    const double t = *sum + v;
+    if (std::fabs(*sum) >= std::fabs(v)) *c += (*sum - t) + v;
+    else                                 *c += (v - t) + *sum;
+    *sum = t;
+}
+
+inline double neumaier_result(double sum, double c) noexcept {
+    return gs_is_inf(sum) ? sum : sum + c;   // overflow -> Inf, don't add NaN
+}
+
+// Prometheus incremental (Kahan-compensated) mean; `*c` is the running
+// compensation. Once the mean is ±Inf a finite / same-sign-Inf sample keeps it.
+BOLT_FORCE_INLINE double promql_mean_update(double mean, double* BOLT_RESTRICT c,
+                                            double count, double v) noexcept {
+    assert(c != nullptr && count > 0.0);
+    if (gs_is_inf(mean)) {
+        if (gs_is_inf(v) && gs_signbit(v) == gs_signbit(mean)) return mean;
+        if (!gs_is_inf(v) && !gs_is_nan(v)) return mean;
+    }
+    const double q = (count - 1.0) / count;
+    const double base = q * mean, inc = v / count;
+    double bc = q * (*c);
+    const double t = base + inc;
+    if (!gs_is_finite(t)) { *c = 0.0; return t; }
+    bc += (std::fabs(base) >= std::fabs(inc)) ? (base - t) + inc : (inc - t) + base;
+    *c = bc;
+    return t;
+}
+
+// Compensated SUM fold: CorrMoments used as (n, sx=sum, sy=comp).
+BOLT_FORCE_INLINE void kahan_sum_update(CorrMoments* BOLT_RESTRICT m, double x) noexcept {
+    assert(m != nullptr);
+    m->n += 1.0;
+    neumaier_add(&m->sx, &m->sy, x);
+}
+inline double kahan_sum_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
+    assert(m != nullptr);
+    return neumaier_result(m->sx, m->sy);
+}
+
+// Compensated AVG fold: CorrMoments used as (n, sx=sum, sy=sum-comp,
+// sxy=mean, sxx=mean-comp). Finalize = Neumaier sum / count while finite, else
+// the ±Inf-guarded incremental mean (matches Prometheus avg exactly).
+BOLT_FORCE_INLINE void avg_kahan_update(CorrMoments* BOLT_RESTRICT m, double x) noexcept {
+    assert(m != nullptr);
+    m->n += 1.0;
+    neumaier_add(&m->sx, &m->sy, x);
+    m->sxy = promql_mean_update(m->sxy, &m->sxx, m->n, x);
+}
+inline double avg_kahan_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
+    assert(m != nullptr);
+    if (m->n < 1.0) return std::nan("");
+    const double s = neumaier_result(m->sx, m->sy);
+    // Finite sum: exact mean. Overflow (±Inf) -> the ±Inf-guarded incremental
+    // mean (recovers e.g. avg over ±9.988e307 == 0). gs_is_finite is
+    // /fp:fast-immune (std::isfinite folds to true on an inlined ±Inf here).
+    return gs_is_finite(s) ? s / m->n : m->sxy + m->sxx;
+}
+
 // Pearson r = (n*Sxy - Sx*Sy) / sqrt((n*Sxx - Sx^2)(n*Syy - Sy^2)).
 // Returns 0.0 for n<2 or a degenerate (zero-variance) input.
 inline double corr_finalize(const CorrMoments* BOLT_RESTRICT m) noexcept {
