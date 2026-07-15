@@ -238,10 +238,13 @@ struct ChunkRec {
     std::int64_t null_count;
     bool         have_stats;
     bool         null_count_known;
-    // Min / max as raw little-endian (or BE for Decimal128) bytes the
-    // reader can copy straight into PqChunk::min_bytes / max_bytes.
-    std::uint8_t min_buf[16];
-    std::uint8_t max_buf[16];
+    // Min / max as raw little-endian (or BE for Decimal128, raw bytes for
+    // BYTE_ARRAY) payloads the reader can copy straight into
+    // PqChunk::min_bytes / max_bytes. Sized to the reader's
+    // kPqMaxStatBytes (64) so Utf8 stats round-trip; a chunk whose extreme
+    // string is longer than this simply omits stats (compute_stats).
+    std::uint8_t min_buf[64];
+    std::uint8_t max_buf[64];
     std::uint32_t min_len;
     std::uint32_t max_len;
 };
@@ -422,6 +425,61 @@ void write_le(std::uint8_t* dst, T v) noexcept {
     std::memcpy(dst, &v, sizeof(T));
 }
 
+// Unsigned byte-wise lexicographic compare; shorter-prefix compares less.
+// (The UTF8/BYTE_ARRAY sort order min_value/max_value are defined against.)
+int stat_lex_cmp(const std::uint8_t* a, std::uint32_t a_len,
+                 const std::uint8_t* b, std::uint32_t b_len) noexcept {
+    const std::uint32_t n = (a_len < b_len) ? a_len : b_len;
+    const int c = (n != 0) ? std::memcmp(a, b, n) : 0;
+    if (c != 0) return c;
+    return (a_len < b_len) ? -1 : (a_len > b_len ? 1 : 0);
+}
+
+// Utf8/Binary chunk stats (G2FEAT-21). Emits full min/max byte strings —
+// never a truncated bound (a truncated max without the spec's
+// increment-last-byte adjustment would be an INVALID upper bound). A chunk
+// containing any value longer than the stat buffer (== the reader's
+// kPqMaxStatBytes) therefore omits stats entirely; omission is always
+// legal and the reader treats it as "cannot prune".
+bool compute_stats_utf8(const BoltColumn& col, std::int64_t n_rows,
+                        const std::uint8_t* def_bits, bool nullable,
+                        ChunkRec* rec) noexcept {
+    assert(rec != nullptr);
+    assert(col.data != nullptr || n_rows == 0);
+    const auto* sv    = static_cast<const StringView*>(col.data);
+    const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
+    const std::uint8_t* mn_p = nullptr; std::uint32_t mn_n = 0;
+    const std::uint8_t* mx_p = nullptr; std::uint32_t mx_n = 0;
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+        const bool valid = (!nullable) || def_bits[r] != 0;
+        if (!valid) continue;
+        const std::uint32_t len = sv[r].length;
+        if (len > sizeof(rec->min_buf)) return true;   // omit stats (see above)
+        const std::uint8_t* p;
+        if (len <= 12u) {
+            // Inline payload — prefix[4] + inline_data[8] are contiguous
+            // (same layout contract encode_plain_byte_array relies on).
+            p = reinterpret_cast<const std::uint8_t*>(&sv[r].prefix[0]);
+        } else {
+            if (spill == nullptr) return true;         // can't read: omit
+            p = spill + sv[r].ref.offset;
+        }
+        if (mn_p == nullptr || stat_lex_cmp(p, len, mn_p, mn_n) < 0) {
+            mn_p = p; mn_n = len;
+        }
+        if (mx_p == nullptr || stat_lex_cmp(p, len, mx_p, mx_n) > 0) {
+            mx_p = p; mx_n = len;
+        }
+    }
+    if (mn_p == nullptr) return true;   // all null -> no min/max
+    std::memcpy(rec->min_buf, mn_p, mn_n);
+    std::memcpy(rec->max_buf, mx_p, mx_n);
+    rec->min_len = mn_n;
+    rec->max_len = mx_n;
+    rec->have_stats = true;
+    return true;
+}
+
 bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
                    const std::uint8_t* def_bits, bool nullable,
                    ChunkRec* rec) noexcept {
@@ -496,8 +554,11 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
             rec->have_stats = true;
             return true;
         }
+        case BoltType::Utf8:
+        case BoltType::Binary:
+            return compute_stats_utf8(col, n_rows, def_bits, nullable, rec);
         default:
-            // Bool / strings / binary / decimal: stats skipped for v1.
+            // Bool / decimal: stats skipped for v1.
             return true;
     }
 }

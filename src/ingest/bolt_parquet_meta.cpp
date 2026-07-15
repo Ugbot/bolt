@@ -189,6 +189,8 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
                 if (!tc_binary(c, &p, &n)) return false;
                 copy_stat(p, n, ch->max_bytes, &ch->max_len);
                 have_new_max = true;
+                // Flag only when actually kept (oversize => len 0 = absent).
+                if (ch->max_len != 0) ch->stats_flags |= kPqStatMaxIsValueField;
                 break;
             }
             case 6: {   // min_value
@@ -196,6 +198,7 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
                 if (!tc_binary(c, &p, &n)) return false;
                 copy_stat(p, n, ch->min_bytes, &ch->min_len);
                 have_new_min = true;
+                if (ch->min_len != 0) ch->stats_flags |= kPqStatMinIsValueField;
                 break;
             }
             default:
