@@ -1127,3 +1127,14 @@ target_link_libraries(test_bolt_regex_re2
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_regex_re2)
 add_test(NAME test_bolt_regex_re2 COMMAND test_bolt_regex_re2)
+
+# BLLM-12 (N0) — device-generic tensor primitive (bolt_tensor.h). Substrate
+# boltllm::quant::QTensor generalizes into: proves the Tensor POD layout,
+# arena/caller-owned (no-alloc) construction, and per-row-scale
+# quantized row-stride formulas are exact matches for QuantTypes.h's
+# existing convention (F32/Int8/Int4/Int2), not a fresh redesign.
+add_executable(test_bolt_tensor test_bolt_tensor.cpp)
+target_link_libraries(test_bolt_tensor
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_tensor)
+add_test(NAME test_bolt_tensor COMMAND test_bolt_tensor)
