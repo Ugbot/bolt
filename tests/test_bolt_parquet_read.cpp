@@ -177,6 +177,66 @@ TEST(BoltParquetRead, RowGroupGranularRead) {
                                         &rows));
 }
 
+// G2FEAT-8: projection-pushdown variant decodes exactly the requested
+// columns, indexed by PROJECTION position (incl. out-of-order), and matches
+// the full-decode values byte-for-byte.
+TEST(BoltParquetRead, RowGroupProjectedRead) {
+    const auto buf = slurp(data_path("golden_flat.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    PqMeta* meta = static_cast<PqMeta*>(
+        arena.allocate(sizeof(PqMeta), alignof(PqMeta)));
+    ASSERT_NE(meta, nullptr);
+    std::memset(meta, 0, sizeof(*meta));
+    ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &arena, meta));
+    ASSERT_EQ(meta->n_columns, 5u);
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
+        // Reference: full decode.
+        bolt::BoltColumn full[kPqMaxColumns];
+        int64_t full_rows = 0;
+        ASSERT_TRUE(parquet_read_row_group(buf.data(), buf.size(), meta, g,
+                                           &arena, full, &full_rows));
+        // Projection {ratio, id, name} — out-of-order + Utf8 + skips 2 cols.
+        const uint16_t proj[3] = {4, 0, 3};
+        bolt::BoltColumn cols[3];
+        int64_t rows = 0;
+        ASSERT_TRUE(parquet_read_row_group_cols(buf.data(), buf.size(), meta,
+                                                g, proj, 3, &arena, cols,
+                                                &rows));
+        ASSERT_EQ(rows, full_rows);
+        ASSERT_EQ(cols[0].type, bolt::BoltType::Float64);   // ratio at slot 0
+        ASSERT_EQ(cols[1].type, bolt::BoltType::Int64);     // id at slot 1
+        ASSERT_EQ(cols[2].type, bolt::BoltType::Utf8);      // name at slot 2
+        const auto* p_ratio = static_cast<const double*>(cols[0].data);
+        const auto* f_ratio = static_cast<const double*>(full[4].data);
+        const auto* p_id    = static_cast<const int64_t*>(cols[1].data);
+        const auto* f_id    = static_cast<const int64_t*>(full[0].data);
+        const auto* p_name  = static_cast<const bolt::StringView*>(cols[2].data);
+        for (int64_t r = 0; r < rows; ++r) {
+            ASSERT_EQ(p_ratio[r], f_ratio[r]) << "rg " << g << " row " << r;
+            ASSERT_EQ(p_id[r], f_id[r]) << "rg " << g << " row " << r;
+        }
+        // Utf8 content check via the existing helper (projected decode owns
+        // its own overflow buffer — verify content, not pointers).
+        for (int64_t r = 0; r < rows; ++r) {
+            const int64_t i = static_cast<int64_t>(f_id[r]);
+            expect_name(i, p_name[r], cols[2].str_overflow_base);
+        }
+    }
+    // Rejections: n_idx == 0, out-of-range column, out-of-range group.
+    bolt::BoltColumn cols[3];
+    int64_t rows = 0;
+    const uint16_t bad_col[1] = {5};
+    const uint16_t ok_col[1]  = {0};
+    EXPECT_FALSE(parquet_read_row_group_cols(buf.data(), buf.size(), meta, 0,
+                                             ok_col, 0, &arena, cols, &rows));
+    EXPECT_FALSE(parquet_read_row_group_cols(buf.data(), buf.size(), meta, 0,
+                                             bad_col, 1, &arena, cols, &rows));
+    EXPECT_FALSE(parquet_read_row_group_cols(buf.data(), buf.size(), meta,
+                                             meta->n_row_groups, ok_col, 1,
+                                             &arena, cols, &rows));
+}
+
 TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
     PqColumn c{};
     bolt::BoltType t;

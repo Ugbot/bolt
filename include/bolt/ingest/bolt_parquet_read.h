@@ -73,6 +73,19 @@ bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
                             Arena* arena, BoltColumn* out_cols,
                             int64_t* out_rows) noexcept;
 
+// Projection-pushdown variant (G2FEAT-8): decode ONLY the columns named by
+// `col_idx[0..n_idx)` (file-schema indices, caller-deduplicated) from ONE
+// row group. out_cols is indexed by PROJECTION position — out_cols[j] holds
+// the column for col_idx[j] — so a scan operator decodes exactly the
+// referenced columns into a dense output. Same disjoint-output contract as
+// parquet_read_row_group; that function is now the n_idx == n_columns
+// identity case. Rejects out-of-range indices and n_idx == 0.
+bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
+                                 const PqMeta* meta, uint32_t row_group,
+                                 const uint16_t* col_idx, uint32_t n_idx,
+                                 Arena* arena, BoltColumn* out_cols,
+                                 int64_t* out_rows) noexcept;
+
 // Whole file: locate + parse meta, allocate full-length columns, then
 // decode every row group into its row offset (serial v1; the row-group
 // function above is the future parallel unit).
