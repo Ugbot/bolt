@@ -219,6 +219,8 @@ if(BOLT_BUILD_INGEST)
     add_library(bolt_ingest STATIC
         src/ingest/bolt_csv.cpp
         src/ingest/bolt_parquet_meta.cpp
+        src/ingest/bolt_parquet_pageindex.cpp
+        src/ingest/bolt_parquet_bloom.cpp
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_write.cpp
         src/ingest/bolt_avro.cpp

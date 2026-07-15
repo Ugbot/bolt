@@ -913,6 +913,18 @@ target_compile_definitions(test_bolt_parquet_read PRIVATE
 bolt_apply_hardening(test_bolt_parquet_read)
 add_test(NAME test_bolt_parquet_read COMMAND test_bolt_parquet_read)
 
+# G2FEAT-23 — Parquet page index (ColumnIndex/OffsetIndex) + split-block
+# bloom filter reader vs pyarrow/duckdb goldens: analytic page-bound ground
+# truth, prune-property tests, XXH64 vectors, bloom membership from two
+# independent writers, hostile-input fuzzing.
+add_executable(test_bolt_parquet_pageindex test_bolt_parquet_pageindex.cpp)
+target_link_libraries(test_bolt_parquet_pageindex
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_pageindex PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_pageindex)
+add_test(NAME test_bolt_parquet_pageindex COMMAND test_bolt_parquet_pageindex)
+
 # W-PQ-W — Parquet writer round-trip vs the reader (Int64/Utf8 plain,
 # Int64/Utf8 SNAPPY, nullable Int64).
 add_executable(test_bolt_parquet_write test_bolt_parquet_write.cpp)

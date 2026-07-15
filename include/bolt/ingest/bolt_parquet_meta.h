@@ -186,6 +186,20 @@ struct PqChunk {
     uint32_t min_len;                 // 0 = absent
     uint32_t max_len;                 // 0 = absent
     int64_t  null_count;              // -1 = absent
+    // Page-index + bloom-filter locations (G2FEAT-23). These structures
+    // live OUTSIDE the footer FileMetaData: absolute file offsets recorded
+    // here, parsed on demand by bolt_parquet_pageindex.h / _bloom.h. A
+    // parquet file always starts with "PAR1", so 0 is never a valid offset
+    // and doubles as "absent".
+    int64_t  column_index_offset;     // ColumnChunk field 6; 0 = absent
+    int64_t  offset_index_offset;     // ColumnChunk field 4; 0 = absent
+    int64_t  bloom_filter_offset;     // ColumnMetaData field 14; 0 = absent
+    int32_t  column_index_length;     // ColumnChunk field 7; 0 = absent
+    int32_t  offset_index_length;     // ColumnChunk field 5; 0 = absent
+    int32_t  bloom_filter_length;     // ColumnMetaData field 15; 0 = unknown
+                                      // (pre-2.9 writers omit the length —
+                                      // the bloom reader then bounds by EOF)
+    int32_t  _pad2;
 };
 
 struct PqRowGroup {
