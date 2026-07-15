@@ -848,6 +848,15 @@ target_link_libraries(test_bolt_groupby_twopass
 bolt_apply_hardening(test_bolt_groupby_twopass)
 add_test(NAME test_bolt_groupby_twopass COMMAND test_bolt_groupby_twopass)
 
+# G2FEAT-13 radix route-hash kernels — THE stored-hash invariant property
+# test (gb_route_hash_rows == gb_merge_hash_stored for every row) +
+# radix_partition_hashes invariants + GbSharedScratch begin differential.
+add_executable(test_bolt_groupby_radix_hash test_bolt_groupby_radix_hash.cpp)
+target_link_libraries(test_bolt_groupby_radix_hash
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_radix_hash)
+add_test(NAME test_bolt_groupby_radix_hash COMMAND test_bolt_groupby_radix_hash)
+
 # Typed all-shapes SwissTable join kernel (bolt/join/bolt_joinkernel.h).
 add_executable(test_bolt_joinkernel test_bolt_joinkernel.cpp)
 target_link_libraries(test_bolt_joinkernel

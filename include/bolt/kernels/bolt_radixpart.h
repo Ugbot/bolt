@@ -93,4 +93,65 @@ BOLT_FORCE_INLINE void radix_partition_hash_i64(
     assert(n == 0 || cursor[n_buckets - 1] == offsets[n_buckets]);
 }
 
+// G2FEAT-13: partition `n` rows into `2^radix_bits` buckets by CALLER-SUPPLIED
+// pre-computed hashes. Unlike radix_partition_hash_i64 above, the hash is
+// FINAL — no re-mix. Bucket = `hashes[i] & (n_buckets - 1)` (LOW bits), chosen
+// deliberately so the bucket selector is IDENTICAL to the groupby class-merge
+// convention (`gb_merge_hash_stored(state, gid) % n_classes`, which for a
+// power-of-two class count is exactly the low-bit mask). One source of truth:
+// when `hashes[i]` is `bolt::gb_route_hash_rows` output, a row and its stored
+// group land in the same bucket by construction — the invariant radix-
+// partitioned aggregation rests on (see docs/research/design-log.md).
+//
+//   hashes   [n]              read-only pre-computed 64-bit hashes; the hash
+//                             for LOGICAL row i (see `sel`).
+//   sel      [n] or nullptr   optional selection vector. When non-null,
+//                             hashes[i] corresponds to logical row i and
+//                             perm receives the PHYSICAL index sel[i]; when
+//                             null, perm receives i itself.
+//   perm     [n]              OUT: (physical) row indices grouped by bucket.
+//   offsets  [n_buckets + 1]  OUT: exclusive prefix; bucket b occupies
+//                             perm[offsets[b] .. offsets[b+1]).
+//
+// Stable within a bucket (rows keep logical input order). radix_bits in
+// [1, 8]. O(n) time, O(2^radix_bits) stack scratch. No allocation.
+BOLT_FORCE_INLINE void radix_partition_hashes(
+        const std::uint64_t* BOLT_RESTRICT hashes,
+        const std::uint32_t* BOLT_RESTRICT sel,
+        std::int64_t                       n,
+        int                                radix_bits,
+        std::int32_t* BOLT_RESTRICT        perm,
+        std::int64_t* BOLT_RESTRICT        offsets) noexcept {
+    assert(n >= 0);
+    assert((hashes != nullptr && perm != nullptr) || n == 0);
+    assert(offsets != nullptr);
+    assert(radix_bits >= 1 && radix_bits <= kMaxRadixPartBits);
+
+    const std::int64_t  n_buckets = static_cast<std::int64_t>(1) << radix_bits;
+    const std::uint64_t mask      = static_cast<std::uint64_t>(n_buckets) - 1u;
+
+    // Histogram into offsets[1..n_buckets] (shifted by one for the exclusive
+    // prefix sum below); offsets[0] stays 0.
+    for (std::int64_t b = 0; b <= n_buckets; ++b) offsets[b] = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        ++offsets[static_cast<std::int64_t>(hashes[i] & mask) + 1];
+    }
+    // Exclusive prefix sum: offsets[b] = start index of bucket b.
+    for (std::int64_t b = 0; b < n_buckets; ++b) offsets[b + 1] += offsets[b];
+    assert(offsets[n_buckets] == n);
+
+    // Scatter (physical) row indices using a private cursor so `offsets`
+    // keeps the bucket starts for the caller.
+    std::int64_t cursor[kMaxRadixPartBuckets];
+    for (std::int64_t b = 0; b < n_buckets; ++b) cursor[b] = offsets[b];
+    for (std::int64_t i = 0; i < n; ++i) {
+        const std::int64_t bkt = static_cast<std::int64_t>(hashes[i] & mask);
+        const std::int32_t phys = (sel != nullptr)
+            ? static_cast<std::int32_t>(sel[i])
+            : static_cast<std::int32_t>(i);
+        perm[cursor[bkt]++] = phys;
+    }
+    assert(n == 0 || cursor[n_buckets - 1] == offsets[n_buckets]);
+}
+
 }  // namespace bolt
