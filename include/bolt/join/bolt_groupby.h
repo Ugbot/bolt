@@ -1388,7 +1388,7 @@ inline void gb_ingest_fallback(
                     const uint16_t i8 = state->distinct_idx[j];
                     assert(i8 != 0xFFFFu);
                     const size_t doff = static_cast<size_t>(i8) * cap + slot;
-                    if (!state->distinct_cells[doff].insert(v.a)) continue;
+                    if (!state->distinct_cells[doff].insert(v.a, state->arena)) continue;
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;

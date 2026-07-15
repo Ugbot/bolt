@@ -700,7 +700,10 @@ inline void scheduler_assign_cpus(const CpuTopology& topo,
 }
 
 inline bool Scheduler::init(uint32_t num_threads, SpinPolicy default_policy) noexcept {
-    assert(num_threads > 0);
+    // Every num_threads value is legal here: init(SchedulerConfig) maps 0 to
+    // bolt_get_hardware_concurrency() (the documented auto-size sentinel) and
+    // clamps anything above kMaxWorkers. A precondition assert on num_threads
+    // would abort on inputs this function is specified to accept.
     SchedulerConfig c{};
     c.num_workers = num_threads;
     c.spin        = default_policy;
