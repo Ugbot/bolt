@@ -114,6 +114,111 @@ struct DistinctSet64 {
     }
 };
 
+// ---------------------------------------------------------------------------
+// DistinctSetUtf8 — arena-backed, growable, EXACT set of variable-length byte
+// strings, deduped BY CONTENT (not by StringView offset). This is what makes
+// COUNT(DISTINCT <utf8_col>) correct for spilled (>12-byte) strings: two equal
+// strings stored at different overflow offsets have different StringViews but
+// identical content, so an offset/view compare overcounts. Open addressing on
+// an FNV-1a content hash; content bytes are copied into an arena-backed byte
+// pool so the set owns them past the source batch. Grows by doubling + rehash
+// at 0.75 load (content pool grows geometrically, same accepted pattern as the
+// typed-agg key_str_buf / utf8_acc_buf).
+// ---------------------------------------------------------------------------
+struct DistinctSetU8Slot {
+    std::uint64_t hash;    // FNV-1a of content
+    std::uint32_t off;     // byte offset into content pool
+    std::uint32_t len;     // content length
+};
+struct DistinctSetUtf8 {
+    DistinctSetU8Slot* slots;   // [cap]
+    std::uint8_t*      occ;     // [cap]
+    std::uint32_t      cap;     // power of two
+    std::uint32_t      size;    // live entries
+    char*              pool;    // content byte pool
+    std::uint32_t      pool_used;
+    std::uint32_t      pool_cap;
+
+    static BOLT_FORCE_INLINE std::uint64_t hash_bytes(const char* p,
+                                                      std::uint32_t len) noexcept {
+        std::uint64_t h = 1469598103934665603ull;          // FNV-1a offset basis
+        for (std::uint32_t i = 0; i < len; ++i) {
+            h ^= static_cast<std::uint8_t>(p[i]);
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    static DistinctSetUtf8* create(std::uint32_t cap_hint, bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        DistinctSetUtf8* s = arena->allocate_array<DistinctSetUtf8>(1);
+        if (s == nullptr) return nullptr;
+        std::uint32_t cap = 128;
+        while (cap < cap_hint) cap <<= 1;
+        s->slots = arena->allocate_array<DistinctSetU8Slot>(cap);
+        s->occ   = arena->allocate_array<std::uint8_t>(cap);
+        s->pool_cap  = 1u << 16;
+        s->pool      = arena->allocate_array<char>(s->pool_cap);
+        if (s->slots == nullptr || s->occ == nullptr || s->pool == nullptr) return nullptr;
+        std::memset(s->occ, 0, cap);
+        s->cap = cap; s->size = 0; s->pool_used = 0;
+        return s;
+    }
+
+    BOLT_FORCE_INLINE bool grow_slots(bolt::Arena* arena) noexcept {
+        const std::uint32_t ncap = cap << 1;
+        auto* ns = arena->allocate_array<DistinctSetU8Slot>(ncap);
+        auto* no = arena->allocate_array<std::uint8_t>(ncap);
+        if (ns == nullptr || no == nullptr) return false;
+        std::memset(no, 0, ncap);
+        const std::uint32_t nmask = ncap - 1;
+        for (std::uint32_t j = 0; j < cap; ++j) {
+            if (!occ[j]) continue;
+            std::uint32_t i = static_cast<std::uint32_t>(slots[j].hash) & nmask;
+            while (no[i]) i = (i + 1) & nmask;
+            no[i] = 1; ns[i] = slots[j];
+        }
+        slots = ns; occ = no; cap = ncap;
+        return true;
+    }
+
+    // Returns true iff the content was newly inserted.
+    BOLT_FORCE_INLINE bool insert(const char* bytes, std::uint32_t len,
+                                  bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(bytes != nullptr || len == 0);
+        if (static_cast<std::uint64_t>(size + 1) * 4 >=
+            static_cast<std::uint64_t>(cap) * 3) {
+            if (!grow_slots(arena) && size + 1 >= cap) return false;
+        }
+        const std::uint64_t h = hash_bytes(bytes, len);
+        const std::uint32_t mask = cap - 1;
+        std::uint32_t i = static_cast<std::uint32_t>(h) & mask;
+        while (occ[i]) {
+            if (slots[i].hash == h && slots[i].len == len &&
+                std::memcmp(pool + slots[i].off, bytes, len) == 0) {
+                return false;                                   // duplicate content
+            }
+            i = (i + 1) & mask;
+        }
+        // Store content in the pool (grow geometrically if needed).
+        if (pool_used + len > pool_cap) {
+            std::uint32_t ncap = pool_cap * 2u;
+            while (ncap < pool_used + len) ncap *= 2u;
+            char* np = arena->allocate_array<char>(ncap);
+            if (np == nullptr) return false;
+            std::memcpy(np, pool, pool_used);
+            pool = np; pool_cap = ncap;
+        }
+        std::memcpy(pool + pool_used, bytes, len);
+        occ[i] = 1;
+        slots[i].hash = h; slots[i].off = pool_used; slots[i].len = len;
+        pool_used += len;
+        ++size;
+        return true;
+    }
+};
+
 // 64-byte aligned inline distinct-value tracker for ONE (group, agg) cell.
 // `n` holds the live entry count; once it reaches `k_distinct_cell_cap` the
 // cell is marked saturated and future inserts increment `overflow_seen`
