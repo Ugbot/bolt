@@ -155,7 +155,7 @@ target_link_libraries(bolt INTERFACE bolt::ribbon)
 option(BOLT_BUILD_PARSE "Build bolt::parse compiled library" ${BOLT_IS_TOPLEVEL})
 
 if(BOLT_BUILD_PARSE)
-    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp)
+    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
     add_library(bolt::parse ALIAS bolt_parse)
     target_link_libraries(bolt_parse PUBLIC bolt::core)
     target_include_directories(bolt_parse PUBLIC
@@ -164,6 +164,37 @@ if(BOLT_BUILD_PARSE)
     bolt_apply_hardening(bolt_parse)
     bolt_apply_simd(bolt_parse ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::parse)
+endif()
+
+# ---------------------------------------------------------------------------
+# bolt::vulkan — device/queue/memory scaffolding behind bolt::compute's
+# reserved Vulkan device slot (BLLM-46). Compiled (not header-only) for the
+# same reason as bolt::parse: Vulkan's C API + loader linkage doesn't suit
+# a header-only inline function. Gated on CMake actually finding a Vulkan
+# SDK (via find_package's standard FindVulkan module, which consults the
+# VULKAN_SDK env var the LunarG installer sets) -- if none is found, this
+# target is simply not built, and bolt::compute's Vulkan slot stays a
+# hard-failing stub exactly as it is today. Never required for a build to
+# succeed; every other consumer keeps working CPU-only regardless.
+# ---------------------------------------------------------------------------
+find_package(Vulkan QUIET)
+option(BOLT_BUILD_VULKAN "Build bolt::vulkan device/queue/memory scaffolding"
+       ${Vulkan_FOUND})
+
+if(BOLT_BUILD_VULKAN AND NOT Vulkan_FOUND)
+    message(WARNING "BOLT_BUILD_VULKAN requested but no Vulkan SDK found (set VULKAN_SDK) -- skipping bolt::vulkan")
+    set(BOLT_BUILD_VULKAN OFF)
+endif()
+
+if(BOLT_BUILD_VULKAN)
+    add_library(bolt_vulkan STATIC src/bolt_vulkan.cpp)
+    add_library(bolt::vulkan ALIAS bolt_vulkan)
+    target_link_libraries(bolt_vulkan PUBLIC bolt::core Vulkan::Vulkan)
+    target_include_directories(bolt_vulkan PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_vulkan)
+    target_link_libraries(bolt INTERFACE bolt::vulkan)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -451,6 +482,9 @@ if(BOLT_BUILD_IO)
 endif()
 if(BOLT_BUILD_PARSE)
     list(APPEND _bolt_install_targets bolt_parse)
+endif()
+if(BOLT_BUILD_VULKAN)
+    list(APPEND _bolt_install_targets bolt_vulkan)
 endif()
 if(BOLT_BUILD_INGEST)
     list(APPEND _bolt_install_targets bolt_ingest)

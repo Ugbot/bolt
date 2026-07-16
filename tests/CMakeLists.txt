@@ -709,6 +709,53 @@ if(BOLT_BUILD_PARSE)
     add_test(NAME test_bolt_parse_json COMMAND test_bolt_parse_json)
 endif()
 
+# Sandboxed Jinja2-subset lexer for LLM chat templates — BLLM-70/71.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja test_bolt_parse_jinja.cpp)
+    target_link_libraries(test_bolt_parse_jinja
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja)
+    add_test(NAME test_bolt_parse_jinja COMMAND test_bolt_parse_jinja)
+endif()
+
+# Sandboxed Jinja2-subset expression parser/AST — BLLM-70/72.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_ast test_bolt_parse_jinja_ast.cpp)
+    target_link_libraries(test_bolt_parse_jinja_ast
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_ast)
+    add_test(NAME test_bolt_parse_jinja_ast COMMAND test_bolt_parse_jinja_ast)
+endif()
+
+# Sandboxed Jinja2-subset statement parser (if/for/set/macro) — BLLM-70/73.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_stmt test_bolt_parse_jinja_stmt.cpp)
+    target_link_libraries(test_bolt_parse_jinja_stmt
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_stmt)
+    add_test(NAME test_bolt_parse_jinja_stmt COMMAND test_bolt_parse_jinja_stmt)
+endif()
+
+# Sandboxed Jinja2-subset evaluator (Value/Scope + tree-walking render) — BLLM-70/73.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_eval test_bolt_parse_jinja_eval.cpp)
+    target_link_libraries(test_bolt_parse_jinja_eval
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_eval)
+    add_test(NAME test_bolt_parse_jinja_eval COMMAND test_bolt_parse_jinja_eval)
+endif()
+
+# Vulkan device/queue/memory scaffolding — BLLM-46. Runs against whatever
+# real Vulkan device this machine has; self-skips (GTEST_SKIP, not a
+# failure) if bolt::vulkan::available() is false.
+if(BOLT_BUILD_VULKAN)
+    add_executable(test_bolt_vulkan test_bolt_vulkan.cpp)
+    target_link_libraries(test_bolt_vulkan
+        PRIVATE bolt::bolt bolt::vulkan GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_vulkan)
+    add_test(NAME test_bolt_vulkan COMMAND test_bolt_vulkan)
+endif()
+
 # Atomic-bitmap primitives — soft-delete / live-mask substrate.
 add_executable(test_bolt_atomic_bitmap test_bolt_atomic_bitmap.cpp)
 target_link_libraries(test_bolt_atomic_bitmap
