@@ -14,6 +14,11 @@
 
 #include <vulkan/vulkan.h>
 
+#include "bolt/vulkan_shaders/matmul_dequant_f32.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int2.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int4.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int8.h"
+
 namespace bolt::vulkan {
 
 namespace {
@@ -331,6 +336,292 @@ void* Context::map_buffer(const BufferHandle& handle) noexcept {
 void Context::unmap_buffer(const BufferHandle& handle) noexcept {
     if (device_ == nullptr || handle.memory == nullptr) return;
     vkUnmapMemory(static_cast<VkDevice>(device_), static_cast<VkDeviceMemory>(handle.memory));
+}
+
+// ---------------------------------------------------------------------------
+// BLLM-47: matmul+dequant compute pipeline.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// F32's shader has no scale buffer (3 storage-buffer bindings: weight,
+// activation, out); Int8/Int4/Int2 all have 4 (weight, scale, activation,
+// out) -- see each .comp file. Centralizes that fact so create/destroy/
+// dispatch never disagree on binding count.
+uint32_t binding_count_for(WeightDType dtype) noexcept {
+    return (dtype == WeightDType::F32) ? 3u : 4u;
+}
+
+bool shader_words_for(WeightDType dtype, const uint32_t** out_words, size_t* out_size) noexcept {
+    switch (dtype) {
+        case WeightDType::F32:
+            *out_words = shaders::kmatmul_dequant_f32_spv;
+            *out_size = shaders::kmatmul_dequant_f32_spv_size;
+            return true;
+        case WeightDType::Int8:
+            *out_words = shaders::kmatmul_dequant_int8_spv;
+            *out_size = shaders::kmatmul_dequant_int8_spv_size;
+            return true;
+        case WeightDType::Int4:
+            *out_words = shaders::kmatmul_dequant_int4_spv;
+            *out_size = shaders::kmatmul_dequant_int4_spv_size;
+            return true;
+        case WeightDType::Int2:
+            *out_words = shaders::kmatmul_dequant_int2_spv;
+            *out_size = shaders::kmatmul_dequant_int2_spv_size;
+            return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    const uint32_t* spirv_words = nullptr;
+    size_t spirv_size = 0;
+    if (!shader_words_for(dtype, &spirv_words, &spirv_size)) return false;
+    const uint32_t binding_count = binding_count_for(dtype);
+
+    VkShaderModuleCreateInfo module_info{};
+    module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    module_info.codeSize = spirv_size;
+    module_info.pCode = spirv_words;
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &module_info, nullptr, &shader_module) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    for (uint32_t i = 0; i < binding_count; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set_layout_info{};
+    set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_layout_info.bindingCount = binding_count;
+    set_layout_info.pBindings = bindings;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr, &set_layout) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(int32_t);  // matches each shader's `PushConstants { int cols; }`
+
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stage_info{};
+    stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage_info.module = shader_module;
+    stage_info.pName = "main";
+
+    VkComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage = stage_info;
+    pipeline_info.layout = pipeline_layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) !=
+        VK_SUCCESS) {
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkDescriptorPoolSize pool_size{};
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = binding_count;
+    VkDescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkDescriptorSetAllocateInfo set_alloc_info{};
+    set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_alloc_info.descriptorPool = descriptor_pool;
+    set_alloc_info.descriptorSetCount = 1;
+    set_alloc_info.pSetLayouts = &set_layout;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(device, &set_alloc_info, &descriptor_set) != VK_SUCCESS) {
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkCommandPoolCreateInfo cmd_pool_info{};
+    cmd_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cmd_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cmd_pool_info.queueFamilyIndex = queue_family_index_;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    if (vkCreateCommandPool(device, &cmd_pool_info, nullptr, &command_pool) != VK_SUCCESS) {
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo cmd_alloc_info{};
+    cmd_alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc_info.commandPool = command_pool;
+    cmd_alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc_info.commandBufferCount = 1;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device, &cmd_alloc_info, &command_buffer) != VK_SUCCESS) {
+        vkDestroyCommandPool(device, command_pool, nullptr);
+        vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
+        vkDestroyShaderModule(device, shader_module, nullptr);
+        return false;
+    }
+
+    out->shader_module = shader_module;
+    out->descriptor_set_layout = set_layout;
+    out->pipeline_layout = pipeline_layout;
+    out->pipeline = pipeline;
+    out->descriptor_pool = descriptor_pool;
+    out->descriptor_set = descriptor_set;
+    out->command_pool = command_pool;
+    out->command_buffer = command_buffer;
+    out->dtype = dtype;
+    return true;
+}
+
+void Context::destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept {
+    if (pipeline == nullptr || device_ == nullptr) return;
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    // Command buffers are freed implicitly when their pool is destroyed;
+    // descriptor sets likewise when their pool is destroyed -- only the
+    // pools themselves need an explicit destroy call.
+    if (pipeline->command_pool != nullptr) {
+        vkDestroyCommandPool(device, static_cast<VkCommandPool>(pipeline->command_pool), nullptr);
+    }
+    if (pipeline->descriptor_pool != nullptr) {
+        vkDestroyDescriptorPool(device, static_cast<VkDescriptorPool>(pipeline->descriptor_pool),
+                                 nullptr);
+    }
+    if (pipeline->pipeline != nullptr) {
+        vkDestroyPipeline(device, static_cast<VkPipeline>(pipeline->pipeline), nullptr);
+    }
+    if (pipeline->pipeline_layout != nullptr) {
+        vkDestroyPipelineLayout(device, static_cast<VkPipelineLayout>(pipeline->pipeline_layout),
+                                 nullptr);
+    }
+    if (pipeline->descriptor_set_layout != nullptr) {
+        vkDestroyDescriptorSetLayout(
+            device, static_cast<VkDescriptorSetLayout>(pipeline->descriptor_set_layout), nullptr);
+    }
+    if (pipeline->shader_module != nullptr) {
+        vkDestroyShaderModule(device, static_cast<VkShaderModule>(pipeline->shader_module), nullptr);
+    }
+    *pipeline = MatmulPipeline{};
+}
+
+bool Context::matmul_dequant(const MatmulPipeline& pipeline, const BufferHandle& weight,
+                             const BufferHandle& scale, const BufferHandle& activation,
+                             const BufferHandle& out, int32_t out_rows, int32_t cols) noexcept {
+    if (device_ == nullptr || !pipeline.is_valid()) return false;
+    if (weight.buffer == nullptr || activation.buffer == nullptr || out.buffer == nullptr) {
+        return false;
+    }
+    if (pipeline.dtype != WeightDType::F32 && scale.buffer == nullptr) return false;
+    if (out_rows <= 0 || cols <= 0) return false;
+
+    VkDevice device = static_cast<VkDevice>(device_);
+    const uint32_t binding_count = binding_count_for(pipeline.dtype);
+
+    VkDescriptorBufferInfo buffer_infos[4]{};
+    buffer_infos[0] = {static_cast<VkBuffer>(weight.buffer), 0, VK_WHOLE_SIZE};
+    if (pipeline.dtype == WeightDType::F32) {
+        buffer_infos[1] = {static_cast<VkBuffer>(activation.buffer), 0, VK_WHOLE_SIZE};
+        buffer_infos[2] = {static_cast<VkBuffer>(out.buffer), 0, VK_WHOLE_SIZE};
+    } else {
+        buffer_infos[1] = {static_cast<VkBuffer>(scale.buffer), 0, VK_WHOLE_SIZE};
+        buffer_infos[2] = {static_cast<VkBuffer>(activation.buffer), 0, VK_WHOLE_SIZE};
+        buffer_infos[3] = {static_cast<VkBuffer>(out.buffer), 0, VK_WHOLE_SIZE};
+    }
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < binding_count; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(device, binding_count, writes, 0, nullptr);
+
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(pipeline.command_buffer);
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, static_cast<VkPipeline>(pipeline.pipeline));
+    VkDescriptorSet set = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            static_cast<VkPipelineLayout>(pipeline.pipeline_layout), 0, 1, &set, 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t), &cols);
+    vkCmdDispatch(cmd, static_cast<uint32_t>(out_rows), 1, 1);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    VkQueue queue = static_cast<VkQueue>(queue_);
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+
+    // Blocking: simplest correct synchronization for a first real cut (no
+    // async dispatch/fence-polling API yet -- same "block until done"
+    // contract as bolt::rocm::matmul_dequant's hipDeviceSynchronize()).
+    // vkQueueWaitIdle establishes the host-visibility guarantee needed to
+    // safely map_buffer()+read `out` afterward on this HOST_COHERENT
+    // memory, so no separate pipeline barrier is required.
+    return vkQueueWaitIdle(queue) == VK_SUCCESS;
 }
 
 }  // namespace bolt::vulkan

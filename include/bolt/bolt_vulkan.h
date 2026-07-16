@@ -4,10 +4,12 @@
 // `Device` enum and its `vulkan_table` hard-failing stubs -- BLLM-13).
 //
 // Scope: instance + physical/logical device + one dedicated compute queue
-// + a basic buffer allocator. NOT compute kernels/shaders (BLLM-47's job,
-// "adapt dequant+GEMM shaders") -- this is the plumbing those kernels will
-// dispatch through once they exist. bolt_compute.h's vulkan_table entries
-// still point at device_not_implemented() until BLLM-47 lands; this module
+// + a basic buffer allocator, PLUS (BLLM-47) the compiled matmul+dequant
+// compute pipeline itself -- `Context::create_matmul_pipeline` /
+// `matmul_dequant` below. bolt_compute.h's vulkan_table entries still
+// point at device_not_implemented() (wiring this into that dispatch table
+// is a separate follow-up, same seam bolt::rocm's matmul_dequant left
+// open -- see bolt_compute.h's SEAM note on matmul_rocm_stub); this module
 // is additive and does not change that dispatch yet.
 //
 // Runtime-detected, CPU fallback always works: `available()` probes for a
@@ -51,6 +53,42 @@ struct BufferHandle {
     void*    memory = nullptr;
     uint64_t size_bytes = 0;
     bool     host_visible = false;  // true iff map_buffer() will work on this handle
+};
+
+// Weight dtype tag for matmul_dequant (BLLM-47) -- mirrors
+// bolt::rocm::WeightDType and the subset of bolt::DType (bolt_tensor.h)
+// that bolt_compute.h's matmul_row_dot_f32 dequantizes today. Restated by
+// value (not #include bolt_tensor.h) for the same reason bolt_rocm.h
+// restates it: callers that only want the Vulkan kernel shouldn't have to
+// link bolt::core's Tensor type. F16/BF16 are intentionally absent.
+enum class WeightDType : uint8_t {
+    F32  = 0,
+    Int8 = 1,
+    Int4 = 2,
+    Int2 = 3,
+};
+
+// One compiled compute pipeline for a specific WeightDType's matmul+dequant
+// shader (BLLM-47). Owns a shader module, descriptor set layout, pipeline
+// layout, pipeline, a one-set descriptor pool + the set itself, and a
+// dedicated command pool + command buffer -- everything matmul_dequant()
+// needs to record and submit a dispatch without allocating per-call.
+// Opaque handles; only bolt_vulkan.cpp interprets them. Tiger-Style
+// single-owner: default-constructible (inert), destroyed via
+// Context::destroy_matmul_pipeline (this struct has no destructor of its
+// own -- ownership is explicit, matching this module's Context contract).
+struct MatmulPipeline {
+    void*       shader_module = nullptr;         // VkShaderModule
+    void*       descriptor_set_layout = nullptr;  // VkDescriptorSetLayout
+    void*       pipeline_layout = nullptr;        // VkPipelineLayout
+    void*       pipeline = nullptr;               // VkPipeline
+    void*       descriptor_pool = nullptr;        // VkDescriptorPool
+    void*       descriptor_set = nullptr;         // VkDescriptorSet
+    void*       command_pool = nullptr;           // VkCommandPool
+    void*       command_buffer = nullptr;         // VkCommandBuffer
+    WeightDType dtype = WeightDType::F32;
+
+    bool is_valid() const noexcept { return pipeline != nullptr; }
 };
 
 // Owns one Vulkan instance + physical/logical device + one compute queue.
@@ -110,6 +148,36 @@ public:
     // Unmaps a buffer map_buffer() returned non-null for. Precondition:
     // is_valid().
     void unmap_buffer(const BufferHandle& handle) noexcept;
+
+    // ---- BLLM-47: matmul+dequant compute pipeline -----------------------
+
+    // Creates the compiled compute pipeline for one WeightDType's
+    // matmul+dequant shader (embedded SPIR-V -- see shaders/matmul_dequant_
+    // {f32,int8,int4,int2}.comp and bolt_vulkan.cpp's kShaderFor()).
+    // Returns false (leaving `*out` default-constructed) on any failure.
+    // Precondition: is_valid(). May be called more than once (one pipeline
+    // per dtype needed); each call owns independent resources, freed by
+    // destroy_matmul_pipeline().
+    bool create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept;
+
+    // Destroys a pipeline create_matmul_pipeline() returned; safe on a
+    // default-constructed (never-created) pipeline. Zeroes `*pipeline`.
+    void destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept;
+
+    // Dispatches the GEMV: out[r] = dot(weight.row(r), activation), r in
+    // [0, out_rows), with on-the-fly dequant for dtype != F32 -- same
+    // convention (kInt4/kInt2 offsets, per-row `scale`) as
+    // bolt_compute.h's matmul_row_dot_f32 CPU reference and
+    // bolt::rocm::matmul_dequant. All buffer args are Vulkan-resident
+    // BufferHandles from allocate_buffer(); `scale` is ignored (may be a
+    // default-constructed handle) when `pipeline.dtype() ==
+    // WeightDType::F32`. Blocks until the dispatch completes
+    // (vkQueueWaitIdle) -- not a fire-and-forget async dispatch.
+    // Precondition: is_valid(), and `pipeline` was created with the same
+    // dtype these buffers were packed for.
+    bool matmul_dequant(const MatmulPipeline& pipeline, const BufferHandle& weight,
+                        const BufferHandle& scale, const BufferHandle& activation,
+                        const BufferHandle& out, int32_t out_rows, int32_t cols) noexcept;
 
 private:
     void*    instance_ = nullptr;         // VkInstance

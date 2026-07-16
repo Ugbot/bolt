@@ -195,6 +195,50 @@ if(BOLT_BUILD_VULKAN)
         $<INSTALL_INTERFACE:include>)
     bolt_apply_hardening(bolt_vulkan)
     target_link_libraries(bolt INTERFACE bolt::vulkan)
+
+    # -------------------------------------------------------------------
+    # BLLM-47: matmul+dequant compute shaders (F32/Int8/Int4/Int2), written
+    # from scratch for OUR exact quant layout (low-nibble-first Int4,
+    # separate per-row scale array) after reading llama.cpp's real
+    # ggml-vulkan mul_mat_vec.comp design for transferable technique facts
+    # (MIT-licensed; see the repo-root NOTICE file for the full
+    # attribution) -- see each .comp file's own header comment for the
+    # byte-packing details. Compiled to SPIR-V via glslc
+    # at build time, then embedded as a C++ uint32_t array (glslc
+    # -mfmt=c) so bolt::vulkan needs no runtime filesystem access to load
+    # a shader -- CompileShaderToHeader.cmake does the wrapping.
+    # -------------------------------------------------------------------
+    find_program(Vulkan_GLSLC_EXECUTABLE glslc
+                 HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(NOT Vulkan_GLSLC_EXECUTABLE)
+        message(WARNING "BOLT_BUILD_VULKAN is ON but glslc was not found -- BLLM-47 shaders will not be embedded")
+    else()
+        set(_bolt_vulkan_shader_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/bolt/vulkan_shaders")
+        file(MAKE_DIRECTORY "${_bolt_vulkan_shader_gen_dir}")
+        set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2)
+        set(_bolt_vulkan_shader_headers "")
+        foreach(_shader_name ${_bolt_vulkan_shader_names})
+            set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")
+            set(_out "${_bolt_vulkan_shader_gen_dir}/${_shader_name}.h")
+            add_custom_command(
+                OUTPUT "${_out}"
+                COMMAND ${CMAKE_COMMAND}
+                        -DGLSLC=${Vulkan_GLSLC_EXECUTABLE}
+                        -DSRC=${_src}
+                        -DOUT=${_out}
+                        -DVAR_NAME=k${_shader_name}_spv
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaderToHeader.cmake"
+                DEPENDS "${_src}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaderToHeader.cmake"
+                COMMENT "Compiling ${_shader_name}.comp -> embedded SPIR-V header"
+                VERBATIM
+            )
+            list(APPEND _bolt_vulkan_shader_headers "${_out}")
+        endforeach()
+        add_custom_target(bolt_vulkan_shaders DEPENDS ${_bolt_vulkan_shader_headers})
+        add_dependencies(bolt_vulkan bolt_vulkan_shaders)
+        target_include_directories(bolt_vulkan PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
