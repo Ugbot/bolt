@@ -8,7 +8,9 @@
 // fresh here, not shared code with bolt_compute.h, so an algorithmic bug in
 // one is unlikely to be mirrored in the other). The dispatch table itself is
 // checked to resolve Device::CPU to the real implementation and
-// Device::Vulkan/Device::CUDA to populated-but-hard-failing stubs.
+// Device::Vulkan/Device::CUDA/Device::ROCm to populated-but-hard-failing
+// stubs (ROCm's real kernel, bolt::rocm::matmul_dequant -- BLLM-78 -- is a
+// separate optional compiled library, not wired into this table yet).
 
 #include "bolt/bolt_compute.h"
 
@@ -423,7 +425,7 @@ TEST(BoltCompute, DispatchTableVulkanAndCudaSlotsArePopulatedNotSilentNoop) {
     // function pointer -- calling through the table never dereferences a
     // null pointer) but the function itself hard-fails when invoked (see
     // the death tests below), not a quiet no-op.
-    for (Device d : {Device::Vulkan, Device::CUDA}) {
+    for (Device d : {Device::Vulkan, Device::CUDA, Device::ROCm}) {
         const auto& t = bolt::compute::table_for(d);
         EXPECT_NE(t.matmul, nullptr);
         EXPECT_NE(t.rmsnorm, nullptr);
@@ -477,6 +479,23 @@ TEST(BoltComputeDeathTest, SampleTopkTopPTempCudaAborts) {
     EXPECT_DEATH(
         { bolt::compute::sample_topk_topp_temp(Device::CUDA, logits, 2, params, 0.5f); },
         "CUDA");
+}
+
+TEST(BoltComputeDeathTest, MatmulRocmAborts) {
+    std::vector<float> weight_data = {1, 2};
+    Tensor weight = bolt::tensor_make_cpu_2d(DType::F32, 1, 2, weight_data.data());
+    const float activation[2] = {1.0f, 1.0f};
+    float out[1] = {0};
+    EXPECT_DEATH(
+        { bolt::compute::matmul(Device::ROCm, weight, activation, out, 1); },
+        "ROCm");
+}
+
+TEST(BoltComputeDeathTest, SwigluRocmAborts) {
+    const float gate[2] = {1.0f, 2.0f};
+    const float up[2] = {1.0f, 1.0f};
+    float out[2];
+    EXPECT_DEATH({ bolt::compute::swiglu_row(Device::ROCm, gate, up, out, 2); }, "ROCm");
 }
 
 }  // namespace

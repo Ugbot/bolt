@@ -756,6 +756,18 @@ if(BOLT_BUILD_VULKAN)
     add_test(NAME test_bolt_vulkan COMMAND test_bolt_vulkan)
 endif()
 
+# ROCm/HIP matmul+dequant kernel core — BLLM-78. Runs against whatever
+# real ROCm device this machine has; self-skips (GTEST_SKIP, not a
+# failure) if bolt::rocm::available() is false. Only built when a real
+# hipcc was found (BOLT_BUILD_ROCM) -- not the case on this dev box.
+if(BOLT_BUILD_ROCM)
+    add_executable(test_bolt_rocm test_bolt_rocm.cpp)
+    target_link_libraries(test_bolt_rocm
+        PRIVATE bolt::bolt bolt::rocm GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_rocm)
+    add_test(NAME test_bolt_rocm COMMAND test_bolt_rocm)
+endif()
+
 # Atomic-bitmap primitives — soft-delete / live-mask substrate.
 add_executable(test_bolt_atomic_bitmap test_bolt_atomic_bitmap.cpp)
 target_link_libraries(test_bolt_atomic_bitmap

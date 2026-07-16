@@ -53,12 +53,15 @@ TEST(BoltTensor, DefaultConstructedIsZeroed) {
 }
 
 TEST(BoltTensor, DeviceEnumReservesGpuValues) {
-    // This ticket (N0) only reserves the index space; no Vulkan/CUDA
-    // dispatch exists yet. Pin the numeric values since they may end up
-    // serialized (device tag alongside a tensor) before the backends land.
+    // This ticket (N0) only reserves the index space; no Vulkan/CUDA/ROCm
+    // dispatch exists yet (ROCm's real kernel, bolt::rocm, is BLLM-78's
+    // optional compiled library -- not wired into this table). Pin the
+    // numeric values since they may end up serialized (device tag
+    // alongside a tensor) before the backends land.
     EXPECT_EQ(static_cast<uint8_t>(Device::CPU), 0u);
     EXPECT_EQ(static_cast<uint8_t>(Device::Vulkan), 1u);
     EXPECT_EQ(static_cast<uint8_t>(Device::CUDA), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(Device::ROCm), 3u);
 }
 
 TEST(BoltTensor, DTypeValuesMatchQuantFmtWhereTheyOverlap) {

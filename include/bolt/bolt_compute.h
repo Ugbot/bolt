@@ -135,6 +135,7 @@ struct SampleParams {
 [[noreturn]] inline void device_not_implemented(const char* op, Device device) noexcept {
     const char* device_name = (device == Device::Vulkan) ? "Vulkan"
                             : (device == Device::CUDA)   ? "CUDA"
+                            : (device == Device::ROCm)   ? "ROCm"
                                                           : "<unrecognized>";
     std::fprintf(stderr,
                  "bolt::compute: '%s' has no implementation for Device::%s "
@@ -233,6 +234,16 @@ inline void matmul_cpu_scalar(const Tensor& weight, const float* activation, flo
 [[noreturn]] inline void matmul_cuda_stub(const Tensor&, const float*, float*, int32_t) noexcept {
     device_not_implemented("matmul", Device::CUDA);
 }
+// NOTE: Device::ROCm's REAL implementation is bolt::rocm::matmul_dequant
+// (bolt_rocm.h, BLLM-78) -- a separate optional compiled library (gated on
+// finding a real hipcc), not wired into this table yet because doing so
+// would force bolt_compute.h (header-only, always included) to depend on
+// bolt::rocm's HIP-toolchain-gated build. This stub is the fallback this
+// table resolves to until that wiring lands; see bolt_rocm.h's own header
+// comment for the kernel itself.
+[[noreturn]] inline void matmul_rocm_stub(const Tensor&, const float*, float*, int32_t) noexcept {
+    device_not_implemented("matmul", Device::ROCm);
+}
 
 }  // namespace detail
 
@@ -267,6 +278,9 @@ inline void rmsnorm_cpu_scalar(const float* x, const float* w, float* y, int32_t
 }
 [[noreturn]] inline void rmsnorm_cuda_stub(const float*, const float*, float*, int32_t, float) noexcept {
     device_not_implemented("rmsnorm", Device::CUDA);
+}
+[[noreturn]] inline void rmsnorm_rocm_stub(const float*, const float*, float*, int32_t, float) noexcept {
+    device_not_implemented("rmsnorm", Device::ROCm);
 }
 
 }  // namespace detail
@@ -347,6 +361,9 @@ inline void rope_half_split_cpu_scalar(float* x, int32_t head_dim_rope, int32_t 
 [[noreturn]] inline void rope_cuda_stub(float*, int32_t, int32_t, float) noexcept {
     device_not_implemented("rope", Device::CUDA);
 }
+[[noreturn]] inline void rope_rocm_stub(float*, int32_t, int32_t, float) noexcept {
+    device_not_implemented("rope", Device::ROCm);
+}
 
 }  // namespace detail
 
@@ -384,6 +401,9 @@ inline void softmax_inplace_cpu_scalar(float* x, int32_t n) noexcept {
 [[noreturn]] inline void softmax_cuda_stub(float*, int32_t) noexcept {
     device_not_implemented("softmax", Device::CUDA);
 }
+[[noreturn]] inline void softmax_rocm_stub(float*, int32_t) noexcept {
+    device_not_implemented("softmax", Device::ROCm);
+}
 
 }  // namespace detail
 
@@ -415,6 +435,9 @@ inline void swiglu_row_cpu_scalar(const float* gate, const float* up, float* out
 }
 [[noreturn]] inline void swiglu_cuda_stub(const float*, const float*, float*, int32_t) noexcept {
     device_not_implemented("swiglu", Device::CUDA);
+}
+[[noreturn]] inline void swiglu_rocm_stub(const float*, const float*, float*, int32_t) noexcept {
+    device_not_implemented("swiglu", Device::ROCm);
 }
 
 }  // namespace detail
@@ -519,6 +542,9 @@ inline int32_t sample_topk_topp_temp_cpu(const float* logits, int32_t n, const S
 [[noreturn]] inline int32_t sample_cuda_stub(const float*, int32_t, const SampleParams&, float) noexcept {
     device_not_implemented("sample_topk_topp_temp", Device::CUDA);
 }
+[[noreturn]] inline int32_t sample_rocm_stub(const float*, int32_t, const SampleParams&, float) noexcept {
+    device_not_implemented("sample_topk_topp_temp", Device::ROCm);
+}
 
 }  // namespace detail
 
@@ -582,11 +608,25 @@ inline const ComputeTable& table_for(Device device) noexcept {
         t.sample_topk_topp_temp = &detail::sample_cuda_stub;
         return t;
     }();
+    // See the SEAM note on matmul_rocm_stub above: bolt::rocm's real
+    // matmul_dequant kernel (BLLM-78) is not wired into this slot yet.
+    static const ComputeTable rocm_table = [] {
+        ComputeTable t;
+        t.matmul = &detail::matmul_rocm_stub;
+        t.rmsnorm = &detail::rmsnorm_rocm_stub;
+        t.rope_interleave = &detail::rope_rocm_stub;
+        t.rope_half_split = &detail::rope_rocm_stub;
+        t.softmax_inplace = &detail::softmax_rocm_stub;
+        t.swiglu_row = &detail::swiglu_rocm_stub;
+        t.sample_topk_topp_temp = &detail::sample_rocm_stub;
+        return t;
+    }();
 
     switch (device) {
         case Device::CPU:    return cpu_table;
         case Device::Vulkan: return vulkan_table;
         case Device::CUDA:   return cuda_table;
+        case Device::ROCm:   return rocm_table;
     }
     device_not_implemented("table_for", device);  // unrecognized enum value.
 }

@@ -198,6 +198,45 @@ if(BOLT_BUILD_VULKAN)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::rocm -- ROCm/HIP matmul+dequant kernel core behind bolt::compute's
+# reserved ROCm device slot (BLLM-78). Same "simply not built if the SDK
+# isn't present" contract as bolt::vulkan above. Gated on actually finding
+# a real hipcc (via HIP_PATH/ROCM_PATH env vars or a standard ROCm install
+# path) -- enable_language(HIP) is only attempted after that probe
+# succeeds, so its absence never breaks configure for anyone else. Checked
+# 2026-07-16 on this dev box (AMD Ryzen AI Max+ 395 / Radeon 8060S,
+# gfx1151): no HIP_PATH, no hipcc, no ROCm install dir found -- this
+# target is NOT built here; the kernel source (src/bolt_rocm.cpp) exists
+# and is structurally complete but has never been run through a real HIP
+# compiler (see that file's header comment).
+# ---------------------------------------------------------------------------
+find_program(BOLT_HIPCC_EXECUTABLE NAMES hipcc
+             HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
+option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core" OFF)
+if(BOLT_HIPCC_EXECUTABLE)
+    set(BOLT_BUILD_ROCM ON)
+endif()
+
+if(BOLT_BUILD_ROCM AND NOT BOLT_HIPCC_EXECUTABLE)
+    message(WARNING "BOLT_BUILD_ROCM requested but no hipcc found (set HIP_PATH/ROCM_PATH) -- skipping bolt::rocm")
+    set(BOLT_BUILD_ROCM OFF)
+endif()
+
+if(BOLT_BUILD_ROCM)
+    set(CMAKE_HIP_COMPILER "${BOLT_HIPCC_EXECUTABLE}")
+    enable_language(HIP)
+    set_source_files_properties(src/bolt_rocm.cpp PROPERTIES LANGUAGE HIP)
+    add_library(bolt_rocm STATIC src/bolt_rocm.cpp)
+    add_library(bolt::rocm ALIAS bolt_rocm)
+    target_link_libraries(bolt_rocm PUBLIC bolt::core)
+    target_include_directories(bolt_rocm PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_rocm)
+    target_link_libraries(bolt INTERFACE bolt::rocm)
+endif()
+
+# ---------------------------------------------------------------------------
 # bolt::ingest — compiled static library (CSV loader).
 # Delegates numeric parsing to bolt::parse; ships as a TU so the parser
 # tables link once per binary instead of per consumer.
@@ -487,6 +526,9 @@ if(BOLT_BUILD_PARSE)
 endif()
 if(BOLT_BUILD_VULKAN)
     list(APPEND _bolt_install_targets bolt_vulkan)
+endif()
+if(BOLT_BUILD_ROCM)
+    list(APPEND _bolt_install_targets bolt_rocm)
 endif()
 if(BOLT_BUILD_INGEST)
     list(APPEND _bolt_install_targets bolt_ingest)
