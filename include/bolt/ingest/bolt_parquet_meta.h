@@ -157,6 +157,17 @@ struct PqColumn {
     uint8_t  _pad[7];
 };
 
+// PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics
+// field each kept stat came from. The modern `min_value`/`max_value`
+// (fields 6/5) are defined against the column's logical sort order and a
+// spec-compliant writer keeps them valid bounds even when truncated; the
+// legacy `min`/`max` (fields 2/1) were written by old writers with
+// inconsistent orderings for BYTE_ARRAY (signed-byte vs unsigned-lex), so
+// string pruning must never trust them. Integer stats are safe from either
+// source (signed order is the one defined order for INT32/INT64).
+inline constexpr uint32_t kPqStatMinIsValueField = 1u << 0;  // from min_value
+inline constexpr uint32_t kPqStatMaxIsValueField = 1u << 1;  // from max_value
+
 // One column chunk inside a row group.
 struct PqChunk {
     int64_t  data_page_offset;
@@ -165,13 +176,30 @@ struct PqChunk {
     int64_t  total_compressed_size;
     int64_t  total_uncompressed_size;
     PqCodec  codec;
-    int32_t  _pad;
+    uint32_t stats_flags;             // kPqStat* bits (was padding)
     // Statistics (min_value/max_value preferred; legacy min/max fallback).
+    // A stat longer than kPqMaxStatBytes is recorded as ABSENT (len 0) —
+    // bolt never keeps a self-truncated stat, so a present stat is the
+    // writer's full bytes (see copy_stat).
     uint8_t  min_bytes[kPqMaxStatBytes];
     uint8_t  max_bytes[kPqMaxStatBytes];
     uint32_t min_len;                 // 0 = absent
     uint32_t max_len;                 // 0 = absent
     int64_t  null_count;              // -1 = absent
+    // Page-index + bloom-filter locations (G2FEAT-23). These structures
+    // live OUTSIDE the footer FileMetaData: absolute file offsets recorded
+    // here, parsed on demand by bolt_parquet_pageindex.h / _bloom.h. A
+    // parquet file always starts with "PAR1", so 0 is never a valid offset
+    // and doubles as "absent".
+    int64_t  column_index_offset;     // ColumnChunk field 6; 0 = absent
+    int64_t  offset_index_offset;     // ColumnChunk field 4; 0 = absent
+    int64_t  bloom_filter_offset;     // ColumnMetaData field 14; 0 = absent
+    int32_t  column_index_length;     // ColumnChunk field 7; 0 = absent
+    int32_t  offset_index_length;     // ColumnChunk field 5; 0 = absent
+    int32_t  bloom_filter_length;     // ColumnMetaData field 15; 0 = unknown
+                                      // (pre-2.9 writers omit the length —
+                                      // the bloom reader then bounds by EOF)
+    int32_t  _pad2;
 };
 
 struct PqRowGroup {

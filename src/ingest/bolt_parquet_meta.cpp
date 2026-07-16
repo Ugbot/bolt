@@ -189,6 +189,8 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
                 if (!tc_binary(c, &p, &n)) return false;
                 copy_stat(p, n, ch->max_bytes, &ch->max_len);
                 have_new_max = true;
+                // Flag only when actually kept (oversize => len 0 = absent).
+                if (ch->max_len != 0) ch->stats_flags |= kPqStatMaxIsValueField;
                 break;
             }
             case 6: {   // min_value
@@ -196,6 +198,7 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
                 if (!tc_binary(c, &p, &n)) return false;
                 copy_stat(p, n, ch->min_bytes, &ch->min_len);
                 have_new_min = true;
+                if (ch->min_len != 0) ch->stats_flags |= kPqStatMinIsValueField;
                 break;
             }
             default:
@@ -210,7 +213,7 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
 // fields: 1 type 2 encodings 3 path_in_schema 4 codec 5 num_values
 //         6 total_uncompressed_size 7 total_compressed_size
 //         9 data_page_offset 10 index_page_offset 11 dictionary_page_offset
-//         12 statistics
+//         12 statistics 14 bloom_filter_offset 15 bloom_filter_length
 bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
     assert(c != nullptr && ch != nullptr);
     int16_t fid = 0;
@@ -246,6 +249,16 @@ bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
                 if (ft != kTcStruct) { if (!tc_skip(c, ft, 0)) return false; break; }
                 if (!parse_statistics(c, ch)) return false;
                 break;
+            case 14:    // bloom_filter_offset (absolute file offset)
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0) ch->bloom_filter_offset = v;
+                break;
+            case 15:    // bloom_filter_length (header + bitset bytes)
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0 && v <= 0x7FFFFFFF) {
+                    ch->bloom_filter_length = static_cast<int32_t>(v);
+                }
+                break;
             default:
                 if (!tc_skip(c, ft, 0)) return false;
                 break;
@@ -256,6 +269,8 @@ bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
 
 // ---- ColumnChunk -----------------------------------------------------------
 // fields: 1 file_path 2 file_offset 3 meta_data
+//         4 offset_index_offset 5 offset_index_length
+//         6 column_index_offset 7 column_index_length
 bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
     assert(c != nullptr && ch != nullptr);
     std::memset(ch, 0, sizeof(*ch));
@@ -263,6 +278,7 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {
+        int64_t v = 0;
         switch (fid) {
             case 1: {
                 const uint8_t* p; uint32_t n;
@@ -273,6 +289,26 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
             case 3:
                 if (ft != kTcStruct) { if (!tc_skip(c, ft, 0)) return false; break; }
                 if (!parse_column_meta(c, ch)) return false;
+                break;
+            case 4:     // offset_index_offset
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0) ch->offset_index_offset = v;
+                break;
+            case 5:     // offset_index_length
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0 && v <= 0x7FFFFFFF) {
+                    ch->offset_index_length = static_cast<int32_t>(v);
+                }
+                break;
+            case 6:     // column_index_offset
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0) ch->column_index_offset = v;
+                break;
+            case 7:     // column_index_length
+                if (!tc_zigzag(c, &v)) return false;
+                if (v > 0 && v <= 0x7FFFFFFF) {
+                    ch->column_index_length = static_cast<int32_t>(v);
+                }
                 break;
             default:
                 if (!tc_skip(c, ft, 0)) return false;
