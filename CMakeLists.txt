@@ -137,15 +137,22 @@ endif()
 # Header `bolt/bolt_ribbon.h` declares the API; this static lib carries
 # `build` + `might_contain`.
 # ---------------------------------------------------------------------------
-add_library(bolt_ribbon STATIC src/bolt_ribbon.cpp)
-add_library(bolt::ribbon ALIAS bolt_ribbon)
-target_link_libraries(bolt_ribbon PUBLIC bolt::core)
-target_include_directories(bolt_ribbon PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-bolt_apply_hardening(bolt_ribbon)
-bolt_apply_simd(bolt_ribbon ${BOLT_SIMD_TIER})
-target_link_libraries(bolt INTERFACE bolt::ribbon)
+# Default ON (not ${BOLT_IS_TOPLEVEL}): this target was unconditional before the
+# switch existed, so ON keeps every consumer building exactly as it did. The
+# switch is here so a consumer that only wants bolt::core can decline the cost.
+option(BOLT_BUILD_RIBBON "Build bolt::ribbon banded GF(2) Ribbon filter" ON)
+
+if(BOLT_BUILD_RIBBON)
+    add_library(bolt_ribbon STATIC src/bolt_ribbon.cpp)
+    add_library(bolt::ribbon ALIAS bolt_ribbon)
+    target_link_libraries(bolt_ribbon PUBLIC bolt::core)
+    target_include_directories(bolt_ribbon PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_ribbon)
+    bolt_apply_simd(bolt_ribbon ${BOLT_SIMD_TIER})
+    target_link_libraries(bolt INTERFACE bolt::ribbon)
+endif()
 
 # ---------------------------------------------------------------------------
 # bolt::parse — compiled static library (ASCII numeric parsers).
@@ -155,7 +162,7 @@ target_link_libraries(bolt INTERFACE bolt::ribbon)
 option(BOLT_BUILD_PARSE "Build bolt::parse compiled library" ${BOLT_IS_TOPLEVEL})
 
 if(BOLT_BUILD_PARSE)
-    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp)
+    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
     add_library(bolt::parse ALIAS bolt_parse)
     target_link_libraries(bolt_parse PUBLIC bolt::core)
     target_include_directories(bolt_parse PUBLIC
@@ -164,6 +171,184 @@ if(BOLT_BUILD_PARSE)
     bolt_apply_hardening(bolt_parse)
     bolt_apply_simd(bolt_parse ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::parse)
+endif()
+
+# ---------------------------------------------------------------------------
+# bolt::vulkan — device/queue/memory scaffolding behind bolt::compute's
+# reserved Vulkan device slot (BLLM-46). Compiled (not header-only) for the
+# same reason as bolt::parse: Vulkan's C API + loader linkage doesn't suit
+# a header-only inline function. Gated on CMake actually finding a Vulkan
+# SDK (via find_package's standard FindVulkan module, which consults the
+# VULKAN_SDK env var the LunarG installer sets) -- if none is found, this
+# target is simply not built, and bolt::compute's Vulkan slot stays a
+# hard-failing stub exactly as it is today. Never required for a build to
+# succeed; every other consumer keeps working CPU-only regardless.
+# ---------------------------------------------------------------------------
+find_package(Vulkan QUIET)
+
+# Default follows the same rule as every other optional compiled target
+# (bolt::io / bolt::parse / bolt::ingest): ON only when bolt is the TOP-LEVEL
+# project -- i.e. someone is building/testing bolt itself -- and the SDK is
+# actually present. Availability is NOT need: a consumer that links bolt::bolt
+# for bolt::core must never silently compile bolt::vulkan + a SPIR-V shader
+# pipeline just because the dev box happens to have the LunarG SDK installed.
+# Consumers that DO want it opt in explicitly with -DBOLT_BUILD_VULKAN=ON.
+if(BOLT_IS_TOPLEVEL AND Vulkan_FOUND)
+    set(BOLT_VULKAN_DEFAULT ON)
+else()
+    set(BOLT_VULKAN_DEFAULT OFF)
+endif()
+option(BOLT_BUILD_VULKAN "Build bolt::vulkan device/queue/memory scaffolding"
+       ${BOLT_VULKAN_DEFAULT})
+
+if(BOLT_BUILD_VULKAN AND NOT Vulkan_FOUND)
+    message(WARNING "BOLT_BUILD_VULKAN requested but no Vulkan SDK found (set VULKAN_SDK) -- skipping bolt::vulkan")
+    set(BOLT_BUILD_VULKAN OFF)
+endif()
+
+if(BOLT_BUILD_VULKAN)
+    add_library(bolt_vulkan STATIC src/bolt_vulkan.cpp)
+    add_library(bolt::vulkan ALIAS bolt_vulkan)
+    target_link_libraries(bolt_vulkan PUBLIC bolt::core Vulkan::Vulkan)
+    target_include_directories(bolt_vulkan PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_vulkan)
+    target_link_libraries(bolt INTERFACE bolt::vulkan)
+
+    # -------------------------------------------------------------------
+    # BLLM-47: matmul+dequant compute shaders (F32/Int8/Int4/Int2), written
+    # from scratch for OUR exact quant layout (low-nibble-first Int4,
+    # separate per-row scale array) after reading llama.cpp's real
+    # ggml-vulkan mul_mat_vec.comp design for transferable technique facts
+    # (MIT-licensed; see the repo-root NOTICE file for the full
+    # attribution) -- see each .comp file's own header comment for the
+    # byte-packing details. Compiled to SPIR-V via glslc
+    # at build time, then embedded as a C++ uint32_t array (glslc
+    # -mfmt=c) so bolt::vulkan needs no runtime filesystem access to load
+    # a shader -- CompileShaderToHeader.cmake does the wrapping.
+    # -------------------------------------------------------------------
+    find_program(Vulkan_GLSLC_EXECUTABLE glslc
+                 HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(NOT Vulkan_GLSLC_EXECUTABLE)
+        message(WARNING "BOLT_BUILD_VULKAN is ON but glslc was not found -- BLLM-47 shaders will not be embedded")
+    else()
+        set(_bolt_vulkan_shader_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/bolt/vulkan_shaders")
+        file(MAKE_DIRECTORY "${_bolt_vulkan_shader_gen_dir}")
+        set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2
+                                       matmul_dequant_int8act_int8 matmul_dequant_int8act_int4
+                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched)
+        set(_bolt_vulkan_shader_headers "")
+        foreach(_shader_name ${_bolt_vulkan_shader_names})
+            set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")
+            set(_out "${_bolt_vulkan_shader_gen_dir}/${_shader_name}.h")
+            add_custom_command(
+                OUTPUT "${_out}"
+                COMMAND ${CMAKE_COMMAND}
+                        -DGLSLC=${Vulkan_GLSLC_EXECUTABLE}
+                        -DSRC=${_src}
+                        -DOUT=${_out}
+                        -DVAR_NAME=k${_shader_name}_spv
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaderToHeader.cmake"
+                DEPENDS "${_src}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaderToHeader.cmake"
+                COMMENT "Compiling ${_shader_name}.comp -> embedded SPIR-V header"
+                VERBATIM
+            )
+            list(APPEND _bolt_vulkan_shader_headers "${_out}")
+        endforeach()
+        add_custom_target(bolt_vulkan_shaders DEPENDS ${_bolt_vulkan_shader_headers})
+        add_dependencies(bolt_vulkan bolt_vulkan_shaders)
+        target_include_directories(bolt_vulkan PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# bolt::rocm -- ROCm/HIP matmul+dequant kernel core behind bolt::compute's
+# reserved ROCm device slot (BLLM-78).
+#
+# Checked 2026-07-16: no HIP_PATH, no hipcc, no ROCm install dir found on
+# this dev box (AMD Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) -- BLLM-90
+# then found AMD's Windows HIP SDK officially lists gfx1151 as supported
+# (reversing that finding); HIP SDK 7.1 installed 2026-07-17. bolt::rocm's
+# kernel WAS validated for real against this box's actual GPU
+# (F32/Int8/Int4/Int2, including the multi-row misaligned-stride
+# regression case -- 50/50 checks pass) by invoking hipcc directly.
+#
+# UNLIKE bolt::vulkan above, this option DOES NOT auto-enable just because
+# hipcc/clang++ are found (BLLM-92 finding): CMake's enable_language(HIP)
+# does not currently link cleanly on Windows against this HIP SDK -- the
+# HIP-language link step inherits an MSVC-style linker flag (/machine:x64)
+# that plain clang++ (CMAKE_HIP_COMPILER) rejects, even with
+# CMAKE_HIP_ARCHITECTURES/CMAKE_HIP_COMPILER_ROCM_ROOT/--rocm-path all
+# supplied correctly (the COMPILE step succeeds; only the final link
+# fails). enable_language(HIP) has no graceful-failure mode -- it hard-
+# errors the ENTIRE configure, not just this target -- so auto-enabling
+# here would break bolt's default `cmake -S . -B build` for anyone on a
+# machine with HIP_PATH set (which the AMD installer sets as a PERSISTENT
+# SYSTEM environment variable, confirmed on this exact box: every future
+# shell has it, not just the one that ran the installer). Requires
+# EXPLICIT `-DBOLT_BUILD_ROCM=ON` until the Windows CMake+HIP linking gap
+# is resolved (a newer CMake/ROCm release, or a working
+# CMAKE_HIP_LINK_EXECUTABLE override) -- passing it today will still fail
+# the configure with the /machine:x64 error, this flag is a placeholder
+# for whoever picks up that fix, not a currently-working opt-in.
+# ---------------------------------------------------------------------------
+find_program(BOLT_HIPCC_EXECUTABLE NAMES hipcc
+             HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
+# CMake's HIP language support rejects the hipcc WRAPPER script as
+# CMAKE_HIP_COMPILER ("Use Clang directly, or let CMake pick a default" --
+# found 2026-07-17 getting this working for real against this box's newly
+# installed HIP SDK 7.1). The real compiler is clang++ in that same bin/
+# directory (ROCm's HIP toolchain bundles its own Clang) -- hipcc itself is
+# just a driver script around it. Probe for hipcc (a reliable "is a HIP SDK
+# here at all" signal, matching how a human would check) but point CMake at
+# clang++ directly for the actual compiler.
+find_program(BOLT_HIP_CLANGXX_EXECUTABLE NAMES clang++
+             HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
+
+# Deliberately ALWAYS OFF by default, even when BOLT_IS_TOPLEVEL and both
+# hipcc/clang++ are found (stronger than BOLT_BUILD_VULKAN's
+# "top-level AND SDK found" rule above): confirmed 2026-07-17 on this exact
+# box that enable_language(HIP) does not currently link cleanly on Windows
+# against HIP SDK 7.1 even for a top-level bolt build with a real hipcc +
+# clang++ present -- the HIP-language link step inherits an MSVC-style
+# linker flag (/machine:x64) that plain clang++ rejects (the COMPILE step
+# succeeds; only the final link fails; see the header comment above for the
+# full diagnosis). enable_language(HIP) has no graceful-failure mode -- it
+# hard-errors the ENTIRE configure, not just this target -- so any
+# auto-enable rule here (even a narrower "top-level only" one) risks
+# breaking bolt's own default `cmake -S . -B build` for whoever next builds
+# it standalone on a box with a HIP SDK installed (which the AMD installer
+# sets up via a PERSISTENT SYSTEM HIP_PATH env var, so this isn't a
+# one-time-shell concern). Requires explicit `-DBOLT_BUILD_ROCM=ON` --
+# which today will still fail the configure with the /machine:x64 error;
+# this option is a placeholder for whoever fixes that Windows CMake+HIP
+# linking gap (a newer CMake/ROCm release, or a working
+# CMAKE_HIP_LINK_EXECUTABLE override), not a currently-working opt-in.
+# Also note: a bare `set(BOLT_BUILD_ROCM ON)` after option() would silently
+# override an explicit -DBOLT_BUILD_ROCM=OFF (set() beats the cache) --
+# never do that; this block only ever narrows via the warning-guard below,
+# never widens.
+option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core (see the known Windows linking gap above before enabling)" OFF)
+
+if(BOLT_BUILD_ROCM AND NOT (BOLT_HIPCC_EXECUTABLE AND BOLT_HIP_CLANGXX_EXECUTABLE))
+    message(WARNING "BOLT_BUILD_ROCM requested but no hipcc/clang++ found (set HIP_PATH/ROCM_PATH) -- skipping bolt::rocm")
+    set(BOLT_BUILD_ROCM OFF)
+endif()
+
+if(BOLT_BUILD_ROCM)
+    set(CMAKE_HIP_COMPILER "${BOLT_HIP_CLANGXX_EXECUTABLE}")
+    enable_language(HIP)
+    set_source_files_properties(src/bolt_rocm.cpp PROPERTIES LANGUAGE HIP)
+    add_library(bolt_rocm STATIC src/bolt_rocm.cpp)
+    add_library(bolt::rocm ALIAS bolt_rocm)
+    target_link_libraries(bolt_rocm PUBLIC bolt::core)
+    target_include_directories(bolt_rocm PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_rocm)
+    target_link_libraries(bolt INTERFACE bolt::rocm)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -219,6 +404,8 @@ if(BOLT_BUILD_INGEST)
     add_library(bolt_ingest STATIC
         src/ingest/bolt_csv.cpp
         src/ingest/bolt_parquet_meta.cpp
+        src/ingest/bolt_parquet_pageindex.cpp
+        src/ingest/bolt_parquet_bloom.cpp
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_write.cpp
         src/ingest/bolt_avro.cpp
@@ -272,15 +459,49 @@ endif()
 # the Noise XX handshake + ChaCha20-Poly1305 AEAD (noise.cpp), whose X25519 /
 # AEAD math is OpenSSL 3.x EVP — gated on OpenSSL being found below.
 # ---------------------------------------------------------------------------
-add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
-            src/crypto/ed25519.cpp)
-add_library(bolt::crypto ALIAS bolt_crypto)
-target_link_libraries(bolt_crypto PUBLIC bolt::core)
-target_include_directories(bolt_crypto PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-bolt_apply_hardening(bolt_crypto)
-target_link_libraries(bolt INTERFACE bolt::crypto)
+# All three default ON: they were unconditional before these switches existed,
+# so ON preserves every consumer's build exactly. See the consistency check
+# below -- bolt::lakehouse genuinely cannot link without crypto/net/parse.
+option(BOLT_BUILD_CRYPTO    "Build bolt::crypto (SigV4 + Noise XX + Ed25519)" ON)
+option(BOLT_BUILD_NET       "Build bolt::net (TLS + HTTP client)"             ON)
+option(BOLT_BUILD_LAKEHOUSE "Build bolt::lakehouse (Delta + Iceberg + catalogs + object stores)" ON)
+
+# bolt::lakehouse links bolt::crypto (SigV4), bolt::net (HTTP/TLS for the REST
+# catalogs) and bolt::parse (fionn JSON). Fail loudly on an impossible combo
+# rather than silently flipping a switch the caller explicitly set -- an
+# unbuildable request is a programmer error, and a confusing "target bolt::net
+# not found" 300 lines later is worse than saying so here.
+if(BOLT_BUILD_LAKEHOUSE)
+    set(_bolt_lh_missing "")
+    if(NOT BOLT_BUILD_CRYPTO)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_CRYPTO")
+    endif()
+    if(NOT BOLT_BUILD_NET)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_NET")
+    endif()
+    if(NOT BOLT_BUILD_PARSE)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_PARSE")
+    endif()
+    if(_bolt_lh_missing)
+        string(REPLACE ";" ", " _bolt_lh_missing_str "${_bolt_lh_missing}")
+        message(FATAL_ERROR
+            "BOLT_BUILD_LAKEHOUSE=ON requires: ${_bolt_lh_missing_str}. "
+            "Either enable them, or pass -DBOLT_BUILD_LAKEHOUSE=OFF if you "
+            "don't need Delta/Iceberg.")
+    endif()
+endif()
+
+if(BOLT_BUILD_CRYPTO)
+    add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
+                src/crypto/ed25519.cpp)
+    add_library(bolt::crypto ALIAS bolt_crypto)
+    target_link_libraries(bolt_crypto PUBLIC bolt::core)
+    target_include_directories(bolt_crypto PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_crypto)
+    target_link_libraries(bolt INTERFACE bolt::crypto)
+endif()
 
 # ---------------------------------------------------------------------------
 # bolt::lakehouse — compiled static library (lakehouse W1 foundations):
@@ -305,11 +526,13 @@ endif()
 # bolt::crypto's Noise XX (X25519 + ChaCha20-Poly1305) needs OpenSSL EVP.
 # Without it, noise.cpp compiles to explicit-failure stubs (returns false)
 # so the link still succeeds; SigV4 stays dependency-free either way.
-if(BOLT_WITH_TLS AND OpenSSL_FOUND)
+# Guarded on BOLT_BUILD_CRYPTO: the target only exists when it's enabled.
+if(BOLT_BUILD_CRYPTO AND BOLT_WITH_TLS AND OpenSSL_FOUND)
     target_compile_definitions(bolt_crypto PUBLIC BOLT_WITH_TLS=1)
     target_link_libraries(bolt_crypto PUBLIC OpenSSL::Crypto)
 endif()
 
+if(BOLT_BUILD_NET)
 add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp src/net/bolt_udp.cpp)
 add_library(bolt::net ALIAS bolt_net)
 target_link_libraries(bolt_net PUBLIC bolt::core)
@@ -325,12 +548,14 @@ if(WIN32)
     target_link_libraries(bolt_net PUBLIC ws2_32)
 endif()
 target_link_libraries(bolt INTERFACE bolt::net)
+endif()  # BOLT_BUILD_NET
 
 # ---------------------------------------------------------------------------
 # bolt::lakehouse (W1 foundations + W6 catalogs). Depends on bolt::net for
 # the HTTP client + TLS used by the Iceberg REST / Unity / Glue / Polaris /
 # Nessie / Gravitino catalogs, and bolt::parse for fionn JSON.
 # ---------------------------------------------------------------------------
+if(BOLT_BUILD_LAKEHOUSE)
 add_library(bolt_lakehouse STATIC
     src/lakehouse/object_store_filesystem.cpp
     src/lakehouse/object_store_s3.cpp
@@ -405,6 +630,7 @@ if(OpenSSL_FOUND)
     target_link_libraries(bolt_lakehouse PRIVATE OpenSSL::Crypto)
 endif()
 target_link_libraries(bolt INTERFACE bolt::lakehouse)
+endif()  # BOLT_BUILD_LAKEHOUSE
 
 # ---------------------------------------------------------------------------
 # bolt::ybolt — Y CRDT runtime adapter (ycpp + bolt::Arena).
@@ -452,6 +678,12 @@ endif()
 if(BOLT_BUILD_PARSE)
     list(APPEND _bolt_install_targets bolt_parse)
 endif()
+if(BOLT_BUILD_VULKAN)
+    list(APPEND _bolt_install_targets bolt_vulkan)
+endif()
+if(BOLT_BUILD_ROCM)
+    list(APPEND _bolt_install_targets bolt_rocm)
+endif()
 if(BOLT_BUILD_INGEST)
     list(APPEND _bolt_install_targets bolt_ingest)
 endif()
@@ -470,6 +702,19 @@ write_basic_package_version_file(
     VERSION       ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
+
+# ---------------------------------------------------------------------------
+# Feature summary. bolt::core + kernels/join/wire/arrow are header-only and
+# always available; everything below is a compiled target you can decline with
+# -DBOLT_BUILD_<X>=OFF. Printed so a consumer can SEE what they're paying for
+# rather than discovering it in a link line.
+# ---------------------------------------------------------------------------
+message(STATUS "bolt: compiled targets -- "
+               "io=${BOLT_BUILD_IO} ribbon=${BOLT_BUILD_RIBBON} "
+               "parse=${BOLT_BUILD_PARSE} ingest=${BOLT_BUILD_INGEST} "
+               "crypto=${BOLT_BUILD_CRYPTO} net=${BOLT_BUILD_NET} "
+               "lakehouse=${BOLT_BUILD_LAKEHOUSE} "
+               "vulkan=${BOLT_BUILD_VULKAN} rocm=${BOLT_BUILD_ROCM}")
 
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bolt-config.cmake.in

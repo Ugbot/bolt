@@ -1,0 +1,55 @@
+#version 450
+// BLLM-81: Vulkan matmul kernel for boltllm's REAL expert-FFN hot path
+// numerics tier -- an ALREADY-quantized int8 ACTIVATION dotted against an
+// Int4-quantized weight, matching boltllm::quant::idot_gemv_int4_scalar's
+// exact contract (IdotDispatch.cpp): int32 accumulation of
+// act_q[i]*(nibble_i - kInt4Offset) (no float rounding until the SINGLE
+// final act_scale*weight_scale multiply). See matmul_dequant_int8act_int8.comp
+// for the full design rationale (portable-first, GL_EXT_integer_dot_product
+// deferred, int32 overflow analysis) -- identical here, just Int4 weight
+// unpacking (low-nibble-first, offset 8, same as matmul_dequant_int4.comp).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float weight_scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { uint activation_packed[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+    float act_scale;
+} pc;
+
+shared int partial_sum[256];
+
+const int kInt4DequantOffset = 8;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint bytes_per_row = (cols + 1u) / 2u;
+    uint row_byte_offset = row * bytes_per_row;
+
+    int acc = 0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint byte_idx = row_byte_offset + (i >> 1u);
+        uint w_word = weight_packed[byte_idx >> 2u];
+        uint byte_val = bitfieldExtract(w_word, int((byte_idx & 3u) * 8u), 8);
+        uint nibble = ((i & 1u) == 0u) ? (byte_val & 0xFu) : (byte_val >> 4u);
+        int w_v = int(nibble) - kInt4DequantOffset;
+
+        uint a_word = activation_packed[i >> 2u];
+        int a_v = bitfieldExtract(int(a_word), int((i & 3u) * 8u), 8);
+
+        acc += w_v * a_v;
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = float(partial_sum[0]) * pc.act_scale * weight_scale[row];
+}

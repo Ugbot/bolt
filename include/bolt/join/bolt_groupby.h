@@ -1023,6 +1023,20 @@ struct GroupbyTypedState {
     uint8_t         _pad[1];
 };
 
+// G2FEAT-13: caller-owned scratch shared across MANY GroupbyTypedStates
+// (radix bucket sub-tables). Per-state _begin allocates a private
+// kGbIngestWindow gid scratch (256 KiB) plus bank accumulators; with P=64
+// bucket sub-tables that is ~24 MiB of duplicated scratch — sub-tables on
+// ONE worker are ingested strictly serially, so one scratch suffices.
+// CONTRACT: two states sharing a GbSharedScratch must never be in _ingest
+// concurrently (the gid scratch is a per-window temp; nothing persists
+// across ingest calls). Bank accumulators are DISABLED for shared-scratch
+// states (banks pay off for one big table, not P small ones); the plain
+// gid-driven pass-2 loops remain correct.
+struct GbSharedScratch {
+    int32_t* gid_scratch;   // [kGbIngestWindow], caller-allocated
+};
+
 // Initialise state and allocate all scratch tables in `arena`. `key_descs`
 // and `payload_descs` are *type-only* descriptors - only `.type` and
 // `.decimal_scale` are consulted (`.data` may be nullptr).
@@ -1030,17 +1044,22 @@ struct GroupbyTypedState {
 // `expected_groups_hint`: 0 -> kernel uses a 1024-default cap; >0 ->
 // tight-size SwissTable to the smallest power-of-two >= hint. Hard cap
 // is kGbEntryCap (16M).
-inline bool groupby_agg_multi_key_typed_begin(
-        GroupbyTypedState* state,
-        Arena*             arena,
-        const BoltColumn*  key_descs,
-        uint8_t            n_keys,
-        const BoltColumn*  payload_descs,
-        uint8_t            n_payload,
-        const AggSpec*     specs,
-        uint8_t            n_aggs,
-        uint64_t           expected_groups_hint,
-        uint64_t           grow_cap = 0) noexcept {
+//
+// `shared`: nullptr -> private gid scratch + banks (the historical
+// behaviour, what groupby_agg_multi_key_typed_begin forwards); non-null ->
+// gid scratch borrowed from `shared`, banks disabled (see GbSharedScratch).
+inline bool gb_begin_with_scratch(
+        GroupbyTypedState*     state,
+        Arena*                 arena,
+        const BoltColumn*      key_descs,
+        uint8_t                n_keys,
+        const BoltColumn*      payload_descs,
+        uint8_t                n_payload,
+        const AggSpec*         specs,
+        uint8_t                n_aggs,
+        uint64_t               expected_groups_hint,
+        uint64_t               grow_cap,
+        const GbSharedScratch* shared) noexcept {
     assert(state != nullptr);
     assert(arena != nullptr);
     assert(n_keys >= 1 && n_keys <= kGbMaxKeys);
@@ -1098,18 +1117,27 @@ inline bool groupby_agg_multi_key_typed_begin(
         static_cast<size_t>(cap) * n_aggs);
     // K-AGG-C: per-window gid scratch — the ONLY required two-pass
     // allocation, done once here so _ingest stays allocation-free.
-    int32_t*  gid_scratch  = arena->allocate_array<int32_t>(kGbIngestWindow);
+    // G2FEAT-13: a shared scratch (radix bucket sub-tables) borrows the
+    // caller's buffer instead — same size, same per-window-temp semantics.
+    int32_t*  gid_scratch  = (shared != nullptr)
+        ? shared->gid_scratch
+        : arena->allocate_array<int32_t>(kGbIngestWindow);
     if (keys_flat == nullptr || accums == nullptr || counts == nullptr ||
         gid_scratch == nullptr) return false;
     // Bank scratch is optional: null banks just disable the banked pass-2
-    // loops (plain gid-driven loops remain correct).
-    GbCell16* bank_acc = arena->allocate_array<GbCell16>(
-        static_cast<size_t>(kGbBankCount) * kGbBankGroups);
-    int64_t*  bank_cnt = arena->allocate_array<int64_t>(
-        static_cast<size_t>(kGbBankCount) * kGbBankGroups);
-    if (bank_acc == nullptr || bank_cnt == nullptr) {
-        bank_acc = nullptr;
-        bank_cnt = nullptr;
+    // loops (plain gid-driven loops remain correct). Shared-scratch states
+    // skip banks entirely (G2FEAT-13; see GbSharedScratch).
+    GbCell16* bank_acc = nullptr;
+    int64_t*  bank_cnt = nullptr;
+    if (shared == nullptr) {
+        bank_acc = arena->allocate_array<GbCell16>(
+            static_cast<size_t>(kGbBankCount) * kGbBankGroups);
+        bank_cnt = arena->allocate_array<int64_t>(
+            static_cast<size_t>(kGbBankCount) * kGbBankGroups);
+        if (bank_acc == nullptr || bank_cnt == nullptr) {
+            bank_acc = nullptr;
+            bank_cnt = nullptr;
+        }
     }
     std::memset(counts, 0, sizeof(int64_t) * static_cast<size_t>(cap) * n_aggs);
 
@@ -1159,6 +1187,51 @@ inline bool groupby_agg_multi_key_typed_begin(
         state->agg_str_cap[j]  = 0;
     }
     return true;
+}
+
+// The historical entry point: private gid scratch + banks. Behaviour is
+// byte-for-byte the pre-G2FEAT-13 _begin (the shared-scratch branch is
+// dead when `shared == nullptr`).
+inline bool groupby_agg_multi_key_typed_begin(
+        GroupbyTypedState* state,
+        Arena*             arena,
+        const BoltColumn*  key_descs,
+        uint8_t            n_keys,
+        const BoltColumn*  payload_descs,
+        uint8_t            n_payload,
+        const AggSpec*     specs,
+        uint8_t            n_aggs,
+        uint64_t           expected_groups_hint,
+        uint64_t           grow_cap = 0) noexcept {
+    assert(state != nullptr);
+    assert(arena != nullptr);
+    return gb_begin_with_scratch(state, arena, key_descs, n_keys,
+                                 payload_descs, n_payload, specs, n_aggs,
+                                 expected_groups_hint, grow_cap,
+                                 /*shared=*/nullptr);
+}
+
+// G2FEAT-13: shared-scratch variant for radix bucket sub-tables — gid
+// scratch borrowed from `shared`, banks disabled. See GbSharedScratch for
+// the serial-ingest contract.
+inline bool groupby_agg_multi_key_typed_begin_shared(
+        GroupbyTypedState*     state,
+        Arena*                 arena,
+        const BoltColumn*      key_descs,
+        uint8_t                n_keys,
+        const BoltColumn*      payload_descs,
+        uint8_t                n_payload,
+        const AggSpec*         specs,
+        uint8_t                n_aggs,
+        uint64_t               expected_groups_hint,
+        uint64_t               grow_cap,
+        const GbSharedScratch* shared) noexcept {
+    assert(shared != nullptr);
+    assert(shared->gid_scratch != nullptr);
+    if (shared == nullptr || shared->gid_scratch == nullptr) return false;
+    return gb_begin_with_scratch(state, arena, key_descs, n_keys,
+                                 payload_descs, n_payload, specs, n_aggs,
+                                 expected_groups_hint, grow_cap, shared);
 }
 
 // W-P: enable the dense gid index AFTER begin and BEFORE the first
@@ -1388,7 +1461,7 @@ inline void gb_ingest_fallback(
                     const uint16_t i8 = state->distinct_idx[j];
                     assert(i8 != 0xFFFFu);
                     const size_t doff = static_cast<size_t>(i8) * cap + slot;
-                    if (!state->distinct_cells[doff].insert(v.a)) continue;
+                    if (!state->distinct_cells[doff].insert(v.a, state->arena)) continue;
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;
@@ -1451,6 +1524,100 @@ inline uint64_t gb_merge_hash_stored(const GroupbyTypedState* s,
         h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(row[k].b));
     }
     return h;
+}
+
+// ---------------------------------------------------------------------------
+// G2FEAT-13: per-row ROUTE hash — the single source of truth for radix-
+// partitioned aggregation. For every row r, gb_route_hash_rows produces
+// exactly the hash gb_merge_hash_stored yields for r's group once ingested:
+//
+//     gb_route_hash_rows(row r) == gb_merge_hash_stored(state, gid_of(r))
+//
+// This holds because BOTH replicate gb_detail::hash_keys byte-for-byte:
+//   * non-Utf8 keys hash the read_cell16 cell halves — and the STORED cell
+//     IS read_cell16's result (int widening, Date32, Decimal64 sign-extend,
+//     Float32→double promotion all happen inside read_cell16, identically
+//     for the live row and the stored representative);
+//   * Utf8 keys hash CONTENT bytes (length + bytes) via hash_utf8_content —
+//     spilled stored copies (key_str_buf) and inline canonicalised cells
+//     (padding zeroed; the hash reads only `length` bytes) hash identically
+//     to the source-column view they were packed from.
+// A radix bucket selector of `route_hash & (P-1)` therefore agrees with the
+// class-merge convention (`gb_merge_hash_stored % n_classes`, pow-2 P), so a
+// row always routes to the bucket that owns its group — no duplicate groups
+// across buckets. Property-tested in tests/test_bolt_groupby_radix_hash.cpp.
+// ---------------------------------------------------------------------------
+
+namespace gb_detail {
+
+// Fold one Utf8 key column into the running route hashes (column-major so
+// the type branch is hoisted out of the row loop). Mix chain is byte-exact
+// with hash_keys' Utf8 arm: h = mix(h ^ content_hash).
+inline void gb_route_fold_utf8(const BoltColumn& key, const uint32_t* sel,
+                               int64_t start, int64_t count,
+                               uint64_t* out) noexcept {
+    assert(key.data != nullptr || count == 0);
+    assert(out != nullptr || count == 0);
+    const auto* svs  = static_cast<const StringView*>(key.data);
+    const char* base = static_cast<const char*>(key.str_overflow_base);
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t r = (sel != nullptr)
+            ? static_cast<int64_t>(sel[start + i]) : (start + i);
+        StringView sv;
+        std::memcpy(&sv, &svs[r], 16);
+        out[i] = swiss_mix_wyhash3(out[i] ^ hash_utf8_content(sv, base));
+    }
+}
+
+// Fold one non-Utf8 key column into the running route hashes. Mix chain is
+// byte-exact with hash_keys' cell arm: h ^= mix(a); h = mix(h ^ b). The
+// read_cell16 switch stays in the loop but is perfectly predicted (the
+// column's type is constant across the window).
+inline void gb_route_fold_cells(const BoltColumn& key, const uint32_t* sel,
+                                int64_t start, int64_t count,
+                                uint64_t* out) noexcept {
+    assert(key.data != nullptr || count == 0);
+    assert(out != nullptr || count == 0);
+    for (int64_t i = 0; i < count; ++i) {
+        const int64_t r = (sel != nullptr)
+            ? static_cast<int64_t>(sel[start + i]) : (start + i);
+        const GbCell16 c = read_cell16(key, r);
+        uint64_t h = out[i];
+        h ^= swiss_mix_wyhash3(static_cast<uint64_t>(c.a));
+        h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(c.b));
+        out[i] = h;
+    }
+}
+
+}  // namespace gb_detail
+
+// Compute the route hash for rows [start, start + count) of the iteration
+// space (dense rows when sel == nullptr, else sel positions — the same
+// window convention as _ingest). `keys` are the live morsel columns; their
+// types MUST match the descriptors passed to _begin (asserted). out[i]
+// receives the hash of iterated row i. No allocation; O(count · n_keys).
+inline void gb_route_hash_rows(const GroupbyTypedState* st,
+                               const BoltColumn*        keys,
+                               const uint32_t*          sel,
+                               int64_t                  start,
+                               int64_t                  count,
+                               uint64_t*                out) noexcept {
+    assert(st != nullptr);
+    assert(keys != nullptr);
+    assert(out != nullptr || count == 0);
+    assert(count >= 0 && start >= 0);
+    const uint32_t n_keys = st->n_keys;
+    assert(n_keys >= 1 && n_keys <= kGbMaxKeys);
+    for (int64_t i = 0; i < count; ++i) out[i] = 0x9E3779B97F4A7C15ULL;
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        assert(st->key_types[k] == keys[k].type &&
+               "route hash requires the _begin descriptor types");
+        if (keys[k].type == BoltType::Utf8) {
+            gb_detail::gb_route_fold_utf8(keys[k], sel, start, count, out);
+        } else {
+            gb_detail::gb_route_fold_cells(keys[k], sel, start, count, out);
+        }
+    }
 }
 
 // W-P geometric growth: quadruple the group table + cap-strided arrays and

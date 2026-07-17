@@ -12,6 +12,7 @@
 #include "bolt/bolt_column.h"
 
 #include <algorithm>
+#include <chrono>
 #include <random>
 #include <thread>
 #include <vector>

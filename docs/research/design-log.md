@@ -1986,3 +1986,44 @@ zero cost, and wins grow with group count). Tests 20/20 incl. bit-exact
 lane on/off parity at near-INT64_MAX totals and forced-fallback mixing.
 New dec64 kernels: sum_to_d128(_selected) — streaming global-sum folds,
 bit-identical to the per-row d128 fold by associativity.
+
+## 2026-07-15 / G2FEAT-13 — radix route-hash kernels: one source of truth for bucket routing
+
+Radix-partitioned aggregation (chukonu follow-up) routes each input row to
+a bucket sub-table, aggregates buckets independently, and concatenates —
+sound ONLY if a row and its stored group always land in the same bucket.
+The entire design therefore rests on one invariant:
+
+    gb_route_hash_rows(row r) == gb_merge_hash_stored(state, gid_of(r))
+
+Decision: the bucket selector is the LOW bits of the stored-hash replica —
+`route_hash & (P - 1)` — never a re-mix and never high bits. Rationale:
+chukonu's existing W-J5 class merge buckets by
+`gb_merge_hash_stored(state, gid) % n_classes` (hash_agg_typed_op.cpp),
+which for a power-of-two class count IS the low-bit mask; using the same
+selector means the already-tested merge/adopt machinery works on radix
+buckets unchanged. `radix_partition_hashes` (bolt_radixpart.h) is the
+histogram+scatter over caller-supplied FINAL hashes (sel-composing, stable,
+O(n), no alloc); `radix_partition_hash_i64` keeps its own SplitMix64 mix
+for raw-key callers — the two are different tools, documented at both.
+
+Why one source of truth: `gb_route_hash_rows` (bolt_groupby.h) is a
+column-major, type-branch-hoisted replica of `gb_detail::hash_keys` — the
+exact hash every ingest path uses (per-row fallback directly; the two-pass
+path via its byte-exact register replicas gb_hash_packed/gb_hash_inline_sv)
+and the exact hash `gb_merge_hash_stored` reproduces from stored cells
+(stored cells ARE read_cell16 results; Utf8 hashes content bytes, so
+spilled deep-copies and canonicalised inline padding cannot diverge). Any
+drift here silently splits one logical group across buckets → duplicate
+output groups; the invariant property test
+(tests/test_bolt_groupby_radix_hash.cpp) asserts route == stored hash for
+EVERY row across key-type mixes {Int64} {Int32} {Date32} {Int64,Int64}
+{Int64,Utf8-inline} {Utf8-spilled} {Int64,Int32,Utf8-mixed} × seeds,
+through the REAL begin/ingest paths (incl. gb_grow rehash and sparse sel).
+
+Also landed: `GbSharedScratch` + `groupby_agg_multi_key_typed_begin_shared`
+— P bucket sub-tables on one worker share ONE gid scratch (256 KiB) instead
+of P private copies, banks disabled (banks pay off for one big table, not P
+small ones); ingest across sharing states must be serial (documented
+contract). The historical `_begin` forwards with `shared = nullptr` and is
+behaviour-identical.

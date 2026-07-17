@@ -1,0 +1,37 @@
+#version 450
+// BLLM-47: Vulkan matmul+dequant compute shader, F32 weight path.
+// One workgroup per output row; threads stride over `cols`, then a
+// shared-memory tree reduction combines partial sums. Numerically
+// identical to bolt_compute.h's matmul_row_dot_f32 F32 case (plain dot
+// product, no dequant).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { float weight[]; };
+layout(set = 0, binding = 1) readonly buffer ActBuf { float activation[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+} pc;
+
+shared float partial_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint row_offset = row * cols;
+
+    float acc = 0.0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        acc += activation[i] * weight[row_offset + i];
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = partial_sum[0];
+}

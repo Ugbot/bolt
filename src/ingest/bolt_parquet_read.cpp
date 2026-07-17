@@ -786,6 +786,36 @@ bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
     return true;
 }
 
+bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
+                                 const PqMeta* meta, uint32_t row_group,
+                                 const uint16_t* col_idx, uint32_t n_idx,
+                                 Arena* arena, BoltColumn* out_cols,
+                                 int64_t* out_rows) noexcept {
+    assert(meta != nullptr && out_cols != nullptr);
+    assert(out_rows != nullptr);
+    if (buf == nullptr || arena == nullptr) return false;
+    if (col_idx == nullptr || n_idx == 0 || n_idx > meta->n_columns) return false;
+    if (row_group >= meta->n_row_groups) return false;
+    const PqRowGroup* rg = &meta->row_groups[row_group];
+    if (rg->num_rows < 0) return false;
+    for (uint32_t j = 0; j < n_idx; ++j) {              // bounded: <= n_columns
+        const uint32_t c = col_idx[j];
+        if (c >= meta->n_columns) return false;
+        ColCtx cx;
+        if (!init_col_ctx(meta, c, row_group, row_group + 1, rg->num_rows,
+                          arena, &out_cols[j], &cx)) {
+            return false;
+        }
+        const PqChunk* ch = &meta->chunks[rg->chunk_off + c];
+        if (ch->num_values != rg->num_rows) return false;   // flat invariant
+        if (!decode_chunk(buf, len, ch, &cx, 0, rg->num_rows, arena)) {
+            return false;
+        }
+    }
+    *out_rows = rg->num_rows;
+    return true;
+}
+
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
                        BoltBatch* out_batch) noexcept {
     assert(arena != nullptr);

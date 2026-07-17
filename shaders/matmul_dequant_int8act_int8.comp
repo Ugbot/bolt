@@ -1,0 +1,67 @@
+#version 450
+// BLLM-81: Vulkan matmul kernel for boltllm's REAL expert-FFN hot path
+// numerics tier -- an ALREADY-quantized int8 ACTIVATION dotted against an
+// Int8-quantized weight, both in pure integer arithmetic, matching
+// boltllm::quant::idot_gemv_int8_scalar's exact contract (IdotDispatch.cpp):
+// int32 accumulation of act_q[i]*weight_q[i] (no float rounding until the
+// SINGLE final act_scale*weight_scale multiply). This is DIFFERENT from
+// matmul_dequant_int8.comp (BLLM-47/80), which dots a plain FLOAT
+// activation against a dequantized weight -- that kernel matches lm_head's
+// numerics tier, not expert-FFN's.
+//
+// Portable scalar-per-byte implementation (bitfieldExtract, same flat-byte
+// addressing as matmul_dequant_int8.comp -- see that file's 2026-07-17
+// note on why row-word-alignment assumptions are wrong). ggml-vulkan's own
+// mul_mat_vecq.comp uses GL_EXT_integer_dot_product's packed 4x8-bit dot
+// intrinsics for this same operation (read 2026-07-17, NOTICE-cited) --
+// deliberately NOT used here yet: that extension's availability on this
+// exact GPU/driver hasn't been verified, and this project ships correct
+// portable code first, faster-but-extension-gated code only once measured
+// to be worth the added portability risk (a real follow-up, not a TODO
+// nobody intends to do).
+//
+// int32 accumulation is safe without overflow for any realistic hidden
+// size: max |term| = 127*127 = 16129 (int8 x int8), and even at cols =
+// 100,000 the running sum stays under 1.7e9, well inside int32's ~2.1e9
+// range -- real hidden sizes (thousands, not hundreds of thousands) leave
+// enormous headroom.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float weight_scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { uint activation_packed[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+    float act_scale;
+} pc;
+
+shared int partial_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint row_byte_offset = row * cols;  // Int8 weight: 1 byte/elem, no padding
+
+    int acc = 0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint w_byte_idx = row_byte_offset + i;
+        uint w_word = weight_packed[w_byte_idx >> 2u];
+        int w_v = bitfieldExtract(int(w_word), int((w_byte_idx & 3u) * 8u), 8);
+
+        uint a_word = activation_packed[i >> 2u];
+        int a_v = bitfieldExtract(int(a_word), int((i & 3u) * 8u), 8);
+
+        acc += w_v * a_v;
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = float(partial_sum[0]) * pc.act_scale * weight_scale[row];
+}

@@ -238,10 +238,13 @@ struct ChunkRec {
     std::int64_t null_count;
     bool         have_stats;
     bool         null_count_known;
-    // Min / max as raw little-endian (or BE for Decimal128) bytes the
-    // reader can copy straight into PqChunk::min_bytes / max_bytes.
-    std::uint8_t min_buf[16];
-    std::uint8_t max_buf[16];
+    // Min / max as raw little-endian (or BE for Decimal128, raw bytes for
+    // BYTE_ARRAY) payloads the reader can copy straight into
+    // PqChunk::min_bytes / max_bytes. Sized to the reader's
+    // kPqMaxStatBytes (64) so Utf8 stats round-trip; a chunk whose extreme
+    // string is longer than this simply omits stats (compute_stats).
+    std::uint8_t min_buf[64];
+    std::uint8_t max_buf[64];
     std::uint32_t min_len;
     std::uint32_t max_len;
 };
@@ -422,6 +425,61 @@ void write_le(std::uint8_t* dst, T v) noexcept {
     std::memcpy(dst, &v, sizeof(T));
 }
 
+// Unsigned byte-wise lexicographic compare; shorter-prefix compares less.
+// (The UTF8/BYTE_ARRAY sort order min_value/max_value are defined against.)
+int stat_lex_cmp(const std::uint8_t* a, std::uint32_t a_len,
+                 const std::uint8_t* b, std::uint32_t b_len) noexcept {
+    const std::uint32_t n = (a_len < b_len) ? a_len : b_len;
+    const int c = (n != 0) ? std::memcmp(a, b, n) : 0;
+    if (c != 0) return c;
+    return (a_len < b_len) ? -1 : (a_len > b_len ? 1 : 0);
+}
+
+// Utf8/Binary chunk stats (G2FEAT-21). Emits full min/max byte strings —
+// never a truncated bound (a truncated max without the spec's
+// increment-last-byte adjustment would be an INVALID upper bound). A chunk
+// containing any value longer than the stat buffer (== the reader's
+// kPqMaxStatBytes) therefore omits stats entirely; omission is always
+// legal and the reader treats it as "cannot prune".
+bool compute_stats_utf8(const BoltColumn& col, std::int64_t n_rows,
+                        const std::uint8_t* def_bits, bool nullable,
+                        ChunkRec* rec) noexcept {
+    assert(rec != nullptr);
+    assert(col.data != nullptr || n_rows == 0);
+    const auto* sv    = static_cast<const StringView*>(col.data);
+    const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
+    const std::uint8_t* mn_p = nullptr; std::uint32_t mn_n = 0;
+    const std::uint8_t* mx_p = nullptr; std::uint32_t mx_n = 0;
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+        const bool valid = (!nullable) || def_bits[r] != 0;
+        if (!valid) continue;
+        const std::uint32_t len = sv[r].length;
+        if (len > sizeof(rec->min_buf)) return true;   // omit stats (see above)
+        const std::uint8_t* p;
+        if (len <= 12u) {
+            // Inline payload — prefix[4] + inline_data[8] are contiguous
+            // (same layout contract encode_plain_byte_array relies on).
+            p = reinterpret_cast<const std::uint8_t*>(&sv[r].prefix[0]);
+        } else {
+            if (spill == nullptr) return true;         // can't read: omit
+            p = spill + sv[r].ref.offset;
+        }
+        if (mn_p == nullptr || stat_lex_cmp(p, len, mn_p, mn_n) < 0) {
+            mn_p = p; mn_n = len;
+        }
+        if (mx_p == nullptr || stat_lex_cmp(p, len, mx_p, mx_n) > 0) {
+            mx_p = p; mx_n = len;
+        }
+    }
+    if (mn_p == nullptr) return true;   // all null -> no min/max
+    std::memcpy(rec->min_buf, mn_p, mn_n);
+    std::memcpy(rec->max_buf, mx_p, mx_n);
+    rec->min_len = mn_n;
+    rec->max_len = mx_n;
+    rec->have_stats = true;
+    return true;
+}
+
 bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
                    const std::uint8_t* def_bits, bool nullable,
                    ChunkRec* rec) noexcept {
@@ -470,12 +528,21 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
         }
         case BoltType::Float32: {
             const auto* p = static_cast<const float*>(col.data);
-            float mn = p[r0], mx = p[r0];
-            for (std::int64_t r = r0 + 1; r < n_rows; ++r) {
+            bool seen = false;
+            float mn = 0.0f, mx = 0.0f;
+            for (std::int64_t r = r0; r < n_rows; ++r) {
                 if (!valid_at(r)) continue;
-                if (p[r] < mn) mn = p[r];
-                if (p[r] > mx) mx = p[r];
+                const float v = p[r];
+                if (v != v) continue;               // NaN: never a bound
+                if (!seen) { mn = mx = v; seen = true; continue; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
             }
+            if (!seen) return true;                 // all NaN -> omit stats
+            // Spec recommendation: a zero min is written as -0.0 and a zero
+            // max as +0.0 so both signed zeros lie inside [min, max].
+            if (mn == 0.0f) mn = -0.0f;
+            if (mx == 0.0f) mx = +0.0f;
             write_le<float>(rec->min_buf, mn);
             write_le<float>(rec->max_buf, mx);
             rec->min_len = rec->max_len = 4u;
@@ -484,20 +551,48 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
         }
         case BoltType::Float64: {
             const auto* p = static_cast<const double*>(col.data);
-            double mn = p[r0], mx = p[r0];
-            for (std::int64_t r = r0 + 1; r < n_rows; ++r) {
+            bool seen = false;
+            double mn = 0.0, mx = 0.0;
+            for (std::int64_t r = r0; r < n_rows; ++r) {
                 if (!valid_at(r)) continue;
-                if (p[r] < mn) mn = p[r];
-                if (p[r] > mx) mx = p[r];
+                const double v = p[r];
+                if (v != v) continue;               // NaN: never a bound
+                if (!seen) { mn = mx = v; seen = true; continue; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
             }
+            if (!seen) return true;                 // all NaN -> omit stats
+            if (mn == 0.0) mn = -0.0;
+            if (mx == 0.0) mx = +0.0;
             write_le<double>(rec->min_buf, mn);
             write_le<double>(rec->max_buf, mx);
             rec->min_len = rec->max_len = 8u;
             rec->have_stats = true;
             return true;
         }
+        case BoltType::Bool: {
+            // BoltColumn stores bool one byte per row; the Statistics
+            // payload for BOOLEAN is a single PLAIN byte 0x00 / 0x01.
+            const auto* p = static_cast<const std::uint8_t*>(col.data);
+            std::uint8_t mn = 1u, mx = 0u;
+            for (std::int64_t r = r0; r < n_rows; ++r) {
+                if (!valid_at(r)) continue;
+                const std::uint8_t v = (p[r] != 0u) ? 1u : 0u;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            if (mn > mx) return true;   // unreachable (r0 valid) — safety
+            rec->min_buf[0] = mn;
+            rec->max_buf[0] = mx;
+            rec->min_len = rec->max_len = 1u;
+            rec->have_stats = true;
+            return true;
+        }
+        case BoltType::Utf8:
+        case BoltType::Binary:
+            return compute_stats_utf8(col, n_rows, def_bits, nullable, rec);
         default:
-            // Bool / strings / binary / decimal: stats skipped for v1.
+            // Decimal128: min/max skipped (v1 gap, documented in the header).
             return true;
     }
 }
@@ -577,7 +672,11 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
         def_bits.resize(static_cast<std::size_t>(n_rows));
         fill_def_bits(col, n_rows, def_bits.data(), &rec->null_count);
     }
-    rec->null_count_known = nullable;
+    // G2FEAT-24: null_count is always known — counted for OPTIONAL columns,
+    // structurally 0 for REQUIRED ones — so the footer always carries it
+    // (pyarrow/DuckDB surface it; bolt's pq_chunk_no_nulls accepts either
+    // null_count == 0 or REQUIRED, so both readers agree).
+    rec->null_count_known = true;
 
     // Encode PLAIN values.
     std::vector<std::uint8_t> values;
@@ -776,6 +875,14 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
 void write_column_chunk_struct(TcOut* o, const ParquetWriter* w,
                                const ParquetWriteColumn& sch,
                                const ChunkRec& rec) noexcept {
+    // ColumnChunk: 2 = file_offset (i64, REQUIRED in parquet.thrift).
+    // Deprecated by the spec ("writers should write 0") but thrift-generated
+    // readers (pyarrow, DuckDB) throw INVALID_DATA when a required field is
+    // absent — omitting it made every bolt-written file unreadable by them
+    // (G2FEAT-24 audit find; bolt's own reader never consulted it, which is
+    // why the gap was invisible to round-trip tests).
+    tc_put_field(o, 2, kFI64);
+    tc_put_zigzag(o, 0);
     // ColumnChunk: 3 = meta_data (struct)
     tc_put_field(o, 3, kFStruct);
     write_column_meta(o, w, sch, rec);
@@ -827,6 +934,23 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     // 6 created_by
     tc_put_field(&o, 6, kFBinary);
     tc_put_string(&o, "bolt-parquet-writer v1");
+    // 7 column_orders: list<ColumnOrder>, one TYPE_ORDER (TypeDefinedOrder,
+    // an empty struct inside the ColumnOrder union) per column. Without
+    // this, parquet-cpp / pyarrow refuses to trust the modern
+    // min_value/max_value statistics (`has_min_max == false`) even though
+    // the bytes are present (G2FEAT-24 audit find). Declaring TYPE_ORDER is
+    // correct for everything we emit stats for: signed order for
+    // INT32/INT64, IEEE order with NaN skipped + signed-zero normalization
+    // for FLOAT/DOUBLE, false < true for BOOLEAN, unsigned lexicographic
+    // bytes for BYTE_ARRAY (compute_stats/compute_stats_utf8 above).
+    // Decimal128 chunks emit no min/max, so the declaration is vacuous there.
+    tc_put_field(&o, 7, kFList);
+    tc_put_list_hdr(&o, kFStruct, n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        tc_put_field(&o, 1, kFStruct);   // ColumnOrder.TYPE_ORDER
+        tc_put_stop(&o);                 // empty TypeDefinedOrder struct
+        tc_put_stop(&o);                 // end ColumnOrder union
+    }
     tc_put_stop(&o);
 }
 
@@ -870,36 +994,102 @@ ParquetWriter* parquet_write_open(const char* path,
     return w;
 }
 
+namespace {
+
+// Per-row byte stride of the writer-side in-memory representation, used to
+// slice a column at a row offset (G2FEAT-24 rowgroup splitting). Utf8 /
+// Binary columns are arrays of StringView whose spill offsets are absolute
+// into str_overflow_base, so advancing the view array alone is a valid
+// slice. Returns 0 for unsupported types (rejected at open anyway).
+std::size_t slice_stride(BoltType t) noexcept {
+    switch (t) {
+        case BoltType::Bool:       return 1u;   // byte-packed in BoltColumn
+        case BoltType::Int32:
+        case BoltType::Date32:
+        case BoltType::Float32:    return 4u;
+        case BoltType::Int64:
+        case BoltType::Timestamp:
+        case BoltType::Float64:    return 8u;
+        case BoltType::Utf8:
+        case BoltType::Binary:     return sizeof(StringView);
+        case BoltType::Decimal128: return 16u;
+        default:                   return 0u;
+    }
+}
+
+// A shallow row-window view of `c` starting at `start` for `rows` rows.
+// Data pointer advances by the type stride; the validity bitmap pointer is
+// left alone and validity_offset absorbs the shift (read_valid honors it).
+BoltColumn slice_column(const BoltColumn& c, BoltType t,
+                        std::int64_t start, std::int64_t rows) noexcept {
+    assert(start >= 0);
+    assert(rows >= 0);
+    BoltColumn s = c;
+    s.length = rows;
+    if (start > 0 && c.data != nullptr) {
+        const std::size_t stride = slice_stride(t);
+        s.data = static_cast<std::uint8_t*>(c.data) +
+                 static_cast<std::size_t>(start) * stride;
+        s.validity_offset = c.validity_offset + start;
+    }
+    return s;
+}
+
+// Append exactly one row group covering rows [start, start + rows) of the
+// batch's columns. Bookkeeping mirrors the pre-split writer verbatim.
+bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
+                         std::int64_t start, std::int64_t rows) noexcept {
+    assert(w != nullptr && cols != nullptr);
+    assert(rows >= 0);
+    if (w->row_groups.size() >= kPwMaxRowGroups) return false;
+    const std::int64_t rg_start = w->file_pos;
+    RowGroupRec rg{};
+    rg.num_rows = rows;
+    rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
+    rg.chunk_count = w->opts.n_columns;
+    for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
+        const BoltColumn sc = slice_column(cols[c], w->opts.columns[c].type,
+                                           start, rows);
+        ChunkRec rec{};
+        if (!write_column_chunk(w, sc, w->opts.columns[c], rows, &rec)) {
+            return false;
+        }
+        w->chunks.push_back(rec);
+    }
+    rg.total_byte_size = w->file_pos - rg_start;
+    w->row_groups.push_back(rg);
+    w->total_rows += rows;
+    return true;
+}
+
+}  // namespace
+
 bool parquet_write_row_group(ParquetWriter* w,
                              const BoltBatch* batch) noexcept {
     assert(w != nullptr);
     assert(batch != nullptr);
     if (w == nullptr || batch == nullptr || w->failed) return false;
     if (batch->num_cols != w->opts.n_columns) return false;
-    if (w->row_groups.size() >= kPwMaxRowGroups) return false;
     const std::int64_t n_rows = batch->num_rows;
     if (n_rows < 0) return false;
 
-    const std::int64_t rg_start = w->file_pos;
-    RowGroupRec rg{};
-    rg.num_rows = n_rows;
-    rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
-    rg.chunk_count = w->opts.n_columns;
-
     const BoltColumn* cols = batch->columns[batch->read_epoch];
-    for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
-        ChunkRec rec{};
-        if (!write_column_chunk(w, cols[c], w->opts.columns[c],
-                                n_rows, &rec)) {
+    // G2FEAT-24: 0 keeps the legacy one-call-one-rowgroup contract; > 0
+    // splits into consecutive row groups of at most that many rows.
+    const std::int64_t cap =
+        (w->opts.row_group_max_rows > 0u)
+            ? static_cast<std::int64_t>(w->opts.row_group_max_rows)
+            : (n_rows > 0 ? n_rows : 1);
+    std::int64_t start = 0;
+    do {
+        const std::int64_t remain = n_rows - start;
+        const std::int64_t rows = (remain < cap) ? remain : cap;
+        if (!write_one_row_group(w, cols, start, rows)) {
             w->failed = true;
             return false;
         }
-        w->chunks.push_back(rec);
-    }
-
-    rg.total_byte_size = w->file_pos - rg_start;
-    w->row_groups.push_back(rg);
-    w->total_rows += n_rows;
+        start += rows;
+    } while (start < n_rows);
     return true;
 }
 

@@ -1,0 +1,52 @@
+#version 450
+// BLLM-47: Vulkan matmul+dequant compute shader, Int2 weight path.
+// Four 2-bit codes packed per byte, LOWEST BITS FIRST -- matches
+// bolt_compute.h's matmul_row_dot_f32 Int2 case exactly. Both extracts
+// (byte from word, code from byte) use bitfieldExtract on unsigned values
+// so neither sign-extends; kInt2DequantOffset (2) subtracted manually.
+//
+// Addressing is FLAT BYTE OFFSET (row * bytes_per_row + byte-within-row),
+// NOT row-major words with each row padded to a whole uint (real bug found
+// 2026-07-17, see matmul_dequant_int8.comp's identical note -- QuantTypes.h's
+// host-side packing is TIGHT, no per-row padding).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { float activation[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+} pc;
+
+shared float partial_sum[256];
+
+const int kInt2DequantOffset = 2;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint bytes_per_row = (cols + 3u) / 4u;
+    uint row_byte_offset = row * bytes_per_row;
+
+    float acc = 0.0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint byte_idx = row_byte_offset + (i >> 2u);
+        uint word = weight_packed[byte_idx >> 2u];
+        uint byte_val = bitfieldExtract(word, int((byte_idx & 3u) * 8u), 8);
+        uint sh = (i & 3u) * 2u;
+        uint code = bitfieldExtract(byte_val, int(sh), 2);
+        int v = int(code) - kInt2DequantOffset;
+        acc += activation[i] * float(v);
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = partial_sum[0] * scale[row];
+}

@@ -709,6 +709,65 @@ if(BOLT_BUILD_PARSE)
     add_test(NAME test_bolt_parse_json COMMAND test_bolt_parse_json)
 endif()
 
+# Sandboxed Jinja2-subset lexer for LLM chat templates — BLLM-70/71.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja test_bolt_parse_jinja.cpp)
+    target_link_libraries(test_bolt_parse_jinja
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja)
+    add_test(NAME test_bolt_parse_jinja COMMAND test_bolt_parse_jinja)
+endif()
+
+# Sandboxed Jinja2-subset expression parser/AST — BLLM-70/72.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_ast test_bolt_parse_jinja_ast.cpp)
+    target_link_libraries(test_bolt_parse_jinja_ast
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_ast)
+    add_test(NAME test_bolt_parse_jinja_ast COMMAND test_bolt_parse_jinja_ast)
+endif()
+
+# Sandboxed Jinja2-subset statement parser (if/for/set/macro) — BLLM-70/73.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_stmt test_bolt_parse_jinja_stmt.cpp)
+    target_link_libraries(test_bolt_parse_jinja_stmt
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_stmt)
+    add_test(NAME test_bolt_parse_jinja_stmt COMMAND test_bolt_parse_jinja_stmt)
+endif()
+
+# Sandboxed Jinja2-subset evaluator (Value/Scope + tree-walking render) — BLLM-70/73.
+if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_parse_jinja_eval test_bolt_parse_jinja_eval.cpp)
+    target_link_libraries(test_bolt_parse_jinja_eval
+        PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_parse_jinja_eval)
+    add_test(NAME test_bolt_parse_jinja_eval COMMAND test_bolt_parse_jinja_eval)
+endif()
+
+# Vulkan device/queue/memory scaffolding — BLLM-46. Runs against whatever
+# real Vulkan device this machine has; self-skips (GTEST_SKIP, not a
+# failure) if bolt::vulkan::available() is false.
+if(BOLT_BUILD_VULKAN)
+    add_executable(test_bolt_vulkan test_bolt_vulkan.cpp)
+    target_link_libraries(test_bolt_vulkan
+        PRIVATE bolt::bolt bolt::vulkan GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_vulkan)
+    add_test(NAME test_bolt_vulkan COMMAND test_bolt_vulkan)
+endif()
+
+# ROCm/HIP matmul+dequant kernel core — BLLM-78. Runs against whatever
+# real ROCm device this machine has; self-skips (GTEST_SKIP, not a
+# failure) if bolt::rocm::available() is false. Only built when a real
+# hipcc was found (BOLT_BUILD_ROCM) -- not the case on this dev box.
+if(BOLT_BUILD_ROCM)
+    add_executable(test_bolt_rocm test_bolt_rocm.cpp)
+    target_link_libraries(test_bolt_rocm
+        PRIVATE bolt::bolt bolt::rocm GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_rocm)
+    add_test(NAME test_bolt_rocm COMMAND test_bolt_rocm)
+endif()
+
 # Atomic-bitmap primitives — soft-delete / live-mask substrate.
 add_executable(test_bolt_atomic_bitmap test_bolt_atomic_bitmap.cpp)
 target_link_libraries(test_bolt_atomic_bitmap
@@ -848,6 +907,15 @@ target_link_libraries(test_bolt_groupby_twopass
 bolt_apply_hardening(test_bolt_groupby_twopass)
 add_test(NAME test_bolt_groupby_twopass COMMAND test_bolt_groupby_twopass)
 
+# G2FEAT-13 radix route-hash kernels — THE stored-hash invariant property
+# test (gb_route_hash_rows == gb_merge_hash_stored for every row) +
+# radix_partition_hashes invariants + GbSharedScratch begin differential.
+add_executable(test_bolt_groupby_radix_hash test_bolt_groupby_radix_hash.cpp)
+target_link_libraries(test_bolt_groupby_radix_hash
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_radix_hash)
+add_test(NAME test_bolt_groupby_radix_hash COMMAND test_bolt_groupby_radix_hash)
+
 # Typed all-shapes SwissTable join kernel (bolt/join/bolt_joinkernel.h).
 add_executable(test_bolt_joinkernel test_bolt_joinkernel.cpp)
 target_link_libraries(test_bolt_joinkernel
@@ -903,6 +971,18 @@ target_compile_definitions(test_bolt_parquet_read PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_read)
 add_test(NAME test_bolt_parquet_read COMMAND test_bolt_parquet_read)
+
+# G2FEAT-23 — Parquet page index (ColumnIndex/OffsetIndex) + split-block
+# bloom filter reader vs pyarrow/duckdb goldens: analytic page-bound ground
+# truth, prune-property tests, XXH64 vectors, bloom membership from two
+# independent writers, hostile-input fuzzing.
+add_executable(test_bolt_parquet_pageindex test_bolt_parquet_pageindex.cpp)
+target_link_libraries(test_bolt_parquet_pageindex
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_pageindex PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_pageindex)
+add_test(NAME test_bolt_parquet_pageindex COMMAND test_bolt_parquet_pageindex)
 
 # W-PQ-W — Parquet writer round-trip vs the reader (Int64/Utf8 plain,
 # Int64/Utf8 SNAPPY, nullable Int64).
@@ -1118,3 +1198,25 @@ target_link_libraries(test_bolt_regex_re2
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_regex_re2)
 add_test(NAME test_bolt_regex_re2 COMMAND test_bolt_regex_re2)
+
+# BLLM-12 (N0) — device-generic tensor primitive (bolt_tensor.h). Substrate
+# boltllm::quant::QTensor generalizes into: proves the Tensor POD layout,
+# arena/caller-owned (no-alloc) construction, and per-row-scale
+# quantized row-stride formulas are exact matches for QuantTypes.h's
+# existing convention (F32/Int8/Int4/Int2), not a fresh redesign.
+add_executable(test_bolt_tensor test_bolt_tensor.cpp)
+target_link_libraries(test_bolt_tensor
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_tensor)
+add_test(NAME test_bolt_tensor COMMAND test_bolt_tensor)
+
+# BLLM-13 — device-generic compute dispatch table (bolt_compute.h), layered
+# on bolt_tensor.h's Tensor/Device (BLLM-12). CPU-tier matmul/rmsnorm/rope
+# (both conventions)/softmax/swiglu ports + a net-new
+# top-k/top-p/temperature sampler; Vulkan/CUDA slots reserved but hard-fail
+# rather than silently no-op.
+add_executable(test_bolt_compute test_bolt_compute.cpp)
+target_link_libraries(test_bolt_compute
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_compute)
+add_test(NAME test_bolt_compute COMMAND test_bolt_compute)

@@ -1,0 +1,71 @@
+#version 450
+// BLLM-87: batched twin of matmul_dequant_int8act_int8.comp -- computes
+// out[t][r] = dot(weight.row(r), activation[t]) * act_scale[t] *
+// weight_scale[r] for EVERY (row, token) pair in ONE dispatch, instead of
+// one matmul_dequant_int8_activation() call per token. Exists to amortize
+// per-dispatch overhead (descriptor set update, command buffer submit,
+// queue wait) across a batch of tokens -- see BLLM-85's investigation
+// (tracker) for why per-TOKEN device-resident expert caching was found not
+// viable (host-to-device upload cost dominates); batching across tokens
+// against an ALREADY-resident weight is the design this shader targets
+// instead, since it amortizes that same weight's upload cost across many
+// tokens' worth of compute rather than needing a cache at all.
+//
+// Same portable scalar-per-byte + int32-accumulation approach as the
+// single-token kernel (see that file's header for why: no
+// GL_EXT_integer_dot_product dependency until its availability on this
+// GPU/driver is verified). Only the dispatch shape and buffer layouts
+// differ: activation/act_scale/output all gain a token dimension.
+//
+// Dispatch shape: (out_rows, n_tokens, 1) workgroups -- gl_WorkGroupID.x
+// selects the output row, gl_WorkGroupID.y selects the token. Buffers are
+// TOKEN-MAJOR (activation_packed: token*cols + byte_in_row, no per-token
+// padding; out_data: token*rows + row), matching BatchExpertFfn.cpp's own
+// existing CPU-side token-major scratch layout (x_q_all/pre arrays) so a
+// caller can write GPU output straight into that same layout.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float weight_scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { uint activation_packed[]; };
+layout(set = 0, binding = 3) readonly buffer ActScaleBuf { float act_scale[]; };
+layout(set = 0, binding = 4) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+    int rows;
+} pc;
+
+shared int partial_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint row_byte_offset = row * cols;              // Int8 weight: 1 byte/elem, no padding
+    uint act_byte_offset = token * cols;             // Int8 activation: 1 byte/elem, no per-token padding
+
+    int acc = 0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint w_byte_idx = row_byte_offset + i;
+        uint w_word = weight_packed[w_byte_idx >> 2u];
+        int w_v = bitfieldExtract(int(w_word), int((w_byte_idx & 3u) * 8u), 8);
+
+        uint a_byte_idx = act_byte_offset + i;
+        uint a_word = activation_packed[a_byte_idx >> 2u];
+        int a_v = bitfieldExtract(int(a_word), int((a_byte_idx & 3u) * 8u), 8);
+
+        acc += w_v * a_v;
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) {
+        out_data[token * uint(pc.rows) + row] = float(partial_sum[0]) * act_scale[token] * weight_scale[row];
+    }
+}

@@ -1,0 +1,50 @@
+#version 450
+// BLLM-47: Vulkan matmul+dequant compute shader, Int8 weight path.
+// Weight bytes are packed 4-per-uint (std430 buffer of uint reinterpreting
+// the same raw byte layout the CPU/ROCm paths read -- valid on any
+// little-endian host+GPU pairing, true for every real target here).
+// bitfieldExtract on a SIGNED int sign-extends per GLSL spec, giving the
+// correct int8 value directly. Per-row scale applied after reduction,
+// same convention as bolt_compute.h's matmul_row_dot_f32 Int8 case.
+//
+// Addressing is FLAT BYTE OFFSET (row * cols + i), NOT row-major words with
+// each row padded to a whole uint (that was a real bug found 2026-07-17 via
+// test_gpu_context.cpp: QuantTypes.h's host-side packing is TIGHT -- no
+// per-row padding -- so row 1's data can start mid-word if `cols` isn't a
+// multiple of 4; a per-row word-aligned assumption silently corrupted every
+// row after row 0 whenever the row byte stride wasn't 4-byte-aligned).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { float activation[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+} pc;
+
+shared float partial_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint row_byte_offset = row * cols;  // Int8: exactly 1 byte per element, no padding
+
+    float acc = 0.0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint byte_idx = row_byte_offset + i;
+        uint word = weight_packed[byte_idx >> 2u];
+        int v = bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
+        acc += activation[i] * float(v);
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) out_data[row] = partial_sum[0] * scale[row];
+}
