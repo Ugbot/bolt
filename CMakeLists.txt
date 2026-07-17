@@ -243,31 +243,56 @@ endif()
 
 # ---------------------------------------------------------------------------
 # bolt::rocm -- ROCm/HIP matmul+dequant kernel core behind bolt::compute's
-# reserved ROCm device slot (BLLM-78). Same "simply not built if the SDK
-# isn't present" contract as bolt::vulkan above. Gated on actually finding
-# a real hipcc (via HIP_PATH/ROCM_PATH env vars or a standard ROCm install
-# path) -- enable_language(HIP) is only attempted after that probe
-# succeeds, so its absence never breaks configure for anyone else. Checked
-# 2026-07-16 on this dev box (AMD Ryzen AI Max+ 395 / Radeon 8060S,
-# gfx1151): no HIP_PATH, no hipcc, no ROCm install dir found -- this
-# target is NOT built here; the kernel source (src/bolt_rocm.cpp) exists
-# and is structurally complete but has never been run through a real HIP
-# compiler (see that file's header comment).
+# reserved ROCm device slot (BLLM-78).
+#
+# Checked 2026-07-16: no HIP_PATH, no hipcc, no ROCm install dir found on
+# this dev box (AMD Ryzen AI Max+ 395 / Radeon 8060S, gfx1151) -- BLLM-90
+# then found AMD's Windows HIP SDK officially lists gfx1151 as supported
+# (reversing that finding); HIP SDK 7.1 installed 2026-07-17. bolt::rocm's
+# kernel WAS validated for real against this box's actual GPU
+# (F32/Int8/Int4/Int2, including the multi-row misaligned-stride
+# regression case -- 50/50 checks pass) by invoking hipcc directly.
+#
+# UNLIKE bolt::vulkan above, this option DOES NOT auto-enable just because
+# hipcc/clang++ are found (BLLM-92 finding): CMake's enable_language(HIP)
+# does not currently link cleanly on Windows against this HIP SDK -- the
+# HIP-language link step inherits an MSVC-style linker flag (/machine:x64)
+# that plain clang++ (CMAKE_HIP_COMPILER) rejects, even with
+# CMAKE_HIP_ARCHITECTURES/CMAKE_HIP_COMPILER_ROCM_ROOT/--rocm-path all
+# supplied correctly (the COMPILE step succeeds; only the final link
+# fails). enable_language(HIP) has no graceful-failure mode -- it hard-
+# errors the ENTIRE configure, not just this target -- so auto-enabling
+# here would break bolt's default `cmake -S . -B build` for anyone on a
+# machine with HIP_PATH set (which the AMD installer sets as a PERSISTENT
+# SYSTEM environment variable, confirmed on this exact box: every future
+# shell has it, not just the one that ran the installer). Requires
+# EXPLICIT `-DBOLT_BUILD_ROCM=ON` until the Windows CMake+HIP linking gap
+# is resolved (a newer CMake/ROCm release, or a working
+# CMAKE_HIP_LINK_EXECUTABLE override) -- passing it today will still fail
+# the configure with the /machine:x64 error, this flag is a placeholder
+# for whoever picks up that fix, not a currently-working opt-in.
 # ---------------------------------------------------------------------------
 find_program(BOLT_HIPCC_EXECUTABLE NAMES hipcc
              HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
-option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core" OFF)
-if(BOLT_HIPCC_EXECUTABLE)
-    set(BOLT_BUILD_ROCM ON)
-endif()
+# CMake's HIP language support rejects the hipcc WRAPPER script as
+# CMAKE_HIP_COMPILER ("Use Clang directly, or let CMake pick a default" --
+# found 2026-07-17 getting this working for real against this box's newly
+# installed HIP SDK 7.1). The real compiler is clang++ in that same bin/
+# directory (ROCm's HIP toolchain bundles its own Clang) -- hipcc itself is
+# just a driver script around it. Probe for hipcc (a reliable "is a HIP SDK
+# here at all" signal, matching how a human would check) but point CMake at
+# clang++ directly for the actual compiler.
+find_program(BOLT_HIP_CLANGXX_EXECUTABLE NAMES clang++
+             HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
+option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core (see the known Windows linking gap above before enabling)" OFF)
 
-if(BOLT_BUILD_ROCM AND NOT BOLT_HIPCC_EXECUTABLE)
-    message(WARNING "BOLT_BUILD_ROCM requested but no hipcc found (set HIP_PATH/ROCM_PATH) -- skipping bolt::rocm")
+if(BOLT_BUILD_ROCM AND NOT (BOLT_HIPCC_EXECUTABLE AND BOLT_HIP_CLANGXX_EXECUTABLE))
+    message(WARNING "BOLT_BUILD_ROCM requested but no hipcc/clang++ found (set HIP_PATH/ROCM_PATH) -- skipping bolt::rocm")
     set(BOLT_BUILD_ROCM OFF)
 endif()
 
 if(BOLT_BUILD_ROCM)
-    set(CMAKE_HIP_COMPILER "${BOLT_HIPCC_EXECUTABLE}")
+    set(CMAKE_HIP_COMPILER "${BOLT_HIP_CLANGXX_EXECUTABLE}")
     enable_language(HIP)
     set_source_files_properties(src/bolt_rocm.cpp PROPERTIES LANGUAGE HIP)
     add_library(bolt_rocm STATIC src/bolt_rocm.cpp)
