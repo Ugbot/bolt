@@ -81,6 +81,37 @@ TEST(BoltVulkan, AllocateAndMapHostVisibleBuffer) {
     EXPECT_EQ(handle.memory, nullptr);
 }
 
+// BLLM-83: on this box's real integrated/UMA GPU (AMD Radeon 8060S), a
+// direct vkGetPhysicalDeviceMemoryProperties dump (2026-07-17) confirmed 4
+// of 16 memory types are simultaneously HOST_VISIBLE|HOST_COHERENT|
+// DEVICE_LOCAL, backed by a genuinely separate ~68GB DEVICE_LOCAL heap
+// distinct from a ~34GB host-only heap -- but the PRE-FIX find_memory_type
+// order would have silently landed a prefer_host_visible=true allocation
+// on the slower non-device-local heap purely because it sorted first by
+// type index, with no error to reveal it. This test locks in the fix:
+// a host-visible allocation on this hardware must ALSO be device_local.
+TEST(BoltVulkan, PreferHostVisibleLandsOnDeviceLocalHeapOnUma) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+
+    BufferHandle handle;
+    ASSERT_TRUE(ctx.allocate_buffer(4096, /*prefer_host_visible=*/true, &handle));
+    EXPECT_TRUE(handle.host_visible);
+    // NOTE: this assertion is hardware-fact-dependent (true on this box's
+    // real UMA GPU as of 2026-07-17) rather than a universal Vulkan
+    // guarantee -- a genuinely discrete GPU with no coincident heap would
+    // legitimately fail this and that would be correct, not a regression.
+    EXPECT_TRUE(handle.device_local)
+        << "expected a coincident HOST_VISIBLE+DEVICE_LOCAL heap on this UMA GPU -- "
+           "if this fails on different hardware, the memory-type selection preference "
+           "is still correct, this specific expectation just doesn't hold there";
+
+    ctx.free_buffer(&handle);
+}
+
 TEST(BoltVulkan, AllocateDeviceLocalBufferSucceeds) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";

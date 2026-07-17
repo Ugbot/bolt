@@ -269,6 +269,28 @@ bool Context::allocate_buffer(uint64_t size_bytes, bool prefer_host_visible,
     bool host_visible = false;
     if (prefer_host_visible &&
         find_memory_type(mem_props, mem_reqs.memoryTypeBits,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                         &mem_type)) {
+        // BLLM-83 UMA fast path: on an integrated/UMA GPU, one memory type
+        // is typically BOTH host-visible AND device-local at once (a real,
+        // measured fact on this box -- 4 of 16 memory types report all
+        // three flags, backed by a genuinely separate 68GB DEVICE_LOCAL
+        // heap distinct from a smaller 34GB host-only heap; verified via a
+        // direct vkGetPhysicalDeviceMemoryProperties dump, not assumed).
+        // Prefer this type FIRST -- find_memory_type returns the first
+        // matching index, and a plain HOST_VISIBLE|HOST_COHERENT query
+        // (the branch below) would have silently landed on the slower,
+        // non-device-local heap purely because it happens to sort first
+        // by type index, with no error or fallback ever triggering to
+        // reveal that. Being also mappable this way means the "staging
+        // buffer" ds4_metal.m's Shared-storage pattern exists specifically
+        // to avoid was never needed here -- GpuContext.cpp already writes
+        // straight into this buffer via map_buffer(), no separate
+        // device-local buffer + copy step exists to eliminate.
+        host_visible = true;
+    } else if (prefer_host_visible &&
+        find_memory_type(mem_props, mem_reqs.memoryTypeBits,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          &mem_type)) {
         host_visible = true;
@@ -309,6 +331,8 @@ bool Context::allocate_buffer(uint64_t size_bytes, bool prefer_host_visible,
     out->memory = memory;
     out->size_bytes = size_bytes;
     out->host_visible = host_visible;
+    out->device_local =
+        (mem_props.memoryTypes[mem_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     return true;
 }
 

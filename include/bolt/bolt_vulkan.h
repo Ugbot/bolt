@@ -53,6 +53,16 @@ struct BufferHandle {
     void*    memory = nullptr;
     uint64_t size_bytes = 0;
     bool     host_visible = false;  // true iff map_buffer() will work on this handle
+    // BLLM-83: true iff this allocation ALSO landed on a DEVICE_LOCAL heap
+    // (real on UMA/integrated GPUs -- confirmed on this box's AMD Radeon
+    // 8060S, which exposes memory types that are simultaneously
+    // HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL). When true and host_visible
+    // is also true, writes via map_buffer() land directly in
+    // GPU-fast-path memory -- no separate staging buffer + device-local
+    // copy step is needed, matching ds4_metal.m's MTLResourceStorageModeShared
+    // zero-copy pattern one layer down (Vulkan's equivalent is memory-type
+    // selection, not a separate storage-mode API).
+    bool     device_local = false;
 };
 
 // Weight dtype tag for matmul_dequant (BLLM-47) -- mirrors
