@@ -311,6 +311,109 @@ TEST(BoltVulkan, MatmulDequantInt2MatchesScaledDotProduct) {
     ctx.destroy_matmul_pipeline(&pipeline);
 }
 
+// Regression test for a real bug found 2026-07-17 (via boltllm's
+// test_gpu_context.cpp): the original Int8/Int4/Int2 shaders assumed each
+// row was padded to a whole 4-byte word boundary, but QuantTypes.h's
+// host-side packing is TIGHT (no per-row padding) -- row 0 always happened
+// to read correctly (offset 0 either way), but every row after it was
+// silently corrupted whenever the row's byte stride wasn't itself a
+// multiple of 4 (true whenever `cols` isn't a multiple of 4 for Int8, or
+// the packed byte-per-row count isn't a multiple of 4 for Int4/Int2). ALL
+// of the single-row tests above (out_rows=1) could not have caught this --
+// this test deliberately uses multiple rows AND deliberately
+// non-4-byte-aligned row strides.
+TEST(BoltVulkan, MatmulDequantMultiRowMisalignedStrideRegression) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+
+    // Int8: cols=5 -> row stride 5 bytes, not a multiple of 4.
+    {
+        MatmulPipeline pipeline;
+        ASSERT_TRUE(ctx.create_matmul_pipeline(WeightDType::Int8, &pipeline));
+        const int32_t rows = 4, cols = 5;
+        std::vector<int8_t> weight(static_cast<size_t>(rows * cols));
+        std::vector<float> scale(static_cast<size_t>(rows));
+        std::vector<float> activation(static_cast<size_t>(cols));
+        for (int32_t i = 0; i < cols; ++i) activation[static_cast<size_t>(i)] = 0.5f + static_cast<float>(i);
+        std::vector<float> expected(static_cast<size_t>(rows));
+        for (int32_t r = 0; r < rows; ++r) {
+            scale[static_cast<size_t>(r)] = 0.5f + 0.25f * static_cast<float>(r);
+            float acc = 0.0f;
+            for (int32_t c = 0; c < cols; ++c) {
+                const int8_t v = static_cast<int8_t>((r * 7 + c * 3) % 21 - 10);
+                weight[static_cast<size_t>(r * cols + c)] = v;
+                acc += activation[static_cast<size_t>(c)] * static_cast<float>(v);
+            }
+            expected[static_cast<size_t>(r)] = acc * scale[static_cast<size_t>(r)];
+        }
+        BufferHandle weight_buf = make_and_fill(ctx, weight.data(), weight.size() * sizeof(int8_t));
+        BufferHandle scale_buf = make_and_fill(ctx, scale.data(), scale.size() * sizeof(float));
+        BufferHandle act_buf = make_and_fill(ctx, activation.data(), activation.size() * sizeof(float));
+        BufferHandle out_buf;
+        ASSERT_TRUE(ctx.allocate_buffer(static_cast<uint64_t>(rows) * sizeof(float), true, &out_buf));
+        ASSERT_TRUE(ctx.matmul_dequant(pipeline, weight_buf, scale_buf, act_buf, out_buf, rows, cols));
+        float* out_ptr = static_cast<float*>(ctx.map_buffer(out_buf));
+        ASSERT_NE(out_ptr, nullptr);
+        for (int32_t r = 0; r < rows; ++r) {
+            EXPECT_NEAR(out_ptr[r], expected[static_cast<size_t>(r)], 1e-2f)
+                << "Int8 row " << r << " (regression: row-stride-misalignment corruption)";
+        }
+        ctx.unmap_buffer(out_buf);
+        ctx.free_buffer(&weight_buf);
+        ctx.free_buffer(&scale_buf);
+        ctx.free_buffer(&act_buf);
+        ctx.free_buffer(&out_buf);
+        ctx.destroy_matmul_pipeline(&pipeline);
+    }
+
+    // Int2: cols=9 -> bytes_per_row = ceil(9/4) = 3, not a multiple of 4.
+    {
+        MatmulPipeline pipeline;
+        ASSERT_TRUE(ctx.create_matmul_pipeline(WeightDType::Int2, &pipeline));
+        const int32_t rows = 4, cols = 9;
+        const size_t bytes_per_row = static_cast<size_t>((cols + 3) / 4);
+        std::vector<uint8_t> packed(static_cast<size_t>(rows) * bytes_per_row, 0);
+        std::vector<float> scale(static_cast<size_t>(rows));
+        std::vector<float> activation(static_cast<size_t>(cols));
+        for (int32_t i = 0; i < cols; ++i) activation[static_cast<size_t>(i)] = 0.5f + static_cast<float>(i) * 0.25f;
+        std::vector<float> expected(static_cast<size_t>(rows), 0.0f);
+        for (int32_t r = 0; r < rows; ++r) {
+            scale[static_cast<size_t>(r)] = 0.25f + 0.1f * static_cast<float>(r);
+            float acc = 0.0f;
+            for (int32_t c = 0; c < cols; ++c) {
+                const uint32_t code = static_cast<uint32_t>((r * 3 + c * 5) % 4);  // 0..3
+                const int32_t v = static_cast<int32_t>(code) - 2;  // kInt2Offset
+                const size_t byte_idx = static_cast<size_t>(r) * bytes_per_row + static_cast<size_t>(c >> 2);
+                const uint32_t shift = static_cast<uint32_t>((c & 3) * 2);
+                packed[byte_idx] = static_cast<uint8_t>(packed[byte_idx] | (code << shift));
+                acc += activation[static_cast<size_t>(c)] * static_cast<float>(v);
+            }
+            expected[static_cast<size_t>(r)] = acc * scale[static_cast<size_t>(r)];
+        }
+        BufferHandle weight_buf = make_and_fill(ctx, packed.data(), packed.size());
+        BufferHandle scale_buf = make_and_fill(ctx, scale.data(), scale.size() * sizeof(float));
+        BufferHandle act_buf = make_and_fill(ctx, activation.data(), activation.size() * sizeof(float));
+        BufferHandle out_buf;
+        ASSERT_TRUE(ctx.allocate_buffer(static_cast<uint64_t>(rows) * sizeof(float), true, &out_buf));
+        ASSERT_TRUE(ctx.matmul_dequant(pipeline, weight_buf, scale_buf, act_buf, out_buf, rows, cols));
+        float* out_ptr = static_cast<float*>(ctx.map_buffer(out_buf));
+        ASSERT_NE(out_ptr, nullptr);
+        for (int32_t r = 0; r < rows; ++r) {
+            EXPECT_NEAR(out_ptr[r], expected[static_cast<size_t>(r)], 1e-2f)
+                << "Int2 row " << r << " (regression: row-stride-misalignment corruption)";
+        }
+        ctx.unmap_buffer(out_buf);
+        ctx.free_buffer(&weight_buf);
+        ctx.free_buffer(&scale_buf);
+        ctx.free_buffer(&act_buf);
+        ctx.free_buffer(&out_buf);
+        ctx.destroy_matmul_pipeline(&pipeline);
+    }
+}
+
 TEST(BoltVulkan, MatmulDequantFailsCleanlyOnInvalidPipeline) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";

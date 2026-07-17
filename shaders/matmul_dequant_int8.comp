@@ -6,6 +6,13 @@
 // bitfieldExtract on a SIGNED int sign-extends per GLSL spec, giving the
 // correct int8 value directly. Per-row scale applied after reduction,
 // same convention as bolt_compute.h's matmul_row_dot_f32 Int8 case.
+//
+// Addressing is FLAT BYTE OFFSET (row * cols + i), NOT row-major words with
+// each row padded to a whole uint (that was a real bug found 2026-07-17 via
+// test_gpu_context.cpp: QuantTypes.h's host-side packing is TIGHT -- no
+// per-row padding -- so row 1's data can start mid-word if `cols` isn't a
+// multiple of 4; a per-row word-aligned assumption silently corrupted every
+// row after row 0 whenever the row byte stride wasn't 4-byte-aligned).
 
 layout(local_size_x = 256) in;
 
@@ -24,13 +31,13 @@ void main() {
     uint row = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint cols = uint(pc.cols);
-    uint words_per_row = (cols + 3u) / 4u;
-    uint row_word_offset = row * words_per_row;
+    uint row_byte_offset = row * cols;  // Int8: exactly 1 byte per element, no padding
 
     float acc = 0.0;
     for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
-        uint word = weight_packed[row_word_offset + (i >> 2u)];
-        int v = bitfieldExtract(int(word), int((i & 3u) * 8u), 8);
+        uint byte_idx = row_byte_offset + i;
+        uint word = weight_packed[byte_idx >> 2u];
+        int v = bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
         acc += activation[i] * float(v);
     }
     partial_sum[tid] = acc;
