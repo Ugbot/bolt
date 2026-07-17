@@ -7,7 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <random>
 #include <vector>
 
 #include "bolt/bolt_vulkan.h"
@@ -481,4 +484,192 @@ TEST(BoltVulkan, MatmulDequantRequiresScaleForQuantizedDtypes) {
     ctx.free_buffer(&activation);
     ctx.free_buffer(&out);
     ctx.destroy_matmul_pipeline(&pipeline);
+}
+
+// ---------------------------------------------------------------------------
+// BLLM-87: batched int8-activation matmul -- validated against the ALREADY-
+// verified single-token int8-activation kernel (BLLM-81's own test above),
+// rather than a fresh CPU reference: for a batch of N tokens, the batched
+// kernel's output for token t must match the single-token kernel called
+// individually on token t's own activation, since both compute the exact
+// same int32-accumulation dot product against the exact same resident
+// weight -- only the dispatch shape differs.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Quantizes `raw[rows][cols]` (row-major) to Int8 with a simple per-row
+// max-abs scale -- a self-contained test helper (bolt has no project
+// dependency on boltllm::quant's own quantize_rows_int8, and shouldn't
+// gain one just for a test). Exact rounding convention doesn't matter here:
+// this test only compares the batched kernel against the single-token
+// kernel using the SAME quantized bytes, not against an external oracle.
+void quantize_int8_rows(const std::vector<float>& raw, int32_t rows, int32_t cols,
+                         std::vector<int8_t>& q_out, std::vector<float>& scale_out) {
+    q_out.resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+    scale_out.resize(static_cast<size_t>(rows));
+    for (int32_t r = 0; r < rows; ++r) {
+        const float* row = raw.data() + static_cast<size_t>(r) * cols;
+        float max_abs = 1e-8f;
+        for (int32_t c = 0; c < cols; ++c) max_abs = std::max(max_abs, std::fabs(row[c]));
+        const float scale = max_abs / 127.0f;
+        scale_out[static_cast<size_t>(r)] = scale;
+        int8_t* qrow = q_out.data() + static_cast<size_t>(r) * cols;
+        for (int32_t c = 0; c < cols; ++c) {
+            int v = static_cast<int>(row[c] / scale + (row[c] >= 0.0f ? 0.5f : -0.5f));
+            v = std::max(-127, std::min(127, v));
+            qrow[c] = static_cast<int8_t>(v);
+        }
+    }
+}
+
+void run_batched_int8act_case(WeightDType dtype, int32_t rows, int32_t cols, int32_t n_tokens) {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
+
+    // Weight: [rows, cols], quantized per-row.
+    std::vector<float> raw_weight(static_cast<size_t>(rows) * cols);
+    for (auto& v : raw_weight) v = dist(rng);
+    std::vector<int8_t> weight_q8;
+    std::vector<float> weight_scale;
+    quantize_int8_rows(raw_weight, rows, cols, weight_q8, weight_scale);
+
+    std::vector<uint8_t> weight_packed;
+    if (dtype == WeightDType::Int8) {
+        weight_packed.assign(reinterpret_cast<uint8_t*>(weight_q8.data()),
+                              reinterpret_cast<uint8_t*>(weight_q8.data()) + weight_q8.size());
+    } else {
+        // Int4: pack two int8-range-clamped-to-[-8,7] values per byte,
+        // low-nibble-first, offset 8 -- matches matmul_dequant_int8act_int4's
+        // own convention. Requantize from the SAME raw weight at 4-bit
+        // range so weight_scale still reflects the actual clamp range used.
+        weight_q8.clear();
+        weight_scale.clear();
+        weight_q8.resize(static_cast<size_t>(rows) * cols);
+        weight_scale.resize(static_cast<size_t>(rows));
+        weight_packed.assign(static_cast<size_t>(rows) * ((cols + 1) / 2), 0);
+        for (int32_t r = 0; r < rows; ++r) {
+            const float* row = raw_weight.data() + static_cast<size_t>(r) * cols;
+            float max_abs = 1e-8f;
+            for (int32_t c = 0; c < cols; ++c) max_abs = std::max(max_abs, std::fabs(row[c]));
+            const float scale = max_abs / 7.0f;
+            weight_scale[static_cast<size_t>(r)] = scale;
+            for (int32_t c = 0; c < cols; ++c) {
+                int v = static_cast<int>(row[c] / scale + (row[c] >= 0.0f ? 0.5f : -0.5f));
+                v = std::max(-8, std::min(7, v)) + 8;  // offset-8 nibble range [0,15]
+                const size_t byte_idx = static_cast<size_t>(r) * ((cols + 1) / 2) + static_cast<size_t>(c) / 2;
+                if (c % 2 == 0) {
+                    weight_packed[byte_idx] = static_cast<uint8_t>(v);
+                } else {
+                    weight_packed[byte_idx] |= static_cast<uint8_t>(v << 4);
+                }
+            }
+        }
+    }
+
+    // n_tokens activations, each [cols], quantized independently (own scale).
+    std::vector<std::vector<int8_t>> act_q(static_cast<size_t>(n_tokens));
+    std::vector<float> act_scale(static_cast<size_t>(n_tokens));
+    for (int32_t t = 0; t < n_tokens; ++t) {
+        std::vector<float> raw_act(static_cast<size_t>(cols));
+        for (auto& v : raw_act) v = dist(rng);
+        std::vector<int8_t> q;
+        std::vector<float> s;
+        quantize_int8_rows(raw_act, 1, cols, q, s);
+        act_q[static_cast<size_t>(t)] = std::move(q);
+        act_scale[static_cast<size_t>(t)] = s[0];
+    }
+
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+
+    // ---- Reference: single-token kernel, called once per token.
+    MatmulPipeline single_pipeline;
+    ASSERT_TRUE(ctx.create_int8_activation_pipeline(dtype, &single_pipeline));
+    BufferHandle weight_buf = make_and_fill(ctx, weight_packed.data(), weight_packed.size());
+    BufferHandle scale_buf = make_and_fill(ctx, weight_scale.data(), weight_scale.size() * sizeof(float));
+
+    std::vector<float> expected(static_cast<size_t>(n_tokens) * rows);
+    for (int32_t t = 0; t < n_tokens; ++t) {
+        BufferHandle act_buf =
+            make_and_fill(ctx, act_q[static_cast<size_t>(t)].data(), static_cast<size_t>(cols));
+        BufferHandle out_buf;
+        ASSERT_TRUE(ctx.allocate_buffer(static_cast<uint64_t>(rows) * sizeof(float), true, &out_buf));
+        ASSERT_TRUE(ctx.matmul_dequant_int8_activation(single_pipeline, weight_buf, scale_buf, act_buf,
+                                                        act_scale[static_cast<size_t>(t)], out_buf, rows,
+                                                        cols));
+        float* out_ptr = static_cast<float*>(ctx.map_buffer(out_buf));
+        ASSERT_NE(out_ptr, nullptr);
+        std::memcpy(expected.data() + static_cast<size_t>(t) * rows, out_ptr, static_cast<size_t>(rows) * sizeof(float));
+        ctx.unmap_buffer(out_buf);
+        ctx.free_buffer(&act_buf);
+        ctx.free_buffer(&out_buf);
+    }
+    ctx.destroy_matmul_pipeline(&single_pipeline);
+
+    // ---- Batched kernel: ONE dispatch for all n_tokens.
+    MatmulPipeline batched_pipeline;
+    ASSERT_TRUE(ctx.create_int8_activation_batched_pipeline(dtype, &batched_pipeline));
+
+    std::vector<int8_t> act_q_flat(static_cast<size_t>(n_tokens) * cols);
+    for (int32_t t = 0; t < n_tokens; ++t) {
+        std::memcpy(act_q_flat.data() + static_cast<size_t>(t) * cols, act_q[static_cast<size_t>(t)].data(),
+                    static_cast<size_t>(cols));
+    }
+    BufferHandle act_flat_buf = make_and_fill(ctx, act_q_flat.data(), act_q_flat.size());
+    BufferHandle act_scale_buf = make_and_fill(ctx, act_scale.data(), act_scale.size() * sizeof(float));
+    BufferHandle out_flat_buf;
+    ASSERT_TRUE(ctx.allocate_buffer(static_cast<uint64_t>(n_tokens) * rows * sizeof(float), true,
+                                    &out_flat_buf));
+
+    ASSERT_TRUE(ctx.matmul_dequant_int8_activation_batched(batched_pipeline, weight_buf, scale_buf,
+                                                            act_flat_buf, act_scale_buf, out_flat_buf,
+                                                            rows, cols, n_tokens));
+
+    float* out_flat_ptr = static_cast<float*>(ctx.map_buffer(out_flat_buf));
+    ASSERT_NE(out_flat_ptr, nullptr);
+    for (int32_t t = 0; t < n_tokens; ++t) {
+        for (int32_t r = 0; r < rows; ++r) {
+            const size_t idx = static_cast<size_t>(t) * rows + r;
+            const float diff = std::fabs(out_flat_ptr[idx] - expected[idx]);
+            const float tol = 1e-3f * (std::fabs(expected[idx]) + 1.0f);
+            EXPECT_LE(diff, tol) << "token=" << t << " row=" << r << " got=" << out_flat_ptr[idx]
+                                  << " expected=" << expected[idx];
+        }
+    }
+    ctx.unmap_buffer(out_flat_buf);
+
+    ctx.free_buffer(&weight_buf);
+    ctx.free_buffer(&scale_buf);
+    ctx.free_buffer(&act_flat_buf);
+    ctx.free_buffer(&act_scale_buf);
+    ctx.free_buffer(&out_flat_buf);
+    ctx.destroy_int8_activation_batched_pipeline(&batched_pipeline);
+}
+
+}  // namespace
+
+TEST(BoltVulkan, BatchedInt8ActivationMatchesSingleTokenKernelInt8Weight) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    run_batched_int8act_case(WeightDType::Int8, /*rows=*/16, /*cols=*/128, /*n_tokens=*/5);
+    run_batched_int8act_case(WeightDType::Int8, /*rows=*/384, /*cols=*/1024, /*n_tokens=*/12);
+}
+
+TEST(BoltVulkan, BatchedInt8ActivationMatchesSingleTokenKernelInt4Weight) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    run_batched_int8act_case(WeightDType::Int4, /*rows=*/16, /*cols=*/130, /*n_tokens=*/5);
+    run_batched_int8act_case(WeightDType::Int4, /*rows=*/384, /*cols=*/1024, /*n_tokens=*/12);
+}
+
+TEST(BoltVulkan, BatchedInt8ActivationSingleTokenBatchWorks) {
+    // n_tokens=1 is a valid, degenerate batch -- must behave identically to
+    // the single-token kernel path.
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    run_batched_int8act_case(WeightDType::Int8, /*rows=*/8, /*cols=*/64, /*n_tokens=*/1);
 }

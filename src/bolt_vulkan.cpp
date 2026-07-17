@@ -9,6 +9,7 @@
 
 #include "bolt/bolt_vulkan.h"
 
+#include <cassert>
 #include <cstring>
 #include <vector>
 
@@ -19,7 +20,9 @@
 #include "bolt/vulkan_shaders/matmul_dequant_int4.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int4.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int8act_int4_batched.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int8.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int8act_int8_batched.h"
 
 namespace bolt::vulkan {
 
@@ -420,6 +423,26 @@ bool int8act_shader_words_for(WeightDType dtype, const uint32_t** out_words,
     return false;
 }
 
+// BLLM-87: shader words for the BATCHED int8-activation variants -- same
+// dtype scope as int8act_shader_words_for() (Int8/Int4 only).
+bool int8act_batched_shader_words_for(WeightDType dtype, const uint32_t** out_words,
+                                       size_t* out_size) noexcept {
+    switch (dtype) {
+        case WeightDType::Int8:
+            *out_words = shaders::kmatmul_dequant_int8act_int8_batched_spv;
+            *out_size = shaders::kmatmul_dequant_int8act_int8_batched_spv_size;
+            return true;
+        case WeightDType::Int4:
+            *out_words = shaders::kmatmul_dequant_int8act_int4_batched_spv;
+            *out_size = shaders::kmatmul_dequant_int8act_int4_batched_spv_size;
+            return true;
+        case WeightDType::F32:
+        case WeightDType::Int2:
+            return false;
+    }
+    return false;
+}
+
 // Shared by create_matmul_pipeline() and create_int8_activation_pipeline():
 // every field of MatmulPipeline construction is identical except which
 // SPIR-V words are loaded, how many storage-buffer bindings the descriptor
@@ -439,7 +462,8 @@ bool create_pipeline_common(VkDevice device, uint32_t queue_family_index,
         return false;
     }
 
-    VkDescriptorSetLayoutBinding bindings[4]{};
+    VkDescriptorSetLayoutBinding bindings[5]{};
+    assert(binding_count <= 5);
     for (uint32_t i = 0; i < binding_count; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -597,6 +621,23 @@ bool Context::create_int8_activation_pipeline(WeightDType dtype, MatmulPipeline*
                                    out);
 }
 
+bool Context::create_int8_activation_batched_pipeline(WeightDType dtype,
+                                                        MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+
+    const uint32_t* spirv_words = nullptr;
+    size_t spirv_size = 0;
+    if (!int8act_batched_shader_words_for(dtype, &spirv_words, &spirv_size)) return false;
+
+    // Both batched int8-activation shaders always have 5 bindings (weight,
+    // weight_scale, activation, act_scale, out) and an 8-byte push constant
+    // (`{int cols; int rows;}`).
+    return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_, spirv_words,
+                                   spirv_size, /*binding_count=*/5, /*push_constant_size=*/8, dtype,
+                                   out);
+}
+
 void Context::destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept {
     if (pipeline == nullptr || device_ == nullptr) return;
     VkDevice device = static_cast<VkDevice>(device_);
@@ -632,6 +673,10 @@ void Context::destroy_int8_activation_pipeline(MatmulPipeline* pipeline) noexcep
     // Identical teardown to destroy_matmul_pipeline() -- MatmulPipeline's
     // resources are torn down the same way regardless of which shader
     // family created them.
+    destroy_matmul_pipeline(pipeline);
+}
+
+void Context::destroy_int8_activation_batched_pipeline(MatmulPipeline* pipeline) noexcept {
     destroy_matmul_pipeline(pipeline);
 }
 
@@ -763,6 +808,80 @@ bool Context::matmul_dequant_int8_activation(const MatmulPipeline& pipeline,
     vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
     vkCmdDispatch(cmd, static_cast<uint32_t>(out_rows), 1, 1);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    VkQueue queue = static_cast<VkQueue>(queue_);
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+
+    return vkQueueWaitIdle(queue) == VK_SUCCESS;
+}
+
+bool Context::matmul_dequant_int8_activation_batched(const MatmulPipeline& pipeline,
+                                                       const BufferHandle& weight,
+                                                       const BufferHandle& weight_scale,
+                                                       const BufferHandle& activation,
+                                                       const BufferHandle& act_scale,
+                                                       const BufferHandle& out, int32_t out_rows,
+                                                       int32_t cols, int32_t n_tokens) noexcept {
+    if (device_ == nullptr || !pipeline.is_valid()) return false;
+    if (pipeline.dtype != WeightDType::Int8 && pipeline.dtype != WeightDType::Int4) return false;
+    if (weight.buffer == nullptr || weight_scale.buffer == nullptr || activation.buffer == nullptr ||
+        act_scale.buffer == nullptr || out.buffer == nullptr) {
+        return false;
+    }
+    if (out_rows <= 0 || cols <= 0 || n_tokens <= 0) return false;
+
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    VkDescriptorBufferInfo buffer_infos[5]{};
+    buffer_infos[0] = {static_cast<VkBuffer>(weight.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[1] = {static_cast<VkBuffer>(weight_scale.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[2] = {static_cast<VkBuffer>(activation.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[3] = {static_cast<VkBuffer>(act_scale.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[4] = {static_cast<VkBuffer>(out.buffer), 0, VK_WHOLE_SIZE};
+
+    VkWriteDescriptorSet writes[5]{};
+    for (uint32_t i = 0; i < 5; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(pipeline.command_buffer);
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, static_cast<VkPipeline>(pipeline.pipeline));
+    VkDescriptorSet set = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            static_cast<VkPipelineLayout>(pipeline.pipeline_layout), 0, 1, &set, 0,
+                            nullptr);
+    // Push constants layout matches the batched shaders' own
+    // `PushConstants { int cols; int rows; }` exactly.
+    struct PushConstants {
+        int32_t cols;
+        int32_t rows;
+    };
+    const PushConstants push{cols, out_rows};
+    vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
+    // Dispatch shape (out_rows, n_tokens, 1) -- gl_WorkGroupID.x selects the
+    // output row, gl_WorkGroupID.y selects the token (see the .comp file's
+    // own header for this convention).
+    vkCmdDispatch(cmd, static_cast<uint32_t>(out_rows), static_cast<uint32_t>(n_tokens), 1);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
 

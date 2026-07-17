@@ -225,6 +225,47 @@ public:
                                         const BufferHandle& out, int32_t out_rows,
                                         int32_t cols) noexcept;
 
+    // ---- BLLM-87: BATCHED int8-ACTIVATION matmul -- amortizes one
+    // dispatch's overhead (descriptor set update, command buffer submit,
+    // queue wait) across MANY tokens against the SAME resident weight,
+    // instead of one matmul_dequant_int8_activation() call per token. See
+    // matmul_dequant_int8act_int8_batched.comp's header for the full
+    // design rationale (this is the viable alternative to a per-token
+    // device-resident expert cache, which BLLM-85's investigation found
+    // upload-cost-dominated and not worth building).
+
+    // Creates the compiled pipeline for the batched int8-activation variant
+    // of one weight dtype's matmul shader
+    // (matmul_dequant_int8act_{int8,int4}_batched.comp). Same dtype scope
+    // as create_int8_activation_pipeline() (Int8/Int4 only). A pipeline
+    // created here is NOT interchangeable with one from
+    // create_int8_activation_pipeline() (different descriptor layout/push
+    // constants) -- only pass it to matmul_dequant_int8_activation_batched().
+    bool create_int8_activation_batched_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept;
+
+    // Same lifetime contract as destroy_matmul_pipeline().
+    void destroy_int8_activation_batched_pipeline(MatmulPipeline* pipeline) noexcept;
+
+    // Dispatches out[t][r] = dot(activation[t], weight.row(r)) *
+    // act_scale[t] * weight_scale[r] for EVERY (row, token) pair in ONE
+    // Vulkan submit. `activation` is `n_tokens` already-quantized int8_t
+    // rows, TIGHTLY PACKED token-major (row t at byte offset t*cols, no
+    // per-token padding -- matches boltllm::quant::quantize_act_row_int8's
+    // own per-row packing, just concatenated across tokens). `act_scale` is
+    // `n_tokens` floats, one per token (each token's own
+    // quantize_act_row_int8-produced scale). `out` is `n_tokens * out_rows`
+    // floats, token-major (`out[t*out_rows + r]`). Blocks until the
+    // dispatch completes. Precondition: is_valid(), pipeline created via
+    // create_int8_activation_batched_pipeline() with a matching dtype,
+    // n_tokens >= 1.
+    bool matmul_dequant_int8_activation_batched(const MatmulPipeline& pipeline,
+                                                 const BufferHandle& weight,
+                                                 const BufferHandle& weight_scale,
+                                                 const BufferHandle& activation,
+                                                 const BufferHandle& act_scale,
+                                                 const BufferHandle& out, int32_t out_rows,
+                                                 int32_t cols, int32_t n_tokens) noexcept;
+
 private:
     void*    instance_ = nullptr;         // VkInstance
     void*    physical_device_ = nullptr;  // VkPhysicalDevice

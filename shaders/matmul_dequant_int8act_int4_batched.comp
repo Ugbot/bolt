@@ -1,0 +1,58 @@
+#version 450
+// BLLM-87: batched twin of matmul_dequant_int8act_int4.comp -- see
+// matmul_dequant_int8act_int8_batched.comp's header for the full batching
+// design rationale (dispatch shape, token-major buffer layout). Only the
+// WEIGHT unpacking differs from that file (Int4 nibbles here, matching
+// matmul_dequant_int8act_int4.comp's own convention) -- activation indexing
+// (token*cols + byte-in-row, Int8, no per-token padding) is identical.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint weight_packed[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { float weight_scale[]; };
+layout(set = 0, binding = 2) readonly buffer ActBuf { uint activation_packed[]; };
+layout(set = 0, binding = 3) readonly buffer ActScaleBuf { float act_scale[]; };
+layout(set = 0, binding = 4) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PushConstants {
+    int cols;
+    int rows;
+} pc;
+
+shared int partial_sum[256];
+
+const int kInt4DequantOffset = 8;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint cols = uint(pc.cols);
+    uint bytes_per_row = (cols + 1u) / 2u;
+    uint row_byte_offset = row * bytes_per_row;
+    uint act_byte_offset = token * cols;
+
+    int acc = 0;
+    for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
+        uint byte_idx = row_byte_offset + (i >> 1u);
+        uint w_word = weight_packed[byte_idx >> 2u];
+        uint byte_val = bitfieldExtract(w_word, int((byte_idx & 3u) * 8u), 8);
+        uint nibble = ((i & 1u) == 0u) ? (byte_val & 0xFu) : (byte_val >> 4u);
+        int w_v = int(nibble) - kInt4DequantOffset;
+
+        uint a_byte_idx = act_byte_offset + i;
+        uint a_word = activation_packed[a_byte_idx >> 2u];
+        int a_v = bitfieldExtract(int(a_word), int((a_byte_idx & 3u) * 8u), 8);
+
+        acc += w_v * a_v;
+    }
+    partial_sum[tid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
+        barrier();
+    }
+    if (tid == 0u) {
+        out_data[token * uint(pc.rows) + row] = float(partial_sum[0]) * act_scale[token] * weight_scale[row];
+    }
+}
