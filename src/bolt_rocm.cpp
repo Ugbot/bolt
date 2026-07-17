@@ -125,6 +125,61 @@ __global__ void matmul_dequant_int2_kernel(const uint8_t* weight, const float* s
     if (threadIdx.x == 0) out[row] = shared[0] * scale[row];
 }
 
+// BLLM-91: int8-ACTIVATION kernels -- the real expert-FFN numerics tier
+// (distinct from the float-activation kernels above, which match lm_head's
+// tier -- see bolt_rocm.h's matmul_dequant_int8_activation doc). Both
+// activation AND weight are already-quantized integers; accumulate in
+// int32 (safe without overflow for any realistic hidden size -- max |term|
+// = 127*127 = 16129, staying well inside int32 range even at cols in the
+// hundreds of thousands), single final act_scale*weight_scale float
+// multiply, matching boltllm::quant::idot_gemv_int8/int4_scalar's exact
+// contract (IdotDispatch.cpp) byte-for-byte.
+__global__ void matmul_dequant_int8act_int8_kernel(const int8_t* weight, const float* weight_scale,
+                                                    const int8_t* activation, float act_scale,
+                                                    float* out, int32_t cols) {
+    __shared__ int32_t shared[kBlockSize];
+    const int32_t row = blockIdx.x;
+    const int8_t* row_ptr = weight + static_cast<int64_t>(row) * cols;
+
+    int32_t acc = 0;
+    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) {
+        acc += static_cast<int32_t>(activation[i]) * static_cast<int32_t>(row_ptr[i]);
+    }
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = static_cast<float>(shared[0]) * act_scale * weight_scale[row];
+}
+
+// Int4 weight, low-nibble-first packing, offset kInt4DequantOffset -- same
+// layout matmul_dequant_int4_kernel uses, just int8-activation numerics.
+__global__ void matmul_dequant_int8act_int4_kernel(const uint8_t* weight, const float* weight_scale,
+                                                    const int8_t* activation, float act_scale,
+                                                    float* out, int32_t cols) {
+    __shared__ int32_t shared[kBlockSize];
+    const int32_t row = blockIdx.x;
+    const int32_t packed_cols = (cols + 1) / 2;
+    const uint8_t* row_ptr = weight + static_cast<int64_t>(row) * packed_cols;
+
+    int32_t acc = 0;
+    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) {
+        const uint8_t byte = row_ptr[i >> 1];
+        const int32_t nibble = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+        const int32_t w_v = nibble - kInt4DequantOffset;
+        acc += static_cast<int32_t>(activation[i]) * w_v;
+    }
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = static_cast<float>(shared[0]) * act_scale * weight_scale[row];
+}
+
 }  // namespace
 
 bool available() noexcept {
@@ -223,6 +278,37 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
             matmul_dequant_int2_kernel<<<grid, block>>>(
                 static_cast<const uint8_t*>(weight_device), scale_device, activation_device,
                 out_device, cols);
+            break;
+        default:
+            return false;
+    }
+
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
+bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, WeightDType dtype,
+                                     const float* weight_scale_device,
+                                     const int8_t* activation_device, float act_scale,
+                                     float* out_device, int32_t out_rows, int32_t cols) noexcept {
+    if (!ctx.is_valid() || weight_device == nullptr || weight_scale_device == nullptr ||
+        activation_device == nullptr || out_device == nullptr || out_rows <= 0 || cols <= 0) {
+        return false;
+    }
+    if (dtype != WeightDType::Int8 && dtype != WeightDType::Int4) return false;
+
+    const dim3 grid(static_cast<unsigned int>(out_rows));
+    const dim3 block(static_cast<unsigned int>(kBlockSize));
+
+    switch (dtype) {
+        case WeightDType::Int8:
+            matmul_dequant_int8act_int8_kernel<<<grid, block>>>(
+                static_cast<const int8_t*>(weight_device), weight_scale_device, activation_device,
+                act_scale, out_device, cols);
+            break;
+        case WeightDType::Int4:
+            matmul_dequant_int8act_int4_kernel<<<grid, block>>>(
+                static_cast<const uint8_t*>(weight_device), weight_scale_device, activation_device,
+                act_scale, out_device, cols);
             break;
         default:
             return false;

@@ -127,4 +127,23 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                      const float* scale_device, const float* activation_device,
                      float* out_device, int32_t out_rows, int32_t cols) noexcept;
 
+// BLLM-91: int8-ACTIVATION matmul -- the HIP twin of
+// bolt::vulkan::Context::matmul_dequant_int8_activation (BLLM-81), the
+// real expert-FFN numerics tier (distinct from matmul_dequant above, which
+// matches lm_head's float-activation tier). Matches
+// boltllm::quant::idot_gemv_int8/int4_scalar's exact contract
+// (IdotDispatch.cpp): int32 accumulation of act_q[i]*weight_q[i] (or
+// dequant-then-multiply for Int4 weight), a SINGLE final
+// act_scale*weight_scale float multiply. `dtype` must be Int8 or Int4 (no
+// int8-activation hot path exists for F32/Int2 weights in boltllm today).
+// `activation_device` is an already-quantized int8_t device buffer (the
+// caller quantizes host-side via boltllm::quant::quantize_act_row_int8 or
+// equivalent BEFORE upload -- this function never quantizes on-device).
+// Returns false on invalid arguments, an unsupported dtype, or any
+// launch/sync failure. Precondition: ctx.is_valid().
+bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, WeightDType dtype,
+                                     const float* weight_scale_device,
+                                     const int8_t* activation_device, float act_scale,
+                                     float* out_device, int32_t out_rows, int32_t cols) noexcept;
+
 }  // namespace bolt::rocm
