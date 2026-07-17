@@ -137,15 +137,22 @@ endif()
 # Header `bolt/bolt_ribbon.h` declares the API; this static lib carries
 # `build` + `might_contain`.
 # ---------------------------------------------------------------------------
-add_library(bolt_ribbon STATIC src/bolt_ribbon.cpp)
-add_library(bolt::ribbon ALIAS bolt_ribbon)
-target_link_libraries(bolt_ribbon PUBLIC bolt::core)
-target_include_directories(bolt_ribbon PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-bolt_apply_hardening(bolt_ribbon)
-bolt_apply_simd(bolt_ribbon ${BOLT_SIMD_TIER})
-target_link_libraries(bolt INTERFACE bolt::ribbon)
+# Default ON (not ${BOLT_IS_TOPLEVEL}): this target was unconditional before the
+# switch existed, so ON keeps every consumer building exactly as it did. The
+# switch is here so a consumer that only wants bolt::core can decline the cost.
+option(BOLT_BUILD_RIBBON "Build bolt::ribbon banded GF(2) Ribbon filter" ON)
+
+if(BOLT_BUILD_RIBBON)
+    add_library(bolt_ribbon STATIC src/bolt_ribbon.cpp)
+    add_library(bolt::ribbon ALIAS bolt_ribbon)
+    target_link_libraries(bolt_ribbon PUBLIC bolt::core)
+    target_include_directories(bolt_ribbon PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_ribbon)
+    bolt_apply_simd(bolt_ribbon ${BOLT_SIMD_TIER})
+    target_link_libraries(bolt INTERFACE bolt::ribbon)
+endif()
 
 # ---------------------------------------------------------------------------
 # bolt::parse — compiled static library (ASCII numeric parsers).
@@ -178,8 +185,21 @@ endif()
 # succeed; every other consumer keeps working CPU-only regardless.
 # ---------------------------------------------------------------------------
 find_package(Vulkan QUIET)
+
+# Default follows the same rule as every other optional compiled target
+# (bolt::io / bolt::parse / bolt::ingest): ON only when bolt is the TOP-LEVEL
+# project -- i.e. someone is building/testing bolt itself -- and the SDK is
+# actually present. Availability is NOT need: a consumer that links bolt::bolt
+# for bolt::core must never silently compile bolt::vulkan + a SPIR-V shader
+# pipeline just because the dev box happens to have the LunarG SDK installed.
+# Consumers that DO want it opt in explicitly with -DBOLT_BUILD_VULKAN=ON.
+if(BOLT_IS_TOPLEVEL AND Vulkan_FOUND)
+    set(BOLT_VULKAN_DEFAULT ON)
+else()
+    set(BOLT_VULKAN_DEFAULT OFF)
+endif()
 option(BOLT_BUILD_VULKAN "Build bolt::vulkan device/queue/memory scaffolding"
-       ${Vulkan_FOUND})
+       ${BOLT_VULKAN_DEFAULT})
 
 if(BOLT_BUILD_VULKAN AND NOT Vulkan_FOUND)
     message(WARNING "BOLT_BUILD_VULKAN requested but no Vulkan SDK found (set VULKAN_SDK) -- skipping bolt::vulkan")
@@ -256,10 +276,20 @@ endif()
 # ---------------------------------------------------------------------------
 find_program(BOLT_HIPCC_EXECUTABLE NAMES hipcc
              HINTS "$ENV{HIP_PATH}/bin" "$ENV{ROCM_PATH}/bin" /opt/rocm/bin)
-option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core" OFF)
-if(BOLT_HIPCC_EXECUTABLE)
-    set(BOLT_BUILD_ROCM ON)
+
+# Same rule as BOLT_BUILD_VULKAN above: default ON only when bolt is top-level
+# AND hipcc exists. Note this deliberately REPLACES an unconditional
+# `set(BOLT_BUILD_ROCM ON)` that ran after option() whenever hipcc was found --
+# a plain set() overrides the cache, so an explicit -DBOLT_BUILD_ROCM=OFF was
+# silently ignored on any box with ROCm installed. Never override an explicit
+# opt-out; a found toolchain is permission to build, not a reason to.
+if(BOLT_IS_TOPLEVEL AND BOLT_HIPCC_EXECUTABLE)
+    set(BOLT_ROCM_DEFAULT ON)
+else()
+    set(BOLT_ROCM_DEFAULT OFF)
 endif()
+option(BOLT_BUILD_ROCM "Build bolt::rocm ROCm/HIP matmul+dequant kernel core"
+       ${BOLT_ROCM_DEFAULT})
 
 if(BOLT_BUILD_ROCM AND NOT BOLT_HIPCC_EXECUTABLE)
     message(WARNING "BOLT_BUILD_ROCM requested but no hipcc found (set HIP_PATH/ROCM_PATH) -- skipping bolt::rocm")
@@ -388,15 +418,49 @@ endif()
 # the Noise XX handshake + ChaCha20-Poly1305 AEAD (noise.cpp), whose X25519 /
 # AEAD math is OpenSSL 3.x EVP — gated on OpenSSL being found below.
 # ---------------------------------------------------------------------------
-add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
-            src/crypto/ed25519.cpp)
-add_library(bolt::crypto ALIAS bolt_crypto)
-target_link_libraries(bolt_crypto PUBLIC bolt::core)
-target_include_directories(bolt_crypto PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-bolt_apply_hardening(bolt_crypto)
-target_link_libraries(bolt INTERFACE bolt::crypto)
+# All three default ON: they were unconditional before these switches existed,
+# so ON preserves every consumer's build exactly. See the consistency check
+# below -- bolt::lakehouse genuinely cannot link without crypto/net/parse.
+option(BOLT_BUILD_CRYPTO    "Build bolt::crypto (SigV4 + Noise XX + Ed25519)" ON)
+option(BOLT_BUILD_NET       "Build bolt::net (TLS + HTTP client)"             ON)
+option(BOLT_BUILD_LAKEHOUSE "Build bolt::lakehouse (Delta + Iceberg + catalogs + object stores)" ON)
+
+# bolt::lakehouse links bolt::crypto (SigV4), bolt::net (HTTP/TLS for the REST
+# catalogs) and bolt::parse (fionn JSON). Fail loudly on an impossible combo
+# rather than silently flipping a switch the caller explicitly set -- an
+# unbuildable request is a programmer error, and a confusing "target bolt::net
+# not found" 300 lines later is worse than saying so here.
+if(BOLT_BUILD_LAKEHOUSE)
+    set(_bolt_lh_missing "")
+    if(NOT BOLT_BUILD_CRYPTO)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_CRYPTO")
+    endif()
+    if(NOT BOLT_BUILD_NET)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_NET")
+    endif()
+    if(NOT BOLT_BUILD_PARSE)
+        list(APPEND _bolt_lh_missing "BOLT_BUILD_PARSE")
+    endif()
+    if(_bolt_lh_missing)
+        string(REPLACE ";" ", " _bolt_lh_missing_str "${_bolt_lh_missing}")
+        message(FATAL_ERROR
+            "BOLT_BUILD_LAKEHOUSE=ON requires: ${_bolt_lh_missing_str}. "
+            "Either enable them, or pass -DBOLT_BUILD_LAKEHOUSE=OFF if you "
+            "don't need Delta/Iceberg.")
+    endif()
+endif()
+
+if(BOLT_BUILD_CRYPTO)
+    add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
+                src/crypto/ed25519.cpp)
+    add_library(bolt::crypto ALIAS bolt_crypto)
+    target_link_libraries(bolt_crypto PUBLIC bolt::core)
+    target_include_directories(bolt_crypto PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_crypto)
+    target_link_libraries(bolt INTERFACE bolt::crypto)
+endif()
 
 # ---------------------------------------------------------------------------
 # bolt::lakehouse — compiled static library (lakehouse W1 foundations):
@@ -421,11 +485,13 @@ endif()
 # bolt::crypto's Noise XX (X25519 + ChaCha20-Poly1305) needs OpenSSL EVP.
 # Without it, noise.cpp compiles to explicit-failure stubs (returns false)
 # so the link still succeeds; SigV4 stays dependency-free either way.
-if(BOLT_WITH_TLS AND OpenSSL_FOUND)
+# Guarded on BOLT_BUILD_CRYPTO: the target only exists when it's enabled.
+if(BOLT_BUILD_CRYPTO AND BOLT_WITH_TLS AND OpenSSL_FOUND)
     target_compile_definitions(bolt_crypto PUBLIC BOLT_WITH_TLS=1)
     target_link_libraries(bolt_crypto PUBLIC OpenSSL::Crypto)
 endif()
 
+if(BOLT_BUILD_NET)
 add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp)
 add_library(bolt::net ALIAS bolt_net)
 target_link_libraries(bolt_net PUBLIC bolt::core)
@@ -441,12 +507,14 @@ if(WIN32)
     target_link_libraries(bolt_net PUBLIC ws2_32)
 endif()
 target_link_libraries(bolt INTERFACE bolt::net)
+endif()  # BOLT_BUILD_NET
 
 # ---------------------------------------------------------------------------
 # bolt::lakehouse (W1 foundations + W6 catalogs). Depends on bolt::net for
 # the HTTP client + TLS used by the Iceberg REST / Unity / Glue / Polaris /
 # Nessie / Gravitino catalogs, and bolt::parse for fionn JSON.
 # ---------------------------------------------------------------------------
+if(BOLT_BUILD_LAKEHOUSE)
 add_library(bolt_lakehouse STATIC
     src/lakehouse/object_store_filesystem.cpp
     src/lakehouse/object_store_s3.cpp
@@ -521,6 +589,7 @@ if(OpenSSL_FOUND)
     target_link_libraries(bolt_lakehouse PRIVATE OpenSSL::Crypto)
 endif()
 target_link_libraries(bolt INTERFACE bolt::lakehouse)
+endif()  # BOLT_BUILD_LAKEHOUSE
 
 # ---------------------------------------------------------------------------
 # bolt::ybolt — Y CRDT runtime adapter (ycpp + bolt::Arena).
@@ -592,6 +661,19 @@ write_basic_package_version_file(
     VERSION       ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
+
+# ---------------------------------------------------------------------------
+# Feature summary. bolt::core + kernels/join/wire/arrow are header-only and
+# always available; everything below is a compiled target you can decline with
+# -DBOLT_BUILD_<X>=OFF. Printed so a consumer can SEE what they're paying for
+# rather than discovering it in a link line.
+# ---------------------------------------------------------------------------
+message(STATUS "bolt: compiled targets -- "
+               "io=${BOLT_BUILD_IO} ribbon=${BOLT_BUILD_RIBBON} "
+               "parse=${BOLT_BUILD_PARSE} ingest=${BOLT_BUILD_INGEST} "
+               "crypto=${BOLT_BUILD_CRYPTO} net=${BOLT_BUILD_NET} "
+               "lakehouse=${BOLT_BUILD_LAKEHOUSE} "
+               "vulkan=${BOLT_BUILD_VULKAN} rocm=${BOLT_BUILD_ROCM}")
 
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bolt-config.cmake.in

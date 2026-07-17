@@ -803,7 +803,7 @@ struct BoltColumn {
     /// underlying data is mutated). One-pass per-dim Welford —
     /// vertical traversal (rows outer, dim inner) so the inner loop
     /// auto-vectorises on AVX2 / NEON.
-    VectorStats* compute_stats_vector(Arena* arena) noexcept;
+    VectorStats* compute_stats_vector(Arena* arena_in) noexcept;
 
     /// Try to promote format based on stats (e.g., Flat → Constant)
     bool try_promote(Arena* arena) noexcept;
@@ -1154,21 +1154,21 @@ inline void BoltColumn::compute_stats_numeric() noexcept {
 // stable for f32 accumulation across millions of rows. Single pass —
 // the caller is expected to invalidate the sidecar slot whenever the
 // underlying data mutates.
-inline VectorStats* BoltColumn::compute_stats_vector(Arena* arena) noexcept {
-    assert(arena != nullptr);
+inline VectorStats* BoltColumn::compute_stats_vector(Arena* arena_in) noexcept {
+    assert(arena_in != nullptr);
     if (type != BoltType::Embedding) return nullptr;
     if (format != ColumnFormat::Flat) return nullptr;
     const uint32_t dim = vector_dim();
     if (dim == 0u || length <= 0) return nullptr;
 
     auto* vs = static_cast<VectorStats*>(
-        arena->allocate(sizeof(VectorStats)));
+        arena_in->allocate(sizeof(VectorStats)));
     if (vs == nullptr) return nullptr;
     const size_t lane_bytes = static_cast<size_t>(dim) * sizeof(float);
-    auto* mn = static_cast<float*>(arena->allocate(lane_bytes));
-    auto* mx = static_cast<float*>(arena->allocate(lane_bytes));
-    auto* mu = static_cast<float*>(arena->allocate(lane_bytes));
-    auto* m2 = static_cast<float*>(arena->allocate(lane_bytes));
+    auto* mn = static_cast<float*>(arena_in->allocate(lane_bytes));
+    auto* mx = static_cast<float*>(arena_in->allocate(lane_bytes));
+    auto* mu = static_cast<float*>(arena_in->allocate(lane_bytes));
+    auto* m2 = static_cast<float*>(arena_in->allocate(lane_bytes));
     if (!mn || !mx || !mu || !m2) return nullptr;
 
     const float* BOLT_RESTRICT row0 = vector_row(0);
