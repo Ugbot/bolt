@@ -18,6 +18,8 @@
 #include "bolt/vulkan_shaders/matmul_dequant_int2.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int4.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int8act_int4.h"
+#include "bolt/vulkan_shaders/matmul_dequant_int8act_int8.h"
 
 namespace bolt::vulkan {
 
@@ -398,18 +400,36 @@ bool shader_words_for(WeightDType dtype, const uint32_t** out_words, size_t* out
     return false;
 }
 
-}  // namespace
+// BLLM-81: shader words for the int8-ACTIVATION matmul variants (Int8/Int4
+// weight only -- see bolt_vulkan.h's create_int8_activation_pipeline doc).
+bool int8act_shader_words_for(WeightDType dtype, const uint32_t** out_words,
+                               size_t* out_size) noexcept {
+    switch (dtype) {
+        case WeightDType::Int8:
+            *out_words = shaders::kmatmul_dequant_int8act_int8_spv;
+            *out_size = shaders::kmatmul_dequant_int8act_int8_spv_size;
+            return true;
+        case WeightDType::Int4:
+            *out_words = shaders::kmatmul_dequant_int8act_int4_spv;
+            *out_size = shaders::kmatmul_dequant_int8act_int4_spv_size;
+            return true;
+        case WeightDType::F32:
+        case WeightDType::Int2:
+            return false;  // no int8-activation hot path for these dtypes
+    }
+    return false;
+}
 
-bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept {
-    *out = MatmulPipeline{};
-    if (device_ == nullptr) return false;
-    VkDevice device = static_cast<VkDevice>(device_);
-
-    const uint32_t* spirv_words = nullptr;
-    size_t spirv_size = 0;
-    if (!shader_words_for(dtype, &spirv_words, &spirv_size)) return false;
-    const uint32_t binding_count = binding_count_for(dtype);
-
+// Shared by create_matmul_pipeline() and create_int8_activation_pipeline():
+// every field of MatmulPipeline construction is identical except which
+// SPIR-V words are loaded, how many storage-buffer bindings the descriptor
+// set layout needs, and the push-constant range's byte size (4 bytes for
+// `{int cols}` vs 8 for `{int cols; float act_scale}`). Factored out to
+// avoid ~150 lines of copy-pasted Vulkan boilerplate between the two.
+bool create_pipeline_common(VkDevice device, uint32_t queue_family_index,
+                             const uint32_t* spirv_words, size_t spirv_size,
+                             uint32_t binding_count, uint32_t push_constant_size,
+                             WeightDType dtype, MatmulPipeline* out) noexcept {
     VkShaderModuleCreateInfo module_info{};
     module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     module_info.codeSize = spirv_size;
@@ -439,7 +459,7 @@ bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noe
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push_range.offset = 0;
-    push_range.size = sizeof(int32_t);  // matches each shader's `PushConstants { int cols; }`
+    push_range.size = push_constant_size;
 
     VkPipelineLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -508,7 +528,7 @@ bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noe
     VkCommandPoolCreateInfo cmd_pool_info{};
     cmd_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cmd_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cmd_pool_info.queueFamilyIndex = queue_family_index_;
+    cmd_pool_info.queueFamilyIndex = queue_family_index;
     VkCommandPool command_pool = VK_NULL_HANDLE;
     if (vkCreateCommandPool(device, &cmd_pool_info, nullptr, &command_pool) != VK_SUCCESS) {
         vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
@@ -547,6 +567,36 @@ bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noe
     return true;
 }
 
+}  // namespace
+
+bool Context::create_matmul_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+
+    const uint32_t* spirv_words = nullptr;
+    size_t spirv_size = 0;
+    if (!shader_words_for(dtype, &spirv_words, &spirv_size)) return false;
+
+    return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_, spirv_words,
+                                   spirv_size, binding_count_for(dtype), sizeof(int32_t), dtype, out);
+}
+
+bool Context::create_int8_activation_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+
+    const uint32_t* spirv_words = nullptr;
+    size_t spirv_size = 0;
+    if (!int8act_shader_words_for(dtype, &spirv_words, &spirv_size)) return false;
+
+    // Both int8-activation shaders always have 4 bindings (weight,
+    // weight_scale, activation, out) and an 8-byte push constant
+    // (`{int cols; float act_scale;}`).
+    return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_, spirv_words,
+                                   spirv_size, /*binding_count=*/4, /*push_constant_size=*/8, dtype,
+                                   out);
+}
+
 void Context::destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept {
     if (pipeline == nullptr || device_ == nullptr) return;
     VkDevice device = static_cast<VkDevice>(device_);
@@ -576,6 +626,13 @@ void Context::destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept {
         vkDestroyShaderModule(device, static_cast<VkShaderModule>(pipeline->shader_module), nullptr);
     }
     *pipeline = MatmulPipeline{};
+}
+
+void Context::destroy_int8_activation_pipeline(MatmulPipeline* pipeline) noexcept {
+    // Identical teardown to destroy_matmul_pipeline() -- MatmulPipeline's
+    // resources are torn down the same way regardless of which shader
+    // family created them.
+    destroy_matmul_pipeline(pipeline);
 }
 
 bool Context::matmul_dequant(const MatmulPipeline& pipeline, const BufferHandle& weight,
@@ -645,6 +702,77 @@ bool Context::matmul_dequant(const MatmulPipeline& pipeline, const BufferHandle&
     // vkQueueWaitIdle establishes the host-visibility guarantee needed to
     // safely map_buffer()+read `out` afterward on this HOST_COHERENT
     // memory, so no separate pipeline barrier is required.
+    return vkQueueWaitIdle(queue) == VK_SUCCESS;
+}
+
+bool Context::matmul_dequant_int8_activation(const MatmulPipeline& pipeline,
+                                             const BufferHandle& weight,
+                                             const BufferHandle& weight_scale,
+                                             const BufferHandle& activation, float act_scale,
+                                             const BufferHandle& out, int32_t out_rows,
+                                             int32_t cols) noexcept {
+    if (device_ == nullptr || !pipeline.is_valid()) return false;
+    if (pipeline.dtype != WeightDType::Int8 && pipeline.dtype != WeightDType::Int4) return false;
+    if (weight.buffer == nullptr || weight_scale.buffer == nullptr || activation.buffer == nullptr ||
+        out.buffer == nullptr) {
+        return false;
+    }
+    if (out_rows <= 0 || cols <= 0) return false;
+
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    VkDescriptorBufferInfo buffer_infos[4]{};
+    buffer_infos[0] = {static_cast<VkBuffer>(weight.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[1] = {static_cast<VkBuffer>(weight_scale.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[2] = {static_cast<VkBuffer>(activation.buffer), 0, VK_WHOLE_SIZE};
+    buffer_infos[3] = {static_cast<VkBuffer>(out.buffer), 0, VK_WHOLE_SIZE};
+
+    VkWriteDescriptorSet writes[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(pipeline.command_buffer);
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, static_cast<VkPipeline>(pipeline.pipeline));
+    VkDescriptorSet set = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            static_cast<VkPipelineLayout>(pipeline.pipeline_layout), 0, 1, &set, 0,
+                            nullptr);
+    // Push constants layout matches each int8act shader's
+    // `PushConstants { int cols; float act_scale; }` exactly (offset 0 =
+    // cols, offset 4 = act_scale) -- packed into one struct so a single
+    // vkCmdPushConstants call covers both fields.
+    struct PushConstants {
+        int32_t cols;
+        float act_scale;
+    };
+    const PushConstants push{cols, act_scale};
+    vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
+    vkCmdDispatch(cmd, static_cast<uint32_t>(out_rows), 1, 1);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    VkQueue queue = static_cast<VkQueue>(queue_);
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+
     return vkQueueWaitIdle(queue) == VK_SUCCESS;
 }
 

@@ -189,6 +189,42 @@ public:
                         const BufferHandle& scale, const BufferHandle& activation,
                         const BufferHandle& out, int32_t out_rows, int32_t cols) noexcept;
 
+    // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
+    // tier, distinct from matmul_dequant's float-activation tier above) ---
+
+    // Creates the compiled pipeline for the int8-activation variant of one
+    // weight dtype's matmul shader (matmul_dequant_int8act_{int8,int4}.comp).
+    // `dtype` must be Int8 or Int4 (Int2/F32 have no int8-activation hot
+    // path in boltllm today -- see bolt::compute::detail's own CPU
+    // idot_gemv_int8/int4, which only cover those two). Returns false on
+    // any failure or an unsupported dtype. Precondition: is_valid().
+    bool create_int8_activation_pipeline(WeightDType dtype, MatmulPipeline* out) noexcept;
+
+    // Same lifetime contract as destroy_matmul_pipeline() -- shares
+    // implementation, just documented separately for discoverability next
+    // to create_int8_activation_pipeline().
+    void destroy_int8_activation_pipeline(MatmulPipeline* pipeline) noexcept;
+
+    // Dispatches the GEMV: out[r] = dot(activation_q, weight.row(r)), r in
+    // [0, out_rows), where BOTH activation and weight are already-quantized
+    // int8/int4 integers -- matching boltllm::quant::idot_gemv_int8_scalar/
+    // idot_gemv_int4_scalar's exact contract (IdotDispatch.cpp): int32
+    // accumulation of act_q[i]*weight_q[i] (or dequant-then-multiply for
+    // Int4 weight), a SINGLE final act_scale*weight_scale float multiply.
+    // `activation` must be a device buffer of already-quantized int8_t
+    // values (the caller quantizes host-side via
+    // boltllm::quant::quantize_act_row_int8 or equivalent BEFORE upload --
+    // this function never quantizes on-device). `act_scale` is the single
+    // scalar boltllm::quant::quantize_act_row_int8 produced for that whole
+    // activation row. Blocks until the dispatch completes.
+    // Precondition: is_valid(), pipeline created via
+    // create_int8_activation_pipeline() with a matching dtype.
+    bool matmul_dequant_int8_activation(const MatmulPipeline& pipeline, const BufferHandle& weight,
+                                        const BufferHandle& weight_scale,
+                                        const BufferHandle& activation, float act_scale,
+                                        const BufferHandle& out, int32_t out_rows,
+                                        int32_t cols) noexcept;
+
 private:
     void*    instance_ = nullptr;         // VkInstance
     void*    physical_device_ = nullptr;  // VkPhysicalDevice
