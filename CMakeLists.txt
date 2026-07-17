@@ -338,16 +338,98 @@ if(BOLT_BUILD_ROCM AND NOT (BOLT_HIPCC_EXECUTABLE AND BOLT_HIP_CLANGXX_EXECUTABL
 endif()
 
 if(BOLT_BUILD_ROCM)
-    set(CMAKE_HIP_COMPILER "${BOLT_HIP_CLANGXX_EXECUTABLE}")
-    enable_language(HIP)
-    set_source_files_properties(src/bolt_rocm.cpp PROPERTIES LANGUAGE HIP)
-    add_library(bolt_rocm STATIC src/bolt_rocm.cpp)
+    # BLLM-99 FIX (2026-07-17): bypass CMake's native enable_language(HIP)
+    # entirely, rather than fight it further -- confirmed with a minimal
+    # isolated repro that CMake's own HIP-language integration is what's
+    # broken here, not cross-toolchain linking itself:
+    #   - Ninja generator: CMake's Windows-Clang-HIP.cmake platform file
+    #     hard-refuses outright ("The current configuration mixes Clang and
+    #     MSVC ... This is not supported") the moment CXX=MSVC and HIP=Clang
+    #     coexist in one project -- a deliberate CMake-side same-toolchain-
+    #     family check, not a bug to work around via flags.
+    #   - VS generator: gets further (compile succeeds) before the HIP-
+    #     language LINK step inherits an MSVC-style /machine:x64 flag plain
+    #     clang++ rejects (the original symptom this ticket was filed for).
+    #   - Proven separately (isolated repro, this box, 2026-07-17): a HIP
+    #     kernel compiled DIRECTLY via clang++ (no enable_language(HIP) at
+    #     all) produces a plain COFF .obj that MSVC's own link.exe links
+    #     cleanly against MSVC-compiled host code -- ran for real on this
+    #     box's GPU (hipMalloc/hipMemcpy/kernel dispatch/hipDeviceSynchronize,
+    #     correct result). The object files and toolchains are NOT
+    #     incompatible; only CMake's own HIP-language machinery's assumptions
+    #     are.
+    #
+    # Fix: an add_custom_command invokes clang++ directly (same flags
+    # BLLM-92's proven-working hipcc-direct validation used), producing a
+    # plain .obj, archived into a .lib via MSVC's own lib.exe (already on
+    # PATH -- bolt's build already requires it for cl.exe/link.exe), exposed
+    # as an IMPORTED STATIC library the rest of the (MSVC-built) project
+    # links against normally. No enable_language(HIP) call anywhere.
+    if(DEFINED ENV{ROCM_PATH})
+        set(_bolt_rocm_root "$ENV{ROCM_PATH}")
+    else()
+        set(_bolt_rocm_root "$ENV{HIP_PATH}")
+    endif()
+    # clang++ mishandles a space-containing --rocm-path on Windows
+    # (confirmed BLLM-90/92) -- resolve the 8.3 short path so
+    # "Program Files" never appears in the flag's value.
+    if(WIN32)
+        execute_process(
+            COMMAND powershell -NoProfile -Command
+                "(New-Object -ComObject Scripting.FileSystemObject).GetFolder('${_bolt_rocm_root}').ShortPath"
+            OUTPUT_VARIABLE _bolt_rocm_root_short
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _bolt_rocm_short_result)
+        if(_bolt_rocm_short_result EQUAL 0 AND _bolt_rocm_root_short)
+            set(_bolt_rocm_root "${_bolt_rocm_root_short}")
+        endif()
+    endif()
+
+    set(_bolt_rocm_obj "${CMAKE_CURRENT_BINARY_DIR}/bolt_rocm_hip.obj")
+    set(_bolt_rocm_lib "${CMAKE_CURRENT_BINARY_DIR}/bolt_rocm_hip.lib")
+
+    find_program(BOLT_LIB_EXE_EXECUTABLE NAMES lib lib.exe)
+    if(NOT BOLT_LIB_EXE_EXECUTABLE)
+        message(WARNING "BOLT_BUILD_ROCM: lib.exe not found on PATH (needed to archive the "
+                         "clang++-compiled bolt_rocm.cpp into a linkable .lib) -- skipping bolt::rocm. "
+                         "Run from a Developer/VS environment (vcvarsall.bat) so lib.exe is on PATH.")
+        set(BOLT_BUILD_ROCM OFF)
+    endif()
+endif()
+
+if(BOLT_BUILD_ROCM)
+    add_custom_command(
+        OUTPUT "${_bolt_rocm_obj}"
+        COMMAND "${BOLT_HIP_CLANGXX_EXECUTABLE}" -x hip -c
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_rocm.cpp"
+                -o "${_bolt_rocm_obj}"
+                --offload-arch=gfx1151
+                "--rocm-path=${_bolt_rocm_root}"
+                -O2 -DNDEBUG -std=c++20
+                -fms-runtime-lib=dll
+                -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_rocm.cpp"
+        COMMENT "BLLM-99: compiling bolt_rocm.cpp via clang++ HIP directly (bypassing enable_language(HIP))"
+        VERBATIM)
+    add_custom_command(
+        OUTPUT "${_bolt_rocm_lib}"
+        COMMAND "${BOLT_LIB_EXE_EXECUTABLE}" /nologo "/OUT:${_bolt_rocm_lib}" "${_bolt_rocm_obj}"
+        DEPENDS "${_bolt_rocm_obj}"
+        COMMENT "BLLM-99: archiving bolt_rocm_hip.obj into bolt_rocm_hip.lib"
+        VERBATIM)
+    add_custom_target(bolt_rocm_hip_build DEPENDS "${_bolt_rocm_lib}")
+
+    add_library(bolt_rocm STATIC IMPORTED GLOBAL)
+    set_target_properties(bolt_rocm PROPERTIES IMPORTED_LOCATION "${_bolt_rocm_lib}")
+    add_dependencies(bolt_rocm bolt_rocm_hip_build)
     add_library(bolt::rocm ALIAS bolt_rocm)
-    target_link_libraries(bolt_rocm PUBLIC bolt::core)
-    target_include_directories(bolt_rocm PUBLIC
+
+    target_include_directories(bolt_rocm INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-    bolt_apply_hardening(bolt_rocm)
+    # amdhip64.lib -- the HIP runtime import library every bolt::rocm
+    # consumer needs (hipMalloc/hipMemcpy/kernel-launch symbols).
+    target_link_libraries(bolt_rocm INTERFACE "$ENV{HIP_PATH}/lib/amdhip64.lib")
     target_link_libraries(bolt INTERFACE bolt::rocm)
 endif()
 
@@ -681,9 +763,13 @@ endif()
 if(BOLT_BUILD_VULKAN)
     list(APPEND _bolt_install_targets bolt_vulkan)
 endif()
-if(BOLT_BUILD_ROCM)
-    list(APPEND _bolt_install_targets bolt_rocm)
-endif()
+## BLLM-99: bolt_rocm is an IMPORTED target (built via a direct clang++
+## invocation, not enable_language(HIP) -- see that block's own comment) --
+## install(TARGETS) does not support imported targets ("given target
+## bolt_rocm which does not exist"), so it is deliberately NOT added to
+## the install list. A consumer wanting to install bolt::rocm's own
+## artifact would need to install "${_bolt_rocm_lib}" as a FILE, not a
+## TARGET -- not needed for this repo's own build+test use, so not added.
 if(BOLT_BUILD_INGEST)
     list(APPEND _bolt_install_targets bolt_ingest)
 endif()
