@@ -174,6 +174,71 @@ if(BOLT_BUILD_PARSE)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::compute_idot — compiled static library: int8-ACTIVATION quantized
+# GEMV (BLLM-14). Unlike the rest of bolt::compute (compile-time SIMD tier,
+# header-only), this carries AVX2/AVX-512VNNI intrinsics + bolt's FIRST
+# runtime CPUID probe + a one-time-init function-pointer table -- exactly the
+# reasons bolt_compute.h's own banner gives for why IdotDispatch needs a .cpp
+# and it does not. So it lives in a compiled TU set, modeled on bolt::parse.
+#
+# PER-SOURCE ISA flags (not a whole-target tier): scalar + dispatch compile at
+# BASELINE so the runtime fallback + CPUID probe are SAFE on any CPU (a
+# whole-target /arch:AVX512 would let the compiler emit AVX-512 into the
+# "scalar" fallback and SIGILL on a non-AVX512 CPU -- a latent hazard in the
+# boltllm source this ports from, deliberately fixed here). Only idot_avx2.cpp
+# gets AVX2 and only idot_avx512vnni.cpp gets AVX512+VNNI. Note bolt's own
+# AVX512 SIMD tier OMITS -mavx512vnni/-mfma on GCC/Clang (BoltCompileOptions),
+# so the VNNI flags are spelled out explicitly per-source below.
+#
+# x86-ONLY target: the SIMD .cpp files are #if BOLT_ARCH_X86 (empty TUs on
+# ARM) and the AVX flags are only applied on x86, so macos-arm / any ARM
+# consumer builds a scalar-only path with no unsupported compiler flags.
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_COMPUTE_IDOT "Build bolt::compute_idot int8-activation GEMV kernels" ${BOLT_IS_TOPLEVEL})
+
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_library(bolt_compute_idot STATIC
+        src/compute/idot_scalar.cpp
+        src/compute/idot_avx2.cpp
+        src/compute/idot_avx512vnni.cpp
+        src/compute/idot_dispatch.cpp)
+    add_library(bolt::compute_idot ALIAS bolt_compute_idot)
+    target_link_libraries(bolt_compute_idot PUBLIC bolt::core)
+    target_include_directories(bolt_compute_idot PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_compute_idot)
+
+    # Derive an x86 flag from the target processor (bolt has no CMake arch
+    # var; bolt_port.h's BOLT_ARCH_X86 is a C++ macro, not visible to CMake).
+    # x86-64: "x86_64" (Linux/mac-intel), "AMD64" (Windows), "x86"/"i686"/
+    # "i386" (32-bit). Everything else (arm64/aarch64/...) is non-x86.
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _bolt_proc_lower)
+    if(_bolt_proc_lower MATCHES "^(x86_64|amd64|x86|i[3-6]86)$")
+        set(BOLT_ARCH_IS_X86 TRUE)
+    else()
+        set(BOLT_ARCH_IS_X86 FALSE)
+    endif()
+
+    # Per-source ISA flags, x86 only. scalar/dispatch stay at baseline.
+    if(BOLT_ARCH_IS_X86)
+        if(MSVC)
+            set_source_files_properties(src/compute/idot_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            set_source_files_properties(src/compute/idot_avx512vnni.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        else()
+            set_source_files_properties(src/compute/idot_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+            set_source_files_properties(src/compute/idot_avx512vnni.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512bw;-mavx512vnni")
+        endif()
+    endif()
+
+    target_link_libraries(bolt INTERFACE bolt::compute_idot)
+endif()
+
+# ---------------------------------------------------------------------------
 # bolt::vulkan — device/queue/memory scaffolding behind bolt::compute's
 # reserved Vulkan device slot (BLLM-46). Compiled (not header-only) for the
 # same reason as bolt::parse: Vulkan's C API + loader linkage doesn't suit
@@ -773,6 +838,9 @@ endif()
 if(BOLT_BUILD_INGEST)
     list(APPEND _bolt_install_targets bolt_ingest)
 endif()
+if(BOLT_BUILD_COMPUTE_IDOT)
+    list(APPEND _bolt_install_targets bolt_compute_idot)
+endif()
 install(TARGETS ${_bolt_install_targets}
     EXPORT bolt-targets
 )
@@ -800,7 +868,8 @@ message(STATUS "bolt: compiled targets -- "
                "parse=${BOLT_BUILD_PARSE} ingest=${BOLT_BUILD_INGEST} "
                "crypto=${BOLT_BUILD_CRYPTO} net=${BOLT_BUILD_NET} "
                "lakehouse=${BOLT_BUILD_LAKEHOUSE} "
-               "vulkan=${BOLT_BUILD_VULKAN} rocm=${BOLT_BUILD_ROCM}")
+               "vulkan=${BOLT_BUILD_VULKAN} rocm=${BOLT_BUILD_ROCM} "
+               "compute_idot=${BOLT_BUILD_COMPUTE_IDOT}")
 
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bolt-config.cmake.in

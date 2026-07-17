@@ -161,3 +161,20 @@ if(NOT MSVC)
 endif()
 bolt_apply_hardening(bench_decimal)
 bolt_apply_bench_tuning(bench_decimal)
+
+# -----------------------------------------------------------------------
+# BLLM-14: int8-activation IDOT GEMV perf tripwire. Times the dispatched
+# (CPUID-selected) kernel vs the scalar reference and asserts a GFLOPS-ratio
+# floor when a SIMD tier is present -- the only gate that catches a silent
+# SIMD->scalar regression (the equality tests can't). Registered as a ctest
+# so it runs on x86 CI lanes; no-op PASS on scalar-only hardware. Both kernels
+# come from the baseline/per-source-flagged bolt::compute_idot lib, so the
+# benchmark TU's own compile flags don't advantage either side.
+# -----------------------------------------------------------------------
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_executable(bench_compute_idot bench_compute_idot.cpp)
+    target_link_libraries(bench_compute_idot PRIVATE bolt::bolt bolt::compute_idot)
+    bolt_apply_hardening(bench_compute_idot)
+    bolt_apply_bench_tuning(bench_compute_idot)
+    add_test(NAME bench_compute_idot COMMAND bench_compute_idot)
+endif()

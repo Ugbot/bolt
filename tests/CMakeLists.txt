@@ -1220,3 +1220,17 @@ target_link_libraries(test_bolt_compute
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_compute)
 add_test(NAME test_bolt_compute COMMAND test_bolt_compute)
+
+# BLLM-14 — int8-activation IDOT GEMV kernels (bolt::compute_idot). Consolidates
+# boltllm's two IDOT test suites into one gtest TU: every available SIMD tier
+# (AVX2/AVX-512VNNI) bit-exact vs scalar, dispatch == selected tier, tolerance
+# vs a dequant-dot reference, determinism. Self-guards on BOLT_ARCH_X86 + the
+# runtime CPUID probes so it is green on x86 (fast tiers exercised) and ARM
+# (scalar-only). Only built when the lib is.
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_executable(test_bolt_idot test_bolt_idot.cpp)
+    target_link_libraries(test_bolt_idot
+        PRIVATE bolt::bolt bolt::compute_idot GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_idot)
+    add_test(NAME test_bolt_idot COMMAND test_bolt_idot)
+endif()
