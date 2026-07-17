@@ -514,11 +514,11 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
     if (codec == 1u) {
         const std::size_t cap = snappy_max_compressed_len(src_len);
         dst->resize(cap);
-        std::size_t out_len = 0;
+        std::uint64_t out_len = 0;
         if (!snappy_compress(src, src_len, dst->data(), cap, &out_len)) {
             return false;
         }
-        dst->resize(out_len);
+        dst->resize(static_cast<std::size_t>(out_len));
         return true;
     }
     return false;
