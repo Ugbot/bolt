@@ -124,6 +124,15 @@ struct SampleParams {
     float   temperature = 1.0f;  // must be > 0. 1.0 == no rescaling.
     int32_t top_k       = 0;     // 0 (or >= n) disables top-k filtering.
     float   top_p       = 1.0f;  // in (0, 1]. 1.0 disables nucleus filtering.
+    // BLLM-101: min_p (llama.cpp/HF's "min-p sampling" -- Minh et al. 2024).
+    // 0.0f disables it (the zero-regression default -- every existing
+    // caller that doesn't set this keeps today's exact top_k/top_p-only
+    // behavior). When > 0.0f, applied AFTER temperature/softmax but BEFORE
+    // top_p (see sample_topk_topp_temp_cpu's own comment for why this order
+    // was chosen): keeps only candidates whose post-softmax probability is
+    // >= min_p * (the single highest probability in the top_k-filtered
+    // set), always keeping at least the top candidate. Must be in [0, 1].
+    float   min_p       = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -474,6 +483,7 @@ inline int32_t sample_topk_topp_temp_cpu(const float* logits, int32_t n, const S
     assert(n > 0);
     assert(params.temperature > 0.0f);
     assert(params.top_p > 0.0f && params.top_p <= 1.0f);
+    assert(params.min_p >= 0.0f && params.min_p <= 1.0f);
     assert(uniform_draw >= 0.0f && uniform_draw < 1.0f);
 
     // 1) Rank all candidates descending; top-k keeps a prefix of this order
@@ -505,12 +515,33 @@ inline int32_t sample_topk_topp_temp_cpu(const float* logits, int32_t n, const S
         probs[static_cast<size_t>(i)] = static_cast<float>(static_cast<double>(probs[static_cast<size_t>(i)]) / sum);
     }
 
-    // 3) Nucleus (top-p) truncation: keep the smallest prefix (already
-    //    sorted descending) whose cumulative probability >= top_p.
-    int32_t nucleus_count = keep_k;
+    // 3) min_p filtering (BLLM-101): keep only candidates whose probability
+    //    is >= min_p * probs[0] (probs is already sorted descending, so
+    //    probs[0] is the top candidate's probability). Runs BEFORE top_p --
+    //    both are alternative/complementary tail-filters over the SAME
+    //    sorted probability list, and applying min_p first means top_p's
+    //    cumulative-mass threshold below is computed over the already-
+    //    min_p-trimmed set, matching how the two are meant to compose (a
+    //    min_p floor first, then a cumulative-mass cap on what's left).
+    //    min_p == 0.0f (the default) is a no-op: min_p_count stays keep_k,
+    //    so existing top_k/top_p-only callers are byte-for-byte unaffected.
+    int32_t min_p_count = keep_k;
+    if (params.min_p > 0.0f) {
+        const float threshold = params.min_p * probs[0];
+        min_p_count = 1;  // always keep at least the top candidate
+        for (int32_t i = 1; i < keep_k; ++i) {
+            if (probs[static_cast<size_t>(i)] < threshold) break;  // probs is sorted descending
+            min_p_count = i + 1;
+        }
+    }
+
+    // 4) Nucleus (top-p) truncation: keep the smallest prefix (already
+    //    sorted descending, now bounded by min_p_count) whose cumulative
+    //    probability >= top_p.
+    int32_t nucleus_count = min_p_count;
     if (params.top_p < 1.0f) {
         double cum = 0.0;
-        for (int32_t i = 0; i < keep_k; ++i) {
+        for (int32_t i = 0; i < min_p_count; ++i) {
             cum += static_cast<double>(probs[static_cast<size_t>(i)]);
             if (cum >= static_cast<double>(params.top_p)) {
                 nucleus_count = i + 1;
@@ -665,6 +696,114 @@ inline void swiglu_row(Device device, const float* gate, const float* up, float*
 inline int32_t sample_topk_topp_temp(Device device, const float* logits, int32_t n,
                                       const SampleParams& params, float uniform_draw) noexcept {
     return table_for(device).sample_topk_topp_temp(logits, n, params, uniform_draw);
+}
+
+// =============================================================================
+// Repetition penalties + logit_bias (BLLM-101) -- deliberately NOT part of
+// the per-Device dispatch table above: both are cheap O(recent_count) /
+// O(bias_count) preprocessing passes over raw logits (not O(n) over the
+// full vocab, and not compute-shape work a GPU kernel would meaningfully
+// accelerate), so they stay as plain host-side functions callers run on a
+// MUTABLE COPY of the model's raw logits BEFORE calling
+// sample_topk_topp_temp -- exactly matching llama.cpp's/HF `generate()`'s
+// own pipeline placement (penalties + bias apply to raw logits, before any
+// softmax/temperature/top_k/top_p/min_p filtering happens).
+// =============================================================================
+
+// Mutates `logits[0, n)` in place: for every token id in `recent_tokens[0,
+// recent_count)` (the most recent `recent_count` generated ids, oldest-
+// first or any order -- order doesn't matter, only membership/count does),
+// applies (in this order, matching llama.cpp's `llama_sampler_penalties`):
+//   1. repeat_penalty (>= 1.0; 1.0 disables): divides the logit by
+//      repeat_penalty if positive, multiplies if negative -- the standard
+//      CTRL/Keskar-style repetition penalty (HF's
+//      `RepetitionPenaltyLogitsProcessor`), applied AT MOST ONCE per
+//      distinct token id even if it appears multiple times in the recent
+//      window (matches HF's own "penalize each occurring token id once"
+//      semantics, not once-per-occurrence).
+//   2. presence_penalty (subtracted once per distinct recent token id,
+//      regardless of how many times it occurred).
+//   3. frequency_penalty (subtracted, scaled by how many times that token
+//      id actually occurred in the recent window -- unlike presence_penalty,
+//      this DOES scale with occurrence count).
+// `repeat_penalty <= 0` is invalid (asserted); 1.0f is the no-op value.
+// `presence_penalty`/`frequency_penalty` of 0.0f are no-ops. Token ids
+// outside [0, n) in `recent_tokens` are skipped (never an out-of-bounds
+// write), matching this codebase's "never UB on a malformed id" convention.
+inline void apply_repetition_penalties(float* logits, int32_t n, const int32_t* recent_tokens,
+                                        int32_t recent_count, float repeat_penalty,
+                                        float presence_penalty, float frequency_penalty) noexcept {
+    assert(logits != nullptr);
+    assert(n > 0);
+    assert(recent_count == 0 || recent_tokens != nullptr);
+    assert(repeat_penalty > 0.0f);
+
+    if (repeat_penalty == 1.0f && presence_penalty == 0.0f && frequency_penalty == 0.0f) return;
+
+    // Count occurrences per distinct id in the recent window -- a small
+    // fixed-capacity linear scan over `recent_tokens` per distinct id would
+    // be O(recent_count^2); instead do one O(n) pass building counts
+    // in a caller-sized scratch-free way: since `n` is the vocab size
+    // (tens to low hundreds of thousands) and `recent_count` is typically
+    // small (a few hundred at most, bounded by context length), a single
+    // O(recent_count) pass that mutates `logits` directly the FIRST time
+    // each id is seen, and a separate O(recent_count) occurrence-count
+    // pass for frequency_penalty, together stay well within budget without
+    // any std::unordered_map allocation.
+    for (int32_t i = 0; i < recent_count; ++i) {
+        const int32_t id = recent_tokens[i];
+        if (id < 0 || id >= n) continue;
+        // Only apply repeat/presence ONCE per distinct id: detect "already
+        // applied" by scanning [0, i) for this same id -- O(recent_count^2)
+        // worst case, acceptable given recent_count's realistic bound
+        // (a context window's length, not the vocab size).
+        bool already_applied = false;
+        for (int32_t j = 0; j < i; ++j) {
+            if (recent_tokens[j] == id) {
+                already_applied = true;
+                break;
+            }
+        }
+        if (already_applied) continue;
+
+        if (repeat_penalty != 1.0f) {
+            logits[id] = (logits[id] > 0.0f) ? (logits[id] / repeat_penalty)
+                                              : (logits[id] * repeat_penalty);
+        }
+        if (presence_penalty != 0.0f) logits[id] -= presence_penalty;
+    }
+
+    if (frequency_penalty != 0.0f) {
+        for (int32_t i = 0; i < recent_count; ++i) {
+            const int32_t id = recent_tokens[i];
+            if (id < 0 || id >= n) continue;
+            // Only charge frequency_penalty on the LAST occurrence's pass
+            // to avoid re-subtracting per occurrence in this loop too --
+            // instead, subtract 1x frequency_penalty per occurrence
+            // directly (this IS supposed to scale with count, unlike
+            // repeat/presence above).
+            logits[id] -= frequency_penalty;
+        }
+    }
+}
+
+// Mutates `logits[0, n)` in place: adds `bias_values[i]` to
+// `logits[bias_ids[i]]` for each i in [0, bias_count). Ids outside [0, n)
+// are skipped (never an out-of-bounds write). Duplicate ids in `bias_ids`
+// accumulate (matches OpenAI's own `logit_bias` semantics: last-write-wins
+// is NOT how the reference API behaves for repeated keys in a JSON object,
+// since JSON objects can't have duplicate keys in the first place -- a
+// caller-side concern, not this function's).
+inline void apply_logit_bias(float* logits, int32_t n, const int32_t* bias_ids,
+                              const float* bias_values, int32_t bias_count) noexcept {
+    assert(logits != nullptr);
+    assert(n > 0);
+    assert(bias_count == 0 || (bias_ids != nullptr && bias_values != nullptr));
+    for (int32_t i = 0; i < bias_count; ++i) {
+        const int32_t id = bias_ids[i];
+        if (id < 0 || id >= n) continue;
+        logits[id] += bias_values[i];
+    }
 }
 
 }  // namespace bolt::compute

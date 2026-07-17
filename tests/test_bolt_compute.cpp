@@ -405,6 +405,127 @@ TEST(BoltCompute, SampleTiesBrokenByLowestIndex) {
 }
 
 // ---------------------------------------------------------------------------
+// min_p (BLLM-101).
+// ---------------------------------------------------------------------------
+
+TEST(BoltCompute, SampleMinPDisabledByDefaultIsByteForByteUnaffected) {
+    // min_p == 0.0f (the default) must reproduce the EXACT same result as
+    // before this feature existed -- reusing SampleTopPNucleusExactBoundary's
+    // own fixture/expectations verbatim.
+    const float logits[3] = {std::log(0.5f), std::log(0.3f), std::log(0.2f)};
+    bolt::compute::SampleParams params;
+    params.top_p = 0.7f;
+    EXPECT_EQ(bolt::compute::sample_topk_topp_temp(Device::CPU, logits, 3, params, 0.0f), 0);
+    EXPECT_EQ(bolt::compute::sample_topk_topp_temp(Device::CPU, logits, 3, params, 0.7f), 1);
+}
+
+TEST(BoltCompute, SampleMinPExcludesLowProbabilityTail) {
+    // p = [0.5, 0.2, 0.2, 0.1] (already descending, exact via log(p) trick).
+    const float logits[4] = {std::log(0.5f), std::log(0.2f), std::log(0.2f), std::log(0.1f)};
+    bolt::compute::SampleParams params;
+    params.min_p = 0.5f;  // threshold = 0.5 * 0.5 = 0.25 -- 0.2 < 0.25, only index 0 clears it.
+    // With only index 0 surviving min_p, the nucleus is a single candidate:
+    // every draw must return index 0.
+    for (float u : {0.0f, 0.5f, 0.999f}) {
+        EXPECT_EQ(bolt::compute::sample_topk_topp_temp(Device::CPU, logits, 4, params, u), 0);
+    }
+}
+
+TEST(BoltCompute, SampleMinPAlwaysKeepsAtLeastTopCandidate) {
+    // An extreme min_p (1.0) would threshold out everything except a
+    // perfect tie with the max -- must still keep at least index 0.
+    const float logits[3] = {std::log(0.5f), std::log(0.3f), std::log(0.2f)};
+    bolt::compute::SampleParams params;
+    params.min_p = 1.0f;
+    EXPECT_EQ(bolt::compute::sample_topk_topp_temp(Device::CPU, logits, 3, params, 0.999f), 0);
+}
+
+TEST(BoltCompute, SampleMinPComposesWithTopP) {
+    // p = [0.4, 0.35, 0.15, 0.10]. min_p=0.3 -> threshold 0.12 -> survivors
+    // {0,1,2} (0.15 >= 0.12, 0.10 < 0.12 excluded). top_p=0.7 over the
+    // RENORMALIZED-view cumulative (still using the original probs, matching
+    // the implementation's own cumulative-over-unnormalized-within-set
+    // logic): cumulative 0.4, 0.75 (>=0.7) -> nucleus {0,1} only, excluding
+    // index 2 even though min_p alone would have kept it.
+    const float logits[4] = {std::log(0.4f), std::log(0.35f), std::log(0.15f), std::log(0.10f)};
+    bolt::compute::SampleParams params;
+    params.min_p = 0.3f;
+    params.top_p = 0.7f;
+    for (float u : {0.0f, 0.99f}) {
+        const int32_t idx = bolt::compute::sample_topk_topp_temp(Device::CPU, logits, 4, params, u);
+        EXPECT_TRUE(idx == 0 || idx == 1) << "idx=" << idx;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_repetition_penalties / apply_logit_bias (BLLM-101).
+// ---------------------------------------------------------------------------
+
+TEST(BoltCompute, RepetitionPenaltyDividesPositiveLogitOncePerDistinctId) {
+    float logits[3] = {4.0f, -4.0f, 1.0f};
+    const int32_t recent[3] = {0, 0, 1};  // id 0 appears twice -- must apply only once.
+    bolt::compute::apply_repetition_penalties(logits, 3, recent, 3, /*repeat_penalty=*/2.0f,
+                                                /*presence_penalty=*/0.0f, /*frequency_penalty=*/0.0f);
+    EXPECT_FLOAT_EQ(logits[0], 2.0f);   // 4.0 / 2.0 (once, not twice -> would be 1.0)
+    EXPECT_FLOAT_EQ(logits[1], -8.0f);  // negative logit: multiplied, not divided
+    EXPECT_FLOAT_EQ(logits[2], 1.0f);   // untouched (not in recent)
+}
+
+TEST(BoltCompute, PresencePenaltyAppliesOncePerDistinctId) {
+    float logits[2] = {5.0f, 5.0f};
+    const int32_t recent[3] = {0, 0, 0};  // id 0 occurs 3x -- presence is still ONE subtraction.
+    bolt::compute::apply_repetition_penalties(logits, 2, recent, 3, /*repeat_penalty=*/1.0f,
+                                                /*presence_penalty=*/1.5f, /*frequency_penalty=*/0.0f);
+    EXPECT_FLOAT_EQ(logits[0], 3.5f);  // 5.0 - 1.5, not 5.0 - 4.5
+    EXPECT_FLOAT_EQ(logits[1], 5.0f);
+}
+
+TEST(BoltCompute, FrequencyPenaltyScalesWithOccurrenceCount) {
+    float logits[2] = {10.0f, 10.0f};
+    const int32_t recent[3] = {0, 0, 1};  // id 0 occurs twice, id 1 once.
+    bolt::compute::apply_repetition_penalties(logits, 2, recent, 3, /*repeat_penalty=*/1.0f,
+                                                /*presence_penalty=*/0.0f, /*frequency_penalty=*/1.0f);
+    EXPECT_FLOAT_EQ(logits[0], 8.0f);  // 10.0 - 2*1.0
+    EXPECT_FLOAT_EQ(logits[1], 9.0f);  // 10.0 - 1*1.0
+}
+
+TEST(BoltCompute, RepetitionPenaltiesAllDisabledIsNoOp) {
+    float logits[2] = {3.0f, -3.0f};
+    const int32_t recent[2] = {0, 1};
+    bolt::compute::apply_repetition_penalties(logits, 2, recent, 2, 1.0f, 0.0f, 0.0f);
+    EXPECT_FLOAT_EQ(logits[0], 3.0f);
+    EXPECT_FLOAT_EQ(logits[1], -3.0f);
+}
+
+TEST(BoltCompute, RepetitionPenaltiesSkipOutOfRangeIds) {
+    float logits[2] = {3.0f, 3.0f};
+    const int32_t recent[2] = {5, -1};  // both out of [0, 2) -- must not crash or write OOB.
+    bolt::compute::apply_repetition_penalties(logits, 2, recent, 2, 2.0f, 1.0f, 1.0f);
+    EXPECT_FLOAT_EQ(logits[0], 3.0f);
+    EXPECT_FLOAT_EQ(logits[1], 3.0f);
+}
+
+TEST(BoltCompute, LogitBiasAddsToTargetIdsOnly) {
+    float logits[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const int32_t ids[2] = {1, 3};
+    const float vals[2] = {5.0f, -100.0f};
+    bolt::compute::apply_logit_bias(logits, 4, ids, vals, 2);
+    EXPECT_FLOAT_EQ(logits[0], 1.0f);
+    EXPECT_FLOAT_EQ(logits[1], 6.0f);
+    EXPECT_FLOAT_EQ(logits[2], 1.0f);
+    EXPECT_FLOAT_EQ(logits[3], -99.0f);
+}
+
+TEST(BoltCompute, LogitBiasSkipsOutOfRangeIds) {
+    float logits[2] = {1.0f, 1.0f};
+    const int32_t ids[2] = {2, -1};
+    const float vals[2] = {100.0f, 100.0f};
+    bolt::compute::apply_logit_bias(logits, 2, ids, vals, 2);
+    EXPECT_FLOAT_EQ(logits[0], 1.0f);
+    EXPECT_FLOAT_EQ(logits[1], 1.0f);
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch table structure — CPU resolves to a real implementation;
 // Vulkan/CUDA resolve to populated (non-null), hard-failing stubs.
 // ---------------------------------------------------------------------------
