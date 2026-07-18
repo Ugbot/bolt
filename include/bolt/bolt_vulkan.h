@@ -204,6 +204,12 @@ public:
     bool elementwise(const MatmulPipeline& pipeline, const BufferHandle& a, const BufferHandle& b,
                      const BufferHandle& out, int32_t n, int32_t op) noexcept;
 
+    // ---- BLLM-177: on-device RoPE (rotate_half, matches rope_half_split).
+    // Rotates a [num_heads, head_dim] buffer in place. Blocks until complete. ----
+    bool create_rope_pipeline(MatmulPipeline* out) noexcept;
+    bool rope(const MatmulPipeline& pipeline, const BufferHandle& x, int32_t head_dim,
+              int32_t num_heads, int32_t position, float theta) noexcept;
+
     // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
     // tier, distinct from matmul_dequant's float-activation tier above) ---
 

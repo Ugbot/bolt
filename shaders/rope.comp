@@ -1,0 +1,39 @@
+#version 450
+// BLLM-177: on-device RoPE, rotate_half / non-interleaved convention -- matches
+// OlmoeAttention.h::rope_half_split exactly. Applies to a [num_heads, head_dim]
+// buffer in place; one invocation per (head, j) pair rotates (x[j], x[j+half]).
+//   inv_freq = theta^(-2j/head_dim); angle = position*inv_freq;
+//   x[j]      = a*cos - b*sin;  x[j+half] = b*cos + a*sin  (a=x[j], b=x[j+half])
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer XBuf { float x[]; };  // read-modify-write
+
+layout(push_constant) uniform PushConstants {
+    int head_dim;
+    int num_heads;
+    int position;
+    float theta;
+} pc;
+
+void main() {
+    uint hd2 = uint(pc.head_dim) / 2u;
+    uint total = uint(pc.num_heads) * hd2;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    uint head = idx / hd2;
+    uint j = idx % hd2;
+    uint base = head * uint(pc.head_dim);
+
+    float exponent = -2.0 * float(j) / float(pc.head_dim);
+    float inv_freq = pow(pc.theta, exponent);
+    float angle = float(pc.position) * inv_freq;
+    float cs = cos(angle);
+    float sn = sin(angle);
+
+    float a = x[base + j];
+    float b = x[base + j + hd2];
+    x[base + j] = a * cs - b * sn;
+    x[base + j + hd2] = b * cs + a * sn;
+}

@@ -322,6 +322,51 @@ TEST(BoltVulkan, ElementwiseMatchesCpuReference) {
     ctx.destroy_matmul_pipeline(&pipeline);
 }
 
+// BLLM-177: on-device RoPE matches the CPU rope_half_split reference per head.
+TEST(BoltVulkan, RopeMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_rope_pipeline(&pipeline));
+
+    const int head_dim = 64, num_heads = 4, position = 7;
+    const float theta = 10000.0f;
+    const int n = head_dim * num_heads;
+    std::vector<float> x(static_cast<size_t>(n)), ref(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.2f;
+        ref[static_cast<size_t>(i)] = x[static_cast<size_t>(i)];
+    }
+    // CPU rope_half_split per head.
+    const int half = head_dim / 2;
+    for (int h = 0; h < num_heads; ++h) {
+        float* v = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int j = 0; j < half; ++j) {
+            const float inv = std::pow(theta, -2.0f * static_cast<float>(j) / head_dim);
+            const float ang = static_cast<float>(position) * inv;
+            const float cs = std::cos(ang), sn = std::sin(ang);
+            const float a = v[j], b = v[j + half];
+            v[j] = a * cs - b * sn;
+            v[j + half] = b * cs + a * sn;
+        }
+    }
+
+    BufferHandle xb = make_and_fill(ctx, x.data(), x.size() * sizeof(float));
+    ASSERT_TRUE(ctx.rope(pipeline, xb, head_dim, num_heads, position, theta));
+
+    float* g = static_cast<float*>(ctx.map_buffer(xb));
+    ASSERT_NE(g, nullptr);
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(g[i], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.unmap_buffer(xb);
+    ctx.free_buffer(&xb);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
 TEST(BoltVulkan, MatmulDequantInt8MatchesScaledDotProduct) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";

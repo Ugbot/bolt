@@ -25,6 +25,7 @@
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int8_batched.h"
 #include "bolt/vulkan_shaders/rmsnorm.h"  // BLLM-176 on-device RMSNorm
 #include "bolt/vulkan_shaders/elementwise.h"  // BLLM-179 add/SwiGLU/GeGLU
+#include "bolt/vulkan_shaders/rope.h"  // BLLM-177 rotate_half RoPE
 
 namespace bolt::vulkan {
 
@@ -756,6 +757,65 @@ bool Context::elementwise(const MatmulPipeline& pipeline, const BufferHandle& a,
     vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (static_cast<uint32_t>(n) + 255u) / 256u, 1, 1);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    VkQueue queue = static_cast<VkQueue>(queue_);
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+    return vkQueueWaitIdle(queue) == VK_SUCCESS;
+}
+
+bool Context::create_rope_pipeline(MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+    // BLLM-177: 1 binding (in-place x) + 16-byte push {int head_dim; int num_heads;
+    // int position; float theta}.
+    return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_,
+                                   shaders::krope_spv, shaders::krope_spv_size,
+                                   /*binding_count=*/1, /*push_constant_size=*/16, WeightDType::F32,
+                                   out);
+}
+
+bool Context::rope(const MatmulPipeline& pipeline, const BufferHandle& x, int32_t head_dim,
+                   int32_t num_heads, int32_t position, float theta) noexcept {
+    if (device_ == nullptr || !pipeline.is_valid()) return false;
+    if (x.buffer == nullptr || head_dim <= 0 || num_heads <= 0) return false;
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    VkDescriptorBufferInfo info = {static_cast<VkBuffer>(x.buffer), 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(pipeline.command_buffer);
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      static_cast<VkPipeline>(pipeline.pipeline));
+    VkDescriptorSet set = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            static_cast<VkPipelineLayout>(pipeline.pipeline_layout), 0, 1, &set, 0,
+                            nullptr);
+    struct {
+        int32_t head_dim;
+        int32_t num_heads;
+        int32_t position;
+        float theta;
+    } pc{head_dim, num_heads, position, theta};
+    vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    const uint32_t total = static_cast<uint32_t>(num_heads) * (static_cast<uint32_t>(head_dim) / 2u);
+    vkCmdDispatch(cmd, (total + 255u) / 256u, 1, 1);
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
