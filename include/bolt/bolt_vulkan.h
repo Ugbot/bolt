@@ -210,6 +210,18 @@ public:
     bool rope(const MatmulPipeline& pipeline, const BufferHandle& x, int32_t head_dim,
               int32_t num_heads, int32_t position, float theta) noexcept;
 
+    // ---- BLLM-178: on-device decode-step causal attention with flash-style
+    // online softmax (the Vulkan twin of bolt::rocm::attention). `q` is
+    // [num_heads, head_dim]; `k_cache`/`v_cache` are [seq_len, num_kv_heads,
+    // head_dim]; `out` is [num_heads, head_dim]. GQA: query head h reads kv
+    // head h/(num_heads/num_kv_heads). One workgroup per query head; requires
+    // head_dim <= 256. Blocks until complete. ----
+    bool create_attention_pipeline(MatmulPipeline* out) noexcept;
+    bool attention(const MatmulPipeline& pipeline, const BufferHandle& q,
+                   const BufferHandle& k_cache, const BufferHandle& v_cache,
+                   const BufferHandle& out, int32_t num_heads, int32_t num_kv_heads,
+                   int32_t head_dim, int32_t seq_len, float scale) noexcept;
+
     // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
     // tier, distinct from matmul_dequant's float-activation tier above) ---
 

@@ -374,7 +374,8 @@ if(BOLT_BUILD_VULKAN)
                                        matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched
                                        rmsnorm       # BLLM-176 on-device RMSNorm
                                        elementwise   # BLLM-179 add/SwiGLU/GeGLU
-                                       rope)         # BLLM-177 rotate_half RoPE
+                                       rope          # BLLM-177 rotate_half RoPE
+                                       attention)    # BLLM-178 flash-style decode attention
         set(_bolt_vulkan_shader_headers "")
         foreach(_shader_name ${_bolt_vulkan_shader_names})
             set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")
