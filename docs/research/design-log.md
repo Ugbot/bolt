@@ -2369,3 +2369,24 @@ REAL qwen2.5-0.5b-q8_0: Int8 116.9 -> 123.6 t/s, coherent -> PASSES llama.cpp's 
 
 Now the sinks are lm_head (1.87 ms, one huge GEMV) + fused_swiglu (1.14). FTZ +
 attention together took the real model from 115 to 123.6 t/s.
+
+## 2026-07-19 / warp-per-row GEMV -- llama.cpp mul_mat_vec shape (BLLM-190)
+
+Fair GPU-vs-GPU: llama.cpp Vulkan on the 8060S hits 304 t/s on qwen2.5-0.5b-q8_0
+(our 123.6 only beat their CPU 116). The gap was our naive GEMV: one block/row
+with an 8-round shared-mem block reduction for ~3.5 bytes/thread of work
+(lm_head ran at 73 GB/s). Rewrote matmul_dequant f32/int8/int4 (+residual) and
+fused_swiglu to ONE WAVEFRONT PER ROW with a shuffle reduction (warp_reduce_sum,
+__shfl_down, width-agnostic via warpSize) -- no shared mem, no __syncthreads,
+blockDim/warpSize rows per block for high occupancy. Coherence tests green (16/16).
+
+lm_head: 1867 -> 1024 us (73 -> 133 GB/s). fused_swiglu 47->21. SUM 4.60->3.08 ms.
+Synthetic 0.5B: Int8 156 -> 206, Int4 165 -> 247.
+REAL qwen2.5-0.5b-q8_0 Int8: 123.6 -> 163 t/s, coherent (52 CPU this morning -> 163).
+=> 54% of llama.cpp's GPU 304, closing.
+
+Note: warp-per-row favors TALL matrices (lm_head 151936 rows). WIDE ones (8B FFN
+down/gate, 14336 cols) regress slightly (fewer lanes per long row) -- 8B Int8
+16.5 -> 13.7. An adaptive multi-warp-per-row for wide cols is the follow-up.
+Next levers to chase 304: vectorized loads (int8x4/float4), Int4 lm_head, faster
+attention occupancy (split-K).
