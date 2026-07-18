@@ -2093,3 +2093,95 @@ of P private copies, banks disabled (banks pay off for one big table, not P
 small ones); ingest across sharing states must be serial (documented
 contract). The historical `_begin` forwards with `shared = nullptr` and is
 behaviour-identical.
+
+## 2026-07-18 / perf-pass — f32/f16 float-activation SIMD GEMV (compute_gemv.h)
+
+LLM decode is memory-bandwidth-bound: every weight is read once per token.
+The dense-family hot path (attention Q/K/V/O, dense FFN, lm_head) was a plain
+scalar f32 dot (`bolt::compute::matmul`'s F32 tier + the consumer's
+`linear_forward`), measured at a flat ~5 GF/s (~10 GB/s) — it cannot even
+saturate DRAM. An AVX-512 FMA GEMV hits the CPU's real memory wall (~19-25
+GF/s, ~40-50 GB/s), a measured ~4x on real model shapes (67 MB attn / 235 MB
+FFN) and ~12x L2-resident.
+
+Decision: add an f32/f16 float-activation SIMD GEMV as a NEW default tier,
+living in bolt (the shared substrate) as `bolt::compute::matmul_f32` /
+`matmul_f16` (compute_gemv.h), NOT in the consumer. It rides in the existing
+per-source-ISA `bolt::compute_idot` library and reuses that module's exact
+shape: intrinsic kernels in dedicated TUs compiled at `/arch:AVX2` (+F16C) and
+`/arch:AVX512`, a baseline-ISA CPUID probe, and a C++11 magic-static
+function-pointer table resolved ONCE (AVX-512F > AVX2+FMA+F16C > scalar), hot
+path = one indirect call. This is the same justified exception to bolt's
+"no runtime dispatch" rule that idot_dispatch.cpp documents (probe amortized
+over a heavy GEMV, not paid per element).
+
+Algorithm (ggml's ggml_vec_dot_f32 as the reference, written bolt-native — no
+vendored source, so bolt stays zero-dependency): 4 independent f32 accumulators
+over a STEP-unrolled body (32-wide AVX2 / 64-wide AVX-512) to hide FMA latency,
+tree-reduce, then a final f64 horizontal sum + f64 scalar tail. f16 weights
+upcast on the fly (_mm256_cvtph_ps / _mm512_cvtph_ps) so the GEMV reads 2 bytes
+per weight instead of 4.
+
+Why the default wins / what flips it: SIMD reorders the f32 reduction, so
+matmul_f32 is NOT bit-exact vs the scalar f64 reference (unlike the integer
+IDOT kernels) — it agrees to ~1e-6 relative, inside every consumer oracle's
+1e-3 tolerance and preserving greedy token-exactness. The scalar tier stays
+reachable (and is what non-AVX2 hardware runs + what test_bolt_gemv compares
+against). Gate: bench_compute_gemv asserts a 2.5x GFLOPS floor over scalar on
+model shapes when a SIMD tier is present, catching a silent /arch-flag or
+CPUID-probe regression to scalar (which the equality test cannot). The choice
+flips only if a consumer needs bit-exact reproducibility across ISA tiers — it
+would then pin the scalar tier.
+
+## 2026-07-18 / perf-pass 2 — threaded + quantized dense decode: near llama.cpp parity
+
+Follow-up to the f32/f16 SIMD GEMV entry. Established the llama.cpp baseline on
+the target box (Ryzen AI Max+ 395, 16 cores, ~256 GB/s UMA) with a real model
+(Qwen2.5-0.5B-Q8_0): llama.cpp tg128 = 116 t/s; boltllm f32-resident = 27 t/s
+(23%). Decode is memory-bandwidth-bound and the gap mapped almost exactly to
+bytes/weight (f32 4B vs Q8_0 ~1B).
+
+Closed the gap on the CPU with three stacked, measured levers, all preserving
+coherence:
+1. Threaded per-layer GEMV: fan attention/FFN GEMVs across the shared pool by
+   output-row blocks (one core hits ~46 GB/s of the ~256 aggregate). Measured
+   2.0-2.6x over single-core SIMD. Zero numeric change (row-block independent).
+2. Quantized-resident dense weights (opt-in BOLTLLM_DENSE_QUANT=int8|int4):
+   requantize at load, route attention/lm_head through a threaded int8-activation
+   IDOT and the dense FFN through the existing ExpertFfn IDOT dispatch. Int8: 60
+   t/s coherent (52% of llama.cpp); Int4: 90 t/s (77%) but per-row-scale int4 is
+   too coarse for a 0.5B model (degraded output -> Q4_K block-quant is the fix).
+   f32 forward-oracles stay green (opt-in). Int8 is the fast-and-coherent default.
+3. Branch-free online-softmax attention (flash-attention-style): one streaming
+   pass over KV per head (running max + f64 denom + rescaled context), no scores
+   buffer, no separate softmax pass. Token-exact (oracle green).
+
+GPU verdict (measured, not assumed): lm_head on the iGPU (26 t/s) LOSES to the
+threaded CPU (27) on UMA -- shared memory + per-dispatch overhead. With the CPU
+now at 60-90 t/s, GPU offload is not viable on this box (same reasoning that
+cancelled the per-token expert-cache). HFT tail: p99/p50 = 1.12x (f32) / 1.18x
+(int8) -- the tight tail corroborates zero-hot-path allocation.
+
+Net: boltllm 23% -> 52% of llama.cpp at full coherence (Int8), decode tail
+HFT-tight, all wins behind perf tripwires. Remaining for full parity: Q4_K
+block-quant (quality-preserving 4-bit) + rolling the quantized path to the other
+dense families (Qwen2 is the proven reference).
+
+## 2026-07-18 / perf-pass 2b — block-scale Q4 (quality-preserving 4-bit) + alignment discipline
+
+Per-row Int4 (perf-pass 2) hit near-parity SPEED (90 t/s) but degraded coherence
+on small models -- one scale per row is too coarse. Added block-scale Q4
+(BOLTLLM_DENSE_QUANT=q4b): 32-element blocks each with its own f32 scale (the
+Q4_0 essence), boltllm/quant/BlockQ4.h -- format + quantizer + threaded
+dequant-in-dot GEMV, wired into Qwen2 attention/lm_head + a manual block-Q4
+SwiGLU FFN. Result: coherent 4-bit restored ("...capital of France is Paris...")
+at ~0.625 B/weight, f32 oracles green (opt-in). The GEMV is scalar for now
+(compute-bound ~23 t/s) -- a SIMD block-dequant kernel (BLLM-173) turns the
+bandwidth into speed.
+
+Standing perf discipline for all kernels (user directive): maintain page +
+stride alignment and every perf trick. 64-byte-aligned buffers (bolt_aligned_alloc,
+not std::vector's 16), row byte-strides padded to a 64-byte multiple (no
+split-line SIMD loads, no page bisecting a hot vector), aligned loads once
+guaranteed, 4-accumulator STEP-unroll, BOLT_RESTRICT, prefetch, branch-free,
+zero hot-path alloc, elevated-/arch TU. Required from the start on BLLM-173.

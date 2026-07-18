@@ -189,6 +189,14 @@ public:
                         const BufferHandle& scale, const BufferHandle& activation,
                         const BufferHandle& out, int32_t out_rows, int32_t cols) noexcept;
 
+    // ---- BLLM-176: on-device RMSNorm (first non-GEMV op of the resident-graph
+    // forward, BLLM-159). out[i] = x[i]/sqrt(mean(x^2)+eps)*weight[i]. All args
+    // are Vulkan-resident BufferHandles; one workgroup normalizes the whole
+    // n-wide vector. Blocks until complete (vkQueueWaitIdle). ----
+    bool create_rmsnorm_pipeline(MatmulPipeline* out) noexcept;
+    bool rmsnorm(const MatmulPipeline& pipeline, const BufferHandle& x, const BufferHandle& weight,
+                 const BufferHandle& out, int32_t n, float eps) noexcept;
+
     // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
     // tier, distinct from matmul_dequant's float-activation tier above) ---
 

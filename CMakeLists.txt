@@ -251,7 +251,15 @@ if(BOLT_BUILD_COMPUTE_IDOT)
         src/compute/idot_scalar.cpp
         src/compute/idot_avx2.cpp
         src/compute/idot_avx512vnni.cpp
-        src/compute/idot_dispatch.cpp)
+        src/compute/idot_dispatch.cpp
+        # f32/f16 float-activation SIMD GEMV (perf pass) -- same per-source-ISA
+        # + runtime-CPUID-dispatch pattern as the IDOT kernels above, so it
+        # rides in this same compiled library (compute_gemv.h is the public
+        # surface).
+        src/compute/gemv_scalar.cpp
+        src/compute/gemv_avx2.cpp
+        src/compute/gemv_avx512.cpp
+        src/compute/gemv_dispatch.cpp)
     add_library(bolt::compute_idot ALIAS bolt_compute_idot)
     target_link_libraries(bolt_compute_idot PUBLIC bolt::core)
     target_include_directories(bolt_compute_idot PUBLIC
@@ -277,11 +285,22 @@ if(BOLT_BUILD_COMPUTE_IDOT)
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+            # MSVC /arch:AVX2 enables AVX2+FMA+F16C intrinsics together;
+            # /arch:AVX512 additionally enables the 512-bit + cvtph path.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
         else()
             set_source_files_properties(src/compute/idot_avx2.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512bw;-mavx512vnni")
+            # -mf16c for the _mm256_cvtph_ps / _cvtsh_ss f16 upcasts.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mavx512f")
         endif()
     endif()
 
@@ -352,7 +371,8 @@ if(BOLT_BUILD_VULKAN)
         file(MAKE_DIRECTORY "${_bolt_vulkan_shader_gen_dir}")
         set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2
                                        matmul_dequant_int8act_int8 matmul_dequant_int8act_int4
-                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched)
+                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched
+                                       rmsnorm)  # BLLM-176 on-device RMSNorm
         set(_bolt_vulkan_shader_headers "")
         foreach(_shader_name ${_bolt_vulkan_shader_names})
             set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")

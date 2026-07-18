@@ -1234,3 +1234,16 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_hardening(test_bolt_idot)
     add_test(NAME test_bolt_idot COMMAND test_bolt_idot)
 endif()
+
+# perf pass — f32/f16 float-activation SIMD GEMV (rides in bolt::compute_idot).
+# Every available SIMD tier (AVX2/AVX-512F) agrees with the scalar f64
+# reference to a derived tolerance (NOT bit-exact, the f32 reduction is
+# reassociated), dispatch == selected tier, f16 vs dequant-dot, determinism.
+# Self-guards on BOLT_ARCH_X86 + runtime CPUID probes (green on x86 + ARM).
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_executable(test_bolt_gemv test_bolt_gemv.cpp)
+    target_link_libraries(test_bolt_gemv
+        PRIVATE bolt::bolt bolt::compute_idot GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_gemv)
+    add_test(NAME test_bolt_gemv COMMAND test_bolt_gemv)
+endif()

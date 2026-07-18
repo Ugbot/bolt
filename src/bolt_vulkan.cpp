@@ -23,6 +23,7 @@
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int4_batched.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int8.h"
 #include "bolt/vulkan_shaders/matmul_dequant_int8act_int8_batched.h"
+#include "bolt/vulkan_shaders/rmsnorm.h"  // BLLM-176 on-device RMSNorm
 
 namespace bolt::vulkan {
 
@@ -636,6 +637,70 @@ bool Context::create_int8_activation_batched_pipeline(WeightDType dtype,
     return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_, spirv_words,
                                    spirv_size, /*binding_count=*/5, /*push_constant_size=*/8, dtype,
                                    out);
+}
+
+bool Context::create_rmsnorm_pipeline(MatmulPipeline* out) noexcept {
+    *out = MatmulPipeline{};
+    if (device_ == nullptr) return false;
+    // BLLM-176: 3 bindings (x, weight, out) + 8-byte push constant {int n; float eps;}.
+    return create_pipeline_common(static_cast<VkDevice>(device_), queue_family_index_,
+                                   shaders::krmsnorm_spv, shaders::krmsnorm_spv_size,
+                                   /*binding_count=*/3, /*push_constant_size=*/8, WeightDType::F32,
+                                   out);
+}
+
+bool Context::rmsnorm(const MatmulPipeline& pipeline, const BufferHandle& x,
+                      const BufferHandle& weight, const BufferHandle& out, int32_t n,
+                      float eps) noexcept {
+    if (device_ == nullptr || !pipeline.is_valid()) return false;
+    if (x.buffer == nullptr || weight.buffer == nullptr || out.buffer == nullptr || n <= 0) {
+        return false;
+    }
+    VkDevice device = static_cast<VkDevice>(device_);
+
+    VkDescriptorBufferInfo buffer_infos[3] = {
+        {static_cast<VkBuffer>(x.buffer), 0, VK_WHOLE_SIZE},
+        {static_cast<VkBuffer>(weight.buffer), 0, VK_WHOLE_SIZE},
+        {static_cast<VkBuffer>(out.buffer), 0, VK_WHOLE_SIZE},
+    };
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+
+    VkCommandBuffer cmd = static_cast<VkCommandBuffer>(pipeline.command_buffer);
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      static_cast<VkPipeline>(pipeline.pipeline));
+    VkDescriptorSet set = static_cast<VkDescriptorSet>(pipeline.descriptor_set);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            static_cast<VkPipelineLayout>(pipeline.pipeline_layout), 0, 1, &set, 0,
+                            nullptr);
+    struct {
+        int32_t n;
+        float eps;
+    } pc{n, eps};
+    vkCmdPushConstants(cmd, static_cast<VkPipelineLayout>(pipeline.pipeline_layout),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, 1, 1, 1);  // one workgroup normalizes the whole vector
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return false;
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd;
+    VkQueue queue = static_cast<VkQueue>(queue_);
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+    return vkQueueWaitIdle(queue) == VK_SUCCESS;
 }
 
 void Context::destroy_matmul_pipeline(MatmulPipeline* pipeline) noexcept {

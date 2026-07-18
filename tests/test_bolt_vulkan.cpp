@@ -227,6 +227,53 @@ TEST(BoltVulkan, MatmulDequantF32MatchesHandComputedDotProduct) {
     ctx.destroy_matmul_pipeline(&pipeline);
 }
 
+// BLLM-176: on-device RMSNorm matches the CPU reference (f64-accumulated
+// sum-of-squares -> inv-rms -> scale). n=300 spans multiple subgroups, so the
+// shader's cross-subgroup reduction combine is exercised.
+TEST(BoltVulkan, RmsnormMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_rmsnorm_pipeline(&pipeline));
+
+    const int n = 300;
+    std::vector<float> x(static_cast<size_t>(n)), w(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.5f;
+        w[static_cast<size_t>(i)] = 1.0f + static_cast<float>(i % 3) * 0.25f;
+    }
+    const float eps = 1e-5f;
+
+    BufferHandle xb = make_and_fill(ctx, x.data(), x.size() * sizeof(float));
+    BufferHandle wb = make_and_fill(ctx, w.data(), w.size() * sizeof(float));
+    BufferHandle yb;
+    ASSERT_TRUE(ctx.allocate_buffer(x.size() * sizeof(float), true, &yb));
+    ASSERT_NE(xb.buffer, nullptr);
+    ASSERT_NE(wb.buffer, nullptr);
+
+    ASSERT_TRUE(ctx.rmsnorm(pipeline, xb, wb, yb, n, eps));
+
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) ss += static_cast<double>(x[static_cast<size_t>(i)]) *
+                                       static_cast<double>(x[static_cast<size_t>(i)]);
+    const float inv = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+
+    float* y = static_cast<float*>(ctx.map_buffer(yb));
+    ASSERT_NE(y, nullptr);
+    for (int i = 0; i < n; ++i) {
+        const float want = x[static_cast<size_t>(i)] * inv * w[static_cast<size_t>(i)];
+        EXPECT_NEAR(y[i], want, 1e-4f) << "i=" << i;
+    }
+    ctx.unmap_buffer(yb);
+    ctx.free_buffer(&xb);
+    ctx.free_buffer(&wb);
+    ctx.free_buffer(&yb);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
 TEST(BoltVulkan, MatmulDequantInt8MatchesScaledDotProduct) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";
