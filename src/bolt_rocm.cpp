@@ -81,7 +81,26 @@ __global__ void matmul_dequant_int8_kernel(const int8_t* weight, const float* sc
     const int32_t lane = threadIdx.x % warpSize;
     const int8_t* row_ptr = weight + static_cast<int64_t>(row) * cols;
     float acc = 0.0f;
-    for (int32_t i = lane; i < cols; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
+    // BLLM-190: vectorized fast path -- each lane loads 4 int8 weights as one
+    // uint32 and 4 activations as one float4, 4 MACs/iter (4x fewer loads, more
+    // ILP -> closer to the bandwidth wall). Requires cols % 4 == 0 so every row
+    // starts 4-byte aligned; the scalar warp loop handles any remainder / odd cols.
+    const int32_t cols4 = cols & ~3;
+    if ((cols & 3) == 0) {
+        const uint32_t* w4 = reinterpret_cast<const uint32_t*>(row_ptr);
+        const float4* x4 = reinterpret_cast<const float4*>(activation);
+        for (int32_t j = lane; j < cols4 / 4; j += warpSize) {
+            const uint32_t w = w4[j];
+            const float4 x = x4[j];
+            acc += x.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
+                   x.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
+                   x.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
+                   x.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
+        }
+    } else {
+        for (int32_t i = lane; i < cols4; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
+        for (int32_t i = cols4 + lane; i < cols; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
+    }
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
         const float v = acc * scale[row];

@@ -2390,3 +2390,19 @@ down/gate, 14336 cols) regress slightly (fewer lanes per long row) -- 8B Int8
 16.5 -> 13.7. An adaptive multi-warp-per-row for wide cols is the follow-up.
 Next levers to chase 304: vectorized loads (int8x4/float4), Int4 lm_head, faster
 attention occupancy (split-K).
+
+## 2026-07-19 / vectorized int8 GEMV loads -- lm_head at the bandwidth wall (BLLM-190)
+
+Each warp lane now loads 4 int8 weights as one uint32 + 4 activations as one
+float4 (4 MACs/iter, 4x fewer loads, more ILP). Requires cols%4==0 (all Qwen2.5
+dims qualify); scalar warp loop handles odd cols. Coherence green (16/16).
+
+lm_head: 1024 -> 617 us = 220 GB/s (AT the wall). down-resid 27->9 (the wide-
+matrix warp regression is GONE -- vectorization fixed it), O 5.3->3.5. SUM
+3.08 -> 2.19 ms. Synthetic 0.5B Int8 206 -> 264.6 (now BEATS Int4 248 -- int8 is
+vectorized, int4 not yet). 8B Int8 recovered 13.7 -> 16.2.
+REAL qwen2.5-0.5b-q8_0 Int8: 163 -> 217.8 t/s, coherent+fluent.
+
+Session arc: 52 (CPU this morning) -> 217.8 t/s = 4.2x, now 72% of llama.cpp's
+GPU 304. Remaining sinks: lm_head 0.62 (bandwidth-bound now), fused_swiglu 0.50
+(not yet vectorized), qkv 0.27. Next: vectorize fused_swiglu + fused_qkv + int4.
