@@ -189,6 +189,7 @@ option(BOLT_BUILD_REACTOR "Build bolt::reactor native async event loop / I/O" ${
 if(BOLT_BUILD_REACTOR)
     set(_bolt_reactor_sources
         src/api/core/async_io.cpp
+        src/api/core/timer_queue.cpp
         src/api/core/logger.cpp
         src/api/core/worker_pool.cpp
         src/api/net/event_loop.cpp
