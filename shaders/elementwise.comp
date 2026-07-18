@@ -1,0 +1,35 @@
+#version 450
+// BLLM-179: on-device elementwise ops for the resident-graph forward. One
+// invocation per element; op selected by push constant so a single pipeline
+// covers residual/bias add, SwiGLU, and GeGLU (all shapes are o[i]=f(a[i],b[i])).
+//   op 0: add    -> a + b            (residual add, bias add)
+//   op 1: swiglu -> silu(a) * b      (silu(x) = x*sigmoid(x))
+//   op 2: geglu  -> gelu_tanh(a) * b (matches MoeMath.h gelu_tanh)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer ABuf { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BBuf { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer OBuf { float o[]; };
+
+layout(push_constant) uniform PushConstants {
+    int n;
+    int op;
+} pc;
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+float gelu_tanh(float x) {
+    return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    float av = a[i];
+    float bv = b[i];
+    float r;
+    if (pc.op == 0) r = av + bv;
+    else if (pc.op == 1) r = silu(av) * bv;
+    else r = gelu_tanh(av) * bv;
+    o[i] = r;
+}

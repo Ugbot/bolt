@@ -197,6 +197,13 @@ public:
     bool rmsnorm(const MatmulPipeline& pipeline, const BufferHandle& x, const BufferHandle& weight,
                  const BufferHandle& out, int32_t n, float eps) noexcept;
 
+    // ---- BLLM-179: on-device elementwise (add/SwiGLU/GeGLU). out[i] = op(a[i],
+    // b[i]); op 0=a+b (residual/bias), 1=silu(a)*b (SwiGLU), 2=gelu(a)*b (GeGLU).
+    // One invocation per element. Blocks until complete. ----
+    bool create_elementwise_pipeline(MatmulPipeline* out) noexcept;
+    bool elementwise(const MatmulPipeline& pipeline, const BufferHandle& a, const BufferHandle& b,
+                     const BufferHandle& out, int32_t n, int32_t op) noexcept;
+
     // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
     // tier, distinct from matmul_dequant's float-activation tier above) ---
 

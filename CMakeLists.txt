@@ -372,7 +372,8 @@ if(BOLT_BUILD_VULKAN)
         set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2
                                        matmul_dequant_int8act_int8 matmul_dequant_int8act_int4
                                        matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched
-                                       rmsnorm)  # BLLM-176 on-device RMSNorm
+                                       rmsnorm       # BLLM-176 on-device RMSNorm
+                                       elementwise)  # BLLM-179 add/SwiGLU/GeGLU
         set(_bolt_vulkan_shader_headers "")
         foreach(_shader_name ${_bolt_vulkan_shader_names})
             set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")

@@ -274,6 +274,54 @@ TEST(BoltVulkan, RmsnormMatchesCpuReference) {
     ctx.destroy_matmul_pipeline(&pipeline);
 }
 
+// BLLM-179: on-device SwiGLU (op 1) and add (op 0) match CPU references.
+TEST(BoltVulkan, ElementwiseMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_elementwise_pipeline(&pipeline));
+
+    const int n = 500;  // not a multiple of 256 -> exercises the OOB guard
+    std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        a[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.3f;
+        b[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.7f;
+    }
+    BufferHandle ab = make_and_fill(ctx, a.data(), a.size() * sizeof(float));
+    BufferHandle bb = make_and_fill(ctx, b.data(), b.size() * sizeof(float));
+    BufferHandle ob;
+    ASSERT_TRUE(ctx.allocate_buffer(a.size() * sizeof(float), true, &ob));
+
+    // op 1: SwiGLU -> silu(a)*b.
+    ASSERT_TRUE(ctx.elementwise(pipeline, ab, bb, ob, n, /*op=*/1));
+    float* o = static_cast<float*>(ctx.map_buffer(ob));
+    ASSERT_NE(o, nullptr);
+    for (int i = 0; i < n; ++i) {
+        const float x = a[static_cast<size_t>(i)];
+        const float want = (x / (1.0f + std::exp(-x))) * b[static_cast<size_t>(i)];
+        EXPECT_NEAR(o[i], want, 1e-4f) << "swiglu i=" << i;
+    }
+    ctx.unmap_buffer(ob);
+
+    // op 0: add -> a+b.
+    ASSERT_TRUE(ctx.elementwise(pipeline, ab, bb, ob, n, /*op=*/0));
+    o = static_cast<float*>(ctx.map_buffer(ob));
+    ASSERT_NE(o, nullptr);
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(o[i], a[static_cast<size_t>(i)] + b[static_cast<size_t>(i)], 1e-5f)
+            << "add i=" << i;
+    }
+    ctx.unmap_buffer(ob);
+
+    ctx.free_buffer(&ab);
+    ctx.free_buffer(&bb);
+    ctx.free_buffer(&ob);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
 TEST(BoltVulkan, MatmulDequantInt8MatchesScaledDotProduct) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";
