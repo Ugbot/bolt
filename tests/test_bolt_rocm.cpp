@@ -535,13 +535,10 @@ TEST(BoltRocm, ResidentLayerForwardMatchesCpuReference) {
     ASSERT_TRUE(bolt::rocm::rmsnorm(ctx, static_cast<const float*>(dx.ptr),
                                     static_cast<const float*>(dn1.ptr),
                                     static_cast<float*>(dnorm.ptr), H, eps));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWq.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dnorm.ptr),
-                                           static_cast<float*>(dq.ptr), q_dim, H));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWk.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dnorm.ptr), k_slot, kv_dim, H));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWv.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dnorm.ptr), v_slot, kv_dim, H));
+    // FUSED QKV (BLLM-189): one launch for q/k/v; k/v write into the cache slots.
+    ASSERT_TRUE(bolt::rocm::fused_qkv(ctx, dWq.ptr, dWk.ptr, dWv.ptr, WeightDType::F32, nullptr,
+                                      nullptr, nullptr, static_cast<const float*>(dnorm.ptr),
+                                      static_cast<float*>(dq.ptr), k_slot, v_slot, q_dim, kv_dim, H));
     ASSERT_TRUE(bolt::rocm::rope(ctx, static_cast<float*>(dq.ptr), head_dim, num_heads, S - 1, theta));
     ASSERT_TRUE(bolt::rocm::rope(ctx, k_slot, head_dim, num_kv_heads, S - 1, theta));
     ASSERT_TRUE(bolt::rocm::attention(ctx, static_cast<const float*>(dq.ptr), pkc, pvc,

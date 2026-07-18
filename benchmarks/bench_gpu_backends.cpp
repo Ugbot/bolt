@@ -185,9 +185,9 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
             float* kslot = mp(kc[l]) + (int64_t)pos * kv_dim;
             float* vslot = mp(vc[l]) + (int64_t)pos * kv_dim;
             rmsnorm(ctx, fp(hid), fp(an[l]), mp(nrm), H, eps);
-            matmul_dequant(ctx, wq[l].ptr, wdt, sc(sq, l), fp(nrm), mp(q), q_dim, H);
-            matmul_dequant(ctx, wk[l].ptr, wdt, sc(sk, l), fp(nrm), kslot, kv_dim, H);
-            matmul_dequant(ctx, wv[l].ptr, wdt, sc(sv, l), fp(nrm), vslot, kv_dim, H);
+            // FUSED QKV (BLLM-189): 3 matmuls -> 1; k/v write into the cache slots.
+            fused_qkv(ctx, wq[l].ptr, wk[l].ptr, wv[l].ptr, wdt, sc(sq, l), sc(sk, l), sc(sv, l),
+                      fp(nrm), mp(q), kslot, vslot, q_dim, kv_dim, H);
             rope(ctx, mp(q), head_dim, heads, pos, theta);
             rope(ctx, kslot, head_dim, kv_heads, pos, theta);
             attention(ctx, fp(q), fp(kc[l]), fp(vc[l]), mp(ctxb), heads, kv_heads, head_dim, S, scale);

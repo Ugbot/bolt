@@ -2309,3 +2309,21 @@ Still latency-bound (9.08ms Int8 = 54 GB/s effective vs 3.3ms bandwidth ceiling;
 266 kernels x ~22us). Next: fused QKV (3->1), merge 2 rope launches -> cross 116.
 Open caveat: 116 is llama.cpp CPU-only; fair GPU-vs-GPU needs llama.cpp's Vulkan
 backend on this iGPU.
+
+## 2026-07-18 / fused QKV perf-neutral -> the bound is TRAFFIC, not kernel count (BLLM-189)
+
+Added fused_qkv (f32/int8): one launch produces q/k/v from the shared normed
+input (canonical llama.cpp fusion), coherence-verified via the resident-layer
+test. Perf: NEUTRAL (110 -> 110 t/s Int8 0.5B). Contrast fused_swiglu (+11).
+Difference: swiglu removed the gate/up/act INTERMEDIATE BUFFERS (real traffic);
+QKV only removed launches (q/k/v still written). => at this size decode is
+memory-traffic-bound (weights + intermediates), NOT launch-count-bound -- same
+reason hipGraph did nothing. Corroboration: F32 0.5B = 155 GB/s (bandwidth-bound,
+near GEMV ceiling); Int8 = 54 GB/s (too few weight bytes to saturate -> floored by
+fixed per-op work). fused_qkv kept (correct, standard, cuts launches for
+batched/other-hw regimes) but perf-neutral for single-token 0.5B.
+
+Status: 110 t/s Int8 = 95% of llama.cpp CPU baseline; 8B GPU (15.6 t/s) laps
+llama.cpp CPU decode. Next: (1) rocprof to find the real ~9ms sink before more
+fusion; (2) fair GPU-vs-GPU number (llama.cpp Vulkan on this iGPU -- 116 is
+CPU-only, and llama.cpp's GPU path may itself sit below 116 on a tiny 0.5B model).

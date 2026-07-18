@@ -230,4 +230,14 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
                   const float* wg_scale, const float* wu_scale, const float* x, float* act,
                   int32_t rows, int32_t cols) noexcept;
 
+// BLLM-189: fused QKV projection -- one kernel produces q[q_rows], k[kv_rows],
+// v[kv_rows] from the shared normed activation `x[cols]`, replacing three
+// matmul_dequant calls with one launch. `wq`/`wk`/`wv` are row-major weights of
+// dtype (F32 or Int8); for Int8 `sq`/`sk`/`sv` are the per-row scales (required;
+// ignored for F32). Same dequant contract as matmul_dequant. Precondition:
+// ctx.is_valid().
+bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, WeightDType dtype,
+               const float* sq, const float* sk, const float* sv, const float* x, float* q,
+               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols) noexcept;
+
 }  // namespace bolt::rocm

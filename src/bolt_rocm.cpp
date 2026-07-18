@@ -351,6 +351,66 @@ __global__ void fused_swiglu_int8_kernel(const int8_t* wg, const int8_t* wu, con
     }
 }
 
+// BLLM-189: fused QKV projection. ONE block per output row across the
+// concatenated [q | k | v] rows -- one launch replaces three matmuls that all
+// read the same normed activation. The which-tensor selection is uniform per
+// block (constant across the block's threads), so there is no intra-block
+// divergence and the hot dot loop stays branch-free. F32-weight tier.
+__global__ void fused_qkv_f32_kernel(const float* wq, const float* wk, const float* wv,
+                                     const float* x, float* q, float* k, float* v, int32_t q_rows,
+                                     int32_t kv_rows, int32_t cols) {
+    __shared__ float shared[kBlockSize];
+    const int32_t b = blockIdx.x;
+    const float* wrow;
+    float* out;
+    int32_t orow;
+    if (b < q_rows) {
+        wrow = wq + static_cast<int64_t>(b) * cols; out = q; orow = b;
+    } else if (b < q_rows + kv_rows) {
+        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; out = k;
+    } else {
+        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; out = v;
+    }
+    float acc = 0.0f;
+    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) acc += x[i] * wrow[i];
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[orow] = shared[0];
+}
+
+// Int8-weight twin: each of q/k/v carries its own per-row scale array.
+__global__ void fused_qkv_int8_kernel(const int8_t* wq, const int8_t* wk, const int8_t* wv,
+                                      const float* sq, const float* sk, const float* sv,
+                                      const float* x, float* q, float* k, float* v, int32_t q_rows,
+                                      int32_t kv_rows, int32_t cols) {
+    __shared__ float shared[kBlockSize];
+    const int32_t b = blockIdx.x;
+    const int8_t* wrow;
+    const float* scl;
+    float* out;
+    int32_t orow;
+    if (b < q_rows) {
+        wrow = wq + static_cast<int64_t>(b) * cols; scl = sq; out = q; orow = b;
+    } else if (b < q_rows + kv_rows) {
+        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; scl = sk; out = k;
+    } else {
+        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; scl = sv; out = v;
+    }
+    float acc = 0.0f;
+    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) acc += x[i] * static_cast<float>(wrow[i]);
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[orow] = shared[0] * scl[orow];
+}
+
 }  // namespace
 
 bool available() noexcept {
@@ -640,6 +700,31 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
         fused_swiglu_int8_kernel<<<grid, block, 0, st>>>(static_cast<const int8_t*>(wg),
                                                          static_cast<const int8_t*>(wu), wg_scale,
                                                          wu_scale, x, act, cols);
+    }
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, WeightDType dtype,
+               const float* sq, const float* sk, const float* sv, const float* x, float* q,
+               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols) noexcept {
+    if (!ctx.is_valid() || wq == nullptr || wk == nullptr || wv == nullptr || x == nullptr ||
+        q == nullptr || k == nullptr || v == nullptr || q_rows <= 0 || kv_rows <= 0 || cols <= 0) {
+        return false;
+    }
+    if (dtype != WeightDType::F32 && dtype != WeightDType::Int8) return false;
+    if (dtype == WeightDType::Int8 && (sq == nullptr || sk == nullptr || sv == nullptr)) return false;
+
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    const dim3 grid(static_cast<unsigned int>(q_rows + 2 * kv_rows));
+    const dim3 block(static_cast<unsigned int>(kBlockSize));
+    if (dtype == WeightDType::F32) {
+        fused_qkv_f32_kernel<<<grid, block, 0, st>>>(
+            static_cast<const float*>(wq), static_cast<const float*>(wk),
+            static_cast<const float*>(wv), x, q, k, v, q_rows, kv_rows, cols);
+    } else {
+        fused_qkv_int8_kernel<<<grid, block, 0, st>>>(
+            static_cast<const int8_t*>(wq), static_cast<const int8_t*>(wk),
+            static_cast<const int8_t*>(wv), sq, sk, sv, x, q, k, v, q_rows, kv_rows, cols);
     }
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
