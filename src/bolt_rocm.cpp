@@ -293,6 +293,10 @@ bool Context::create() noexcept {
     hipDeviceProp_t props{};
     if (hipGetDeviceProperties(&props, chosen) != hipSuccess) return false;
 
+    hipStream_t stream = nullptr;
+    if (hipStreamCreate(&stream) != hipSuccess) return false;
+    stream_ = stream;
+
     std::snprintf(device_name_, sizeof(device_name_), "%s", props.name);
     device_local_heap_bytes_ = static_cast<uint64_t>(props.totalGlobalMem);
     wavefront_size_ = props.warpSize;
@@ -302,6 +306,11 @@ bool Context::create() noexcept {
 }
 
 void Context::destroy() noexcept {
+    free_graph();
+    if (stream_ != nullptr) {
+        hipStreamDestroy(static_cast<hipStream_t>(stream_));
+        stream_ = nullptr;
+    }
     valid_ = false;
     device_index_ = -1;
     wavefront_size_ = 0;
@@ -342,7 +351,43 @@ bool Context::copy_to_host(const DeviceBuffer& src, void* host_dst, uint64_t siz
 
 bool Context::end_batch() noexcept {
     batch_mode_ = false;
-    return hipDeviceSynchronize() == hipSuccess;
+    return hipStreamSynchronize(static_cast<hipStream_t>(stream_)) == hipSuccess;
+}
+
+bool Context::begin_graph_capture() noexcept {
+    if (!valid_ || stream_ == nullptr) return false;
+    free_graph();
+    batch_mode_ = true;  // ops skip their per-op sync while being captured
+    return hipStreamBeginCapture(static_cast<hipStream_t>(stream_),
+                                 hipStreamCaptureModeThreadLocal) == hipSuccess;
+}
+
+bool Context::end_graph_capture() noexcept {
+    batch_mode_ = false;
+    hipGraph_t graph = nullptr;
+    if (hipStreamEndCapture(static_cast<hipStream_t>(stream_), &graph) != hipSuccess) return false;
+    hipGraphExec_t exec = nullptr;
+    const hipError_t rc = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    hipGraphDestroy(graph);
+    if (rc != hipSuccess) return false;
+    graph_exec_ = exec;
+    return true;
+}
+
+bool Context::graph_launch() noexcept {
+    if (graph_exec_ == nullptr || stream_ == nullptr) return false;
+    if (hipGraphLaunch(static_cast<hipGraphExec_t>(graph_exec_),
+                       static_cast<hipStream_t>(stream_)) != hipSuccess) {
+        return false;
+    }
+    return hipStreamSynchronize(static_cast<hipStream_t>(stream_)) == hipSuccess;
+}
+
+void Context::free_graph() noexcept {
+    if (graph_exec_ != nullptr) {
+        hipGraphExecDestroy(static_cast<hipGraphExec_t>(graph_exec_));
+        graph_exec_ = nullptr;
+    }
 }
 
 bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
@@ -354,26 +399,27 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
     }
     if (dtype != WeightDType::F32 && scale_device == nullptr) return false;
 
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>(out_rows));
     const dim3 block(static_cast<unsigned int>(kBlockSize));
 
     switch (dtype) {
         case WeightDType::F32:
-            matmul_dequant_f32_kernel<<<grid, block>>>(
+            matmul_dequant_f32_kernel<<<grid, block, 0, st>>>(
                 static_cast<const float*>(weight_device), activation_device, out_device, cols);
             break;
         case WeightDType::Int8:
-            matmul_dequant_int8_kernel<<<grid, block>>>(
+            matmul_dequant_int8_kernel<<<grid, block, 0, st>>>(
                 static_cast<const int8_t*>(weight_device), scale_device, activation_device,
                 out_device, cols);
             break;
         case WeightDType::Int4:
-            matmul_dequant_int4_kernel<<<grid, block>>>(
+            matmul_dequant_int4_kernel<<<grid, block, 0, st>>>(
                 static_cast<const uint8_t*>(weight_device), scale_device, activation_device,
                 out_device, cols);
             break;
         case WeightDType::Int2:
-            matmul_dequant_int2_kernel<<<grid, block>>>(
+            matmul_dequant_int2_kernel<<<grid, block, 0, st>>>(
                 static_cast<const uint8_t*>(weight_device), scale_device, activation_device,
                 out_device, cols);
             break;
@@ -381,7 +427,7 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
             return false;
     }
 
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, WeightDType dtype,
@@ -394,17 +440,18 @@ bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, Wei
     }
     if (dtype != WeightDType::Int8 && dtype != WeightDType::Int4) return false;
 
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>(out_rows));
     const dim3 block(static_cast<unsigned int>(kBlockSize));
 
     switch (dtype) {
         case WeightDType::Int8:
-            matmul_dequant_int8act_int8_kernel<<<grid, block>>>(
+            matmul_dequant_int8act_int8_kernel<<<grid, block, 0, st>>>(
                 static_cast<const int8_t*>(weight_device), weight_scale_device, activation_device,
                 act_scale, out_device, cols);
             break;
         case WeightDType::Int4:
-            matmul_dequant_int8act_int4_kernel<<<grid, block>>>(
+            matmul_dequant_int8act_int4_kernel<<<grid, block, 0, st>>>(
                 static_cast<const uint8_t*>(weight_device), weight_scale_device, activation_device,
                 act_scale, out_device, cols);
             break;
@@ -412,7 +459,7 @@ bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, Wei
             return false;
     }
 
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* y_device, int32_t n,
@@ -421,17 +468,19 @@ bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* 
         n <= 0) {
         return false;
     }
-    rmsnorm_kernel<<<dim3(1), dim3(kBlockSize)>>>(x_device, w_device, y_device, n, eps);
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    rmsnorm_kernel<<<dim3(1), dim3(kBlockSize), 0, st>>>(x_device, w_device, y_device, n, eps);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, int32_t position,
           float theta) noexcept {
     if (!ctx.is_valid() || x_device == nullptr || head_dim <= 0 || num_heads <= 0) return false;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const int32_t total = num_heads * (head_dim / 2);
     const dim3 grid(static_cast<unsigned int>((total + kBlockSize - 1) / kBlockSize));
-    rope_kernel<<<grid, dim3(kBlockSize)>>>(x_device, head_dim, num_heads, position, theta);
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    rope_kernel<<<grid, dim3(kBlockSize), 0, st>>>(x_device, head_dim, num_heads, position, theta);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 bool elementwise(Context& ctx, const float* a_device, const float* b_device, float* out_device,
@@ -440,9 +489,10 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
         n <= 0) {
         return false;
     }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize));
-    elementwise_kernel<<<grid, dim3(kBlockSize)>>>(a_device, b_device, out_device, n, op);
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    elementwise_kernel<<<grid, dim3(kBlockSize), 0, st>>>(a_device, b_device, out_device, n, op);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
@@ -455,13 +505,14 @@ bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
     if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return false;
     if (num_heads % num_kv_heads != 0 || head_dim > kBlockSize) return false;
     const int32_t group_size = num_heads / num_kv_heads;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     int32_t block = 1;
     while (block < head_dim) block <<= 1;  // power-of-two >= head_dim for the tree reduce
     attention_kernel<<<dim3(static_cast<unsigned int>(num_heads)),
-                       dim3(static_cast<unsigned int>(block))>>>(
+                       dim3(static_cast<unsigned int>(block)), 0, st>>>(
         q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
         seq_len, scale);
-    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
 }  // namespace bolt::rocm

@@ -2262,3 +2262,26 @@ overhead caps it at ~10ms. => the bottleneck flipped from bandwidth to launch
 overhead. Next lever to pass llama.cpp: hipGraph capture (replay the token's
 kernel sequence, no per-launch cost) + op fusion (norm+matmul, gate+up+SwiGLU),
 targeting Int8's ~290 t/s ceiling = ~2.5x llama.cpp. New ticket BLLM-189.
+
+## 2026-07-18 / hipGraph measured -> NOT the lever; op fusion is (BLLM-189)
+
+Hypothesis from the prior entry: Int8's shortfall is CPU kernel-LAUNCH overhead;
+fix with hipGraph capture (record token once, replay). Built it (bolt::rocm
+Context: non-default stream + begin/end_graph_capture + graph_launch). RESULT:
+zero improvement -- Int8 96 t/s batch vs 96 hipGraph (0.5B), 13.3 vs 13.3 (8B).
+Hypothesis WRONG. hipGraph only removes CPU launch cost; since it didn't move,
+the bottleneck is GPU-side serial execution of ~361 data-dependent kernels/token
+(each reads the prior op's output -> no overlap; fixed ~28us dispatch/drain each
+~= 10ms, matching Int8's floor).
+
+Corroboration: F32 8B hits 208 GB/s = ~UMA wall (GEMV kernels efficient, not the
+problem). Int8-vs-F32 speedup grows with model size (0.5B 1.34x -> 8B 1.93x) as
+bigger GEMVs stay bandwidth-bound long enough to amortize per-kernel latency, but
+never 4x while kernel COUNT stays ~361.
+
+=> Real lever to pass llama.cpp is OP FUSION (fewer/bigger kernels): norm+matmul,
+fused QKV (one GEMV off shared normed input), fused gate+up+SwiGLU, fused
+attention -- ~15 kernels/layer -> ~5. hipGraph kept as a shipped primitive (right
+tool when CPU launch IS the bound: many tiny independent kernels) but not the
+decode lever. Measure-don't-assume win: the disproven hypothesis localized the
+real cause. BLLM-189 redirected to fusion.

@@ -121,6 +121,25 @@ public:
     // this to decide whether to skip their per-op sync.
     bool batching() const noexcept { return batch_mode_; }
 
+    // The HIP stream every op launches on (opaque hipStream_t). Non-default so
+    // the op sequence can be captured into a graph. Valid only if is_valid().
+    void* stream() const noexcept { return stream_; }
+
+    // BLLM-189: HIP graph capture -- the lever past the per-launch overhead the
+    // resident-graph decode measured. begin_graph_capture() starts recording the
+    // ops issued on this Context's stream (they skip their per-op sync, like a
+    // batch); end_graph_capture() ends recording and instantiates an executable
+    // graph; graph_launch() replays that whole captured sequence in ONE
+    // launch + sync, amortizing the ~362-launches/token cost to ~0. The captured
+    // graph bakes in the exact kernel arguments (device pointers, dims), so it is
+    // valid only while those resident buffers + shapes are unchanged -- re-capture
+    // if the position/shape changes. Returns false on any HIP failure.
+    bool begin_graph_capture() noexcept;
+    bool end_graph_capture() noexcept;
+    bool graph_launch() noexcept;
+    bool has_graph() const noexcept { return graph_exec_ != nullptr; }
+    void free_graph() noexcept;
+
 private:
     bool     valid_ = false;
     bool     batch_mode_ = false;
@@ -128,6 +147,8 @@ private:
     int32_t  wavefront_size_ = 0;
     char     device_name_[256] = {};
     uint64_t device_local_heap_bytes_ = 0;
+    void*    stream_ = nullptr;      // hipStream_t (opaque)
+    void*    graph_exec_ = nullptr;  // hipGraphExec_t (opaque)
 };
 
 // GEMV: out[r] = dot(weight.row(r), activation), r in [0, out_rows), with

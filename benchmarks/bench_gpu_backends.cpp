@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -123,10 +124,15 @@ private:
 // throughput the resident graph unlocks -- the per-op transfer+sync overhead the
 // GEMV table pays is gone. Weights are uninitialized (perf is bandwidth, not
 // values). Returns median ms/token, or 0 on setup failure.
-double bench_rocm_resident_forward(bolt::rocm::Context& ctx, bool int8) {
+struct ModelCfg {
+    int H, layers, heads, kv_heads, head_dim, ffn, vocab;
+};
+
+double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg, bool int8,
+                                   bool use_graph) {
     using namespace bolt::rocm;
-    const int H = 896, layers = 24, heads = 14, kv_heads = 2, head_dim = 64, ffn = 4864;
-    const int vocab = 151936;
+    const int H = cfg.H, layers = cfg.layers, heads = cfg.heads, kv_heads = cfg.kv_heads;
+    const int head_dim = cfg.head_dim, ffn = cfg.ffn, vocab = cfg.vocab;
     const int q_dim = heads * head_dim;        // 896
     const int kv_dim = kv_heads * head_dim;    // 128
     const int S = 128;                          // KV cache length (mid-sequence)
@@ -172,8 +178,9 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, bool int8) {
     auto mp = [](const DeviceBuffer& b) { return static_cast<float*>(b.ptr); };
     auto sc = [&](std::vector<DeviceBuffer>& sv_, int l) { return int8 ? fp(sv_[l]) : nullptr; };
 
-    auto forward = [&]() {
-        ctx.begin_batch();
+    // The op sequence only -- no batch/sync/readback (so it can be either batched
+    // or captured into a graph).
+    auto record_ops = [&]() {
         for (int l = 0; l < layers; ++l) {
             float* kslot = mp(kc[l]) + (int64_t)pos * kv_dim;
             float* vslot = mp(vc[l]) + (int64_t)pos * kv_dim;
@@ -195,17 +202,36 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, bool int8) {
         }
         rmsnorm(ctx, fp(hid), fp(d_fn), mp(nrm), H, eps);
         matmul_dequant(ctx, d_lm.ptr, wdt, int8 ? fp(s_lm) : nullptr, fp(nrm), mp(logits), vocab, H);
-        ctx.end_batch();  // ONE sync for the whole token
-        ctx.copy_to_host(logits, logits_host.data(), logits_host.size() * sizeof(float));
     };
 
-    for (int i = 0; i < 3; ++i) forward();  // warmup
+    std::function<void()> run;
+    if (use_graph) {
+        ctx.begin_graph_capture();
+        record_ops();
+        if (!ctx.end_graph_capture()) {
+            std::printf("  (graph capture failed)\n");
+        }
+        run = [&]() {
+            ctx.graph_launch();  // whole token replayed in one launch + one sync
+            ctx.copy_to_host(logits, logits_host.data(), logits_host.size() * sizeof(float));
+        };
+    } else {
+        run = [&]() {
+            ctx.begin_batch();
+            record_ops();
+            ctx.end_batch();  // ONE sync for the whole token
+            ctx.copy_to_host(logits, logits_host.data(), logits_host.size() * sizeof(float));
+        };
+    }
+
+    for (int i = 0; i < 3; ++i) run();  // warmup
     std::vector<double> ts;
     for (int i = 0; i < 20; ++i) {
         auto a = Clock::now();
-        forward();
+        run();
         ts.push_back(std::chrono::duration<double, std::micro>(Clock::now() - a).count());
     }
+    ctx.free_graph();  // release the captured graph before its buffers go away
     auto freev = [&](std::vector<DeviceBuffer>& v) { for (auto& b : v) ctx.free(&b); };
     freev(wq); freev(wk); freev(wv); freev(wo); freev(wg); freev(wu); freev(wd);
     freev(sq); freev(sk); freev(sv); freev(so); freev(sg); freev(su); freev(sd);
@@ -341,16 +367,26 @@ int main() {
 
 #if defined(BOLT_HAVE_ROCM)
     if (rocm_ok) {
-        std::printf("\n--- ROCm resident-graph decode (Qwen2.5-0.5B shape, 24 layers + lm_head) ---\n");
-        std::printf("Whole token chained on-device, ONE sync/token (batch mode).\n");
-        const double ms_f32 = bench_rocm_resident_forward(rocm, /*int8=*/false);
-        if (ms_f32 > 0.0)
-            std::printf("  F32 weights:   %6.2f ms/token  ->  %6.1f tok/s\n", ms_f32, 1000.0 / ms_f32);
-        const double ms_i8 = bench_rocm_resident_forward(rocm, /*int8=*/true);
-        if (ms_i8 > 0.0)
-            std::printf("  Int8 weights:  %6.2f ms/token  ->  %6.1f tok/s   (MEASURED)\n", ms_i8, 1000.0 / ms_i8);
-        std::printf("  llama.cpp baseline (Qwen2.5-0.5B Q8_0, CPU-only llama-bench): 116 tok/s\n");
-        std::printf("  boltllm CPU:  Int8 ~60 tok/s, Int4 ~90 tok/s (docs/perf/llama-cpp-baseline.md)\n");
+        std::printf("\n--- ROCm resident-graph decode (whole token on-device, one sync/token) ---\n");
+        const ModelCfg kSmall{896, 24, 14, 2, 64, 4864, 151936};    // Qwen2.5-0.5B
+        const ModelCfg kLarge{4096, 32, 32, 8, 128, 14336, 128256};  // Llama-3-8B shape
+        auto suite = [&](const char* name, const ModelCfg& cfg) {
+            std::printf("  [%s]  H=%d layers=%d ffn=%d GQA=%d/%d vocab=%d\n", name, cfg.H, cfg.layers,
+                        cfg.ffn, cfg.heads, cfg.kv_heads, cfg.vocab);
+            auto row = [&](const char* tag, bool i8, bool g) {
+                const double ms = bench_rocm_resident_forward(rocm, cfg, i8, g);
+                if (ms > 0.0)
+                    std::printf("    %-24s %7.2f ms/token  ->  %7.1f tok/s\n", tag, ms, 1000.0 / ms);
+            };
+            row("F32  batch:", false, false);
+            row("Int8 batch:", true, false);
+            row("Int8 hipGraph:", true, true);
+        };
+        suite("Qwen2.5-0.5B", kSmall);
+        suite("Llama-3-8B", kLarge);
+        std::printf("  ---\n");
+        std::printf("  llama.cpp (Qwen2.5-0.5B Q8_0, CPU-only llama-bench): 116 tok/s\n");
+        std::printf("  boltllm CPU: Int8 ~60, Int4 ~90 tok/s. llama.cpp 8B-class CPU decode ~ a few t/s.\n");
     }
 #endif
     return 0;
