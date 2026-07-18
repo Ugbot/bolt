@@ -36,6 +36,13 @@ constexpr int32_t kInt2DequantOffset = 2;
 // since there is no hardware access to verify that width empirically.
 constexpr int32_t kBlockSize = 256;
 
+// BLLM-189: two-pass attention shared-memory caps. head_dim <= 256 (already
+// enforced), scores buffer holds the KV context length. 4096 covers decode
+// contexts up to 4K tokens at 16 KB shared; longer falls back to the online
+// kernel (which never materializes scores).
+constexpr int32_t kMaxHeadDim = 256;
+constexpr int32_t kMaxAttnSeq = 4096;
+
 // BLLM-189: templated on Accumulate -- <false> writes out[row]=dot (plain
 // matmul), <true> writes out[row]+=dot (fuses the residual-add into the
 // projection, removing a separate elementwise kernel). Accumulate is a
@@ -246,16 +253,12 @@ __global__ void elementwise_kernel(const float* a, const float* b, float* o, int
 }
 
 // BLLM-187: decode-step attention with flash-style online softmax. ONE block
-// per query head; blockDim is a power-of-two >= head_dim, one thread per dim
-// (inactive threads d>=head_dim contribute 0 to the QK dot and skip the write,
-// so the power-of-two tree reduction stays valid). Mirrors qwen2_attention_'s
-// numerics exactly: stream over cached KV in one pass keeping a running max
-// `m`, denominator `l`, and rescaled per-dim context `ch`. GQA: query head h
-// reads kv head h/group_size. m/l/corr/p are computed identically by every
-// thread from the broadcast score, so they stay in lockstep with no extra sync.
-__global__ void attention_kernel(const float* q, const float* k_cache, const float* v_cache,
-                                 float* out, int32_t head_dim, int32_t num_kv_heads,
-                                 int32_t group_size, int32_t seq_len, float scale) {
+// per query head; blockDim is a power-of-two >= head_dim, one thread per dim.
+// Kept as the LARGE-CONTEXT fallback (scores never materialized) for
+// seq_len > kMaxAttnSeq; the two-pass kernel below is the fast path.
+__global__ void attention_online_kernel(const float* q, const float* k_cache, const float* v_cache,
+                                         float* out, int32_t head_dim, int32_t num_kv_heads,
+                                         int32_t group_size, int32_t seq_len, float scale) {
     __shared__ float red[kBlockSize];
     __shared__ float s_bcast;
     const int32_t h = blockIdx.x;
@@ -285,6 +288,78 @@ __global__ void attention_kernel(const float* q, const float* k_cache, const flo
         m = m_new;
     }
     if (active) out[static_cast<int64_t>(h) * head_dim + d] = ch / l;
+}
+
+// BLLM-189: two-pass decode attention -- the fast path. The online kernel does
+// a block reduction PER timestep (~seq_len * log2(blockDim) __syncthreads, the
+// #1 decode sink in the profile). This kernel materializes the scores in shared
+// memory and does just TWO block reductions total (max, then sum), then a
+// sync-free weighted-V pass:
+//   pass 1: 256 threads stride over timesteps, each computes a full QK dot ->
+//           scores[t] (q cached in shared, no per-timestep sync)
+//   reduce: block max over scores; block sum of exp(scores-max)
+//   pass 2: 256 threads stride over head dims, each sums weight[t]*V[t][d]
+// Mathematically identical to the online softmax; ~20 syncs vs ~768. Requires
+// seq_len <= kMaxAttnSeq and head_dim <= kMaxHeadDim (host dispatches to the
+// online kernel otherwise). GQA: query head h reads kv head h/group_size.
+__global__ void attention_twopass_kernel(const float* q, const float* k_cache,
+                                         const float* v_cache, float* out, int32_t head_dim,
+                                         int32_t num_kv_heads, int32_t group_size, int32_t seq_len,
+                                         float scale) {
+    __shared__ float q_sh[kMaxHeadDim];
+    __shared__ float scores[kMaxAttnSeq];
+    __shared__ float red[kBlockSize];
+    const int32_t h = blockIdx.x;
+    const int32_t kv_head = h / group_size;
+    const int32_t tid = threadIdx.x;
+
+    for (int32_t i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q[static_cast<int64_t>(h) * head_dim + i];
+    __syncthreads();
+
+    // Pass 1: scores[t] = scale * dot(q, K[t]).  No per-timestep sync.
+    for (int32_t t = tid; t < seq_len; t += blockDim.x) {
+        const float* kt = k_cache + (static_cast<int64_t>(t) * num_kv_heads + kv_head) * head_dim;
+        float s = 0.0f;
+        for (int32_t d = 0; d < head_dim; ++d) s += q_sh[d] * kt[d];
+        scores[t] = s * scale;
+    }
+    __syncthreads();
+
+    // Block max over scores.
+    float pm = -INFINITY;
+    for (int32_t t = tid; t < seq_len; t += blockDim.x) pm = fmaxf(pm, scores[t]);
+    red[tid] = pm;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
+        __syncthreads();
+    }
+    const float mmax = red[0];
+    __syncthreads();
+
+    // exp(scores-max) in place + block sum -> denominator.
+    float pl = 0.0f;
+    for (int32_t t = tid; t < seq_len; t += blockDim.x) {
+        const float p = expf(scores[t] - mmax);
+        scores[t] = p;
+        pl += p;
+    }
+    red[tid] = pl;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    const float inv_l = 1.0f / red[0];
+    __syncthreads();
+
+    // Pass 2: out[d] = inv_l * sum_t scores[t] * V[t][d].  No sync.
+    for (int32_t d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int32_t t = 0; t < seq_len; ++t)
+            acc += scores[t] * v_cache[(static_cast<int64_t>(t) * num_kv_heads + kv_head) * head_dim + d];
+        out[static_cast<int64_t>(h) * head_dim + d] = acc * inv_l;
+    }
 }
 
 // BLLM-189: fused gate+up+SwiGLU FFN kernel. ONE block per FFN row computes BOTH
@@ -713,12 +788,19 @@ bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
     if (num_heads % num_kv_heads != 0 || head_dim > kBlockSize) return false;
     const int32_t group_size = num_heads / num_kv_heads;
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
-    int32_t block = 1;
-    while (block < head_dim) block <<= 1;  // power-of-two >= head_dim for the tree reduce
-    attention_kernel<<<dim3(static_cast<unsigned int>(num_heads)),
-                       dim3(static_cast<unsigned int>(block)), 0, st>>>(
-        q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
-        seq_len, scale);
+    const dim3 grid(static_cast<unsigned int>(num_heads));
+    if (seq_len <= kMaxAttnSeq && head_dim <= kMaxHeadDim) {
+        // BLLM-189 fast path: two block reductions total instead of one per timestep.
+        attention_twopass_kernel<<<grid, dim3(static_cast<unsigned int>(kBlockSize)), 0, st>>>(
+            q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
+            seq_len, scale);
+    } else {  // large-context fallback: never materializes the scores
+        int32_t block = 1;
+        while (block < head_dim) block <<= 1;  // power-of-two >= head_dim for the tree reduce
+        attention_online_kernel<<<grid, dim3(static_cast<unsigned int>(block)), 0, st>>>(
+            q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
+            seq_len, scale);
+    }
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

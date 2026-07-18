@@ -2352,3 +2352,20 @@ ATTENTION is a weak kernel: 1 block/head (14 blocks -> poor occupancy), 64/256
 threads used, serial 128-step loop w/ per-step block reduction. Next lever: proper
 flash-decode attention (parallelize timesteps, one end-reduction) -> cut several-
 fold, push past 116.
+
+## 2026-07-19 / two-pass flash-decode attention -- the #1 sink, 10x'd (BLLM-189)
+
+The online attention kernel did a block reduction PER timestep (~seq_len *
+log2(blockDim) __syncthreads) -- the profile's #1 decode sink (79us/call, 1.91
+ms/token). Replaced with a two-pass kernel (attention_twopass_kernel): pass 1
+materializes scores[t] in shared (256 threads stride timesteps, full QK dot each,
+no per-step sync); TWO block reductions total (max, then sum of exp); pass 2
+strides head dims summing weight[t]*V[t][d]. ~20 syncs vs ~768. Same numerics
+(coherence tests green). Kept the online kernel as the >4096-context fallback.
+
+attention: 79 -> 8 us/call (10x). SUM 6.34 -> 4.60 ms.
+Synthetic 0.5B: Int8 111 -> 156 t/s, Int4 115 -> 165. 8B: Int8 15.4 -> 16.5.
+REAL qwen2.5-0.5b-q8_0: Int8 116.9 -> 123.6 t/s, coherent -> PASSES llama.cpp's 116.
+
+Now the sinks are lm_head (1.87 ms, one huge GEMV) + fused_swiglu (1.14). FTZ +
+attention together took the real model from 115 to 123.6 t/s.
