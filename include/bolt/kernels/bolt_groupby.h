@@ -8,7 +8,10 @@
 //   Single-threaded, branch-free apply (CMOV-style bmin/bmax for integer
 //   MIN/MAX), Tiger Style — no hot-path allocs, ≤70 lines/fn, ≥2 asserts.
 //
-// K-AGG-B (deferred): Utf8 spilled keys, COUNT(DISTINCT), partitioned-parallel.
+// K-AGG-B: Utf8 spilled (>12-byte) GROUP BY keys are handled — the stateful
+//   _begin/_ingest/_finalize + merge path deep-copies them into its own arena
+//   (Card S), and the one-shot groupby_agg_multi_key_typed re-anchors + owns
+//   them at emit. Still deferred: COUNT(DISTINCT), partitioned-parallel.
 
 #pragma once
 

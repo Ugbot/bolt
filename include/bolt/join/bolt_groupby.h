@@ -571,10 +571,12 @@ BOLT_FORCE_INLINE StringView sv_bytelex_max(
 // / Utf8 inline-StringView identities). All scratch lives in the caller-
 // supplied Arena — no hot-path heap.
 //
-// Deferred to K-AGG-B (NOT in this kernel): Utf8 spilled keys, COUNT(DISTINCT),
-// partitioned-parallel variant. The chukonu wrapper at
-// `src/operators/impl/hash_agg_typed_op.cpp` keeps owning those features
-// until this kernel's surface is extended in K-AGG-B.
+// K-AGG-B status: Utf8 spilled (>12-byte) GROUP BY keys ARE handled — the
+// stateful _ingest/fallback + merge path deep-copies them into its own arena
+// (Card S: key_str_buf), and the one-shot groupby_agg_multi_key_typed
+// re-anchors + owns them into `arena` at emit so they never dangle. Still
+// deferred to a later K-AGG-B increment (NOT in this kernel): COUNT(DISTINCT),
+// the partitioned-parallel variant.
 // ===========================================================================
 
 // Per-cell payload — 16 bytes covers Int64 (.a only), Decimal128 ({lo,hi}),
@@ -2122,6 +2124,40 @@ inline bool groupby_agg_multi_key_typed(
                     static_cast<int64_t*>(buf)[r] = krow[k].a; break;
             }
         }
+    }
+
+    // ---- K-AGG-B: own the spilled Utf8 group-key bytes -------------------
+    // The scatter above copied each stored key cell verbatim; a spilled
+    // (>12-byte) key's StringView.ref.offset is relative to the INPUT
+    // column's overflow base (in_bases[k]), which the caller may free after
+    // this call — and the output column's own str_overflow_base is still
+    // null, so a consumer resolving `base + offset` would hit nullptr (the
+    // base-anchor crash class: G2FEAT-283/295/307). Deep-copy the spilled
+    // bytes into `arena` (which owns the output), re-anchor each output
+    // view's offset, and publish the column base — so spilled output keys
+    // are self-contained and never dangle (mirrors the stateful finalize's
+    // Card S treatment and the spilled MIN/MAX-winner deep-copy).
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        if (key_types[k] != BoltType::Utf8) continue;
+        StringView* osv = static_cast<StringView*>(out_keys[k].data);
+        size_t total = 0;
+        for (int64_t r = 0; r < out_n; ++r) {
+            if (osv[r].length > 12u) total += osv[r].length;
+        }
+        if (total == 0) continue;          // all inline — no base needed
+        if (total > 0xFFFFFFFFull) return false;   // 32-bit offset ceiling
+        char* kbuf = static_cast<char*>(arena->allocate(total, 16));
+        if (kbuf == nullptr) return false;
+        size_t used = 0;
+        for (int64_t r = 0; r < out_n; ++r) {
+            if (osv[r].length <= 12u) continue;
+            const char* src = kernels::utf8::sv_bytes(osv[r], in_bases[k]);
+            std::memcpy(kbuf + used, src, osv[r].length);
+            osv[r].ref.buf_idx = 0;
+            osv[r].ref.offset  = static_cast<uint32_t>(used);
+            used += osv[r].length;
+        }
+        out_keys[k].str_overflow_base = kbuf;
     }
 
     // ---- Scatter aggs (finalize Avg per cell) ----

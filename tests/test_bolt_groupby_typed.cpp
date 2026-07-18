@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -627,6 +628,152 @@ TEST(BoltGroupbyTypedXMorsel, Float64TwoMorselsSumMerge) {
         if (okp[i] == 1) EXPECT_DOUBLE_EQ(oap[i], 4.0);
         if (okp[i] == 2) EXPECT_DOUBLE_EQ(oap[i], 30.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// K-AGG-B: spilled (>12-byte) Utf8 GROUP BY keys through the ONE-SHOT
+// groupby_agg_multi_key_typed. Grouping/hash/equality already resolve
+// spilled keys by content, but the one-shot emit path must ALSO hand the
+// output key column a str_overflow_base that owns the spilled bytes — the
+// stored StringView's ref.offset is meaningless without a base, and a
+// nullptr base dereferenced as `base + offset` is the exact base-anchor
+// crash class (G2FEAT-283/295/307). These tests fail by construction
+// against the pre-fix kernel (out_keys[k].str_overflow_base == nullptr).
+// ---------------------------------------------------------------------------
+
+// Build a spilled StringView (length > 12) referencing `base + off`.
+static StringView sv_spilled(const char* base, uint32_t off, uint32_t len) {
+    StringView v{};
+    v.length = len;
+    std::memcpy(v.prefix, base + off, 4);
+    v.ref.buf_idx = 0;
+    v.ref.offset  = off;
+    return v;
+}
+
+// Build an inline StringView (length <= 12): prefix[0..4) + inline_data[0..8).
+static StringView sv_inl(const char* s, uint32_t len) {
+    StringView v{};
+    v.length = len;
+    const uint32_t p = (len < 4u) ? len : 4u;
+    if (p > 0) std::memcpy(v.prefix, s, p);
+    if (len > 4u) std::memcpy(v.inline_data, s + 4, len - 4u);
+    return v;
+}
+
+// Resolve one output group key's content bytes as a std::string, via the
+// output column's own str_overflow_base (inline views ignore the base).
+static std::string resolve_key(const BoltColumn& col, uint32_t row) {
+    StringView sv;
+    std::memcpy(&sv, &static_cast<const StringView*>(col.data)[row], 16);
+    const char* b = static_cast<const char*>(col.str_overflow_base);
+    const char* p = bolt::kernels::utf8::sv_bytes(sv, b);
+    return std::string(p, sv.length);
+}
+
+// Shared body: run the one-shot grouper over a Utf8 key column mixing two
+// spilled keys and one inline key (with duplicates) and verify grouping,
+// per-group SUM/COUNT, and — the K-AGG-B fix — that the output key column
+// owns its spilled bytes and every group key resolves to the right string.
+static void check_spilled_utf8_key_grouping(const BoltColumn& key_col,
+                                            const int64_t* vals, int64_t n) {
+    Arena a;
+    BoltColumn val = BoltColumn::make_flat(const_cast<int64_t*>(vals), nullptr,
+                                           n, BoltType::Int64);
+    AggSpec specs[2] = {make_spec(AggKind::Sum, 0),
+                        make_spec(AggKind::CountStar, 0)};
+    BoltColumn ok[1], oa[2];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key_col, 1, &val, 1, specs, 2, n,
+                                            ok, oa, &ng, &a, /*hint=*/8));
+    EXPECT_EQ(ng, 3u);
+    EXPECT_EQ(ok[0].type, BoltType::Utf8);
+
+    // Per-group aggregates verified WITHOUT touching the spilled base, so
+    // this part passes both pre- and post-fix (grouping was already correct).
+    const int64_t* sums = static_cast<const int64_t*>(oa[0].data);
+    const int64_t* cnts = static_cast<const int64_t*>(oa[1].data);
+    // Expected (sum,count) multiset: A=(40,2) B=(20,1) C=(15,3).
+    int seen_A = 0, seen_B = 0, seen_C = 0;
+    for (uint32_t i = 0; i < ng; ++i) {
+        if (sums[i] == 40 && cnts[i] == 2) ++seen_A;
+        else if (sums[i] == 20 && cnts[i] == 1) ++seen_B;
+        else if (sums[i] == 15 && cnts[i] == 3) ++seen_C;
+        else ADD_FAILURE() << "unexpected group sum=" << sums[i]
+                           << " count=" << cnts[i];
+    }
+    EXPECT_EQ(seen_A, 1);
+    EXPECT_EQ(seen_B, 1);
+    EXPECT_EQ(seen_C, 1);
+
+    // K-AGG-B fix: spilled group keys are present, so the output key column
+    // MUST own a non-null str_overflow_base. ASSERT (not EXPECT) so a
+    // pre-fix run returns here instead of dereferencing a nullptr base.
+    ASSERT_NE(ok[0].str_overflow_base, nullptr)
+        << "output Utf8 key column lacks a spilled-byte base — spilled group "
+           "keys dangle";
+
+    // Every group key resolves to the correct content bytes via the output
+    // column's own base — proves the deep copy is correct (not just non-null).
+    bool got_A = false, got_B = false, got_C = false;
+    for (uint32_t i = 0; i < ng; ++i) {
+        const std::string k = resolve_key(ok[0], i);
+        if (k == "alpha_long_key_0001") { got_A = true; EXPECT_EQ(sums[i], 40); EXPECT_EQ(cnts[i], 2); }
+        else if (k == "beta_longer_key_0002") { got_B = true; EXPECT_EQ(sums[i], 20); EXPECT_EQ(cnts[i], 1); }
+        else if (k == "short") { got_C = true; EXPECT_EQ(sums[i], 15); EXPECT_EQ(cnts[i], 3); }
+        else ADD_FAILURE() << "unresolved/garbled group key: '" << k << "'";
+    }
+    EXPECT_TRUE(got_A);
+    EXPECT_TRUE(got_B);
+    EXPECT_TRUE(got_C);
+}
+
+TEST(BoltGroupbyTyped, SpilledUtf8KeyGroupsAndResolvesFromOwnBase) {
+    // Overflow buffer holding the two spilled (>12B) key strings.
+    static char ovf[64];
+    std::memset(ovf, 0, sizeof(ovf));
+    std::memcpy(ovf + 0,  "alpha_long_key_0001", 19);   // offset 0,  len 19
+    std::memcpy(ovf + 24, "beta_longer_key_0002", 20);  // offset 24, len 20
+    StringView keys[6] = {
+        sv_spilled(ovf, 0, 19),    // A
+        sv_inl("short", 5),        // C
+        sv_spilled(ovf, 24, 20),   // B
+        sv_spilled(ovf, 0, 19),    // A (dup)
+        sv_inl("short", 5),        // C (dup)
+        sv_inl("short", 5),        // C (dup)
+    };
+    int64_t vals[6] = {10, 5, 20, 30, 5, 5};   // A:10+30=40, C:5+5+5=15, B:20
+    BoltColumn key = BoltColumn::make_flat(keys, nullptr, 6, BoltType::Utf8);
+    key.str_overflow_base = ovf;
+    check_spilled_utf8_key_grouping(key, vals, 6);
+}
+
+// SLICE case: the key column's data pointer starts PAST row 0 of a larger
+// StringView array while str_overflow_base points at the full overflow
+// buffer. Spilled ref.offsets are relative to that full base — a fix that
+// assumed the base begins at the slice's first row (offset 0) would resolve
+// garbage. The two leading padding views deliberately differ in content.
+TEST(BoltGroupbyTyped, SpilledUtf8KeySlicedColumnResolvesCorrectly) {
+    static char ovf[96];
+    std::memset(ovf, 0, sizeof(ovf));
+    std::memcpy(ovf + 0,  "PADPADPADPADPADPAD00", 20);   // padding row's key
+    std::memcpy(ovf + 32, "alpha_long_key_0001", 19);
+    std::memcpy(ovf + 56, "beta_longer_key_0002", 20);
+    // Full array of 8; real keys live at [2..8).
+    StringView full[8] = {
+        sv_spilled(ovf, 0, 20),    // padding row 0 (not scanned)
+        sv_inl("pad", 3),          // padding row 1 (not scanned)
+        sv_spilled(ovf, 32, 19),   // A
+        sv_inl("short", 5),        // C
+        sv_spilled(ovf, 56, 20),   // B
+        sv_spilled(ovf, 32, 19),   // A (dup)
+        sv_inl("short", 5),        // C (dup)
+        sv_inl("short", 5),        // C (dup)
+    };
+    int64_t vals[6] = {10, 5, 20, 30, 5, 5};
+    BoltColumn key = BoltColumn::make_flat(full + 2, nullptr, 6, BoltType::Utf8);
+    key.str_overflow_base = ovf;   // full base; offsets are absolute into it
+    check_spilled_utf8_key_grouping(key, vals, 6);
 }
 
 }  // namespace
