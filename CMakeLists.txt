@@ -198,7 +198,7 @@ endif()
 option(BOLT_BUILD_PARSE "Build bolt::parse compiled library" ${BOLT_IS_TOPLEVEL})
 
 if(BOLT_BUILD_PARSE)
-    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
+    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_json_writer.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
     add_library(bolt::parse ALIAS bolt_parse)
     target_link_libraries(bolt_parse PUBLIC bolt::core)
     target_include_directories(bolt_parse PUBLIC
