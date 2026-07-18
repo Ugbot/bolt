@@ -547,35 +547,128 @@ TEST(BoltRocm, ResidentLayerForwardMatchesCpuReference) {
     ASSERT_TRUE(bolt::rocm::attention(ctx, static_cast<const float*>(dq.ptr), pkc, pvc,
                                       static_cast<float*>(dcxt.ptr), num_heads, num_kv_heads,
                                       head_dim, S, scale));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWo.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dcxt.ptr),
-                                           static_cast<float*>(dao.ptr), H, q_dim));
-    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dx.ptr),
-                                        static_cast<const float*>(dao.ptr),
-                                        static_cast<float*>(dx.ptr), H, /*add=*/0));
+    // O-proj with FUSED residual add (BLLM-189): dx += Wo·ctx.
+    ASSERT_TRUE(bolt::rocm::matmul_dequant_residual(ctx, dWo.ptr, WeightDType::F32, nullptr,
+                                                    static_cast<const float*>(dcxt.ptr),
+                                                    static_cast<float*>(dx.ptr), H, q_dim));
     // FFN sublayer.
     ASSERT_TRUE(bolt::rocm::rmsnorm(ctx, static_cast<const float*>(dx.ptr),
                                     static_cast<const float*>(dn2.ptr),
                                     static_cast<float*>(dnorm.ptr), H, eps));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWg.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dnorm.ptr),
-                                           static_cast<float*>(dg.ptr), ffn, H));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWu.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dnorm.ptr),
-                                           static_cast<float*>(du.ptr), ffn, H));
-    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dg.ptr),
-                                        static_cast<const float*>(du.ptr),
-                                        static_cast<float*>(dact.ptr), ffn, /*swiglu=*/1));
-    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWd.ptr, WeightDType::F32, nullptr,
-                                           static_cast<const float*>(dact.ptr),
-                                           static_cast<float*>(ddn.ptr), H, ffn));
-    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dx.ptr),
-                                        static_cast<const float*>(ddn.ptr),
-                                        static_cast<float*>(dx.ptr), H, /*add=*/0));
+    // FUSED gate+up+SwiGLU (BLLM-189): 3 ops -> 1.
+    ASSERT_TRUE(bolt::rocm::fused_swiglu(ctx, dWg.ptr, dWu.ptr, WeightDType::F32, nullptr, nullptr,
+                                         static_cast<const float*>(dnorm.ptr),
+                                         static_cast<float*>(dact.ptr), ffn, H));
+    // down-proj with FUSED residual add: dx += Wd·act.
+    ASSERT_TRUE(bolt::rocm::matmul_dequant_residual(ctx, dWd.ptr, WeightDType::F32, nullptr,
+                                                    static_cast<const float*>(dact.ptr),
+                                                    static_cast<float*>(dx.ptr), H, ffn));
 
     std::vector<float> out(static_cast<size_t>(H));
     ASSERT_TRUE(ctx.copy_to_host(dx, out.data(), out.size() * sizeof(float)));
     for (int i = 0; i < H; ++i) {
         EXPECT_NEAR(out[static_cast<size_t>(i)], ref_x[static_cast<size_t>(i)], 1e-3f) << "i=" << i;
     }
+}
+
+// BLLM-189: fused gate+up+SwiGLU (F32) matches the unfused gate-matmul +
+// up-matmul + SwiGLU reference.
+TEST(BoltRocm, FusedSwigluF32MatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int rows = 300, cols = 128;  // ffn rows x hidden cols
+    std::vector<float> wg(static_cast<size_t>(rows) * cols), wu(static_cast<size_t>(rows) * cols),
+        x(static_cast<size_t>(cols));
+    for (int i = 0; i < rows * cols; ++i) {
+        wg[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.1f;
+        wu[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.15f;
+    }
+    for (int c = 0; c < cols; ++c) x[static_cast<size_t>(c)] = static_cast<float>((c % 9) - 4) * 0.2f;
+
+    std::vector<float> ref(static_cast<size_t>(rows));
+    for (int r = 0; r < rows; ++r) {
+        float g = 0.0f, u = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            g += x[static_cast<size_t>(c)] * wg[static_cast<size_t>(r) * cols + c];
+            u += x[static_cast<size_t>(c)] * wu[static_cast<size_t>(r) * cols + c];
+        }
+        ref[static_cast<size_t>(r)] = (g / (1.0f + std::exp(-g))) * u;
+    }
+
+    DeviceBuffer dg, du, dx, da;
+    ASSERT_TRUE(ctx.allocate(wg.size() * sizeof(float), &dg));
+    ASSERT_TRUE(ctx.allocate(wu.size() * sizeof(float), &du));
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &dx));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(rows) * sizeof(float), &da));
+    ASSERT_TRUE(ctx.copy_to_device(wg.data(), &dg, wg.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(wu.data(), &du, wu.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &dx, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::fused_swiglu(ctx, dg.ptr, du.ptr, WeightDType::F32, nullptr, nullptr,
+                                         static_cast<const float*>(dx.ptr),
+                                         static_cast<float*>(da.ptr), rows, cols));
+    std::vector<float> act(static_cast<size_t>(rows));
+    ASSERT_TRUE(ctx.copy_to_host(da, act.data(), act.size() * sizeof(float)));
+    for (int r = 0; r < rows; ++r)
+        EXPECT_NEAR(act[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-4f) << "r=" << r;
+    ctx.free(&dg); ctx.free(&du); ctx.free(&dx); ctx.free(&da);
+}
+
+// BLLM-189: fused gate+up+SwiGLU (Int8 weights + per-row scales).
+TEST(BoltRocm, FusedSwigluInt8MatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int rows = 256, cols = 96;
+    std::vector<int8_t> wg(static_cast<size_t>(rows) * cols), wu(static_cast<size_t>(rows) * cols);
+    std::vector<float> gs(static_cast<size_t>(rows)), us(static_cast<size_t>(rows)),
+        x(static_cast<size_t>(cols));
+    for (int i = 0; i < rows * cols; ++i) {
+        wg[static_cast<size_t>(i)] = static_cast<int8_t>((i % 15) - 7);
+        wu[static_cast<size_t>(i)] = static_cast<int8_t>((i % 11) - 5);
+    }
+    for (int r = 0; r < rows; ++r) {
+        gs[static_cast<size_t>(r)] = 0.01f + static_cast<float>(r % 4) * 0.003f;
+        us[static_cast<size_t>(r)] = 0.02f + static_cast<float>(r % 3) * 0.004f;
+    }
+    for (int c = 0; c < cols; ++c) x[static_cast<size_t>(c)] = static_cast<float>((c % 9) - 4) * 0.2f;
+
+    std::vector<float> ref(static_cast<size_t>(rows));
+    for (int r = 0; r < rows; ++r) {
+        float g = 0.0f, u = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            g += x[static_cast<size_t>(c)] * static_cast<float>(wg[static_cast<size_t>(r) * cols + c]);
+            u += x[static_cast<size_t>(c)] * static_cast<float>(wu[static_cast<size_t>(r) * cols + c]);
+        }
+        g *= gs[static_cast<size_t>(r)];
+        u *= us[static_cast<size_t>(r)];
+        ref[static_cast<size_t>(r)] = (g / (1.0f + std::exp(-g))) * u;
+    }
+
+    DeviceBuffer dg, du, dgs, dus, dx, da;
+    ASSERT_TRUE(ctx.allocate(wg.size(), &dg));
+    ASSERT_TRUE(ctx.allocate(wu.size(), &du));
+    ASSERT_TRUE(ctx.allocate(gs.size() * sizeof(float), &dgs));
+    ASSERT_TRUE(ctx.allocate(us.size() * sizeof(float), &dus));
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &dx));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(rows) * sizeof(float), &da));
+    ASSERT_TRUE(ctx.copy_to_device(wg.data(), &dg, wg.size()));
+    ASSERT_TRUE(ctx.copy_to_device(wu.data(), &du, wu.size()));
+    ASSERT_TRUE(ctx.copy_to_device(gs.data(), &dgs, gs.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(us.data(), &dus, us.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &dx, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::fused_swiglu(ctx, dg.ptr, du.ptr, WeightDType::Int8,
+                                         static_cast<const float*>(dgs.ptr),
+                                         static_cast<const float*>(dus.ptr),
+                                         static_cast<const float*>(dx.ptr),
+                                         static_cast<float*>(da.ptr), rows, cols));
+    std::vector<float> act(static_cast<size_t>(rows));
+    ASSERT_TRUE(ctx.copy_to_host(da, act.data(), act.size() * sizeof(float)));
+    for (int r = 0; r < rows; ++r)
+        EXPECT_NEAR(act[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-4f) << "r=" << r;
+    ctx.free(&dg); ctx.free(&du); ctx.free(&dgs); ctx.free(&dus); ctx.free(&dx); ctx.free(&da);
 }

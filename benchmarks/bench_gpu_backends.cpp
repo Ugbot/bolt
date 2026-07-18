@@ -191,14 +191,13 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
             rope(ctx, mp(q), head_dim, heads, pos, theta);
             rope(ctx, kslot, head_dim, kv_heads, pos, theta);
             attention(ctx, fp(q), fp(kc[l]), fp(vc[l]), mp(ctxb), heads, kv_heads, head_dim, S, scale);
-            matmul_dequant(ctx, wo[l].ptr, wdt, sc(so, l), fp(ctxb), mp(ao), H, q_dim);
-            elementwise(ctx, fp(hid), fp(ao), mp(hid), H, 0);
+            // O-proj with FUSED residual add (BLLM-189): hid += Wo·ctx.
+            matmul_dequant_residual(ctx, wo[l].ptr, wdt, sc(so, l), fp(ctxb), mp(hid), H, q_dim);
             rmsnorm(ctx, fp(hid), fp(fn[l]), mp(nrm), H, eps);
-            matmul_dequant(ctx, wg[l].ptr, wdt, sc(sg, l), fp(nrm), mp(gate), ffn, H);
-            matmul_dequant(ctx, wu[l].ptr, wdt, sc(su, l), fp(nrm), mp(up), ffn, H);
-            elementwise(ctx, fp(gate), fp(up), mp(act), ffn, 1);
-            matmul_dequant(ctx, wd[l].ptr, wdt, sc(sd, l), fp(act), mp(ffo), H, ffn);
-            elementwise(ctx, fp(hid), fp(ffo), mp(hid), H, 0);
+            // FUSED gate+up+SwiGLU (BLLM-189): 3 kernels -> 1.
+            fused_swiglu(ctx, wg[l].ptr, wu[l].ptr, wdt, sc(sg, l), sc(su, l), fp(nrm), mp(act), ffn, H);
+            // down-proj with FUSED residual add: hid += Wd·act.
+            matmul_dequant_residual(ctx, wd[l].ptr, wdt, sc(sd, l), fp(act), mp(hid), H, ffn);
         }
         rmsnorm(ctx, fp(hid), fp(d_fn), mp(nrm), H, eps);
         matmul_dequant(ctx, d_lm.ptr, wdt, int8 ? fp(s_lm) : nullptr, fp(nrm), mp(logits), vocab, H);

@@ -164,6 +164,15 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                      const float* scale_device, const float* activation_device,
                      float* out_device, int32_t out_rows, int32_t cols) noexcept;
 
+// BLLM-189: like matmul_dequant but ACCUMULATES -- out[r] += dot(weight.row(r),
+// activation) -- fusing a residual/skip add into the projection GEMV (removes a
+// separate elementwise-add kernel from the decode chain). `out_device` must hold
+// the residual on entry. F32 and Int8 weights only (the resident-graph tiers);
+// returns false for Int4/Int2. Precondition: ctx.is_valid().
+bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDType dtype,
+                             const float* scale_device, const float* activation_device,
+                             float* out_device, int32_t out_rows, int32_t cols) noexcept;
+
 // BLLM-91: int8-ACTIVATION matmul -- the HIP twin of
 // bolt::vulkan::Context::matmul_dequant_int8_activation (BLLM-81), the
 // real expert-FFN numerics tier (distinct from matmul_dequant above, which
@@ -209,5 +218,16 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
 bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
                const float* v_cache_device, float* out_device, int32_t num_heads,
                int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale) noexcept;
+
+// BLLM-189: fused gate+up+SwiGLU FFN. Computes act[r] = silu(dot(Wg[r],x)) *
+// dot(Wu[r],x) for r in [0,rows) in ONE kernel -- the op-fusion lever that
+// replaces gate-matmul + up-matmul + SwiGLU-elementwise (3 launches + 2 buffers)
+// with 1. `wg`/`wu` are row-major [rows, cols] of dtype (F32 or Int8); for Int8,
+// `wg_scale`/`wu_scale` are the per-row scales (required; ignored for F32).
+// `x` is the [cols] float activation, `act` the [rows] float output. Same per-row
+// scale + dequant contract as matmul_dequant. Precondition: ctx.is_valid().
+bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtype,
+                  const float* wg_scale, const float* wu_scale, const float* x, float* act,
+                  int32_t rows, int32_t cols) noexcept;
 
 }  // namespace bolt::rocm

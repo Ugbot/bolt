@@ -2285,3 +2285,27 @@ attention -- ~15 kernels/layer -> ~5. hipGraph kept as a shipped primitive (righ
 tool when CPU launch IS the bound: many tiny independent kernels) but not the
 decode lever. Measure-don't-assume win: the disproven hypothesis localized the
 real cause. BLLM-189 redirected to fusion.
+
+## 2026-07-18 / op fusion landing -- 97 -> 110 t/s Int8 0.5B (BLLM-189)
+
+The lever from the prior entry, executed. Each fusion TigerStyle + branch-free +
+coherence-gated (resident-layer test now runs the FUSED path, still matches CPU
+1e-3) + unit-tested.
+
+  step                                     kern/layer  0.5B Int8
+  unfused                                     15         97 t/s   (84% of llama.cpp)
+  + fused gate+up+SwiGLU (3->1)               13        108 t/s   (93%)
+  + residual-add folded into O/down matmul    11        110 t/s   (95%)
+
+- fused_swiglu (f32/int8): one block per FFN row does both gate & up dots in one
+  pass (two shared-mem reductions) + silu(gate)*up. Removes 2 big GEMV launches +
+  gate/up/act intermediate buffers. Biggest single jump (+11 t/s).
+- matmul_dequant_f32/int8_kernel templated on <bool Accumulate> (compile-time
+  dispatch, branch vanishes); matmul_dequant_residual launches <true> so
+  out[r]+=dot folds the skip-add into the projection. Small gain (+2, the elt-add
+  was cheap) but removes 2 launches/layer.
+
+Still latency-bound (9.08ms Int8 = 54 GB/s effective vs 3.3ms bandwidth ceiling;
+266 kernels x ~22us). Next: fused QKV (3->1), merge 2 rope launches -> cross 116.
+Open caveat: 116 is llama.cpp CPU-only; fair GPU-vs-GPU needs llama.cpp's Vulkan
+backend on this iGPU.
