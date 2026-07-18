@@ -106,8 +106,24 @@ public:
     bool copy_to_device(const void* host_src, DeviceBuffer* dst, uint64_t size_bytes) noexcept;
     bool copy_to_host(const DeviceBuffer& src, void* host_dst, uint64_t size_bytes) noexcept;
 
+    // BLLM-188: batch mode for the resident-graph forward. Between begin_batch()
+    // and end_batch(), the compute ops (matmul_dequant/rmsnorm/rope/elementwise/
+    // attention) skip their per-op hipDeviceSynchronize -- the kernels serialize
+    // in issue order on the default stream, so correctness is preserved and the
+    // whole layer/graph costs ONE sync instead of one-per-op (this is the lever
+    // the per-op GEMV bench, docs/perf/gpu-backends-parity.md, identified as the
+    // decode-throughput cap). end_batch() performs the single sync and returns
+    // false iff any batched launch failed. Nesting is not supported; begin then
+    // end. Outside a batch (the default) every op syncs as before.
+    void begin_batch() noexcept { batch_mode_ = true; }
+    bool end_batch() noexcept;
+    // True between begin_batch() and end_batch(); the free-function ops read
+    // this to decide whether to skip their per-op sync.
+    bool batching() const noexcept { return batch_mode_; }
+
 private:
     bool     valid_ = false;
+    bool     batch_mode_ = false;
     int32_t  device_index_ = -1;
     int32_t  wavefront_size_ = 0;
     char     device_name_[256] = {};

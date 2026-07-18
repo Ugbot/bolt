@@ -340,6 +340,11 @@ bool Context::copy_to_host(const DeviceBuffer& src, void* host_dst, uint64_t siz
     return hipMemcpy(host_dst, src.ptr, size_bytes, hipMemcpyDeviceToHost) == hipSuccess;
 }
 
+bool Context::end_batch() noexcept {
+    batch_mode_ = false;
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
 bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                      const float* scale_device, const float* activation_device,
                      float* out_device, int32_t out_rows, int32_t cols) noexcept {
@@ -376,7 +381,7 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
             return false;
     }
 
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, WeightDType dtype,
@@ -407,7 +412,7 @@ bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, Wei
             return false;
     }
 
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* y_device, int32_t n,
@@ -417,7 +422,7 @@ bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* 
         return false;
     }
     rmsnorm_kernel<<<dim3(1), dim3(kBlockSize)>>>(x_device, w_device, y_device, n, eps);
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, int32_t position,
@@ -426,7 +431,7 @@ bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, in
     const int32_t total = num_heads * (head_dim / 2);
     const dim3 grid(static_cast<unsigned int>((total + kBlockSize - 1) / kBlockSize));
     rope_kernel<<<grid, dim3(kBlockSize)>>>(x_device, head_dim, num_heads, position, theta);
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 bool elementwise(Context& ctx, const float* a_device, const float* b_device, float* out_device,
@@ -437,7 +442,7 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
     }
     const dim3 grid(static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize));
     elementwise_kernel<<<grid, dim3(kBlockSize)>>>(a_device, b_device, out_device, n, op);
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
@@ -456,7 +461,7 @@ bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
                        dim3(static_cast<unsigned int>(block))>>>(
         q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
         seq_len, scale);
-    return hipDeviceSynchronize() == hipSuccess;
+    return ctx.batching() ? true : (hipDeviceSynchronize() == hipSuccess);
 }
 
 }  // namespace bolt::rocm

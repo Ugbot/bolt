@@ -2240,3 +2240,25 @@ the largest shape. => move big attention/FFN GEMVs to GPU, keep small/norm ops
 on CPU. The per-op transfer+WaitIdle overhead measured here is exactly what the
 engine-wired resident graph (BLLM-174 resident activations + BLLM-175 batched
 single-submit) removes -- that's the next lever, now with a measured ceiling.
+
+## 2026-07-18 / ROCm resident-graph decode measured + launch-overhead finding (BLLM-188/189)
+
+Added bolt::rocm batch mode (begin_batch/end_batch): between them the compute ops
+skip their per-op hipDeviceSynchronize (kernels serialize on the default stream),
+so a whole token costs ONE sync. bench_gpu_backends.cpp runs a full resident-graph
+decode step at Qwen2.5-0.5B shape (24 layers + lm_head), weights resident, only
+logits read back.
+
+Measured (Radeon 8060S, stable):
+  F32  weights: ~13.3 ms/token -> ~75 t/s  (65% of llama.cpp's 116)
+  Int8 weights: ~10.3 ms/token -> ~97 t/s  (84%) -- MEASURED, beats boltllm CPU
+                                                    (Int8 60 / Int4 90 t/s)
+
+KEY FINDING: Int8 is only 1.3x faster than F32, NOT the 4x its byte savings imply.
+F32 GEMVs are bandwidth-bound (~146 GB/s, launches hidden behind long kernels);
+Int8 GEMVs are 4x faster so the ~362 kernel LAUNCHES/token (~20us each ~= 7ms)
+become the exposed floor. Int8's bandwidth ceiling is ~3.4ms (~290 t/s) -- launch
+overhead caps it at ~10ms. => the bottleneck flipped from bandwidth to launch
+overhead. Next lever to pass llama.cpp: hipGraph capture (replay the token's
+kernel sequence, no per-launch cost) + op fusion (norm+matmul, gate+up+SwiGLU),
+targeting Int8's ~290 t/s ceiling = ~2.5x llama.cpp. New ticket BLLM-189.

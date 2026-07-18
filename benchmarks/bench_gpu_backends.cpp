@@ -115,6 +115,108 @@ private:
     bool stop_ = false;
 };
 
+#if defined(BOLT_HAVE_ROCM)
+// BLLM-188: full resident-graph decode step at Qwen2.5-0.5B shape, chained
+// entirely on-device in BATCH mode (one hipDeviceSynchronize per TOKEN, not per
+// op). Weights are resident (uploaded once); per token we run all layers' ops
+// back-to-back on the stream and read back only the logits. This is the decode
+// throughput the resident graph unlocks -- the per-op transfer+sync overhead the
+// GEMV table pays is gone. Weights are uninitialized (perf is bandwidth, not
+// values). Returns median ms/token, or 0 on setup failure.
+double bench_rocm_resident_forward(bolt::rocm::Context& ctx, bool int8) {
+    using namespace bolt::rocm;
+    const int H = 896, layers = 24, heads = 14, kv_heads = 2, head_dim = 64, ffn = 4864;
+    const int vocab = 151936;
+    const int q_dim = heads * head_dim;        // 896
+    const int kv_dim = kv_heads * head_dim;    // 128
+    const int S = 128;                          // KV cache length (mid-sequence)
+    const int pos = S - 1;
+    const float eps = 1e-5f, theta = 1e6f;
+    const float scale = 1.0f / 8.0f;            // 1/sqrt(64)
+    const WeightDType wdt = int8 ? WeightDType::Int8 : WeightDType::F32;
+    const uint64_t wbpe = int8 ? 1u : 4u;       // weight bytes per element
+
+    // GEMV-weight buffers (dtype-sized) + their per-row scale buffers (Int8 only).
+    std::vector<DeviceBuffer> wq, wk, wv, wo, wg, wu, wd;
+    std::vector<DeviceBuffer> sq, sk, sv, so, sg, su, sd;
+    // f32 norm weights + f32 KV cache (norms/activations stay f32 in both modes).
+    std::vector<DeviceBuffer> an, fn, kc, vc;
+    bool ok = true;
+    auto aw = [&](int64_t rows, int64_t cols, std::vector<DeviceBuffer>& wv_, std::vector<DeviceBuffer>& sv_) {
+        DeviceBuffer w, s;
+        ok = ok && ctx.allocate(static_cast<uint64_t>(rows * cols) * wbpe, &w);
+        wv_.push_back(w);
+        if (int8) { ok = ok && ctx.allocate(static_cast<uint64_t>(rows) * 4, &s); sv_.push_back(s); }
+    };
+    auto af = [&](int64_t elems, std::vector<DeviceBuffer>& into) {
+        DeviceBuffer b; ok = ok && ctx.allocate(static_cast<uint64_t>(elems) * 4, &b); into.push_back(b);
+    };
+    for (int l = 0; l < layers; ++l) {
+        af(H, an); af(H, fn); af((int64_t)S * kv_dim, kc); af((int64_t)S * kv_dim, vc);
+        aw(q_dim, H, wq, sq); aw(kv_dim, H, wk, sk); aw(kv_dim, H, wv, sv); aw(H, q_dim, wo, so);
+        aw(ffn, H, wg, sg); aw(ffn, H, wu, su); aw(H, ffn, wd, sd);
+    }
+    DeviceBuffer d_fn, d_lm, s_lm, hid, nrm, q, ctxb, ao, gate, up, act, ffo, logits;
+    ok = ok && ctx.allocate((uint64_t)H * 4, &d_fn) &&
+         ctx.allocate((uint64_t)vocab * H * wbpe, &d_lm) &&
+         (!int8 || ctx.allocate((uint64_t)vocab * 4, &s_lm)) &&
+         ctx.allocate((uint64_t)H * 4, &hid) && ctx.allocate((uint64_t)H * 4, &nrm) &&
+         ctx.allocate((uint64_t)q_dim * 4, &q) && ctx.allocate((uint64_t)q_dim * 4, &ctxb) &&
+         ctx.allocate((uint64_t)H * 4, &ao) && ctx.allocate((uint64_t)ffn * 4, &gate) &&
+         ctx.allocate((uint64_t)ffn * 4, &up) && ctx.allocate((uint64_t)ffn * 4, &act) &&
+         ctx.allocate((uint64_t)H * 4, &ffo) && ctx.allocate((uint64_t)vocab * 4, &logits);
+    if (!ok) { std::printf("  (resident-forward: device alloc failed -- out of memory?)\n"); return 0.0; }
+
+    std::vector<float> logits_host(static_cast<size_t>(vocab));
+    auto fp = [](const DeviceBuffer& b) { return static_cast<const float*>(b.ptr); };
+    auto mp = [](const DeviceBuffer& b) { return static_cast<float*>(b.ptr); };
+    auto sc = [&](std::vector<DeviceBuffer>& sv_, int l) { return int8 ? fp(sv_[l]) : nullptr; };
+
+    auto forward = [&]() {
+        ctx.begin_batch();
+        for (int l = 0; l < layers; ++l) {
+            float* kslot = mp(kc[l]) + (int64_t)pos * kv_dim;
+            float* vslot = mp(vc[l]) + (int64_t)pos * kv_dim;
+            rmsnorm(ctx, fp(hid), fp(an[l]), mp(nrm), H, eps);
+            matmul_dequant(ctx, wq[l].ptr, wdt, sc(sq, l), fp(nrm), mp(q), q_dim, H);
+            matmul_dequant(ctx, wk[l].ptr, wdt, sc(sk, l), fp(nrm), kslot, kv_dim, H);
+            matmul_dequant(ctx, wv[l].ptr, wdt, sc(sv, l), fp(nrm), vslot, kv_dim, H);
+            rope(ctx, mp(q), head_dim, heads, pos, theta);
+            rope(ctx, kslot, head_dim, kv_heads, pos, theta);
+            attention(ctx, fp(q), fp(kc[l]), fp(vc[l]), mp(ctxb), heads, kv_heads, head_dim, S, scale);
+            matmul_dequant(ctx, wo[l].ptr, wdt, sc(so, l), fp(ctxb), mp(ao), H, q_dim);
+            elementwise(ctx, fp(hid), fp(ao), mp(hid), H, 0);
+            rmsnorm(ctx, fp(hid), fp(fn[l]), mp(nrm), H, eps);
+            matmul_dequant(ctx, wg[l].ptr, wdt, sc(sg, l), fp(nrm), mp(gate), ffn, H);
+            matmul_dequant(ctx, wu[l].ptr, wdt, sc(su, l), fp(nrm), mp(up), ffn, H);
+            elementwise(ctx, fp(gate), fp(up), mp(act), ffn, 1);
+            matmul_dequant(ctx, wd[l].ptr, wdt, sc(sd, l), fp(act), mp(ffo), H, ffn);
+            elementwise(ctx, fp(hid), fp(ffo), mp(hid), H, 0);
+        }
+        rmsnorm(ctx, fp(hid), fp(d_fn), mp(nrm), H, eps);
+        matmul_dequant(ctx, d_lm.ptr, wdt, int8 ? fp(s_lm) : nullptr, fp(nrm), mp(logits), vocab, H);
+        ctx.end_batch();  // ONE sync for the whole token
+        ctx.copy_to_host(logits, logits_host.data(), logits_host.size() * sizeof(float));
+    };
+
+    for (int i = 0; i < 3; ++i) forward();  // warmup
+    std::vector<double> ts;
+    for (int i = 0; i < 20; ++i) {
+        auto a = Clock::now();
+        forward();
+        ts.push_back(std::chrono::duration<double, std::micro>(Clock::now() - a).count());
+    }
+    auto freev = [&](std::vector<DeviceBuffer>& v) { for (auto& b : v) ctx.free(&b); };
+    freev(wq); freev(wk); freev(wv); freev(wo); freev(wg); freev(wu); freev(wd);
+    freev(sq); freev(sk); freev(sv); freev(so); freev(sg); freev(su); freev(sd);
+    freev(an); freev(fn); freev(kc); freev(vc);
+    ctx.free(&d_fn); ctx.free(&d_lm); ctx.free(&s_lm); ctx.free(&hid); ctx.free(&nrm); ctx.free(&q);
+    ctx.free(&ctxb); ctx.free(&ao); ctx.free(&gate); ctx.free(&up); ctx.free(&act);
+    ctx.free(&ffo); ctx.free(&logits);
+    return median_us(ts) / 1000.0;  // ms/token
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -236,5 +338,20 @@ int main() {
     }
     std::printf("\nNote: GPU numbers include per-op activation upload + dispatch + wait + readback\n");
     std::printf("(weights resident). On UMA all paths hit the same LPDDR5X; ~256 GB/s is the wall.\n");
+
+#if defined(BOLT_HAVE_ROCM)
+    if (rocm_ok) {
+        std::printf("\n--- ROCm resident-graph decode (Qwen2.5-0.5B shape, 24 layers + lm_head) ---\n");
+        std::printf("Whole token chained on-device, ONE sync/token (batch mode).\n");
+        const double ms_f32 = bench_rocm_resident_forward(rocm, /*int8=*/false);
+        if (ms_f32 > 0.0)
+            std::printf("  F32 weights:   %6.2f ms/token  ->  %6.1f tok/s\n", ms_f32, 1000.0 / ms_f32);
+        const double ms_i8 = bench_rocm_resident_forward(rocm, /*int8=*/true);
+        if (ms_i8 > 0.0)
+            std::printf("  Int8 weights:  %6.2f ms/token  ->  %6.1f tok/s   (MEASURED)\n", ms_i8, 1000.0 / ms_i8);
+        std::printf("  llama.cpp baseline (Qwen2.5-0.5B Q8_0, CPU-only llama-bench): 116 tok/s\n");
+        std::printf("  boltllm CPU:  Int8 ~60 tok/s, Int4 ~90 tok/s (docs/perf/llama-cpp-baseline.md)\n");
+    }
+#endif
     return 0;
 }
