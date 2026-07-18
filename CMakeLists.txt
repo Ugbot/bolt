@@ -571,6 +571,47 @@ if(BOLT_BUILD_ROCM)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::cuda — NVIDIA/CUDA compute backend (BLLM-182). A near-1:1 mirror of
+# bolt::rocm (CUDA and HIP are source-compatible). Unlike the ROCm block above
+# (which needs a Windows clang++-direct workaround for the enable_language(HIP)
+# /machine:x64 link gap), CUDA has first-class CMake support, so this uses the
+# standard enable_language(CUDA) + CUDAToolkit path -- compiling bolt_cuda.cpp
+# as a CUDA TU (LANGUAGE CUDA). OFF by default; requires an explicit
+# -DBOLT_BUILD_CUDA=ON AND a real nvcc / CMAKE_CUDA_COMPILER. This dev box has
+# no NVIDIA GPU / no CUDA toolkit, so it stays inert here (BLLM-182 open until
+# validated on real hardware -- see bolt_cuda.h's status note).
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_CUDA "Build bolt::cuda CUDA/NVIDIA matmul+dequant + on-device-forward kernel core (needs nvcc; unvalidated -- see bolt_cuda.h)" OFF)
+
+if(BOLT_BUILD_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(WARNING "BOLT_BUILD_CUDA requested but no CUDA compiler (nvcc) found -- skipping bolt::cuda")
+        set(BOLT_BUILD_CUDA OFF)
+    endif()
+endif()
+
+if(BOLT_BUILD_CUDA)
+    enable_language(CUDA)
+    add_library(bolt_cuda STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp")
+    # nvcc compiles bolt_cuda.cpp as CUDA (it uses <<<>>> launch syntax + __global__).
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp"
+                                PROPERTIES LANGUAGE CUDA)
+    set_target_properties(bolt_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_library(bolt::cuda ALIAS bolt_cuda)
+    target_include_directories(bolt_cuda PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    # cudart -- the CUDA runtime (cudaMalloc/cudaMemcpy/kernel-launch symbols).
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_libraries(bolt_cuda PUBLIC CUDA::cudart)
+    endif()
+    target_link_libraries(bolt INTERFACE bolt::cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # bolt::ingest — compiled static library (CSV loader).
 # Delegates numeric parsing to bolt::parse; ships as a TU so the parser
 # tables link once per binary instead of per consumer.

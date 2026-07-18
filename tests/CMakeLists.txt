@@ -768,6 +768,17 @@ if(BOLT_BUILD_ROCM)
     add_test(NAME test_bolt_rocm COMMAND test_bolt_rocm)
 endif()
 
+# CUDA/NVIDIA kernel core — BLLM-182. Mirror of test_bolt_rocm; self-skips
+# (GTEST_SKIP) if bolt::cuda::available() is false. Only built when a real
+# nvcc was found (BOLT_BUILD_CUDA) -- not the case on this NVIDIA-less box.
+if(BOLT_BUILD_CUDA)
+    add_executable(test_bolt_cuda test_bolt_cuda.cpp)
+    target_link_libraries(test_bolt_cuda
+        PRIVATE bolt::bolt bolt::cuda GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_cuda)
+    add_test(NAME test_bolt_cuda COMMAND test_bolt_cuda)
+endif()
+
 # Atomic-bitmap primitives — soft-delete / live-mask substrate.
 add_executable(test_bolt_atomic_bitmap test_bolt_atomic_bitmap.cpp)
 target_link_libraries(test_bolt_atomic_bitmap
