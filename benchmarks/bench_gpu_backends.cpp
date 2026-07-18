@@ -128,31 +128,36 @@ struct ModelCfg {
     int H, layers, heads, kv_heads, head_dim, ffn, vocab;
 };
 
-double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg, bool int8,
-                                   bool use_graph) {
+double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg,
+                                   bolt::rocm::WeightDType wdt, bool use_graph) {
     using namespace bolt::rocm;
     const int H = cfg.H, layers = cfg.layers, heads = cfg.heads, kv_heads = cfg.kv_heads;
     const int head_dim = cfg.head_dim, ffn = cfg.ffn, vocab = cfg.vocab;
+    const bool quant = wdt != WeightDType::F32;  // Int8/Int4 carry per-row scales
+    // Weight bytes for a [rows,cols] matrix: F32=4B, Int8=1B, Int4=0.5B (packed).
+    auto wbytes = [&](int64_t rows, int64_t cols) -> uint64_t {
+        if (wdt == WeightDType::F32) return static_cast<uint64_t>(rows * cols) * 4;
+        if (wdt == WeightDType::Int8) return static_cast<uint64_t>(rows * cols);
+        return static_cast<uint64_t>(rows) * ((cols + 1) / 2);  // Int4
+    };
     const int q_dim = heads * head_dim;        // 896
     const int kv_dim = kv_heads * head_dim;    // 128
     const int S = 128;                          // KV cache length (mid-sequence)
     const int pos = S - 1;
     const float eps = 1e-5f, theta = 1e6f;
     const float scale = 1.0f / 8.0f;            // 1/sqrt(64)
-    const WeightDType wdt = int8 ? WeightDType::Int8 : WeightDType::F32;
-    const uint64_t wbpe = int8 ? 1u : 4u;       // weight bytes per element
 
-    // GEMV-weight buffers (dtype-sized) + their per-row scale buffers (Int8 only).
+    // GEMV-weight buffers (dtype-sized) + their per-row scale buffers (quant only).
     std::vector<DeviceBuffer> wq, wk, wv, wo, wg, wu, wd;
     std::vector<DeviceBuffer> sq, sk, sv, so, sg, su, sd;
-    // f32 norm weights + f32 KV cache (norms/activations stay f32 in both modes).
+    // f32 norm weights + f32 KV cache (norms/activations stay f32 in every mode).
     std::vector<DeviceBuffer> an, fn, kc, vc;
     bool ok = true;
     auto aw = [&](int64_t rows, int64_t cols, std::vector<DeviceBuffer>& wv_, std::vector<DeviceBuffer>& sv_) {
         DeviceBuffer w, s;
-        ok = ok && ctx.allocate(static_cast<uint64_t>(rows * cols) * wbpe, &w);
+        ok = ok && ctx.allocate(wbytes(rows, cols), &w);
         wv_.push_back(w);
-        if (int8) { ok = ok && ctx.allocate(static_cast<uint64_t>(rows) * 4, &s); sv_.push_back(s); }
+        if (quant) { ok = ok && ctx.allocate(static_cast<uint64_t>(rows) * 4, &s); sv_.push_back(s); }
     };
     auto af = [&](int64_t elems, std::vector<DeviceBuffer>& into) {
         DeviceBuffer b; ok = ok && ctx.allocate(static_cast<uint64_t>(elems) * 4, &b); into.push_back(b);
@@ -164,8 +169,8 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
     }
     DeviceBuffer d_fn, d_lm, s_lm, hid, nrm, q, ctxb, ao, gate, up, act, ffo, logits;
     ok = ok && ctx.allocate((uint64_t)H * 4, &d_fn) &&
-         ctx.allocate((uint64_t)vocab * H * wbpe, &d_lm) &&
-         (!int8 || ctx.allocate((uint64_t)vocab * 4, &s_lm)) &&
+         ctx.allocate(wbytes(vocab, H), &d_lm) &&
+         (!quant || ctx.allocate((uint64_t)vocab * 4, &s_lm)) &&
          ctx.allocate((uint64_t)H * 4, &hid) && ctx.allocate((uint64_t)H * 4, &nrm) &&
          ctx.allocate((uint64_t)q_dim * 4, &q) && ctx.allocate((uint64_t)q_dim * 4, &ctxb) &&
          ctx.allocate((uint64_t)H * 4, &ao) && ctx.allocate((uint64_t)ffn * 4, &gate) &&
@@ -176,7 +181,7 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
     std::vector<float> logits_host(static_cast<size_t>(vocab));
     auto fp = [](const DeviceBuffer& b) { return static_cast<const float*>(b.ptr); };
     auto mp = [](const DeviceBuffer& b) { return static_cast<float*>(b.ptr); };
-    auto sc = [&](std::vector<DeviceBuffer>& sv_, int l) { return int8 ? fp(sv_[l]) : nullptr; };
+    auto sc = [&](std::vector<DeviceBuffer>& sv_, int l) { return quant ? fp(sv_[l]) : nullptr; };
 
     // The op sequence only -- no batch/sync/readback (so it can be either batched
     // or captured into a graph).
@@ -185,9 +190,15 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
             float* kslot = mp(kc[l]) + (int64_t)pos * kv_dim;
             float* vslot = mp(vc[l]) + (int64_t)pos * kv_dim;
             rmsnorm(ctx, fp(hid), fp(an[l]), mp(nrm), H, eps);
-            // FUSED QKV (BLLM-189): 3 matmuls -> 1; k/v write into the cache slots.
-            fused_qkv(ctx, wq[l].ptr, wk[l].ptr, wv[l].ptr, wdt, sc(sq, l), sc(sk, l), sc(sv, l),
-                      fp(nrm), mp(q), kslot, vslot, q_dim, kv_dim, H);
+            // QKV: fused (F32/Int8) or 3 unfused matmuls (Int4). k/v write into the cache slots.
+            if (wdt == WeightDType::Int4) {
+                matmul_dequant(ctx, wq[l].ptr, wdt, sc(sq, l), fp(nrm), mp(q), q_dim, H);
+                matmul_dequant(ctx, wk[l].ptr, wdt, sc(sk, l), fp(nrm), kslot, kv_dim, H);
+                matmul_dequant(ctx, wv[l].ptr, wdt, sc(sv, l), fp(nrm), vslot, kv_dim, H);
+            } else {
+                fused_qkv(ctx, wq[l].ptr, wk[l].ptr, wv[l].ptr, wdt, sc(sq, l), sc(sk, l), sc(sv, l),
+                          fp(nrm), mp(q), kslot, vslot, q_dim, kv_dim, H);
+            }
             rope(ctx, mp(q), head_dim, heads, pos, theta);
             rope(ctx, kslot, head_dim, kv_heads, pos, theta);
             attention(ctx, fp(q), fp(kc[l]), fp(vc[l]), mp(ctxb), heads, kv_heads, head_dim, S, scale);
@@ -200,7 +211,7 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
             matmul_dequant_residual(ctx, wd[l].ptr, wdt, sc(sd, l), fp(act), mp(hid), H, ffn);
         }
         rmsnorm(ctx, fp(hid), fp(d_fn), mp(nrm), H, eps);
-        matmul_dequant(ctx, d_lm.ptr, wdt, int8 ? fp(s_lm) : nullptr, fp(nrm), mp(logits), vocab, H);
+        matmul_dequant(ctx, d_lm.ptr, wdt, quant ? fp(s_lm) : nullptr, fp(nrm), mp(logits), vocab, H);
     };
 
     std::function<void()> run;
@@ -239,6 +250,79 @@ double bench_rocm_resident_forward(bolt::rocm::Context& ctx, const ModelCfg& cfg
     ctx.free(&ctxb); ctx.free(&ao); ctx.free(&gate); ctx.free(&up); ctx.free(&act);
     ctx.free(&ffo); ctx.free(&logits);
     return median_us(ts) / 1000.0;  // ms/token
+}
+
+// BLLM-189: per-op microbench -- isolates each decode op's GPU time (rocprof is
+// absent on Windows HIP). Each op runs K times back-to-back in one batch (one
+// sync amortized), giving per-call us; x per-token count gives its contribution.
+void profile_rocm_ops(bolt::rocm::Context& ctx) {
+    using namespace bolt::rocm;
+    const int H = 896, heads = 14, kv_heads = 2, head_dim = 64, ffn = 4864, vocab = 151936;
+    const int q_dim = heads * head_dim, kv_dim = kv_heads * head_dim, S = 128, layers = 24;
+    const float eps = 1e-5f, theta = 1e6f, scale = 0.125f;
+    const int K = 100;
+
+    // Generous scratch: one weight buffer big enough for the largest GEMV (lm_head).
+    DeviceBuffer w_big, s_big, x_big, o_big, kc_b, vc_b, w2, s2;
+    const bool ok =
+        ctx.allocate((uint64_t)vocab * H, &w_big) && ctx.allocate((uint64_t)vocab * 4, &s_big) &&
+        ctx.allocate((uint64_t)ffn * 4, &x_big) && ctx.allocate((uint64_t)vocab * 4, &o_big) &&
+        ctx.allocate((uint64_t)S * kv_dim * 4, &kc_b) && ctx.allocate((uint64_t)S * kv_dim * 4, &vc_b) &&
+        ctx.allocate((uint64_t)ffn * H, &w2) && ctx.allocate((uint64_t)ffn * 4, &s2);
+    if (!ok) { std::printf("  (profile: alloc failed)\n"); return; }
+    auto f = [](const DeviceBuffer& b) { return static_cast<const float*>(b.ptr); };
+    auto m = [](const DeviceBuffer& b) { return static_cast<float*>(b.ptr); };
+
+    auto time_op = [&](const std::function<void()>& op) {
+        for (int i = 0; i < 5; ++i) { ctx.begin_batch(); op(); ctx.end_batch(); }
+        std::vector<double> ts;
+        for (int r = 0; r < 15; ++r) {
+            auto a = Clock::now();
+            ctx.begin_batch();
+            for (int i = 0; i < K; ++i) op();
+            ctx.end_batch();
+            ts.push_back(std::chrono::duration<double, std::micro>(Clock::now() - a).count() / K);
+        }
+        return median_us(ts);
+    };
+
+    struct Row { const char* name; int count; double us; };
+    Row rows[] = {
+        {"rmsnorm (H=896)", 2 * layers + 1,
+         time_op([&] { rmsnorm(ctx, f(x_big), f(s_big), m(o_big), H, eps); })},
+        {"fused_qkv int8", layers,
+         time_op([&] { fused_qkv(ctx, w2.ptr, w2.ptr, w2.ptr, WeightDType::Int8, f(s2), f(s2),
+                                 f(s2), f(x_big), m(o_big), m(o_big) + q_dim, m(o_big) + q_dim + kv_dim,
+                                 q_dim, kv_dim, H); })},
+        {"rope", 2 * layers,
+         time_op([&] { rope(ctx, m(o_big), head_dim, heads, S - 1, theta); })},
+        {"attention (S=128)", layers,
+         time_op([&] { attention(ctx, f(x_big), f(kc_b), f(vc_b), m(o_big), heads, kv_heads,
+                                  head_dim, S, scale); })},
+        {"O-proj resid (896x896)", layers,
+         time_op([&] { matmul_dequant_residual(ctx, w2.ptr, WeightDType::Int8, f(s2), f(x_big),
+                                               m(o_big), H, H); })},
+        {"fused_swiglu (4864x896)", layers,
+         time_op([&] { fused_swiglu(ctx, w2.ptr, w2.ptr, WeightDType::Int8, f(s2), f(s2), f(x_big),
+                                    m(o_big), ffn, H); })},
+        {"down resid (896x4864)", layers,
+         time_op([&] { matmul_dequant_residual(ctx, w2.ptr, WeightDType::Int8, f(s2), f(x_big),
+                                               m(o_big), H, ffn); })},
+        {"lm_head (151936x896)", 1,
+         time_op([&] { matmul_dequant(ctx, w_big.ptr, WeightDType::Int8, f(s_big), f(x_big),
+                                      m(o_big), vocab, H); })},
+    };
+    std::printf("\n  --- per-op profile (Int8, Qwen2.5-0.5B shape) ---\n");
+    std::printf("  %-26s %7s x%-4s %9s\n", "op", "us/call", "cnt", "ms/token");
+    double total = 0.0;
+    for (const Row& r : rows) {
+        const double contrib = r.us * r.count / 1000.0;
+        total += contrib;
+        std::printf("  %-26s %7.1f x%-4d %8.2f\n", r.name, r.us, r.count, contrib);
+    }
+    std::printf("  %-26s %7s %5s %8.2f\n", "SUM", "", "", total);
+    ctx.free(&w_big); ctx.free(&s_big); ctx.free(&x_big); ctx.free(&o_big); ctx.free(&kc_b);
+    ctx.free(&vc_b); ctx.free(&w2); ctx.free(&s2);
 }
 #endif
 
@@ -372,20 +456,23 @@ int main() {
         auto suite = [&](const char* name, const ModelCfg& cfg) {
             std::printf("  [%s]  H=%d layers=%d ffn=%d GQA=%d/%d vocab=%d\n", name, cfg.H, cfg.layers,
                         cfg.ffn, cfg.heads, cfg.kv_heads, cfg.vocab);
-            auto row = [&](const char* tag, bool i8, bool g) {
-                const double ms = bench_rocm_resident_forward(rocm, cfg, i8, g);
+            using bolt::rocm::WeightDType;
+            auto row = [&](const char* tag, WeightDType wdt, bool g) {
+                const double ms = bench_rocm_resident_forward(rocm, cfg, wdt, g);
                 if (ms > 0.0)
                     std::printf("    %-24s %7.2f ms/token  ->  %7.1f tok/s\n", tag, ms, 1000.0 / ms);
             };
-            row("F32  batch:", false, false);
-            row("Int8 batch:", true, false);
-            row("Int8 hipGraph:", true, true);
+            row("F32  batch:", WeightDType::F32, false);
+            row("Int8 batch:", WeightDType::Int8, false);
+            row("Int4 batch:", WeightDType::Int4, false);
+            row("Int4 hipGraph:", WeightDType::Int4, true);
         };
         suite("Qwen2.5-0.5B", kSmall);
         suite("Llama-3-8B", kLarge);
         std::printf("  ---\n");
         std::printf("  llama.cpp (Qwen2.5-0.5B Q8_0, CPU-only llama-bench): 116 tok/s\n");
         std::printf("  boltllm CPU: Int8 ~60, Int4 ~90 tok/s. llama.cpp 8B-class CPU decode ~ a few t/s.\n");
+        profile_rocm_ops(rocm);
     }
 #endif
     return 0;

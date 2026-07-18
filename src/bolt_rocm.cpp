@@ -87,6 +87,7 @@ __global__ void matmul_dequant_int8_kernel(const int8_t* weight, const float* sc
 // Int4: two 4-bit codes packed per byte, low nibble first -- same layout
 // bolt_compute.h's matmul_row_dot_f32 (Int4 case) and boltllm::quant's
 // packing convention use.
+template <bool Accumulate>
 __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* scale,
                                             const float* activation, float* out, int32_t cols) {
     __shared__ float shared[kBlockSize];
@@ -107,7 +108,10 @@ __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* s
         if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[row] = shared[0] * scale[row];
+    if (threadIdx.x == 0) {
+        const float val = shared[0] * scale[row];
+        out[row] = Accumulate ? (out[row] + val) : val;
+    }
 }
 
 // Int2: four 2-bit codes packed per byte, lowest bits first -- same
@@ -351,6 +355,40 @@ __global__ void fused_swiglu_int8_kernel(const int8_t* wg, const int8_t* wu, con
     }
 }
 
+// Int4-weight twin: nibble-unpack (low-first, offset kInt4DequantOffset) both Wg
+// and Wu, per-row scales. Reads 0.5 B/weight -- the bandwidth tier.
+__global__ void fused_swiglu_int4_kernel(const uint8_t* wg, const uint8_t* wu,
+                                         const float* wg_scale, const float* wu_scale,
+                                         const float* x, float* act, int32_t cols) {
+    __shared__ float sg[kBlockSize];
+    __shared__ float su[kBlockSize];
+    const int32_t row = blockIdx.x;
+    const int32_t packed = (cols + 1) / 2;
+    const uint8_t* gr = wg + static_cast<int64_t>(row) * packed;
+    const uint8_t* ur = wu + static_cast<int64_t>(row) * packed;
+    float ga = 0.0f, ua = 0.0f;
+    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float xi = x[i];
+        const int32_t sh = (i & 1) * 4;  // 0 for low nibble, 4 for high
+        ga += xi * static_cast<float>(static_cast<int32_t>((gr[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
+        ua += xi * static_cast<float>(static_cast<int32_t>((ur[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
+    }
+    sg[threadIdx.x] = ga;
+    su[threadIdx.x] = ua;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sg[threadIdx.x] += sg[threadIdx.x + stride];
+            su[threadIdx.x] += su[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float g = sg[0] * wg_scale[row];
+        act[row] = (g / (1.0f + expf(-g))) * (su[0] * wu_scale[row]);
+    }
+}
+
 // BLLM-189: fused QKV projection. ONE block per output row across the
 // concatenated [q | k | v] rows -- one launch replaces three matmuls that all
 // read the same normed activation. The which-tensor selection is uniform per
@@ -552,7 +590,7 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                 out_device, cols);
             break;
         case WeightDType::Int4:
-            matmul_dequant_int4_kernel<<<grid, block, 0, st>>>(
+            matmul_dequant_int4_kernel<false><<<grid, block, 0, st>>>(
                 static_cast<const uint8_t*>(weight_device), scale_device, activation_device,
                 out_device, cols);
             break;
@@ -575,19 +613,23 @@ bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDTyp
         out_device == nullptr || out_rows <= 0 || cols <= 0) {
         return false;
     }
-    if (dtype == WeightDType::Int8 && scale_device == nullptr) return false;
+    if (dtype != WeightDType::F32 && scale_device == nullptr) return false;
 
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>(out_rows));
     const dim3 block(static_cast<unsigned int>(kBlockSize));
-    // out[row] += dot(...) -- fuses the residual-add into the projection. F32/Int8
-    // only (the resident-graph decode tiers); Int4/Int2 keep the unfused path.
+    // out[row] += dot(...) -- fuses the residual-add into the projection. F32/Int8/
+    // Int4 (the resident-graph decode tiers); Int2 keeps the unfused path.
     if (dtype == WeightDType::F32) {
         matmul_dequant_f32_kernel<true><<<grid, block, 0, st>>>(
             static_cast<const float*>(weight_device), activation_device, out_device, cols);
     } else if (dtype == WeightDType::Int8) {
         matmul_dequant_int8_kernel<true><<<grid, block, 0, st>>>(
             static_cast<const int8_t*>(weight_device), scale_device, activation_device, out_device,
+            cols);
+    } else if (dtype == WeightDType::Int4) {
+        matmul_dequant_int4_kernel<true><<<grid, block, 0, st>>>(
+            static_cast<const uint8_t*>(weight_device), scale_device, activation_device, out_device,
             cols);
     } else {
         return false;
@@ -687,8 +729,9 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
         rows <= 0 || cols <= 0) {
         return false;
     }
-    if (dtype != WeightDType::F32 && dtype != WeightDType::Int8) return false;
-    if (dtype == WeightDType::Int8 && (wg_scale == nullptr || wu_scale == nullptr)) return false;
+    if (dtype != WeightDType::F32 && dtype != WeightDType::Int8 && dtype != WeightDType::Int4)
+        return false;
+    if (dtype != WeightDType::F32 && (wg_scale == nullptr || wu_scale == nullptr)) return false;
 
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>(rows));
@@ -696,9 +739,13 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
     if (dtype == WeightDType::F32) {
         fused_swiglu_f32_kernel<<<grid, block, 0, st>>>(static_cast<const float*>(wg),
                                                         static_cast<const float*>(wu), x, act, cols);
-    } else {
+    } else if (dtype == WeightDType::Int8) {
         fused_swiglu_int8_kernel<<<grid, block, 0, st>>>(static_cast<const int8_t*>(wg),
                                                          static_cast<const int8_t*>(wu), wg_scale,
+                                                         wu_scale, x, act, cols);
+    } else {
+        fused_swiglu_int4_kernel<<<grid, block, 0, st>>>(static_cast<const uint8_t*>(wg),
+                                                         static_cast<const uint8_t*>(wu), wg_scale,
                                                          wu_scale, x, act, cols);
     }
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);

@@ -669,3 +669,69 @@ TEST(BoltRocm, FusedSwigluInt8MatchesCpuReference) {
         EXPECT_NEAR(act[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-4f) << "r=" << r;
     ctx.free(&dg); ctx.free(&du); ctx.free(&dgs); ctx.free(&dus); ctx.free(&dx); ctx.free(&da);
 }
+
+// BLLM-189: fused gate+up+SwiGLU (Int4 weights, nibble-packed low-first, offset 8).
+TEST(BoltRocm, FusedSwigluInt4MatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int rows = 256, cols = 96;                 // cols even -> exact nibble packing
+    const int packed = (cols + 1) / 2;
+    std::vector<uint8_t> wg(static_cast<size_t>(rows) * packed),
+        wu(static_cast<size_t>(rows) * packed);
+    std::vector<float> gs(static_cast<size_t>(rows)), us(static_cast<size_t>(rows)),
+        x(static_cast<size_t>(cols));
+    // Nibble codes in [0,15]; value = code - 8.
+    auto code = [](int i) { return static_cast<uint8_t>(i % 16); };
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t nib = code(r + c);
+            const size_t bi = static_cast<size_t>(r) * packed + (c >> 1);
+            if (c & 1) { wg[bi] = static_cast<uint8_t>((wg[bi] & 0x0F) | (nib << 4)); }
+            else { wg[bi] = static_cast<uint8_t>((wg[bi] & 0xF0) | nib); }
+            const uint8_t nib2 = code(r + 2 * c + 1);
+            if (c & 1) { wu[bi] = static_cast<uint8_t>((wu[bi] & 0x0F) | (nib2 << 4)); }
+            else { wu[bi] = static_cast<uint8_t>((wu[bi] & 0xF0) | nib2); }
+        }
+        gs[static_cast<size_t>(r)] = 0.01f + static_cast<float>(r % 4) * 0.003f;
+        us[static_cast<size_t>(r)] = 0.02f + static_cast<float>(r % 3) * 0.004f;
+    }
+    for (int c = 0; c < cols; ++c) x[static_cast<size_t>(c)] = static_cast<float>((c % 9) - 4) * 0.2f;
+
+    std::vector<float> ref(static_cast<size_t>(rows));
+    for (int r = 0; r < rows; ++r) {
+        float g = 0.0f, u = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            g += x[static_cast<size_t>(c)] * static_cast<float>(static_cast<int>(code(r + c)) - 8);
+            u += x[static_cast<size_t>(c)] * static_cast<float>(static_cast<int>(code(r + 2 * c + 1)) - 8);
+        }
+        g *= gs[static_cast<size_t>(r)];
+        u *= us[static_cast<size_t>(r)];
+        ref[static_cast<size_t>(r)] = (g / (1.0f + std::exp(-g))) * u;
+    }
+
+    DeviceBuffer dg, du, dgs, dus, dx, da;
+    ASSERT_TRUE(ctx.allocate(wg.size(), &dg));
+    ASSERT_TRUE(ctx.allocate(wu.size(), &du));
+    ASSERT_TRUE(ctx.allocate(gs.size() * sizeof(float), &dgs));
+    ASSERT_TRUE(ctx.allocate(us.size() * sizeof(float), &dus));
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &dx));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(rows) * sizeof(float), &da));
+    ASSERT_TRUE(ctx.copy_to_device(wg.data(), &dg, wg.size()));
+    ASSERT_TRUE(ctx.copy_to_device(wu.data(), &du, wu.size()));
+    ASSERT_TRUE(ctx.copy_to_device(gs.data(), &dgs, gs.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(us.data(), &dus, us.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &dx, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::fused_swiglu(ctx, dg.ptr, du.ptr, WeightDType::Int4,
+                                         static_cast<const float*>(dgs.ptr),
+                                         static_cast<const float*>(dus.ptr),
+                                         static_cast<const float*>(dx.ptr),
+                                         static_cast<float*>(da.ptr), rows, cols));
+    std::vector<float> act(static_cast<size_t>(rows));
+    ASSERT_TRUE(ctx.copy_to_host(da, act.data(), act.size() * sizeof(float)));
+    for (int r = 0; r < rows; ++r)
+        EXPECT_NEAR(act[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-4f) << "r=" << r;
+    ctx.free(&dg); ctx.free(&du); ctx.free(&dgs); ctx.free(&dus); ctx.free(&dx); ctx.free(&da);
+}

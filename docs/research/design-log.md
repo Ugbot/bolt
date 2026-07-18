@@ -2327,3 +2327,28 @@ Status: 110 t/s Int8 = 95% of llama.cpp CPU baseline; 8B GPU (15.6 t/s) laps
 llama.cpp CPU decode. Next: (1) rocprof to find the real ~9ms sink before more
 fusion; (2) fair GPU-vs-GPU number (llama.cpp Vulkan on this iGPU -- 116 is
 CPU-only, and llama.cpp's GPU path may itself sit below 116 on a tiny 0.5B model).
+
+## 2026-07-19 / Int4 fused kernels + per-op profile -> attention is the sink (BLLM-189)
+
+Int4 weight tier added to the fused kernels (fused_swiglu_int4 nibble-unpack;
+matmul_dequant_int4 templated <Accumulate> for residual O/down; qkv unfused in
+Int4 since fused_qkv is perf-neutral). Coherence-gated (FusedSwigluInt4 test).
+
+Resident-graph decode: 0.5B Int4 = 115 t/s (Int8 111, F32 77) = 99% of llama.cpp
+CPU baseline (116). 8B Int4 = 17.2. Int4's gain modest (+4 on 0.5B) -- weight
+GEMVs latency-bound at this size.
+
+Per-op profile (profile_rocm_ops, rocprof-absent substitute -- each op K x in one
+batch, one sync amortized, x per-token count):
+  attention (S=128)      79 us x24 = 1.91 ms   <-- #1 sink
+  lm_head (151936x896) 1869 us x1  = 1.87 ms
+  fused_swiglu           48 us x24 = 1.16
+  down-resid             25 us x24 = 0.59
+  qkv/O/rmsnorm/rope                = 0.79
+  SUM                               ~6.3 ms
+
+Two sinks: attention + lm_head. lm_head = one unavoidable huge GEMV (Int4 halves).
+ATTENTION is a weak kernel: 1 block/head (14 blocks -> poor occupancy), 64/256
+threads used, serial 128-step loop w/ per-step block reduction. Next lever: proper
+flash-decode attention (parallelize timesteps, one end-reduction) -> cut several-
+fold, push past 116.
