@@ -162,3 +162,127 @@ TEST(BoltRocm, MatmulDequantRequiresScaleForQuantizedDtypes) {
     EXPECT_FALSE(bolt::rocm::matmul_dequant(ctx, weight, WeightDType::Int8, nullptr, activation, out,
                                              1, 2));
 }
+
+// BLLM-184: on-device HIP RMSNorm matches the CPU reference.
+TEST(BoltRocm, RmsnormMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int n = 300;
+    std::vector<float> x(static_cast<size_t>(n)), w(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.5f;
+        w[static_cast<size_t>(i)] = 1.0f + static_cast<float>(i % 3) * 0.25f;
+    }
+    const float eps = 1e-5f;
+    DeviceBuffer xb, wb, yb;
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &xb));
+    ASSERT_TRUE(ctx.allocate(w.size() * sizeof(float), &wb));
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &yb));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &xb, x.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(w.data(), &wb, w.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::rmsnorm(ctx, static_cast<const float*>(xb.ptr),
+                                    static_cast<const float*>(wb.ptr),
+                                    static_cast<float*>(yb.ptr), n, eps));
+    std::vector<float> y(static_cast<size_t>(n));
+    ASSERT_TRUE(ctx.copy_to_host(yb, y.data(), y.size() * sizeof(float)));
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) ss += static_cast<double>(x[static_cast<size_t>(i)]) *
+                                       static_cast<double>(x[static_cast<size_t>(i)]);
+    const float inv = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(y[static_cast<size_t>(i)],
+                    x[static_cast<size_t>(i)] * inv * w[static_cast<size_t>(i)], 1e-4f)
+            << "i=" << i;
+    }
+    ctx.free(&xb);
+    ctx.free(&wb);
+    ctx.free(&yb);
+}
+
+// BLLM-185: on-device HIP RoPE matches rope_half_split per head.
+TEST(BoltRocm, RopeMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int head_dim = 64, num_heads = 4, position = 7;
+    const float theta = 10000.0f;
+    const int n = head_dim * num_heads, half = head_dim / 2;
+    std::vector<float> x(static_cast<size_t>(n)), ref(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.2f;
+        ref[static_cast<size_t>(i)] = x[static_cast<size_t>(i)];
+    }
+    for (int h = 0; h < num_heads; ++h) {
+        float* v = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int j = 0; j < half; ++j) {
+            const float inv = std::pow(theta, -2.0f * static_cast<float>(j) / head_dim);
+            const float ang = static_cast<float>(position) * inv;
+            const float cs = std::cos(ang), sn = std::sin(ang);
+            const float a = v[j], b = v[j + half];
+            v[j] = a * cs - b * sn;
+            v[j + half] = b * cs + a * sn;
+        }
+    }
+    DeviceBuffer xb;
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &xb));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &xb, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::rope(ctx, static_cast<float*>(xb.ptr), head_dim, num_heads, position,
+                                 theta));
+    std::vector<float> g(static_cast<size_t>(n));
+    ASSERT_TRUE(ctx.copy_to_host(xb, g.data(), g.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(g[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.free(&xb);
+}
+
+// BLLM-186: on-device HIP elementwise (SwiGLU op1 + add op0) matches CPU.
+TEST(BoltRocm, ElementwiseMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int n = 500;
+    std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        a[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.3f;
+        b[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.7f;
+    }
+    DeviceBuffer ab, bb, ob;
+    ASSERT_TRUE(ctx.allocate(a.size() * sizeof(float), &ab));
+    ASSERT_TRUE(ctx.allocate(b.size() * sizeof(float), &bb));
+    ASSERT_TRUE(ctx.allocate(a.size() * sizeof(float), &ob));
+    ASSERT_TRUE(ctx.copy_to_device(a.data(), &ab, a.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(b.data(), &bb, b.size() * sizeof(float)));
+    std::vector<float> o(static_cast<size_t>(n));
+
+    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(ab.ptr),
+                                        static_cast<const float*>(bb.ptr),
+                                        static_cast<float*>(ob.ptr), n, /*op=*/1));
+    ASSERT_TRUE(ctx.copy_to_host(ob, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i) {
+        const float x = a[static_cast<size_t>(i)];
+        EXPECT_NEAR(o[static_cast<size_t>(i)], (x / (1.0f + std::exp(-x))) * b[static_cast<size_t>(i)],
+                    1e-4f)
+            << "swiglu i=" << i;
+    }
+
+    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(ab.ptr),
+                                        static_cast<const float*>(bb.ptr),
+                                        static_cast<float*>(ob.ptr), n, /*op=*/0));
+    ASSERT_TRUE(ctx.copy_to_host(ob, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(o[static_cast<size_t>(i)],
+                    a[static_cast<size_t>(i)] + b[static_cast<size_t>(i)], 1e-5f)
+            << "add i=" << i;
+    }
+    ctx.free(&ab);
+    ctx.free(&bb);
+    ctx.free(&ob);
+}

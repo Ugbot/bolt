@@ -180,6 +180,57 @@ __global__ void matmul_dequant_int8act_int4_kernel(const uint8_t* weight, const 
     if (threadIdx.x == 0) out[row] = static_cast<float>(shared[0]) * act_scale * weight_scale[row];
 }
 
+// BLLM-184: RMSNorm -- y[i]=x[i]/sqrt(mean(x^2)+eps)*w[i]. One block, tree reduce.
+__global__ void rmsnorm_kernel(const float* x, const float* w, float* y, int32_t n, float eps) {
+    __shared__ float shared[kBlockSize];
+    __shared__ float inv_rms;
+    float ss = 0.0f;
+    for (int32_t i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    shared[threadIdx.x] = ss;
+    __syncthreads();
+    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_rms = rsqrtf(shared[0] / static_cast<float>(n) + eps);
+    __syncthreads();
+    const float r = inv_rms;
+    for (int32_t i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * r * w[i];
+}
+
+// BLLM-185: RoPE (rotate_half) on [num_heads, head_dim], in place, one thread
+// per (head, j) pair -- matches rope_half_split exactly.
+__global__ void rope_kernel(float* x, int32_t head_dim, int32_t num_heads, int32_t position,
+                            float theta) {
+    const int32_t hd2 = head_dim / 2;
+    const int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * hd2) return;
+    const int32_t head = idx / hd2;
+    const int32_t j = idx % hd2;
+    const int32_t base = head * head_dim;
+    const float inv = powf(theta, -2.0f * static_cast<float>(j) / static_cast<float>(head_dim));
+    const float ang = static_cast<float>(position) * inv;
+    const float cs = cosf(ang), sn = sinf(ang);
+    const float a = x[base + j], b = x[base + j + hd2];
+    x[base + j] = a * cs - b * sn;
+    x[base + j + hd2] = b * cs + a * sn;
+}
+
+// BLLM-186: elementwise -- op 0=add(a+b), 1=SwiGLU(silu(a)*b), 2=GeGLU(gelu(a)*b).
+__global__ void elementwise_kernel(const float* a, const float* b, float* o, int32_t n, int32_t op) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float av = a[i], bv = b[i];
+    if (op == 0) {
+        o[i] = av + bv;
+    } else if (op == 1) {
+        o[i] = (av / (1.0f + expf(-av))) * bv;
+    } else {
+        const float g = 0.5f * av * (1.0f + tanhf(0.7978845608028654f * (av + 0.044715f * av * av * av)));
+        o[i] = g * bv;
+    }
+}
+
 }  // namespace
 
 bool available() noexcept {
@@ -314,6 +365,36 @@ bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, Wei
             return false;
     }
 
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
+bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* y_device, int32_t n,
+             float eps) noexcept {
+    if (!ctx.is_valid() || x_device == nullptr || w_device == nullptr || y_device == nullptr ||
+        n <= 0) {
+        return false;
+    }
+    rmsnorm_kernel<<<dim3(1), dim3(kBlockSize)>>>(x_device, w_device, y_device, n, eps);
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
+bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, int32_t position,
+          float theta) noexcept {
+    if (!ctx.is_valid() || x_device == nullptr || head_dim <= 0 || num_heads <= 0) return false;
+    const int32_t total = num_heads * (head_dim / 2);
+    const dim3 grid(static_cast<unsigned int>((total + kBlockSize - 1) / kBlockSize));
+    rope_kernel<<<grid, dim3(kBlockSize)>>>(x_device, head_dim, num_heads, position, theta);
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
+bool elementwise(Context& ctx, const float* a_device, const float* b_device, float* out_device,
+                 int32_t n, int32_t op) noexcept {
+    if (!ctx.is_valid() || a_device == nullptr || b_device == nullptr || out_device == nullptr ||
+        n <= 0) {
+        return false;
+    }
+    const dim3 grid(static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize));
+    elementwise_kernel<<<grid, dim3(kBlockSize)>>>(a_device, b_device, out_device, n, op);
     return hipDeviceSynchronize() == hipSuccess;
 }
 

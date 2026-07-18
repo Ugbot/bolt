@@ -146,4 +146,21 @@ bool matmul_dequant_int8_activation(Context& ctx, const void* weight_device, Wei
                                      const int8_t* activation_device, float act_scale,
                                      float* out_device, int32_t out_rows, int32_t cols) noexcept;
 
+// ---- On-device forward ops (HIP twins of the bolt::vulkan shaders), for the
+// resident-graph GPU forward (BLLM-181). All buffers are device pointers from
+// Context::allocate(); each blocks until complete (hipDeviceSynchronize). ----
+
+// BLLM-184: y[i] = x[i]/sqrt(mean(x^2)+eps) * w[i].
+bool rmsnorm(Context& ctx, const float* x_device, const float* w_device, float* y_device, int32_t n,
+             float eps) noexcept;
+
+// BLLM-185: rotate_half RoPE on a [num_heads, head_dim] buffer, in place.
+bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, int32_t position,
+          float theta) noexcept;
+
+// BLLM-186: elementwise op 0=a+b (residual/bias), 1=silu(a)*b (SwiGLU),
+// 2=gelu(a)*b (GeGLU).
+bool elementwise(Context& ctx, const float* a_device, const float* b_device, float* out_device,
+                 int32_t n, int32_t op) noexcept;
+
 }  // namespace bolt::rocm
