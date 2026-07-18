@@ -2185,3 +2185,35 @@ not std::vector's 16), row byte-strides padded to a 64-byte multiple (no
 split-line SIMD loads, no page bisecting a hot vector), aligned loads once
 guaranteed, 4-accumulator STEP-unroll, BOLT_RESTRICT, prefetch, branch-free,
 zero hot-path alloc, elevated-/arch TU. Required from the start on BLLM-173.
+
+## 2026-07-18 / ROCm backend — native AMD on-device forward (BLLM-181, 184-188)
+
+Vulkan was the portable fallback; ROCm/HIP is AMD's native compute and the fast
+path on the target Radeon 8060S (RDNA 3.5, gfx1151). ROCm 7.1 is now installed
+on this box, so bolt::rocm is testable here for the first time. Built the full
+on-device op set as HIP kernels mirroring the Vulkan shaders 1:1, each verified
+GPU-vs-CPU on the real device:
+
+- matmul_dequant (F32/Int8/Int4/Int2) + int8-activation — pre-existing (BLLM-78/91).
+- rmsnorm (BLLM-184): shared-mem tree reduction + rsqrtf.
+- rope (BLLM-185): rotate_half in place, matches rope_half_split.
+- elementwise (BLLM-186): op0=add, op1=SwiGLU (silu*b), op2=GeGLU (gelu*b).
+- attention (BLLM-187): flash-style online softmax, one block per query head,
+  GQA-aware, blockDim power-of-two >= head_dim so the tree-reduced QK dot stays
+  valid with inactive threads contributing 0. Mirrors qwen2_attention_ exactly.
+
+Coherence gate (BLLM-188): a FULL pre-norm transformer layer (Qwen2/Llama-style,
+GQA, no biases, SwiGLU) computed ENTIRELY on-device — rmsnorm -> Q/K/V matmul ->
+RoPE -> attention -> O matmul -> residual -> rmsnorm -> gate/up -> SwiGLU ->
+down -> residual — with activations staying RESIDENT across the whole layer (only
+the input hidden uploaded once, final hidden read back once; the current token's
+K/V matmul writes directly into its KV-cache slot on-device, no round-trip).
+Matches a CPU reference within 1e-3 on the real gfx1151. This is the technical
+crux of the resident-graph win on UMA: keep the graph on-device, pay upload/
+readback once per token instead of per-op. Build: clang++ HIP direct .obj->.lib
+(BLLM-99), host stays MSVC, -DBOLT_BUILD_ROCM=ON; 13/13 test_bolt_rocm PASSED.
+
+Still open (BLLM-188 tail): wiring this chain into boltllm's Engine (GpuContext
+is Vulkan-only today) + an end-to-end tok/s measurement vs Vulkan and the 60-90
+t/s CPU on a real GGUF. The kernels + coherence are proven; the engine-level
+backend selection and measurement are the remaining integration.

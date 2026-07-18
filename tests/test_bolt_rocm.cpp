@@ -362,3 +362,220 @@ TEST(BoltRocm, AttentionMatchesCpuReference) {
     ctx.free(&vb);
     ctx.free(&ob);
 }
+
+// BLLM-188: a FULL pre-norm transformer layer (Qwen2/Llama-style, GQA, no
+// biases, SwiGLU FFN) computed entirely on-device -- activations stay resident
+// across the whole layer (only the input hidden is uploaded once and the final
+// hidden read back once). Every step is a bolt::rocm op chained over device
+// buffers: rmsnorm -> Q/K/V matmul -> RoPE -> attention -> O matmul -> residual
+// add -> rmsnorm -> gate/up matmul -> SwiGLU -> down matmul -> residual add.
+// This is the coherence gate for the ROCm resident-graph forward (BLLM-181):
+// if the whole chain matches a CPU reference, the on-device graph is correct.
+TEST(BoltRocm, ResidentLayerForwardMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+
+    const int H = 32, num_heads = 4, num_kv_heads = 2, head_dim = 8, ffn = 64;
+    const int q_dim = num_heads * head_dim;   // 32
+    const int kv_dim = num_kv_heads * head_dim;  // 16
+    const int S = 4;                          // KV cache length; query is slot S-1
+    const int group_size = num_heads / num_kv_heads;
+    const float eps = 1e-5f, theta = 10000.0f;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    auto gen = [](int i, int salt) {
+        return static_cast<float>(((i * 131 + salt * 17) % 19) - 9) * 0.05f;
+    };
+
+    // ---- Host tensors (deterministic) ----
+    std::vector<float> x(static_cast<size_t>(H)), wn1(static_cast<size_t>(H)),
+        wn2(static_cast<size_t>(H));
+    for (int i = 0; i < H; ++i) {
+        x[static_cast<size_t>(i)] = gen(i, 1);
+        wn1[static_cast<size_t>(i)] = 0.5f + static_cast<float>(i % 4) * 0.1f;
+        wn2[static_cast<size_t>(i)] = 0.7f + static_cast<float>(i % 3) * 0.1f;
+    }
+    auto mk = [&](int rows, int cols, int salt) {
+        std::vector<float> w(static_cast<size_t>(rows) * cols);
+        for (int i = 0; i < rows * cols; ++i) w[static_cast<size_t>(i)] = gen(i, salt);
+        return w;
+    };
+    const std::vector<float> Wq = mk(q_dim, H, 2), Wk = mk(kv_dim, H, 3), Wv = mk(kv_dim, H, 4),
+                             Wo = mk(H, q_dim, 5), Wg = mk(ffn, H, 6), Wu = mk(ffn, H, 7),
+                             Wd = mk(H, ffn, 8);
+    // Prior KV cache rows [0, S-1) are fixed synthetic (both paths read identical bytes).
+    std::vector<float> kc(static_cast<size_t>(S) * kv_dim), vc(static_cast<size_t>(S) * kv_dim);
+    for (int i = 0; i < (S - 1) * kv_dim; ++i) {
+        kc[static_cast<size_t>(i)] = gen(i, 9);
+        vc[static_cast<size_t>(i)] = gen(i, 10);
+    }
+
+    // ---- CPU reference ----
+    auto rms = [&](const std::vector<float>& in, const std::vector<float>& w) {
+        double ss = 0.0;
+        for (int i = 0; i < H; ++i) ss += static_cast<double>(in[static_cast<size_t>(i)]) *
+                                          in[static_cast<size_t>(i)];
+        const float inv = static_cast<float>(1.0 / std::sqrt(ss / H + eps));
+        std::vector<float> o(static_cast<size_t>(H));
+        for (int i = 0; i < H; ++i)
+            o[static_cast<size_t>(i)] = in[static_cast<size_t>(i)] * inv * w[static_cast<size_t>(i)];
+        return o;
+    };
+    auto mv = [](const std::vector<float>& w, const std::vector<float>& a, int rows, int cols) {
+        std::vector<float> o(static_cast<size_t>(rows), 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            float s = 0.0f;
+            for (int c = 0; c < cols; ++c)
+                s += w[static_cast<size_t>(r) * cols + c] * a[static_cast<size_t>(c)];
+            o[static_cast<size_t>(r)] = s;
+        }
+        return o;
+    };
+    auto rope = [&](std::vector<float>& t, int heads) {
+        const int hd2 = head_dim / 2;
+        for (int h = 0; h < heads; ++h) {
+            float* v = t.data() + static_cast<size_t>(h) * head_dim;
+            for (int j = 0; j < hd2; ++j) {
+                const float inv = std::pow(theta, -2.0f * static_cast<float>(j) / head_dim);
+                const float ang = static_cast<float>(S - 1) * inv;
+                const float cs = std::cos(ang), sn = std::sin(ang);
+                const float a = v[j], b = v[j + hd2];
+                v[j] = a * cs - b * sn;
+                v[j + hd2] = b * cs + a * sn;
+            }
+        }
+    };
+    std::vector<float> ref_x = x;
+    {
+        std::vector<float> n1 = rms(ref_x, wn1);
+        std::vector<float> q = mv(Wq, n1, q_dim, H), k = mv(Wk, n1, kv_dim, H),
+                           v = mv(Wv, n1, kv_dim, H);
+        rope(q, num_heads);
+        rope(k, num_kv_heads);
+        for (int i = 0; i < kv_dim; ++i) {
+            kc[static_cast<size_t>(S - 1) * kv_dim + i] = k[static_cast<size_t>(i)];
+            vc[static_cast<size_t>(S - 1) * kv_dim + i] = v[static_cast<size_t>(i)];
+        }
+        std::vector<float> cxt(static_cast<size_t>(q_dim), 0.0f);
+        for (int h = 0; h < num_heads; ++h) {
+            const int kvh = h / group_size;
+            std::vector<float> sc(static_cast<size_t>(S));
+            float mx = -1e30f;
+            for (int t = 0; t < S; ++t) {
+                float s = 0.0f;
+                for (int d = 0; d < head_dim; ++d)
+                    s += q[static_cast<size_t>(h) * head_dim + d] *
+                         kc[(static_cast<size_t>(t) * num_kv_heads + kvh) * head_dim + d];
+                s *= scale;
+                sc[static_cast<size_t>(t)] = s;
+                mx = std::fmax(mx, s);
+            }
+            double den = 0.0;
+            for (int t = 0; t < S; ++t) {
+                sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
+                den += sc[static_cast<size_t>(t)];
+            }
+            for (int t = 0; t < S; ++t) {
+                const float wgt = static_cast<float>(sc[static_cast<size_t>(t)] / den);
+                for (int d = 0; d < head_dim; ++d)
+                    cxt[static_cast<size_t>(h) * head_dim + d] +=
+                        wgt * vc[(static_cast<size_t>(t) * num_kv_heads + kvh) * head_dim + d];
+            }
+        }
+        std::vector<float> ao = mv(Wo, cxt, H, q_dim);
+        for (int i = 0; i < H; ++i) ref_x[static_cast<size_t>(i)] += ao[static_cast<size_t>(i)];
+        std::vector<float> n2 = rms(ref_x, wn2);
+        std::vector<float> g = mv(Wg, n2, ffn, H), u = mv(Wu, n2, ffn, H);
+        std::vector<float> act(static_cast<size_t>(ffn));
+        for (int i = 0; i < ffn; ++i) {
+            const float gv = g[static_cast<size_t>(i)];
+            act[static_cast<size_t>(i)] = (gv / (1.0f + std::exp(-gv))) * u[static_cast<size_t>(i)];
+        }
+        std::vector<float> dn = mv(Wd, act, H, ffn);
+        for (int i = 0; i < H; ++i) ref_x[static_cast<size_t>(i)] += dn[static_cast<size_t>(i)];
+    }
+
+    // ---- On-device resident forward ----
+    auto up = [&](const std::vector<float>& h, DeviceBuffer* b) {
+        ASSERT_TRUE(ctx.allocate(h.size() * sizeof(float), b));
+        ASSERT_TRUE(ctx.copy_to_device(h.data(), b, h.size() * sizeof(float)));
+    };
+    DeviceBuffer dx, dn1, dn2, dWq, dWk, dWv, dWo, dWg, dWu, dWd, dkc, dvc;
+    DeviceBuffer dq, dcxt, dao, dg, du, dact, ddn;
+    up(x, &dx);
+    up(wn1, &dn1);
+    up(wn2, &dn2);
+    up(Wq, &dWq);
+    up(Wk, &dWk);
+    up(Wv, &dWv);
+    up(Wo, &dWo);
+    up(Wg, &dWg);
+    up(Wu, &dWu);
+    up(Wd, &dWd);
+    up(kc, &dkc);  // prior rows live; current-token slot overwritten on-device below
+    up(vc, &dvc);
+    DeviceBuffer dnorm;
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(H) * sizeof(float), &dnorm));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(q_dim) * sizeof(float), &dq));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(q_dim) * sizeof(float), &dcxt));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(H) * sizeof(float), &dao));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(ffn) * sizeof(float), &dg));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(ffn) * sizeof(float), &du));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(ffn) * sizeof(float), &dact));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(H) * sizeof(float), &ddn));
+
+    float* pkc = static_cast<float*>(dkc.ptr);
+    float* pvc = static_cast<float*>(dvc.ptr);
+    float* k_slot = pkc + static_cast<size_t>(S - 1) * kv_dim;
+    float* v_slot = pvc + static_cast<size_t>(S - 1) * kv_dim;
+
+    // Attention sublayer.
+    ASSERT_TRUE(bolt::rocm::rmsnorm(ctx, static_cast<const float*>(dx.ptr),
+                                    static_cast<const float*>(dn1.ptr),
+                                    static_cast<float*>(dnorm.ptr), H, eps));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWq.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dnorm.ptr),
+                                           static_cast<float*>(dq.ptr), q_dim, H));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWk.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dnorm.ptr), k_slot, kv_dim, H));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWv.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dnorm.ptr), v_slot, kv_dim, H));
+    ASSERT_TRUE(bolt::rocm::rope(ctx, static_cast<float*>(dq.ptr), head_dim, num_heads, S - 1, theta));
+    ASSERT_TRUE(bolt::rocm::rope(ctx, k_slot, head_dim, num_kv_heads, S - 1, theta));
+    ASSERT_TRUE(bolt::rocm::attention(ctx, static_cast<const float*>(dq.ptr), pkc, pvc,
+                                      static_cast<float*>(dcxt.ptr), num_heads, num_kv_heads,
+                                      head_dim, S, scale));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWo.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dcxt.ptr),
+                                           static_cast<float*>(dao.ptr), H, q_dim));
+    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dx.ptr),
+                                        static_cast<const float*>(dao.ptr),
+                                        static_cast<float*>(dx.ptr), H, /*add=*/0));
+    // FFN sublayer.
+    ASSERT_TRUE(bolt::rocm::rmsnorm(ctx, static_cast<const float*>(dx.ptr),
+                                    static_cast<const float*>(dn2.ptr),
+                                    static_cast<float*>(dnorm.ptr), H, eps));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWg.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dnorm.ptr),
+                                           static_cast<float*>(dg.ptr), ffn, H));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWu.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dnorm.ptr),
+                                           static_cast<float*>(du.ptr), ffn, H));
+    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dg.ptr),
+                                        static_cast<const float*>(du.ptr),
+                                        static_cast<float*>(dact.ptr), ffn, /*swiglu=*/1));
+    ASSERT_TRUE(bolt::rocm::matmul_dequant(ctx, dWd.ptr, WeightDType::F32, nullptr,
+                                           static_cast<const float*>(dact.ptr),
+                                           static_cast<float*>(ddn.ptr), H, ffn));
+    ASSERT_TRUE(bolt::rocm::elementwise(ctx, static_cast<const float*>(dx.ptr),
+                                        static_cast<const float*>(ddn.ptr),
+                                        static_cast<float*>(dx.ptr), H, /*add=*/0));
+
+    std::vector<float> out(static_cast<size_t>(H));
+    ASSERT_TRUE(ctx.copy_to_host(dx, out.data(), out.size() * sizeof(float)));
+    for (int i = 0; i < H; ++i) {
+        EXPECT_NEAR(out[static_cast<size_t>(i)], ref_x[static_cast<size_t>(i)], 1e-3f) << "i=" << i;
+    }
+}
