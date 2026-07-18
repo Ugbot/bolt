@@ -2217,3 +2217,26 @@ Still open (BLLM-188 tail): wiring this chain into boltllm's Engine (GpuContext
 is Vulkan-only today) + an end-to-end tok/s measurement vs Vulkan and the 60-90
 t/s CPU on a real GGUF. The kernels + coherence are proven; the engine-level
 backend selection and measurement are the remaining integration.
+
+## 2026-07-18 / measured: ROCm vs Vulkan vs CPU (BLLM-188/148)
+
+bench_gpu_backends.cpp: matmul_dequant F32 GEMV (the dominant decode op) at real
+model shapes, effective GB/s (decode is bandwidth-bound; ~256 GB/s UMA wall).
+GPU = resident weight + per-op {act-in, dispatch, wait, out}; CPU = bolt SIMD
+GEMV, single-thread + persistent warm pool (32 threads spawned once).
+
+Typical GB/s (median of 3, ~±15% run variance):
+  shape                cpu-1t  cpu-Nt  vulkan  rocm
+  0.9K^2 (3 MiB,L2)    ~150    ~64     ~45     ~28
+  4K^2   (64 MiB)      ~49     ~82     ~140    ~149
+  11K4K  (172 MiB)     ~40     ~70     ~145    ~188
+
+Verdict (the per-op measure-gated call BLLM-148 wanted): on real-sized weights
+(64-172 MiB) the GPU wins ~1.8-2.5x over the threaded CPU (ROCm ~188 GB/s = 74%
+of the UMA wall on the biggest GEMV; Vulkan close). On tiny L2-resident weights
+(3 MiB) the CPU wins big (~150 GB/s, never touches DRAM) -- GPU dispatch/transfer
+overhead dominates. ROCm ~= Vulkan at the kernel level, ROCm modestly ahead on
+the largest shape. => move big attention/FFN GEMVs to GPU, keep small/norm ops
+on CPU. The per-op transfer+WaitIdle overhead measured here is exactly what the
+engine-wired resident graph (BLLM-174 resident activations + BLLM-175 batched
+single-submit) removes -- that's the next lever, now with a measured ceiling.

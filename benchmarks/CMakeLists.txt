@@ -192,3 +192,21 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_bench_tuning(bench_compute_gemv)
     add_test(NAME bench_compute_gemv COMMAND bench_compute_gemv)
 endif()
+
+# BLLM-188/148: ROCm vs Vulkan vs CPU for the dominant decode GEMV. Needs the
+# CPU SIMD GEMV (bolt::compute_idot) plus at least one GPU backend; each backend
+# is compiled in via a BOLT_HAVE_* define and self-skips at runtime if absent.
+if(BOLT_BUILD_COMPUTE_IDOT AND (BOLT_BUILD_ROCM OR BOLT_BUILD_VULKAN))
+    add_executable(bench_gpu_backends bench_gpu_backends.cpp)
+    target_link_libraries(bench_gpu_backends PRIVATE bolt::bolt bolt::compute_idot)
+    if(BOLT_BUILD_ROCM)
+        target_link_libraries(bench_gpu_backends PRIVATE bolt::rocm)
+        target_compile_definitions(bench_gpu_backends PRIVATE BOLT_HAVE_ROCM)
+    endif()
+    if(BOLT_BUILD_VULKAN)
+        target_link_libraries(bench_gpu_backends PRIVATE bolt::vulkan)
+        target_compile_definitions(bench_gpu_backends PRIVATE BOLT_HAVE_VULKAN)
+    endif()
+    bolt_apply_hardening(bench_gpu_backends)
+    bolt_apply_bench_tuning(bench_gpu_backends)
+endif()
