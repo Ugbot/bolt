@@ -99,7 +99,12 @@ JsonValue* make_bool  (Arena* arena, bool v) noexcept;
 JsonValue* make_int   (Arena* arena, int64_t v) noexcept;
 // Non-finite doubles (NaN / +-Inf) have no JSON representation and are encoded
 // as `null` (matching nlohmann's default), since emitting "nan"/"inf" would be
-// invalid JSON. Finite doubles round-trip through "%.17g".
+// invalid JSON. Finite doubles are formatted with a SHORTEST-round-trip
+// (Grisu2) dtoa that reproduces nlohmann::json's float output byte-for-byte —
+// e.g. 0.1 -> "0.1" (not "0.10000000000000001"), 0.0 -> "0.0", -0.0 -> "-0.0",
+// 1e100 -> "1e+100". See dtoa_impl in bolt_json_writer.cpp (a faithful port of
+// nlohmann's MIT-licensed to_chars). This is the ONE constructor whose bytes
+// are recomputed rather than sliced; every other scalar is emitted verbatim.
 JsonValue* make_double(Arena* arena, double v) noexcept;
 
 // make_string  — `bytes` is raw text; it is JSON-ESCAPED on serialize.
@@ -158,6 +163,52 @@ bool value_from_index(const StructuralIndex* idx, Arena* arena,
 // (> kJsonMaxDepth), a size exceeding INT32_MAX, or arena exhaustion.
 // ---------------------------------------------------------------------------
 bool serialize(const JsonValue* root, Arena* arena,
+               const uint8_t** out_bytes, int32_t* out_len) noexcept;
+
+// ---------------------------------------------------------------------------
+// nlohmann-FAITHFUL emit mode (STATION-87)
+// ---------------------------------------------------------------------------
+// The compact `serialize()` above is BYTE-FAITHFUL to a *source document* (it
+// re-emits verbatim slices, keys unescaped, no whitespace). The overload below
+// is instead byte-faithful to *nlohmann::json::dump()* — the exact output the
+// ~105 nlohmann consumers deferred by STATION-81 depend on. It is meant for a
+// value tree built through the make_*/object_add/array_add API (the way those
+// consumers assemble a payload), NOT for a tree lifted by value_from_index:
+//
+//   * object KEYS are treated as RAW text and JSON-escaped on emit (nlohmann
+//     escapes every key via dump_escaped); the compact path leaves keys
+//     verbatim because they arrive already-escaped from the tape.
+//   * StringEscaped values are escaped with nlohmann's exact rules (below).
+//   * StringVerbatim values are still emitted VERBATIM between quotes (they are
+//     a byte-faithful-mode primitive; supply nlohmann-faithful bytes, or use
+//     StringEscaped). ensure_ascii does NOT rewrite StringVerbatim content.
+//   * Literals (numbers / true / false / null) emit verbatim — make_int and
+//     make_double already produce nlohmann-identical bytes.
+//
+// EmitOptions mirrors nlohmann's dump(indent, indent_char, ensure_ascii):
+//   indent  < 0  -> COMPACT  (no whitespace)  == dump()          [default]
+//   indent >= 0  -> PRETTY   (indent spaces/level, ": " and "\n") == dump(N)
+//   ensure_ascii -> escape every codepoint >= U+007F as \uXXXX (surrogate
+//                   pairs for > U+FFFF), matching nlohmann's default.
+//
+// nlohmann escape rules (reproduced exactly): 0x08->\b 0x09->\t 0x0A->\n
+// 0x0C->\f 0x0D->\r 0x22->\" 0x5C->\\ ; any other codepoint <= 0x1F (and 0x7F
+// when ensure_ascii) -> \u00xx (LOWERCASE hex); else verbatim UTF-8 unless
+// ensure_ascii escapes it.
+struct EmitOptions {
+    int32_t indent       = -1;    // <0 compact; >=0 spaces per nesting level
+    char    indent_char  = ' ';   // nlohmann's indent_char (default space)
+    bool    ensure_ascii = false; // \uXXXX-escape non-ASCII (nlohmann default)
+};
+
+// Serialise `root` to arena-owned JSON text reproducing nlohmann's
+// dump(opts.indent, opts.indent_char, opts.ensure_ascii) byte-for-byte for a
+// make_*-built tree. Two passes (count, then write) like serialize(). Returns
+// false on null args, depth overflow, size > INT32_MAX, arena exhaustion, or —
+// only when opts.ensure_ascii is set — a StringEscaped value or object key that
+// is not valid UTF-8 (nlohmann throws type_error 316 there; a noexcept writer
+// fails instead). Output is NOT null-terminated.
+bool serialize(const JsonValue* root, Arena* arena, const EmitOptions& opts,
                const uint8_t** out_bytes, int32_t* out_len) noexcept;
 
 }  // namespace json
