@@ -547,6 +547,11 @@ if(BOLT_BUILD_ROCM)
                 --offload-arch=gfx1151
                 "--rocm-path=${_bolt_rocm_root}"
                 -O2 -DNDEBUG -std=c++20
+                # BLLM-189: flush f32 denormals to zero. Coarse Int4 quant can
+                # produce subnormal intermediates that hit the GPU's slow FP
+                # path (measured ~6x decode slowdown on a real Int4 model);
+                # FTZ is standard for inference kernels and never hurts.
+                -fgpu-flush-denormals-to-zero
                 -fms-runtime-lib=dll
                 -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_rocm.cpp"
