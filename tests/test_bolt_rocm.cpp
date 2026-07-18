@@ -286,3 +286,79 @@ TEST(BoltRocm, ElementwiseMatchesCpuReference) {
     ctx.free(&bb);
     ctx.free(&ob);
 }
+
+// BLLM-187: on-device HIP decode-step attention (GQA) matches a two-pass CPU
+// softmax reference (mathematically identical to the online-softmax kernel).
+TEST(BoltRocm, AttentionMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int num_heads = 4, num_kv_heads = 2, head_dim = 8, seq_len = 5;
+    const int group_size = num_heads / num_kv_heads;
+    const int q_n = num_heads * head_dim;
+    const int kv_n = seq_len * num_kv_heads * head_dim;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    std::vector<float> q(static_cast<size_t>(q_n)), kc(static_cast<size_t>(kv_n)),
+        vc(static_cast<size_t>(kv_n));
+    for (int i = 0; i < q_n; ++i) q[static_cast<size_t>(i)] = static_cast<float>((i % 9) - 4) * 0.15f;
+    for (int i = 0; i < kv_n; ++i) {
+        kc[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.12f;
+        vc[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.2f;
+    }
+
+    // CPU reference: per head, two-pass softmax over cached KV.
+    std::vector<float> ref(static_cast<size_t>(q_n), 0.0f);
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_head = h / group_size;
+        const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+        std::vector<float> sc(static_cast<size_t>(seq_len));
+        float mx = -1e30f;
+        for (int t = 0; t < seq_len; ++t) {
+            const float* kh =
+                kc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            float s = 0.0f;
+            for (int d = 0; d < head_dim; ++d) s += qh[d] * kh[d];
+            s *= scale;
+            sc[static_cast<size_t>(t)] = s;
+            mx = std::fmax(mx, s);
+        }
+        double denom = 0.0;
+        for (int t = 0; t < seq_len; ++t) {
+            sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
+            denom += sc[static_cast<size_t>(t)];
+        }
+        float* rh = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int t = 0; t < seq_len; ++t) {
+            const float w = static_cast<float>(sc[static_cast<size_t>(t)] / denom);
+            const float* vh =
+                vc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) rh[d] += w * vh[d];
+        }
+    }
+
+    DeviceBuffer qb, kb, vb, ob;
+    ASSERT_TRUE(ctx.allocate(q.size() * sizeof(float), &qb));
+    ASSERT_TRUE(ctx.allocate(kc.size() * sizeof(float), &kb));
+    ASSERT_TRUE(ctx.allocate(vc.size() * sizeof(float), &vb));
+    ASSERT_TRUE(ctx.allocate(q.size() * sizeof(float), &ob));
+    ASSERT_TRUE(ctx.copy_to_device(q.data(), &qb, q.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(kc.data(), &kb, kc.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(vc.data(), &vb, vc.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::attention(ctx, static_cast<const float*>(qb.ptr),
+                                      static_cast<const float*>(kb.ptr),
+                                      static_cast<const float*>(vb.ptr),
+                                      static_cast<float*>(ob.ptr), num_heads, num_kv_heads, head_dim,
+                                      seq_len, scale));
+    std::vector<float> o(static_cast<size_t>(q_n));
+    ASSERT_TRUE(ctx.copy_to_host(ob, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < q_n; ++i) {
+        EXPECT_NEAR(o[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.free(&qb);
+    ctx.free(&kb);
+    ctx.free(&vb);
+    ctx.free(&ob);
+}

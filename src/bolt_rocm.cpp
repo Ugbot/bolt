@@ -231,6 +231,48 @@ __global__ void elementwise_kernel(const float* a, const float* b, float* o, int
     }
 }
 
+// BLLM-187: decode-step attention with flash-style online softmax. ONE block
+// per query head; blockDim is a power-of-two >= head_dim, one thread per dim
+// (inactive threads d>=head_dim contribute 0 to the QK dot and skip the write,
+// so the power-of-two tree reduction stays valid). Mirrors qwen2_attention_'s
+// numerics exactly: stream over cached KV in one pass keeping a running max
+// `m`, denominator `l`, and rescaled per-dim context `ch`. GQA: query head h
+// reads kv head h/group_size. m/l/corr/p are computed identically by every
+// thread from the broadcast score, so they stay in lockstep with no extra sync.
+__global__ void attention_kernel(const float* q, const float* k_cache, const float* v_cache,
+                                 float* out, int32_t head_dim, int32_t num_kv_heads,
+                                 int32_t group_size, int32_t seq_len, float scale) {
+    __shared__ float red[kBlockSize];
+    __shared__ float s_bcast;
+    const int32_t h = blockIdx.x;
+    const int32_t kv_head = h / group_size;
+    const int32_t d = threadIdx.x;
+    const bool active = d < head_dim;
+    const float qd = active ? q[static_cast<int64_t>(h) * head_dim + d] : 0.0f;
+
+    float ch = 0.0f, m = -INFINITY, l = 0.0f;
+    for (int32_t t = 0; t < seq_len; ++t) {
+        const int64_t off = (static_cast<int64_t>(t) * num_kv_heads + kv_head) * head_dim + d;
+        const float kd = active ? k_cache[off] : 0.0f;
+        red[threadIdx.x] = qd * kd;
+        __syncthreads();
+        for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) s_bcast = red[0] * scale;
+        __syncthreads();
+        const float s = s_bcast;
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new);
+        const float p = expf(s - m_new);
+        l = l * corr + p;
+        ch = ch * corr + p * (active ? v_cache[off] : 0.0f);
+        m = m_new;
+    }
+    if (active) out[static_cast<int64_t>(h) * head_dim + d] = ch / l;
+}
+
 }  // namespace
 
 bool available() noexcept {
@@ -395,6 +437,25 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
     }
     const dim3 grid(static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize));
     elementwise_kernel<<<grid, dim3(kBlockSize)>>>(a_device, b_device, out_device, n, op);
+    return hipDeviceSynchronize() == hipSuccess;
+}
+
+bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
+               const float* v_cache_device, float* out_device, int32_t num_heads,
+               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale) noexcept {
+    if (!ctx.is_valid() || q_device == nullptr || k_cache_device == nullptr ||
+        v_cache_device == nullptr || out_device == nullptr) {
+        return false;
+    }
+    if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return false;
+    if (num_heads % num_kv_heads != 0 || head_dim > kBlockSize) return false;
+    const int32_t group_size = num_heads / num_kv_heads;
+    int32_t block = 1;
+    while (block < head_dim) block <<= 1;  // power-of-two >= head_dim for the tree reduce
+    attention_kernel<<<dim3(static_cast<unsigned int>(num_heads)),
+                       dim3(static_cast<unsigned int>(block))>>>(
+        q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
+        seq_len, scale);
     return hipDeviceSynchronize() == hipSuccess;
 }
 

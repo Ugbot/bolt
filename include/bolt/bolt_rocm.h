@@ -163,4 +163,14 @@ bool rope(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads, in
 bool elementwise(Context& ctx, const float* a_device, const float* b_device, float* out_device,
                  int32_t n, int32_t op) noexcept;
 
+// BLLM-187: decode-step causal attention with flash-style online softmax. `q`
+// is [num_heads, head_dim]; `k_cache`/`v_cache` are [seq_len, num_kv_heads,
+// head_dim] (the KV cache including the current position); `out` is
+// [num_heads, head_dim]. GQA: query head h reads kv head h/(num_heads/
+// num_kv_heads). `scale` is the softmax scale (typically 1/sqrt(head_dim)).
+// Precondition: num_heads % num_kv_heads == 0 and head_dim <= 256.
+bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
+               const float* v_cache_device, float* out_device, int32_t num_heads,
+               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale) noexcept;
+
 }  // namespace bolt::rocm
