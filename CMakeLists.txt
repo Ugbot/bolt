@@ -195,7 +195,8 @@ if(BOLT_BUILD_REACTOR)
         src/api/net/event_loop.cpp
         src/api/net/io_dispatcher.cpp
         src/api/net/coro_tcp_listener.cpp
-        src/api/net/tcp_socket.cpp)
+        src/api/net/tcp_socket.cpp
+        src/api/io/file.cpp)
     if(WIN32)
         list(APPEND _bolt_reactor_sources
             src/api/core/async_io_iocp.cpp
