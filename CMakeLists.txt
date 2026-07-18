@@ -174,6 +174,56 @@ if(BOLT_BUILD_PARSE)
 endif()
 
 # ---------------------------------------------------------------------------
+# bolt::reactor — compiled static library: the native cross-platform async
+# reactor (event loop + async I/O), hoisted from boltapi (STATION-78).
+# A coroutine-based callback engine (bolt::api::core::async_io) with per-OS
+# backends — IOCP (Windows), epoll + io_uring (Linux), kqueue (macOS) — plus a
+# coroutine dispatcher (bolt::api::net::IODispatcher), a readiness event loop,
+# and a turnkey TCP listener. Namespace stays bolt::api::* so boltapi consumes
+# it unchanged. bolt's FIRST real-I/O target, hence opt-in and kept OUT of the
+# bolt::bolt umbrella: consumers link bolt::reactor explicitly so pure-compute
+# bolt users don't drag in ws2_32/mswsock.
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_REACTOR "Build bolt::reactor native async event loop / I/O" ${BOLT_IS_TOPLEVEL})
+
+if(BOLT_BUILD_REACTOR)
+    set(_bolt_reactor_sources
+        src/api/core/async_io.cpp
+        src/api/core/logger.cpp
+        src/api/core/worker_pool.cpp
+        src/api/net/event_loop.cpp
+        src/api/net/io_dispatcher.cpp
+        src/api/net/coro_tcp_listener.cpp
+        src/api/net/tcp_socket.cpp)
+    if(WIN32)
+        list(APPEND _bolt_reactor_sources
+            src/api/core/async_io_iocp.cpp
+            src/api/net/event_loop_iocp.cpp)
+    elseif(APPLE)
+        list(APPEND _bolt_reactor_sources
+            src/api/core/async_io_kqueue.cpp
+            src/api/net/event_loop_kqueue.cpp)
+    elseif(UNIX)
+        list(APPEND _bolt_reactor_sources
+            src/api/core/async_io_epoll.cpp
+            src/api/core/async_io_uring.cpp
+            src/api/net/event_loop_epoll.cpp)
+    endif()
+
+    add_library(bolt_reactor STATIC ${_bolt_reactor_sources})
+    add_library(bolt::reactor ALIAS bolt_reactor)
+    target_link_libraries(bolt_reactor PUBLIC bolt::core)
+    target_include_directories(bolt_reactor PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    target_compile_features(bolt_reactor PUBLIC cxx_std_20)
+    if(WIN32)
+        target_link_libraries(bolt_reactor PUBLIC ws2_32 mswsock)
+    endif()
+    bolt_apply_hardening(bolt_reactor)
+endif()
+
+# ---------------------------------------------------------------------------
 # bolt::compute_idot — compiled static library: int8-ACTIVATION quantized
 # GEMV (BLLM-14). Unlike the rest of bolt::compute (compile-time SIMD tier,
 # header-only), this carries AVX2/AVX-512VNNI intrinsics + bolt's FIRST
