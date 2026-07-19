@@ -160,9 +160,12 @@ private:
 // dtype == WeightDType::F32 (no scale used); required otherwise.
 // Returns false on invalid arguments or any launch/sync failure.
 // Precondition: ctx.is_valid().
+// BLLM-200: optional per-row `bias` (nullptr = none) is folded into the output
+// (out = dot + bias), removing a separate bias-add launch (router/lm_head/proj).
 bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                      const float* scale_device, const float* activation_device,
-                     float* out_device, int32_t out_rows, int32_t cols) noexcept;
+                     float* out_device, int32_t out_rows, int32_t cols,
+                     const float* bias = nullptr) noexcept;
 
 // BLLM-189: like matmul_dequant but ACCUMULATES -- out[r] += dot(weight.row(r),
 // activation) -- fusing a residual/skip add into the projection GEMV (removes a
@@ -171,7 +174,8 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
 // returns false for Int4/Int2. Precondition: ctx.is_valid().
 bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDType dtype,
                              const float* scale_device, const float* activation_device,
-                             float* out_device, int32_t out_rows, int32_t cols) noexcept;
+                             float* out_device, int32_t out_rows, int32_t cols,
+                             const float* bias = nullptr) noexcept;
 
 // BLLM-91: int8-ACTIVATION matmul -- the HIP twin of
 // bolt::vulkan::Context::matmul_dequant_int8_activation (BLLM-81), the
@@ -313,8 +317,13 @@ bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, i
 // dtype (F32 or Int8); for Int8 `sq`/`sk`/`sv` are the per-row scales (required;
 // ignored for F32). Same dequant contract as matmul_dequant. Precondition:
 // ctx.is_valid().
+// BLLM-200: optional per-row biases qb/kb/vb (nullptr = none) are folded into the
+// projection -- out = dot + bias -- removing three separate elementwise bias-add
+// launches per layer (the gpt-oss dense path is kernel-count bound).
 bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, WeightDType dtype,
                const float* sq, const float* sk, const float* sv, const float* x, float* q,
-               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols) noexcept;
+               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols,
+               const float* qb = nullptr, const float* kb = nullptr,
+               const float* vb = nullptr) noexcept;
 
 }  // namespace bolt::rocm

@@ -61,7 +61,7 @@ __device__ inline float warp_reduce_sum(float v) {
 // out[row]=dot, <true> writes out[row]+=dot (fuses the residual-add).
 template <bool Accumulate>
 __global__ void matmul_dequant_f32_kernel(const float* weight, const float* activation, float* out,
-                                          int32_t rows, int32_t cols) {
+                                          int32_t rows, int32_t cols, const float* bias = nullptr) {
     const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= rows) return;
     const int32_t lane = threadIdx.x % warpSize;
@@ -69,42 +69,50 @@ __global__ void matmul_dequant_f32_kernel(const float* weight, const float* acti
     float acc = 0.0f;
     for (int32_t i = lane; i < cols; i += warpSize) acc += activation[i] * row_ptr[i];
     acc = warp_reduce_sum(acc);
-    if (lane == 0) out[row] = Accumulate ? (out[row] + acc) : acc;
+    if (lane == 0) out[row] = (Accumulate ? out[row] : 0.0f) + acc + (bias ? bias[row] : 0.0f);
 }
 
 template <bool Accumulate>
 __global__ void matmul_dequant_int8_kernel(const int8_t* weight, const float* scale,
                                             const float* activation, float* out, int32_t rows,
-                                            int32_t cols) {
+                                            int32_t cols, const float* bias = nullptr) {
     const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= rows) return;
     const int32_t lane = threadIdx.x % warpSize;
     const int8_t* row_ptr = weight + static_cast<int64_t>(row) * cols;
     float acc = 0.0f;
-    // BLLM-190: vectorized fast path -- each lane loads 4 int8 weights as one
-    // uint32 and 4 activations as one float4, 4 MACs/iter (4x fewer loads, more
-    // ILP -> closer to the bandwidth wall). Requires cols % 4 == 0 so every row
-    // starts 4-byte aligned; the scalar warp loop handles any remainder / odd cols.
-    const int32_t cols4 = cols & ~3;
-    if ((cols & 3) == 0) {
+    // BLLM-200: WIDE vectorized path -- each lane loads 16 int8 weights as one uint4
+    // (16-byte load) + 16 activations as 4 float4, 16 MACs/iter. The 16-byte weight
+    // load is 4x fewer weight-load instructions than the uint32 path, which is what
+    // makes the MXFP4 GEMV hit ~170 GB/s vs int8's ~94 (both warp-per-row, same
+    // occupancy -- the difference was load width). cols%16==0 uses this; %4 falls to
+    // the uint32 path; else scalar.
+    auto dot4 = [](uint32_t w, float4 x) -> float {
+        return x.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
+               x.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
+               x.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
+               x.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
+    };
+    if ((cols & 15) == 0) {
+        const uint4* w16 = reinterpret_cast<const uint4*>(row_ptr);
+        const float4* x4 = reinterpret_cast<const float4*>(activation);
+        for (int32_t j = lane; j < cols / 16; j += warpSize) {
+            const uint4 w = w16[j];
+            const int32_t xb = j * 4;
+            acc += dot4(w.x, x4[xb]) + dot4(w.y, x4[xb + 1]) + dot4(w.z, x4[xb + 2]) +
+                   dot4(w.w, x4[xb + 3]);
+        }
+    } else if ((cols & 3) == 0) {
         const uint32_t* w4 = reinterpret_cast<const uint32_t*>(row_ptr);
         const float4* x4 = reinterpret_cast<const float4*>(activation);
-        for (int32_t j = lane; j < cols4 / 4; j += warpSize) {
-            const uint32_t w = w4[j];
-            const float4 x = x4[j];
-            acc += x.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
-                   x.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
-                   x.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
-                   x.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
-        }
+        for (int32_t j = lane; j < cols / 4; j += warpSize) acc += dot4(w4[j], x4[j]);
     } else {
-        for (int32_t i = lane; i < cols4; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
-        for (int32_t i = cols4 + lane; i < cols; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
+        for (int32_t i = lane; i < cols; i += warpSize) acc += activation[i] * static_cast<float>(row_ptr[i]);
     }
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
         const float v = acc * scale[row];
-        out[row] = Accumulate ? (out[row] + v) : v;
+        out[row] = (Accumulate ? out[row] : 0.0f) + v + (bias ? bias[row] : 0.0f);
     }
 }
 
@@ -749,6 +757,7 @@ __global__ void axpy_bias_kernel(const float* x, const float* bias, float scale,
 // block (constant across the block's threads), so there is no intra-block
 // divergence and the hot dot loop stays branch-free. F32-weight tier.
 __global__ void fused_qkv_f32_kernel(const float* wq, const float* wk, const float* wv,
+                                     const float* qb, const float* kb, const float* vb,
                                      const float* x, float* q, float* k, float* v, int32_t q_rows,
                                      int32_t kv_rows, int32_t cols) {
     const int32_t total = q_rows + 2 * kv_rows;
@@ -756,25 +765,27 @@ __global__ void fused_qkv_f32_kernel(const float* wq, const float* wk, const flo
     if (b >= total) return;
     const int32_t lane = threadIdx.x % warpSize;
     const float* wrow;
+    const float* bias;
     float* out;
     int32_t orow;
     if (b < q_rows) {
-        wrow = wq + static_cast<int64_t>(b) * cols; out = q; orow = b;
+        wrow = wq + static_cast<int64_t>(b) * cols; bias = qb; out = q; orow = b;
     } else if (b < q_rows + kv_rows) {
-        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; out = k;
+        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; bias = kb; out = k;
     } else {
-        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; out = v;
+        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; bias = vb; out = v;
     }
     float acc = 0.0f;
     for (int32_t i = lane; i < cols; i += warpSize) acc += x[i] * wrow[i];
     acc = warp_reduce_sum(acc);
-    if (lane == 0) out[orow] = acc;
+    if (lane == 0) out[orow] = acc + (bias ? bias[orow] : 0.0f);
 }
 
 // Int8-weight twin: each of q/k/v carries its own per-row scale array. Warp-per-
 // row + vectorized (4 int8 as uint32, float4 activation) when cols % 4 == 0.
 __global__ void fused_qkv_int8_kernel(const int8_t* wq, const int8_t* wk, const int8_t* wv,
                                       const float* sq, const float* sk, const float* sv,
+                                      const float* qb, const float* kb, const float* vb,
                                       const float* x, float* q, float* k, float* v, int32_t q_rows,
                                       int32_t kv_rows, int32_t cols) {
     const int32_t total = q_rows + 2 * kv_rows;
@@ -783,32 +794,40 @@ __global__ void fused_qkv_int8_kernel(const int8_t* wq, const int8_t* wk, const 
     const int32_t lane = threadIdx.x % warpSize;
     const int8_t* wrow;
     const float* scl;
+    const float* bias;
     float* out;
     int32_t orow;
     if (b < q_rows) {
-        wrow = wq + static_cast<int64_t>(b) * cols; scl = sq; out = q; orow = b;
+        wrow = wq + static_cast<int64_t>(b) * cols; scl = sq; bias = qb; out = q; orow = b;
     } else if (b < q_rows + kv_rows) {
-        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; scl = sk; out = k;
+        orow = b - q_rows; wrow = wk + static_cast<int64_t>(orow) * cols; scl = sk; bias = kb; out = k;
     } else {
-        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; scl = sv; out = v;
+        orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; scl = sv; bias = vb; out = v;
     }
     float acc = 0.0f;
-    if ((cols & 3) == 0) {
+    auto dot4 = [](uint32_t w, float4 xv) -> float {
+        return xv.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
+               xv.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
+               xv.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
+               xv.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
+    };
+    if ((cols & 15) == 0) {  // BLLM-200: 16-byte uint4 weight load (16 int8), 16 MAC/iter
+        const uint4* w16 = reinterpret_cast<const uint4*>(wrow);
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        for (int32_t j = lane; j < cols / 16; j += warpSize) {
+            const uint4 w = w16[j];
+            const int32_t xb = j * 4;
+            acc += dot4(w.x, x4[xb]) + dot4(w.y, x4[xb + 1]) + dot4(w.z, x4[xb + 2]) + dot4(w.w, x4[xb + 3]);
+        }
+    } else if ((cols & 3) == 0) {
         const uint32_t* w4 = reinterpret_cast<const uint32_t*>(wrow);
         const float4* x4 = reinterpret_cast<const float4*>(x);
-        for (int32_t j = lane; j < cols / 4; j += warpSize) {
-            const uint32_t w = w4[j];
-            const float4 xv = x4[j];
-            acc += xv.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
-                   xv.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
-                   xv.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
-                   xv.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
-        }
+        for (int32_t j = lane; j < cols / 4; j += warpSize) acc += dot4(w4[j], x4[j]);
     } else {
         for (int32_t i = lane; i < cols; i += warpSize) acc += x[i] * static_cast<float>(wrow[i]);
     }
     acc = warp_reduce_sum(acc);
-    if (lane == 0) out[orow] = acc * scl[orow];
+    if (lane == 0) out[orow] = acc * scl[orow] + (bias ? bias[orow] : 0.0f);
 }
 
 }  // namespace
@@ -930,7 +949,7 @@ void Context::free_graph() noexcept {
 
 bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
                      const float* scale_device, const float* activation_device,
-                     float* out_device, int32_t out_rows, int32_t cols) noexcept {
+                     float* out_device, int32_t out_rows, int32_t cols, const float* bias) noexcept {
     if (!ctx.is_valid() || weight_device == nullptr || activation_device == nullptr ||
         out_device == nullptr || out_rows <= 0 || cols <= 0) {
         return false;
@@ -950,12 +969,12 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
         case WeightDType::F32:
             matmul_dequant_f32_kernel<false><<<wgrid, block, 0, st>>>(
                 static_cast<const float*>(weight_device), activation_device, out_device, out_rows,
-                cols);
+                cols, bias);
             break;
         case WeightDType::Int8:
             matmul_dequant_int8_kernel<false><<<wgrid, block, 0, st>>>(
                 static_cast<const int8_t*>(weight_device), scale_device, activation_device,
-                out_device, out_rows, cols);
+                out_device, out_rows, cols, bias);
             break;
         case WeightDType::Int4:
             matmul_dequant_int4_kernel<false><<<wgrid, block, 0, st>>>(
@@ -976,7 +995,8 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
 
 bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDType dtype,
                              const float* scale_device, const float* activation_device,
-                             float* out_device, int32_t out_rows, int32_t cols) noexcept {
+                             float* out_device, int32_t out_rows, int32_t cols,
+                             const float* bias) noexcept {
     if (!ctx.is_valid() || weight_device == nullptr || activation_device == nullptr ||
         out_device == nullptr || out_rows <= 0 || cols <= 0) {
         return false;
@@ -989,15 +1009,15 @@ bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDTyp
     if (wps <= 0) wps = 32;
     const int32_t wpb = kBlockSize / wps;
     const dim3 wgrid(static_cast<unsigned int>((out_rows + wpb - 1) / wpb));
-    // out[row] += dot(...) -- fuses the residual-add into the projection. F32/Int8/
-    // Int4 (the resident-graph decode tiers); Int2 keeps the unfused path.
+    // out[row] += dot(...) (+ bias) -- fuses the residual-add (and optional bias)
+    // into the projection. F32/Int8/Int4 tiers; Int2 keeps the unfused path.
     if (dtype == WeightDType::F32) {
         matmul_dequant_f32_kernel<true><<<wgrid, block, 0, st>>>(
-            static_cast<const float*>(weight_device), activation_device, out_device, out_rows, cols);
+            static_cast<const float*>(weight_device), activation_device, out_device, out_rows, cols, bias);
     } else if (dtype == WeightDType::Int8) {
         matmul_dequant_int8_kernel<true><<<wgrid, block, 0, st>>>(
             static_cast<const int8_t*>(weight_device), scale_device, activation_device, out_device,
-            out_rows, cols);
+            out_rows, cols, bias);
     } else if (dtype == WeightDType::Int4) {
         matmul_dequant_int4_kernel<true><<<wgrid, block, 0, st>>>(
             static_cast<const uint8_t*>(weight_device), scale_device, activation_device, out_device,
@@ -1184,7 +1204,8 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
 
 bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, WeightDType dtype,
                const float* sq, const float* sk, const float* sv, const float* x, float* q,
-               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols) noexcept {
+               float* k, float* v, int32_t q_rows, int32_t kv_rows, int32_t cols, const float* qb,
+               const float* kb, const float* vb) noexcept {
     if (!ctx.is_valid() || wq == nullptr || wk == nullptr || wv == nullptr || x == nullptr ||
         q == nullptr || k == nullptr || v == nullptr || q_rows <= 0 || kv_rows <= 0 || cols <= 0) {
         return false;
@@ -1201,11 +1222,11 @@ bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, Wei
     if (dtype == WeightDType::F32) {
         fused_qkv_f32_kernel<<<grid, block, 0, st>>>(
             static_cast<const float*>(wq), static_cast<const float*>(wk),
-            static_cast<const float*>(wv), x, q, k, v, q_rows, kv_rows, cols);
+            static_cast<const float*>(wv), qb, kb, vb, x, q, k, v, q_rows, kv_rows, cols);
     } else {
         fused_qkv_int8_kernel<<<grid, block, 0, st>>>(
             static_cast<const int8_t*>(wq), static_cast<const int8_t*>(wk),
-            static_cast<const int8_t*>(wv), sq, sk, sv, x, q, k, v, q_rows, kv_rows, cols);
+            static_cast<const int8_t*>(wv), sq, sk, sv, qb, kb, vb, x, q, k, v, q_rows, kv_rows, cols);
     }
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
