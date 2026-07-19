@@ -122,7 +122,7 @@ __global__ void matmul_dequant_int8_kernel(const int8_t* weight, const float* sc
 template <bool Accumulate>
 __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* scale,
                                             const float* activation, float* out, int32_t rows,
-                                            int32_t cols) {
+                                            int32_t cols, const float* bias = nullptr) {
     const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= rows) return;
     const int32_t lane = threadIdx.x % warpSize;
@@ -157,7 +157,7 @@ __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* s
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
         const float v = acc * scale[row];
-        out[row] = Accumulate ? (out[row] + v) : v;
+        out[row] = (Accumulate ? out[row] : 0.0f) + v + (bias ? bias[row] : 0.0f);
     }
 }
 
@@ -979,7 +979,7 @@ bool matmul_dequant(Context& ctx, const void* weight_device, WeightDType dtype,
         case WeightDType::Int4:
             matmul_dequant_int4_kernel<false><<<wgrid, block, 0, st>>>(
                 static_cast<const uint8_t*>(weight_device), scale_device, activation_device,
-                out_device, out_rows, cols);
+                out_device, out_rows, cols, bias);
             break;
         case WeightDType::Int2:
             matmul_dequant_int2_kernel<<<rgrid, block, 0, st>>>(
@@ -1021,7 +1021,7 @@ bool matmul_dequant_residual(Context& ctx, const void* weight_device, WeightDTyp
     } else if (dtype == WeightDType::Int4) {
         matmul_dequant_int4_kernel<true><<<wgrid, block, 0, st>>>(
             static_cast<const uint8_t*>(weight_device), scale_device, activation_device, out_device,
-            out_rows, cols);
+            out_rows, cols, bias);
     } else {
         return false;
     }
