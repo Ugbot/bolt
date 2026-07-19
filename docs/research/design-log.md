@@ -2406,3 +2406,18 @@ REAL qwen2.5-0.5b-q8_0 Int8: 163 -> 217.8 t/s, coherent+fluent.
 Session arc: 52 (CPU this morning) -> 217.8 t/s = 4.2x, now 72% of llama.cpp's
 GPU 304. Remaining sinks: lm_head 0.62 (bandwidth-bound now), fused_swiglu 0.50
 (not yet vectorized), qkv 0.27. Next: vectorize fused_swiglu + fused_qkv + int4.
+
+## 2026-07-19 / vectorized fused_swiglu + fused_qkv (BLLM-190)
+
+Rolled the 4-int8-as-uint32 + float4 vectorization into fused_swiglu_int8 and
+fused_qkv_int8 (also converted fused_qkv f32/int8 from block-per-row to warp-
+per-row). 16/16 coherence green.
+
+fused_qkv 11.2->3.8 us, fused_swiglu 20.8->10.9 us. SUM 2.19->1.78 ms.
+Synthetic 0.5B Int8 264.6 -> 280.3 t/s. REAL qwen2.5-0.5b-q8_0 Int8: 217.8 ->
+244 t/s, coherent.
+
+Session arc: 52 (CPU) -> 244 t/s = 4.7x, now 80% of llama.cpp's GPU 304.
+Sinks now: lm_head 0.64 (bandwidth-bound), fused_swiglu 0.26, down 0.22,
+attention 0.19, rmsnorm 0.18. Next: Int4 lm_head (mixed, halves the top sink),
+vectorize the Int4 kernels (Int4 240 < Int8 280 because not vectorized).

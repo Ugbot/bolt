@@ -412,10 +412,28 @@ __global__ void fused_swiglu_int8_kernel(const int8_t* wg, const int8_t* wu, con
     const int8_t* gr = wg + static_cast<int64_t>(row) * cols;
     const int8_t* ur = wu + static_cast<int64_t>(row) * cols;
     float ga = 0.0f, ua = 0.0f;
-    for (int32_t i = lane; i < cols; i += warpSize) {
-        const float xi = x[i];
-        ga += xi * static_cast<float>(gr[i]);
-        ua += xi * static_cast<float>(ur[i]);
+    if ((cols & 3) == 0) {  // BLLM-190: 4 int8 as uint32 + float4 activation
+        const uint32_t* g4 = reinterpret_cast<const uint32_t*>(gr);
+        const uint32_t* u4 = reinterpret_cast<const uint32_t*>(ur);
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        for (int32_t j = lane; j < cols / 4; j += warpSize) {
+            const uint32_t g = g4[j], u = u4[j];
+            const float4 xv = x4[j];
+            ga += xv.x * static_cast<float>(static_cast<int8_t>(g & 0xffu)) +
+                  xv.y * static_cast<float>(static_cast<int8_t>((g >> 8) & 0xffu)) +
+                  xv.z * static_cast<float>(static_cast<int8_t>((g >> 16) & 0xffu)) +
+                  xv.w * static_cast<float>(static_cast<int8_t>((g >> 24) & 0xffu));
+            ua += xv.x * static_cast<float>(static_cast<int8_t>(u & 0xffu)) +
+                  xv.y * static_cast<float>(static_cast<int8_t>((u >> 8) & 0xffu)) +
+                  xv.z * static_cast<float>(static_cast<int8_t>((u >> 16) & 0xffu)) +
+                  xv.w * static_cast<float>(static_cast<int8_t>((u >> 24) & 0xffu));
+        }
+    } else {
+        for (int32_t i = lane; i < cols; i += warpSize) {
+            const float xi = x[i];
+            ga += xi * static_cast<float>(gr[i]);
+            ua += xi * static_cast<float>(ur[i]);
+        }
     }
     ga = warp_reduce_sum(ga);
     ua = warp_reduce_sum(ua);
@@ -459,8 +477,10 @@ __global__ void fused_swiglu_int4_kernel(const uint8_t* wg, const uint8_t* wu,
 __global__ void fused_qkv_f32_kernel(const float* wq, const float* wk, const float* wv,
                                      const float* x, float* q, float* k, float* v, int32_t q_rows,
                                      int32_t kv_rows, int32_t cols) {
-    __shared__ float shared[kBlockSize];
-    const int32_t b = blockIdx.x;
+    const int32_t total = q_rows + 2 * kv_rows;
+    const int32_t b = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (b >= total) return;
+    const int32_t lane = threadIdx.x % warpSize;
     const float* wrow;
     float* out;
     int32_t orow;
@@ -472,23 +492,21 @@ __global__ void fused_qkv_f32_kernel(const float* wq, const float* wk, const flo
         orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; out = v;
     }
     float acc = 0.0f;
-    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) acc += x[i] * wrow[i];
-    shared[threadIdx.x] = acc;
-    __syncthreads();
-    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[orow] = shared[0];
+    for (int32_t i = lane; i < cols; i += warpSize) acc += x[i] * wrow[i];
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[orow] = acc;
 }
 
-// Int8-weight twin: each of q/k/v carries its own per-row scale array.
+// Int8-weight twin: each of q/k/v carries its own per-row scale array. Warp-per-
+// row + vectorized (4 int8 as uint32, float4 activation) when cols % 4 == 0.
 __global__ void fused_qkv_int8_kernel(const int8_t* wq, const int8_t* wk, const int8_t* wv,
                                       const float* sq, const float* sk, const float* sv,
                                       const float* x, float* q, float* k, float* v, int32_t q_rows,
                                       int32_t kv_rows, int32_t cols) {
-    __shared__ float shared[kBlockSize];
-    const int32_t b = blockIdx.x;
+    const int32_t total = q_rows + 2 * kv_rows;
+    const int32_t b = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (b >= total) return;
+    const int32_t lane = threadIdx.x % warpSize;
     const int8_t* wrow;
     const float* scl;
     float* out;
@@ -501,14 +519,22 @@ __global__ void fused_qkv_int8_kernel(const int8_t* wq, const int8_t* wk, const 
         orow = b - q_rows - kv_rows; wrow = wv + static_cast<int64_t>(orow) * cols; scl = sv; out = v;
     }
     float acc = 0.0f;
-    for (int32_t i = threadIdx.x; i < cols; i += blockDim.x) acc += x[i] * static_cast<float>(wrow[i]);
-    shared[threadIdx.x] = acc;
-    __syncthreads();
-    for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-        __syncthreads();
+    if ((cols & 3) == 0) {
+        const uint32_t* w4 = reinterpret_cast<const uint32_t*>(wrow);
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        for (int32_t j = lane; j < cols / 4; j += warpSize) {
+            const uint32_t w = w4[j];
+            const float4 xv = x4[j];
+            acc += xv.x * static_cast<float>(static_cast<int8_t>(w & 0xffu)) +
+                   xv.y * static_cast<float>(static_cast<int8_t>((w >> 8) & 0xffu)) +
+                   xv.z * static_cast<float>(static_cast<int8_t>((w >> 16) & 0xffu)) +
+                   xv.w * static_cast<float>(static_cast<int8_t>((w >> 24) & 0xffu));
+        }
+    } else {
+        for (int32_t i = lane; i < cols; i += warpSize) acc += x[i] * static_cast<float>(wrow[i]);
     }
-    if (threadIdx.x == 0) out[orow] = shared[0] * scl[orow];
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[orow] = acc * scl[orow];
 }
 
 }  // namespace
@@ -844,8 +870,11 @@ bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, Wei
     if (dtype == WeightDType::Int8 && (sq == nullptr || sk == nullptr || sv == nullptr)) return false;
 
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
-    const dim3 grid(static_cast<unsigned int>(q_rows + 2 * kv_rows));
     const dim3 block(static_cast<unsigned int>(kBlockSize));
+    int32_t wps = ctx.wavefront_size();
+    if (wps <= 0) wps = 32;
+    const int32_t wpb = kBlockSize / wps;
+    const dim3 grid(static_cast<unsigned int>((q_rows + 2 * kv_rows + wpb - 1) / wpb));  // warp-per-row
     if (dtype == WeightDType::F32) {
         fused_qkv_f32_kernel<<<grid, block, 0, st>>>(
             static_cast<const float*>(wq), static_cast<const float*>(wk),
