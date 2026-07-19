@@ -232,48 +232,84 @@ __global__ void matmul_mxfp4_aligned_kernel(const uint8_t* codes, const uint8_t*
     if (lane == 0) out[row] = acc;
 }
 
-// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai in ONE launch (vs 2 matmul_mxfp4
-// + 1 swiglu_oai). One warp per output row r in [0,rows=expert_inter): dots BOTH the
-// gate and up MXFP4 rows against the shared activation, applies the per-column
-// biases + swiglu_oai, writes act[r]. Launch-overhead is the gpt-oss decode cap
-// (720 expert launches/token at ~29us each), so op-fusion is the lever here.
-__global__ void moe_gate_up_swiglu_mxfp4_kernel(const uint8_t* gcodes, const uint8_t* gscales,
-                                                const uint8_t* ucodes, const uint8_t* uscales,
-                                                const float* gbias, const float* ubias,
-                                                const float* x, float* act, int32_t rows, int32_t cols,
-                                                float alpha, float limit) {
+// BLLM-200: GPU top-K + softmax router selection (gpt-oss: top-4 of 128 by raw
+// logit, then softmax over the 4). ONE thread (E,K tiny) writes sel[K] (expert
+// indices) + selw[K] (softmax weights) to device buffers -- so the expert kernels
+// read their expert index ON DEVICE and the whole token needs NO per-layer host
+// round-trip (was 36 syncs/token). K <= 64.
+__global__ void moe_topk_softmax_kernel(const float* logits, int32_t* sel, float* selw, int32_t E,
+                                        int32_t K) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int32_t kk = 0; kk < K; ++kk) {
+        int32_t best = -1;
+        float bv = -INFINITY;
+        for (int32_t e = 0; e < E; ++e) {
+            bool taken = false;
+            for (int32_t j = 0; j < kk; ++j)
+                if (sel[j] == e) { taken = true; break; }
+            if (!taken && logits[e] > bv) { bv = logits[e]; best = e; }
+        }
+        sel[kk] = best;
+        selw[kk] = bv;
+    }
+    float mx = selw[0];
+    for (int32_t kk = 1; kk < K; ++kk) mx = fmaxf(mx, selw[kk]);
+    float sum = 0.0f;
+    for (int32_t kk = 0; kk < K; ++kk) { selw[kk] = expf(selw[kk] - mx); sum += selw[kk]; }
+    for (int32_t kk = 0; kk < K; ++kk) selw[kk] /= sum;
+}
+
+// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai in ONE launch, DEVICE-INDEXED.
+// The expert `e = sel[kk]` is read on-device, so the whole MoE runs without a host
+// round-trip for routing. gate/up share the [expert_inter, hidden] shape (same
+// codes/scale strides). One warp per output row r; per-expert bias stride == rows.
+__global__ void moe_gate_up_swiglu_mxfp4_kernel(const uint8_t* gcb, const uint8_t* gsb,
+                                                const uint8_t* ucb, const uint8_t* usb,
+                                                int64_t cstride, int64_t sstride,
+                                                const float* gbias_base, const float* ubias_base,
+                                                const int32_t* sel, int32_t kk, const float* x,
+                                                float* act, int32_t rows, int32_t cols, float alpha,
+                                                float limit) {
     const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= rows) return;
     const int32_t lane = threadIdx.x % warpSize;
+    const int32_t e = sel[kk];
     const int32_t nb = cols >> 5;
-    const int64_t co = static_cast<int64_t>(row) * nb * 16, so = static_cast<int64_t>(row) * nb;
-    float g = mxfp4_aligned_partial(gcodes + co, gscales + so, x, nb, lane);
-    float u = mxfp4_aligned_partial(ucodes + co, uscales + so, x, nb, lane);
+    const int64_t co = static_cast<int64_t>(e) * cstride + static_cast<int64_t>(row) * nb * 16;
+    const int64_t so = static_cast<int64_t>(e) * sstride + static_cast<int64_t>(row) * nb;
+    float g = mxfp4_aligned_partial(gcb + co, gsb + so, x, nb, lane);
+    float u = mxfp4_aligned_partial(ucb + co, usb + so, x, nb, lane);
     g = warp_reduce_sum(g);
     u = warp_reduce_sum(u);
     if (lane == 0) {
-        g += gbias ? gbias[row] : 0.0f;
-        u += ubias ? ubias[row] : 0.0f;
+        const int64_t bo = static_cast<int64_t>(e) * rows + row;
+        g += gbias_base ? gbias_base[bo] : 0.0f;
+        u += ubias_base ? ubias_base[bo] : 0.0f;
         const float gg = fminf(g, limit);
         const float uu = fmaxf(-limit, fminf(u, limit));
         act[row] = (gg / (1.0f + expf(-alpha * gg))) * (uu + 1.0f);
     }
 }
 
-// BLLM-200: FUSED expert down-projection + weighted residual accumulate in ONE
-// launch (vs matmul_mxfp4 + axpy_bias). One warp per row r in [0,rows=hidden):
-// hidden[r] += weight * (dot(down_row_r, act) + dbias[r]).
-__global__ void moe_down_accum_mxfp4_kernel(const uint8_t* codes, const uint8_t* scales,
-                                            const float* dbias, float weight, const float* act,
-                                            float* hidden, int32_t rows, int32_t cols) {
+// BLLM-200: FUSED expert down-projection + weighted residual accumulate, ONE launch,
+// DEVICE-INDEXED. hidden[r] += selw[kk] * (dot(down[e].row_r, act) + dbias[e][r]),
+// e = sel[kk]. Per-expert bias stride == rows.
+__global__ void moe_down_accum_mxfp4_kernel(const uint8_t* cb, const uint8_t* sb, int64_t cstride,
+                                            int64_t sstride, const float* dbias_base,
+                                            const float* selw, const int32_t* sel, int32_t kk,
+                                            const float* act, float* hidden, int32_t rows,
+                                            int32_t cols) {
     const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
     if (row >= rows) return;
     const int32_t lane = threadIdx.x % warpSize;
+    const int32_t e = sel[kk];
     const int32_t nb = cols >> 5;
-    float p = mxfp4_aligned_partial(codes + static_cast<int64_t>(row) * nb * 16,
-                                    scales + static_cast<int64_t>(row) * nb, act, nb, lane);
+    const int64_t co = static_cast<int64_t>(e) * cstride + static_cast<int64_t>(row) * nb * 16;
+    const int64_t so = static_cast<int64_t>(e) * sstride + static_cast<int64_t>(row) * nb;
+    float p = mxfp4_aligned_partial(cb + co, sb + so, act, nb, lane);
     p = warp_reduce_sum(p);
-    if (lane == 0) hidden[row] += weight * (p + (dbias ? dbias[row] : 0.0f));
+    if (lane == 0)
+        hidden[row] += selw[kk] * (p + (dbias_base ? dbias_base[static_cast<int64_t>(e) * rows + row] : 0.0f));
 }
 
 // Int2: four 2-bit codes packed per byte, lowest bits first -- same
@@ -1219,33 +1255,46 @@ static inline dim3 mxfp4_grid_(Context& ctx, int32_t rows) noexcept {
     return dim3(static_cast<unsigned int>((rows + wpb - 1) / wpb));
 }
 
+bool moe_topk_softmax(Context& ctx, const float* logits_device, int32_t* sel_device,
+                      float* selw_device, int32_t E, int32_t K) noexcept {
+    if (!ctx.is_valid() || logits_device == nullptr || sel_device == nullptr ||
+        selw_device == nullptr || E <= 0 || K <= 0 || K > 64) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    moe_topk_softmax_kernel<<<dim3(1), dim3(1), 0, st>>>(logits_device, sel_device, selw_device, E, K);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
 bool moe_gate_up_swiglu_mxfp4(Context& ctx, const void* gcodes, const void* gscales,
-                              const void* ucodes, const void* uscales, const float* gbias,
-                              const float* ubias, const float* x, float* act, int32_t rows,
-                              int32_t cols, float alpha, float limit) noexcept {
-    if (!ctx.is_valid() || gcodes == nullptr || ucodes == nullptr || x == nullptr || act == nullptr ||
-        rows <= 0 || cols <= 0 || (cols & 31) != 0) {
+                              const void* ucodes, const void* uscales, int64_t cstride,
+                              int64_t sstride, const float* gbias, const float* ubias,
+                              const int32_t* sel, int32_t kk, const float* x, float* act,
+                              int32_t rows, int32_t cols, float alpha, float limit) noexcept {
+    if (!ctx.is_valid() || gcodes == nullptr || ucodes == nullptr || sel == nullptr || x == nullptr ||
+        act == nullptr || rows <= 0 || cols <= 0 || (cols & 31) != 0) {
         return false;
     }
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     moe_gate_up_swiglu_mxfp4_kernel<<<mxfp4_grid_(ctx, rows), dim3(kBlockSize), 0, st>>>(
         static_cast<const uint8_t*>(gcodes), static_cast<const uint8_t*>(gscales),
-        static_cast<const uint8_t*>(ucodes), static_cast<const uint8_t*>(uscales), gbias, ubias, x,
-        act, rows, cols, alpha, limit);
+        static_cast<const uint8_t*>(ucodes), static_cast<const uint8_t*>(uscales), cstride, sstride,
+        gbias, ubias, sel, kk, x, act, rows, cols, alpha, limit);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
-bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, const float* dbias,
-                          float weight, const float* act, float* hidden, int32_t rows,
+bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, int64_t cstride,
+                          int64_t sstride, const float* dbias, const float* selw, const int32_t* sel,
+                          int32_t kk, const float* act, float* hidden, int32_t rows,
                           int32_t cols) noexcept {
-    if (!ctx.is_valid() || codes == nullptr || act == nullptr || hidden == nullptr || rows <= 0 ||
-        cols <= 0 || (cols & 31) != 0) {
+    if (!ctx.is_valid() || codes == nullptr || sel == nullptr || selw == nullptr || act == nullptr ||
+        hidden == nullptr || rows <= 0 || cols <= 0 || (cols & 31) != 0) {
         return false;
     }
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     moe_down_accum_mxfp4_kernel<<<mxfp4_grid_(ctx, rows), dim3(kBlockSize), 0, st>>>(
-        static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), dbias, weight, act,
-        hidden, rows, cols);
+        static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), cstride, sstride,
+        dbias, selw, sel, kk, act, hidden, rows, cols);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

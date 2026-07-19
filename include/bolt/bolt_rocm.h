@@ -277,22 +277,30 @@ bool matmul_mxfp4_aligned(Context& ctx, const void* codes_device, const void* sc
                           const float* activation_device, float* out_device, int32_t out_rows,
                           int32_t cols) noexcept;
 
-// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai -- act[r] = swiglu_oai(
-// dot(gate[r],x)+gbias[r], dot(up[r],x)+ubias[r]) for r in [0,rows=expert_inter),
-// in ONE launch (vs 2 matmul_mxfp4_aligned + swiglu_oai). gate/up are split
-// codes+scales (aligned layout). gbias/ubias may be null. Cuts the per-expert
-// launch count 3->1 (launch overhead is the gpt-oss decode cap). ctx.is_valid().
-bool moe_gate_up_swiglu_mxfp4(Context& ctx, const void* gcodes, const void* gscales,
-                              const void* ucodes, const void* uscales, const float* gbias,
-                              const float* ubias, const float* x, float* act, int32_t rows,
-                              int32_t cols, float alpha, float limit) noexcept;
+// BLLM-200: GPU top-K + softmax router selection -- writes sel_device[K] (expert
+// indices, top-K of E by raw logit) + selw_device[K] (softmax weights over the K)
+// so the MoE runs with NO per-layer host round-trip (was the sole decode sync).
+// K <= 64. Precondition: ctx.is_valid().
+bool moe_topk_softmax(Context& ctx, const float* logits_device, int32_t* sel_device,
+                      float* selw_device, int32_t E, int32_t K) noexcept;
 
-// BLLM-200: FUSED expert down-projection + weighted residual accumulate --
-// hidden[r] += weight*(dot(down[r],act)+dbias[r]) for r in [0,rows=hidden), in ONE
-// launch (vs matmul_mxfp4_aligned + axpy_bias). down is split codes+scales; dbias
-// may be null. Precondition: ctx.is_valid().
-bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, const float* dbias,
-                          float weight, const float* act, float* hidden, int32_t rows,
+// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai in ONE launch, DEVICE-INDEXED:
+// expert e = sel[kk] read on-device. gate/up are split codes+scales (aligned) with
+// shared [expert_inter, hidden] shape -> shared cstride (bytes/expert of codes) and
+// sstride (bytes/expert of scales). gbias/ubias base pointers may be null (per-
+// expert bias stride == rows). act[r]=swiglu_oai(dot(gate[e].r,x)+gb, dot(up[e].r,x)+ub).
+bool moe_gate_up_swiglu_mxfp4(Context& ctx, const void* gcodes, const void* gscales,
+                              const void* ucodes, const void* uscales, int64_t cstride,
+                              int64_t sstride, const float* gbias, const float* ubias,
+                              const int32_t* sel, int32_t kk, const float* x, float* act,
+                              int32_t rows, int32_t cols, float alpha, float limit) noexcept;
+
+// BLLM-200: FUSED expert down-projection + weighted residual accumulate, ONE launch,
+// DEVICE-INDEXED. hidden[r] += selw[kk]*(dot(down[e].r,act)+dbias[e][r]), e=sel[kk].
+// down is split codes+scales; dbias base may be null (per-expert stride == rows).
+bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, int64_t cstride,
+                          int64_t sstride, const float* dbias, const float* selw, const int32_t* sel,
+                          int32_t kk, const float* act, float* hidden, int32_t rows,
                           int32_t cols) noexcept;
 
 // BLLM-189: fused QKV projection -- one kernel produces q[q_rows], k[kv_rows],
