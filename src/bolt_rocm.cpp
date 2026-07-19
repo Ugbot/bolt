@@ -510,8 +510,12 @@ __global__ void attention_twopass_kernel(const float* q, const float* k_cache,
                                          int32_t num_kv_heads, int32_t group_size, int32_t seq_len,
                                          float scale, const float* sinks, int32_t t0) {
     __shared__ float q_sh[kMaxHeadDim];
-    __shared__ float scores[kMaxAttnSeq];
     __shared__ float red[kBlockSize];
+    // BLLM-200: scores sized DYNAMICALLY to seq_len (not a static [kMaxAttnSeq]=16KB
+    // array). At decode seq_len is small, so this frees ~16KB of LDS/block -> many
+    // more concurrent attention blocks per CU (the kernel launches only num_heads
+    // blocks, so occupancy was the bottleneck, not bandwidth).
+    extern __shared__ float scores[];
     const int32_t h = blockIdx.x;
     const int32_t kv_head = h / group_size;
     const int32_t tid = threadIdx.x;
@@ -1111,7 +1115,8 @@ bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
         // BLLM-189 fast path: two block reductions total instead of one per timestep.
         // BLLM-200: gpt-oss attention sinks (sinks_device, per-head; nullptr=none) +
         // sliding-window start (window_start; 0=full causal) threaded through.
-        attention_twopass_kernel<<<grid, dim3(static_cast<unsigned int>(kBlockSize)), 0, st>>>(
+        const uint32_t scores_lds = static_cast<uint32_t>(seq_len) * sizeof(float);
+        attention_twopass_kernel<<<grid, dim3(static_cast<unsigned int>(kBlockSize)), scores_lds, st>>>(
             q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
             seq_len, scale, sinks_device, window_start);
     } else {  // large-context fallback: never materializes the scores
