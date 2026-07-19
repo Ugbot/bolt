@@ -365,10 +365,14 @@ __global__ void attention_online_kernel(const float* q, const float* k_cache, co
 // Mathematically identical to the online softmax; ~20 syncs vs ~768. Requires
 // seq_len <= kMaxAttnSeq and head_dim <= kMaxHeadDim (host dispatches to the
 // online kernel otherwise). GQA: query head h reads kv head h/group_size.
+// BLLM-200: `sinks` (per-head learned softmax-denominator logit, gpt-oss;
+// nullptr = none) and `t0` (sliding-window start: keys [t0, seq_len); 0 = full
+// causal) added. The sink participates in the max + contributes only to the
+// denominator (no value), matching ggml_soft_max_add_sinks / qwen-style decode.
 __global__ void attention_twopass_kernel(const float* q, const float* k_cache,
                                          const float* v_cache, float* out, int32_t head_dim,
                                          int32_t num_kv_heads, int32_t group_size, int32_t seq_len,
-                                         float scale) {
+                                         float scale, const float* sinks, int32_t t0) {
     __shared__ float q_sh[kMaxHeadDim];
     __shared__ float scores[kMaxAttnSeq];
     __shared__ float red[kBlockSize];
@@ -379,8 +383,8 @@ __global__ void attention_twopass_kernel(const float* q, const float* k_cache,
     for (int32_t i = tid; i < head_dim; i += blockDim.x) q_sh[i] = q[static_cast<int64_t>(h) * head_dim + i];
     __syncthreads();
 
-    // Pass 1: scores[t] = scale * dot(q, K[t]).  No per-timestep sync.
-    for (int32_t t = tid; t < seq_len; t += blockDim.x) {
+    // Pass 1: scores[t] = scale * dot(q, K[t]) for t in [t0, seq_len). No sync.
+    for (int32_t t = t0 + tid; t < seq_len; t += blockDim.x) {
         const float* kt = k_cache + (static_cast<int64_t>(t) * num_kv_heads + kv_head) * head_dim;
         float s = 0.0f;
         for (int32_t d = 0; d < head_dim; ++d) s += q_sh[d] * kt[d];
@@ -388,21 +392,22 @@ __global__ void attention_twopass_kernel(const float* q, const float* k_cache,
     }
     __syncthreads();
 
-    // Block max over scores.
+    // Block max over scores; fold in the per-head sink logit.
     float pm = -INFINITY;
-    for (int32_t t = tid; t < seq_len; t += blockDim.x) pm = fmaxf(pm, scores[t]);
+    for (int32_t t = t0 + tid; t < seq_len; t += blockDim.x) pm = fmaxf(pm, scores[t]);
     red[tid] = pm;
     __syncthreads();
     for (int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
         __syncthreads();
     }
-    const float mmax = red[0];
+    const float sink = sinks ? sinks[h] : -INFINITY;
+    const float mmax = fmaxf(red[0], sink);
     __syncthreads();
 
-    // exp(scores-max) in place + block sum -> denominator.
+    // exp(scores-max) in place + block sum; add the sink term to the denominator.
     float pl = 0.0f;
-    for (int32_t t = tid; t < seq_len; t += blockDim.x) {
+    for (int32_t t = t0 + tid; t < seq_len; t += blockDim.x) {
         const float p = expf(scores[t] - mmax);
         scores[t] = p;
         pl += p;
@@ -413,13 +418,14 @@ __global__ void attention_twopass_kernel(const float* q, const float* k_cache,
         if (tid < stride) red[tid] += red[tid + stride];
         __syncthreads();
     }
-    const float inv_l = 1.0f / red[0];
+    const float sink_term = sinks ? expf(sink - mmax) : 0.0f;
+    const float inv_l = 1.0f / (red[0] + sink_term);
     __syncthreads();
 
-    // Pass 2: out[d] = inv_l * sum_t scores[t] * V[t][d].  No sync.
+    // Pass 2: out[d] = inv_l * sum_t scores[t] * V[t][d] over [t0, seq_len). No sync.
     for (int32_t d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int32_t t = 0; t < seq_len; ++t)
+        for (int32_t t = t0; t < seq_len; ++t)
             acc += scores[t] * v_cache[(static_cast<int64_t>(t) * num_kv_heads + kv_head) * head_dim + d];
         out[static_cast<int64_t>(h) * head_dim + d] = acc * inv_l;
     }
@@ -535,6 +541,27 @@ __global__ void fused_swiglu_int4_kernel(const uint8_t* wg, const uint8_t* wu,
     if (lane == 0) {
         const float g = ga * wg_scale[row];
         act[row] = (g / (1.0f + expf(-g))) * (ua * wu_scale[row]);
+    }
+}
+
+// BLLM-200: gpt-oss expert activation (swiglu_oai). gate/up are produced by two
+// separate matmul_mxfp4 calls (the expert gate/up MXFP4 tensors), each with an
+// optional per-column bias. Distinct from plain SwiGLU: the gate is clamped from
+// ABOVE only (min(g, limit)), the up is clamped symmetrically, the SiLU carries a
+// slope alpha (1.702), and the up is offset by +1 --
+//   g = min(gate+gb, limit); u = clamp(up+ub, -limit, limit);
+//   out = (g * sigmoid(alpha*g)) * (u + 1)
+// One thread per element (n = expert_inter); grid-stride for n > grid.
+__global__ void swiglu_oai_kernel(const float* gate, const float* up, const float* gate_bias,
+                                  const float* up_bias, float* out, int32_t n, float alpha,
+                                  float limit) {
+    for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float g = gate[i] + (gate_bias ? gate_bias[i] : 0.0f);
+        float u = up[i] + (up_bias ? up_bias[i] : 0.0f);
+        g = fminf(g, limit);
+        u = fmaxf(-limit, fminf(u, limit));
+        const float glu = g / (1.0f + expf(-alpha * g));
+        out[i] = glu * (u + 1.0f);
     }
 }
 
@@ -870,28 +897,51 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
 
 bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
                const float* v_cache_device, float* out_device, int32_t num_heads,
-               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale) noexcept {
+               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale,
+               const float* sinks_device, int32_t window_start) noexcept {
     if (!ctx.is_valid() || q_device == nullptr || k_cache_device == nullptr ||
         v_cache_device == nullptr || out_device == nullptr) {
         return false;
     }
     if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return false;
     if (num_heads % num_kv_heads != 0 || head_dim > kBlockSize) return false;
+    if (window_start < 0 || window_start >= seq_len) window_start = 0;  // clamp: full causal
     const int32_t group_size = num_heads / num_kv_heads;
     const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
     const dim3 grid(static_cast<unsigned int>(num_heads));
     if (seq_len <= kMaxAttnSeq && head_dim <= kMaxHeadDim) {
         // BLLM-189 fast path: two block reductions total instead of one per timestep.
+        // BLLM-200: gpt-oss attention sinks (sinks_device, per-head; nullptr=none) +
+        // sliding-window start (window_start; 0=full causal) threaded through.
         attention_twopass_kernel<<<grid, dim3(static_cast<unsigned int>(kBlockSize)), 0, st>>>(
             q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
-            seq_len, scale);
+            seq_len, scale, sinks_device, window_start);
     } else {  // large-context fallback: never materializes the scores
+        // NOTE: the online fallback does not yet implement sinks/SWA; gpt-oss decode
+        // stays within kMaxAttnSeq (SWA layers cap the window at 128) so it uses the
+        // two-pass path above. Full-attention layers past kMaxAttnSeq would need this
+        // extended before long-context gpt-oss is correct.
         int32_t block = 1;
         while (block < head_dim) block <<= 1;  // power-of-two >= head_dim for the tree reduce
         attention_online_kernel<<<grid, dim3(static_cast<unsigned int>(block)), 0, st>>>(
             q_device, k_cache_device, v_cache_device, out_device, head_dim, num_kv_heads, group_size,
             seq_len, scale);
     }
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool swiglu_oai(Context& ctx, const float* gate_device, const float* up_device,
+                const float* gate_bias_device, const float* up_bias_device, float* out_device,
+                int32_t n, float alpha, float limit) noexcept {
+    if (!ctx.is_valid() || gate_device == nullptr || up_device == nullptr || out_device == nullptr) {
+        return false;
+    }
+    if (n <= 0) return false;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    unsigned int blocks = static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize);
+    if (blocks > 65535u) blocks = 65535u;  // grid-stride handles the remainder
+    swiglu_oai_kernel<<<dim3(blocks), dim3(kBlockSize), 0, st>>>(
+        gate_device, up_device, gate_bias_device, up_bias_device, out_device, n, alpha, limit);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

@@ -215,9 +215,22 @@ bool elementwise(Context& ctx, const float* a_device, const float* b_device, flo
 // [num_heads, head_dim]. GQA: query head h reads kv head h/(num_heads/
 // num_kv_heads). `scale` is the softmax scale (typically 1/sqrt(head_dim)).
 // Precondition: num_heads % num_kv_heads == 0 and head_dim <= 256.
+// BLLM-200: `sinks_device` (per-head learned softmax-denominator logit; nullptr =
+// none) and `window_start` (sliding-window: attend keys [window_start, seq_len);
+// 0 = full causal) are optional gpt-oss extensions. Handled on the two-pass path
+// (seq_len <= kMaxAttnSeq); the long-context online fallback ignores them.
 bool attention(Context& ctx, const float* q_device, const float* k_cache_device,
                const float* v_cache_device, float* out_device, int32_t num_heads,
-               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale) noexcept;
+               int32_t num_kv_heads, int32_t head_dim, int32_t seq_len, float scale,
+               const float* sinks_device = nullptr, int32_t window_start = 0) noexcept;
+
+// BLLM-200: gpt-oss expert activation. gate/up are the [n] outputs of two separate
+// matmul_mxfp4 calls; gate_bias/up_bias are optional per-column biases (nullptr =
+// none). out[i] = (g*sigmoid(alpha*g))*(u+1), g=min(gate+gb,limit),
+// u=clamp(up+ub,-limit,limit). gpt-oss uses alpha=1.702, limit=7.
+bool swiglu_oai(Context& ctx, const float* gate_device, const float* up_device,
+                const float* gate_bias_device, const float* up_bias_device, float* out_device,
+                int32_t n, float alpha, float limit) noexcept;
 
 // BLLM-189: fused gate+up+SwiGLU FFN. Computes act[r] = silu(dot(Wg[r],x)) *
 // dot(Wu[r],x) for r in [0,rows) in ONE kernel -- the op-fusion lever that

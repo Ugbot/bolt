@@ -363,6 +363,139 @@ TEST(BoltRocm, AttentionMatchesCpuReference) {
     ctx.free(&ob);
 }
 
+// BLLM-200: attention with gpt-oss sinks + sliding-window start. CPU reference
+// restricts the softmax to keys [t0, seq_len) and folds a per-head sink logit into
+// the denominator only (no value contribution).
+TEST(BoltRocm, AttentionSinksAndWindowMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int num_heads = 4, num_kv_heads = 2, head_dim = 8, seq_len = 6;
+    const int group_size = num_heads / num_kv_heads;
+    const int q_n = num_heads * head_dim;
+    const int kv_n = seq_len * num_kv_heads * head_dim;
+    const int t0 = 2;  // sliding-window: attend keys [2, 6)
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    std::vector<float> q(static_cast<size_t>(q_n)), kc(static_cast<size_t>(kv_n)),
+        vc(static_cast<size_t>(kv_n)), sinks(static_cast<size_t>(num_heads));
+    for (int i = 0; i < q_n; ++i) q[static_cast<size_t>(i)] = static_cast<float>((i % 9) - 4) * 0.15f;
+    for (int i = 0; i < kv_n; ++i) {
+        kc[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.12f;
+        vc[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.2f;
+    }
+    for (int h = 0; h < num_heads; ++h) sinks[static_cast<size_t>(h)] = 0.1f + 0.3f * h;
+
+    std::vector<float> ref(static_cast<size_t>(q_n), 0.0f);
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_head = h / group_size;
+        const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+        std::vector<float> sc(static_cast<size_t>(seq_len));
+        float mx = sinks[static_cast<size_t>(h)];  // sink participates in the max
+        for (int t = t0; t < seq_len; ++t) {
+            const float* kh = kc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            float s = 0.0f;
+            for (int d = 0; d < head_dim; ++d) s += qh[d] * kh[d];
+            s *= scale;
+            sc[static_cast<size_t>(t)] = s;
+            mx = std::fmax(mx, s);
+        }
+        double denom = std::exp(sinks[static_cast<size_t>(h)] - mx);  // sink -> denom only
+        for (int t = t0; t < seq_len; ++t) {
+            sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
+            denom += sc[static_cast<size_t>(t)];
+        }
+        float* rh = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int t = t0; t < seq_len; ++t) {
+            const float w = static_cast<float>(sc[static_cast<size_t>(t)] / denom);
+            const float* vh = vc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) rh[d] += w * vh[d];
+        }
+    }
+
+    DeviceBuffer qb, kb, vb, ob, sb;
+    ASSERT_TRUE(ctx.allocate(q.size() * sizeof(float), &qb));
+    ASSERT_TRUE(ctx.allocate(kc.size() * sizeof(float), &kb));
+    ASSERT_TRUE(ctx.allocate(vc.size() * sizeof(float), &vb));
+    ASSERT_TRUE(ctx.allocate(q.size() * sizeof(float), &ob));
+    ASSERT_TRUE(ctx.allocate(sinks.size() * sizeof(float), &sb));
+    ASSERT_TRUE(ctx.copy_to_device(q.data(), &qb, q.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(kc.data(), &kb, kc.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(vc.data(), &vb, vc.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(sinks.data(), &sb, sinks.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::attention(
+        ctx, static_cast<const float*>(qb.ptr), static_cast<const float*>(kb.ptr),
+        static_cast<const float*>(vb.ptr), static_cast<float*>(ob.ptr), num_heads, num_kv_heads,
+        head_dim, seq_len, scale, static_cast<const float*>(sb.ptr), t0));
+    std::vector<float> o(static_cast<size_t>(q_n));
+    ASSERT_TRUE(ctx.copy_to_host(ob, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < q_n; ++i) {
+        EXPECT_NEAR(o[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.free(&qb);
+    ctx.free(&kb);
+    ctx.free(&vb);
+    ctx.free(&ob);
+    ctx.free(&sb);
+}
+
+// BLLM-200: gpt-oss expert activation (swiglu_oai) matches a CPU reference,
+// including the asymmetric gate clamp, symmetric up clamp, alpha slope, +1 offset,
+// and optional per-column biases.
+TEST(BoltRocm, SwigluOaiMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int n = 257;  // odd, to exercise the grid-stride tail
+    const float alpha = 1.702f, limit = 7.0f;
+    std::vector<float> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n)),
+        gb(static_cast<size_t>(n)), ub(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        gate[static_cast<size_t>(i)] = static_cast<float>((i % 23) - 11) * 0.9f;  // spans past +/-7
+        up[static_cast<size_t>(i)] = static_cast<float>((i % 19) - 9) * 1.1f;
+        gb[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.05f;
+        ub[static_cast<size_t>(i)] = static_cast<float>((i % 3) - 1) * 0.07f;
+    }
+    std::vector<float> ref(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        float g = gate[static_cast<size_t>(i)] + gb[static_cast<size_t>(i)];
+        float u = up[static_cast<size_t>(i)] + ub[static_cast<size_t>(i)];
+        g = std::fmin(g, limit);
+        u = std::fmax(-limit, std::fmin(u, limit));
+        const float glu = g / (1.0f + std::exp(-alpha * g));
+        ref[static_cast<size_t>(i)] = glu * (u + 1.0f);
+    }
+
+    DeviceBuffer gd, ud, gbd, ubd, od;
+    ASSERT_TRUE(ctx.allocate(gate.size() * sizeof(float), &gd));
+    ASSERT_TRUE(ctx.allocate(up.size() * sizeof(float), &ud));
+    ASSERT_TRUE(ctx.allocate(gb.size() * sizeof(float), &gbd));
+    ASSERT_TRUE(ctx.allocate(ub.size() * sizeof(float), &ubd));
+    ASSERT_TRUE(ctx.allocate(gate.size() * sizeof(float), &od));
+    ASSERT_TRUE(ctx.copy_to_device(gate.data(), &gd, gate.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(up.data(), &ud, up.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(gb.data(), &gbd, gb.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(ub.data(), &ubd, ub.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::swiglu_oai(
+        ctx, static_cast<const float*>(gd.ptr), static_cast<const float*>(ud.ptr),
+        static_cast<const float*>(gbd.ptr), static_cast<const float*>(ubd.ptr),
+        static_cast<float*>(od.ptr), n, alpha, limit));
+    std::vector<float> o(static_cast<size_t>(n));
+    ASSERT_TRUE(ctx.copy_to_host(od, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(o[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.free(&gd);
+    ctx.free(&ud);
+    ctx.free(&gbd);
+    ctx.free(&ubd);
+    ctx.free(&od);
+}
+
 // BLLM-200: GPU MXFP4 matvec matches a CPU dequant-in-dot reference.
 TEST(BoltRocm, MatmulMxfp4MatchesCpuReference) {
     if (!bolt::rocm::available()) {
