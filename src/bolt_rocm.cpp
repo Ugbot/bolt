@@ -121,10 +121,30 @@ __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* s
     const int32_t packed_cols = (cols + 1) / 2;
     const uint8_t* row_ptr = weight + static_cast<int64_t>(row) * packed_cols;
     float acc = 0.0f;
-    for (int32_t i = lane; i < cols; i += warpSize) {
-        const uint8_t byte = row_ptr[i >> 1];
-        const int32_t nibble = (i & 1) ? (byte >> 4) : (byte & 0x0F);
-        acc += activation[i] * static_cast<float>(nibble - kInt4DequantOffset);
+    // BLLM-190: vectorized -- one uint32 = 4 packed bytes = 8 nibbles (cols),
+    // matched with two float4 activations. nibble k = (w >> 4k) & 0xF.
+    if ((cols & 7) == 0) {
+        const uint32_t* w8 = reinterpret_cast<const uint32_t*>(row_ptr);
+        const float4* x4 = reinterpret_cast<const float4*>(activation);
+        for (int32_t j = lane; j < cols / 8; j += warpSize) {
+            const uint32_t w = w8[j];
+            const float4 xa = x4[2 * j];
+            const float4 xb = x4[2 * j + 1];
+            acc += xa.x * static_cast<float>(static_cast<int32_t>(w & 0xFu) - kInt4DequantOffset) +
+                   xa.y * static_cast<float>(static_cast<int32_t>((w >> 4) & 0xFu) - kInt4DequantOffset) +
+                   xa.z * static_cast<float>(static_cast<int32_t>((w >> 8) & 0xFu) - kInt4DequantOffset) +
+                   xa.w * static_cast<float>(static_cast<int32_t>((w >> 12) & 0xFu) - kInt4DequantOffset) +
+                   xb.x * static_cast<float>(static_cast<int32_t>((w >> 16) & 0xFu) - kInt4DequantOffset) +
+                   xb.y * static_cast<float>(static_cast<int32_t>((w >> 20) & 0xFu) - kInt4DequantOffset) +
+                   xb.z * static_cast<float>(static_cast<int32_t>((w >> 24) & 0xFu) - kInt4DequantOffset) +
+                   xb.w * static_cast<float>(static_cast<int32_t>((w >> 28) & 0xFu) - kInt4DequantOffset);
+        }
+    } else {
+        for (int32_t i = lane; i < cols; i += warpSize) {
+            const uint8_t byte = row_ptr[i >> 1];
+            const int32_t nibble = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+            acc += activation[i] * static_cast<float>(nibble - kInt4DequantOffset);
+        }
     }
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
@@ -455,11 +475,29 @@ __global__ void fused_swiglu_int4_kernel(const uint8_t* wg, const uint8_t* wu,
     const uint8_t* gr = wg + static_cast<int64_t>(row) * packed;
     const uint8_t* ur = wu + static_cast<int64_t>(row) * packed;
     float ga = 0.0f, ua = 0.0f;
-    for (int32_t i = lane; i < cols; i += warpSize) {
-        const float xi = x[i];
-        const int32_t sh = (i & 1) * 4;  // 0 for low nibble, 4 for high
-        ga += xi * static_cast<float>(static_cast<int32_t>((gr[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
-        ua += xi * static_cast<float>(static_cast<int32_t>((ur[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
+    if ((cols & 7) == 0) {  // BLLM-190: uint32 = 8 nibbles, two float4 activations
+        const uint32_t* g8 = reinterpret_cast<const uint32_t*>(gr);
+        const uint32_t* u8 = reinterpret_cast<const uint32_t*>(ur);
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        for (int32_t j = lane; j < cols / 8; j += warpSize) {
+            const uint32_t g = g8[j], u = u8[j];
+            const float4 xa = x4[2 * j];
+            const float4 xb = x4[2 * j + 1];
+            const float xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+            for (int32_t n = 0; n < 8; ++n) {
+                const int32_t sh = 4 * n;
+                ga += xs[n] * static_cast<float>(static_cast<int32_t>((g >> sh) & 0xFu) - kInt4DequantOffset);
+                ua += xs[n] * static_cast<float>(static_cast<int32_t>((u >> sh) & 0xFu) - kInt4DequantOffset);
+            }
+        }
+    } else {
+        for (int32_t i = lane; i < cols; i += warpSize) {
+            const float xi = x[i];
+            const int32_t sh = (i & 1) * 4;  // 0 for low nibble, 4 for high
+            ga += xi * static_cast<float>(static_cast<int32_t>((gr[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
+            ua += xi * static_cast<float>(static_cast<int32_t>((ur[i >> 1] >> sh) & 0x0F) - kInt4DequantOffset);
+        }
     }
     ga = warp_reduce_sum(ga);
     ua = warp_reduce_sum(ua);
