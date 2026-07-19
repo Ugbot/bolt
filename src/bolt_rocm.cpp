@@ -153,6 +153,37 @@ __global__ void matmul_dequant_int4_kernel(const uint8_t* weight, const float* s
     }
 }
 
+// BLLM-200: GPU MXFP4 matvec -- the expert-weight tier for gpt-oss (MoE). The
+// experts stay resident on the iGPU in their native MXFP4 (0.53 B/weight, ~60GB
+// fits the UMA); this kernel dequants IN THE DOT (E8M0 block scale 2^(e-127) x
+// E2M1 codebook), one wavefront per output row, lanes striding the cols/32
+// 17-byte blocks, shuffle reduction. Same MXFP4 layout as GgufDequant.cpp's
+// dequant_block_mxfp4 and the CPU core's mxfp4_row_dot.
+__device__ const float kMxfp4Dev[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+__global__ void matmul_mxfp4_kernel(const uint8_t* weight, const float* activation, float* out,
+                                    int32_t rows, int32_t cols) {
+    const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (row >= rows) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t nb = cols >> 5;  // cols / 32 blocks
+    const uint8_t* wr = weight + static_cast<int64_t>(row) * nb * 17;
+    float acc = 0.0f;
+    for (int32_t b = lane; b < nb; b += warpSize) {
+        const uint8_t* blk = wr + static_cast<int64_t>(b) * 17;
+        const float scale = exp2f(static_cast<float>(static_cast<int32_t>(blk[0]) - 127));
+        const uint8_t* qs = blk + 1;
+        const float* xb = activation + static_cast<int64_t>(b) * 32;
+        float ba = 0.0f;
+        for (int32_t j = 0; j < 16; ++j)
+            ba += kMxfp4Dev[qs[j] & 0x0F] * xb[j] + kMxfp4Dev[qs[j] >> 4] * xb[j + 16];
+        acc += scale * ba;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 // Int2: four 2-bit codes packed per byte, lowest bits first -- same
 // layout bolt_compute.h's matmul_row_dot_f32 (Int2 case) uses.
 __global__ void matmul_dequant_int2_kernel(const uint8_t* weight, const float* scale,
@@ -922,6 +953,23 @@ bool fused_qkv(Context& ctx, const void* wq, const void* wk, const void* wv, Wei
             static_cast<const int8_t*>(wq), static_cast<const int8_t*>(wk),
             static_cast<const int8_t*>(wv), sq, sk, sv, x, q, k, v, q_rows, kv_rows, cols);
     }
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool matmul_mxfp4(Context& ctx, const void* weight_device, const float* activation_device,
+                  float* out_device, int32_t out_rows, int32_t cols) noexcept {
+    if (!ctx.is_valid() || weight_device == nullptr || activation_device == nullptr ||
+        out_device == nullptr || out_rows <= 0 || cols <= 0 || (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    int32_t wps = ctx.wavefront_size();
+    if (wps <= 0) wps = 32;
+    const int32_t wpb = kBlockSize / wps;
+    const dim3 grid(static_cast<unsigned int>((out_rows + wpb - 1) / wpb));
+    const dim3 block(static_cast<unsigned int>(kBlockSize));
+    matmul_mxfp4_kernel<<<grid, block, 0, st>>>(static_cast<const uint8_t*>(weight_device),
+                                                activation_device, out_device, out_rows, cols);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

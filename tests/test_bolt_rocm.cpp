@@ -363,6 +363,53 @@ TEST(BoltRocm, AttentionMatchesCpuReference) {
     ctx.free(&ob);
 }
 
+// BLLM-200: GPU MXFP4 matvec matches a CPU dequant-in-dot reference.
+TEST(BoltRocm, MatmulMxfp4MatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int rows = 200, cols = 64;  // 2 MXFP4 blocks/row
+    const int nb = cols / 32, row_bytes = nb * 17;
+    static const float kMx[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                  0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    std::vector<uint8_t> w(static_cast<size_t>(rows) * row_bytes, 0);
+    std::vector<float> x(static_cast<size_t>(cols)), ref(static_cast<size_t>(rows), 0.0f);
+    for (int c = 0; c < cols; ++c) x[static_cast<size_t>(c)] = static_cast<float>((c % 9) - 4) * 0.2f;
+    for (int r = 0; r < rows; ++r) {
+        uint8_t* wr = w.data() + static_cast<size_t>(r) * row_bytes;
+        float acc = 0.0f;
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* blk = wr + b * 17;
+            const int e = 120 + (r % 12);
+            blk[0] = static_cast<uint8_t>(e);
+            const float scale = std::ldexp(1.0f, e - 127);
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t lo = static_cast<uint8_t>((r + b + j) % 16);
+                const uint8_t hi = static_cast<uint8_t>((r + 2 * b + j + 3) % 16);
+                blk[1 + j] = static_cast<uint8_t>(lo | (hi << 4));
+                acc += scale * (kMx[lo] * x[static_cast<size_t>(b) * 32 + j] +
+                                kMx[hi] * x[static_cast<size_t>(b) * 32 + j + 16]);
+            }
+        }
+        ref[static_cast<size_t>(r)] = acc;
+    }
+    DeviceBuffer wb, xb, ob;
+    ASSERT_TRUE(ctx.allocate(w.size(), &wb));
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &xb));
+    ASSERT_TRUE(ctx.allocate(static_cast<uint64_t>(rows) * sizeof(float), &ob));
+    ASSERT_TRUE(ctx.copy_to_device(w.data(), &wb, w.size()));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &xb, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::matmul_mxfp4(ctx, wb.ptr, static_cast<const float*>(xb.ptr),
+                                         static_cast<float*>(ob.ptr), rows, cols));
+    std::vector<float> out(static_cast<size_t>(rows));
+    ASSERT_TRUE(ctx.copy_to_host(ob, out.data(), out.size() * sizeof(float)));
+    for (int r = 0; r < rows; ++r)
+        EXPECT_NEAR(out[static_cast<size_t>(r)], ref[static_cast<size_t>(r)], 1e-3f) << "r=" << r;
+    ctx.free(&wb); ctx.free(&xb); ctx.free(&ob);
+}
+
 // BLLM-188: a FULL pre-norm transformer layer (Qwen2/Llama-style, GQA, no
 // biases, SwiGLU FFN) computed entirely on-device -- activations stay resident
 // across the whole layer (only the input hidden is uploaded once and the final

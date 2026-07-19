@@ -230,6 +230,15 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
                   const float* wg_scale, const float* wu_scale, const float* x, float* act,
                   int32_t rows, int32_t cols) noexcept;
 
+// BLLM-200: GPU MXFP4 matvec -- out[r] = dot(dequant(weight.row(r)), activation)
+// for r in [0,out_rows). `weight_device` is one expert matrix's resident MXFP4
+// bytes ([out_rows, cols], row = (cols/32)*17 bytes); dequant happens in the dot
+// (E8M0 scale + E2M1 codebook). `cols` must be a multiple of 32. f32 activation.
+// The gpt-oss expert tier (experts stay MXFP4-resident on the iGPU). Precondition:
+// ctx.is_valid().
+bool matmul_mxfp4(Context& ctx, const void* weight_device, const float* activation_device,
+                  float* out_device, int32_t out_rows, int32_t cols) noexcept;
+
 // BLLM-189: fused QKV projection -- one kernel produces q[q_rows], k[kv_rows],
 // v[kv_rows] from the shared normed activation `x[cols]`, replacing three
 // matmul_dequant calls with one launch. `wq`/`wk`/`wv` are row-major weights of
