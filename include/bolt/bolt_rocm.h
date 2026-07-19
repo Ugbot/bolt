@@ -232,6 +232,20 @@ bool swiglu_oai(Context& ctx, const float* gate_device, const float* up_device,
                 const float* gate_bias_device, const float* up_bias_device, float* out_device,
                 int32_t n, float alpha, float limit) noexcept;
 
+// BLLM-200: NeoX RoPE + optional YaRN, in place on [num_heads, head_dim]. `base`
+// is the rope theta; when `yarn` the extrapolate/interpolate blend uses freq_scale
+// + beta_fast/beta_slow + orig_ctx (mscale = attn_factor*(1+0.1*ln(1/freq_scale))).
+// Matches the CPU rope_neox_yarn exactly. Precondition: head_dim even.
+bool rope_neox_yarn(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads,
+                    int32_t position, float base, bool yarn, float freq_scale, float ext_factor,
+                    float attn_factor, float beta_fast, float beta_slow, int32_t orig_ctx) noexcept;
+
+// BLLM-200: scaled accumulate with optional bias -- out[i] += scale*(x[i]+bias[i]),
+// i in [0,n). The MoE expert-mixing step (weight the down-projection by its routing
+// softmax weight, fold in down_bias). bias_device may be null.
+bool axpy_bias(Context& ctx, const float* x_device, const float* bias_device, float scale,
+               float* out_device, int32_t n) noexcept;
+
 // BLLM-189: fused gate+up+SwiGLU FFN. Computes act[r] = silu(dot(Wg[r],x)) *
 // dot(Wu[r],x) for r in [0,rows) in ONE kernel -- the op-fusion lever that
 // replaces gate-matmul + up-matmul + SwiGLU-elementwise (3 launches + 2 buffers)

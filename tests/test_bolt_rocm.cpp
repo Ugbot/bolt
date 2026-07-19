@@ -496,6 +496,102 @@ TEST(BoltRocm, SwigluOaiMatchesCpuReference) {
     ctx.free(&od);
 }
 
+// BLLM-200: NeoX + YaRN RoPE matches the CPU reference (the exact math boltllm's
+// TransformerCore::rope_neox_yarn uses for gpt-oss).
+TEST(BoltRocm, RopeNeoxYarnMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int num_heads = 3, head_dim = 64, pos = 37;
+    const float base = 150000.0f, freq_scale = 1.0f / 32.0f, ext_factor = 1.0f, attn_factor = 1.0f;
+    const float beta_fast = 32.0f, beta_slow = 1.0f;
+    const int orig_ctx = 4096;
+    const int n = num_heads * head_dim;
+    std::vector<float> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) x[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.11f;
+
+    // CPU reference (mirrors rope_neox_yarn + the kernel).
+    std::vector<float> ref = x;
+    const int half = head_dim / 2;
+    const double twopi = 6.283185307179586;
+    auto corr = [&](float b) {
+        return static_cast<float>(head_dim * std::log(orig_ctx / (b * twopi)) / (2.0 * std::log(base)) *
+                                  0.5);
+    };
+    float low = std::floor(corr(beta_fast)), high = std::ceil(corr(beta_slow));
+    low = std::fmax(0.0f, low);
+    high = std::fmin(static_cast<float>(half - 1), high);
+    const float mscale = attn_factor * (1.0f + 0.1f * std::log(1.0f / freq_scale));
+    for (int h = 0; h < num_heads; ++h) {
+        float* xh = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int j = 0; j < half; ++j) {
+            const float freq = std::pow(base, -2.0f * j / static_cast<float>(head_dim));
+            const float te = static_cast<float>(pos) * freq;
+            const float ti = freq_scale * te;
+            const float ramp = 1.0f - std::fmin(1.0f, std::fmax(0.0f, (j - low) / std::fmax(0.001f, high - low)));
+            const float mix = ramp * ext_factor;
+            const float theta = ti * (1.0f - mix) + te * mix;
+            const float cs = std::cos(theta) * mscale, sn = std::sin(theta) * mscale;
+            const float a = xh[j], b = xh[j + half];
+            xh[j] = a * cs - b * sn;
+            xh[j + half] = b * cs + a * sn;
+        }
+    }
+
+    DeviceBuffer xb;
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &xb));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &xb, x.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::rope_neox_yarn(ctx, static_cast<float*>(xb.ptr), head_dim, num_heads, pos,
+                                           base, true, freq_scale, ext_factor, attn_factor, beta_fast,
+                                           beta_slow, orig_ctx));
+    std::vector<float> o(static_cast<size_t>(n));
+    ASSERT_TRUE(ctx.copy_to_host(xb, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(o[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.free(&xb);
+}
+
+// BLLM-200: axpy_bias -- out[i] += scale*(x[i]+bias[i]).
+TEST(BoltRocm, AxpyBiasMatchesCpuReference) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    const int n = 300;
+    const float scale = 0.37f;
+    std::vector<float> x(static_cast<size_t>(n)), bias(static_cast<size_t>(n)), out(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.3f;
+        bias[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.2f;
+        out[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.5f;  // residual on entry
+    }
+    std::vector<float> ref(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+        ref[static_cast<size_t>(i)] = out[static_cast<size_t>(i)] + scale * (x[static_cast<size_t>(i)] + bias[static_cast<size_t>(i)]);
+
+    DeviceBuffer xb, bb, ob;
+    ASSERT_TRUE(ctx.allocate(x.size() * sizeof(float), &xb));
+    ASSERT_TRUE(ctx.allocate(bias.size() * sizeof(float), &bb));
+    ASSERT_TRUE(ctx.allocate(out.size() * sizeof(float), &ob));
+    ASSERT_TRUE(ctx.copy_to_device(x.data(), &xb, x.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(bias.data(), &bb, bias.size() * sizeof(float)));
+    ASSERT_TRUE(ctx.copy_to_device(out.data(), &ob, out.size() * sizeof(float)));
+    ASSERT_TRUE(bolt::rocm::axpy_bias(ctx, static_cast<const float*>(xb.ptr),
+                                      static_cast<const float*>(bb.ptr), scale,
+                                      static_cast<float*>(ob.ptr), n));
+    std::vector<float> o(static_cast<size_t>(n));
+    ASSERT_TRUE(ctx.copy_to_host(ob, o.data(), o.size() * sizeof(float)));
+    for (int i = 0; i < n; ++i)
+        EXPECT_NEAR(o[static_cast<size_t>(i)], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    ctx.free(&xb);
+    ctx.free(&bb);
+    ctx.free(&ob);
+}
+
 // BLLM-200: GPU MXFP4 matvec matches a CPU dequant-in-dot reference.
 TEST(BoltRocm, MatmulMxfp4MatchesCpuReference) {
     if (!bolt::rocm::available()) {

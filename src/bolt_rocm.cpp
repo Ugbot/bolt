@@ -565,6 +565,56 @@ __global__ void swiglu_oai_kernel(const float* gate, const float* up, const floa
     }
 }
 
+// BLLM-200: NeoX RoPE + optional YaRN, in place on [num_heads, head_dim]. One
+// block per head; threads stride over the half-dim pairs (j, j+half). Mirrors the
+// CPU rope_neox_yarn (TransformerCore.cpp) exactly: extrapolate/interpolate blend
+// via the beta_fast/beta_slow correction ramp + the 1+0.1*ln(1/freq_scale) mscale.
+__global__ void rope_neox_yarn_kernel(float* x, int32_t head_dim, int32_t num_heads, int32_t pos,
+                                      float base, int32_t yarn, float freq_scale, float ext_factor,
+                                      float attn_factor, float beta_fast, float beta_slow,
+                                      int32_t orig_ctx) {
+    const int32_t h = blockIdx.x;
+    if (h >= num_heads) return;
+    const int32_t half = head_dim / 2;
+    float* xh = x + static_cast<int64_t>(h) * head_dim;
+    float low = 0.0f, high = static_cast<float>(half - 1), mscale = 1.0f;
+    if (yarn) {
+        const float twopi = 6.283185307179586f;
+        const float denom = 2.0f * logf(base);
+        low = floorf(head_dim * logf(static_cast<float>(orig_ctx) / (beta_fast * twopi)) / denom * 0.5f);
+        high = ceilf(head_dim * logf(static_cast<float>(orig_ctx) / (beta_slow * twopi)) / denom * 0.5f);
+        low = fmaxf(0.0f, low);
+        high = fminf(static_cast<float>(half - 1), high);
+        mscale = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
+    }
+    for (int32_t j = threadIdx.x; j < half; j += blockDim.x) {
+        const float freq = powf(base, -2.0f * static_cast<float>(j) / static_cast<float>(head_dim));
+        const float te = static_cast<float>(pos) * freq;
+        float theta = te;
+        if (yarn) {
+            const float ti = freq_scale * te;
+            const float ramp =
+                1.0f - fminf(1.0f, fmaxf(0.0f, (static_cast<float>(j) - low) / fmaxf(0.001f, high - low)));
+            const float mix = ramp * ext_factor;
+            theta = ti * (1.0f - mix) + te * mix;
+        }
+        const float cs = cosf(theta) * mscale, sn = sinf(theta) * mscale;
+        const float a = xh[j], b = xh[j + half];
+        xh[j] = a * cs - b * sn;
+        xh[j + half] = b * cs + a * sn;
+    }
+}
+
+// BLLM-200: scaled accumulate with optional bias -- out[i] += scale*(x[i]+bias[i]).
+// The MoE expert-mixing step: each selected expert's down-projection output is
+// added into the residual weighted by its routing softmax weight, folding the
+// per-column down_bias into the same pass. bias may be null.
+__global__ void axpy_bias_kernel(const float* x, const float* bias, float scale, float* out,
+                                 int32_t n) {
+    for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x)
+        out[i] += scale * (x[i] + (bias ? bias[i] : 0.0f));
+}
+
 // BLLM-189: fused QKV projection. ONE block per output row across the
 // concatenated [q | k | v] rows -- one launch replaces three matmuls that all
 // read the same normed activation. The which-tensor selection is uniform per
@@ -942,6 +992,32 @@ bool swiglu_oai(Context& ctx, const float* gate_device, const float* up_device,
     if (blocks > 65535u) blocks = 65535u;  // grid-stride handles the remainder
     swiglu_oai_kernel<<<dim3(blocks), dim3(kBlockSize), 0, st>>>(
         gate_device, up_device, gate_bias_device, up_bias_device, out_device, n, alpha, limit);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool rope_neox_yarn(Context& ctx, float* x_device, int32_t head_dim, int32_t num_heads,
+                    int32_t position, float base, bool yarn, float freq_scale, float ext_factor,
+                    float attn_factor, float beta_fast, float beta_slow, int32_t orig_ctx) noexcept {
+    if (!ctx.is_valid() || x_device == nullptr) return false;
+    if (head_dim <= 0 || num_heads <= 0 || (head_dim & 1) != 0) return false;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    const int32_t half = head_dim / 2;
+    const unsigned int tb = static_cast<unsigned int>(half < kBlockSize ? half : kBlockSize);
+    rope_neox_yarn_kernel<<<dim3(static_cast<unsigned int>(num_heads)), dim3(tb), 0, st>>>(
+        x_device, head_dim, num_heads, position, base, yarn ? 1 : 0, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow, orig_ctx);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool axpy_bias(Context& ctx, const float* x_device, const float* bias_device, float scale,
+               float* out_device, int32_t n) noexcept {
+    if (!ctx.is_valid() || x_device == nullptr || out_device == nullptr) return false;
+    if (n <= 0) return false;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    unsigned int blocks = static_cast<unsigned int>((n + kBlockSize - 1) / kBlockSize);
+    if (blocks > 65535u) blocks = 65535u;
+    axpy_bias_kernel<<<dim3(blocks), dim3(kBlockSize), 0, st>>>(x_device, bias_device, scale,
+                                                               out_device, n);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
