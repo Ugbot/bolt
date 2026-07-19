@@ -829,16 +829,41 @@ struct BoltColumn {
 // BoltBatch — double-buffered, COW, Venus tick-tock pattern
 // ============================================================================
 
-static constexpr uint32_t kMaxBatchColumns = 256;
+// Upper BOUND on a batch's column count — an assertion cap, NOT an allocation
+// size. G2FEAT-47: columns are now dynamically right-sized to `num_cols` via
+// `alloc_columns()`, so a wide bound costs nothing when unused. (Was 256 as a
+// fixed inline `columns[2][256]` that over-allocated ~151 KB per batch.)
+static constexpr uint32_t kMaxBatchColumns = 1024;
+
+// Column cap for the FIXED-INLINE auxiliary framing structs that predate the
+// dynamic-columns change and still embed `[N]` column arrays: the wire codec
+// (WireStream / serialize scratch), RowView, and the Parquet write column
+// table. Kept at the historical kMaxBatchColumns value (256) so those structs
+// stay compact — decoupling them from the in-memory batch bound (raised to
+// 1024) avoids ballooning them 4× and keeps WireStream inside its 16 KB budget.
+// Consequence (non-regressing): a batch wider than kMaxFixedColumns can live in
+// memory (right-sized) but cannot cross the wire / be Parquet-row-group-written
+// — the exact prior behaviour, since batches were capped at 256 before.
+static constexpr uint32_t kMaxFixedColumns = 256;
 
 struct alignas(64) BoltBatch {
-    // Double-buffered columns
-    BoltColumn columns[2][kMaxBatchColumns];
+    // Double-buffered columns — two tick-tock epochs, each a pointer to an
+    // arena-allocated array of exactly `num_cols` BoltColumn (nullptr until
+    // `alloc_columns()` runs). Indexing `columns[epoch][i]` is unchanged from
+    // the old fixed 2D array; only the backing storage moved to the arena.
+    BoltColumn* columns[2];
 
-    // Dirty tracking (own cache line)
-    alignas(64) std::atomic<uint64_t> dirty_mask_lo;  // Columns 0-63
-    alignas(64) std::atomic<uint64_t> dirty_mask_hi;  // Columns 64-127
-    // (Columns 128-255 rarely mutated, no atomic tracking needed)
+    // Dirty tracking — DYNAMIC bitmask, one bit per column, sized to
+    // `ceil(num_cols/64)` atomic words and arena-allocated by alloc_columns()
+    // (nullptr until then). G2FEAT-47: replaces the old fixed 128-bit
+    // dirty_mask_lo/hi so clone-on-write works for ANY column index up to the
+    // kMaxBatchColumns bound (in-place ingestion / dataframe-style column
+    // mutation on wide batches is a first-class path). The common num_cols<=64
+    // case is a single word — the array owns its own cache line (64-B aligned),
+    // preserving the original false-sharing isolation. num_cols in [65,128]
+    // gives two words, byte-for-byte the old lo/hi behaviour.
+    std::atomic<uint64_t>* dirty_mask;
+    uint32_t               dirty_words;   // ceil(num_cols/64)
 
     // Epoch — atomic (W6.0): the tick-tock `swap()` flips these on the
     // owner/apply thread while pinned readers concurrently pick an epoch
@@ -867,13 +892,110 @@ struct alignas(64) BoltBatch {
     // Initialize an already-allocated BoltBatch in place. Returning by value
     // is not possible: std::atomic members are non-copyable.
     static void init_empty(BoltBatch* b) noexcept {
-        // zero all non-atomic fields; then explicitly init atomics
+        // zero all non-atomic fields from read_epoch onward (num_rows/num_cols/
+        // schema/arena all live after it); then explicitly init atomics and the
+        // two column pointers (which sit BEFORE read_epoch and so are untouched
+        // by the memset — they MUST be nulled here so a caller that never calls
+        // alloc_columns can't dereference a dangling pointer).
         memset(reinterpret_cast<char*>(b) + offsetof(BoltBatch, read_epoch),
                0, sizeof(BoltBatch) - offsetof(BoltBatch, read_epoch));
+        b->columns[0]  = nullptr;
+        b->columns[1]  = nullptr;
+        b->dirty_mask  = nullptr;
+        b->dirty_words = 0;
         b->read_epoch  = 0;
         b->write_epoch = 1;
-        b->dirty_mask_lo.store(0, std::memory_order_relaxed);
-        b->dirty_mask_hi.store(0, std::memory_order_relaxed);
+    }
+
+    // Arena-allocate the two per-epoch column arrays, each sized to exactly
+    // `n_cols` BoltColumn, zero-initialised. Sets `num_cols` and `arena`. This
+    // is the sanctioned "constructor" for a batch's storage — call it AFTER
+    // init_empty and BEFORE writing any `columns[epoch][i]`.
+    //
+    // READ-ONLY by default (G2FEAT-47 "pay for what you use"): no dirty-mask is
+    // allocated, so the batch is strictly cheaper than the old fixed layout.
+    // This is correct for the vast majority of sites — scan outputs, wide
+    // 105/1024-col batches, and freshly-produced operator batches that fill
+    // every column once and never `mut_col` in place. Such a batch must never
+    // call mut_col()/mark_dirty() (they assert dirty_mask != nullptr). Use
+    // `alloc_columns_mutable` for the ingestion / dataframe-mutation / post-swap
+    // clone-on-write producers instead.
+    //
+    // Tiger Style: this is init-time allocation (once per batch use), never a
+    // hot-path grow. Pool-reused batches re-`init_empty` (nulling the pointers)
+    // and re-`alloc_columns` at the width of the new use; the pool's arena is
+    // reset between uses, so the previous arrays are already reclaimed — there
+    // is no leak and no stale-width reuse.
+    //
+    // Returns false on arena OOM (batch left with num_cols==0, columns null).
+    // `n_cols == 0` is legal (empty batch): leaves both pointers null.
+    static bool alloc_columns(BoltBatch* b, Arena* arena, uint32_t n_cols) noexcept {
+        return alloc_columns_impl(b, arena, n_cols, /*with_cow=*/false);
+    }
+
+    // Like alloc_columns, but ALSO allocates the dynamic clone-on-write dirty
+    // mask (`ceil(n_cols/64)` atomic words, 64-B aligned so the common
+    // single-word case owns its cache line), enabling mut_col()/swap()/COW at
+    // ANY column index up to kMaxBatchColumns. For the ingestion path, in-place
+    // dataframe-style column mutation, and any operator that COW-mutates an
+    // existing batch after a tick-tock swap.
+    static bool alloc_columns_mutable(BoltBatch* b, Arena* arena,
+                                      uint32_t n_cols) noexcept {
+        return alloc_columns_impl(b, arena, n_cols, /*with_cow=*/true);
+    }
+
+    static bool alloc_columns_impl(BoltBatch* b, Arena* arena, uint32_t n_cols,
+                                   bool with_cow) noexcept {
+        assert(b != nullptr);
+        assert(n_cols <= kMaxBatchColumns);
+        b->arena       = arena;
+        b->num_cols    = n_cols;
+        b->dirty_mask  = nullptr;
+        b->dirty_words = 0;
+        if (n_cols == 0) {
+            b->columns[0] = nullptr;
+            b->columns[1] = nullptr;
+            b->schema.set_storage(nullptr, 0);   // G2FEAT-47: dynamic schema
+            return true;
+        }
+        assert(arena != nullptr);
+        BoltColumn* c0 = arena->allocate_array<BoltColumn>(n_cols);
+        BoltColumn* c1 = arena->allocate_array<BoltColumn>(n_cols);
+        // G2FEAT-47: right-size the embedded schema's field storage to n_cols too
+        // (BoltSchema.fields is now an arena pointer, not a fixed [256] array —
+        // this is what stops BoltBatch carrying ~20 KB of inline schema).
+        BoltField* fbuf = arena->allocate_array<BoltField>(n_cols);
+        if (c0 == nullptr || c1 == nullptr || fbuf == nullptr) {
+            b->columns[0] = nullptr;
+            b->columns[1] = nullptr;
+            b->schema.set_storage(nullptr, 0);
+            b->num_cols   = 0;
+            return false;
+        }
+        memset(static_cast<void*>(c0), 0, sizeof(BoltColumn) * n_cols);
+        memset(static_cast<void*>(c1), 0, sizeof(BoltColumn) * n_cols);
+        memset(static_cast<void*>(fbuf), 0, sizeof(BoltField) * n_cols);
+        b->columns[0] = c0;
+        b->columns[1] = c1;
+        b->schema.set_storage(fbuf, n_cols);
+        if (with_cow) {
+            const uint32_t dw = (n_cols + 63u) / 64u;
+            void* raw = arena->allocate(sizeof(std::atomic<uint64_t>) * dw,
+                                        /*align=*/64);
+            if (raw == nullptr) {
+                b->columns[0] = nullptr;
+                b->columns[1] = nullptr;
+                b->num_cols   = 0;
+                return false;
+            }
+            auto* dm = static_cast<std::atomic<uint64_t>*>(raw);
+            for (uint32_t w = 0; w < dw; ++w) {
+                new (&dm[w]) std::atomic<uint64_t>(0);
+            }
+            b->dirty_mask  = dm;
+            b->dirty_words = dw;
+        }
+        return true;
     }
 
     // =====================================================================
@@ -882,6 +1004,8 @@ struct alignas(64) BoltBatch {
 
     const BoltColumn& col(uint32_t i) const noexcept {
         assert(i < num_cols);
+        assert(columns[read_epoch] != nullptr &&
+               "col() before alloc_columns() — missing alloc_columns at a fill site");
         return columns[read_epoch][i];
     }
 
@@ -896,6 +1020,8 @@ struct alignas(64) BoltBatch {
 
     BoltColumn& mut_col(uint32_t i) noexcept {
         assert(i < num_cols);
+        assert(columns[write_epoch] != nullptr &&
+               "mut_col() before alloc_columns() — missing alloc_columns at a fill site");
         mark_dirty(i);
         return columns[write_epoch][i];
     }
@@ -908,8 +1034,12 @@ struct alignas(64) BoltBatch {
         read_epoch ^= 1;
         write_epoch ^= 1;
         generation[write_epoch]++;
-        dirty_mask_lo.store(0, std::memory_order_release);
-        dirty_mask_hi.store(0, std::memory_order_release);
+        // Clear every dirty word (bounded: dirty_words <= ceil(1024/64) = 16).
+        // A read-only batch (no dirty mask) has nothing to clear — swapping one
+        // is legal (epoch flip only), it simply carries no COW state.
+        for (uint32_t w = 0; w < dirty_words; ++w) {
+            dirty_mask[w].store(0, std::memory_order_release);
+        }
     }
 
     // =====================================================================
@@ -934,28 +1064,24 @@ struct alignas(64) BoltBatch {
 
 private:
     void mark_dirty(uint32_t col_idx) noexcept {
-        if (col_idx < 64) {
-            uint64_t bit = 1ULL << col_idx;
-            uint64_t mask = dirty_mask_lo.load(std::memory_order_acquire);
-            if (!(mask & bit)) {
-                if (generation[read_epoch] != generation[write_epoch] && arena) {
-                    columns[write_epoch][col_idx] =
-                        columns[read_epoch][col_idx].clone_into(arena);
-                }
-                dirty_mask_lo.fetch_or(bit, std::memory_order_release);
+        // The dynamic dirty mask makes clone-on-write correct for ANY column
+        // index up to kMaxBatchColumns. Batch MUST have been constructed via
+        // alloc_columns_mutable (dirty mask present) — a read-only batch never
+        // mutates in place.
+        assert(dirty_mask != nullptr &&
+               "mut_col on a read-only batch — construct with alloc_columns_mutable");
+        assert(col_idx < num_cols);
+        const uint32_t word = col_idx >> 6;
+        const uint64_t bit  = 1ULL << (col_idx & 63u);
+        assert(word < dirty_words);
+        const uint64_t mask = dirty_mask[word].load(std::memory_order_acquire);
+        if (!(mask & bit)) {
+            if (generation[read_epoch] != generation[write_epoch] && arena) {
+                columns[write_epoch][col_idx] =
+                    columns[read_epoch][col_idx].clone_into(arena);
             }
-        } else if (col_idx < 128) {
-            uint64_t bit = 1ULL << (col_idx - 64);
-            uint64_t mask = dirty_mask_hi.load(std::memory_order_acquire);
-            if (!(mask & bit)) {
-                if (generation[read_epoch] != generation[write_epoch] && arena) {
-                    columns[write_epoch][col_idx] =
-                        columns[read_epoch][col_idx].clone_into(arena);
-                }
-                dirty_mask_hi.fetch_or(bit, std::memory_order_release);
-            }
+            dirty_mask[word].fetch_or(bit, std::memory_order_release);
         }
-        // Columns 128+ don't get atomic COW tracking (rarely mutated)
     }
 };
 

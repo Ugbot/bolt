@@ -496,8 +496,8 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
     const int64_t row_count = compute_row_count(buf, buf_len, schema.has_header);
 
     BoltBatch::init_empty(out_batch);
-    out_batch->arena    = arena;
-    out_batch->num_cols = schema.num_cols;
+    // G2FEAT-47: right-size columns[2] before dereferencing columns[read_epoch].
+    if (!BoltBatch::alloc_columns(out_batch, arena, schema.num_cols)) return false;
     out_batch->num_rows = row_count;
 
     BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
@@ -709,8 +709,8 @@ bool parse_csv_parallel(const char* BOLT_RESTRICT buf, size_t buf_len,
     }
 
     BoltBatch::init_empty(out_batch);
-    out_batch->arena    = arena;
-    out_batch->num_cols = schema.num_cols;
+    // G2FEAT-47: right-size columns[2] before dereferencing columns[read_epoch].
+    if (!BoltBatch::alloc_columns(out_batch, arena, schema.num_cols)) return false;
     out_batch->num_rows = row_count;
     BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
     if (!alloc_columns(schema, row_count, arena, cols)) return false;

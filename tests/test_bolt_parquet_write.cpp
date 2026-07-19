@@ -64,6 +64,7 @@ void build_int64_utf8_batch(bolt::Arena* arena, std::int64_t n,
     bolt::BoltBatch::init_empty(out);
     out->num_cols = 2;
     out->num_rows = n;
+    bolt::BoltBatch::alloc_columns(out, arena, 2);  // G2FEAT-47: size columns[2]
     out->schema.add_field("id", bolt::BoltType::Int64, false);
     out->schema.add_field("name", bolt::BoltType::Utf8, false);
 
@@ -202,6 +203,7 @@ TEST(BoltParquetWrite, NullableInt64Roundtrip) {
     bolt::BoltBatch::init_empty(batch);
     batch->num_cols = 1;
     batch->num_rows = kRows;
+    bolt::BoltBatch::alloc_columns(batch, &arena, 1);  // G2FEAT-47: size columns[2]
     batch->schema.add_field("v", bolt::BoltType::Int64, true);
 
     bolt::BoltColumn& v = batch->columns[batch->read_epoch][0];
@@ -277,6 +279,7 @@ void build_stats_batch(bolt::Arena* arena, std::int64_t base, std::int64_t n,
     bolt::BoltBatch::init_empty(out);
     out->num_cols = 2;
     out->num_rows = n;
+    bolt::BoltBatch::alloc_columns(out, arena, 2);  // G2FEAT-47: size columns[2]
 
     bolt::BoltColumn& id = out->columns[out->read_epoch][0];
     id = bolt::BoltColumn::make_flat_alloc(n, bolt::BoltType::Int64, arena);
@@ -514,6 +517,7 @@ TEST(BoltParquetStats, BoolAndFloatStatCompleteness) {
     bolt::BoltBatch::init_empty(b);
     b->num_cols = 6;
     b->num_rows = kRows;
+    bolt::BoltBatch::alloc_columns(b, &arena, 6);  // G2FEAT-47: size columns[2]
     bolt::BoltColumn* cols = b->columns[b->read_epoch];
 
     // c0 mixed bool, c1 all-true bool.

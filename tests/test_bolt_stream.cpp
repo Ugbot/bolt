@@ -35,6 +35,7 @@ void make_int64_batch(BoltBatch* out, Arena* arena,
     out->arena     = arena;
     out->num_rows  = n;
     out->num_cols  = 1;
+    BoltBatch::alloc_columns(out, arena, 1);  // G2FEAT-47: size columns[2]
 
     int64_t* buf = static_cast<int64_t*>(arena->allocate(n * sizeof(int64_t), alignof(int64_t)));
     ASSERT_NE(buf, nullptr);
@@ -49,10 +50,12 @@ void make_int64_batch(BoltBatch* out, Arena* arena,
 
 // Shallow copy: forward the single column view from in_batch to out_batch.
 bool stage_copy(const BoltBatch* in_batch, BoltBatch* out_batch,
-                Scheduler* /*sched*/, Arena* /*arena*/,
+                Scheduler* /*sched*/, Arena* arena,
                 void* /*state*/) noexcept {
     out_batch->num_rows = in_batch->num_rows;
     out_batch->num_cols = in_batch->num_cols;
+    // G2FEAT-47: size the out batch columns[2] before copying views in.
+    BoltBatch::alloc_columns(out_batch, arena, in_batch->num_cols);
     for (uint32_t i = 0; i < in_batch->num_cols; ++i) {
         const BoltColumn& src = in_batch->col(i);
         out_batch->columns[out_batch->read_epoch][i]  = src;
@@ -75,6 +78,7 @@ bool stage_double(const BoltBatch* in_batch, BoltBatch* out_batch,
     BoltColumn c = BoltColumn::make_flat(out, nullptr, n, BoltType::Int64);
     out_batch->num_rows = n;
     out_batch->num_cols = 1;
+    BoltBatch::alloc_columns(out_batch, arena, 1);  // G2FEAT-47: size columns[2]
     out_batch->columns[out_batch->read_epoch][0]  = c;
     out_batch->columns[out_batch->write_epoch][0] = c;
     return true;
@@ -97,6 +101,7 @@ bool stage_sum(const BoltBatch* in_batch, BoltBatch* out_batch,
     BoltColumn c = BoltColumn::make_flat(out, nullptr, 1, BoltType::Int64);
     out_batch->num_rows = 1;
     out_batch->num_cols = 1;
+    BoltBatch::alloc_columns(out_batch, arena, 1);  // G2FEAT-47: size columns[2]
     out_batch->columns[out_batch->read_epoch][0]  = c;
     out_batch->columns[out_batch->write_epoch][0] = c;
     return true;
@@ -107,12 +112,14 @@ struct DropEveryOther {
 };
 
 bool stage_drop_every_other(const BoltBatch* in_batch, BoltBatch* out_batch,
-                            Scheduler* /*sched*/, Arena* /*arena*/,
+                            Scheduler* /*sched*/, Arena* arena,
                             void* state) noexcept {
     auto* s = static_cast<DropEveryOther*>(state);
     const uint32_t n = s->calls.fetch_add(1, std::memory_order_relaxed);
     if ((n & 1) != 0) return false;
-    return stage_copy(in_batch, out_batch, nullptr, nullptr, nullptr);
+    // G2FEAT-47: thread the real arena through — stage_copy now needs it to
+    // size the out batch's columns[2] (was nullptr, which would fail alloc).
+    return stage_copy(in_batch, out_batch, nullptr, arena, nullptr);
 }
 
 // ---- Sinks ----

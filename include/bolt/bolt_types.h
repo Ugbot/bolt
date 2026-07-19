@@ -324,7 +324,13 @@ static_assert(alignof(StringView) == 4, "StringView must be 4-byte aligned");
 
 static constexpr uint32_t kMaxFieldName = 63;  // 63 chars + null terminator
 
-/// A single field. Fixed-size (80 bytes). No heap allocation.
+/// A single field — the "better Arrow" column descriptor. Fixed-size (80 bytes),
+/// self-describing. No heap allocation. Carries type + nullability + the rich
+/// kinds: Dictionary/Symbol key+value types, Embedding dimension / FixedSizeBinary
+/// width (`fixed_size`), and decimal scale. Text/Keyword/Document map to
+/// Utf8/Dictionary/Binary at this layer; per-column index attachments (BM25 /
+/// PDX-vector) live on the storage-schema authority (marbledb ColumnDef), not
+/// here — this descriptor is what travels with an in-memory batch.
 struct BoltField {
     char     name[kMaxFieldName + 1];  // Null-terminated, 64 bytes
     BoltType type;
@@ -332,7 +338,8 @@ struct BoltField {
     BoltType dict_key_type;    // For Dictionary/Symbol
     BoltType dict_value_type;  // For Dictionary/Symbol
     uint32_t fixed_size;       // For FixedSizeBinary, Embedding dimension
-    uint8_t  _pad[6];
+    uint8_t  decimal_scale;    // For Decimal64/128 (G2FEAT-47: rich schema)
+    uint8_t  _pad[5];
 
     void set_name(const char* n) noexcept {
         size_t len = strlen(n);
@@ -342,15 +349,38 @@ struct BoltField {
     }
 };
 
-static constexpr uint32_t kMaxSchemaFields = 256;
+// One honest assertion ceiling for column/field counts across bolt (G2FEAT-47).
+// Used ONLY in asserts/rejects — NEVER to size an array or a bitmask. Schemas and
+// batches are arena-allocated right-sized to their real column count; this bound
+// only stops a pathological / corrupt count. (Replaces the old fixed
+// `kMaxSchemaFields`/`kMaxBatchColumns` inline-array sizes.)
+static constexpr uint32_t kMaxColumns = 4096;
+// Deprecated back-compat aliases — existing call sites still name these. They are
+// now assertion ceilings, not allocation sizes. New code should use kMaxColumns.
+static constexpr uint32_t kMaxSchemaFields = kMaxColumns;
 
-/// Schema: fixed-capacity array of fields. No heap. No exceptions.
+/// Schema: a dynamically-sized, arena-backed list of fields (G2FEAT-47). No heap
+/// of its own, no exceptions. `fields` points at `cap` arena-allocated BoltField
+/// slots (nullptr until `set_storage`). A batch-embedded schema gets its storage
+/// from `BoltBatch::alloc_columns` (sized to the batch's column count); a
+/// standalone schema calls `set_storage` with a caller-allocated buffer.
+/// `sizeof(BoltSchema)` is 16 bytes (was ~20 KB) — batches no longer embed a
+/// fixed 256-field array. `add_field` on a schema with no storage cleanly returns
+/// false (num_fields 0 >= cap 0) — never dereferences null.
 struct BoltSchema {
-    BoltField fields[kMaxSchemaFields];
-    uint32_t  num_fields;
+    BoltField* fields;       // arena-owned, `cap` entries (nullptr until set_storage)
+    uint32_t   num_fields;
+    uint32_t   cap;
 
-    BoltSchema() noexcept : num_fields(0) {
-        memset(fields, 0, sizeof(fields));
+    BoltSchema() noexcept : fields(nullptr), num_fields(0), cap(0) {}
+
+    // Attach arena-backed field storage (buf holds `capacity` BoltField). Resets
+    // num_fields to 0. Callers with an Arena: allocate `capacity` BoltField and
+    // pass the buffer (bolt_types.h stays Arena-free by design).
+    void set_storage(BoltField* buf, uint32_t capacity) noexcept {
+        fields = buf;
+        cap = capacity;
+        num_fields = 0;
     }
 
     int find_field(const char* name) const noexcept {
@@ -361,7 +391,7 @@ struct BoltSchema {
     }
 
     bool add_field(const char* name, BoltType type, bool nullable = true) noexcept {
-        if (num_fields >= kMaxSchemaFields) return false;
+        if (num_fields >= cap) return false;   // storage bound (was kMaxSchemaFields)
         BoltField& f = fields[num_fields++];
         memset(&f, 0, sizeof(f));
         f.set_name(name);

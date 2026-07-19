@@ -62,7 +62,7 @@ namespace {
 
 constexpr std::uint32_t kPwMaxRowGroupBytes = 64u * 1024u * 1024u;  // 64 MiB
 constexpr std::uint32_t kPwMaxRowGroups     = 4096u;
-constexpr std::uint32_t kPwMaxColumns       = kMaxBatchColumns;
+constexpr std::uint32_t kPwMaxColumns       = kMaxFixedColumns;  // G2FEAT-47
 
 // Parquet enum codes we emit (parquet.thrift).
 constexpr std::int32_t kPtBoolean   = 0;

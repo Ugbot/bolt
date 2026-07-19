@@ -135,6 +135,7 @@ TEST(BoltVectorColumn, WireRoundTripPreservesDimAndPayload) {
     b.arena    = &arena;
     b.num_cols = 1;
     b.num_rows = kRows;
+    bolt::BoltBatch::alloc_columns(&b, &arena, 1);  // G2FEAT-47: size columns[2]
     b.schema.num_fields = 1;
     std::memset(&b.schema.fields[0], 0, sizeof(b.schema.fields[0]));
     std::memcpy(b.schema.fields[0].name, "emb", 3);
@@ -265,6 +266,7 @@ void build_vector_batch(bolt::BoltBatch* b,
     b->arena    = arena;
     b->num_cols = 1;
     b->num_rows = c.length;
+    bolt::BoltBatch::alloc_columns(b, arena, 1);  // G2FEAT-47: size columns[2]
     b->schema.num_fields = 1;
     std::memset(&b->schema.fields[0], 0, sizeof(b->schema.fields[0]));
     const size_t nlen = std::strlen(col_name);

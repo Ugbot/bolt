@@ -41,6 +41,7 @@ void fill_int_batch(bolt::Arena* arena, bolt::BoltBatch* batch,
     bolt::BoltBatch::init_empty(batch);
     batch->num_cols = 1;
     batch->num_rows = rows;
+    bolt::BoltBatch::alloc_columns(batch, arena, 1);  // G2FEAT-47: size columns[2]
     batch->schema.add_field("id", bolt::BoltType::Int64, false);
     bolt::BoltColumn& id = batch->columns[batch->read_epoch][0];
     id = bolt::BoltColumn::make_flat_alloc(rows, bolt::BoltType::Int64, arena);

@@ -116,7 +116,10 @@ TEST(StringView, SizeIs16) {
 // ============================================================================
 
 TEST(BoltSchema, AddAndFind) {
+    // G2FEAT-47: BoltSchema.fields is now arena/caller-backed — give it storage.
+    BoltField fbuf[8];
     BoltSchema s;
+    s.set_storage(fbuf, 8);
     EXPECT_TRUE(s.add_field("price", BoltType::Float64));
     EXPECT_TRUE(s.add_field("symbol", BoltType::Symbol));
     EXPECT_TRUE(s.add_field("timestamp", BoltType::Timestamp));
@@ -129,7 +132,9 @@ TEST(BoltSchema, AddAndFind) {
 }
 
 TEST(BoltSchema, FieldNameTruncation) {
+    BoltField fbuf[4];
     BoltSchema s;
+    s.set_storage(fbuf, 4);
     char long_name[128];
     memset(long_name, 'x', 127);
     long_name[127] = '\0';
@@ -138,7 +143,10 @@ TEST(BoltSchema, FieldNameTruncation) {
 }
 
 TEST(BoltSchema, Equality) {
+    BoltField abuf[4], bbuf[4], cbuf[4];
     BoltSchema a, b;
+    a.set_storage(abuf, 4);
+    b.set_storage(bbuf, 4);
     a.add_field("x", BoltType::Int32);
     a.add_field("y", BoltType::Float64);
     b.add_field("x", BoltType::Int32);
@@ -146,6 +154,7 @@ TEST(BoltSchema, Equality) {
     EXPECT_TRUE(a.equals(b));
 
     BoltSchema c;
+    c.set_storage(cbuf, 4);
     c.add_field("x", BoltType::Int64);  // Different type
     c.add_field("y", BoltType::Float64);
     EXPECT_FALSE(a.equals(c));
@@ -1129,6 +1138,7 @@ TEST(BoltBatchArrow, FillSchemaStruct) {
     b.arena = &a;
     b.num_rows = 0;
     b.num_cols = 2;
+    BoltBatch::alloc_columns(&b, &a, 2);  // G2FEAT-47: size columns[2]
     b.schema.add_field("x", BoltType::Int32);
     b.schema.add_field("y", BoltType::Float64);
     b.columns[0][0] = BoltColumn::make_flat(nullptr, nullptr, 0, BoltType::Int32);

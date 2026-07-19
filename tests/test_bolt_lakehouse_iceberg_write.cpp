@@ -52,6 +52,7 @@ void make_batch(bolt::Arena* a, bolt::BoltBatch* out, int64_t base,
     out->arena    = a;
     out->num_rows = n;
     out->num_cols = 1;
+    bolt::BoltBatch::alloc_columns(out, a, 1);  // G2FEAT-47: size columns[2]
     out->schema.add_field("id", bolt::BoltType::Int64, false);
     auto* cols = out->columns[out->read_epoch];
     cols[0].type = bolt::BoltType::Int64;

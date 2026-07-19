@@ -89,7 +89,10 @@ inline constexpr size_t kWireDescSize        = 56;
 inline constexpr size_t kWireAlign           = 64;
 
 // Hard cap mirrors kMaxBatchColumns so we never underestimate bounds.
-inline constexpr uint32_t kWireMaxCols = kMaxBatchColumns;
+// G2FEAT-47: the wire codec keeps the historical 256-col cap (see
+// kMaxFixedColumns) — decoupled from the in-memory kMaxBatchColumns (1024) so
+// the fixed serialize scratch + WireStream framing stay compact.
+inline constexpr uint32_t kWireMaxCols = kMaxFixedColumns;
 
 // ===========================================================================
 // Internal helpers
@@ -539,9 +542,10 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
     if (data_off > buf_len) return false;
 
     BoltBatch::init_empty(out);
+    // G2FEAT-47: right-size the column arrays to the wire's num_cols before the
+    // per-column loop writes columns[epoch][i]. Sets num_cols + arena.
+    if (!BoltBatch::alloc_columns(out, arena, num_cols)) return false;
     out->num_rows = num_rows;
-    out->num_cols = num_cols;
-    out->arena    = arena;
     out->schema.num_fields = num_cols;
 
     // --- Per-column parse ---
@@ -676,9 +680,14 @@ inline bool bolt_wire_deserialize(const void* buf, size_t buf_len,
 /// memcpy rather than assume typed alignment. Halves the apply-path memory
 /// traffic vs deserialize+apply (one copy into the sink instead of two). Returns
 /// false on any validation error. See MarbleDB's mt_apply_entry kBatch path.
+// G2FEAT-47: `arena` is required now — dynamic BoltBatch.columns[2] need arena
+// storage for the (small) per-column DESCRIPTOR array even in view mode. The
+// column DATA still aliases `buf` zero-copy; only the descriptors are allocated
+// (same arena/lifetime the deserialize fallback uses). Passing nullptr with a
+// non-empty batch asserts in alloc_columns.
 inline bool bolt_wire_view(const void* buf, size_t buf_len,
-                           BoltBatch* out) noexcept {
-    return bolt_wire_parse<true>(buf, buf_len, out, nullptr);
+                           BoltBatch* out, Arena* arena) noexcept {
+    return bolt_wire_parse<true>(buf, buf_len, out, arena);
 }
 
 }  // namespace wire

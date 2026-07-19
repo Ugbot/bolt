@@ -81,13 +81,16 @@ struct WireStream {
 
     // Per-column absolute offsets + lengths captured during append.
     // Indexed by column index; filled into the descriptor block at finalize.
-    uint64_t col_b0_off[kMaxBatchColumns];
-    uint64_t col_b0_len[kMaxBatchColumns];
-    uint64_t col_b1_off[kMaxBatchColumns];
-    uint64_t col_b1_len[kMaxBatchColumns];
-    uint64_t col_b2_off[kMaxBatchColumns];
-    uint64_t col_b2_len[kMaxBatchColumns];
-    uint8_t  col_format[kMaxBatchColumns];  // always Flat in Phase 1
+    // G2FEAT-47: sized to the wire cap (kMaxFixedColumns=256), not the raised
+    // in-memory kMaxBatchColumns — keeps WireStream inside its 16 KB budget and
+    // matches the kWireMaxCols guards below.
+    uint64_t col_b0_off[wire::kWireMaxCols];
+    uint64_t col_b0_len[wire::kWireMaxCols];
+    uint64_t col_b1_off[wire::kWireMaxCols];
+    uint64_t col_b1_len[wire::kWireMaxCols];
+    uint64_t col_b2_off[wire::kWireMaxCols];
+    uint64_t col_b2_len[wire::kWireMaxCols];
+    uint8_t  col_format[wire::kWireMaxCols];  // always Flat in Phase 1
 };
 
 // WireStream is ~12.5 KB at kMaxBatchColumns=256. Pass it by pointer always.

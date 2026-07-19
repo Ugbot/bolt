@@ -32,6 +32,7 @@ void build_int32_batch(BoltBatch* b, Arena* arena,
     b->num_rows = nrows;
     b->num_cols = ncols;
     b->arena    = arena;
+    BoltBatch::alloc_columns(b, arena, ncols);  // G2FEAT-47: size columns[2]
     b->schema.num_fields = ncols;
 
     for (uint32_t c = 0; c < ncols; ++c) {
@@ -219,6 +220,7 @@ TEST(BoltWireStream, MixedInt32Int64Columns) {
     src.num_cols = 2;
     src.arena    = &arena_src;
     src.schema.num_fields = 2;
+    BoltBatch::alloc_columns(&src, &arena_src, 2);  // G2FEAT-47: size columns[2]
 
     BoltField& f0 = src.schema.fields[0];
     std::memset(&f0, 0, sizeof(f0));

@@ -390,6 +390,9 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             ++s->cur_file_idx;
             continue;
         }
+        // G2FEAT-47: right-size columns[2] to this file's width before deref.
+        if (!BoltBatch::alloc_columns(out, s->scratch, s->cur_meta->n_columns))
+            return false;
         BoltColumn* cols = out->columns[out->read_epoch];
         int64_t rows = 0;
         if (!pq::parquet_read_row_group(s->cur_body, s->cur_body_len,

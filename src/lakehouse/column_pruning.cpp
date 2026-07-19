@@ -32,14 +32,16 @@ bool column_pruning_gather(
     if (src == nullptr || plan == nullptr || dst == nullptr) return false;
     if (plan->n_keep > kMaxBatchColumns) return false;
     dst->num_rows = src->num_rows;
+    // G2FEAT-47: this helper writes via dst->mut_col(i), so dst needs the COW
+    // dirty mask — construct mutable. Sizes columns[2] to the kept width.
+    const uint32_t n_out = plan->all_columns ? src->num_cols : plan->n_keep;
+    if (!BoltBatch::alloc_columns_mutable(dst, dst->arena, n_out)) return false;
     if (plan->all_columns) {
-        dst->num_cols = src->num_cols;
         for (uint32_t i = 0; i < src->num_cols; ++i) {
             dst->mut_col(i) = src->col(i);
         }
         return true;
     }
-    dst->num_cols = plan->n_keep;
     for (uint32_t i = 0; i < plan->n_keep; ++i) {
         const uint32_t s = plan->keep[i];
         if (s >= src->num_cols) return false;

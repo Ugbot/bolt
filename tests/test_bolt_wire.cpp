@@ -23,6 +23,7 @@ void build_int32_batch(BoltBatch* b, Arena* arena,
     b->num_rows = nrows;
     b->num_cols = ncols;
     b->arena    = arena;
+    BoltBatch::alloc_columns(b, arena, ncols);  // G2FEAT-47: size columns[2]
     b->schema.num_fields = ncols;
 
     for (uint32_t c = 0; c < ncols; ++c) {
@@ -151,6 +152,7 @@ TEST(BoltWire, VarBinaryRoundTrip) {
     src.num_cols = 2;
     src.num_rows = 4;
     src.schema.num_fields = 2;
+    BoltBatch::alloc_columns(&src, &arena_src, 2);  // G2FEAT-47: size columns[2]
     {
         BoltField& f0 = src.schema.fields[0];
         std::memset(&f0, 0, sizeof(f0));
@@ -251,6 +253,7 @@ TEST(BoltWire, FlatUtf8RoundTrip) {
     src.num_cols = 1;
     src.num_rows = 5;
     src.schema.num_fields = 1;
+    BoltBatch::alloc_columns(&src, &arena_src, 1);  // G2FEAT-47: size columns[2]
     {
         BoltField& f0 = src.schema.fields[0];
         std::memset(&f0, 0, sizeof(f0));
@@ -404,6 +407,7 @@ TEST(BoltWire, FlatUtf8SlicedViewRoundTrip) {
     src.num_cols = 1;
     src.num_rows = 2;
     src.schema.num_fields = 1;
+    BoltBatch::alloc_columns(&src, &arena_src, 1);  // G2FEAT-47: size columns[2]
     {
         BoltField& f0 = src.schema.fields[0];
         std::memset(&f0, 0, sizeof(f0));

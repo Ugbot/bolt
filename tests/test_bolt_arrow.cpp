@@ -170,6 +170,7 @@ void build_mixed_batch(BoltBatch* b, Arena* arena) {
     b->num_rows = 10;
     b->num_cols = 3;
     b->arena = arena;
+    BoltBatch::alloc_columns(b, arena, 3);  // G2FEAT-47: size columns[2]
     b->schema.num_fields = 3;
 
     const BoltType types[3] = {BoltType::Int32, BoltType::Int64, BoltType::Float64};
@@ -291,6 +292,8 @@ TEST(BoltArrow, BatchToBatch) {
     dst.num_rows = src.num_rows;
     dst.num_cols = static_cast<uint32_t>(schema.n_children);
     dst.arena = &dst_arena;
+    BoltBatch::alloc_columns(&dst, &dst_arena,
+                             static_cast<uint32_t>(schema.n_children));  // G2FEAT-47
     dst.schema.num_fields = dst.num_cols;
 
     for (uint32_t i = 0; i < dst.num_cols; ++i) {

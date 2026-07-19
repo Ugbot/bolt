@@ -829,8 +829,8 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     if (!parquet_read_meta(buf, len, arena, meta)) return false;
     if (meta->num_rows < 0) return false;
     BoltBatch::init_empty(out_batch);
-    out_batch->arena = arena;
-    out_batch->num_cols = meta->n_columns;
+    // G2FEAT-47: right-size columns[2] before dereferencing columns[read_epoch].
+    if (!BoltBatch::alloc_columns(out_batch, arena, meta->n_columns)) return false;
     out_batch->num_rows = meta->num_rows;
     BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
     ColCtx* cxs = arena->allocate_array<ColCtx>(meta->n_columns);

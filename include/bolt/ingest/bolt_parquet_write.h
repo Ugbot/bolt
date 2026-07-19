@@ -77,7 +77,10 @@ struct ParquetWriteColumn {
 
 // Writer options. POD; copied into the writer at open.
 struct ParquetWriteOpts {
-    ParquetWriteColumn columns[kMaxBatchColumns];
+    // G2FEAT-47: kMaxFixedColumns (256), decoupled from the raised in-memory
+    // kMaxBatchColumns; kPwMaxColumns (impl) matches. A batch wider than this
+    // cannot be Parquet-row-group-written — the exact prior 256-col behaviour.
+    ParquetWriteColumn columns[kMaxFixedColumns];
     std::uint32_t      n_columns;
     std::uint32_t      row_group_target_bytes;   // capped at 64 MiB internally.
                                                  // NOTE: advisory only today —

@@ -57,8 +57,11 @@ struct alignas(64) RowView {
     // Column pointers + sizes, indexed 0..ncols-1. Positions beyond
     // `ncols` are undefined (do not read). Producers must match the
     // schema's column order.
-    const void* col_ptrs[kMaxBatchColumns];
-    uint16_t    col_sizes[kMaxBatchColumns];
+    // G2FEAT-47: sized to kMaxFixedColumns (256), not the raised in-memory
+    // kMaxBatchColumns — RowView is the point-get / KV row-materialisation
+    // shape (schema-narrow), so it keeps the compact historical cap.
+    const void* col_ptrs[kMaxFixedColumns];
+    uint16_t    col_sizes[kMaxFixedColumns];
     uint32_t    ncols;
 
     // Opaque pin state. Consumers MUST NOT interpret these fields
@@ -78,8 +81,8 @@ struct alignas(64) RowView {
 // stable for ABI-minded callers.
 static_assert(sizeof(RowView) <=
                   (sizeof(int64_t) * 2 +
-                   sizeof(void*) * kMaxBatchColumns +
-                   sizeof(uint16_t) * kMaxBatchColumns +
+                   sizeof(void*) * kMaxFixedColumns +
+                   sizeof(uint16_t) * kMaxFixedColumns +
                    sizeof(uint32_t) * 2 +
                    sizeof(uint64_t) +
                    sizeof(void*) +
