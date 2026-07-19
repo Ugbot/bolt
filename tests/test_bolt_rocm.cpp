@@ -648,10 +648,17 @@ TEST(BoltRocm, RawReadBandwidthProbe) {
     }
     Context ctx;
     ASSERT_TRUE(ctx.create());
-    double gbps = 0.0;
-    ASSERT_TRUE(bolt::rocm::bandwidth_probe(ctx, 512ull * 1024 * 1024, 30, &gbps));
-    std::printf("[BANDWIDTH] raw device read = %.1f GB/s (peak spec ~256 GB/s)\n", gbps);
-    EXPECT_GT(gbps, 1.0);
+    // Probe several sizes: the 512 MB stream vs the ~4.4 MB one expert matrix is,
+    // to see the small-matrix GEMV ceiling (is 156 GB/s the kernel or the hardware?).
+    const uint64_t sizes[] = {512ull * 1024 * 1024, 64ull * 1024 * 1024, 16ull * 1024 * 1024,
+                              4608ull * 1024, 1024ull * 1024};
+    for (uint64_t sz : sizes) {
+        double gbps = 0.0;
+        const int iters = sz >= (16ull << 20) ? 30 : 200;
+        ASSERT_TRUE(bolt::rocm::bandwidth_probe(ctx, sz, iters, &gbps));
+        std::printf("[BANDWIDTH] read %6llu KB = %.1f GB/s\n",
+                    static_cast<unsigned long long>(sz / 1024), gbps);
+    }
 }
 
 // BLLM-200: the bandwidth-optimized aligned MXFP4 matvec matches the same CPU

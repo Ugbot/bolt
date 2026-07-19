@@ -320,6 +320,61 @@ __global__ void moe_down_accum_mxfp4_kernel(const uint8_t* cb, const uint8_t* sb
         hidden[row] += selw[kk] * (p + (dbias_base ? dbias_base[static_cast<int64_t>(e) * rows + row] : 0.0f));
 }
 
+// BLLM-200: BATCHED gate+up+swiglu over ALL K selected experts in ONE launch. The
+// virtual row vr in [0, K*ei) maps to expert kk=vr/ei (e=sel[kk]) + local row
+// vr%ei; act is [K, ei]. One big kernel instead of K small ones -> less aggregate
+// launch/ramp overhead, so the memory-bound expert GEMV saturates DRAM better.
+__global__ void moe_gate_up_batched_kernel(const uint8_t* gcb, const uint8_t* gsb,
+                                           const uint8_t* ucb, const uint8_t* usb, int64_t cstride,
+                                           int64_t sstride, const float* gbias_base,
+                                           const float* ubias_base, const int32_t* sel, int32_t K,
+                                           const float* x, float* act, int32_t ei, int32_t cols,
+                                           float alpha, float limit) {
+    const int32_t vr = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (vr >= K * ei) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t kk = vr / ei, row = vr - kk * ei, e = sel[kk];
+    const int32_t nb = cols >> 5;
+    const int64_t co = static_cast<int64_t>(e) * cstride + static_cast<int64_t>(row) * nb * 16;
+    const int64_t so = static_cast<int64_t>(e) * sstride + static_cast<int64_t>(row) * nb;
+    float g = mxfp4_aligned_partial(gcb + co, gsb + so, x, nb, lane);
+    float u = mxfp4_aligned_partial(ucb + co, usb + so, x, nb, lane);
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+    if (lane == 0) {
+        const int64_t bo = static_cast<int64_t>(e) * ei + row;
+        g += gbias_base ? gbias_base[bo] : 0.0f;
+        u += ubias_base ? ubias_base[bo] : 0.0f;
+        const float gg = fminf(g, limit);
+        const float uu = fmaxf(-limit, fminf(u, limit));
+        act[vr] = (gg / (1.0f + expf(-alpha * gg))) * (uu + 1.0f);
+    }
+}
+
+// BLLM-200: BATCHED down-projection over ALL K experts. Virtual row vr in [0, K*H):
+// kk=vr/H, row=vr%H, e=sel[kk]; reads this expert's activation slice act[kk*ei..].
+// Each expert's contribution is atomicAdd'd into hidden[row] (K experts -> same
+// row), fusing the weighted residual accumulate. cols == ei.
+__global__ void moe_down_batched_kernel(const uint8_t* cb, const uint8_t* sb, int64_t cstride,
+                                        int64_t sstride, const float* dbias_base, const float* selw,
+                                        const int32_t* sel, int32_t K, const float* act,
+                                        float* hidden, int32_t H, int32_t cols) {
+    const int32_t vr = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (vr >= K * H) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t kk = vr / H, row = vr - kk * H, e = sel[kk];
+    const int32_t nb = cols >> 5;
+    const int64_t co = static_cast<int64_t>(e) * cstride + static_cast<int64_t>(row) * nb * 16;
+    const int64_t so = static_cast<int64_t>(e) * sstride + static_cast<int64_t>(row) * nb;
+    const float* actk = act + static_cast<int64_t>(kk) * cols;
+    float p = mxfp4_aligned_partial(cb + co, sb + so, actk, nb, lane);
+    p = warp_reduce_sum(p);
+    if (lane == 0) {
+        const float add = selw[kk] * (p + (dbias_base ? dbias_base[static_cast<int64_t>(e) * H + row] : 0.0f));
+        atomicAdd(&hidden[row], add);
+    }
+}
+
 // Int2: four 2-bit codes packed per byte, lowest bits first -- same
 // layout bolt_compute.h's matmul_row_dot_f32 (Int2 case) uses.
 __global__ void matmul_dequant_int2_kernel(const uint8_t* weight, const float* scale,
@@ -1321,6 +1376,36 @@ bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, i
     moe_down_accum_mxfp4_kernel<<<mxfp4_grid_(ctx, rows), dim3(kBlockSize), 0, st>>>(
         static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), cstride, sstride,
         dbias, selw, sel, kk, act, hidden, rows, cols);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool moe_gate_up_batched(Context& ctx, const void* gcodes, const void* gscales, const void* ucodes,
+                         const void* uscales, int64_t cstride, int64_t sstride, const float* gbias,
+                         const float* ubias, const int32_t* sel, int32_t K, const float* x,
+                         float* act, int32_t ei, int32_t cols, float alpha, float limit) noexcept {
+    if (!ctx.is_valid() || gcodes == nullptr || ucodes == nullptr || sel == nullptr || x == nullptr ||
+        act == nullptr || K <= 0 || ei <= 0 || cols <= 0 || (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    moe_gate_up_batched_kernel<<<mxfp4_grid_(ctx, K * ei), dim3(kBlockSize), 0, st>>>(
+        static_cast<const uint8_t*>(gcodes), static_cast<const uint8_t*>(gscales),
+        static_cast<const uint8_t*>(ucodes), static_cast<const uint8_t*>(uscales), cstride, sstride,
+        gbias, ubias, sel, K, x, act, ei, cols, alpha, limit);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool moe_down_batched(Context& ctx, const void* codes, const void* scales, int64_t cstride,
+                      int64_t sstride, const float* dbias, const float* selw, const int32_t* sel,
+                      int32_t K, const float* act, float* hidden, int32_t H, int32_t cols) noexcept {
+    if (!ctx.is_valid() || codes == nullptr || sel == nullptr || selw == nullptr || act == nullptr ||
+        hidden == nullptr || K <= 0 || H <= 0 || cols <= 0 || (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    moe_down_batched_kernel<<<mxfp4_grid_(ctx, K * H), dim3(kBlockSize), 0, st>>>(
+        static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), cstride, sstride,
+        dbias, selw, sel, K, act, hidden, H, cols);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

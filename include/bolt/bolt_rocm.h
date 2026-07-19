@@ -311,6 +311,19 @@ bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, i
                           int32_t kk, const float* act, float* hidden, int32_t rows,
                           int32_t cols) noexcept;
 
+// BLLM-200: BATCHED expert kernels -- all K selected experts in ONE launch each
+// (vs K separate gate_up + K down). gate_up writes act[K*ei] (row vr -> expert
+// sel[vr/ei], local vr%ei); down reads act[kk*ei..] and atomicAdd's each expert's
+// weighted contribution into hidden[row]. Fewer, bigger memory-bound kernels ->
+// better DRAM saturation. `cols` is the shared-dim (H for gate_up, ei for down).
+bool moe_gate_up_batched(Context& ctx, const void* gcodes, const void* gscales, const void* ucodes,
+                         const void* uscales, int64_t cstride, int64_t sstride, const float* gbias,
+                         const float* ubias, const int32_t* sel, int32_t K, const float* x,
+                         float* act, int32_t ei, int32_t cols, float alpha, float limit) noexcept;
+bool moe_down_batched(Context& ctx, const void* codes, const void* scales, int64_t cstride,
+                      int64_t sstride, const float* dbias, const float* selw, const int32_t* sel,
+                      int32_t K, const float* act, float* hidden, int32_t H, int32_t cols) noexcept;
+
 // BLLM-189: fused QKV projection -- one kernel produces q[q_rows], k[kv_rows],
 // v[kv_rows] from the shared normed activation `x[cols]`, replacing three
 // matmul_dequant calls with one launch. `wq`/`wk`/`wv` are row-major weights of
