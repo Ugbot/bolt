@@ -639,6 +639,21 @@ TEST(BoltRocm, MatmulMxfp4MatchesCpuReference) {
     ctx.free(&wb); ctx.free(&xb); ctx.free(&ob);
 }
 
+// BLLM-200 diagnostic: measure the iGPU's raw read bandwidth ceiling. Prints GB/s;
+// compare to the ~105 GB/s the gpt-oss GEMVs achieve to decide whether HIP itself
+// is the wall (kernels already at ceiling) or the kernels leave bandwidth unused.
+TEST(BoltRocm, RawReadBandwidthProbe) {
+    if (!bolt::rocm::available()) {
+        GTEST_SKIP() << "No ROCm-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    double gbps = 0.0;
+    ASSERT_TRUE(bolt::rocm::bandwidth_probe(ctx, 512ull * 1024 * 1024, 30, &gbps));
+    std::printf("[BANDWIDTH] raw device read = %.1f GB/s (peak spec ~256 GB/s)\n", gbps);
+    EXPECT_GT(gbps, 1.0);
+}
+
 // BLLM-200: the bandwidth-optimized aligned MXFP4 matvec matches the same CPU
 // reference after repacking the 17-byte blocks into split codes/scales arrays.
 TEST(BoltRocm, MatmulMxfp4AlignedMatchesCpuReference) {

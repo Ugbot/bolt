@@ -277,6 +277,10 @@ bool matmul_mxfp4_aligned(Context& ctx, const void* codes_device, const void* sc
                           const float* activation_device, float* out_device, int32_t out_rows,
                           int32_t cols) noexcept;
 
+// BLLM-200 diagnostic: raw device read bandwidth in GB/s (streams `bytes` through a
+// grid-stride sum, `iters` times, hipEvent-timed). The memory-bound decode ceiling.
+bool bandwidth_probe(Context& ctx, uint64_t bytes, int32_t iters, double* gbps) noexcept;
+
 // BLLM-200: GPU top-K + softmax router selection -- writes sel_device[K] (expert
 // indices, top-K of E by raw logit) + selw_device[K] (softmax weights over the K)
 // so the MoE runs with NO per-layer host round-trip (was the sole decode sync).

@@ -1298,4 +1298,55 @@ bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, i
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 
+// BLLM-200 diagnostic: raw device read bandwidth. Streams a large buffer through a
+// grid-stride sum -> the practical ceiling for the memory-bound GEMV decode. If
+// this is ~= the GEMVs' effective GB/s, HIP itself is the wall (not the kernels).
+__global__ void read_reduce_kernel(const float4* in, float* out, int64_t n4) {
+    float4 acc = {0, 0, 0, 0};
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += blockDim.x * gridDim.x) {
+        const float4 v = in[i];
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    __shared__ float s[kBlockSize];
+    s[threadIdx.x] = acc.x + acc.y + acc.z + acc.w;
+    __syncthreads();
+    for (int32_t st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) s[threadIdx.x] += s[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = s[0];
+}
+
+bool bandwidth_probe(Context& ctx, uint64_t bytes, int32_t iters, double* gbps) noexcept {
+    if (!ctx.is_valid() || bytes < 16 || iters <= 0 || gbps == nullptr) return false;
+    const int64_t n4 = static_cast<int64_t>(bytes / 16);  // float4 count
+    const uint32_t blocks = 4096, threads = kBlockSize;
+    DeviceBuffer in, out;
+    if (!ctx.allocate(static_cast<uint64_t>(n4) * 16, &in) || !ctx.allocate(blocks * 4ull, &out))
+        return false;
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    // warm up
+    read_reduce_kernel<<<blocks, threads, 0, st>>>(static_cast<const float4*>(in.ptr),
+                                                   static_cast<float*>(out.ptr), n4);
+    hipStreamSynchronize(st);
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0);
+    hipEventCreate(&e1);
+    hipEventRecord(e0, st);
+    for (int32_t k = 0; k < iters; ++k)
+        read_reduce_kernel<<<blocks, threads, 0, st>>>(static_cast<const float4*>(in.ptr),
+                                                       static_cast<float*>(out.ptr), n4);
+    hipEventRecord(e1, st);
+    hipEventSynchronize(e1);
+    float ms = 0.0f;
+    hipEventElapsedTime(&ms, e0, e1);
+    hipEventDestroy(e0);
+    hipEventDestroy(e1);
+    ctx.free(&in);
+    ctx.free(&out);
+    if (ms <= 0.0f) return false;
+    *gbps = (static_cast<double>(n4) * 16.0 * iters) / (static_cast<double>(ms) * 1.0e6);
+    return true;
+}
+
 }  // namespace bolt::rocm
