@@ -184,6 +184,98 @@ __global__ void matmul_mxfp4_kernel(const uint8_t* weight, const float* activati
     if (lane == 0) out[row] = acc;
 }
 
+// BLLM-200: bandwidth-optimized MXFP4 matvec. The 17-byte-block kernel above reads
+// unaligned (each lane's block starts on a 17-byte boundary -> every load spills
+// across cache lines), capping effective bandwidth at ~1/3 peak on the iGPU. Here
+// the weight is REPACKED at upload into a struct-of-arrays: `codes` holds each
+// block's 16 E2M1 code bytes contiguously (16-byte aligned -> one uint4 vector
+// load) and `scales` holds the E8M0 scale bytes separately. Activation is read as
+// float4. Same math + total bytes as matmul_mxfp4, but coalesced/vectorized.
+// codes row r = codes + r*nb*16; scales row r = scales + r*nb.
+// This lane's partial dot(dequant(codes row), x) over blocks strided by warpSize.
+// Aligned uint4 code load + float4 activation load. Caller warp_reduce_sum's it.
+__device__ inline float mxfp4_aligned_partial(const uint8_t* codes_row, const uint8_t* scales_row,
+                                              const float* x, int32_t nb, int32_t lane) {
+    const uint4* crow = reinterpret_cast<const uint4*>(codes_row);
+    float acc = 0.0f;
+    for (int32_t b = lane; b < nb; b += warpSize) {
+        const float scale = exp2f(static_cast<float>(static_cast<int32_t>(scales_row[b]) - 127));
+        const uint4 c = crow[b];
+        const uint32_t ws[4] = {c.x, c.y, c.z, c.w};
+        const float4* xl = reinterpret_cast<const float4*>(x + static_cast<int64_t>(b) * 32);
+        const float4* xh = reinterpret_cast<const float4*>(x + static_cast<int64_t>(b) * 32 + 16);
+        float ba = 0.0f;
+#pragma unroll
+        for (int32_t g = 0; g < 4; ++g) {
+            const uint32_t w = ws[g];
+            const float4 lo = xl[g], hi = xh[g];
+            ba += kMxfp4Dev[w & 0xF] * lo.x + kMxfp4Dev[(w >> 4) & 0xF] * hi.x +
+                  kMxfp4Dev[(w >> 8) & 0xF] * lo.y + kMxfp4Dev[(w >> 12) & 0xF] * hi.y +
+                  kMxfp4Dev[(w >> 16) & 0xF] * lo.z + kMxfp4Dev[(w >> 20) & 0xF] * hi.z +
+                  kMxfp4Dev[(w >> 24) & 0xF] * lo.w + kMxfp4Dev[(w >> 28) & 0xF] * hi.w;
+        }
+        acc += scale * ba;
+    }
+    return acc;
+}
+
+__global__ void matmul_mxfp4_aligned_kernel(const uint8_t* codes, const uint8_t* scales,
+                                            const float* activation, float* out, int32_t rows,
+                                            int32_t cols) {
+    const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (row >= rows) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t nb = cols >> 5;
+    float acc = mxfp4_aligned_partial(codes + static_cast<int64_t>(row) * nb * 16,
+                                      scales + static_cast<int64_t>(row) * nb, activation, nb, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai in ONE launch (vs 2 matmul_mxfp4
+// + 1 swiglu_oai). One warp per output row r in [0,rows=expert_inter): dots BOTH the
+// gate and up MXFP4 rows against the shared activation, applies the per-column
+// biases + swiglu_oai, writes act[r]. Launch-overhead is the gpt-oss decode cap
+// (720 expert launches/token at ~29us each), so op-fusion is the lever here.
+__global__ void moe_gate_up_swiglu_mxfp4_kernel(const uint8_t* gcodes, const uint8_t* gscales,
+                                                const uint8_t* ucodes, const uint8_t* uscales,
+                                                const float* gbias, const float* ubias,
+                                                const float* x, float* act, int32_t rows, int32_t cols,
+                                                float alpha, float limit) {
+    const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (row >= rows) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t nb = cols >> 5;
+    const int64_t co = static_cast<int64_t>(row) * nb * 16, so = static_cast<int64_t>(row) * nb;
+    float g = mxfp4_aligned_partial(gcodes + co, gscales + so, x, nb, lane);
+    float u = mxfp4_aligned_partial(ucodes + co, uscales + so, x, nb, lane);
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+    if (lane == 0) {
+        g += gbias ? gbias[row] : 0.0f;
+        u += ubias ? ubias[row] : 0.0f;
+        const float gg = fminf(g, limit);
+        const float uu = fmaxf(-limit, fminf(u, limit));
+        act[row] = (gg / (1.0f + expf(-alpha * gg))) * (uu + 1.0f);
+    }
+}
+
+// BLLM-200: FUSED expert down-projection + weighted residual accumulate in ONE
+// launch (vs matmul_mxfp4 + axpy_bias). One warp per row r in [0,rows=hidden):
+// hidden[r] += weight * (dot(down_row_r, act) + dbias[r]).
+__global__ void moe_down_accum_mxfp4_kernel(const uint8_t* codes, const uint8_t* scales,
+                                            const float* dbias, float weight, const float* act,
+                                            float* hidden, int32_t rows, int32_t cols) {
+    const int32_t row = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+    if (row >= rows) return;
+    const int32_t lane = threadIdx.x % warpSize;
+    const int32_t nb = cols >> 5;
+    float p = mxfp4_aligned_partial(codes + static_cast<int64_t>(row) * nb * 16,
+                                    scales + static_cast<int64_t>(row) * nb, act, nb, lane);
+    p = warp_reduce_sum(p);
+    if (lane == 0) hidden[row] += weight * (p + (dbias ? dbias[row] : 0.0f));
+}
+
 // Int2: four 2-bit codes packed per byte, lowest bits first -- same
 // layout bolt_compute.h's matmul_row_dot_f32 (Int2 case) uses.
 __global__ void matmul_dequant_int2_kernel(const uint8_t* weight, const float* scale,
@@ -1096,6 +1188,64 @@ bool matmul_mxfp4(Context& ctx, const void* weight_device, const float* activati
     const dim3 block(static_cast<unsigned int>(kBlockSize));
     matmul_mxfp4_kernel<<<grid, block, 0, st>>>(static_cast<const uint8_t*>(weight_device),
                                                 activation_device, out_device, out_rows, cols);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool matmul_mxfp4_aligned(Context& ctx, const void* codes_device, const void* scales_device,
+                          const float* activation_device, float* out_device, int32_t out_rows,
+                          int32_t cols) noexcept {
+    if (!ctx.is_valid() || codes_device == nullptr || scales_device == nullptr ||
+        activation_device == nullptr || out_device == nullptr || out_rows <= 0 || cols <= 0 ||
+        (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    int32_t wps = ctx.wavefront_size();
+    if (wps <= 0) wps = 32;
+    const int32_t wpb = kBlockSize / wps;
+    const dim3 grid(static_cast<unsigned int>((out_rows + wpb - 1) / wpb));
+    const dim3 block(static_cast<unsigned int>(kBlockSize));
+    matmul_mxfp4_aligned_kernel<<<grid, block, 0, st>>>(
+        static_cast<const uint8_t*>(codes_device), static_cast<const uint8_t*>(scales_device),
+        activation_device, out_device, out_rows, cols);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+// Shared grid/block for the warp-per-row MXFP4 kernels.
+static inline dim3 mxfp4_grid_(Context& ctx, int32_t rows) noexcept {
+    int32_t wps = ctx.wavefront_size();
+    if (wps <= 0) wps = 32;
+    const int32_t wpb = kBlockSize / wps;
+    return dim3(static_cast<unsigned int>((rows + wpb - 1) / wpb));
+}
+
+bool moe_gate_up_swiglu_mxfp4(Context& ctx, const void* gcodes, const void* gscales,
+                              const void* ucodes, const void* uscales, const float* gbias,
+                              const float* ubias, const float* x, float* act, int32_t rows,
+                              int32_t cols, float alpha, float limit) noexcept {
+    if (!ctx.is_valid() || gcodes == nullptr || ucodes == nullptr || x == nullptr || act == nullptr ||
+        rows <= 0 || cols <= 0 || (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    moe_gate_up_swiglu_mxfp4_kernel<<<mxfp4_grid_(ctx, rows), dim3(kBlockSize), 0, st>>>(
+        static_cast<const uint8_t*>(gcodes), static_cast<const uint8_t*>(gscales),
+        static_cast<const uint8_t*>(ucodes), static_cast<const uint8_t*>(uscales), gbias, ubias, x,
+        act, rows, cols, alpha, limit);
+    return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
+}
+
+bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, const float* dbias,
+                          float weight, const float* act, float* hidden, int32_t rows,
+                          int32_t cols) noexcept {
+    if (!ctx.is_valid() || codes == nullptr || act == nullptr || hidden == nullptr || rows <= 0 ||
+        cols <= 0 || (cols & 31) != 0) {
+        return false;
+    }
+    const hipStream_t st = static_cast<hipStream_t>(ctx.stream());
+    moe_down_accum_mxfp4_kernel<<<mxfp4_grid_(ctx, rows), dim3(kBlockSize), 0, st>>>(
+        static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), dbias, weight, act,
+        hidden, rows, cols);
     return ctx.batching() ? true : (hipStreamSynchronize(st) == hipSuccess);
 }
 

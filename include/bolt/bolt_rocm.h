@@ -266,6 +266,35 @@ bool fused_swiglu(Context& ctx, const void* wg, const void* wu, WeightDType dtyp
 bool matmul_mxfp4(Context& ctx, const void* weight_device, const float* activation_device,
                   float* out_device, int32_t out_rows, int32_t cols) noexcept;
 
+// BLLM-200: bandwidth-optimized MXFP4 matvec. The weight is repacked (at upload)
+// into struct-of-arrays: `codes_device` = each 32-element block's 16 E2M1 code
+// bytes contiguous (16-byte aligned; row r at codes + r*(cols/32)*16), and
+// `scales_device` = the E8M0 scale bytes (row r at scales + r*(cols/32)). Reads
+// codes as aligned uint4 + activation as float4 -- same result as matmul_mxfp4 but
+// coalesced/vectorized (the iGPU-bandwidth path for the gpt-oss experts). `cols`
+// must be a multiple of 32. Precondition: ctx.is_valid().
+bool matmul_mxfp4_aligned(Context& ctx, const void* codes_device, const void* scales_device,
+                          const float* activation_device, float* out_device, int32_t out_rows,
+                          int32_t cols) noexcept;
+
+// BLLM-200: FUSED gpt-oss expert gate+up+swiglu_oai -- act[r] = swiglu_oai(
+// dot(gate[r],x)+gbias[r], dot(up[r],x)+ubias[r]) for r in [0,rows=expert_inter),
+// in ONE launch (vs 2 matmul_mxfp4_aligned + swiglu_oai). gate/up are split
+// codes+scales (aligned layout). gbias/ubias may be null. Cuts the per-expert
+// launch count 3->1 (launch overhead is the gpt-oss decode cap). ctx.is_valid().
+bool moe_gate_up_swiglu_mxfp4(Context& ctx, const void* gcodes, const void* gscales,
+                              const void* ucodes, const void* uscales, const float* gbias,
+                              const float* ubias, const float* x, float* act, int32_t rows,
+                              int32_t cols, float alpha, float limit) noexcept;
+
+// BLLM-200: FUSED expert down-projection + weighted residual accumulate --
+// hidden[r] += weight*(dot(down[r],act)+dbias[r]) for r in [0,rows=hidden), in ONE
+// launch (vs matmul_mxfp4_aligned + axpy_bias). down is split codes+scales; dbias
+// may be null. Precondition: ctx.is_valid().
+bool moe_down_accum_mxfp4(Context& ctx, const void* codes, const void* scales, const float* dbias,
+                          float weight, const float* act, float* hidden, int32_t rows,
+                          int32_t cols) noexcept;
+
 // BLLM-189: fused QKV projection -- one kernel produces q[q_rows], k[kv_rows],
 // v[kv_rows] from the shared normed activation `x[cols]`, replacing three
 // matmul_dequant calls with one launch. `wq`/`wk`/`wv` are row-major weights of
