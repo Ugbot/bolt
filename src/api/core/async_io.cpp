@@ -17,8 +17,10 @@ std::unique_ptr<async_io> async_io::create(const async_io_config& config) {
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
         backend = io_backend::kqueue;
 #elif defined(__linux__)
-        // Try io_uring first, fall back to epoll
-        backend = io_backend::io_uring;  // TODO: Check kernel version
+        // Prefer io_uring; the io_uring backend probes usable() at construction
+        // and falls back to epoll at runtime when the kernel (<5.11) or a seccomp
+        // policy (Docker default) rejects it — see the io_uring case below.
+        backend = io_backend::io_uring;
 #elif defined(_WIN32)
         backend = io_backend::iocp;
 #else
