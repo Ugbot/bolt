@@ -816,6 +816,147 @@ bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
     return true;
 }
 
+// G2FEAT-49: resumable single-column page decode. Decodes WHOLE data pages of
+// column `col` in `row_group`, starting at byte offset `start_off` (0 = first
+// data page of the chunk), until >= `max_rows` rows are decoded (whole pages,
+// may overshoot), into a FRESH Flat column `out_col` sized to exactly the
+// decoded rows. Returns the decoded row count in *out_rows and the byte offset
+// of the next undecoded page in *next_off (0 = chunk exhausted).
+//
+// v1 scope: PLAIN chunks only — fail-closed on a dictionary page (a chunk-scoped
+// dictionary cannot be sub-decoded without re-decoding the whole dict per call,
+// which defeats the footprint goal). Byte-exact at the VALUE level vs a
+// whole-chunk decode of the same pages: whole pages, no mid-page trim, so
+// concatenating sub-chunks reproduces the column (per-sub-chunk overflow means
+// StringView offsets differ; the decoded string values are identical).
+bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
+                                  const PqMeta* meta, uint32_t row_group,
+                                  uint16_t col, uint64_t start_off,
+                                  int64_t max_rows, Arena* arena,
+                                  BoltColumn* out_col, int64_t* out_rows,
+                                  uint64_t* next_off) noexcept {
+    assert(meta != nullptr && out_col != nullptr);
+    assert(out_rows != nullptr && next_off != nullptr);
+    if (buf == nullptr || arena == nullptr) return false;
+    if (row_group >= meta->n_row_groups) return false;
+    if (col >= meta->n_columns) return false;
+    if (max_rows <= 0) return false;
+    *out_rows = 0;
+    *next_off = 0;
+    const PqRowGroup* rg = &meta->row_groups[row_group];
+    const PqChunk* ch = &meta->chunks[rg->chunk_off + col];
+    if (ch->dictionary_page_offset > 0) return false;   // v1: PLAIN only
+    if (ch->data_page_offset <= 0 || ch->total_compressed_size <= 0) return false;
+    const uint64_t region_start = static_cast<uint64_t>(ch->data_page_offset);
+    const uint64_t end =
+        region_start + static_cast<uint64_t>(ch->total_compressed_size);
+    if (end > len) return false;
+    const uint64_t p_start = (start_off == 0) ? region_start : start_off;
+    if (p_start < region_start || p_start > end) return false;
+    if (p_start == end) return true;                    // exhausted (rows=0)
+    // ---- Pass 1: header scan (no decompress) to size the sub-chunk ----
+    uint64_t p = p_start;
+    int64_t rows_sum = 0;
+    uint64_t unc_sum = 0;
+    uint64_t p_after = p_start;
+    bool reached_end = false;
+    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+        if (rows_sum >= max_rows) break;
+        if (p >= end) { reached_end = true; break; }
+        TcCursor c{buf + p, buf + end};
+        PageHdr h;
+        if (!parse_page_header(&c, &h)) return false;
+        const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
+        if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
+        const uint64_t p_next = pay + static_cast<uint64_t>(h.cmp);
+        if (h.type == kPageData) {
+            if (h.nvals < 0) return false;
+            rows_sum += h.nvals;
+            if (h.unc > 0) unc_sum += static_cast<uint64_t>(h.unc);
+            p_after = p_next;
+        } else if (h.type == kPageDict) {
+            return false;                               // no dict after data
+        } else if (h.type != kPageIndex) {
+            return false;                               // DATA_PAGE_V2 etc.
+        }
+        p = p_next;
+    }
+    if (rows_sum == 0) return true;                      // no data pages left
+    // ---- Allocate a fresh sub-chunk column sized to rows_sum ----
+    const PqColumn* pc = &meta->columns[col];
+    BoltType t;
+    uint8_t scale = 0;
+    if (!parquet_map_type(pc, &t, &scale)) return false;
+    *out_col = BoltColumn::make_flat_alloc(rows_sum, t, arena);
+    if (out_col->data == nullptr) return false;
+    out_col->decimal_scale = scale;
+    ColCtx cx;
+    std::memset(&cx, 0, sizeof(cx));
+    cx.pc = pc;
+    cx.type = t;
+    cx.elem = static_cast<uint32_t>(bolt::type_size(t));
+    cx.out = static_cast<uint8_t*>(out_col->data);
+    if (pc->optional != 0 && ch->null_count != 0) {
+        const uint64_t nb = (static_cast<uint64_t>(rows_sum) + 7u) / 8u;
+        uint8_t* bm = static_cast<uint8_t*>(arena->allocate(nb, 1));
+        if (bm == nullptr) return false;
+        std::memset(bm, 0xFF, nb);                      // pages clear null bits
+        out_col->validity = bm;
+        out_col->stats.all_valid = false;
+        cx.validity = bm;
+    }
+    if (t == BoltType::Utf8 && unc_sum > 0) {
+        char* ob = static_cast<char*>(arena->allocate(unc_sum, 1));
+        if (ob == nullptr) return false;
+        cx.overflow = ob;
+        cx.overflow_cap = unc_sum;
+        out_col->str_overflow_base = ob;
+    }
+    // ---- Pass 2: decode the same pages (reuses the whole-chunk page path) ----
+    p = p_start;
+    int64_t rows_done = 0;
+    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+        if (rows_done >= rows_sum) break;
+        if (p >= end) break;
+        TcCursor c{buf + p, buf + end};
+        PageHdr h;
+        if (!parse_page_header(&c, &h)) return false;
+        const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
+        if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
+        const uint8_t* pd = buf + pay;
+        uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+        if (h.type == kPageData) {
+            if (ch->codec == PqCodec::Snappy) {
+                uint8_t* dst = static_cast<uint8_t*>(
+                    arena->allocate(static_cast<uint64_t>(h.unc) + 1u, 8));
+                if (dst == nullptr) return false;
+                if (!snappy_decompress(pd, pd_len, dst,
+                                       static_cast<uint64_t>(h.unc))) {
+                    return false;
+                }
+                pd = dst;
+                pd_len = static_cast<uint64_t>(h.unc);
+            } else if (ch->codec == PqCodec::Uncompressed) {
+                if (h.cmp != h.unc) return false;
+            } else {
+                return false;
+            }
+            if (!decode_data_page(&cx, pd, pd_len, &h, rows_done,
+                                  rows_sum - rows_done, arena)) {
+                return false;
+            }
+            rows_done += h.nvals;
+        } else if (h.type != kPageIndex) {
+            return false;
+        }
+        p = pay + static_cast<uint64_t>(h.cmp);
+    }
+    if (rows_done != rows_sum) return false;
+    *out_rows = rows_sum;
+    *next_off = reached_end ? 0 : p_after;
+    return true;
+}
+
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
                        BoltBatch* out_batch) noexcept {
     assert(arena != nullptr);

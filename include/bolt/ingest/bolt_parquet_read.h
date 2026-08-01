@@ -86,6 +86,21 @@ bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
                                  Arena* arena, BoltColumn* out_cols,
                                  int64_t* out_rows) noexcept;
 
+// G2FEAT-49: resumable single-column page decode. Decodes WHOLE data pages of
+// `col` in `row_group` from byte offset `start_off` (0 = first data page) until
+// >= `max_rows` rows (whole pages, may overshoot), into a FRESH Flat `out_col`
+// sized to exactly the decoded rows; returns the row count in *out_rows and the
+// next undecoded page offset in *next_off (0 = chunk exhausted). Walk `next_off`
+// to stream a chunk in bounded sub-chunks. v1: PLAIN chunks only (returns false
+// on a dictionary page). Byte-exact (value-level) vs a whole-chunk decode of the
+// same pages. Enables bounded per-worker footprint for wide single-column scans.
+bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
+                                  const PqMeta* meta, uint32_t row_group,
+                                  uint16_t col, uint64_t start_off,
+                                  int64_t max_rows, Arena* arena,
+                                  BoltColumn* out_col, int64_t* out_rows,
+                                  uint64_t* next_off) noexcept;
+
 // Whole file: locate + parse meta, allocate full-length columns, then
 // decode every row group into its row offset (serial v1; the row-group
 // function above is the future parallel unit).

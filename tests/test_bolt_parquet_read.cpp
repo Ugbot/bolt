@@ -438,4 +438,146 @@ TEST(BoltParquetRead, CorruptPagesNeverCrash) {
     SUCCEED();
 }
 
+// ---- G2FEAT-49: resumable single-column page decode -------------------------
+
+// The single Utf8 (ByteArray) column in a golden file (-1 if none).
+int find_utf8_col(const PqMeta* meta) {
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {
+        bolt::BoltType t;
+        uint8_t s = 0;
+        if (parquet_map_type(&meta->columns[c], &t, &s) &&
+            t == bolt::BoltType::Utf8) {
+            return static_cast<int>(c);
+        }
+    }
+    return -1;
+}
+
+PqMeta* parse_meta(const std::vector<uint8_t>& buf, bolt::Arena* arena) {
+    PqMeta* meta = static_cast<PqMeta*>(
+        arena->allocate(sizeof(PqMeta), alignof(PqMeta)));
+    if (meta == nullptr) return nullptr;
+    std::memset(meta, 0, sizeof(*meta));
+    if (!parquet_read_meta(buf.data(), buf.size(), arena, meta)) return nullptr;
+    return meta;
+}
+
+// Multi-page resumption: decode a chunk whole (reference) vs via small
+// sub-chunks walking next_off. Values must match row-for-row (VALUE-level, not
+// raw offsets — each sub-chunk owns its overflow) and >1 sub-chunk must be
+// produced (golden_pageindex: ~100-row pages, 8-10 per chunk).
+TEST(BoltParquetPageRange, MultiPageResumeByteExact) {
+    const auto buf = slurp(data_path("golden_pageindex.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    PqMeta* meta = parse_meta(buf, &arena);
+    ASSERT_NE(meta, nullptr);
+    const int uc = find_utf8_col(meta);
+    ASSERT_GE(uc, 0);
+    const uint16_t col = static_cast<uint16_t>(uc);
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
+        const uint16_t proj[1] = {col};
+        bolt::BoltColumn whole[1];
+        int64_t whole_rows = 0;
+        ASSERT_TRUE(parquet_read_row_group_cols(buf.data(), buf.size(), meta, g,
+                                                proj, 1, &arena, whole,
+                                                &whole_rows));
+        const auto* w = static_cast<const bolt::StringView*>(whole[0].data);
+        uint64_t off = 0;
+        int64_t seen = 0;
+        int nchunks = 0;
+        for (int guard = 0; guard < 100000; ++guard) {
+            bolt::BoltColumn sub;
+            int64_t srows = 0;
+            uint64_t next = 0;
+            ASSERT_TRUE(parquet_read_col_chunk_pages(buf.data(), buf.size(),
+                                                     meta, g, col, off, 128,
+                                                     &arena, &sub, &srows,
+                                                     &next));
+            if (srows == 0) {
+                ASSERT_EQ(next, 0u);
+                break;
+            }
+            ++nchunks;
+            ASSERT_EQ(sub.type, bolt::BoltType::Utf8);
+            const auto* s = static_cast<const bolt::StringView*>(sub.data);
+            for (int64_t r = 0; r < srows; ++r) {
+                ASSERT_LT(seen + r, whole_rows);
+                const bolt::StringView& a = w[seen + r];
+                const bolt::StringView& b = s[r];
+                ASSERT_EQ(a.length, b.length) << "g" << g << " row " << seen + r;
+                ASSERT_EQ(std::memcmp(sv_bytes(a, whole[0].str_overflow_base),
+                                      sv_bytes(b, sub.str_overflow_base),
+                                      a.length),
+                          0)
+                    << "g" << g << " row " << seen + r;
+            }
+            seen += srows;
+            off = next;
+            if (next == 0) break;
+        }
+        ASSERT_EQ(seen, whole_rows) << "rg " << g;
+        ASSERT_GT(nchunks, 1) << "rg " << g << ": expected multi-page resumption";
+    }
+}
+
+// Spill path: golden_flat_plain name has 28-char (>12B) spilled strings; the
+// per-sub-chunk overflow (sized to page uncompressed bytes) must reproduce them.
+TEST(BoltParquetPageRange, SpilledStringsByteExact) {
+    const auto buf = slurp(data_path("golden_flat_plain.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    PqMeta* meta = parse_meta(buf, &arena);
+    ASSERT_NE(meta, nullptr);
+    const int uc = find_utf8_col(meta);
+    ASSERT_GE(uc, 0);
+    const uint16_t col = static_cast<uint16_t>(uc);
+    int64_t first = 0;
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
+        uint64_t off = 0;
+        int64_t seen = 0;
+        bool saw_spill = false;
+        for (int guard = 0; guard < 100000; ++guard) {
+            bolt::BoltColumn sub;
+            int64_t srows = 0;
+            uint64_t next = 0;
+            ASSERT_TRUE(parquet_read_col_chunk_pages(buf.data(), buf.size(),
+                                                     meta, g, col, off, 50,
+                                                     &arena, &sub, &srows,
+                                                     &next));
+            if (srows == 0) break;
+            const auto* s = static_cast<const bolt::StringView*>(sub.data);
+            for (int64_t r = 0; r < srows; ++r) {
+                const int64_t i = first + seen + r;
+                expect_name(i, s[r], sub.str_overflow_base);   // golden law
+                if (s[r].length > 12u) saw_spill = true;
+            }
+            seen += srows;
+            off = next;
+            if (next == 0) break;
+        }
+        ASSERT_EQ(seen, meta->row_groups[g].num_rows) << "rg " << g;
+        first += seen;
+        EXPECT_TRUE(saw_spill) << "rg " << g << ": expected >12B spilled strings";
+    }
+    ASSERT_EQ(first, 1000);
+}
+
+// Fail-closed: a dictionary-encoded chunk (golden_flat name) is rejected in v1.
+TEST(BoltParquetPageRange, DictChunkFailClosed) {
+    const auto buf = slurp(data_path("golden_flat.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    PqMeta* meta = parse_meta(buf, &arena);
+    ASSERT_NE(meta, nullptr);
+    const int uc = find_utf8_col(meta);
+    ASSERT_GE(uc, 0);
+    bolt::BoltColumn sub;
+    int64_t srows = 0;
+    uint64_t next = 0;
+    EXPECT_FALSE(parquet_read_col_chunk_pages(buf.data(), buf.size(), meta, 0,
+                                              static_cast<uint16_t>(uc), 0, 128,
+                                              &arena, &sub, &srows, &next));
+}
+
 }  // namespace
