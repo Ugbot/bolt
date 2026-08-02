@@ -587,6 +587,77 @@ struct BoltColumn {
         return c;
     }
 
+    /// Utf8 column in the **Flat/StringView** layout, built from an already
+    /// packed `(bytes, offsets)` pair — i.e. the same physical shape the
+    /// parquet reader and the hash-agg output produce, which is what every
+    /// operator in the engine actually consumes.
+    ///
+    /// WHY THIS EXISTS (G2FEAT-77). Two incompatible physical layouts share
+    /// `BoltType::Utf8`:
+    ///   * `Format::Flat`/`View` — one `StringView` per row (inline ≤12 bytes,
+    ///     else spilled via `str_overflow_base`);
+    ///   * `Format::VarBinary` — `offsets[] + packed bytes` (`make_var_binary`).
+    /// Compute, filter, sort, join and hash-agg all read Utf8 *exclusively* as
+    /// `StringView` + `str_overflow_base`; none of them dispatch on `format`.
+    /// A VarBinary column reaching them is therefore reinterpreted as a
+    /// StringView array — a silent garbage read, not a clean failure. Producers
+    /// that naturally hold packed bytes (every connector: Kafka key/value,
+    /// Redis, MQTT, REST, …) should build through THIS factory so their strings
+    /// are readable by the whole engine. `make_var_binary` remains valid for
+    /// consumers that explicitly dispatch on `VarBinary` (e.g. collect_sink).
+    ///
+    /// ZERO-COPY: the caller's packed buffer becomes `str_overflow_base`
+    /// verbatim, and a spilled row's `ref.offset` is simply its `offsets[i]`.
+    /// Only the `StringView` array itself is allocated. `data` must therefore
+    /// outlive the column — the same borrowing contract `make_var_binary` has.
+    ///
+    /// `offsets` has `total_rows + 1` entries, monotonically non-decreasing.
+    /// Returns an empty column if the offsets exceed the `uint32` range a
+    /// `StringView::ref.offset` can address.
+    static BoltColumn make_utf8_from_packed(const void* data,
+                                            uint8_t* validity,
+                                            const int32_t* offsets,
+                                            int64_t total_rows,
+                                            Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(total_rows >= 0);
+        if (total_rows < 0) return make_empty();
+        if (total_rows > 0) {
+            if (offsets == nullptr) return make_empty();
+            if (offsets[total_rows] > 0 && data == nullptr) return make_empty();
+        }
+        BoltColumn c = make_flat_alloc(total_rows, BoltType::Utf8, arena);
+        if (total_rows > 0 && c.data == nullptr) return make_empty();
+        const char* base = static_cast<const char*>(data);
+        auto* sv = static_cast<StringView*>(c.data);
+        for (int64_t i = 0; i < total_rows; ++i) {
+            const int32_t start = offsets[i];
+            const int32_t end   = offsets[i + 1];
+            assert(end >= start && "offsets must be non-decreasing");
+            const uint32_t len = static_cast<uint32_t>(end - start);
+            StringView r;
+            std::memset(&r, 0, sizeof(r));
+            r.length = len;
+            if (len <= 12u) {
+                // Inline: prefix[4] then inline_data[8]; nothing to resolve.
+                const uint32_t p = (len < 4u) ? len : 4u;
+                if (p > 0) std::memcpy(r.prefix, base + start, p);
+                if (len > 4u) std::memcpy(r.inline_data, base + start + 4, len - 4u);
+            } else {
+                // Spilled: point INTO the caller's packed buffer. No copy.
+                if (static_cast<uint64_t>(start) > 0xFFFFFFFFull) return make_empty();
+                std::memcpy(r.prefix, base + start, 4);
+                r.ref.buf_idx = 0;
+                r.ref.offset  = static_cast<uint32_t>(start);
+            }
+            sv[i] = r;
+        }
+        c.validity          = validity;
+        c.str_overflow_base = const_cast<void*>(data);
+        c.stats.all_valid   = (validity == nullptr);
+        return c;
+    }
+
     /// Variable-width payload accessor. Returns `(ptr, len)` for row `i`.
     /// Caller must verify the column is `Format::VarBinary`. Branchless: a
     /// pair of int32 loads + a pointer add. Validity is NOT checked here —
@@ -601,6 +672,40 @@ struct BoltColumn {
         const int32_t  end   = offs[row + 1];
         *out_data = static_cast<const uint8_t*>(data) + start;
         *out_len  = end - start;
+    }
+
+    /// Format-agnostic variable-width accessor for a `Utf8`/`Binary` column.
+    /// Returns `(ptr, len)` for row `i` whether the column is laid out as
+    /// `VarBinary` (offsets + packed bytes) or `Flat`/`View` (StringView
+    /// array, inline ≤12 bytes else spilled into `str_overflow_base`).
+    ///
+    /// Both layouts legitimately occur for `BoltType::Utf8` — the parquet
+    /// reader and every operator produce `Flat`, connectors historically
+    /// produced `VarBinary` — and reading one as the other is a silent
+    /// garbage read in Release, not a crash (G2FEAT-77). Any consumer that
+    /// takes bytes out of a string column it did not build itself must use
+    /// this accessor rather than `var_binary_at`. Validity is NOT checked;
+    /// probe the validity bitmap separately if needed.
+    BOLT_FORCE_INLINE void utf8_at(int64_t row,
+                                    const uint8_t** out_data,
+                                    int32_t* out_len) const noexcept {
+        assert(out_data != nullptr && out_len != nullptr);
+        assert(row >= 0 && row < length);
+        if (format == ColumnFormat::VarBinary) {
+            var_binary_at(row, out_data, out_len);
+            return;
+        }
+        assert(format == ColumnFormat::Flat || format == ColumnFormat::View);
+        const auto& sv = static_cast<const StringView*>(data)[row];
+        *out_len = static_cast<int32_t>(sv.length);
+        if (sv.length <= 12u) {
+            // Inline: first 4 bytes in `prefix`, remainder in `inline_data`,
+            // and they are adjacent in the struct, so `prefix` is the base.
+            *out_data = reinterpret_cast<const uint8_t*>(sv.prefix);
+        } else {
+            *out_data = static_cast<const uint8_t*>(str_overflow_base)
+                      + sv.ref.offset;
+        }
     }
 
     /// Bit-packed column (B3). `packed_words` holds `total_rows * bit_width`
