@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -714,6 +715,149 @@ TEST(BoltAvroDatum, ContainerInsideNestedRecord) {
     EXPECT_TRUE(v[0].is_null);
     EXPECT_EQ(v[1].num.i64, 11);
     EXPECT_EQ(v[2].num.i64, 22);
+}
+
+// ---------------------------------------------------------------------------
+// Real Iceberg-manifest-shaped files, written by the STOCK Apache Avro JAVA
+// stack (GenericDatumWriter + DataFileWriter) — the same writer Iceberg's
+// ManifestWriter goes through. Nothing in these bytes shares code with bolt's
+// writer, so a bolt writer bug cannot mask a bolt reader bug.
+//
+// MEASURED (not assumed) from golden_avro_array_of_record.avro: that writer
+// emits arrays as a POSITIVE count with NO byte size —
+//     02          status = 1
+//     04          array count = +2   <-- positive, no size follows
+//     02 c8 01    {key:1, value:100}
+//     04 90 03    {key:2, value:200}
+//     00          terminator
+//     9a 0e       tail = 909
+// The negative-count-plus-size form comes from BlockingBinaryEncoder, which is
+// not what Iceberg uses. So an array whose ELEMENT is a record cannot be
+// skipped from a real manifest: there is no size to jump, and the element
+// width is unknowable from one item_type byte. That case fails closed.
+// ---------------------------------------------------------------------------
+
+std::string data_path(const char* name) {
+    return std::string(BOLT_TEST_DATA_DIR) + "/" + name;
+}
+
+bool read_file(const char* name, std::vector<uint8_t>* out) {
+    std::FILE* f = std::fopen(data_path(name).c_str(), "rb");
+    if (f == nullptr) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out->resize(static_cast<size_t>(n));
+    const size_t got = std::fread(out->data(), 1, static_cast<size_t>(n), f);
+    std::fclose(f);
+    return got == static_cast<size_t>(n);
+}
+
+struct ManifestRows {
+    std::vector<int64_t>     status;
+    std::vector<bool>        snap_null;
+    std::vector<int64_t>     snap;
+    std::vector<std::string> path;
+    std::vector<int64_t>     record_count;
+    std::vector<int64_t>     sort_order_id;
+    std::vector<int64_t>     seq;
+    uint32_t                 width = 0;
+};
+
+bool collect_manifest(void* ctx, const AvroValue* v, uint32_t n,
+                      int64_t /*row*/) noexcept {
+    ManifestRows* m = static_cast<ManifestRows*>(ctx);
+    m->width = n;
+    if (n != 10) return false;
+    m->status.push_back(v[0].num.i64);
+    m->snap_null.push_back(v[1].is_null);
+    m->snap.push_back(v[1].is_null ? 0 : v[1].num.i64);
+    m->path.emplace_back(reinterpret_cast<const char*>(v[2].bytes),
+                         v[2].bytes_len);
+    m->record_count.push_back(v[4].num.i64);
+    m->sort_order_id.push_back(v[8].num.i64);
+    m->seq.push_back(v[9].num.i64);
+    return true;
+}
+
+// The shape a manifest actually has: a nested data_file record carrying an
+// array<long> (split_offsets) and a map<string,long> (value_counts), with
+// scalars on BOTH sides of them, plus a nullable field. Every one of the three
+// mechanisms — splice, array walk, map walk — has to be right simultaneously
+// or the trailing columns land on the wrong bytes.
+TEST(BoltAvroIceberg, RealJavaWrittenManifestShapeReads) {
+    std::vector<uint8_t> buf;
+    ASSERT_TRUE(read_file("golden_avro_manifest.avro", &buf))
+        << "fixture missing";
+
+    bolt::Arena arena;
+    AvroHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    uint64_t body = 0;
+    ASSERT_TRUE(avro_read_header(buf.data(), buf.size(), &arena, &hdr, &body));
+
+    // 4 top-level fields flatten to 10 leaves: status, snapshot_id,
+    // data_file.{file_path, file_format, record_count, file_size_in_bytes,
+    // split_offsets, value_counts, sort_order_id}, sequence_number.
+    ASSERT_EQ(hdr.n_fields, 10u);
+    EXPECT_STREQ(hdr.field[0].name, "status");
+    EXPECT_STREQ(hdr.field[1].name, "snapshot_id");
+    EXPECT_TRUE(hdr.field[1].nullable);
+    EXPECT_STREQ(hdr.field[2].name, "data_file.file_path");
+    EXPECT_STREQ(hdr.field[6].name, "data_file.split_offsets");
+    EXPECT_EQ(hdr.field[6].type, AvroType::kArray);
+    EXPECT_EQ(hdr.field[6].item_type, static_cast<uint8_t>(AvroType::kLong));
+    EXPECT_STREQ(hdr.field[7].name, "data_file.value_counts");
+    EXPECT_EQ(hdr.field[7].type, AvroType::kMap);
+    EXPECT_STREQ(hdr.field[8].name, "data_file.sort_order_id");
+    EXPECT_STREQ(hdr.field[9].name, "sequence_number");
+
+    ManifestRows m;
+    int64_t rows = 0;
+    ASSERT_TRUE(avro_read(buf.data(), buf.size(), &arena, &m,
+                          collect_manifest, &rows));
+    ASSERT_EQ(rows, 3);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(m.status[static_cast<size_t>(i)], 1 + i);
+        // Alternating null exercises the union branch index inside the row.
+        EXPECT_EQ(m.snap_null[static_cast<size_t>(i)], (i % 2) == 0);
+        if ((i % 2) != 0) EXPECT_EQ(m.snap[static_cast<size_t>(i)], 900 + i);
+        EXPECT_EQ(m.path[static_cast<size_t>(i)],
+                  "s3://b/data/part-" + std::to_string(i) + ".parquet");
+        EXPECT_EQ(m.record_count[static_cast<size_t>(i)], 1000 + i);
+        // These two sit AFTER the array and the map. They are the proof the
+        // container walks consumed exactly the right number of bytes.
+        EXPECT_EQ(m.sort_order_id[static_cast<size_t>(i)], 7 + i);
+        EXPECT_EQ(m.seq[static_cast<size_t>(i)], 42 + i);
+    }
+}
+
+// The part of a real manifest we still cannot read, pinned so the limitation
+// is a measured fact rather than a belief — and so that the day it becomes
+// readable, this test says so.
+TEST(BoltAvroIceberg, RealJavaArrayOfRecordFailsClosed) {
+    std::vector<uint8_t> buf;
+    ASSERT_TRUE(read_file("golden_avro_array_of_record.avro", &buf))
+        << "fixture missing";
+
+    bolt::Arena arena;
+    AvroHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    uint64_t body = 0;
+    // The SCHEMA parses: the element is opaque, not unrepresentable.
+    ASSERT_TRUE(avro_read_header(buf.data(), buf.size(), &arena, &hdr, &body));
+    ASSERT_EQ(hdr.n_fields, 3u);
+    EXPECT_STREQ(hdr.field[1].name, "parts");
+    EXPECT_EQ(hdr.field[1].type, AvroType::kArray);
+    EXPECT_EQ(hdr.field[1].item_type, kAvroItemOpaque);
+
+    // Reading FAILS, because this writer emitted a positive count with no
+    // byte size. Failing is the point: any guess at the element width would
+    // silently mis-align `tail` and every row after it.
+    ManifestRows m;
+    int64_t rows = 0;
+    EXPECT_FALSE(avro_read(buf.data(), buf.size(), &arena, &m,
+                           collect_manifest, &rows));
 }
 
 TEST(BoltAvro, HeaderParse) {

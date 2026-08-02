@@ -1,10 +1,28 @@
 // bolt/lakehouse/iceberg/manifest.h — Iceberg manifest + manifest-list PODs.
 //
 // IMPORTANT (W4 deviation): Iceberg manifests are Avro files with nested
-// `data_file` records. bolt's Avro OCF reader (`bolt::ingest::avro_read`) only
-// supports flat-schema rows via a per-row callback, so it cannot decode the
-// nested data_file struct. W4 therefore reads manifests **as JSON arrays** —
-// guarded by `BOLT_ICEBERG_MANIFEST_JSON`. TODO(W5-avro-nested-reader).
+// `data_file` records. W4 therefore reads manifests **as JSON arrays** —
+// guarded by `BOLT_ICEBERG_MANIFEST_JSON`.
+//
+// STATUS UPDATE: the original blocker is GONE. `bolt::ingest::avro_read` now
+// decodes nested records (they flatten positionally into dotted leaves such as
+// "data_file.record_count") and walks arrays and maps, verified against an
+// Iceberg-manifest-shaped OCF written by the stock Apache Avro JAVA writer —
+// the same stack Iceberg's ManifestWriter uses (tests/data/
+// golden_avro_manifest.avro, BoltAvroIceberg.RealJavaWrittenManifestShapeReads).
+//
+// ONE shape still blocks a genuine manifest, and it was MEASURED rather than
+// assumed. Iceberg encodes its INT-KEYED maps — column_sizes, value_counts,
+// null_value_counts, lower_bounds, upper_bounds — as array<record<key,value>>
+// (Avro maps only take string keys). That writer emits an array as a POSITIVE
+// element count with NO byte size, so a record element cannot be skipped: there
+// is nothing to jump over and the element width is unknowable. bolt fails
+// closed there rather than mis-aligning every following field
+// (BoltAvroIceberg.RealJavaArrayOfRecordFailsClosed pins it against a real
+// Java-written file).
+//
+// So this flag stays ON. Flipping it needs element-aware descent into an
+// array<record> — a real increment, not a switch. TODO(W5-avro-nested-reader).
 //
 // JSON Manifest-list:
 //   [{"manifest_path", "manifest_length", "partition_spec_id", "content",

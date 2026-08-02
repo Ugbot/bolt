@@ -1011,6 +1011,10 @@ if(BOLT_BUILD_INGEST)
     add_executable(test_bolt_avro test_bolt_avro.cpp)
     target_link_libraries(test_bolt_avro
         PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    # Iceberg-manifest-shaped goldens written by the stock Apache Avro JAVA
+    # writer (data/golden_avro_manifest.avro, golden_avro_array_of_record.avro).
+    target_compile_definitions(test_bolt_avro PRIVATE
+        BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     bolt_apply_hardening(test_bolt_avro)
     add_test(NAME test_bolt_avro COMMAND test_bolt_avro)
 
