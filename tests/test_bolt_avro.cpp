@@ -82,6 +82,205 @@ TEST(BoltAvro, WriteReadRoundtrip) {
     EXPECT_TRUE(got.score_null[1]);
 }
 
+// ---------------------------------------------------------------------------
+// Bare-datum surface (avro_parse_schema / avro_decode_datum) — the streaming
+// path: a schema as JSON text plus one record body, no OCF container.
+// Datums below are hand-built so the expected bytes are independent of our
+// own writer (a writer bug cannot mask a decoder bug).
+// ---------------------------------------------------------------------------
+
+// Append an Avro zig-zag varint long.
+void put_long(std::vector<uint8_t>& v, int64_t x) {
+    uint64_t u = (static_cast<uint64_t>(x) << 1) ^
+                 static_cast<uint64_t>(x >> 63);
+    do {
+        uint8_t b = static_cast<uint8_t>(u & 0x7Fu);
+        u >>= 7;
+        if (u != 0u) b |= 0x80u;
+        v.push_back(b);
+    } while (u != 0u);
+}
+
+void put_str(std::vector<uint8_t>& v, const char* s) {
+    const uint64_t n = std::strlen(s);
+    put_long(v, static_cast<int64_t>(n));
+    v.insert(v.end(), s, s + n);
+}
+
+TEST(BoltAvroDatum, ParseSchemaAndDecodePrimitives) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"i\",\"type\":\"int\"},"
+        "{\"name\":\"l\",\"type\":\"long\"},"
+        "{\"name\":\"f\",\"type\":\"float\"},"
+        "{\"name\":\"d\",\"type\":\"double\"},"
+        "{\"name\":\"b\",\"type\":\"boolean\"},"
+        "{\"name\":\"s\",\"type\":\"string\"}]}";
+
+    AvroField fields[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  fields, 8, &n));
+    ASSERT_EQ(n, 6u);
+    EXPECT_STREQ(fields[0].name, "i");
+    EXPECT_EQ(fields[0].type, AvroType::kInt);
+    EXPECT_EQ(fields[3].type, AvroType::kDouble);
+    EXPECT_STREQ(fields[5].name, "s");
+    EXPECT_EQ(fields[5].type, AvroType::kString);
+    for (uint32_t k = 0; k < n; ++k) EXPECT_FALSE(fields[k].nullable);
+
+    std::vector<uint8_t> d;
+    put_long(d, 42);                                   // i
+    put_long(d, -7);                                   // l
+    const float fv = 1.5f;  d.insert(d.end(), reinterpret_cast<const uint8_t*>(&fv),
+                                     reinterpret_cast<const uint8_t*>(&fv) + 4);
+    const double dv = 2.25; d.insert(d.end(), reinterpret_cast<const uint8_t*>(&dv),
+                                     reinterpret_cast<const uint8_t*>(&dv) + 8);
+    d.push_back(1);                                    // b = true
+    put_str(d, "hi");                                  // s
+
+    AvroValue vals[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), fields, n, vals, &consumed));
+    EXPECT_EQ(consumed, d.size());                     // consumed exactly one datum
+    EXPECT_EQ(vals[0].num.i64, 42);
+    EXPECT_EQ(vals[1].num.i64, -7);
+    EXPECT_DOUBLE_EQ(vals[2].num.f64, 1.5);
+    EXPECT_DOUBLE_EQ(vals[3].num.f64, 2.25);
+    EXPECT_EQ(vals[4].num.i64, 1);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(vals[5].bytes),
+                          vals[5].bytes_len), "hi");
+}
+
+// ["null","long"] — null is branch 0 (the common registry convention).
+TEST(BoltAvroDatum, NullableNullFirst) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"id\",\"type\":\"long\"},"
+        "{\"name\":\"opt\",\"type\":[\"null\",\"long\"]}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_FALSE(f[0].nullable);
+    ASSERT_TRUE(f[1].nullable);
+    EXPECT_EQ(f[1].type, AvroType::kLong);
+    EXPECT_EQ(f[1].null_branch, 0u);
+
+    AvroValue v[4];
+    {   // present: branch 1 then the value
+        std::vector<uint8_t> d;
+        put_long(d, 5); put_long(d, 1); put_long(d, 900);
+        ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, nullptr));
+        EXPECT_EQ(v[0].num.i64, 5);
+        EXPECT_FALSE(v[1].is_null);
+        EXPECT_EQ(v[1].num.i64, 900);
+    }
+    {   // absent: branch 0, no value follows
+        std::vector<uint8_t> d;
+        put_long(d, 6); put_long(d, 0);
+        ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, nullptr));
+        EXPECT_EQ(v[0].num.i64, 6);
+        EXPECT_TRUE(v[1].is_null);
+    }
+}
+
+// ["long","null"] — null is branch 1. Before null_branch this schema parsed
+// the field as NON-nullable, so the union index byte was read as the value and
+// every subsequent field shifted: silent corruption, not a clean failure.
+TEST(BoltAvroDatum, NullableValueFirstOrdering) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"opt\",\"type\":[\"long\",\"null\"]},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+    ASSERT_TRUE(f[0].nullable);
+    EXPECT_EQ(f[0].type, AvroType::kLong);
+    EXPECT_EQ(f[0].null_branch, 1u);        // null is the SECOND branch
+    EXPECT_FALSE(f[1].nullable);
+
+    AvroValue v[4];
+    {   // present: branch 0 then value; `tail` must still line up
+        std::vector<uint8_t> d;
+        put_long(d, 0); put_long(d, 77); put_long(d, 123);
+        ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, nullptr));
+        EXPECT_FALSE(v[0].is_null);
+        EXPECT_EQ(v[0].num.i64, 77);
+        EXPECT_EQ(v[1].num.i64, 123);
+    }
+    {   // absent: branch 1, no value
+        std::vector<uint8_t> d;
+        put_long(d, 1); put_long(d, 456);
+        ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, nullptr));
+        EXPECT_TRUE(v[0].is_null);
+        EXPECT_EQ(v[1].num.i64, 456);
+    }
+}
+
+TEST(BoltAvroDatum, FailsClosedOnTruncationAndGarbage) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":\"long\"},"
+        "{\"name\":\"s\",\"type\":\"string\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+
+    std::vector<uint8_t> full;
+    put_long(full, 9);
+    put_str(full, "abcdef");
+
+    AvroValue v[4];
+    ASSERT_TRUE(avro_decode_datum(full.data(), full.size(), f, n, v, nullptr));
+
+    // Every strict prefix must fail rather than read past the end.
+    for (size_t cut = 0; cut < full.size(); ++cut) {
+        EXPECT_FALSE(avro_decode_datum(full.data(), cut, f, n, v, nullptr))
+            << "prefix of length " << cut << " should fail closed";
+    }
+
+    // A string length that overruns the buffer must be rejected, not trusted.
+    std::vector<uint8_t> bad;
+    put_long(bad, 1);
+    put_long(bad, 9999);            // claims 9999 bytes; only a few follow
+    bad.push_back('x');
+    EXPECT_FALSE(avro_decode_datum(bad.data(), bad.size(), f, n, v, nullptr));
+
+    EXPECT_FALSE(avro_decode_datum(full.data(), full.size(), f, 0, v, nullptr));
+}
+
+TEST(BoltAvroDatum, SchemaParseRespectsMaxFields) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":\"long\"},"
+        "{\"name\":\"b\",\"type\":\"long\"},"
+        "{\"name\":\"c\",\"type\":\"long\"}]}";
+    AvroField f[2];
+    uint32_t n = 0;
+    // Cap of 2 must clamp, not overrun f[].
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 2, &n));
+    EXPECT_EQ(n, 2u);
+    EXPECT_STREQ(f[0].name, "a");
+    EXPECT_STREQ(f[1].name, "b");
+
+    uint32_t n2 = 0;
+    EXPECT_FALSE(avro_parse_schema(reinterpret_cast<const uint8_t*>("not json"),
+                                   8, f, 2, &n2));
+}
+
 TEST(BoltAvro, HeaderParse) {
     AvroField fields[2];
     std::memset(fields, 0, sizeof(fields));

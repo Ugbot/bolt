@@ -72,8 +72,12 @@ bool read_bytes(const uint8_t* p, uint64_t len, uint64_t* off,
 // We only need the flattened top-level record field list (name + primitive
 // type, nullable if a ["null", T] union). The header schema is a record.
 
+// Sentinel: no "null" branch seen in the union currently being parsed.
+constexpr uint8_t kNoNullBranch = 0xFFu;
+
 struct SchemaCtx {
     AvroField* fields;
+    uint32_t   max_fields;     // caller cap on `fields`
     uint32_t   n;
     uint32_t   depth;          // object nesting depth
     bool       in_fields;      // inside the top record's "fields" array
@@ -81,9 +85,36 @@ struct SchemaCtx {
     bool       expect_type;    // next string is a field type
     char       pending_name[kAvroMaxName];
     bool       have_name;
-    bool       saw_null_union; // current field's type union contains null
+    bool       saw_null_union; // bare "type":"null"
+    // Union state — a field's "type" may be an ARRAY of branches. Both
+    // ["null",T] and [T,"null"] occur in real registry schemas, so the branch
+    // INDEX that means null is recorded rather than assumed (see AvroField::
+    // null_branch). Resolved on ']', not on the first branch string, so
+    // ordering cannot change the outcome.
+    bool       in_union;
+    uint8_t    union_n;         // branches seen so far
+    uint8_t    union_null_idx;  // index of the "null" branch, or kNoNullBranch
+    bool       union_have_type; // a non-null branch was seen
+    AvroType   union_type;      // first non-null branch's type
     bool       ok;
 };
+
+// Append one resolved field. Bounded by the caller's max_fields.
+void commit_field(SchemaCtx* s, AvroType t, bool nullable,
+                  uint8_t null_branch) noexcept {
+    assert(s != nullptr);
+    assert(s->n <= s->max_fields);
+    if (!s->have_name || s->n >= s->max_fields) return;
+    AvroField* f = &s->fields[s->n++];
+    std::memset(f, 0, sizeof(*f));
+    std::strncpy(f->name, s->pending_name, kAvroMaxName - 1u);
+    f->type        = t;
+    f->nullable    = nullable;
+    f->null_branch = nullable ? null_branch : 0u;
+    s->have_name      = false;
+    s->saw_null_union = false;
+    s->expect_type    = false;
+}
 
 AvroType type_from_str(const char* s, uint32_t len) noexcept {
     assert(s != nullptr);
@@ -124,19 +155,21 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
         s->expect_name = false;
         return true;
     }
-    if (s->expect_type) {
+    if (s->in_union) {                       // a branch of ["...", "..."]
+        const AvroType t = type_from_str(b, static_cast<uint32_t>(len));
+        if (t == AvroType::kNull) {
+            if (s->union_null_idx == kNoNullBranch) s->union_null_idx = s->union_n;
+        } else if (!s->union_have_type) {
+            s->union_type      = t;
+            s->union_have_type = true;
+        }
+        if (s->union_n < 0xFEu) ++s->union_n;   // bounded; index fits uint8
+        return true;
+    }
+    if (s->expect_type) {                    // plain "type": "long"
         const AvroType t = type_from_str(b, static_cast<uint32_t>(len));
         if (t == AvroType::kNull) { s->saw_null_union = true; return true; }
-        if (s->n < kAvroMaxFields && s->have_name) {
-            AvroField* f = &s->fields[s->n++];
-            std::memset(f, 0, sizeof(*f));
-            std::strncpy(f->name, s->pending_name, kAvroMaxName - 1u);
-            f->type = t;
-            f->nullable = s->saw_null_union;
-            s->have_name = false;
-            s->saw_null_union = false;
-            s->expect_type = false;
-        }
+        commit_field(s, t, /*nullable=*/s->saw_null_union, /*null_branch=*/0u);
         return true;
     }
     return true;
@@ -153,20 +186,54 @@ bool sx_end_obj(void* c) noexcept {
     return true;
 }
 
-// Parse the schema JSON; fill fields[]. Returns field count, 0 on failure.
+// An array opened while a field's "type" is pending IS that field's union.
+// (The enclosing "fields": [...] array opens when expect_type is false, so the
+// two cannot be confused.)
+bool sx_begin_arr(void* c) noexcept {
+    SchemaCtx* s = static_cast<SchemaCtx*>(c);
+    if (s->expect_type && !s->in_union) {
+        s->in_union        = true;
+        s->union_n         = 0u;
+        s->union_null_idx  = kNoNullBranch;
+        s->union_have_type = false;
+        s->union_type      = AvroType::kNull;
+    }
+    return true;
+}
+
+// Resolve the union here — after every branch is known — so branch ORDER
+// cannot change the result. ["null",T] yields null_branch 0, [T,"null"] 1.
+bool sx_end_arr(void* c) noexcept {
+    SchemaCtx* s = static_cast<SchemaCtx*>(c);
+    if (!s->in_union) return true;
+    const bool nullable = (s->union_null_idx != kNoNullBranch);
+    const AvroType t =
+        s->union_have_type ? s->union_type : AvroType::kNull;
+    commit_field(s, t, nullable,
+                 nullable ? s->union_null_idx : 0u);
+    s->in_union = false;
+    return true;
+}
+
+// Parse the schema JSON; fill fields[] (bounded by max_fields). Returns the
+// field count, 0 on failure.
 uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
-                      AvroField* fields) noexcept {
+                      AvroField* fields, uint32_t max_fields) noexcept {
     assert(json != nullptr);
     assert(fields != nullptr);
     SchemaCtx s;
     std::memset(&s, 0, sizeof(s));
-    s.fields = fields;
-    s.ok = true;
+    s.fields         = fields;
+    s.max_fields     = max_fields;
+    s.union_null_idx = kNoNullBranch;
+    s.ok             = true;
     parse::json::SaxHandler h;
     std::memset(&h, 0, sizeof(h));
     h.ctx = &s;
     h.on_begin_object = sx_begin_obj;
     h.on_end_object   = sx_end_obj;
+    h.on_begin_array  = sx_begin_arr;
+    h.on_end_array    = sx_end_arr;
     h.on_key          = sx_key;
     h.on_string       = sx_string;
     if (!parse::json::sax_parse(json, static_cast<int32_t>(json_len), &h)) {
@@ -231,7 +298,8 @@ bool avro_read_header(const uint8_t* src, uint64_t src_len,
     if (out->codec == AvroCodec::kUnknown) return false;
     if (schema_json == nullptr) return false;
 
-    out->n_fields = parse_schema(schema_json, schema_len, out->field);
+    out->n_fields = parse_schema(schema_json, schema_len, out->field,
+                                 kAvroMaxFields);
     if (out->n_fields == 0) return false;
 
     if (off + kAvroSyncLen > src_len) return false;
@@ -254,12 +322,17 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
         std::memset(val, 0, sizeof(*val));
         val->type = fields[f].type;
         const AvroField* fd = &fields[f];
-        if (fd->nullable) {                          // union index: 0/1
+        if (fd->nullable) {                          // union index precedes value
             int64_t branch = 0;
             if (!read_long(p, len, off, &branch)) return false;
-            // Encoding ["null", T] ⇒ index 0 = null, 1 = value. ["T","null"]
-            // is rarer; we assume null-first which Iceberg emits.
-            if (branch == 0) { val->is_null = true; continue; }
+            // Which index means null is schema-declared (AvroField::null_branch),
+            // not assumed: ["null",T] gives 0 (what Iceberg emits), [T,"null"]
+            // gives 1. A zeroed field decodes null-first, so OCF callers that
+            // predate this field are unaffected.
+            if (branch == static_cast<int64_t>(fd->null_branch)) {
+                val->is_null = true;
+                continue;
+            }
         }
         switch (fd->type) {
             case AvroType::kNull: val->is_null = true; break;
@@ -372,6 +445,37 @@ bool avro_read(const uint8_t* src, uint64_t src_len, Arena* arena,
         off += kAvroSyncLen;
     }
     if (out_rows != nullptr) *out_rows = row_index;
+    return true;
+}
+
+// ---- bare-datum surface (streaming carriers; see bolt_avro.h) --------------
+// Thin, allocation-free wrappers over the SAME parse_schema / decode_row the
+// OCF path uses — deliberately not a second decoder, so the container and
+// streaming paths can never diverge.
+
+bool avro_parse_schema(const uint8_t* json, uint32_t json_len,
+                       AvroField* out_fields, uint32_t max_fields,
+                       uint32_t* out_n) noexcept {
+    assert(out_fields != nullptr || max_fields == 0);
+    assert(out_n != nullptr);
+    if (json == nullptr || out_fields == nullptr || out_n == nullptr) return false;
+    if (json_len == 0u || max_fields == 0u) return false;
+    const uint32_t n = parse_schema(json, json_len, out_fields, max_fields);
+    *out_n = n;
+    return n != 0u;
+}
+
+bool avro_decode_datum(const uint8_t* src, uint64_t src_len,
+                       const AvroField* fields, uint32_t n_fields,
+                       AvroValue* out_vals, uint64_t* out_consumed) noexcept {
+    assert(src != nullptr || src_len == 0);
+    assert(fields != nullptr || n_fields == 0);
+    if (src == nullptr || fields == nullptr || out_vals == nullptr) return false;
+    if (n_fields == 0u) return false;
+    uint64_t off = 0;
+    if (!decode_row(src, src_len, &off, fields, n_fields, out_vals)) return false;
+    assert(off <= src_len);              // decode_row never runs past the end
+    if (out_consumed != nullptr) *out_consumed = off;
     return true;
 }
 

@@ -76,8 +76,14 @@ struct AvroValue {
 struct AvroField {
     char     name[kAvroMaxName];
     AvroType type;            // resolved primitive (union → underlying type)
-    bool     nullable;       // union with "null"
-    uint8_t  _pad[2];
+    bool     nullable;        // union with "null"
+    // Which union branch index encodes null. Avro writes the branch index
+    // before the value, and BOTH orderings occur in the wild: ["null",T]
+    // (the convention when a field has a null default) gives 0, ["T","null"]
+    // gives 1. Only meaningful when `nullable`; a zeroed field therefore
+    // means "null-first", matching the pre-existing behaviour exactly.
+    uint8_t  null_branch;
+    uint8_t  _pad[1];
 };
 
 // Parsed OCF header: schema fields + codec + sync marker.
@@ -106,6 +112,51 @@ bool avro_read_header(const uint8_t* src, uint64_t src_len,
 // when a callback aborts; *out_rows gets the count delivered.
 bool avro_read(const uint8_t* src, uint64_t src_len, Arena* arena,
                void* ctx, AvroRowFn on_row, int64_t* out_rows) noexcept;
+
+// ---------------------------------------------------------------------------
+// Bare-datum surface — schema-driven, NO code generation.
+//
+// The OCF functions above assume a container file (magic + metadata + sync +
+// framed blocks). Streaming carriers do not use that: a Kafka/Confluent value
+// is `[magic 0x00][4-byte big-endian schema id][BARE datum]` — a single record
+// body with no header and no block framing, whose schema is looked up out of
+// band (registry, or supplied by the caller). The two entry points below are
+// that path: parse a schema *as JSON text*, then decode one datum against it.
+// Everything is resolved at runtime from the parsed field table, so a new
+// schema needs no rebuild.
+//
+// Both share the OCF implementation internals — there is exactly one varint /
+// union / primitive decoder in this translation unit, so the streaming and
+// container paths cannot drift apart.
+// ---------------------------------------------------------------------------
+
+// Parse Avro schema JSON (exactly the text a Schema Registry returns for a
+// subject version) into the flattened top-level field table. Writes at most
+// `max_fields` entries and sets *out_n. Returns false when the JSON is
+// malformed or resolves to zero fields — never a partial success.
+//
+// Union handling: a two-branch union with "null" marks the field `nullable`
+// and records which branch index is the null one, so BOTH ["null",T] and
+// [T,"null"] decode correctly.
+bool avro_parse_schema(const uint8_t* json, uint32_t json_len,
+                       AvroField* out_fields, uint32_t max_fields,
+                       uint32_t* out_n) noexcept;
+
+// Decode ONE bare datum: `n_fields` values written to out_vals[0..n_fields).
+// *out_consumed (optional) receives the bytes read, so a caller can walk a
+// buffer holding several datums back-to-back.
+//
+// ZERO-COPY LIFETIME: bytes/string values point INTO `src`, they are not
+// copied — identical to the OCF row callback's contract. The caller must
+// consume (or copy out) before `src` is reused. This is why no Arena is
+// taken: the decoder allocates nothing.
+//
+// Fails closed on truncation or a malformed varint and never reads past
+// src[src_len); a partially-filled out_vals must not be used when it
+// returns false.
+bool avro_decode_datum(const uint8_t* src, uint64_t src_len,
+                       const AvroField* fields, uint32_t n_fields,
+                       AvroValue* out_vals, uint64_t* out_consumed) noexcept;
 
 // ---------------------------------------------------------------------------
 // Writer — encode rows into a single-block OCF (codec = null) into a caller
