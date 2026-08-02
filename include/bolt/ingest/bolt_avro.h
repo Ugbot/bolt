@@ -51,7 +51,17 @@ static constexpr uint32_t kAvroMaxName     = 128u;
 enum class AvroType : uint8_t {
     kNull = 0, kBoolean = 1, kInt = 2, kLong = 3, kFloat = 4, kDouble = 5,
     kBytes = 6, kString = 7,
+    // Container types. These never produce a VALUE -- they decode as null --
+    // but they are SKIPPED on the wire so the fields after them stay aligned.
+    // Without them a schema containing an array was unreadable entirely.
+    kArray = 8, kMap = 9,
 };
+
+// AvroField::item_type when the element of an array/map is not a primitive
+// (a record, a union, or another container). Such a block can still be
+// skipped when the writer emits the byte-size form; otherwise the decode
+// FAILS rather than guessing an element width.
+static constexpr uint8_t kAvroItemOpaque = 0xFFu;
 
 enum class AvroCodec : uint8_t {
     kNull = 0, kDeflate = 1, kSnappy = 2, kZstd = 3, kUnknown = 4,
@@ -83,7 +93,10 @@ struct AvroField {
     // gives 1. Only meaningful when `nullable`; a zeroed field therefore
     // means "null-first", matching the pre-existing behaviour exactly.
     uint8_t  null_branch;
-    uint8_t  _pad[1];
+    // Element type for kArray / kMap, or kAvroItemOpaque. Spends the struct's
+    // ONE spare byte, so sizeof(AvroField) is unchanged (it is multiplied by
+    // kAvroMaxFields inside AvroHeader). Meaningless for other types.
+    uint8_t  item_type;
 };
 
 // Parsed OCF header: schema fields + codec + sync marker.

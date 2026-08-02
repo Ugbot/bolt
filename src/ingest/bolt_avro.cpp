@@ -96,7 +96,12 @@ enum : uint8_t {
     kFrArr           // any other array ("symbols", ...)
 };
 
-enum : uint8_t { kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyOther };
+enum : uint8_t {
+    kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyItems, kKeyValues, kKeyOther
+};
+
+// A type object's container flavour.
+enum : uint8_t { kCplxNone = 0, kCplxArray, kCplxMap };
 
 struct SFrame {
     uint8_t  kind;
@@ -109,6 +114,8 @@ struct SFrame {
     bool     union_have_type;
     AvroType union_type;
     bool     is_record;       // this object declared "type":"record"
+    uint8_t  complex_kind;    // kCplxArray / kCplxMap for a container type obj
+    uint8_t  item_type;       // its element type, or kAvroItemOpaque
     bool     resolved;        // kFrFieldObj: produced a leaf or a splice
     bool     have_name;       // kFrFieldObj: "name" seen
     bool     pushed_prefix;   // kFrFieldsArr: extended the dotted prefix
@@ -124,8 +131,18 @@ struct SchemaCtx {
     uint32_t   sp;            // index of the top frame
     char       prefix[kAvroMaxName];
     uint32_t   prefix_len;
+    // Stack index at which we entered a container's ELEMENT (0 = not in one).
+    // Everything inside is inert: an array<record>'s inner "fields" must NOT
+    // splice into the enclosing field, because those leaves are not in the
+    // parent's wire sequence -- they repeat per element.
+    uint32_t   suppress_sp;
     bool       ok;
 };
+
+bool sx_suppressed(const SchemaCtx* s) noexcept {
+    assert(s != nullptr);
+    return s->suppress_sp != 0u && s->sp >= s->suppress_sp;
+}
 
 SFrame* sx_top(SchemaCtx* s) noexcept {
     assert(s != nullptr);
@@ -168,7 +185,7 @@ int32_t sx_enclosing_field(const SchemaCtx* s, bool* crossed_union) noexcept {
 // Append one resolved leaf under the current dotted prefix. Clamps at
 // max_fields (callers pass a cap and expect truncation, not failure).
 void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
-                    uint8_t null_branch) noexcept {
+                    uint8_t null_branch, uint8_t item_type) noexcept {
     assert(s != nullptr);
     assert(s->n <= s->max_fields);
     if (fi < 0) return;
@@ -186,6 +203,7 @@ void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
     f->type        = t;
     f->nullable    = nullable;
     f->null_branch = nullable ? null_branch : 0u;
+    f->item_type   = item_type;
 }
 
 // Resolve a type NAME. Only the 8 primitives are representable in the flat
@@ -222,6 +240,8 @@ bool sx_key(void* c, const char* b, int32_t len) noexcept {
     if (k("type"))        f->last_key = kKeyType;
     else if (k("name"))   f->last_key = kKeyName;
     else if (k("fields")) f->last_key = kKeyFields;
+    else if (k("items"))  f->last_key = kKeyItems;    // array element type
+    else if (k("values")) f->last_key = kKeyValues;   // map value type
     else                  f->last_key = kKeyOther;
     return true;
 }
@@ -230,6 +250,17 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* f = sx_top(s);
     const uint32_t ln = static_cast<uint32_t>(len);
+    if (sx_suppressed(s)) { f->last_key = kKeyNone; return true; }
+
+    // The element type of a container. A primitive element can be skipped
+    // item-by-item; anything else is opaque and needs the byte-size form.
+    if (f->last_key == kKeyItems || f->last_key == kKeyValues) {
+        f->last_key = kKeyNone;
+        AvroType it = AvroType::kNull;
+        f->item_type = type_from_str(b, ln, &it)
+                           ? static_cast<uint8_t>(it) : kAvroItemOpaque;
+        return true;
+    }
 
     if (f->kind == kFrUnion) {                   // a branch of ["...","..."]
         AvroType t = AvroType::kNull;
@@ -263,12 +294,25 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
         f->last_key = kKeyNone;
         const bool is_rec = (ln == 6u && std::memcmp(b, "record", 6) == 0);
         if (is_rec) { f->is_record = true; return true; }  // splices at "fields"
+        // Containers resolve at the END of their type object, once "items" /
+        // "values" has been seen (JSON key order is not guaranteed).
+        if (ln == 5u && std::memcmp(b, "array", 5) == 0) {
+            f->complex_kind = kCplxArray;
+            f->item_type    = kAvroItemOpaque;
+            return true;
+        }
+        if (ln == 3u && std::memcmp(b, "map", 3) == 0) {
+            f->complex_kind = kCplxMap;
+            f->item_type    = kAvroItemOpaque;
+            return true;
+        }
         AvroType t = AvroType::kNull;
         if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
         if (fi < 0) return true;         // a "type" outside any field
-        sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u);
+        sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u,
+                       /*item_type=*/0u);
         return true;
     }
     return true;
@@ -276,17 +320,42 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
 
 bool sx_begin_obj(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
+    SFrame* p = sx_top(s);
     // An object directly inside a "fields" array IS a field; anything else is
     // a type/record definition.
-    const uint8_t kind =
-        (sx_top(s)->kind == kFrFieldsArr) ? kFrFieldObj : kFrObj;
+    const uint8_t kind = (p->kind == kFrFieldsArr) ? kFrFieldObj : kFrObj;
+    const bool elem = (p->last_key == kKeyItems || p->last_key == kKeyValues);
+    if (elem) { p->item_type = kAvroItemOpaque; p->last_key = kKeyNone; }
     sx_push(s, kind);
+    // A complex element's contents describe the ELEMENT, not the parent
+    // record, so nothing inside may commit or splice.
+    if (elem && s->suppress_sp == 0u) s->suppress_sp = s->sp;
     return true;
 }
 
 bool sx_end_obj(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* f = sx_top(s);
+    if (s->suppress_sp != 0u && s->sp == s->suppress_sp) {
+        s->suppress_sp = 0u;                       // leaving the element
+        sx_pop(s);
+        return true;
+    }
+    if (sx_suppressed(s)) { sx_pop(s); return true; }
+    if (f->complex_kind != kCplxNone) {             // an array/map type object
+        const AvroType ct = (f->complex_kind == kCplxArray) ? AvroType::kArray
+                                                            : AvroType::kMap;
+        const uint8_t it = f->item_type;
+        bool crossed_union = false;
+        const int32_t fi = sx_enclosing_field(s, &crossed_union);
+        // A container inside a union would need the branch index AND the
+        // block walk; the flat model cannot express that, so fail closed.
+        if (crossed_union) s->ok = false;
+        else sx_commit_leaf(s, fi, ct, /*nullable=*/false,
+                            /*null_branch=*/0u, it);
+        sx_pop(s);
+        return true;
+    }
     // A field that resolved to nothing means we could not model its type;
     // dropping it would shift every later field's wire position, so fail.
     if (f->kind == kFrFieldObj && !f->resolved) s->ok = false;
@@ -298,10 +367,14 @@ bool sx_begin_arr(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* p = sx_top(s);
     uint8_t kind = kFrArr;
+    const bool elem = (p->last_key == kKeyItems || p->last_key == kKeyValues);
     if (p->last_key == kKeyFields)   kind = kFrFieldsArr;
     else if (p->last_key == kKeyType) kind = kFrUnion;
+    if (elem) p->item_type = kAvroItemOpaque;   // a union/array element
     p->last_key = kKeyNone;
     sx_push(s, kind);
+    if (elem && s->suppress_sp == 0u) s->suppress_sp = s->sp;
+    if (sx_suppressed(s)) return true;
     if (kind != kFrFieldsArr) return true;
 
     // A "fields" array belongs to a record. If that record is the VALUE of an
@@ -328,6 +401,12 @@ bool sx_begin_arr(void* c) noexcept {
 bool sx_end_arr(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* f = sx_top(s);
+    if (s->suppress_sp != 0u && s->sp == s->suppress_sp) {
+        s->suppress_sp = 0u;
+        sx_pop(s);
+        return true;
+    }
+    if (sx_suppressed(s)) { sx_pop(s); return true; }
     if (f->kind == kFrUnion) {
         const bool nullable = (f->union_null_idx != kNoNullBranch);
         const AvroType t = f->union_have_type ? f->union_type : AvroType::kNull;
@@ -335,7 +414,7 @@ bool sx_end_arr(void* c) noexcept {
         sx_pop(s);
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
-        sx_commit_leaf(s, fi, t, nullable, nb);
+        sx_commit_leaf(s, fi, t, nullable, nb, /*item_type=*/0u);
         return true;
     }
     if (f->kind == kFrFieldsArr && f->pushed_prefix) {
@@ -443,6 +522,86 @@ bool avro_read_header(const uint8_t* src, uint64_t src_len,
 
 namespace {
 
+// Advance past one primitive value. False on truncation / an unskippable type.
+bool skip_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
+                    AvroType t) noexcept {
+    assert(p != nullptr);
+    assert(off != nullptr);
+    switch (t) {
+        case AvroType::kNull: return true;              // zero width
+        case AvroType::kBoolean:
+            if (*off >= len) return false;
+            ++(*off);
+            return true;
+        case AvroType::kInt:
+        case AvroType::kLong: {
+            int64_t tmp = 0;
+            return read_long(p, len, off, &tmp);
+        }
+        case AvroType::kFloat:
+            if (*off + 4u > len) return false;
+            *off += 4u;
+            return true;
+        case AvroType::kDouble:
+            if (*off + 8u > len) return false;
+            *off += 8u;
+            return true;
+        case AvroType::kBytes:
+        case AvroType::kString: {
+            const uint8_t* b = nullptr;
+            uint32_t bl = 0;
+            return read_bytes(p, len, off, &b, &bl);
+        }
+        default: return false;                          // not a primitive
+    }
+}
+
+// Skip an array or map. On the wire both are `block* 0`, where
+//   block := count:long [size:long IF count < 0] item*
+// A NEGATIVE count is followed by the block's BYTE SIZE, which lets us skip
+// the whole block without knowing the element type at all. A positive count
+// carries no size, so each element must be walked individually — which needs
+// a primitive element type. When it is opaque (a record, union, or nested
+// container) we FAIL rather than guess a width: a wrong skip would silently
+// mis-align every field after it, which is exactly the failure this whole
+// change exists to remove.
+//
+// A map element is a key STRING followed by the value, so the key is skipped
+// first. Bounded: block count, and every element consumes at least one byte.
+constexpr uint32_t kAvroMaxBlocks = 1u << 20;
+
+bool skip_container(const uint8_t* p, uint64_t len, uint64_t* off,
+                    uint8_t item_type, bool is_map) noexcept {
+    assert(p != nullptr);
+    assert(off != nullptr);
+    for (uint32_t blk = 0; blk < kAvroMaxBlocks; ++blk) {
+        int64_t count = 0;
+        if (!read_long(p, len, off, &count)) return false;
+        if (count == 0) return true;                    // terminator
+        if (count < 0) {                                // size-prefixed form
+            int64_t nbytes = 0;
+            if (!read_long(p, len, off, &nbytes)) return false;
+            if (nbytes < 0 || static_cast<uint64_t>(nbytes) > len - *off) {
+                return false;
+            }
+            *off += static_cast<uint64_t>(nbytes);
+            continue;
+        }
+        if (item_type == kAvroItemOpaque) return false; // cannot walk elements
+        const AvroType it = static_cast<AvroType>(item_type);
+        for (int64_t i = 0; i < count; ++i) {           // bounded by `count`
+            if (*off >= len) return false;
+            if (is_map) {
+                const uint8_t* kb = nullptr;
+                uint32_t kl = 0;
+                if (!read_bytes(p, len, off, &kb, &kl)) return false;
+            }
+            if (!skip_primitive(p, len, off, it)) return false;
+        }
+    }
+    return false;                                       // unterminated
+}
+
 // Decode one row of primitives at *off (decompressed block buffer `p`).
 bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
                 const AvroField* fields, uint32_t n_fields,
@@ -468,6 +627,18 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
         }
         switch (fd->type) {
             case AvroType::kNull: val->is_null = true; break;
+            // Containers produce no scalar — the value stays NULL — but they
+            // are walked so every FOLLOWING field stays aligned. Before this,
+            // a schema containing an array was unreadable outright.
+            case AvroType::kArray:
+            case AvroType::kMap: {
+                if (!skip_container(p, len, off, fd->item_type,
+                                    fd->type == AvroType::kMap)) {
+                    return false;
+                }
+                val->is_null = true;
+                break;
+            }
             case AvroType::kBoolean: {
                 if (*off >= len) return false;
                 val->num.i64 = p[(*off)++] != 0 ? 1 : 0;

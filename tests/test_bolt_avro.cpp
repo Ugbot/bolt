@@ -451,6 +451,271 @@ TEST(BoltAvroDatum, UnrepresentableTypesFailClosed) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Arrays and maps. Neither yields a value — both decode as NULL — but both are
+// WALKED so the fields after them stay aligned. On the wire each is
+//   block* 0,  block := count:long [size:long IF count<0] item*
+// The negative-count form carries the block's byte size, so it can be skipped
+// without knowing the element type; the positive-count form cannot.
+// ---------------------------------------------------------------------------
+
+// count > 0, elements walked one at a time.
+void put_arr_counted(std::vector<uint8_t>& v,
+                     const std::vector<int64_t>& items) {
+    put_long(v, static_cast<int64_t>(items.size()));
+    for (int64_t x : items) put_long(v, x);
+    put_long(v, 0);                                     // terminator
+}
+
+// count < 0 followed by the block's BYTE SIZE.
+void put_arr_sized(std::vector<uint8_t>& v, const std::vector<int64_t>& items) {
+    std::vector<uint8_t> body;
+    for (int64_t x : items) put_long(body, x);
+    put_long(v, -static_cast<int64_t>(items.size()));
+    put_long(v, static_cast<int64_t>(body.size()));
+    v.insert(v.end(), body.begin(), body.end());
+    put_long(v, 0);
+}
+
+TEST(BoltAvroDatum, ArrayOfPrimitiveSkippedAndScalarStaysAligned) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"head\",\"type\":\"long\"},"
+        "{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"items\":\"long\"}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 3u);
+    EXPECT_EQ(f[1].type, AvroType::kArray);
+    EXPECT_EQ(f[1].item_type, static_cast<uint8_t>(AvroType::kLong));
+    EXPECT_STREQ(f[2].name, "tail");
+
+    // Both block forms, and an EMPTY array, must all land `tail` correctly —
+    // this is the alignment proof that matters most.
+    for (int form = 0; form < 3; ++form) {
+        std::vector<uint8_t> d;
+        put_long(d, 1);
+        if (form == 0)      put_arr_counted(d, {7, 8, 9});
+        else if (form == 1) put_arr_sized(d, {7, 8, 9});
+        else                put_long(d, 0);             // empty: just the 0
+        put_long(d, 4242);
+        AvroValue v[8];
+        uint64_t consumed = 0;
+        ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed))
+            << "form " << form;
+        EXPECT_EQ(consumed, d.size()) << "form " << form;
+        EXPECT_EQ(v[0].num.i64, 1)    << "form " << form;
+        EXPECT_TRUE(v[1].is_null)     << "form " << form;   // no scalar value
+        EXPECT_EQ(v[2].num.i64, 4242) << "form " << form;   // aligned
+    }
+}
+
+// A multi-BLOCK array (writers chunk large arrays) must be walked to the
+// terminating zero, not just through the first block.
+TEST(BoltAvroDatum, ArrayMultiBlock) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":{\"type\":\"array\",\"items\":\"long\"}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    std::vector<uint8_t> d;
+    put_long(d, 2); put_long(d, 1); put_long(d, 2);      // block 1: 2 items
+    put_long(d, 1); put_long(d, 3);                      // block 2: 1 item
+    put_long(d, 0);                                      // terminator
+    put_long(d, 77);
+    AvroValue v[4];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_EQ(v[1].num.i64, 77);
+}
+
+TEST(BoltAvroDatum, ArrayOfStringSkipped) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":{\"type\":\"array\",\"items\":\"string\"}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    EXPECT_EQ(f[0].item_type, static_cast<uint8_t>(AvroType::kString));
+    std::vector<uint8_t> d;
+    put_long(d, 2); put_str(d, "aa"); put_str(d, "bbbb");
+    put_long(d, 0);
+    put_long(d, 5);
+    AvroValue v[4];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_EQ(v[1].num.i64, 5);
+}
+
+// A map element is a key STRING then the value — skipping only the value
+// would desync immediately.
+TEST(BoltAvroDatum, MapSkippedKeyAndValue) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"m\",\"type\":{\"type\":\"map\",\"values\":\"long\"}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_EQ(f[0].type, AvroType::kMap);
+    EXPECT_EQ(f[0].item_type, static_cast<uint8_t>(AvroType::kLong));
+    std::vector<uint8_t> d;
+    put_long(d, 2);
+    put_str(d, "k1"); put_long(d, 10);
+    put_str(d, "k2"); put_long(d, 20);
+    put_long(d, 0);
+    put_long(d, 31337);
+    AvroValue v[4];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_TRUE(v[0].is_null);
+    EXPECT_EQ(v[1].num.i64, 31337);
+}
+
+// An array whose element is a RECORD parses (the field is opaque), and the
+// SIZE-prefixed form still skips exactly. This is the shape Iceberg manifests
+// use for their statistics maps.
+TEST(BoltAvroDatum, ArrayOfRecordOpaqueButSizeFormSkips) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"parts\",\"type\":{\"type\":\"array\",\"items\":"
+        "{\"type\":\"record\",\"name\":\"P\",\"fields\":["
+        "{\"name\":\"k\",\"type\":\"int\"},{\"name\":\"v\",\"type\":\"long\"}]}}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    // The inner record's fields must NOT splice into the parent: they repeat
+    // per element and are not in the parent's wire sequence.
+    ASSERT_EQ(n, 2u);
+    EXPECT_STREQ(f[0].name, "parts");
+    EXPECT_EQ(f[0].type, AvroType::kArray);
+    EXPECT_EQ(f[0].item_type, kAvroItemOpaque);
+    EXPECT_STREQ(f[1].name, "tail");
+
+    // Size-prefixed: skippable without knowing the element type.
+    std::vector<uint8_t> body;
+    put_long(body, 1); put_long(body, 100);
+    put_long(body, 2); put_long(body, 200);
+    std::vector<uint8_t> d;
+    put_long(d, -2);
+    put_long(d, static_cast<int64_t>(body.size()));
+    d.insert(d.end(), body.begin(), body.end());
+    put_long(d, 0);
+    put_long(d, 909);
+    AvroValue v[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_EQ(v[1].num.i64, 909);
+
+    // Positive count with an OPAQUE element carries no size, so the element
+    // width is unknowable. That must FAIL, never guess — a wrong skip would
+    // silently mis-align every field after it.
+    std::vector<uint8_t> bad;
+    put_long(bad, 2);
+    put_long(bad, 1); put_long(bad, 100);
+    put_long(bad, 2); put_long(bad, 200);
+    put_long(bad, 0);
+    put_long(bad, 909);
+    EXPECT_FALSE(avro_decode_datum(bad.data(), bad.size(), f, n, v, nullptr));
+}
+
+// A truncated container must fail rather than run off the buffer.
+TEST(BoltAvroDatum, ContainerTruncationFailsClosed) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":{\"type\":\"array\",\"items\":\"long\"}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    std::vector<uint8_t> full;
+    put_long(full, 3); put_long(full, 1); put_long(full, 2); put_long(full, 3);
+    put_long(full, 0);
+    put_long(full, 6);
+    AvroValue v[4];
+    ASSERT_TRUE(avro_decode_datum(full.data(), full.size(), f, n, v, nullptr));
+    for (size_t cut = 1; cut < full.size(); ++cut) {
+        EXPECT_FALSE(avro_decode_datum(full.data(), cut, f, n, v, nullptr))
+            << "cut " << cut;
+    }
+    // A size-prefixed block claiming more bytes than remain must fail too.
+    std::vector<uint8_t> lie;
+    put_long(lie, -1);
+    put_long(lie, 9999);
+    put_long(lie, 42);
+    EXPECT_FALSE(avro_decode_datum(lie.data(), lie.size(), f, n, v, nullptr));
+}
+
+// A container inside a union needs the branch index AND the block walk, which
+// no fixed positional entry can express.
+TEST(BoltAvroDatum, NullableContainerFailsClosed) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":[\"null\","
+        "{\"type\":\"array\",\"items\":\"long\"}]}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    EXPECT_FALSE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                   static_cast<uint32_t>(std::strlen(json)),
+                                   f, 4, &n));
+}
+
+// A container INSIDE a nested record: the dotted leaf is still produced, and
+// the group after it stays aligned.
+TEST(BoltAvroDatum, ContainerInsideNestedRecord) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"g\",\"type\":{\"type\":\"record\",\"name\":\"G\","
+        "\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"array\","
+        "\"items\":\"long\"}},"
+        "{\"name\":\"z\",\"type\":\"long\"}]}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 3u);
+    EXPECT_STREQ(f[0].name, "g.a");
+    EXPECT_EQ(f[0].type, AvroType::kArray);
+    EXPECT_STREQ(f[1].name, "g.z");
+    EXPECT_STREQ(f[2].name, "tail");
+
+    std::vector<uint8_t> d;
+    put_arr_counted(d, {5, 6});
+    put_long(d, 11);
+    put_long(d, 22);
+    AvroValue v[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_TRUE(v[0].is_null);
+    EXPECT_EQ(v[1].num.i64, 11);
+    EXPECT_EQ(v[2].num.i64, 22);
+}
+
 TEST(BoltAvro, HeaderParse) {
     AvroField fields[2];
     std::memset(fields, 0, sizeof(fields));
