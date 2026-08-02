@@ -75,61 +75,141 @@ bool read_bytes(const uint8_t* p, uint64_t len, uint64_t* off,
 // Sentinel: no "null" branch seen in the union currently being parsed.
 constexpr uint8_t kNoNullBranch = 0xFFu;
 
+// Schema shape is tracked with an explicit FRAME STACK rather than a handful
+// of global flags. The flags could not survive nesting: "in_fields" was set
+// once and never cleared, and a nested record's own "name" was captured as if
+// it were the next field's name — so {user_id, addr:{zip}, amount} parsed to
+// FOUR fields for a THREE-value wire record and every datum under-ran.
+//
+// The model: an Avro record is encoded inline, in order, with no delimiters,
+// so a nested record's correct flattening IS the parent's wire sequence. The
+// leaves splice into the positional list under dotted names; the decoder needs
+// no notion of nesting at all and is unchanged.
+constexpr uint32_t kAvroMaxSchemaDepth = 16u;
+
+enum : uint8_t {
+    kFrRoot = 0,     // outside everything
+    kFrObj,          // a plain object (a record/type definition)
+    kFrFieldsArr,    // the array value of "fields"
+    kFrFieldObj,     // one element of a fields array — a FIELD
+    kFrUnion,        // an array in TYPE position — a union
+    kFrArr           // any other array ("symbols", ...)
+};
+
+enum : uint8_t { kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyOther };
+
+struct SFrame {
+    uint8_t  kind;
+    uint8_t  last_key;        // most recent key seen IN THIS object
+    // Union accumulation (kFrUnion). Both ["null",T] and [T,"null"] occur in
+    // real registry schemas, so the branch INDEX that means null is recorded
+    // rather than assumed, and resolved on ']' so ordering cannot change it.
+    uint8_t  union_n;
+    uint8_t  union_null_idx;
+    bool     union_have_type;
+    AvroType union_type;
+    bool     is_record;       // this object declared "type":"record"
+    bool     resolved;        // kFrFieldObj: produced a leaf or a splice
+    bool     have_name;       // kFrFieldObj: "name" seen
+    bool     pushed_prefix;   // kFrFieldsArr: extended the dotted prefix
+    uint32_t prefix_save;     // ...and the length to restore on ']'
+    char     name[kAvroMaxName];
+};
+
 struct SchemaCtx {
     AvroField* fields;
-    uint32_t   max_fields;     // caller cap on `fields`
+    uint32_t   max_fields;    // caller cap on `fields`
     uint32_t   n;
-    uint32_t   depth;          // object nesting depth
-    bool       in_fields;      // inside the top record's "fields" array
-    bool       expect_name;    // next string is a field name
-    bool       expect_type;    // next string is a field type
-    char       pending_name[kAvroMaxName];
-    bool       have_name;
-    bool       saw_null_union; // bare "type":"null"
-    // Union state — a field's "type" may be an ARRAY of branches. Both
-    // ["null",T] and [T,"null"] occur in real registry schemas, so the branch
-    // INDEX that means null is recorded rather than assumed (see AvroField::
-    // null_branch). Resolved on ']', not on the first branch string, so
-    // ordering cannot change the outcome.
-    bool       in_union;
-    uint8_t    union_n;         // branches seen so far
-    uint8_t    union_null_idx;  // index of the "null" branch, or kNoNullBranch
-    bool       union_have_type; // a non-null branch was seen
-    AvroType   union_type;      // first non-null branch's type
+    SFrame     st[kAvroMaxSchemaDepth];
+    uint32_t   sp;            // index of the top frame
+    char       prefix[kAvroMaxName];
+    uint32_t   prefix_len;
     bool       ok;
 };
 
-// Append one resolved field. Bounded by the caller's max_fields.
-void commit_field(SchemaCtx* s, AvroType t, bool nullable,
-                  uint8_t null_branch) noexcept {
+SFrame* sx_top(SchemaCtx* s) noexcept {
+    assert(s != nullptr);
+    assert(s->sp < kAvroMaxSchemaDepth);
+    return &s->st[s->sp];
+}
+
+// Push a frame. Depth is bounded; overflow fails the parse rather than
+// silently mis-tracking the rest of the document.
+void sx_push(SchemaCtx* s, uint8_t kind) noexcept {
+    assert(s != nullptr);
+    assert(kind <= kFrArr);
+    if (s->sp + 1u >= kAvroMaxSchemaDepth) { s->ok = false; return; }
+    ++s->sp;
+    SFrame* f = &s->st[s->sp];
+    std::memset(f, 0, sizeof(*f));
+    f->kind           = kind;
+    f->union_null_idx = kNoNullBranch;
+}
+
+void sx_pop(SchemaCtx* s) noexcept {
+    assert(s != nullptr);
+    if (s->sp > 0) --s->sp;
+}
+
+// Nearest enclosing FIELD frame, or -1. `crossed_union` reports whether a
+// union sits between: a nested record inside a union means the whole group is
+// present-or-absent per row, which no fixed positional list can describe.
+int32_t sx_enclosing_field(const SchemaCtx* s, bool* crossed_union) noexcept {
+    assert(s != nullptr);
+    assert(crossed_union != nullptr);
+    *crossed_union = false;
+    for (uint32_t i = s->sp + 1u; i-- > 0;) {          // bounded by depth
+        if (s->st[i].kind == kFrUnion) *crossed_union = true;
+        if (s->st[i].kind == kFrFieldObj) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
+// Append one resolved leaf under the current dotted prefix. Clamps at
+// max_fields (callers pass a cap and expect truncation, not failure).
+void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
+                    uint8_t null_branch) noexcept {
     assert(s != nullptr);
     assert(s->n <= s->max_fields);
-    if (!s->have_name || s->n >= s->max_fields) return;
+    if (fi < 0) return;
+    SFrame* ff = &s->st[static_cast<uint32_t>(fi)];
+    if (!ff->have_name) { s->ok = false; return; }
+    ff->resolved = true;
+    if (s->n >= s->max_fields) return;                 // bounded clamp
+    const uint32_t nl = static_cast<uint32_t>(std::strlen(ff->name));
+    if (s->prefix_len + nl + 1u > kAvroMaxName) { s->ok = false; return; }
     AvroField* f = &s->fields[s->n++];
     std::memset(f, 0, sizeof(*f));
-    std::strncpy(f->name, s->pending_name, kAvroMaxName - 1u);
+    std::memcpy(f->name, s->prefix, s->prefix_len);
+    std::memcpy(f->name + s->prefix_len, ff->name, nl);
+    f->name[s->prefix_len + nl] = '\0';
     f->type        = t;
     f->nullable    = nullable;
     f->null_branch = nullable ? null_branch : 0u;
-    s->have_name      = false;
-    s->saw_null_union = false;
-    s->expect_type    = false;
 }
 
-AvroType type_from_str(const char* s, uint32_t len) noexcept {
+// Resolve a type NAME. Only the 8 primitives are representable in the flat
+// positional model; "record" is handled by the caller (it splices). Anything
+// else — enum, fixed, array, map, or a named-type reference — returns false
+// so the parse FAILS rather than decoding as something plausible. The old
+// code mapped every unrecognised name to "string", so an enum (an int on the
+// wire) was read as a length-prefixed byte string, corrupting that row and
+// every row after it.
+bool type_from_str(const char* s, uint32_t len, AvroType* out) noexcept {
     assert(s != nullptr);
+    assert(out != nullptr);
     auto eq = [&](const char* k) noexcept {
         return std::strlen(k) == len && std::memcmp(s, k, len) == 0;
     };
-    if (eq("null"))    return AvroType::kNull;
-    if (eq("boolean")) return AvroType::kBoolean;
-    if (eq("int"))     return AvroType::kInt;
-    if (eq("long"))    return AvroType::kLong;
-    if (eq("float"))   return AvroType::kFloat;
-    if (eq("double"))  return AvroType::kDouble;
-    if (eq("bytes"))   return AvroType::kBytes;
-    if (eq("string"))  return AvroType::kString;
-    return AvroType::kString;  // fallback for named/complex — treated as string
+    if (eq("null"))    { *out = AvroType::kNull;    return true; }
+    if (eq("boolean")) { *out = AvroType::kBoolean; return true; }
+    if (eq("int"))     { *out = AvroType::kInt;     return true; }
+    if (eq("long"))    { *out = AvroType::kLong;    return true; }
+    if (eq("float"))   { *out = AvroType::kFloat;   return true; }
+    if (eq("double"))  { *out = AvroType::kDouble;  return true; }
+    if (eq("bytes"))   { *out = AvroType::kBytes;   return true; }
+    if (eq("string"))  { *out = AvroType::kString;  return true; }
+    return false;
 }
 
 bool sx_key(void* c, const char* b, int32_t len) noexcept {
@@ -138,38 +218,57 @@ bool sx_key(void* c, const char* b, int32_t len) noexcept {
         return static_cast<int32_t>(std::strlen(kk)) == len &&
                std::memcmp(b, kk, static_cast<size_t>(len)) == 0;
     };
-    if (k("fields")) { s->in_fields = true; }
-    else if (k("name") && s->in_fields) { s->expect_name = true; }
-    else if (k("type") && s->in_fields) { s->expect_type = true; }
+    SFrame* f = sx_top(s);
+    if (k("type"))        f->last_key = kKeyType;
+    else if (k("name"))   f->last_key = kKeyName;
+    else if (k("fields")) f->last_key = kKeyFields;
+    else                  f->last_key = kKeyOther;
     return true;
 }
 
 bool sx_string(void* c, const char* b, int32_t len) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
-    if (s->expect_name && !s->have_name) {
-        uint32_t n = static_cast<uint32_t>(len);
-        if (n >= kAvroMaxName) n = kAvroMaxName - 1u;
-        std::memcpy(s->pending_name, b, n);
-        s->pending_name[n] = '\0';
-        s->have_name = true;
-        s->expect_name = false;
-        return true;
-    }
-    if (s->in_union) {                       // a branch of ["...", "..."]
-        const AvroType t = type_from_str(b, static_cast<uint32_t>(len));
+    SFrame* f = sx_top(s);
+    const uint32_t ln = static_cast<uint32_t>(len);
+
+    if (f->kind == kFrUnion) {                   // a branch of ["...","..."]
+        AvroType t = AvroType::kNull;
+        if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
         if (t == AvroType::kNull) {
-            if (s->union_null_idx == kNoNullBranch) s->union_null_idx = s->union_n;
-        } else if (!s->union_have_type) {
-            s->union_type      = t;
-            s->union_have_type = true;
+            if (f->union_null_idx == kNoNullBranch) f->union_null_idx = f->union_n;
+        } else if (!f->union_have_type) {
+            f->union_type      = t;
+            f->union_have_type = true;
         }
-        if (s->union_n < 0xFEu) ++s->union_n;   // bounded; index fits uint8
+        if (f->union_n < 0xFEu) ++f->union_n;    // bounded; index fits uint8
         return true;
     }
-    if (s->expect_type) {                    // plain "type": "long"
-        const AvroType t = type_from_str(b, static_cast<uint32_t>(len));
-        if (t == AvroType::kNull) { s->saw_null_union = true; return true; }
-        commit_field(s, t, /*nullable=*/s->saw_null_union, /*null_branch=*/0u);
+
+    if (f->last_key == kKeyName) {
+        f->last_key = kKeyNone;
+        // Only a FIELD object's "name" names a field. A record definition's
+        // own "name" (e.g. "Addr") is the type's name and must be ignored —
+        // taking it as a field name is what produced the phantom extra field.
+        if (f->kind == kFrFieldObj && !f->have_name) {
+            uint32_t n = ln;
+            if (n >= kAvroMaxName) n = kAvroMaxName - 1u;
+            std::memcpy(f->name, b, n);
+            f->name[n]   = '\0';
+            f->have_name = true;
+        }
+        return true;
+    }
+
+    if (f->last_key == kKeyType) {
+        f->last_key = kKeyNone;
+        const bool is_rec = (ln == 6u && std::memcmp(b, "record", 6) == 0);
+        if (is_rec) { f->is_record = true; return true; }  // splices at "fields"
+        AvroType t = AvroType::kNull;
+        if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
+        bool crossed_union = false;
+        const int32_t fi = sx_enclosing_field(s, &crossed_union);
+        if (fi < 0) return true;         // a "type" outside any field
+        sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u);
         return true;
     }
     return true;
@@ -177,41 +276,72 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
 
 bool sx_begin_obj(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
-    s->depth++;
+    // An object directly inside a "fields" array IS a field; anything else is
+    // a type/record definition.
+    const uint8_t kind =
+        (sx_top(s)->kind == kFrFieldsArr) ? kFrFieldObj : kFrObj;
+    sx_push(s, kind);
     return true;
 }
+
 bool sx_end_obj(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
-    if (s->depth > 0) s->depth--;
+    SFrame* f = sx_top(s);
+    // A field that resolved to nothing means we could not model its type;
+    // dropping it would shift every later field's wire position, so fail.
+    if (f->kind == kFrFieldObj && !f->resolved) s->ok = false;
+    sx_pop(s);
     return true;
 }
 
-// An array opened while a field's "type" is pending IS that field's union.
-// (The enclosing "fields": [...] array opens when expect_type is false, so the
-// two cannot be confused.)
 bool sx_begin_arr(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
-    if (s->expect_type && !s->in_union) {
-        s->in_union        = true;
-        s->union_n         = 0u;
-        s->union_null_idx  = kNoNullBranch;
-        s->union_have_type = false;
-        s->union_type      = AvroType::kNull;
-    }
+    SFrame* p = sx_top(s);
+    uint8_t kind = kFrArr;
+    if (p->last_key == kKeyFields)   kind = kFrFieldsArr;
+    else if (p->last_key == kKeyType) kind = kFrUnion;
+    p->last_key = kKeyNone;
+    sx_push(s, kind);
+    if (kind != kFrFieldsArr) return true;
+
+    // A "fields" array belongs to a record. If that record is the VALUE of an
+    // enclosing field, its leaves are spliced in under "<field>." — which is
+    // also how we mark that enclosing field resolved.
+    bool crossed_union = false;
+    const int32_t fi = sx_enclosing_field(s, &crossed_union);
+    if (fi < 0) return true;                     // the top-level record
+    if (crossed_union) { s->ok = false; return true; }  // optional group
+    SFrame* ff = &s->st[static_cast<uint32_t>(fi)];
+    if (!ff->have_name) { s->ok = false; return true; } // "name" must precede
+    const uint32_t nl = static_cast<uint32_t>(std::strlen(ff->name));
+    if (s->prefix_len + nl + 1u >= kAvroMaxName) { s->ok = false; return true; }
+    SFrame* self = sx_top(s);
+    self->prefix_save   = s->prefix_len;
+    self->pushed_prefix = true;
+    std::memcpy(s->prefix + s->prefix_len, ff->name, nl);
+    s->prefix_len += nl;
+    s->prefix[s->prefix_len++] = '.';
+    ff->resolved = true;
     return true;
 }
 
-// Resolve the union here — after every branch is known — so branch ORDER
-// cannot change the result. ["null",T] yields null_branch 0, [T,"null"] 1.
 bool sx_end_arr(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
-    if (!s->in_union) return true;
-    const bool nullable = (s->union_null_idx != kNoNullBranch);
-    const AvroType t =
-        s->union_have_type ? s->union_type : AvroType::kNull;
-    commit_field(s, t, nullable,
-                 nullable ? s->union_null_idx : 0u);
-    s->in_union = false;
+    SFrame* f = sx_top(s);
+    if (f->kind == kFrUnion) {
+        const bool nullable = (f->union_null_idx != kNoNullBranch);
+        const AvroType t = f->union_have_type ? f->union_type : AvroType::kNull;
+        const uint8_t nb = nullable ? f->union_null_idx : 0u;
+        sx_pop(s);
+        bool crossed_union = false;
+        const int32_t fi = sx_enclosing_field(s, &crossed_union);
+        sx_commit_leaf(s, fi, t, nullable, nb);
+        return true;
+    }
+    if (f->kind == kFrFieldsArr && f->pushed_prefix) {
+        s->prefix_len = f->prefix_save;
+    }
+    sx_pop(s);
     return true;
 }
 
@@ -223,10 +353,11 @@ uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
     assert(fields != nullptr);
     SchemaCtx s;
     std::memset(&s, 0, sizeof(s));
-    s.fields         = fields;
-    s.max_fields     = max_fields;
-    s.union_null_idx = kNoNullBranch;
-    s.ok             = true;
+    s.fields     = fields;
+    s.max_fields = max_fields;
+    s.ok         = true;
+    s.st[0].kind = kFrRoot;
+    s.st[0].union_null_idx = kNoNullBranch;
     parse::json::SaxHandler h;
     std::memset(&h, 0, sizeof(h));
     h.ctx = &s;
@@ -239,6 +370,7 @@ uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
     if (!parse::json::sax_parse(json, static_cast<int32_t>(json_len), &h)) {
         return 0;
     }
+    if (!s.ok) return 0;
     return s.n;
 }
 

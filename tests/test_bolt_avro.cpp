@@ -281,6 +281,176 @@ TEST(BoltAvroDatum, SchemaParseRespectsMaxFields) {
                                    8, f, 2, &n2));
 }
 
+// ---------------------------------------------------------------------------
+// Nested records. Avro encodes a record's fields inline and in order with no
+// delimiters, so a nested record's correct FLATTENING is exactly the parent's
+// wire sequence — the leaves splice into the positional list, and the decoder
+// needs no notion of nesting at all. The names are dotted so a nested leaf
+// cannot collide with a top-level field of the same name.
+// ---------------------------------------------------------------------------
+
+TEST(BoltAvroDatum, NestedRecordFlattensPositionally) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"Event\",\"fields\":["
+        "{\"name\":\"user_id\",\"type\":\"long\"},"
+        "{\"name\":\"addr\",\"type\":{\"type\":\"record\",\"name\":\"Addr\","
+        "\"fields\":[{\"name\":\"zip\",\"type\":\"long\"}]}},"
+        "{\"name\":\"amount\",\"type\":\"double\"}]}";
+
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    // Three LEAVES on the wire. The old parser produced four (it committed
+    // "addr" from the nested "record" type string, then took the nested
+    // record's own "name":"Addr" as a further field), so every datum
+    // under-ran and decoded nothing.
+    ASSERT_EQ(n, 3u);
+    EXPECT_STREQ(f[0].name, "user_id");
+    EXPECT_EQ(f[0].type, AvroType::kLong);
+    EXPECT_STREQ(f[1].name, "addr.zip");
+    EXPECT_EQ(f[1].type, AvroType::kLong);
+    EXPECT_STREQ(f[2].name, "amount");
+    EXPECT_EQ(f[2].type, AvroType::kDouble);
+
+    std::vector<uint8_t> d;
+    put_long(d, 105);                                   // user_id
+    put_long(d, 94107);                                 // addr.zip (inline)
+    const double dv = 7.5;
+    d.insert(d.end(), reinterpret_cast<const uint8_t*>(&dv),
+             reinterpret_cast<const uint8_t*>(&dv) + 8);
+    AvroValue v[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());                      // exact — no drift
+    EXPECT_EQ(v[0].num.i64, 105);
+    EXPECT_EQ(v[1].num.i64, 94107);
+    EXPECT_DOUBLE_EQ(v[2].num.f64, 7.5);
+}
+
+// Depth 3, and a scalar AFTER the nested group: if the splice mis-counted by
+// even one field, `tail` would decode from the wrong offset.
+TEST(BoltAvroDatum, NestedRecordTwoLevelsThenScalar) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"A\",\"fields\":["
+        "{\"name\":\"b\",\"type\":{\"type\":\"record\",\"name\":\"B\","
+        "\"fields\":["
+        "{\"name\":\"c\",\"type\":{\"type\":\"record\",\"name\":\"C\","
+        "\"fields\":[{\"name\":\"d\",\"type\":\"long\"},"
+        "{\"name\":\"e\",\"type\":\"string\"}]}},"
+        "{\"name\":\"f\",\"type\":\"int\"}]}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 4u);
+    EXPECT_STREQ(f[0].name, "b.c.d");
+    EXPECT_STREQ(f[1].name, "b.c.e");
+    EXPECT_STREQ(f[2].name, "b.f");
+    EXPECT_STREQ(f[3].name, "tail");
+
+    std::vector<uint8_t> d;
+    put_long(d, 11);            // b.c.d
+    put_str(d, "xy");           // b.c.e
+    put_long(d, 3);             // b.f  (int)
+    put_long(d, 99);            // tail
+    AvroValue v[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_EQ(v[0].num.i64, 11);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(v[1].bytes),
+                          v[1].bytes_len), "xy");
+    EXPECT_EQ(v[2].num.i64, 3);
+    EXPECT_EQ(v[3].num.i64, 99);     // the alignment proof
+}
+
+// A nested leaf and a top-level field may share a bare name; dotting keeps
+// them distinct instead of silently producing two fields called "zip".
+TEST(BoltAvroDatum, NestedLeafDoesNotCollideWithTopLevel) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"zip\",\"type\":\"long\"},"
+        "{\"name\":\"addr\",\"type\":{\"type\":\"record\",\"name\":\"Addr\","
+        "\"fields\":[{\"name\":\"zip\",\"type\":\"long\"}]}}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_STREQ(f[0].name, "zip");
+    EXPECT_STREQ(f[1].name, "addr.zip");
+}
+
+// A nullable field INSIDE a nested record still carries its own union index.
+TEST(BoltAvroDatum, NestedNullableLeaf) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"n\",\"type\":{\"type\":\"record\",\"name\":\"N\","
+        "\"fields\":[{\"name\":\"opt\",\"type\":[\"null\",\"long\"]}]}},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_STREQ(f[0].name, "n.opt");
+    EXPECT_TRUE(f[0].nullable);
+    EXPECT_EQ(f[0].null_branch, 0u);
+    EXPECT_STREQ(f[1].name, "tail");
+
+    std::vector<uint8_t> d;
+    put_long(d, 0);             // n.opt -> null branch
+    put_long(d, 42);            // tail
+    AvroValue v[8];
+    uint64_t consumed = 0;
+    ASSERT_TRUE(avro_decode_datum(d.data(), d.size(), f, n, v, &consumed));
+    EXPECT_EQ(consumed, d.size());
+    EXPECT_TRUE(v[0].is_null);
+    EXPECT_EQ(v[1].num.i64, 42);
+}
+
+// Types the flat positional model cannot describe must FAIL the parse, not
+// decode as something plausible. The old parser mapped every unrecognised
+// type string to "string", so an enum (an int on the wire) was read as a
+// length-prefixed byte string — silent corruption of that row and every
+// row after it.
+TEST(BoltAvroDatum, UnrepresentableTypesFailClosed) {
+    const char* cases[] = {
+        // enum: an int index on the wire, not a string.
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"s\",\"type\":{\"type\":\"enum\",\"name\":\"S\","
+        "\"symbols\":[\"A\",\"B\"]}}]}",
+        // fixed: N raw bytes, and the width has nowhere to live yet.
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"h\",\"type\":{\"type\":\"fixed\",\"name\":\"H\","
+        "\"size\":16}}]}",
+        // A named-type REFERENCE needs a definition table to resolve.
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"x\",\"type\":\"SomeOtherRecord\"}]}",
+        // A nullable nested RECORD is not flattenable at all: the whole
+        // group is present or absent per row, so no fixed positional list
+        // can describe it.
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":[\"null\",{\"type\":\"record\","
+        "\"name\":\"A\",\"fields\":[{\"name\":\"z\",\"type\":\"long\"}]}]}]}",
+    };
+    for (const char* json : cases) {
+        AvroField f[8];
+        uint32_t n = 0;
+        EXPECT_FALSE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                       static_cast<uint32_t>(std::strlen(json)),
+                                       f, 8, &n))
+            << "should have failed closed: " << json;
+    }
+}
+
 TEST(BoltAvro, HeaderParse) {
     AvroField fields[2];
     std::memset(fields, 0, sizeof(fields));
