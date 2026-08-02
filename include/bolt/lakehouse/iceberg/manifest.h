@@ -11,18 +11,33 @@
 // the same stack Iceberg's ManifestWriter uses (tests/data/
 // golden_avro_manifest.avro, BoltAvroIceberg.RealJavaWrittenManifestShapeReads).
 //
-// ONE shape still blocks a genuine manifest, and it was MEASURED rather than
-// assumed. Iceberg encodes its INT-KEYED maps — column_sizes, value_counts,
-// null_value_counts, lower_bounds, upper_bounds — as array<record<key,value>>
-// (Avro maps only take string keys). That writer emits an array as a POSITIVE
-// element count with NO byte size, so a record element cannot be skipped: there
-// is nothing to jump over and the element width is unknowable. bolt fails
-// closed there rather than mis-aligning every following field
-// (BoltAvroIceberg.RealJavaArrayOfRecordFailsClosed pins it against a real
-// Java-written file).
+// UPDATE 2: the array<record> blocker is GONE too. Iceberg encodes its
+// INT-KEYED maps — column_sizes, value_counts, null_value_counts,
+// lower_bounds, upper_bounds — as array<record<key,value>> (Avro maps only
+// take string keys), and the Java writer emits an array as a POSITIVE element
+// count with NO byte size, so there is nothing to jump over. bolt now MODELS
+// the element record (AvroField::item_type == kAvroItemRecord, its flattened
+// fields spliced in right after the container) and computes each element's
+// width by walking them — the only way to advance past that form.
+// BoltAvroIceberg.RealJavaArrayOfRecordReads pins it against the same real
+// Java-written file the old failure test pinned.
 //
-// So this flag stays ON. Flipping it needs element-aware descent into an
-// array<record> — a real increment, not a switch. TODO(W5-avro-nested-reader).
+// WHAT STILL BLOCKS FLIPPING THIS FLAG (measured, not assumed):
+//   1. There is no Avro manifest PARSER. This flag is documentation, not a
+//      switch: iceberg_manifest.cpp implements manifest_parse_json /
+//      manifest_list_parse_json only, and nothing reads the macro. Flipping it
+//      changes no code path.
+//   2. The Avro reader delivers one value per FIELD, so a REPEATED field has
+//      nowhere to put its N values: containers are walked correctly but
+//      publish as null, and the element descriptors publish as null too.
+//      DataFileRef needs exactly the repeated parts — FileStats (from those
+//      array<record> maps) and equality_ids — so a useful Avro manifest reader
+//      needs per-ELEMENT value delivery, not just a correct skip. The element
+//      schema now required to do that is already parsed and adjacent, so the
+//      shape is a per-element callback over the same walk skip_elem_record
+//      performs. Scalars and the nested `partition` record already flatten and
+//      would come through today.
+// TODO(W5-avro-manifest-reader): (2) then (1).
 //
 // JSON Manifest-list:
 //   [{"manifest_path", "manifest_length", "partition_spec_id", "content",

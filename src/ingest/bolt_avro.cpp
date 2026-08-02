@@ -131,17 +131,34 @@ struct SchemaCtx {
     uint32_t   sp;            // index of the top frame
     char       prefix[kAvroMaxName];
     uint32_t   prefix_len;
-    // Stack index at which we entered a container's ELEMENT (0 = not in one).
-    // Everything inside is inert: an array<record>'s inner "fields" must NOT
-    // splice into the enclosing field, because those leaves are not in the
-    // parent's wire sequence -- they repeat per element.
+    // Stack index at which we entered a container element we cannot model
+    // (0 = not in one). Everything inside is inert.
     uint32_t   suppress_sp;
+    // Stack index at which we entered a container's ELEMENT OBJECT that might
+    // be a RECORD (0 = not in one). Leaves inside land in `elem_buf` under
+    // ELEMENT-RELATIVE names -- they are not in the parent's wire sequence
+    // (they repeat per element), but their widths are what lets the decoder
+    // step over a positive-count block, which is the form Avro's Java writer
+    // emits for array<record>. Nesting an element inside an element falls
+    // back to suppression: only one capture is live at a time.
+    uint32_t   capture_sp;
+    uint32_t   capture_prefix_len;              // dotted prefix to restore
+    char       capture_prefix[kAvroMaxName];    // ...and its bytes
+    AvroField  elem_buf[kAvroMaxElemFields];
+    uint32_t   elem_n;
     bool       ok;
 };
 
 bool sx_suppressed(const SchemaCtx* s) noexcept {
     assert(s != nullptr);
     return s->suppress_sp != 0u && s->sp >= s->suppress_sp;
+}
+
+// Inside a container element object whose fields we are modelling.
+bool sx_capturing(const SchemaCtx* s) noexcept {
+    assert(s != nullptr);
+    assert(s->sp < kAvroMaxSchemaDepth);
+    return s->capture_sp != 0u && s->sp >= s->capture_sp;
 }
 
 SFrame* sx_top(SchemaCtx* s) noexcept {
@@ -161,6 +178,10 @@ void sx_push(SchemaCtx* s, uint8_t kind) noexcept {
     std::memset(f, 0, sizeof(*f));
     f->kind           = kind;
     f->union_null_idx = kNoNullBranch;
+    // "unknown element" is the safe default, and it must not depend on JSON
+    // key order: {"items":"long","type":"array"} is as legal as the reverse,
+    // so the "array"/"map" type string must NOT reset what "items" recorded.
+    f->item_type      = kAvroItemOpaque;
 }
 
 void sx_pop(SchemaCtx* s) noexcept {
@@ -175,7 +196,12 @@ int32_t sx_enclosing_field(const SchemaCtx* s, bool* crossed_union) noexcept {
     assert(s != nullptr);
     assert(crossed_union != nullptr);
     *crossed_union = false;
-    for (uint32_t i = s->sp + 1u; i-- > 0;) {          // bounded by depth
+    // While capturing, the search STOPS at the element object: the element's
+    // own "fields" array must behave exactly like the top-level record's
+    // (no prefix splice, no marking the enclosing field resolved), because
+    // its leaves describe the element, not the enclosing record.
+    const uint32_t lo = sx_capturing(s) ? s->capture_sp : 0u;
+    for (uint32_t i = s->sp + 1u; i-- > lo;) {         // bounded by depth
         if (s->st[i].kind == kFrUnion) *crossed_union = true;
         if (s->st[i].kind == kFrFieldObj) return static_cast<int32_t>(i);
     }
@@ -192,10 +218,23 @@ void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
     SFrame* ff = &s->st[static_cast<uint32_t>(fi)];
     if (!ff->have_name) { s->ok = false; return; }
     ff->resolved = true;
-    if (s->n >= s->max_fields) return;                 // bounded clamp
+    AvroField* f = nullptr;
+    if (sx_capturing(s)) {
+        // An element field must resolve to a PRIMITIVE: the point of modelling
+        // the element is to compute its byte width, and a container nested
+        // inside it would need its own block walk to do that. Fail rather than
+        // model a width we cannot compute.
+        if (t == AvroType::kArray || t == AvroType::kMap) { s->ok = false; return; }
+        // FAIL, never clamp: a truncated element under-states its width and
+        // would mis-align every field after the container.
+        if (s->elem_n >= kAvroMaxElemFields) { s->ok = false; return; }
+        f = &s->elem_buf[s->elem_n++];
+    } else {
+        if (s->n >= s->max_fields) return;              // bounded clamp
+        f = &s->fields[s->n++];
+    }
     const uint32_t nl = static_cast<uint32_t>(std::strlen(ff->name));
     if (s->prefix_len + nl + 1u > kAvroMaxName) { s->ok = false; return; }
-    AvroField* f = &s->fields[s->n++];
     std::memset(f, 0, sizeof(*f));
     std::memcpy(f->name, s->prefix, s->prefix_len);
     std::memcpy(f->name + s->prefix_len, ff->name, nl);
@@ -204,6 +243,44 @@ void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
     f->nullable    = nullable;
     f->null_branch = nullable ? null_branch : 0u;
     f->item_type   = item_type;
+}
+
+// Commit an array/map field, then splice the captured element-record fields
+// immediately AFTER it (that adjacency is the contract AvroField::elem_fields
+// documents, and it is what lets the decoder find them from the container).
+void sx_commit_container(SchemaCtx* s, int32_t fi, AvroType ct,
+                         uint8_t item_type) noexcept {
+    assert(s != nullptr);
+    assert(ct == AvroType::kArray || ct == AvroType::kMap);
+    const uint32_t before = s->n;
+    sx_commit_leaf(s, fi, ct, /*nullable=*/false, /*null_branch=*/0u, item_type);
+    const uint32_t captured = s->elem_n;
+    s->elem_n = 0u;
+    if (item_type != kAvroItemRecord || !s->ok) return;
+    if (s->n != before + 1u) return;         // clamped away, or captured inside
+    assert(captured > 0u);
+    AvroField* cf = &s->fields[before];
+    const uint32_t cl = static_cast<uint32_t>(std::strlen(cf->name));
+    // No room for the element descriptors ⇒ the element width is unknowable
+    // here, so downgrade to opaque and let the decoder fail closed rather
+    // than advertise a record element with nothing to walk.
+    if (s->n + captured > s->max_fields) { cf->item_type = kAvroItemOpaque; return; }
+    // Check EVERY name fits before writing ANY: a half-written element list
+    // would leave orphan entries the decoder reads as parent fields.
+    for (uint32_t i = 0; i < captured; ++i) {          // bounded: kAvroMaxElemFields
+        const uint32_t el = static_cast<uint32_t>(std::strlen(s->elem_buf[i].name));
+        if (cl + 3u + el + 1u > kAvroMaxName) { cf->item_type = kAvroItemOpaque; return; }
+    }
+    for (uint32_t i = 0; i < captured; ++i) {          // bounded: kAvroMaxElemFields
+        const uint32_t el = static_cast<uint32_t>(std::strlen(s->elem_buf[i].name));
+        AvroField* d = &s->fields[s->n++];
+        *d = s->elem_buf[i];
+        std::memcpy(d->name, cf->name, cl);
+        std::memcpy(d->name + cl, "[].", 3);
+        std::memcpy(d->name + cl + 3u, s->elem_buf[i].name, el);
+        d->name[cl + 3u + el] = '\0';
+    }
+    cf->elem_fields = static_cast<uint16_t>(captured);
 }
 
 // Resolve a type NAME. Only the 8 primitives are representable in the flat
@@ -296,14 +373,15 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
         if (is_rec) { f->is_record = true; return true; }  // splices at "fields"
         // Containers resolve at the END of their type object, once "items" /
         // "values" has been seen (JSON key order is not guaranteed).
+        // item_type is NOT reset here: it defaults to opaque at frame push and
+        // "items"/"values" may already have refined it (JSON key order is
+        // free, and resetting it silently un-modelled every such schema).
         if (ln == 5u && std::memcmp(b, "array", 5) == 0) {
             f->complex_kind = kCplxArray;
-            f->item_type    = kAvroItemOpaque;
             return true;
         }
         if (ln == 3u && std::memcmp(b, "map", 3) == 0) {
             f->complex_kind = kCplxMap;
-            f->item_type    = kAvroItemOpaque;
             return true;
         }
         AvroType t = AvroType::kNull;
@@ -327,9 +405,20 @@ bool sx_begin_obj(void* c) noexcept {
     const bool elem = (p->last_key == kKeyItems || p->last_key == kKeyValues);
     if (elem) { p->item_type = kAvroItemOpaque; p->last_key = kKeyNone; }
     sx_push(s, kind);
+    if (!elem) return true;
     // A complex element's contents describe the ELEMENT, not the parent
-    // record, so nothing inside may commit or splice.
-    if (elem && s->suppress_sp == 0u) s->suppress_sp = s->sp;
+    // record, so nothing inside may splice into the parent. But if the element
+    // is a RECORD we still want its fields -- captured separately -- because
+    // their total width is the ONLY way to step over a positive-count block.
+    if (s->suppress_sp != 0u || s->capture_sp != 0u) {
+        if (s->suppress_sp == 0u) s->suppress_sp = s->sp;   // element-in-element
+        return true;
+    }
+    s->capture_sp         = s->sp;
+    s->capture_prefix_len = s->prefix_len;
+    std::memcpy(s->capture_prefix, s->prefix, s->prefix_len);
+    s->prefix_len         = 0u;             // element-relative dotted names
+    s->elem_n             = 0u;
     return true;
 }
 
@@ -341,6 +430,19 @@ bool sx_end_obj(void* c) noexcept {
         sx_pop(s);
         return true;
     }
+    if (s->capture_sp != 0u && s->sp == s->capture_sp) {
+        // Leaving a captured element object. It only models an element if it
+        // really was a record AND produced fields; anything else stays opaque
+        // (which fails the decode closed rather than guessing a width).
+        const bool modelled = f->is_record && s->elem_n > 0u;
+        s->capture_sp = 0u;
+        std::memcpy(s->prefix, s->capture_prefix, s->capture_prefix_len);
+        s->prefix_len = s->capture_prefix_len;
+        if (!modelled) s->elem_n = 0u;
+        sx_pop(s);
+        sx_top(s)->item_type = modelled ? kAvroItemRecord : kAvroItemOpaque;
+        return true;
+    }
     if (sx_suppressed(s)) { sx_pop(s); return true; }
     if (f->complex_kind != kCplxNone) {             // an array/map type object
         const AvroType ct = (f->complex_kind == kCplxArray) ? AvroType::kArray
@@ -350,9 +452,8 @@ bool sx_end_obj(void* c) noexcept {
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
         // A container inside a union would need the branch index AND the
         // block walk; the flat model cannot express that, so fail closed.
-        if (crossed_union) s->ok = false;
-        else sx_commit_leaf(s, fi, ct, /*nullable=*/false,
-                            /*null_branch=*/0u, it);
+        if (crossed_union) { s->ok = false; s->elem_n = 0u; }
+        else sx_commit_container(s, fi, ct, it);
         sx_pop(s);
         return true;
     }
@@ -437,6 +538,7 @@ uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
     s.ok         = true;
     s.st[0].kind = kFrRoot;
     s.st[0].union_null_idx = kNoNullBranch;
+    s.st[0].item_type      = kAvroItemOpaque;
     parse::json::SaxHandler h;
     std::memset(&h, 0, sizeof(h));
     h.ctx = &s;
@@ -556,24 +658,56 @@ bool skip_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
     }
 }
 
+// Advance past ONE element of an array<record> / map<record>. An Avro record
+// is inline with no delimiters, so its width is simply the sum of its fields'
+// widths -- which is exactly why modelling the element schema is what unlocks
+// a positive-count block (the form Avro's Java writer, and therefore Iceberg,
+// actually emits: no byte size to jump over).
+//
+// Element fields are primitives by construction: the schema parser refuses to
+// model an element whose own field is a container, so this stays flat -- no
+// recursion, no decoder stack.
+bool skip_elem_record(const uint8_t* p, uint64_t len, uint64_t* off,
+                      const AvroField* elem, uint32_t n_elem) noexcept {
+    assert(elem != nullptr);
+    assert(n_elem > 0u && n_elem <= kAvroMaxElemFields);
+    for (uint32_t e = 0; e < n_elem; ++e) {         // bounded: kAvroMaxElemFields
+        const AvroField* ef = &elem[e];
+        if (ef->nullable) {                          // union index precedes value
+            int64_t branch = 0;
+            if (!read_long(p, len, off, &branch)) return false;
+            if (branch == static_cast<int64_t>(ef->null_branch)) continue;
+        }
+        if (!skip_primitive(p, len, off, ef->type)) return false;
+    }
+    return true;
+}
+
 // Skip an array or map. On the wire both are `block* 0`, where
 //   block := count:long [size:long IF count < 0] item*
 // A NEGATIVE count is followed by the block's BYTE SIZE, which lets us skip
 // the whole block without knowing the element type at all. A positive count
 // carries no size, so each element must be walked individually — which needs
-// a primitive element type. When it is opaque (a record, union, or nested
-// container) we FAIL rather than guess a width: a wrong skip would silently
-// mis-align every field after it, which is exactly the failure this whole
-// change exists to remove.
+// a known element WIDTH. Two element shapes supply one: a primitive, and a
+// RECORD whose own fields are modelled (kAvroItemRecord + `elem`/`n_elem` —
+// the shape Iceberg's int-keyed maps take). When the element is opaque (a
+// union, or a nested container) we FAIL rather than guess a width: a wrong
+// skip would silently mis-align every field after it, which is exactly the
+// failure this whole change exists to remove.
 //
 // A map element is a key STRING followed by the value, so the key is skipped
 // first. Bounded: block count, and every element consumes at least one byte.
 constexpr uint32_t kAvroMaxBlocks = 1u << 20;
 
 bool skip_container(const uint8_t* p, uint64_t len, uint64_t* off,
-                    uint8_t item_type, bool is_map) noexcept {
+                    uint8_t item_type, bool is_map,
+                    const AvroField* elem, uint32_t n_elem) noexcept {
     assert(p != nullptr);
     assert(off != nullptr);
+    const bool rec = (item_type == kAvroItemRecord);
+    // A record element advertised with nothing to walk is unusable; refuse it
+    // up front rather than silently treating the type byte as a primitive.
+    if (rec && (elem == nullptr || n_elem == 0u)) return false;
     for (uint32_t blk = 0; blk < kAvroMaxBlocks; ++blk) {
         int64_t count = 0;
         if (!read_long(p, len, off, &count)) return false;
@@ -587,7 +721,7 @@ bool skip_container(const uint8_t* p, uint64_t len, uint64_t* off,
             *off += static_cast<uint64_t>(nbytes);
             continue;
         }
-        if (item_type == kAvroItemOpaque) return false; // cannot walk elements
+        if (!rec && item_type == kAvroItemOpaque) return false;  // no width
         const AvroType it = static_cast<AvroType>(item_type);
         for (int64_t i = 0; i < count; ++i) {           // bounded by `count`
             if (*off >= len) return false;
@@ -596,7 +730,11 @@ bool skip_container(const uint8_t* p, uint64_t len, uint64_t* off,
                 uint32_t kl = 0;
                 if (!read_bytes(p, len, off, &kb, &kl)) return false;
             }
-            if (!skip_primitive(p, len, off, it)) return false;
+            if (rec) {
+                if (!skip_elem_record(p, len, off, elem, n_elem)) return false;
+            } else if (!skip_primitive(p, len, off, it)) {
+                return false;
+            }
         }
     }
     return false;                                       // unterminated
@@ -632,11 +770,25 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
             // a schema containing an array was unreadable outright.
             case AvroType::kArray:
             case AvroType::kMap: {
+                // A modelled record element parks its field descriptors in the
+                // entries right after this one (AvroField::elem_fields). They
+                // are NOT in this record's wire sequence -- they repeat per
+                // element -- so they are published as null and stepped over.
+                const uint32_t ne = fd->elem_fields;
+                if (ne != 0u && (f + ne) >= n_fields) return false;
+                const AvroField* elem = (ne != 0u) ? &fields[f + 1u] : nullptr;
                 if (!skip_container(p, len, off, fd->item_type,
-                                    fd->type == AvroType::kMap)) {
+                                    fd->type == AvroType::kMap, elem, ne)) {
                     return false;
                 }
                 val->is_null = true;
+                for (uint32_t e = 1u; e <= ne; ++e) {   // bounded: elem_fields
+                    AvroValue* ev = &vals[f + e];
+                    std::memset(ev, 0, sizeof(*ev));
+                    ev->type    = fields[f + e].type;
+                    ev->is_null = true;
+                }
+                f += ne;
                 break;
             }
             case AvroType::kBoolean: {
@@ -810,9 +962,16 @@ uint32_t build_schema_json(const AvroField* fields, uint32_t n_fields,
     if (!put(&p, "{\"type\":\"record\",\"name\":\"r\",\"fields\":[")) return 0;
     for (uint32_t i = 0; i < n_fields; ++i) {        // bounded
         if (i && !put(&p, ",")) return 0;
+        // The writer emits primitives only. A container (or an element
+        // descriptor spliced in beside one) has no representation here, and
+        // indexing `prim` by its type id would read out of bounds — so a
+        // schema carrying one FAILS the write instead of emitting a schema
+        // that does not describe the bytes.
+        const uint32_t ti = static_cast<uint32_t>(fields[i].type);
+        if (ti >= sizeof(prim) / sizeof(prim[0])) return 0;
         if (!put(&p, "{\"name\":\"") || !put(&p, fields[i].name) ||
             !put(&p, "\",\"type\":")) return 0;
-        const char* tn = prim[static_cast<uint32_t>(fields[i].type)];
+        const char* tn = prim[ti];
         if (fields[i].nullable) {
             if (!put(&p, "[\"null\",\"") || !put(&p, tn) || !put(&p, "\"]"))
                 return 0;
