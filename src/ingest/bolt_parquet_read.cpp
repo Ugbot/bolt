@@ -770,7 +770,7 @@ bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
     if (row_group >= meta->n_row_groups) return false;
     const PqRowGroup* rg = &meta->row_groups[row_group];
     if (rg->num_rows < 0) return false;
-    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= 64
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
         ColCtx cx;
         if (!init_col_ctx(meta, c, row_group, row_group + 1, rg->num_rows,
                           arena, &out_cols[c], &cx)) {
@@ -976,7 +976,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
     ColCtx* cxs = arena->allocate_array<ColCtx>(meta->n_columns);
     if (cxs == nullptr) return false;
-    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= 64
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
         if (!init_col_ctx(meta, c, 0, meta->n_row_groups, meta->num_rows,
                           arena, &cols[c], &cxs[c])) {
             return false;

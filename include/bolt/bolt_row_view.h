@@ -21,8 +21,12 @@
 //      released, the owner will spin in `wait_drained` / eviction will
 //      skip the slot — memory safety preserved, but progress stalls.
 //
-// Size: with `kMaxBatchColumns = 256` this is ~2.6 KiB. Within Bolt's
-// norm for stack POD — `BoltBatch` is ~5 KiB on stack per bolt_column.h.
+// Size: with `kMaxFixedColumns = 256` (RowView's own cap — see below;
+// deliberately NOT the raised `kMaxBatchColumns = 1024`, an assert
+// ceiling, not RowView storage) this is ~2.6 KiB, measured `sizeof(RowView)`
+// = 2624 bytes on bolt 7e4dcf6. Within Bolt's norm for stack POD —
+// `BoltBatch` itself is only 128 bytes on stack post-G2FEAT-47 (its
+// `columns[2]` are arena pointers, not inline storage; see bolt_column.h).
 // Callers with fewer columns still only pay for the columns they fill;
 // the rest of `col_ptrs` is irrelevant.
 //

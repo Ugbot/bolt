@@ -93,10 +93,13 @@ struct WireStream {
     uint8_t  col_format[wire::kWireMaxCols];  // always Flat in Phase 1
 };
 
-// WireStream is ~12.5 KB at kMaxBatchColumns=256. Pass it by pointer always.
-// This guard makes an accidental by-value parameter or return a hard error.
+// WireStream is ~12.5 KB at kWireMaxCols=kMaxFixedColumns=256 (NOT
+// kMaxBatchColumns=1024 — the wire format deliberately stays on the
+// compact 256-column cap; see the G2FEAT-47 note on col_b0_off[] etc.
+// above). Pass it by pointer always. This guard makes an accidental
+// by-value parameter or return a hard error.
 static_assert(sizeof(WireStream) <= 16u * 1024u,
-              "WireStream layout blew past 16 KB — audit kMaxBatchColumns");
+              "WireStream layout blew past 16 KB — audit kWireMaxCols");
 static_assert(alignof(WireStream) >= alignof(uint64_t),
               "WireStream must be 8-byte aligned for u64 offset arrays");
 

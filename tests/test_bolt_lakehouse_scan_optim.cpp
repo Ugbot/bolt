@@ -12,6 +12,7 @@ using bolt::BoltType;
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 using namespace bolt::lakehouse;
@@ -73,6 +74,79 @@ TEST(W8ColPrune, EmptyProjectionKeepsAll) {
     ASSERT_TRUE(column_prune_plan(&opts, names, 2, &plan));
     ASSERT_TRUE(plan.all_columns);
     ASSERT_EQ(plan.n_keep, 2u);
+}
+
+// G2FEAT-47-class real-data width: ClickBench `hits` is 105 real columns.
+// Before this fix kLakeMaxProjection was 64 and this call returned false
+// outright (n_src=105 > 64), even though no projection was requested —
+// this is the discriminating repro for the fix.
+TEST(W8ColPrune, WideSchema105ColumnsAllColumnsSurvives) {
+    static char name_storage[105][kLakeMaxColName];
+    static const char* names[105];
+    for (uint32_t i = 0; i < 105; ++i) {
+        std::snprintf(name_storage[i], kLakeMaxColName, "col_%u", i);
+        names[i] = name_storage[i];
+    }
+    ReadOptions opts{};
+    read_options_init(&opts);   // no projection -> "all columns"
+    ColumnPruneResult plan{};
+    ASSERT_TRUE(column_prune_plan(&opts, names, 105, &plan));
+    ASSERT_TRUE(plan.all_columns);
+    ASSERT_EQ(plan.n_keep, 105u);
+    for (uint32_t i = 0; i < 105; ++i) ASSERT_EQ(plan.keep[i], i);
+}
+
+// A 90-column projected SELECT (the documented ClickBench Q30 shape):
+// project a strict subset out of a 105-column source schema, still under
+// the raised 128 cap.
+TEST(W8ColPrune, WideSchema90ColumnProjectionExact) {
+    static char name_storage[105][kLakeMaxColName];
+    static const char* names[105];
+    for (uint32_t i = 0; i < 105; ++i) {
+        std::snprintf(name_storage[i], kLakeMaxColName, "col_%u", i);
+        names[i] = name_storage[i];
+    }
+    ReadOptions opts{};
+    read_options_init(&opts);
+    for (uint32_t i = 0; i < 90; ++i) {
+        std::strncpy(opts.projection[i], name_storage[i], kLakeMaxColName);
+    }
+    opts.n_projection = 90;
+    ColumnPruneResult plan{};
+    ASSERT_TRUE(column_prune_plan(&opts, names, 105, &plan));
+    ASSERT_FALSE(plan.all_columns);
+    ASSERT_EQ(plan.n_keep, 90u);
+    for (uint32_t i = 0; i < 90; ++i) ASSERT_EQ(plan.keep[i], i);
+}
+
+// A width just over the raised cap (129 > 128) must reject loudly, never
+// truncate silently.
+TEST(W8ColPrune, JustOverRaisedCapRejectsLoudly) {
+    static char name_storage[129][kLakeMaxColName];
+    static const char* names[129];
+    for (uint32_t i = 0; i < 129; ++i) {
+        std::snprintf(name_storage[i], kLakeMaxColName, "col_%u", i);
+        names[i] = name_storage[i];
+    }
+    ReadOptions opts{};
+    read_options_init(&opts);
+    ColumnPruneResult plan{};
+    ASSERT_FALSE(column_prune_plan(&opts, names, 129, &plan));
+}
+
+// Exactly at the raised cap (128) must succeed.
+TEST(W8ColPrune, ExactlyAtRaisedCapSucceeds) {
+    static char name_storage[128][kLakeMaxColName];
+    static const char* names[128];
+    for (uint32_t i = 0; i < 128; ++i) {
+        std::snprintf(name_storage[i], kLakeMaxColName, "col_%u", i);
+        names[i] = name_storage[i];
+    }
+    ReadOptions opts{};
+    read_options_init(&opts);
+    ColumnPruneResult plan{};
+    ASSERT_TRUE(column_prune_plan(&opts, names, 128, &plan));
+    ASSERT_EQ(plan.n_keep, 128u);
 }
 
 // -----------------------------------------------------------------------

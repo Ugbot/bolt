@@ -42,7 +42,20 @@ enum class PredicateOp : uint8_t {
 static constexpr uint32_t kLakeMaxColName  = 64u;
 static constexpr uint32_t kLakeMaxValBytes = 64u;
 static constexpr uint32_t kLakeMaxPredicates = 16u;
-static constexpr uint32_t kLakeMaxProjection = 64u;
+// Matches bolt::ingest::parquet::kPqMaxColumns (bolt_parquet_meta.h) — the
+// source-schema width a lakehouse scan must be able to project/prune,
+// coherently with what the Parquet reader beneath it can decode. Raised
+// from 64 for G2FEAT-47-class real-data widths (ClickBench `hits` is a
+// real 105-flat-leaf-column table; 64 rejected `column_prune_plan` outright
+// even with no projection requested). All arrays sized by this constant
+// (ReadOptions::projection, ColumnPruneResult::keep,
+// RowGroupStats::{min_i64,max_i64,null_count}) are arena- or
+// caller-allocated PODs, never stack-local in a hot loop — see
+// delta_scan.cpp::ScanHandle / iceberg_scan.cpp::ScanHandle, both
+// arena-allocated via `arena->allocate_array<ScanHandle>(1)`. This is an
+// assert-ceiling-style cap: `column_prune_plan` rejects (returns false)
+// rather than truncating when `n_src > kLakeMaxProjection`.
+static constexpr uint32_t kLakeMaxProjection = 128u;
 static constexpr uint32_t kLakeMaxPartCols  = 8u;
 static constexpr uint32_t kLakeMaxLiveFiles = 4096u;
 static constexpr uint32_t kLakeMaxRowGroups = 4096u;

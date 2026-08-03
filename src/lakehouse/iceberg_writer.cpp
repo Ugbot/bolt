@@ -177,8 +177,17 @@ ingest::parquet::ParquetWriteOpts make_pq_opts(const Schema* sch,
                                                 const WriteOptions* w) noexcept {
     ingest::parquet::ParquetWriteOpts po{};
     assert(sch != nullptr);
+    // COLUMN-WIDTH NORMALIZATION (2026-08-03) — STACK BUFFER OVERFLOW FIX.
+    // `po.columns` is `ParquetWriteColumn[kMaxFixedColumns]` (256) on a
+    // STACK-LOCAL struct, but this clamped to kMaxBatchColumns (1024). Correct
+    // while both were 256; raising kMaxBatchColumns to 1024 (G2FEAT-47) made
+    // any 257..1024-field schema overflow `po` on the stack. Clamp to the
+    // destination array's real size. `n_columns` below is set to this clamped
+    // n, so an over-wide schema surfaces downstream as a short column list
+    // rather than corrupting the frame; parquet_write_open additionally
+    // rejects anything past kPwMaxColumns (== kMaxFixedColumns).
     const uint32_t n =
-        sch->n_fields < kMaxBatchColumns ? sch->n_fields : kMaxBatchColumns;
+        sch->n_fields < kMaxFixedColumns ? sch->n_fields : kMaxFixedColumns;
     for (uint32_t i = 0; i < n; ++i) {
         std::strncpy(po.columns[i].name, sch->fields[i].name,
                      sizeof(po.columns[i].name) - 1u);
