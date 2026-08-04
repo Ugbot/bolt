@@ -95,19 +95,146 @@ void copy_stat(const uint8_t* p, uint32_t n, uint8_t* dst,
     *out_len = n;
 }
 
-// ---- SchemaElement ---------------------------------------------------------
-// fields: 1 type(i32) 2 type_length 3 repetition 4 name 5 num_children
-//         6 converted_type 7 scale 8 precision (9 field_id, 10 logicalType: skipped)
+// ---- SchemaElement + LogicalType (G2FEAT-46) -------------------------------
+// SchemaElement fields: 1 type(i32) 2 type_length 3 repetition 4 name
+//   5 num_children 6 converted_type 7 scale 8 precision 9 field_id
+//   10 logicalType(union).
 struct SchemaElem {
     PqColumn col;
     int32_t  num_children;   // >0 => group node (root or nested)
     bool     has_type;
 };
 
+// ConvertedType numeric values (parquet.thrift ConvertedType enum).
+constexpr int32_t kCtDecimal = 5, kCtDate = 6, kCtTimeMillis = 7,
+                  kCtTimeMicros = 8, kCtTsMillis = 9, kCtTsMicros = 10,
+                  kCtUint8 = 11, kCtUint16 = 12, kCtUint32 = 13,
+                  kCtUint64 = 14, kCtInt8 = 15, kCtInt16 = 16,
+                  kCtInt32 = 17, kCtInt64 = 18;
+
+// TimeUnit union (parquet.thrift): field id 1 MILLIS / 2 MICROS / 3 NANOS,
+// each an empty struct. Returns 0 (none) when unrecognized/absent.
+int32_t parse_time_unit(TcCursor* c) noexcept {
+    assert(c != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    int32_t unit = 0;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        if (fid >= 1 && fid <= 3) unit = fid;
+        if (!tc_skip(c, ft, 0)) return unit;   // skip the empty struct value
+    }
+    return unit;
+}
+
+// TimestampType / TimeType struct: 1 isAdjustedToUTC(bool) 2 unit(TimeUnit).
+void parse_ts_or_time(TcCursor* c, uint8_t* utc, int32_t* unit) noexcept {
+    assert(c != nullptr && utc != nullptr && unit != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        if (fid == 1) {                        // bool value in the type nibble
+            *utc = (ft == kTcTrue) ? 1 : 0;
+        } else if (fid == 2 && ft == kTcStruct) {
+            *unit = parse_time_unit(c);
+        } else if (!tc_skip(c, ft, 0)) {
+            return;
+        }
+    }
+}
+
+// IntType struct: 1 bitWidth(byte) 2 isSigned(bool).
+void parse_int_type(TcCursor* c, uint8_t* bits, uint8_t* is_signed) noexcept {
+    assert(c != nullptr && bits != nullptr && is_signed != nullptr);
+    *is_signed = 1;                            // thrift: required, default safe
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        if (fid == 1 && ft == kTcByte) {
+            uint8_t b = 0;
+            if (tc_u8(c, &b)) *bits = b;
+        } else if (fid == 2) {                 // bool value in the type nibble
+            *is_signed = (ft == kTcTrue) ? 1 : 0;
+        } else if (!tc_skip(c, ft, 0)) {
+            return;
+        }
+    }
+}
+
+// DecimalType struct: 1 scale(i32) 2 precision(i32).
+void parse_decimal_type(TcCursor* c, int32_t* scale, int32_t* prec) noexcept {
+    assert(c != nullptr && scale != nullptr && prec != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        int64_t v = 0;
+        if (fid == 1) { if (tc_zigzag(c, &v)) *scale = static_cast<int32_t>(v); }
+        else if (fid == 2) { if (tc_zigzag(c, &v)) *prec = static_cast<int32_t>(v); }
+        else if (!tc_skip(c, ft, 0)) return;
+    }
+}
+
+// LogicalType union (SchemaElement field 10). The set field id selects the
+// member: 5 DECIMAL, 6 DATE, 7 TIME, 8 TIMESTAMP, 10 INTEGER, 1 STRING.
+void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
+    assert(c != nullptr && col != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: union = one member
+        if (ft != kTcStruct) { (void)tc_skip(c, ft, 0); continue; }
+        switch (fid) {
+            case 1: col->logical = static_cast<int32_t>(PqLogical::String);
+                    (void)tc_skip(c, ft, 0); break;
+            case 5: col->logical = static_cast<int32_t>(PqLogical::Decimal);
+                    parse_decimal_type(c, &col->scale, &col->precision); break;
+            case 6: col->logical = static_cast<int32_t>(PqLogical::Date);
+                    (void)tc_skip(c, ft, 0); break;
+            case 7: col->logical = static_cast<int32_t>(PqLogical::Time);
+                    parse_ts_or_time(c, &col->ts_utc, &col->time_unit); break;
+            case 8: col->logical = static_cast<int32_t>(PqLogical::Timestamp);
+                    parse_ts_or_time(c, &col->ts_utc, &col->time_unit); break;
+            case 10: {
+                col->logical = static_cast<int32_t>(PqLogical::Int);
+                uint8_t bits = 0, sgn = 1;
+                parse_int_type(c, &bits, &sgn);
+                col->int_bits = bits;
+                col->int_signed = sgn;
+                break;
+            }
+            default: (void)tc_skip(c, ft, 0); break;
+        }
+    }
+}
+
+// Fallback: fill the normalized logical fields from the legacy ConvertedType
+// when SchemaElement had no LogicalType (field 10) — nanos have no
+// ConvertedType, but millis/micros + un/signed ints do.
+void derive_logical_from_converted(PqColumn* col) noexcept {
+    assert(col != nullptr);
+    switch (col->converted) {
+        case kCtTsMillis:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 1; break;
+        case kCtTsMicros:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 2; break;
+        case kCtTimeMillis: col->logical = static_cast<int32_t>(PqLogical::Time);      col->time_unit = 1; break;
+        case kCtTimeMicros: col->logical = static_cast<int32_t>(PqLogical::Time);      col->time_unit = 2; break;
+        case kCtUint8:  col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 8;  col->int_signed = 0; break;
+        case kCtUint16: col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 16; col->int_signed = 0; break;
+        case kCtUint32: col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 32; col->int_signed = 0; break;
+        case kCtUint64: col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 64; col->int_signed = 0; break;
+        case kCtInt8:   col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 8;  col->int_signed = 1; break;
+        case kCtInt16:  col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 16; col->int_signed = 1; break;
+        case kCtInt32:  col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 32; col->int_signed = 1; break;
+        case kCtInt64:  col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 64; col->int_signed = 1; break;
+        case kCtDecimal: col->logical = static_cast<int32_t>(PqLogical::Decimal); break;
+        case kCtDate:    col->logical = static_cast<int32_t>(PqLogical::Date); break;
+        default: break;
+    }
+}
+
 bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
     assert(c != nullptr && out != nullptr);
     std::memset(out, 0, sizeof(*out));
     out->col.converted = -1;
+    out->col.logical = static_cast<int32_t>(PqLogical::None);
+    out->col.int_signed = 1;
     out->num_children = 0;
     int16_t fid = 0;
     uint8_t ft;
@@ -145,14 +272,22 @@ bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
                 if (!tc_zigzag(c, &v)) return false;
                 out->col.scale = static_cast<int32_t>(v);
                 break;
-            case 8:    // 8 = precision (9 field_id / 10 logicalType skip)
+            case 8:    // 8 = precision
                 if (!tc_zigzag(c, &v)) return false;
                 out->col.precision = static_cast<int32_t>(v);
+                break;
+            case 10:   // logicalType union (preferred over ConvertedType)
+                if (ft != kTcStruct) { if (!tc_skip(c, ft, 0)) return false; break; }
+                parse_logical_type(c, &out->col);
                 break;
             default:
                 if (!tc_skip(c, ft, 0)) return false;
                 break;
         }
+    }
+    // No explicit LogicalType: normalize from the legacy ConvertedType.
+    if (out->col.logical == static_cast<int32_t>(PqLogical::None)) {
+        derive_logical_from_converted(&out->col);
     }
     return true;
 }

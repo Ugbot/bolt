@@ -992,6 +992,15 @@ target_link_libraries(test_bolt_parquet_write
 bolt_apply_hardening(test_bolt_parquet_write)
 add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
 
+# G2FEAT-46 — Parquet type conformance: TIMESTAMP (millis/micros/nanos),
+# TIME, INT96 legacy timestamp, INT32-DECIMAL, un/signed IntType mapping +
+# a Timestamp writer->reader round-trip.
+add_executable(test_bolt_parquet_types test_bolt_parquet_types.cpp)
+target_link_libraries(test_bolt_parquet_types
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_types)
+add_test(NAME test_bolt_parquet_types COMMAND test_bolt_parquet_types)
+
 # bolt::net::TlsSocket — OpenSSL 3.x TLS 1.3 client wrapper (G2CLUS-128).
 # Live connect test against cloudflare.com:443; skips on offline workers.
 add_executable(test_bolt_tls test_bolt_tls.cpp)

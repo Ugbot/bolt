@@ -236,7 +236,7 @@ bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
 struct ColCtx {
     const PqColumn* pc;
     BoltType type;
-    uint32_t elem;              // output stride: 4 / 8 / 16
+    uint32_t elem;              // output stride: 1 / 2 / 4 / 8 / 16
     uint8_t* out;               // column data base
     uint8_t* validity;          // nullptr => no bitmap (all-valid column)
     char*    overflow;          // Utf8 spill buffer (column-wide)
@@ -244,6 +244,13 @@ struct ColCtx {
     uint64_t overflow_cursor;
     uint8_t* dict;              // decoded dict entries, elem stride
     uint32_t dict_n;
+    // Type-conformance decode controls (G2FEAT-46).
+    uint32_t src_width;         // physical source element width (bytes)
+    uint8_t  src_signed;        // 1 => sign-extend on widen (INT32-DECIMAL /
+                                //      signed ints); 0 => zero-extend (uints)
+    uint8_t  int_convert;       // 1 => src_width != elem integer conversion
+    uint8_t  is_int96;          // 1 => INT96 legacy timestamp -> Timestamp[us]
+    int32_t  ts_rescale;        // 0 none / 1 millis*1000 / 2 nanos/1000 -> us
 };
 
 // Build a StringView; >12-byte payloads spill into the column overflow.
@@ -316,6 +323,70 @@ bool plain_f32_widen(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         float f = 0.0f;
         std::memcpy(&f, v + src * 4u, 4);
         dst[i] = static_cast<double>(f);
+        ++src;
+    }
+    return src == nvalid;
+}
+
+// PLAIN fixed integers of physical width `src_width` (4 or 8) converted to
+// output width `elem` (1/2/4/8), value-preserving (G2FEAT-46). Narrowing
+// drops the high bytes (LE host, as the rest of this codec assumes);
+// widening sign-extends when `src_signed` (INT32-DECIMAL mantissa -> int64
+// Decimal64; signed sub-int) or zero-extends for unsigned ints. Handles
+// INT32-DECIMAL, UINT_8/16, INT_8/16 on the data page AND the dict page.
+bool plain_int_conv(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                    const uint32_t* def, int64_t row0, uint32_t nrows,
+                    uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    const uint32_t sw = cx->src_width;
+    const uint32_t dw = cx->elem;
+    assert((sw == 4u || sw == 8u) && dw >= 1u && dw <= 8u);
+    if (static_cast<uint64_t>(nvalid) * sw > vlen) return false;
+    uint64_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
+        if (def != nullptr && def[i] == 0u) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        int64_t val = 0;
+        if (sw == 4u) {
+            int32_t t = 0;
+            std::memcpy(&t, v + src * 4u, 4);
+            val = cx->src_signed ? static_cast<int64_t>(t)
+                                 : static_cast<int64_t>(static_cast<uint32_t>(t));
+        } else {
+            std::memcpy(&val, v + src * 8u, 8);
+        }
+        ++src;
+        std::memcpy(cx->out + (static_cast<uint64_t>(row0) + i) * dw, &val, dw);
+    }
+    return src == nvalid;
+}
+
+// INT96 legacy timestamp (12 bytes: 8-byte nanoseconds-within-day LE +
+// 4-byte Julian day LE) -> Timestamp[us] output (elem 8). Impala/Spark
+// wrote this before the INT64 logical timestamp (G2FEAT-46).
+bool plain_int96(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                 const uint32_t* def, int64_t row0, uint32_t nrows,
+                 uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem == 8u);
+    if (static_cast<uint64_t>(nvalid) * 12u > vlen) return false;
+    int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
+    uint64_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
+        if (def != nullptr && def[i] == 0u) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        const uint8_t* s = v + src * 12u;
+        uint64_t nanos_of_day = 0;
+        int32_t  julian = 0;
+        std::memcpy(&nanos_of_day, s, 8);
+        std::memcpy(&julian, s + 8, 4);
+        const int64_t days = static_cast<int64_t>(julian) - 2440588;  // epoch
+        dst[i] = days * 86400000000LL +
+                 static_cast<int64_t>(nanos_of_day / 1000ull);
         ++src;
     }
     return src == nvalid;
@@ -477,8 +548,19 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     switch (cx->pc->physical) {
         case PqType::Int32:
         case PqType::Int64:
+            // Convert dict entries to the OUTPUT representation once (e.g.
+            // INT32-DECIMAL mantissa sign-extended to Decimal64, unsigned
+            // sub-int narrowed) so data-page gathers stay bare memcpys.
+            ok = cx->int_convert
+                     ? plain_int_conv(&tmp, v, vlen, nullptr, 0, n, n)
+                     : plain_fixed(&tmp, v, vlen, nullptr, 0, n, n);
+            break;
         case PqType::Double:
             ok = plain_fixed(&tmp, v, vlen, nullptr, 0, n, n);
+            break;
+        case PqType::Int96:
+            // 12-byte legacy timestamps -> Timestamp[us] once (G2FEAT-46).
+            ok = plain_int96(&tmp, v, vlen, nullptr, 0, n, n);
             break;
         case PqType::Float:
             // Dict entries widened f32 -> f64 ONCE here so data-page
@@ -535,9 +617,15 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         }
     }
     if (h->enc == kEncPlain) {
+        if (cx->is_int96) {
+            return plain_int96(cx, v, vlen, def, row0, nvals, nvalid);
+        }
         switch (cx->pc->physical) {
             case PqType::Int32:
             case PqType::Int64:
+                return cx->int_convert
+                           ? plain_int_conv(cx, v, vlen, def, row0, nvals, nvalid)
+                           : plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
             case PqType::Double:
                 return plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
             case PqType::Float:
@@ -630,6 +718,16 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
         }
         p = pay + static_cast<uint64_t>(h.cmp);
     }
+    // Timestamp/Time unit normalization to microseconds (G2FEAT-46), over
+    // the chunk's output range [row0, row0+rows) — plain and dict alike.
+    // Invalid rows keep garbage but their validity bit is already cleared.
+    if (cx->ts_rescale != 0 && rows_done == rows) {
+        int64_t* d = reinterpret_cast<int64_t*>(cx->out) + row0;
+        for (int64_t i = 0; i < rows; ++i) {       // bounded: chunk rows
+            if (cx->ts_rescale == 1) d[i] *= 1000;   // millis -> us
+            else                     d[i] /= 1000;   // nanos  -> us
+        }
+    }
     return rows_done == rows;
 }
 
@@ -677,6 +775,32 @@ bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     cx->elem = static_cast<uint32_t>(bolt::type_size(t));
     cx->out = static_cast<uint8_t*>(col->data);
     cx->validity = col->validity;
+    // Type-conformance decode controls (G2FEAT-46). Default: source width ==
+    // output width, signed. Refine per physical type + resolved logical.
+    cx->src_width = cx->elem;
+    cx->src_signed = 1;
+    const bool out_unsigned = (t == BoltType::UInt8 || t == BoltType::UInt16 ||
+                               t == BoltType::UInt32 || t == BoltType::UInt64);
+    if (pc->physical == PqType::Int96) {
+        cx->is_int96 = 1;                 // 12-byte legacy timestamp -> us
+        cx->src_width = 12;
+    } else if (pc->physical == PqType::Int32) {
+        cx->src_width = 4;
+        cx->src_signed = out_unsigned ? 0 : 1;   // Decimal64 mantissa stays signed
+    } else if (pc->physical == PqType::Int64) {
+        cx->src_width = 8;
+        cx->src_signed = out_unsigned ? 0 : 1;
+    }
+    // Integer width conversion needed only when source != output width and
+    // the physical is an integer (Float widen / Bool / FLBA have own paths).
+    cx->int_convert = ((pc->physical == PqType::Int32 ||
+                        pc->physical == PqType::Int64) &&
+                       cx->src_width != cx->elem) ? 1 : 0;
+    // Timestamp/Duration output carries microseconds; rescale non-micro units.
+    if (t == BoltType::Timestamp || t == BoltType::Duration) {
+        if (pc->time_unit == 1) cx->ts_rescale = 1;        // millis -> us
+        else if (pc->time_unit == 3) cx->ts_rescale = 2;   // nanos  -> us
+    }
     if (t == BoltType::Utf8 && ovf > 0 && rows > 0) {
         char* ob = static_cast<char*>(arena->allocate(ovf, 1));
         if (ob == nullptr) return false;
@@ -697,20 +821,77 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
     assert(out_scale != nullptr);
     if (col == nullptr) return false;
     *out_scale = 0;
+    // Resolve the logical intent from either encoding (G2FEAT-46): the
+    // normalized PqColumn::logical (LogicalType or ConvertedType-derived)
+    // plus the legacy converted flags kept as a belt-and-suspenders check.
+    const bool is_dec  = (col->converted == kConvDecimal) ||
+                         (col->logical == static_cast<int32_t>(PqLogical::Decimal));
+    const bool is_date = (col->converted == kConvDate) ||
+                         (col->logical == static_cast<int32_t>(PqLogical::Date));
+    const bool is_ts   = (col->logical == static_cast<int32_t>(PqLogical::Timestamp));
+    const bool is_time = (col->logical == static_cast<int32_t>(PqLogical::Time));
+    const bool is_int  = (col->logical == static_cast<int32_t>(PqLogical::Int));
     switch (col->physical) {
         case PqType::Int64:
-            if (col->converted == kConvDecimal) {       // int64 mantissa as-is
+            if (is_dec) {                               // int64 mantissa as-is
                 if (col->scale < 0 || col->scale > 18) return false;
                 *out_type = BoltType::Decimal64;
                 *out_scale = static_cast<uint8_t>(col->scale);
                 return true;
             }
+            if (is_ts)   { *out_type = BoltType::Timestamp; return true; }
+            if (is_time) { *out_type = BoltType::Duration;  return true; }
+            // INTEGER WIDTH: deliberately NOT narrowed to exact unsigned types.
+            // G2FEAT-46 originally mapped unsigned IntType to UInt8/16/32/64.
+            // That is more type-faithful, but it would change the BoltType of
+            // real production columns (e.g. the TAQ rowgroup u16/u64 columns)
+            // and downstream lane support for exact unsigned is thin -- 4
+            // BoltType::UInt16/UInt32 references in all of chukonu/src, 14 in
+            // marbledb/src. Flipping it needs a downstream kernel audit, not a
+            // reader change. Until then keep the signed lane, which every
+            // kernel handles, and which is what main already produced.
+            // Tracked as a follow-up; see the note in tests/test_bolt_parquet_types.cpp.
             *out_type = BoltType::Int64;
             return true;
         case PqType::Int32:
-            if (col->converted == kConvDecimal) return false;   // v1: reject
-            *out_type = (col->converted == kConvDate) ? BoltType::Date32
-                                                      : BoltType::Int32;
+            if (is_dec) {                               // INT32-backed DECIMAL
+                if (col->scale < 0 || col->scale > 18) return false;
+                *out_type = BoltType::Decimal64;        // p<=9 always fits
+                *out_scale = static_cast<uint8_t>(col->scale);
+                return true;
+            }
+            if (is_date) { *out_type = BoltType::Date32; return true; }
+            if (is_time) { *out_type = BoltType::Int32;  return true; }  // ms raw
+            // See the INTEGER WIDTH note on the Int64 branch above: signed
+            // widths are honoured, unsigned deliberately stays on the signed
+            // lane pending a downstream audit (an INT32-physical unsigned
+            // value is always representable in Int32 here).
+            if (is_int) {
+                // SIGNED sub-word widths are honoured. UNSIGNED deliberately
+                // stays on the next wider SIGNED lane (see the note on the
+                // Int64 branch): a u16 does NOT fit Int16 -- the first draft of
+                // this rebase made exactly that mistake -- and Int32 holds every
+                // 8/16/32-bit unsigned INT32-physical value losslessly, which is
+                // also what main already produced for the TAQ u16 column.
+                if (col->int_signed) {
+                    switch (col->int_bits) {
+                        case 8:  *out_type = BoltType::Int8;  return true;
+                        case 16: *out_type = BoltType::Int16; return true;
+                        case 32: *out_type = BoltType::Int32; return true;
+                        default: break;  // 64-bit on INT32 physical: malformed
+                    }
+                } else {
+                    switch (col->int_bits) {
+                        case 8: case 16: case 32:
+                            *out_type = BoltType::Int32; return true;
+                        default: break;
+                    }
+                }
+            }
+            *out_type = BoltType::Int32;
+            return true;
+        case PqType::Int96:                   // legacy timestamp -> us at decode
+            *out_type = BoltType::Timestamp;
             return true;
         case PqType::Double:
             *out_type = BoltType::Float64;
@@ -725,7 +906,7 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             *out_type = BoltType::Utf8;
             return true;
         case PqType::FixedLenByteArray:
-            if (col->converted != kConvDecimal) return false;
+            if (!is_dec) return false;         // non-DECIMAL FLBA: reject (v1)
             if (col->type_length <= 0 || col->type_length > 16) return false;
             if (col->scale < 0 || col->scale > 38) return false;
             if (col->precision <= 18) {                 // W-DEC representation
@@ -735,7 +916,7 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             }
             *out_scale = static_cast<uint8_t>(col->scale);
             return true;
-        default:                       // Int96: outside v1
+        default:
             return false;
     }
 }

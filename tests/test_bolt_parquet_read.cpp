@@ -247,8 +247,14 @@ TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
     c.physical = PqType::Float;                    // -> Float64 (widened)
     ASSERT_TRUE(parquet_map_type(&c, &t, &s));
     EXPECT_EQ(t, bolt::BoltType::Float64);
+    // Int96 used to be OUTSIDE the supported subset and was asserted rejected
+    // here. G2FEAT-46 added legacy-INT96-timestamp support (decoded to
+    // microseconds), so it is now INSIDE the subset -- the assertion was stale,
+    // not the code. Kept as a positive case so this test still pins the
+    // boundary rather than silently dropping the type.
     c.physical = PqType::Int96;
-    EXPECT_FALSE(parquet_map_type(&c, &t, &s));
+    ASSERT_TRUE(parquet_map_type(&c, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::Timestamp);
     c.physical = PqType::FixedLenByteArray;        // FLBA without DECIMAL
     c.converted = -1;
     c.type_length = 16;

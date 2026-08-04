@@ -4,6 +4,10 @@
 // Scope v1 (read path, FLAT schemas only):
 //   - footer locate/verify: [..data..][metadata][u32 len LE]["PAR1"]
 //   - FileMetaData -> schema (root + leaf columns), num_rows, row groups
+//   - per leaf column: physical type, ConvertedType (field 6) AND the
+//     LogicalType union (field 10 — TIMESTAMP/TIME unit + isAdjustedToUTC,
+//     INTEGER bitWidth/isSigned, DECIMAL scale/precision), normalized into
+//     PqColumn::{logical,time_unit,int_bits,int_signed,ts_utc} (G2FEAT-46)
 //   - per column-chunk: codec, encodings seen, num_values, page offsets,
 //     compressed/uncompressed sizes, min/max statistics bytes
 // Anything outside the subset (nested schemas, unknown field types) is
@@ -139,6 +143,17 @@ enum class PqType : int32_t {
     ByteArray = 6, FixedLenByteArray = 7,
 };
 
+// Normalized logical-type refinement (G2FEAT-46). Resolved from the
+// SchemaElement LogicalType union (field 10) when present, otherwise
+// derived from the legacy ConvertedType (field 6) — so nanosecond
+// timestamps / times (which have no ConvertedType) and isAdjustedToUTC
+// are captured, while millisecond/microsecond forms + un/signed ints
+// still work through either encoding.
+enum class PqLogical : int32_t {
+    None = -1, Timestamp = 0, Time = 1, Int = 2, Decimal = 3,
+    Date = 4, String = 5, Other = 6,
+};
+
 // parquet::CompressionCodec.
 enum class PqCodec : int32_t {
     Uncompressed = 0, Snappy = 1, Gzip = 2, Lzo = 3, Brotli = 4, Lz4 = 5,
@@ -153,8 +168,17 @@ struct PqColumn {
     int32_t  converted;               // ConvertedType, -1 = none
     int32_t  scale;                   // DECIMAL scale (converted/logical)
     int32_t  precision;               // DECIMAL precision
+    // Logical-type refinement (G2FEAT-46). `logical` is a PqLogical value;
+    // the rest qualify it: `time_unit` for Timestamp/Time (0 none / 1 millis
+    // / 2 micros / 3 nanos), `int_bits`/`int_signed` for the Int logical
+    // (bit width 8/16/32/64 and signedness), `ts_utc` = isAdjustedToUTC.
+    int32_t  logical;                 // PqLogical, -1 = none
+    int32_t  time_unit;               // 0/1/2/3 (none/millis/micros/nanos)
     uint8_t  optional;                // repetition: 1 = OPTIONAL (def levels)
-    uint8_t  _pad[7];
+    uint8_t  int_bits;                // Int logical bit width (0 = n/a)
+    uint8_t  int_signed;              // Int logical signedness (1 = signed)
+    uint8_t  ts_utc;                  // Timestamp/Time isAdjustedToUTC
+    uint8_t  _pad[4];
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

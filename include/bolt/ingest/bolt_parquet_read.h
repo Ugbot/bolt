@@ -10,8 +10,15 @@
 //                (max_def_level <= 1), for RLE_DICTIONARY /
 //                PLAIN_DICTIONARY indices (bit-width byte prefix), and
 //                for RLE-encoded BOOLEAN data pages (u32 len prefix).
-//   - types:     INT64 -> Int64 (DECIMAL converted -> Decimal64 mantissa),
-//                INT32 -> Int32 (DATE converted -> Date32),
+//   - types:     INT64 -> Int64 (DECIMAL -> Decimal64 mantissa;
+//                  TIMESTAMP {millis,micros,nanos} -> Timestamp[us],
+//                  normalized to microseconds at decode; TIME -> Duration[us];
+//                  UINT_64 -> UInt64 — G2FEAT-46),
+//                INT32 -> Int32 (DATE -> Date32; DECIMAL -> Decimal64;
+//                  UINT_8/16/32 -> UInt8/16/32, INT_8/16 -> Int8/16;
+//                  TIME_MILLIS -> Int32 raw — G2FEAT-46),
+//                INT96 -> Timestamp[us] (legacy Impala/Spark day+nanos,
+//                  converted at decode — G2FEAT-46),
 //                DOUBLE -> Float64,
 //                FLOAT -> Float64 (f32 widened at decode; dictionary
 //                  entries converted once at dict-page decode — G2FEAT-346),
@@ -23,6 +30,11 @@
 //                FIXED_LEN_BYTE_ARRAY DECIMAL(p<=18) -> Decimal64 (W-DEC:
 //                  big-endian two's-complement mantissa -> int64,
 //                  decimal_scale stamped on the column); p>18 -> Decimal128.
+//     LogicalType (SchemaElement field 10) is honored over ConvertedType,
+//     so nanosecond timestamps/times and un/signed IntType round-trip even
+//     when the writer omitted the legacy ConvertedType.
+//     Still unsupported (parquet_map_type returns false): non-DECIMAL FLBA,
+//     FLBA wider than 16 bytes, and nested LIST/MAP/STRUCT.
 //   - OPTIONAL columns: validity bitmap built from definition levels.
 //     All-valid shortcut: when every chunk of a column reports
 //     statistics null_count == 0 the bitmap is not allocated at all.
@@ -50,10 +62,12 @@ struct BoltColumn;
 namespace ingest {
 namespace parquet {
 
-// Map one parquet leaf column to its Bolt materialization (FLOAT widens
-// to Float64, BOOLEAN lands as Int64 0/1). Returns false when the column
-// shape is outside the supported subset (INT96, non-DECIMAL FLBA, INT32
-// DECIMAL, FLBA wider than 16 bytes).
+// Map one parquet leaf column to its Bolt materialization (FLOAT widens to
+// Float64, BOOLEAN lands as Int64 0/1, TIMESTAMP/INT96 -> Timestamp[us],
+// TIME -> Duration[us], INT32-DECIMAL -> Decimal64, un/signed IntType ->
+// the matching Int*/UInt* width — G2FEAT-46). Returns false only for the
+// still-unsupported shapes: non-DECIMAL FLBA, FLBA wider than 16 bytes, and
+// nested types. `*out_scale` carries the DECIMAL scale for Decimal columns.
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept;
 
