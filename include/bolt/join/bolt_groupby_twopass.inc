@@ -549,7 +549,15 @@ inline void gb_p2_sum_int(GbCell16* BOLT_RESTRICT acc,
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
         const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
         const int32_t g = gid[i];
-        acc[g].a += valid ? static_cast<int64_t>(p[r]) : 0;
+        // G2FEAT-131: 128-bit accumulation across the whole cell. `acc[g].a +=`
+        // wrapped, and an integer aggregate never used the high limb for
+        // anything, so widening is free in memory and one add-with-carry in
+        // time. AVG divides this exactly at finalize; SUM range-checks it.
+        const int64_t x  = valid ? static_cast<int64_t>(p[r]) : 0;
+        const uint64_t lo = static_cast<uint64_t>(acc[g].a);
+        const uint64_t sm = lo + static_cast<uint64_t>(x);
+        acc[g].b += ((sm < lo) ? 1 : 0) + (x >> 63);
+        acc[g].a  = static_cast<int64_t>(sm);
         if (Cnt) cnt[g] += valid ? 1 : 0;
     }
 }
@@ -886,24 +894,25 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
         }
         return true;
     }
+    // G2FEAT-131: the BANKED integer sum loop is deliberately NOT taken any
+    // more. Banking accumulates each of kGbBankCount window slices in a bare
+    // int64 and only widens at the once-per-window merge, which is exactly the
+    // shape that made `gb_p2_sum_dec64_lane_bank` require the caller's
+    // lane==1 PROOF that no partial can overflow. No such proof exists for a
+    // plain integer column, so a banked slice could wrap before the merge ever
+    // sees it. The plain loop is exact for any input; regaining banking needs
+    // a widened bank (2x bank memory) or the same lane certificate, which is
+    // the tracked follow-up. TPC-H's sums are Decimal (untouched arms above),
+    // and chukonu's own int64 aggregate operator — where the overwhelming
+    // majority of integer sums execute — never used this kernel at all.
     if (t == BoltType::Int64) {
-        if (banked) {
-            if (is_avg) BOLT_GB_P2B(gb_p2_sum_int_bank, int64_t, true);
-            else        BOLT_GB_P2B(gb_p2_sum_int_bank, int64_t, false);
-        } else {
-            if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int64_t, true);
-            else        BOLT_GB_P2(gb_p2_sum_int, int64_t, false);
-        }
+        if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int64_t, true);
+        else        BOLT_GB_P2(gb_p2_sum_int, int64_t, false);
         return true;
     }
     if (t == BoltType::Int32 || t == BoltType::Date32) {
-        if (banked) {
-            if (is_avg) BOLT_GB_P2B(gb_p2_sum_int_bank, int32_t, true);
-            else        BOLT_GB_P2B(gb_p2_sum_int_bank, int32_t, false);
-        } else {
-            if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int32_t, true);
-            else        BOLT_GB_P2(gb_p2_sum_int, int32_t, false);
-        }
+        if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int32_t, true);
+        else        BOLT_GB_P2(gb_p2_sum_int, int32_t, false);
         return true;
     }
 #undef BOLT_GB_P2B

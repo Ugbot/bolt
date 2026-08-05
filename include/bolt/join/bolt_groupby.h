@@ -864,13 +864,59 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         std::memcpy(&slot->a, &s, 8);
         return;
     }
+    // G2FEAT-131 — INTEGER SUM/AVG ACCUMULATE IN 128 BITS, NOT 64.
+    //
+    // `slot->a += v.a` wrapped silently. A GbCell16 is 16 bytes and an integer
+    // aggregate used only the low 8, so the high limb was dead weight: widening
+    // costs no memory, no extra cache line, and one add-with-carry. This is the
+    // same treatment Decimal128/Decimal64 sums already get in the arm above
+    // (`d128_add`) — integers were simply never given it.
+    //
+    // The two kinds then differ only at FINALIZE: AVG divides the exact 128-bit
+    // sum into a double (its result type is Float64 either way), while SUM's
+    // result type is the argument's Int64, so finalize verifies the total
+    // actually fits and fails the query if it does not — never a wrapped value.
+    // See gb_int_sum_fits_i64 / gb_int_avg_to_double below.
     switch (k) {
         case AggKind::Sum:
-        case AggKind::Avg: slot->a += v.a; break;
+        case AggKind::Avg: {
+            const uint64_t lo = static_cast<uint64_t>(slot->a);
+            const uint64_t x  = static_cast<uint64_t>(v.a);
+            const uint64_t sm = lo + x;
+            slot->b += ((sm < lo) ? 1 : 0) + (v.a >> 63);
+            slot->a  = static_cast<int64_t>(sm);
+            break;
+        }
         case AggKind::Min: slot->a = branchless::bmin(slot->a, v.a); break;
         case AggKind::Max: slot->a = branchless::bmax(slot->a, v.a); break;
         default: break;
     }
+}
+
+// G2FEAT-131: true when a widened integer SUM cell still fits its declared
+// Int64 result type, i.e. the high limb is exactly the low limb's sign
+// extension. Exact — no false positives, unlike a per-add check, because the
+// accumulator never lost information in the first place.
+BOLT_FORCE_INLINE bool gb_int_sum_fits_i64(GbCell16 acc) noexcept {
+    return acc.b == (acc.a >> 63);
+}
+
+// G2FEAT-131: double read of a widened integer sum. MAGNITUDE FIRST, sign
+// after. Doing it as `(double)hi * 2^64 + (double)(uint64)lo` cancels to 0 for
+// every small negative total (hi == -1 and (double)(2^64 - k) rounds to 2^64).
+BOLT_FORCE_INLINE double gb_int_sum_to_double(GbCell16 acc) noexcept {
+    constexpr double k2p64 = 18446744073709551616.0;   // 2^64
+    uint64_t ulo = static_cast<uint64_t>(acc.a);
+    uint64_t uhi = static_cast<uint64_t>(acc.b);
+    const bool neg = (acc.b < 0);
+    if (neg) {
+        ulo = ~ulo + 1ull;
+        uhi = ~uhi + ((ulo == 0ull) ? 1ull : 0ull);
+    }
+    const double m = static_cast<double>(uhi) * k2p64 +
+                     static_cast<double>(ulo);
+    assert(m >= 0.0);
+    return neg ? -m : m;
 }
 
 // Arrow-convention validity: validity==nullptr means all-valid; otherwise the
@@ -1868,12 +1914,12 @@ inline bool groupby_agg_multi_key_typed_finalize(
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: the accumulator holds a double bit pattern;
-                    // int AVG: a true int64 sum. Reinterpret accordingly.
+                    // int AVG: an EXACT 128-BIT sum (G2FEAT-131).
                     double sum;
                     if (gb_detail::is_float_type(state->agg_in_types[j]))
                         std::memcpy(&sum, &acc.a, 8);
                     else
-                        sum = static_cast<double>(acc.a);
+                        sum = gb_detail::gb_int_sum_to_double(acc);
                     const double d = (cnt > 0) ? (sum / static_cast<double>(cnt)) : 0.0;
                     static_cast<double*>(buf)[r] = d;
                 }
@@ -1889,6 +1935,14 @@ inline bool groupby_agg_multi_key_typed_finalize(
                 // acc.a holds the double's bit pattern — copy 8 bytes verbatim.
                 std::memcpy(&static_cast<double*>(buf)[r], &acc.a, 8);
             } else {
+                // G2FEAT-131: an integer SUM's declared result type is Int64.
+                // The accumulator is exact 128-bit, so a total outside int64
+                // range is DETECTED here and fails the query, instead of being
+                // truncated back to a wrapped 64-bit value.
+                if (state->specs[j].kind == AggKind::Sum &&
+                    !gb_detail::is_float_type(state->agg_in_types[j]) &&
+                    !gb_detail::gb_int_sum_fits_i64(acc))
+                    return false;
                 static_cast<int64_t*>(buf)[r] = acc.a;
             }
         }
@@ -2185,12 +2239,12 @@ inline bool groupby_agg_multi_key_typed(
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: accumulator holds a double bit pattern;
-                    // int AVG: a true int64 sum. Reinterpret accordingly.
+                    // int AVG: an EXACT 128-BIT sum (G2FEAT-131).
                     double sum;
                     if (gb_detail::is_float_type(agg_in_types[j]))
                         std::memcpy(&sum, &acc.a, 8);
                     else
-                        sum = static_cast<double>(acc.a);
+                        sum = gb_detail::gb_int_sum_to_double(acc);
                     const double d = (cnt > 0) ? (sum / static_cast<double>(cnt)) : 0.0;
                     static_cast<double*>(buf)[r] = d;
                 }
@@ -2206,6 +2260,12 @@ inline bool groupby_agg_multi_key_typed(
             } else if (ot == BoltType::Float64) {
                 std::memcpy(&static_cast<double*>(buf)[r], &acc.a, 8);
             } else {
+                // G2FEAT-131: see the stateful finalize — an integer SUM that
+                // left int64 range fails the query rather than wrapping.
+                if (aggs[j].kind == AggKind::Sum &&
+                    !gb_detail::is_float_type(agg_in_types[j]) &&
+                    !gb_detail::gb_int_sum_fits_i64(acc))
+                    return false;
                 static_cast<int64_t*>(buf)[r] = acc.a;
             }
         }
