@@ -1,5 +1,15 @@
 // bolt/lakehouse/iceberg_partition.cpp — partition-value predicate matching.
 // Identity-only equality for W4. Transform-aware pruning TODO(W5).
+//
+// G2FEAT-125: how a file's partition VALUE is matched to a spec FIELD depends
+// on which parser produced the file. The JSON path reads a real "field-id" out
+// of the document; the Avro path cannot (the flattened Avro field table does
+// not model field-id annotations) and instead reports the ORDINAL within the
+// partition struct. Iceberg writes that struct in spec order, so the ordinal
+// join is exact — but joining an ordinal against a v2 spec's field-id (>=1000)
+// matches NOTHING, which is why partition pruning did nothing at all for a
+// real Avro manifest before this. `DataFileRef::partition_ordinal_ids` says
+// which rule applies.
 
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
@@ -43,6 +53,23 @@ int compare_eq(const PartitionValue& pv,
     return -1;
 }
 
+// The file's partition value for spec field `pi`, or null when absent.
+const PartitionValue* value_for_spec_field(const DataFileRef* f,
+                                           uint32_t pi,
+                                           int32_t field_id) noexcept {
+    assert(f != nullptr);
+    if (f->partition_ordinal_ids) {
+        // Ordinal join: partition[i] belongs to spec->fields[i], by Iceberg's
+        // guarantee that the partition struct is written in spec order.
+        if (pi >= f->n_partition) return nullptr;
+        return &f->partition[pi];
+    }
+    for (uint32_t v = 0; v < f->n_partition; ++v) {   // bounded: n_partition
+        if (f->partition[v].field_id == field_id) return &f->partition[v];
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 bool partition_passes(const DataFileRef* f, const PartitionSpec* spec,
@@ -65,12 +92,10 @@ bool partition_passes(const DataFileRef* f, const PartitionSpec* spec,
             if (src_name == nullptr) continue;
             if (std::strcmp(src_name, pr.column) != 0) continue;
             if (pf.transform.kind != TransformKind::kIdentity) continue;
-            for (uint32_t v = 0; v < f->n_partition; ++v) {
-                if (f->partition[v].field_id != pf.field_id) continue;
-                const int r = compare_eq(f->partition[v], pr.value);
-                if (r == 0) return false;
-                break;
-            }
+            const PartitionValue* pv =
+                value_for_spec_field(f, pi, pf.field_id);
+            if (pv == nullptr) continue;
+            if (compare_eq(*pv, pr.value) == 0) return false;
         }
     }
     return true;

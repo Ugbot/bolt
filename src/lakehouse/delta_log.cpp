@@ -50,14 +50,15 @@ void str_copy_cstr(char* dst, uint32_t cap, const char* src) noexcept {
     dst[m] = '\0';
 }
 
+// `bj::iter_skip_to_close` counts depth FROM the token under the cursor and
+// already advances once for a scalar, so it must be called ON the Begin token.
+// Advancing past Begin first leaves the cursor INSIDE the value and silently
+// truncates the enclosing parse — see the long note in iceberg_metadata.cpp
+// (G2FEAT-125), which is where that bug was finally caught.
 bool iter_skip_value(bj::Iterator* it) noexcept {
     assert(it != nullptr);
-    const bj::TokenType t = bj::iter_peek(it);
-    if (t == bj::TokenType::BeginObject || t == bj::TokenType::BeginArray) {
-        bj::iter_advance(it);
-        return bj::iter_skip_to_close(it);
-    }
-    return bj::iter_advance(it);
+    assert(it->idx != nullptr);
+    return bj::iter_skip_to_close(it);
 }
 
 bool eat_string(bj::Iterator* it, char* out, uint32_t cap) noexcept {
@@ -137,7 +138,8 @@ uint32_t eat_raw(bj::Iterator* it, char* out, uint32_t cap) noexcept {
     }
     if (t == bj::TokenType::BeginObject || t == bj::TokenType::BeginArray) {
         const int32_t start = it->idx->tokens[it->cursor].start;
-        bj::iter_advance(it);
+        // Skip FROM the Begin token (see iter_skip_value above); `cursor - 1`
+        // is then the matching close, which is what the span below needs.
         if (!bj::iter_skip_to_close(it)) { out[0] = '\0'; return 0u; }
         const int32_t end_cursor = it->cursor - 1;
         if (end_cursor < 0 || end_cursor >= it->idx->token_count) {

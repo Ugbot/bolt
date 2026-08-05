@@ -28,13 +28,26 @@
 // nothing reads it. The JSON entry points remain for the JSON-shaped fixtures
 // the W4 tests use; new callers reading real tables want the Avro ones.
 //
+// G2FEAT-125 wired the Avro entry points into the SCAN (`iceberg_scan.cpp`),
+// which until then still called the JSON ones — bolt could open a real table
+// but not query it. The scan picks a parser from the OCF magic in the bytes it
+// just read, never from this macro and never from a file extension, so a table
+// may legitimately hold both forms. That end-to-end path (metadata -> manifests
+// -> Parquet -> rows, values checked against pyiceberg's own scan of the same
+// table) is `tests/test_bolt_iceberg_real_scan.cpp`.
+//
 // KNOWN GAPS in the Avro path (fail closed or degrade, never silently wrong):
 //   - `PartitionValue::field_id` is the ORDINAL within the partition struct,
 //     not the Avro "field-id" annotation (the flattened field table does not
 //     model field-ids). The partition struct's order IS the spec's order, so
-//     the ordinal is the stable join key against a PartitionSpec.
+//     the ordinal is the stable join key against a PartitionSpec — which is
+//     what `DataFileRef::partition_ordinal_ids` tells `partition_passes` to
+//     use. Joining the ordinal against a v2 spec's field-id (>= 1000) matches
+//     nothing, so before that flag existed partition pruning silently did
+//     NOTHING for a real manifest.
 //   - Bounds are truncated at kLakeMaxValBytes (64); `lower_len`/`upper_len`
-//     report the stored length.
+//     report the stored length, and `DataFileRef::binary_bounds` says they are
+//     Iceberg's binary single-value encoding rather than ASCII.
 //   - Per-column stats past kIcebergMaxStatCols (32) are dropped — stats are a
 //     pruning aid, so this degrades pruning, never correctness.
 //   - `zstd`-coded OCFs are unsupported (null / deflate / snappy are).
@@ -52,6 +65,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "bolt/lakehouse/iceberg/delete_file.h"
@@ -107,12 +121,34 @@ struct DataFileRef {
     char           file_path[kIcebergMaxPath];
     PartitionValue partition[kIcebergMaxPartitionValues];
     uint32_t       n_partition;
-    uint32_t       _pad2;
+    // How to READ the two fields above and `stats`, set by whichever parser
+    // produced this record. Without them a consumer cannot tell an Avro record
+    // from a JSON one, and both pruning paths join on exactly that difference
+    // (G2FEAT-125). Carved from the former `_pad2`; the size is pinned below.
+    //
+    // `partition_ordinal_ids`: `PartitionValue::field_id` is the ORDINAL within
+    // the partition struct, not the spec's field-id — the Avro schema's
+    // "field-id" annotations are not modelled. The struct's order IS the spec's
+    // order, so `partition[i]` belongs to `PartitionSpec::fields[i]`.
+    //
+    // `binary_bounds`: `lower`/`upper` hold Iceberg's BINARY single-value
+    // encoding (little-endian, `lower_len`/`upper_len` bytes) rather than the
+    // ASCII the JSON fixtures carry. 250.5 is 00 00 00 00 00 50 6F 40 — it
+    // starts with a NUL, so any C-string read of it yields empty.
+    bool           partition_ordinal_ids;
+    bool           binary_bounds;
+    uint8_t        _pad2[2];
     FileStats      stats;
     int32_t        equality_ids[8];
     uint32_t       n_equality_ids;
     uint32_t       _pad3;
 };
+// Pinned: the provenance flags came out of the 4 bytes of padding that used to
+// follow `n_partition`, so nothing after them moved and the struct is the same
+// size it was before G2FEAT-125.
+static_assert(offsetof(DataFileRef, stats) ==
+                  offsetof(DataFileRef, n_partition) + 8u,
+              "DataFileRef layout pinned: provenance flags came from padding");
 
 }  // namespace iceberg
 }  // namespace lakehouse

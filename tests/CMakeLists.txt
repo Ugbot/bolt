@@ -1188,6 +1188,17 @@ target_compile_definitions(test_bolt_iceberg_real_avro PRIVATE
 bolt_apply_hardening(test_bolt_iceberg_real_avro)
 add_test(NAME test_bolt_iceberg_real_avro COMMAND test_bolt_iceberg_real_avro)
 
+# G2FEAT-125 — SCAN a real Iceberg table end to end (metadata -> manifests ->
+# Parquet -> rows) over the complete pyiceberg warehouse in
+# data/golden_iceberg_table. The test above only decodes manifests.
+add_executable(test_bolt_iceberg_real_scan test_bolt_iceberg_real_scan.cpp)
+target_link_libraries(test_bolt_iceberg_real_scan
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_iceberg_real_scan PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_iceberg_real_scan)
+add_test(NAME test_bolt_iceberg_real_scan COMMAND test_bolt_iceberg_real_scan)
+
 # W5 — Iceberg write path.
 add_executable(test_bolt_lakehouse_iceberg_write test_bolt_lakehouse_iceberg_write.cpp)
 target_link_libraries(test_bolt_lakehouse_iceberg_write

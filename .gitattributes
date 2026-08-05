@@ -2,3 +2,9 @@
 # committed test file and the failure surfaces as an unrelated parse error.
 *.avro    binary
 *.parquet binary
+
+# The committed pyiceberg warehouse (G2FEAT-125) is a golden artefact end to
+# end: its metadata.json files are byte-for-byte what the writer emitted and
+# must stay that way, so they are not eligible for line-ending normalisation
+# either — even though pyiceberg happens to emit them with no newlines at all.
+tests/data/golden_iceberg_table/** binary

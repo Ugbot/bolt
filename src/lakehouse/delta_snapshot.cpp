@@ -41,14 +41,15 @@ void copy_tok(const bj::StructuralIndex* idx, int32_t cur, char* dst,
     dst[n] = '\0';
 }
 
+// `bj::iter_skip_to_close` counts depth FROM the token under the cursor and
+// already advances once for a scalar, so it must be called ON the Begin token.
+// Advancing past Begin first leaves the cursor INSIDE the value and silently
+// truncates the enclosing parse — see the long note in iceberg_metadata.cpp
+// (G2FEAT-125), which is where that bug was finally caught.
 bool skip_value(bj::Iterator* it) noexcept {
     assert(it != nullptr);
-    const bj::TokenType t = bj::iter_peek(it);
-    if (t == bj::TokenType::BeginObject || t == bj::TokenType::BeginArray) {
-        bj::iter_advance(it);
-        return bj::iter_skip_to_close(it);
-    }
-    return bj::iter_advance(it);
+    assert(it->idx != nullptr);
+    return bj::iter_skip_to_close(it);
 }
 
 int32_t find_file_idx(LiveFile* files, uint32_t n,

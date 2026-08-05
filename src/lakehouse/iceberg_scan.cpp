@@ -4,11 +4,40 @@
 // Opaque TableHandle / ScanHandle live in the `bolt::lakehouse::iceberg`
 // sub-namespace so they don't collide with Delta's.
 //
-// W4 deviations:
-//   - Manifests + manifest-list read as JSON (BOLT_ICEBERG_MANIFEST_JSON).
-//     TODO(W5-avro-nested-reader).
-//   - Position/equality delete files are in-memory sets only; Parquet-body
-//     loaders TODO(W5-delete-load).
+// G2FEAT-125 — this path now reads a REAL Iceberg table, not just a
+// JSON-shaped stand-in. Three things a real table needs that the W4 path did
+// not have, each proven against a pyiceberg-0.11.1 warehouse committed at
+// tests/data/golden_iceberg_table (see test_bolt_iceberg_real_scan.cpp):
+//
+//   1. AVRO manifests. G2FEAT-76 landed the decoder but nothing called it.
+//      `read_ref` sniffs the Avro object-container magic ("Obj\x01") and
+//      dispatches to `manifest_{list_,}parse_avro`, falling back to the JSON
+//      entry points for the W4 fixtures. Format detection is by CONTENT, not
+//      by file extension or a build flag, so one table may mix them.
+//
+//   2. CATALOG-MANAGED metadata names. `find_latest_metadata` used to require
+//      `version-hint.text` + `v<N>.metadata.json` — the Hadoop-catalog layout.
+//      A pyiceberg SqlCatalog (and REST, Glue, Hive) writes NEITHER: there is
+//      no version hint and the files are `<NNNNN>-<uuid>.metadata.json`. Both
+//      namings are now recognised, ranked by version number.
+//
+//   3. RELOCATION. Every path Iceberg records — the snapshot's manifest list,
+//      the manifest-list's manifest paths, the manifest's data-file paths — is
+//      an ABSOLUTE URI naming wherever the writer stood. A table read anywhere
+//      else (restored from backup, copied between buckets, or, here, checked
+//      out of git) must rebase them. `read_ref` strips the metadata
+//      `location` prefix and resolves the remainder under the table's actual
+//      directory, then falls back to the older strip-root / join-table-rel
+//      attempts so existing callers are unaffected.
+//
+// Still declined, loudly and never silently:
+//   - Position/equality delete files are skipped, so a table carrying them
+//     would over-report rows — `iceberg_scan_open` therefore FAILS on one
+//     rather than returning a wrong answer. TODO(W5-delete-load).
+//   - A live data file that cannot be fetched or decoded fails the scan. It
+//     used to be skipped, which silently returned short.
+//   - Parquet codecs outside Snappy/uncompressed (notably zstd, pyiceberg's
+//     default) fail at decode via the rule above — never a short read.
 //
 // Tiger Style: bounded, noexcept, fixed-size scratch.
 
@@ -103,6 +132,89 @@ const char* strip_root(const char* root, const char* path) noexcept {
     return path;
 }
 
+// ---------------------------------------------------------------------------
+// Relocation: an Iceberg path is an absolute URI naming where the WRITER
+// stood, so reading the table anywhere else has to rebase it.
+// ---------------------------------------------------------------------------
+
+// Drop a leading "<scheme>://". `file:///C:/x` additionally leaves a spurious
+// '/' before the drive letter; `file://C:/x` (what pyiceberg writes) does not.
+// Returns a pointer INTO `p`, never null, never past the terminator.
+const char* strip_scheme(const char* p) noexcept {
+    assert(p != nullptr);
+    const char* sep = std::strstr(p, "://");
+    if (sep == nullptr) return p;
+    const char* q = sep + 3;
+    // "/C:/..." -> "C:/..." — only for a real drive letter, so a POSIX
+    // "file:///tmp/x" keeps its leading slash.
+    if (q[0] == '/' && q[1] != '\0' && q[2] == ':') ++q;
+    assert(q >= p);
+    return q;
+}
+
+// Path-equality-insensitive to separator flavour, so a '\'-joined root still
+// matches a '/'-written URI.
+bool path_prefix_len(const char* path, const char* prefix,
+                     uint32_t* out_len) noexcept {
+    assert(path != nullptr && prefix != nullptr && out_len != nullptr);
+    uint32_t i = 0;
+    for (; prefix[i] != '\0'; ++i) {          // bounded: prefix is NUL-terminated
+        const char a = path[i] == '\\' ? '/' : path[i];
+        const char b = prefix[i] == '\\' ? '/' : prefix[i];
+        if (a == '\0' || a != b) return false;
+    }
+    // Must land on a boundary, so "/a/tablex" never matches prefix "/a/table".
+    if (path[i] != '\0' && path[i] != '/' && path[i] != '\\') return false;
+    *out_len = i;
+    return true;
+}
+
+// Rebase `path` against the table's recorded `location` and produce an object
+// key relative to the store root. False when the location does not cover it.
+bool key_from_location(const char* location, const char* table_rel,
+                       const char* path, char* out, uint32_t cap) noexcept {
+    assert(location != nullptr && table_rel != nullptr);
+    assert(path != nullptr && out != nullptr);
+    if (location[0] == '\0') return false;
+    const char* loc = strip_scheme(location);
+    const char* p   = strip_scheme(path);
+    uint32_t n = 0;
+    if (!path_prefix_len(p, loc, &n)) return false;
+    const char* rel = p + n;
+    while (*rel == '/' || *rel == '\\') ++rel;
+    if (*rel == '\0') return false;
+    return path_join(table_rel, rel, out, cap);
+}
+
+// Read whatever an Iceberg path points at, trying each rebasing in turn:
+// location-relative first (a relocated table), then the historical
+// strip-root and join-table-rel attempts (unchanged for W4 callers).
+bool read_ref(ObjectStore* os, const char* location, const char* fs_root,
+              const char* table_rel, const char* path, Arena* scratch,
+              const uint8_t** out_body, uint64_t* out_len) noexcept {
+    assert(os != nullptr && path != nullptr);
+    assert(out_body != nullptr && out_len != nullptr);
+    char key[kCatMaxPath];
+    if (key_from_location(location, table_rel, path, key, sizeof(key)) &&
+        os_get(os, key, scratch, out_body, out_len) == kOsOk) {
+        return true;
+    }
+    const char* stripped = strip_root(fs_root, path);
+    if (os_get(os, stripped, scratch, out_body, out_len) == kOsOk) return true;
+    if (path_join(table_rel, stripped, key, sizeof(key)) &&
+        os_get(os, key, scratch, out_body, out_len) == kOsOk) {
+        return true;
+    }
+    return false;
+}
+
+// Avro object-container magic. Format is detected from CONTENT so one table
+// may hold both forms (and so no build flag decides how bytes are read).
+bool is_avro_ocf(const uint8_t* b, uint64_t n) noexcept {
+    return b != nullptr && n >= 4u &&
+           b[0] == 'O' && b[1] == 'b' && b[2] == 'j' && b[3] == 1u;
+}
+
 bool read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
                        int64_t* out) noexcept {
     assert(os != nullptr && table_rel != nullptr && out != nullptr);
@@ -118,6 +230,34 @@ bool read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
         else if (any) break;
     }
     if (!any) return false;
+    *out = v;
+    return true;
+}
+
+// Version number encoded in a metadata file NAME, across both layouts a real
+// warehouse uses:
+//   Hadoop catalog     "v12.metadata.json"                    -> 12
+//   catalog-managed    "00002-<uuid>.metadata.json"           -> 2
+// The second is what pyiceberg's SqlCatalog, the Iceberg REST catalog, Glue
+// and Hive all write, and the pre-G2FEAT-125 reader recognised neither it nor
+// the absence of version-hint.text that goes with it.
+bool metadata_version_of(const char* tail, int64_t* out) noexcept {
+    assert(tail != nullptr && out != nullptr);
+    const char* p = tail;
+    if (*p == 'v') ++p;                     // Hadoop-catalog prefix, optional
+    int64_t v = 0;
+    uint32_t digits = 0;
+    while (*p >= '0' && *p <= '9' && digits < 18u) {   // bounded: no overflow
+        v = v * 10 + (*p - '0'); ++p; ++digits;
+    }
+    if (digits == 0u) return false;
+    if (*p == '-') {                        // "<NNNNN>-<uuid>.metadata.json"
+        if (p == tail) return false;        // a bare "-..." is not a version
+        const char* dot = std::strstr(p, ".metadata.json");
+        if (dot == nullptr || dot[14] != '\0') return false;
+    } else if (std::strcmp(p, ".metadata.json") != 0) {
+        return false;
+    }
     *out = v;
     return true;
 }
@@ -149,11 +289,8 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
         const char* k = listing[i].key;
         const char* slash = std::strrchr(k, '/');
         const char* tail = slash ? slash + 1 : k;
-        if (tail[0] != 'v') continue;
-        int64_t v = 0; const char* p = tail + 1; bool any = false;
-        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); ++p; any = true; }
-        if (!any) continue;
-        if (std::strcmp(p, ".metadata.json") != 0) continue;
+        int64_t v = 0;
+        if (!metadata_version_of(tail, &v)) continue;
         if (v > best) {
             best = v;
             std::strncpy(best_key, k, cap - 1u);
@@ -233,48 +370,56 @@ bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
 
 void iceberg_table_close(TableHandle* /*h*/) noexcept {}
 
+const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept {
+    assert(h != nullptr);
+    if (h == nullptr || !h->meta_loaded) return nullptr;
+    return &h->meta;
+}
+
 namespace {
 
-bool open_next_file(ScanHandle* s) noexcept {
+// Open the next live data file. Every failure here means rows the table says
+// exist that we cannot produce, so each one FAILS the scan (*out_err) rather
+// than advancing past the file — the pre-G2FEAT-125 code skipped, which
+// silently returned a short result. Returns false with *out_err false only
+// when the file list is genuinely exhausted.
+bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
     assert(s != nullptr);
-    while (s->cur_file_idx < s->n_live) {
-        const DataFileRef& f = s->live_files[s->cur_file_idx];
-        const char* dot = std::strrchr(f.file_path, '.');
-        if (dot != nullptr) {
-            if (!(std::strcmp(dot, ".parquet") == 0 ||
-                  std::strcmp(dot, ".PARQUET") == 0 ||
-                  std::strcmp(dot, ".pq") == 0)) {
-                ++s->cur_file_idx; continue;
-            }
-        }
-        const char* rel = strip_root(s->table->fs_root, f.file_path);
-        const uint8_t* body = nullptr; uint64_t blen = 0;
-        if (os_get(&s->table->os, rel, s->scratch, &body, &blen) != kOsOk) {
-            char key[kCatMaxPath];
-            if (!path_join(s->table->table_rel, rel, key, sizeof(key))) {
-                ++s->cur_file_idx; continue;
-            }
-            if (os_get(&s->table->os, key, s->scratch, &body, &blen) != kOsOk) {
-                ++s->cur_file_idx; continue;
-            }
-        }
-        pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
-        if (meta == nullptr) return false;
-        std::memset(meta, 0, sizeof(*meta));
-        meta->chunks = s->scratch->allocate_array<pq::PqChunk>(
-            pq::kPqMaxColumns * 16u);
-        meta->chunks_cap = pq::kPqMaxColumns * 16u;
-        if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) {
-            ++s->cur_file_idx; continue;
-        }
-        s->cur_meta = meta;
-        s->cur_body = body;
-        s->cur_body_len = blen;
-        s->cur_row_group = 0;
-        s->cur_file_open = true;
-        return true;
+    assert(out_err != nullptr);
+    *out_err = false;
+    if (s->cur_file_idx >= s->n_live) return false;
+    const DataFileRef& f = s->live_files[s->cur_file_idx];
+    const char* dot = std::strrchr(f.file_path, '.');
+    if (dot == nullptr ||
+        !(std::strcmp(dot, ".parquet") == 0 ||
+          std::strcmp(dot, ".PARQUET") == 0 ||
+          std::strcmp(dot, ".pq") == 0)) {
+        *out_err = true;                 // ORC/Avro data files are not read yet
+        return false;
     }
-    return false;
+    const uint8_t* body = nullptr; uint64_t blen = 0;
+    if (!read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
+                  s->table->table_rel, f.file_path, s->scratch,
+                  &body, &blen)) {
+        *out_err = true;
+        return false;
+    }
+    pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
+    if (meta == nullptr) { *out_err = true; return false; }
+    std::memset(meta, 0, sizeof(*meta));
+    meta->chunks = s->scratch->allocate_array<pq::PqChunk>(
+        pq::kPqMaxColumns * 16u);
+    meta->chunks_cap = pq::kPqMaxColumns * 16u;
+    if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) {
+        *out_err = true;
+        return false;
+    }
+    s->cur_meta = meta;
+    s->cur_body = body;
+    s->cur_body_len = blen;
+    s->cur_row_group = 0;
+    s->cur_file_open = true;
+    return true;
 }
 
 }  // namespace
@@ -301,20 +446,20 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
     if (mlist == nullptr) return false;
     uint32_t n_mlist = 0;
     {
-        const char* mlist_path = s->snap.manifest_list;
-        const char* mkey = strip_root(h->fs_root, mlist_path);
         const uint8_t* body = nullptr; uint64_t blen = 0;
-        if (os_get(&h->os, mkey, h->arena, &body, &blen) != kOsOk) {
-            char joined[kCatMaxPath];
-            if (!(path_join(h->table_rel, mkey, joined, sizeof(joined)) &&
-                  os_get(&h->os, joined, h->arena, &body, &blen) == kOsOk)) {
-                return false;
-            }
-        }
-        if (!manifest_list_parse_json(body, static_cast<uint32_t>(blen),
-                                      h->arena, mlist,
-                                      kIcebergMaxManifestsPerList, &n_mlist))
+        if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
+                      s->snap.manifest_list, h->arena, &body, &blen)) {
             return false;
+        }
+        // A real manifest list is Avro; the W4 fixtures are JSON. Dispatch on
+        // the bytes, never on a build flag.
+        const bool ok = is_avro_ocf(body, blen)
+            ? manifest_list_parse_avro(body, blen, h->arena, mlist,
+                                       kIcebergMaxManifestsPerList, &n_mlist)
+            : manifest_list_parse_json(body, static_cast<uint32_t>(blen),
+                                       h->arena, mlist,
+                                       kIcebergMaxManifestsPerList, &n_mlist);
+        if (!ok) return false;
     }
     s->live_files = h->arena->allocate_array<DataFileRef>(kMaxLiveFiles);
     if (s->live_files == nullptr) return false;
@@ -329,32 +474,36 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
     const Schema* sch = metadata_current_schema(&h->meta);
     for (uint32_t mi = 0; mi < n_mlist; ++mi) {
         const ManifestListEntry& mle = mlist[mi];
-        const char* mkey = strip_root(h->fs_root, mle.manifest_path);
         const uint8_t* body = nullptr; uint64_t blen = 0;
-        if (os_get(&h->os, mkey, h->arena, &body, &blen) != kOsOk) {
-            char joined[kCatMaxPath];
-            if (!(path_join(h->table_rel, mkey, joined, sizeof(joined)) &&
-                  os_get(&h->os, joined, h->arena, &body, &blen) == kOsOk)) {
-                continue;
-            }
+        // A manifest the list names but the store cannot produce is missing
+        // data, not an empty manifest — fail rather than under-report.
+        if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
+                      mle.manifest_path, h->arena, &body, &blen)) {
+            return false;
         }
         DataFileRef* entries =
             h->arena->allocate_array<DataFileRef>(kIcebergMaxManifestEntries);
         if (entries == nullptr) return false;
         uint32_t n_entries = 0;
-        if (!manifest_parse_json(body, static_cast<uint32_t>(blen), h->arena,
+        const bool parsed = is_avro_ocf(body, blen)
+            ? manifest_parse_avro(body, blen, h->arena, mle.partition_spec_id,
+                                  entries, kIcebergMaxManifestEntries,
+                                  &n_entries)
+            : manifest_parse_json(body, static_cast<uint32_t>(blen), h->arena,
                                   mle.partition_spec_id, entries,
-                                  kIcebergMaxManifestEntries, &n_entries))
-            continue;
+                                  kIcebergMaxManifestEntries, &n_entries);
+        if (!parsed) return false;
         const PartitionSpec* spec =
             metadata_spec(&h->meta, mle.partition_spec_id);
         for (uint32_t ei = 0; ei < n_entries; ++ei) {
             DataFileRef& e = entries[ei];
             if (e.status == ManifestStatus::kDeleted) continue;
+            // Delete files are not applied yet, and skipping one would
+            // over-report rows. Decline the scan instead. TODO(W5-delete-load)
             if (mle.content == FileContent::kEqualityDeletes ||
                 e.content == FileContent::kEqualityDeletes ||
                 e.content == FileContent::kPositionDeletes) {
-                continue;   // TODO(W5-delete-load)
+                return false;
             }
             if (!partition_passes(&e, spec, sch,
                                   s->opts.predicates, s->opts.n_predicates))
@@ -380,10 +529,16 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     BoltBatch::init_empty(out);
     out->arena = s->scratch;
     if (s->n_live == 0) { *out_eof = true; return true; }
-    for (;;) {
+    for (uint32_t guard = 0; guard <= kMaxLiveFiles; ++guard) {   // bounded
         if (!s->cur_file_open) {
-            if (!open_next_file(s)) { *out_eof = true; return true; }
+            bool err = false;
+            if (!open_next_file(s, &err)) {
+                if (err) return false;              // unreadable live data file
+                *out_eof = true;
+                return true;
+            }
         }
+        assert(s->cur_meta != nullptr);
         if (s->cur_row_group >= s->cur_meta->n_row_groups ||
             s->cur_row_group >= kLakeMaxRowGroups) {
             s->cur_file_open = false;
@@ -395,12 +550,13 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         BoltColumn* cols = out->columns[out->read_epoch];
         int64_t rows = 0;
+        // A row group the footer declares but the decoder cannot produce is
+        // missing rows (an unsupported codec — zstd — or encoding lands here).
+        // Fail; do not step over it.
         if (!pq::parquet_read_row_group(s->cur_body, s->cur_body_len,
                                          s->cur_meta, s->cur_row_group,
                                          s->scratch, cols, &rows)) {
-            s->cur_file_open = false;
-            ++s->cur_file_idx;
-            continue;
+            return false;
         }
         ++s->cur_row_group;
         out->num_rows = rows;
@@ -411,6 +567,10 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         }
         return true;
     }
+    // Unreachable: each iteration either returns or retires one live file, so
+    // the guard cannot expire. Fail closed if the invariant ever breaks.
+    assert(false && "iceberg scan advance did not make progress");
+    return false;
 }
 
 void iceberg_scan_close(ScanHandle* /*s*/) noexcept {}

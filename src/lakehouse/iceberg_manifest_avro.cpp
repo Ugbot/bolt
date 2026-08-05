@@ -137,6 +137,11 @@ void df_reset_pending(DfCtx* s, int64_t row) noexcept {
     assert(s != nullptr);
     std::memset(&s->pending, 0, sizeof(s->pending));
     s->pending.partition_spec_id = s->default_spec_id;
+    // Provenance, so pruning knows how to read what this parser produces:
+    // partition field_ids are struct ordinals, bounds are Iceberg's binary
+    // single-value encoding. See DataFileRef in manifest.h.
+    s->pending.partition_ordinal_ids = true;
+    s->pending.binary_bounds         = true;
     s->cur_row      = row;
     s->have_pending = true;
 }

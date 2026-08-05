@@ -23,11 +23,19 @@ namespace iceberg {
 
 struct TableHandle;
 struct ScanHandle;
+struct Metadata;
 
 bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                         const char* namespace_, const char* name) noexcept;
 
 void iceberg_table_close(TableHandle* h) noexcept;
+
+// The parsed metadata.json behind an open table — schemas, partition specs,
+// snapshot history, and the `location` the writer recorded. Read-only and
+// owned by the handle's arena; valid until that arena is reset. A caller needs
+// this to pick a snapshot for time travel (`ReadOptions::snapshot_id`), which
+// is otherwise unanswerable from the public surface.
+const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept;
 
 bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                        const ReadOptions* opts) noexcept;

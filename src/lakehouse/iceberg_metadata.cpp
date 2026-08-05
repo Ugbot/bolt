@@ -47,14 +47,23 @@ void copy_tok(const bj::StructuralIndex* idx, int32_t cur, char* dst,
     dst[n] = '\0';
 }
 
+// Skip whatever value the iterator is sitting on.
+//
+// `bj::iter_skip_to_close` counts nesting depth FROM the token under the
+// cursor, so it must be called ON the Begin token — and it already handles a
+// scalar by advancing once. Advancing past Begin first (what every copy of this
+// helper in src/lakehouse used to do) starts the walk at depth 0, so the
+// container's OWN close drives depth to -1, the match never fires, and the
+// cursor is left INSIDE the value. G2FEAT-125 found it the expensive way: a
+// real pyiceberg metadata.json carries `"properties": {...}` ahead of
+// `"snapshots"`, so skipping properties stranded the cursor on its inner key,
+// the top-level `while (peek == Key)` loop saw EndObject and stopped, and the
+// table parsed with ZERO snapshots and format-version 0 — silently, because
+// every field before `properties` read back correctly.
 bool skip_value(bj::Iterator* it) noexcept {
     assert(it != nullptr);
-    const bj::TokenType t = bj::iter_peek(it);
-    if (t == bj::TokenType::BeginObject || t == bj::TokenType::BeginArray) {
-        bj::iter_advance(it);
-        return bj::iter_skip_to_close(it);
-    }
-    return bj::iter_advance(it);
+    assert(it->idx != nullptr);
+    return bj::iter_skip_to_close(it);
 }
 
 bool read_int64(bj::Iterator* it, int64_t* out) noexcept {
