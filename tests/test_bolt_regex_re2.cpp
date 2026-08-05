@@ -29,6 +29,64 @@ bool CompileFails(const char* pat) {
     return !re2_compile(pat, static_cast<uint32_t>(std::strlen(pat)), &prog);
 }
 
+
+// ===========================================================================
+// G2FEAT-150 -- '.' must NOT match a newline in the BACKTRACKING engine.
+//
+// POSIX, PCRE and RE2 all require an explicit DOTALL/`s` flag for `.` to match
+// '\n', and this engine exposes no such flag. regex_atom_matches returned true
+// unconditionally for NodeKind::Any, so `.` matched everything -- while the
+// Re2Op engine in the SAME header already did it correctly
+// (`adv = (b != '\n')`). Two engines, one file, opposite answers for the same
+// pattern: a copy-drift bug, and the backtracking one is what REGEXP_REPLACE
+// runs.
+//
+// Found on ClickBench Q29. One `referer` value contains a literal newline, and
+//   ^https?://(?:www\.)?([^/]+)/.*$
+// must NOT match it, because `.*` cannot cross the newline to reach `$`. Both
+// DuckDB and chDB leave that string unchanged; chukonu rewrote it to its host
+// and put the row in the wrong GROUP BY bucket.
+// ===========================================================================
+
+// Compile with the backtracking engine and report whether it finds a match.
+bool BSearch(const char* pat, const char* text) {
+    CompiledPattern cp;
+    const bool ok = regex_compile(pat, static_cast<uint32_t>(std::strlen(pat)), &cp);
+    EXPECT_TRUE(ok) << "compile failed for /" << pat << "/";
+    if (!ok) return false;
+    MatchResult mr;
+    return regex_search(&cp, text, static_cast<int32_t>(std::strlen(text)), &mr);
+}
+
+TEST(RegexBacktrack, DotDoesNotMatchNewline) {
+    // The exact ClickBench Q29 shape, reduced.
+    const char* pat = "^https?://(?:www\.)?([^/]+)/.*$";
+    EXPECT_TRUE (BSearch(pat, "http://go.mail/a/b"));
+    EXPECT_FALSE(BSearch(pat, "http://go.mail/a\nb"))
+        << "'.*' must not cross a newline to reach '$'";
+
+    // Directly: one '.' against one '\n'.
+    EXPECT_FALSE(BSearch("^.$",   "\n"));
+    EXPECT_TRUE (BSearch("^.$",   "x"));
+    EXPECT_FALSE(BSearch("^a.b$", "a\nb"));
+    EXPECT_TRUE (BSearch("^a.b$", "axb"));
+
+    // A quantified '.' must not swallow one either.
+    EXPECT_FALSE(BSearch("^a.*b$", "a\nzzb"));
+    EXPECT_TRUE (BSearch("^a.*b$", "azzb"));
+
+    // An explicit class still can: only '.' is restricted, and a negated class
+    // that does not exclude '\n' must keep matching it.
+    EXPECT_TRUE(BSearch("^a[^q]b$", "a\nb"));
+    EXPECT_TRUE(BSearch("^a\nb$",   "a\nb"));
+
+    // The two engines in this header must now AGREE. Re2Op::Any was already
+    // correct; this pins them together so they cannot drift apart again.
+    EXPECT_EQ(BSearch("^a.b$", "a\nb"), M("^a.b$", "a\nb"));
+    EXPECT_EQ(BSearch("^a.b$", "axb"),  M("^a.b$", "axb"));
+    EXPECT_EQ(BSearch("^.*$",  "a\nb"), M("^.*$",  "a\nb"));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------

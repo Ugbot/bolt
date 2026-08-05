@@ -261,7 +261,17 @@ inline bool regex_class_matches(const Node& n, std::uint8_t b) noexcept {
 inline bool regex_atom_matches(const Node& n, std::uint8_t b) noexcept {
     switch (n.kind) {
         case NodeKind::Char:  return b == n.ch;
-        case NodeKind::Any:   return true;
+        // '.' does NOT match a newline. POSIX, PCRE and RE2 all require an
+        // explicit DOTALL/`s` flag for that, and this engine exposes no such
+        // flag — so returning true unconditionally was plain over-matching.
+        // The Re2Op engine further down this file already gets this right
+        // (`adv = (b != '\n')`); only this backtracking engine did not, so the
+        // two disagreed about the same pattern depending on which one ran.
+        // Found on ClickBench Q29: one referer contains a literal newline, and
+        // `^https?://(?:www\.)?([^/]+)/.*$` must NOT match it because `.*`
+        // cannot cross the newline to reach `$`. Both oracles leave that string
+        // unchanged; chukonu rewrote it to its host and mis-grouped the row.
+        case NodeKind::Any:   return b != '\n';
         case NodeKind::Class: return regex_class_matches(n, b);
         default:              return false;
     }
