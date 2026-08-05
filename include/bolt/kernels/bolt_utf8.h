@@ -212,10 +212,18 @@ BOLT_FORCE_INLINE int32_t bytes_find(
     if (nlen > hlen) return -1;
     const uint32_t last = hlen - nlen;
     const char first = ndl[0];
-    for (uint32_t k = 0; k <= last; ++k) {
-        if (hay[k] == first && memcmp(hay + k, ndl, nlen) == 0) {
-            return static_cast<int32_t>(k);
-        }
+    // memchr for the first-byte scan, not a byte loop: every libc ships it
+    // SIMD-vectorized, and the scan is the whole cost of a `%needle%` search
+    // over long values (ClickBench's `url` averages 88 bytes over 100M rows).
+    // memcmp only runs on an actual first-byte hit.
+    uint32_t k = 0;
+    while (k <= last) {
+        const void* hit = memchr(hay + k, static_cast<unsigned char>(first),
+                                 static_cast<size_t>(last - k) + 1u);
+        if (hit == nullptr) return -1;
+        k = static_cast<uint32_t>(static_cast<const char*>(hit) - hay);
+        if (memcmp(hay + k, ndl, nlen) == 0) return static_cast<int32_t>(k);
+        ++k;
     }
     return -1;
 }

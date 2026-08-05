@@ -719,4 +719,86 @@ TEST_F(Utf8Test, BytesLike_ExhaustiveVsReferenceWithWildcardsInHaystack) {
     EXPECT_GT(checked, 1000000) << "the sweep must actually be exhaustive";
 }
 
+
+// ===========================================================================
+// The COMPILED LIKE path (utf8_like_compile + utf8_like_match_one) is what
+// chukonu's Utf8 filter now dispatches through, because the general
+// backtracking matcher was the leaf frame in a profile of ClickBench Q21
+// (`count(*) WHERE url LIKE '%google%'` over 100M rows). Two implementations
+// of one semantic is exactly how the two engines in bolt_regex.h drifted
+// apart, so pin them together: the compiled path must agree with bytes_like
+// on EVERY case, over an alphabet that includes the wildcards themselves.
+// ===========================================================================
+
+bool compiled_like(const char* p, uint32_t pl, const char* s, uint32_t sl) {
+    ku::CompiledLike cl{};
+    bolt::StringView pv{};
+    const char* base = nullptr;
+    if (pl <= 12u) {
+        pv = ku::sv_make_inline(p, pl);
+    } else {
+        pv.length = pl; pv.ref.buf_idx = 0; pv.ref.offset = 0; base = p;
+    }
+    if (!ku::utf8_like_compile(pv, &cl, base)) return ku::bytes_like(s, sl, p, pl);
+    return ku::utf8_like_match_one(&cl, s, sl);
+}
+
+TEST_F(Utf8Test, CompiledLikeAgreesWithGeneralMatcherExhaustively) {
+    const char alpha[] = {'a', 'b', '%', '_'};
+    constexpr int kA = 4;
+    char sb[6], pb[5];
+    std::int64_t checked = 0, mism = 0;
+    for (uint32_t sl = 0; sl <= 5u; ++sl) {
+        const std::int64_t sn = static_cast<std::int64_t>(std::pow(kA, sl));
+        for (std::int64_t sc = 0; sc < sn; ++sc) {
+            std::int64_t t = sc;
+            for (uint32_t i = 0; i < sl; ++i) { sb[i] = alpha[t % kA]; t /= kA; }
+            for (uint32_t pl = 0; pl <= 4u; ++pl) {
+                const std::int64_t pn = static_cast<std::int64_t>(std::pow(kA, pl));
+                for (std::int64_t pc = 0; pc < pn; ++pc) {
+                    std::int64_t v = pc;
+                    for (uint32_t i = 0; i < pl; ++i) { pb[i] = alpha[v % kA]; v /= kA; }
+                    const bool a = ku::bytes_like(sb, sl, pb, pl);
+                    const bool b = compiled_like(pb, pl, sb, sl);
+                    ++checked;
+                    if (a != b) {
+                        ++mism;
+                        if (mism <= 3) {
+                            ADD_FAILURE() << "s='" << std::string(sb, sl)
+                                          << "' p='" << std::string(pb, pl)
+                                          << "' general=" << a << " compiled=" << b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mism, 0);
+    EXPECT_GT(checked, 400000);
+}
+
+TEST_F(Utf8Test, BytesFindMemchrScanMatchesNaive) {
+    // bytes_find's first-byte scan is memchr, not a byte loop. Same answers,
+    // including the last legal start position and needles that appear only as
+    // a prefix of a longer near-match.
+    auto naive = [](const char* h, uint32_t hl, const char* n, uint32_t nl) {
+        if (nl == 0) return 0;
+        if (nl > hl) return -1;
+        for (uint32_t k = 0; k + nl <= hl; ++k)
+            if (std::memcmp(h + k, n, nl) == 0) return static_cast<int>(k);
+        return -1;
+    };
+    const char* hays[] = {"", "a", "abcabcabd", "aaaaa", "http://a.ru/b",
+                          "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxab"};
+    const char* ndls[] = {"", "a", "ab", "abd", "aaa", ".ru", "b", "zz", "ab"};
+    for (const char* h : hays) {
+        for (const char* n : ndls) {
+            const uint32_t hl = static_cast<uint32_t>(std::strlen(h));
+            const uint32_t nl = static_cast<uint32_t>(std::strlen(n));
+            EXPECT_EQ(ku::bytes_find(h, hl, n, nl), naive(h, hl, n, nl))
+                << "h='" << h << "' n='" << n << "'";
+        }
+    }
+}
+
 }  // namespace
