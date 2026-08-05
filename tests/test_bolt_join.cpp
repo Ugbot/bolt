@@ -710,3 +710,185 @@ TEST(BoltSwiss, InterleavedLinearProbeSpillover) {
     EXPECT_EQ(iv.size, old_size);
     EXPECT_EQ(iv.find(keys[42]), 9999);
 }
+
+// ---------------------------------------------------------------------------
+// SwissTableSalted (G2FEAT-89/362) — salt-in-entry probe with inline payload.
+// ---------------------------------------------------------------------------
+
+TEST(BoltSwissSalted, FindOrInsertRoundTrip) {
+    Arena arena;
+    SwissTableSalted t{};
+    ASSERT_TRUE(SwissTableSalted::create(&t, 256, &arena));
+
+    for (uint32_t i = 0; i < 100; ++i) {
+        uint64_t key = 0x1000ULL + i * 7u;
+        int64_t* slot = t.find_or_insert(key, static_cast<int64_t>(i));
+        ASSERT_NE(slot, nullptr);
+        EXPECT_EQ(*slot, static_cast<int64_t>(i));
+    }
+    EXPECT_EQ(t.size, 100u);
+
+    for (uint32_t i = 0; i < 100; ++i) {
+        uint64_t key = 0x1000ULL + i * 7u;
+        int64_t* slot = t.find(key);
+        ASSERT_NE(slot, nullptr) << "key=" << key;
+        EXPECT_EQ(*slot, static_cast<int64_t>(i));
+    }
+
+    // Negative lookups.
+    EXPECT_EQ(t.find(0xDEADBEEFCAFEBABEULL), nullptr);
+    EXPECT_EQ(t.find(0), nullptr);
+}
+
+// Repeated find_or_insert on the same key must return the SAME cell (not a
+// fresh one) so `*slot += x` accumulates correctly — the whole point of the
+// co-located layout.
+TEST(BoltSwissSalted, AccumulateInPlaceMatchesGroundTruth) {
+    Arena arena;
+    SwissTableSalted t{};
+    ASSERT_TRUE(SwissTableSalted::create(&t, 64, &arena));
+
+    constexpr int kKeys = 20;
+    constexpr int kRows = 5000;
+    std::vector<int64_t> expected(kKeys, 0);
+
+    std::mt19937_64 rng(0x5EED);
+    for (int i = 0; i < kRows; ++i) {
+        const uint64_t k = static_cast<uint64_t>(rng() % kKeys);
+        const int64_t  v = static_cast<int64_t>((rng() % 97) + 1);
+        int64_t* slot = t.find_or_insert(k, 0);
+        ASSERT_NE(slot, nullptr);
+        *slot += v;
+        expected[static_cast<size_t>(k)] += v;
+    }
+
+    ASSERT_EQ(t.size, static_cast<uint64_t>(kKeys));
+    for (int k = 0; k < kKeys; ++k) {
+        int64_t* slot = t.find(static_cast<uint64_t>(k));
+        ASSERT_NE(slot, nullptr) << "key=" << k;
+        EXPECT_EQ(*slot, expected[static_cast<size_t>(k)]) << "key=" << k;
+    }
+}
+
+// A table sized far too small for the workload must fail closed (bounded
+// probe returns nullptr) rather than loop forever or silently corrupt state
+// — Tiger Style: no growth on the hot path.
+TEST(BoltSwissSalted, FullTableReturnsNullNeverLoopsForever) {
+    Arena arena;
+    SwissTableSalted t{};
+    // create() rounds up to a power of two with ~66% target load; force a
+    // tiny table so it's easy to genuinely fill.
+    ASSERT_TRUE(SwissTableSalted::create(&t, 1, &arena));
+    const uint64_t cap = t.capacity;
+
+    uint32_t inserted = 0;
+    for (uint64_t k = 0; k < cap * 4; ++k) {
+        int64_t* slot = t.find_or_insert(k, static_cast<int64_t>(k));
+        if (slot == nullptr) break;
+        ++inserted;
+    }
+    // Must have stopped at or before full capacity — never silently grown
+    // past it, never crashed, never spun.
+    EXPECT_LE(inserted, cap);
+    EXPECT_GT(inserted, 0u);
+    EXPECT_LE(t.size, t.capacity);
+}
+
+// find_or_insert_batch (windowed-prefetch variant) must return byte-identical
+// slot pointers / final values to the plain scalar find_or_insert loop over
+// the SAME key stream — the prefetch window is purely a latency-hiding
+// reordering trick and must never change which entry a key resolves to.
+TEST(BoltSwissSalted, BatchWindowedPrefetchMatchesScalar) {
+    constexpr int64_t kRows = 200'000;
+    constexpr uint64_t kDistinct = 4000;
+
+    std::vector<uint64_t> keys(static_cast<size_t>(kRows));
+    std::mt19937_64 rng(0xC0FFEE);
+    for (int64_t i = 0; i < kRows; ++i) {
+        keys[static_cast<size_t>(i)] = rng() % kDistinct;
+    }
+
+    // Scalar reference.
+    Arena arena_scalar;
+    SwissTableSalted t_scalar{};
+    ASSERT_TRUE(SwissTableSalted::create(&t_scalar, kDistinct, &arena_scalar));
+    for (int64_t i = 0; i < kRows; ++i) {
+        int64_t* slot = t_scalar.find_or_insert(keys[static_cast<size_t>(i)], 0);
+        ASSERT_NE(slot, nullptr);
+        *slot += 1;
+    }
+
+    // Batched, windowed-prefetch path over the identical key stream.
+    Arena arena_batch;
+    SwissTableSalted t_batch{};
+    ASSERT_TRUE(SwissTableSalted::create(&t_batch, kDistinct, &arena_batch));
+    std::vector<int64_t*> out_slots(static_cast<size_t>(kRows));
+    t_batch.find_or_insert_batch(keys.data(), kRows, 0, out_slots.data());
+    for (int64_t i = 0; i < kRows; ++i) {
+        ASSERT_NE(out_slots[static_cast<size_t>(i)], nullptr);
+        *out_slots[static_cast<size_t>(i)] += 1;
+    }
+
+    ASSERT_EQ(t_scalar.size, t_batch.size);
+    ASSERT_EQ(t_scalar.size, kDistinct);
+    for (uint64_t k = 0; k < kDistinct; ++k) {
+        int64_t* a = t_scalar.find(k);
+        int64_t* b = t_batch.find(k);
+        ASSERT_NE(a, nullptr) << "key=" << k;
+        ASSERT_NE(b, nullptr) << "key=" << k;
+        EXPECT_EQ(*a, *b) << "key=" << k;
+    }
+}
+
+// Cross-check against the REAL, unmodified bolt::SwissTable + a separate
+// accumulator array (the layout SwissTableSalted exists to beat) — both
+// must compute the identical (distinct groups, total) over the same input.
+// This is the correctness half of the go/no-go: a faster wrong answer is
+// not a win.
+TEST(BoltSwissSalted, MatchesFlatSwissTablePlusSeparateArray) {
+    constexpr int64_t kRows = 100'000;
+    constexpr uint64_t kDistinct = 3000;
+
+    std::vector<uint64_t> keys(static_cast<size_t>(kRows));
+    std::mt19937_64 rng(0xA11CE);
+    for (int64_t i = 0; i < kRows; ++i) {
+        keys[static_cast<size_t>(i)] = rng() % kDistinct;
+    }
+
+    // Reference: FLAT SwissTable + separate accum[] array.
+    Arena arena_flat;
+    SwissTable flat{};
+    ASSERT_TRUE(SwissTable::create(&flat, kDistinct, &arena_flat));
+    std::vector<int64_t> accum(flat.capacity, 0);
+    int32_t next_slot = 0;
+    for (int64_t i = 0; i < kRows; ++i) {
+        const uint64_t k = keys[static_cast<size_t>(i)];
+        int32_t slot = flat.find(k);
+        if (slot < 0) {
+            slot = next_slot++;
+            ASSERT_TRUE(flat.insert(k, static_cast<uint32_t>(slot)));
+        }
+        accum[static_cast<size_t>(slot)]++;
+    }
+    int64_t flat_total = 0;
+    for (int32_t s = 0; s < next_slot; ++s) flat_total += accum[static_cast<size_t>(s)];
+
+    // Salted table over the identical stream.
+    Arena arena_salt;
+    SwissTableSalted salted{};
+    ASSERT_TRUE(SwissTableSalted::create(&salted, kDistinct, &arena_salt));
+    for (int64_t i = 0; i < kRows; ++i) {
+        int64_t* slot = salted.find_or_insert(keys[static_cast<size_t>(i)], 0);
+        ASSERT_NE(slot, nullptr);
+        (*slot)++;
+    }
+    int64_t salted_total = 0;
+    for (uint64_t s = 0; s < salted.capacity; ++s) {
+        salted_total += salted.entries[s].value;
+    }
+
+    EXPECT_EQ(static_cast<uint32_t>(next_slot), static_cast<uint32_t>(salted.size));
+    EXPECT_EQ(flat_total, kRows);
+    EXPECT_EQ(salted_total, kRows);
+    EXPECT_EQ(flat_total, salted_total);
+}

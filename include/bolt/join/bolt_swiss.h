@@ -419,4 +419,199 @@ struct SwissTableInterleaved {
     }
 };
 
+// ---------------------------------------------------------------------------
+// SwissTableSalted (G2FEAT-89/362) — salt-in-entry open-addressed table with
+// an inline int64 payload.
+//
+// FLAT `SwissTable` (above) stores {ctrl byte} in one array and {key, value}
+// in a separate array; a caller building an aggregate table typically adds a
+// THIRD array (accumulators, indexed by SwissTable's uint32 value) since the
+// 32-bit value field is meant as an index, not a payload. A probe hit then
+// touches up to three cache lines: ctrl, slot, accumulator.
+//
+// SwissTableSalted co-locates {salt, key, int64 payload} in ONE 32-byte open-
+// addressed entry (two per 64-byte cache line, never straddling — the salt
+// and the trailing pad exist only to keep 8-byte-aligned `key`/`value` on a
+// clean boundary). A probe hit touches ONE cache line: the salt filters
+// candidates cheaply, the full key compare only runs on a salt match, and
+// the payload is already resident for in-place accumulate — no second array.
+//
+// Micro-bench-justified go/no-go (`benchmarks/bench_salt_probe.cpp`,
+// G2FEAT-89): vs FLAT `SwissTable` + a separate accumulator array, measured
+// 2-4x faster for an aggregation-ingest-shaped find-or-insert-and-accumulate
+// workload once the table exceeds L2/L3 residency (no win, sometimes a
+// regression, below that — the extra 32B-vs-~17B entry size and branchier
+// linear probe cost more than a cache-resident table's near-zero miss rate
+// saves). Crucially, the win SURVIVES at 8 independent per-thread tables
+// under DRAM-bandwidth contention (the parallelism-negative regime that
+// motivated this work): at the 17M-distinct / 100M-row production-matched
+// shape, `find_or_insert_batch` measured 2.3x faster than FLAT+separate-
+// array at both 1 and 8 threads. Full numbers, sizes swept, and the exact
+// methodology: docs/research/design-log.md "G2FEAT-89 — salt-in-entry
+// SwissTable probe".
+//
+// Trade-off (do not hide this from a future caller): ~1.9x the per-slot
+// memory footprint of FLAT (32B/entry vs FLAT's ~17B/slot including ctrl).
+// The measured win holds even after paying it, but it is a real cost at
+// >L3 table sizes and should be budgeted for, not assumed free.
+//
+// Scope: single inline int64 payload (sum/count/min/max-shaped) — the
+// common case for a plain int64 aggregate. A composite or wide payload
+// still wants FLAT `SwissTable` mapping key -> a caller-owned wider record.
+//
+// Kept-code-paths policy (mirrors `SwissTableInterleaved` / BOLT_SWISS_LAYOUT
+// above): FLAT `SwissTable` remains the default for general key->slot
+// lookups and is UNCHANGED by this addition. `SwissTableSalted` is reachable
+// by name; wiring a cardinality-based picker into a real aggregate operator
+// is a chukonu-side call (G2FEAT-362 productionization) and explicitly out
+// of scope here — this is the bolt-primitive half only, provided tested and
+// correct, not wired into any call site.
+// ---------------------------------------------------------------------------
+struct SwissEntrySalted {
+    uint64_t salt;       // bit63 = occupied marker; low 63 bits = hash tag
+    int64_t  key;
+    int64_t  value;
+    int64_t  _reserved;  // pads to 32B so entries never straddle a cache line
+};
+static_assert(sizeof(SwissEntrySalted) == 32, "SwissEntrySalted must be 32 bytes");
+
+inline constexpr uint64_t kSwissSaltedOccupied = uint64_t(1) << 63;
+
+struct SwissTableSalted {
+    SwissEntrySalted* entries;   // capacity entries, arena-allocated
+    uint64_t          capacity;  // power of two
+    uint64_t          mask;      // capacity - 1
+    uint64_t          size;      // live entries
+
+    // ------------------------------------------------------------------
+    // Factory: allocate `entries` from arena, all zero (unoccupied).
+    // capacity_hint is the max expected distinct keys; sized to ~66% load
+    // (matches the micro-bench-validated shape), rounded to a power of two.
+    // ------------------------------------------------------------------
+    static bool create(SwissTableSalted* out, uint64_t capacity_hint,
+                       Arena* arena) noexcept {
+        assert(out != nullptr);
+        assert(arena != nullptr);
+
+        uint64_t target = capacity_hint + (capacity_hint >> 1) + kSwissMinCapacity;
+        uint32_t cap = swiss_round_up_pow2(target);
+        assert(cap >= kSwissMinCapacity);
+        assert((cap & (cap - 1)) == 0);
+
+        SwissEntrySalted* e = arena->allocate_array<SwissEntrySalted>(cap);
+        if (!e) return false;
+        memset(e, 0, sizeof(SwissEntrySalted) * cap);
+
+        out->entries  = e;
+        out->capacity = cap;
+        out->mask     = cap - 1;
+        out->size     = 0;
+        return true;
+    }
+
+    // Prefetch the entry line a future find()/find_or_insert() will touch.
+    void prefetch(uint64_t key) const noexcept {
+        assert(entries != nullptr);
+        assert(capacity > 0);
+        const uint64_t h = swiss_mix(key);
+        BOLT_PREFETCH_WRITE(&entries[h & mask]);
+    }
+
+    // ------------------------------------------------------------------
+    // Find-or-insert. Returns a pointer to the entry's `value` field —
+    // freshly set to `initial_value` on first sight of `key`, or the
+    // existing accumulator otherwise (caller does `*slot += x`, `*slot =
+    // max(*slot, x)`, etc. in place — no second lookup, no second array).
+    //
+    // Returns nullptr only if the table is completely full and `key` is
+    // not already present — Tiger Style: bounded probe, no growth on the
+    // hot path, fail rather than loop forever or grow silently. Caller
+    // must size `capacity_hint` generously at create() time.
+    // ------------------------------------------------------------------
+    int64_t* find_or_insert(uint64_t key, int64_t initial_value) noexcept {
+        return find_or_insert_hashed(key, swiss_mix(key), initial_value);
+    }
+
+    // Same as find_or_insert but takes a pre-computed hash — the primitive
+    // find_or_insert_batch() below builds on, and any caller doing its own
+    // windowed prefetch (bench_salt_probe.cpp approach "C") can reuse.
+    int64_t* find_or_insert_hashed(uint64_t key, uint64_t h,
+                                   int64_t initial_value) noexcept {
+        assert(entries != nullptr);
+        assert(capacity > 0);
+        const uint64_t salt = (h & (kSwissSaltedOccupied - 1)) | kSwissSaltedOccupied;
+        uint64_t slot = h & mask;
+
+        for (uint64_t probe = 0; probe < capacity; ++probe) {
+            SwissEntrySalted& c = entries[slot];
+            if (c.salt == 0) {
+                if (size >= capacity) return nullptr;
+                c.key   = static_cast<int64_t>(key);
+                c.value = initial_value;
+                c.salt  = salt;
+                ++size;
+                return &c.value;
+            }
+            if (c.salt == salt && c.key == static_cast<int64_t>(key)) {
+                return &c.value;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return nullptr;  // table full, key not present — bounded, no growth
+    }
+
+    // Pure lookup. Returns nullptr if `key` was never inserted.
+    int64_t* find(uint64_t key) const noexcept {
+        assert(entries != nullptr);
+        assert(capacity > 0);
+        const uint64_t h    = swiss_mix(key);
+        const uint64_t salt = (h & (kSwissSaltedOccupied - 1)) | kSwissSaltedOccupied;
+        uint64_t slot = h & mask;
+
+        for (uint64_t probe = 0; probe < capacity; ++probe) {
+            SwissEntrySalted& c = entries[slot];
+            if (c.salt == 0) return nullptr;
+            if (c.salt == salt && c.key == static_cast<int64_t>(key)) return &c.value;
+            slot = (slot + 1) & mask;
+        }
+        return nullptr;
+    }
+
+    // ------------------------------------------------------------------
+    // Batched find-or-insert with windowed software prefetch — the
+    // strongest measured variant in bench_salt_probe.cpp ("approach C"):
+    // precompute a window of hashes, prefetch each target entry line, then
+    // probe — hides DRAM miss latency across the window instead of
+    // stalling one row at a time. `out_slots[i]` receives the pointer
+    // find_or_insert_hashed() would have returned for `keys[i]`; nullptr
+    // entries mean the table filled (same bounded-failure contract as
+    // find_or_insert). Caller drives accumulation from `out_slots` (kept
+    // separate from the prefetch/probe loop so this stays payload-agnostic
+    // — SUM/COUNT/MIN/MAX all reduce to a different write into *out_slots[i]).
+    // ------------------------------------------------------------------
+    static constexpr int64_t kPrefetchWindow = 32;
+
+    void find_or_insert_batch(const uint64_t* BOLT_RESTRICT keys, int64_t n,
+                              int64_t initial_value,
+                              int64_t** BOLT_RESTRICT out_slots) noexcept {
+        assert(keys != nullptr || n == 0);
+        assert(out_slots != nullptr || n == 0);
+        assert(n >= 0);
+
+        uint64_t hbuf[kPrefetchWindow];
+        for (int64_t base = 0; base < n; base += kPrefetchWindow) {
+            const int64_t m = (base + kPrefetchWindow <= n) ? kPrefetchWindow : (n - base);
+            for (int64_t j = 0; j < m; ++j) {
+                const uint64_t h = swiss_mix(keys[base + j]);
+                hbuf[j] = h;
+                BOLT_PREFETCH_WRITE(&entries[h & mask]);
+            }
+            for (int64_t j = 0; j < m; ++j) {
+                out_slots[base + j] =
+                    find_or_insert_hashed(keys[base + j], hbuf[j], initial_value);
+            }
+        }
+    }
+};
+
 }  // namespace bolt

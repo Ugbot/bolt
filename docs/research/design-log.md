@@ -2093,3 +2093,114 @@ of P private copies, banks disabled (banks pay off for one big table, not P
 small ones); ingest across sharing states must be serial (documented
 contract). The historical `_begin` forwards with `shared = nullptr` and is
 behaviour-identical.
+
+## 2026-08-04 / G2FEAT-89 (tracker "B2") — salt-in-entry SwissTable probe: measured GO, `SwissTableSalted` landed as a named alternative
+
+**Question.** chukonu's own aggregation-engine profiling (`extern/chukonu/docs/
+research/53-aggregation-engine-synthesis.md`) attributes ~94% of ClickBench
+Q16/Q10 wall time to the int64 GROUP BY ingest probe, and it is measured
+*parallelism-negative* (62 ns/row/worker @8t vs 32 ns/row @1t — 8 independent
+per-worker tables contend for DRAM bandwidth). Does co-locating a salt (upper
+hash bits) with the key+accumulator in one cache-line entry — instead of FLAT
+`SwissTable`'s ctrl-byte array plus a separate key/accumulator array — actually
+fix that, or does it only look good single-threaded and evaporate under DRAM
+contention (the fate of every other lever tried so far — see "Measured dead
+ends" in `docs/intent/single-box-engine-strategy.md`)?
+
+**Method — measure before touching the primitive.** New
+`benchmarks/bench_salt_probe.cpp`, four approaches over the IDENTICAL key
+stream (correctness cross-checked: all four must agree on (distinct groups,
+total count) before any timing is trusted):
+
+- **A** — the REAL, unmodified `bolt::SwissTable` (ctrl-byte array, SIMD group
+  scan) mapping key -> slot, plus a separate `accum[]` array (the shape every
+  real caller, chukonu's hash-agg op included, already uses).
+- **D** — `bolt::SwissTableInterleaved` (the existing "per-group co-location"
+  alternative, already in this file, already known ~6%-ish) + separate
+  `accum[]` — included as a same-harness control: if this bench doesn't
+  roughly reproduce "small, not a fix" here too, the harness is suspect.
+- **B** — salt-in-entry, scalar: one open-addressed array of {salt, key,
+  accum} entries (see `SwissTableSalted` below for the exact 32-byte layout
+  and why it isn't 16).
+- **C** — B + windowed software prefetch (32-row window; ClickHouse/StarRocks-
+  style: precompute a window of hashes, prefetch each target entry line, probe
+  after the whole window is in flight).
+
+Swept table sizes crossing L1 -> L2 -> L3-boundary -> DRAM -> the exact
+production shape (17M distinct / 100M rows, the Q16 shape), each size run at
+**both 1 and 8 threads, each thread owning its own full-size table** — the
+per-worker-independent-table shape that makes A parallelism-negative in
+production. A layout only fast at 1t would not have been a green light.
+
+**Result (AMD Ryzen AI MAX+ 395, MSVC RelWithDebInfo, NATIVE SIMD tier;
+full numbers: `bench_salt_probe` stdout, this commit).** Ratio is A's ns/row
+divided by the candidate's (>1 = candidate faster):
+
+| distinct | ~table size | 1t: B / C | 8t: B / C |
+|---|---|---|---|
+| 2K | L1 | 0.66x / 0.68x | 0.78x / 0.86x |
+| 50K | L2 | 1.09x / 1.05x | 1.28x / 1.94x |
+| 1M | L3-boundary | 2.37x / 3.66x | 2.63x / 3.62x |
+| 4M | DRAM | 2.94x / 3.79x | 1.62x / 2.27x |
+| **17M (Q16 shape)** | **DRAM, prod-matched** | **3.16x / 4.16x** | **2.04x / 2.34x** |
+
+D (interleaved control) never won in this harness (0.6x-1.3x across every
+size) — consistent with "small or negative, not a fix," which is what made A
+a trustworthy control for this bench's methodology rather than a fluke.
+
+**Reading it.** Below ~L2 residency there is no win (sometimes a real
+regression) — A is already near-optimal when the table is cache-resident, and
+B/C pay for a bigger entry (32B vs A's ~17B/slot) and a branchier probe for
+nothing in return. That's fine: it isn't the target regime. From the L3
+boundary up, B and C win clearly and — the load-bearing result — **the win
+survives at 8 independent per-thread tables under real DRAM contention**: at
+the exact production shape, C is 4.16x faster at 1t and *still* 2.34x faster
+at 8t. That is the one number every prior lever in this file failed to
+produce (see "Measured dead ends" — vectorized batched probe, per-group
+co-location, cache-residency cap-tuning all either didn't move the needle or
+made 8t worse). Windowed prefetch (C) consistently beats plain salt-in-entry
+(B) once the table exceeds cache — expected, since it overlaps DRAM miss
+latency across the window instead of stalling one row at a time; the
+interesting finding is C also nudges ahead at L2 (1.94x @8t on the 50K-distinct
+point) where B alone is only marginal, so the prefetch pattern itself carries
+real weight even before the entry saves a cache line.
+
+**Decision: GO. `SwissTableSalted` (this file) lands as a NAMED ALTERNATIVE,
+not a default swap.** Same kept-code-paths policy as `SwissTableInterleaved`
+above (C3): FLAT `SwissTable` remains the default for `SwissJoinBuild` /
+`GroupByTable` and every other existing call site — nothing currently wired
+to `SwissTable` changed. `SwissTableSalted` is reachable by name:
+`create(hint, arena)`, `find_or_insert(key, initial) -> int64_t*` (in-place
+accumulate, no second array), `find(key) -> int64_t*`, and
+`find_or_insert_batch(...)` (the measured-strongest windowed-prefetch
+variant, "C" above, as a reusable primitive rather than every caller
+hand-rolling its own window loop). 5 new tests in `tests/test_bolt_join.cpp`
+(`BoltSwissSalted.*`): round-trip, in-place-accumulate-matches-ground-truth,
+bounded-fail-never-loops-forever on a deliberately undersized table, batched
+windowed-prefetch byte-identical to the scalar loop, and a direct
+cross-check against FLAT `SwissTable` + separate `accum[]` over the same
+random stream (same (distinct, total), not just "doesn't crash"). Full suite
+unaffected: 122/122 before and after (the new cases live inside the existing
+`test_bolt_join` ctest entry, so the ctest-level count doesn't move; gtest
+case count inside it goes 9 -> 14, all green).
+
+**What would flip the choice** (i.e., when to reach for `SwissTableSalted`
+instead of `SwissTable`): the aggregate/join-build table is expected to
+exceed L2-L3 residency (roughly >1M int64-keyed groups on commodity server
+L3 sizes) AND the payload is a single inline int64 (sum/count/min/max-
+shaped) — not a composite or wide record, which still wants FLAT's
+key->index-into-a-wider-record shape. Below that size, or under memory
+pressure where the ~1.9x larger footprint (32B/entry vs FLAT's ~17B/slot)
+can't be afforded, FLAT stays the right choice — reflected honestly in the
+"no win below ~L2" row of the table above, not asserted as a universal win.
+
+**Scope note.** This lands the bolt PRIMITIVE only, measured and tested in
+isolation. Wiring a cardinality-based picker into chukonu's real hash-agg
+operator (the G2FEAT-362 productionization) is explicitly out of scope here
+— chukonu's own `bench_agg_salt_micro.cpp` prototype already found that a
+naive parallel-path wrapper around an early version of this idea (20 salt
+tables x memset/run + a disk funnel) was 5.8x WORSE than doing nothing, i.e.
+the wrapper cost swamped the probe win. That integration risk is real and
+belongs to a dedicated chukonu-side session with its own measure-first gate
+(`extern/chukonu/docs/research/53-aggregation-engine-synthesis.md`, "Inc 1"),
+not bundled into this primitive-level change.

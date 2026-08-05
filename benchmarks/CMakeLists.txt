@@ -163,6 +163,20 @@ bolt_apply_hardening(bench_decimal)
 bolt_apply_bench_tuning(bench_decimal)
 
 # -----------------------------------------------------------------------
+# G2FEAT-89/362: salt-in-entry SwissTable probe go/no-go microbenchmark.
+# -----------------------------------------------------------------------
+add_executable(bench_salt_probe bench_salt_probe.cpp)
+target_link_libraries(bench_salt_probe PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_salt_probe PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_salt_probe)
+bolt_apply_bench_tuning(bench_salt_probe)
+
+# -----------------------------------------------------------------------
 # BLLM-14: int8-activation IDOT GEMV perf tripwire. Times the dispatched
 # (CPUID-selected) kernel vs the scalar reference and asserts a GFLOPS-ratio
 # floor when a SIMD tier is present -- the only gate that catches a silent
