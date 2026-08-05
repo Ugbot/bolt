@@ -166,12 +166,22 @@ BOLT_FORCE_INLINE bool bytes_like(
     uint32_t star_p = 0xFFFFFFFFu;   // last '%' position in pattern (+1)
     uint32_t star_s = 0;             // string position when '%' was taken
     while (si < slen) {
-        if (pi < plen && (p[pi] == '_' || p[pi] == s[si])) {
-            ++si; ++pi;
-        } else if (pi < plen && p[pi] == '%') {
+        // '%' MUST be tested before the literal/`_` branch. `p[pi] == s[si]`
+        // is also true when the haystack byte is itself a literal '%', and
+        // taking that branch consumes the pattern's WILDCARD as a literal:
+        // the star is never recorded, so the matcher cannot backtrack past
+        // this point and scans to the end reporting no match. Only haystacks
+        // containing a literal '%' are affected -- which is why URL-encoded
+        // data (`%2F`, `%20`) exposed it and TPC-H/TAQ never did. Found on
+        // ClickBench: `URL LIKE '%.ru%'` missed every row of the form
+        // `...bonprix.ru%2F...` because the byte after `.ru` is '%'
+        // (G2FEAT-146; `%.r%` and `%.ru%2F%` both matched the same row).
+        if (pi < plen && p[pi] == '%') {
             star_p = pi;             // remember star; it matches empty for now
             star_s = si;
             ++pi;
+        } else if (pi < plen && (p[pi] == '_' || p[pi] == s[si])) {
+            ++si; ++pi;
         } else if (star_p != 0xFFFFFFFFu) {
             pi = star_p + 1;         // backtrack: let the star eat one more byte
             ++star_s;

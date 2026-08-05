@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <string>
@@ -624,6 +625,98 @@ TEST_F(Utf8Test, BytesEqualSimdParityBodyAndTail) {
         EXPECT_FALSE(got)   << "planted mismatch must be detected, p=" << p;
         b[p] = saved;                                // restore
     }
+}
+
+
+// ===========================================================================
+// G2FEAT-146 -- bytes_like must test '%' BEFORE the literal/`_` branch.
+//
+// `p[pi] == s[si]` is ALSO true when the haystack byte is itself a literal
+// '%'. With the literal branch first, the pattern's WILDCARD gets consumed as
+// a literal match, the star is never recorded, and the matcher can no longer
+// backtrack -- it scans to the end and reports no match.
+//
+// Only haystacks containing a literal '%' are affected, which is why
+// URL-encoded data exposed it and TPC-H/TAQ never did. A fuzzer whose HAYSTACK
+// alphabet excludes '%' cannot find this: the original 400k-case sweep over
+// {a,b} passed clean. The alphabet below deliberately includes both wildcards.
+// ===========================================================================
+
+// Reference matcher: exhaustive, obviously-correct, no backtracking cleverness.
+bool ref_like(const char* s, uint32_t slen,
+              const char* p, uint32_t plen) noexcept {
+    if (plen == 0) return slen == 0;
+    if (p[0] == '%') {
+        for (uint32_t k = 0; k <= slen; ++k) {
+            if (ref_like(s + k, slen - k, p + 1, plen - 1)) return true;
+        }
+        return false;
+    }
+    if (slen == 0) return false;
+    if (p[0] != '_' && p[0] != s[0]) return false;
+    return ref_like(s + 1, slen - 1, p + 1, plen - 1);
+}
+
+TEST_F(Utf8Test, BytesLike_WildcardBeatsLiteralPercentInHaystack) {
+    // The exact ClickBench row: the byte after `.ru` is a literal '%'.
+    const char* u = "https://produkty%2Fbonprix.ru%2Fkurtka-a-datch2867&pvno=2";
+    const uint32_t ulen = static_cast<uint32_t>(std::strlen(u));
+
+    EXPECT_TRUE(ku::bytes_like(u, ulen, "%.ru%", 5))
+        << "pre-fix this returned false: the trailing '%' matched the "
+           "haystack's literal '%' and destroyed the backtrack point";
+
+    // Controls that passed even PRE-fix -- they pin that the fix did not
+    // simply loosen matching. Both differ from the failing case only in
+    // whether a '%' sits where the pattern's wildcard is tested.
+    EXPECT_TRUE(ku::bytes_like(u, ulen, "%.r%", 4));        // next byte is 'u'
+    EXPECT_TRUE(ku::bytes_like(u, ulen, "%.ru%2F%", 8));    // wildcard consumed, then matches
+    EXPECT_TRUE(ku::bytes_like(u, ulen, "%bonprix%", 9));
+    EXPECT_FALSE(ku::bytes_like(u, ulen, "%.rux%", 6));     // genuinely absent
+    EXPECT_FALSE(ku::bytes_like(u, ulen, "%zzzz%", 6));
+
+    // A literal '%' must still be matchable BY a literal '%' in the pattern
+    // where that is the only reading -- `_` forces one byte, so the '%' that
+    // follows has to match the haystack's '%' as a literal.
+    EXPECT_TRUE(ku::bytes_like("a%b", 3, "a%b", 3));
+    EXPECT_TRUE(ku::bytes_like("a%b", 3, "_%_", 3));
+}
+
+TEST_F(Utf8Test, BytesLike_ExhaustiveVsReferenceWithWildcardsInHaystack) {
+    // Every string up to length 5 and every pattern up to length 4 over an
+    // alphabet that INCLUDES both wildcard characters. This is the coverage
+    // the original sweep lacked.
+    const char alpha[] = {'a', 'b', '%', '_'};
+    constexpr int kA = 4;
+    char sbuf[6], pbuf[5];
+    std::int64_t checked = 0, mismatches = 0;
+    for (uint32_t sl = 0; sl <= 5u; ++sl) {
+        const std::int64_t sn = static_cast<std::int64_t>(std::pow(kA, sl));
+        for (std::int64_t sc = 0; sc < sn; ++sc) {
+            std::int64_t t = sc;
+            for (uint32_t i = 0; i < sl; ++i) { sbuf[i] = alpha[t % kA]; t /= kA; }
+            for (uint32_t pl = 0; pl <= 4u; ++pl) {
+                const std::int64_t pn = static_cast<std::int64_t>(std::pow(kA, pl));
+                for (std::int64_t pc = 0; pc < pn; ++pc) {
+                    std::int64_t v = pc;
+                    for (uint32_t i = 0; i < pl; ++i) { pbuf[i] = alpha[v % kA]; v /= kA; }
+                    const bool got = ku::bytes_like(sbuf, sl, pbuf, pl);
+                    const bool want = ref_like(sbuf, sl, pbuf, pl);
+                    ++checked;
+                    if (got != want) {
+                        ++mismatches;
+                        if (mismatches <= 3) {
+                            ADD_FAILURE() << "s='" << std::string(sbuf, sl)
+                                          << "' p='" << std::string(pbuf, pl)
+                                          << "' got=" << got << " want=" << want;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mismatches, 0);
+    EXPECT_GT(checked, 1000000) << "the sweep must actually be exhaustive";
 }
 
 }  // namespace
