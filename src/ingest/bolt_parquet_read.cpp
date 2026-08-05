@@ -22,6 +22,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_snappy.h"
+#include "bolt/ingest/bolt_zstd_dec.h"
 
 namespace bolt {
 namespace ingest {
@@ -660,6 +661,45 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
     return false;                                   // encoding outside v1
 }
 
+// Decompress one page payload per the chunk's codec, into arena memory.
+//
+// `zscratch` is a lazily-allocated scratch block reused across every zstd page
+// in the chunk: it is ~150 KB, far too big to allocate per page and far too big
+// for a stack frame. It stays null for chunks that never hit a zstd page.
+bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
+                     int32_t unc, Arena* arena, void** zscratch,
+                     const uint8_t** out, uint64_t* out_len) noexcept {
+    assert(arena != nullptr && zscratch != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    if (unc < 0) return false;
+    const uint64_t unc_len = static_cast<uint64_t>(unc);
+    if (codec == PqCodec::Uncompressed) {
+        if (src_len != unc_len) return false;
+        *out = src; *out_len = src_len;
+        return true;
+    }
+    uint8_t* dst = static_cast<uint8_t*>(arena->allocate(unc_len + 1u, 8));
+    if (dst == nullptr) return false;
+    if (codec == PqCodec::Snappy) {
+        if (!snappy_decompress(src, src_len, dst, unc_len)) return false;
+    } else if (codec == PqCodec::Zstd) {
+        if (*zscratch == nullptr) {
+            *zscratch = arena->allocate(zstd_scratch_size(), 8);
+            if (*zscratch == nullptr) return false;
+        }
+        uint64_t got = 0;
+        if (zstd_decode_raw(src, src_len, dst, unc_len, &got,
+                            *zscratch, zstd_scratch_size()) != kZstdOk) {
+            return false;
+        }
+        if (got != unc_len) return false;      // page header size must match
+    } else {
+        return false;                          // codec outside v1
+    }
+    *out = dst; *out_len = unc_len;
+    return true;
+}
+
 // One column chunk: walk its pages, decode rows [row0, row0+rows).
 bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
                   ColCtx* cx, int64_t row0, int64_t rows,
@@ -676,6 +716,7 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
     const uint64_t end = s + region;
     uint64_t p = s;
     int64_t rows_done = 0;
+    void* zscratch = nullptr;                 // lazily allocated, chunk-scoped
     cx->dict = nullptr;                       // dictionary is chunk-scoped
     cx->dict_n = 0;
     for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {  // bounded
@@ -688,20 +729,9 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
         if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
         const uint8_t* pd = buf + pay;
         uint64_t pd_len = static_cast<uint64_t>(h.cmp);
-        if (ch->codec == PqCodec::Snappy) {
-            uint8_t* dst = static_cast<uint8_t*>(
-                arena->allocate(static_cast<uint64_t>(h.unc) + 1u, 8));
-            if (dst == nullptr) return false;
-            if (!snappy_decompress(pd, pd_len, dst,
-                                   static_cast<uint64_t>(h.unc))) {
-                return false;
-            }
-            pd = dst;
-            pd_len = static_cast<uint64_t>(h.unc);
-        } else if (ch->codec == PqCodec::Uncompressed) {
-            if (h.cmp != h.unc) return false;
-        } else {
-            return false;                     // codec outside v1
+        if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena, &zscratch,
+                             &pd, &pd_len)) {
+            return false;
         }
         if (h.type == kPageDict) {
             if (!decode_dict_page(cx, pd, pd_len, h.nvals, arena)) {
@@ -1125,6 +1155,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     // ---- Pass 2: decode the same pages (reuses the whole-chunk page path) ----
     p = p_start;
     int64_t rows_done = 0;
+    void* zscratch = nullptr;                 // lazily allocated, chunk-scoped
     for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
         if (rows_done >= rows_sum) break;
         if (p >= end) break;
@@ -1136,19 +1167,8 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
         const uint8_t* pd = buf + pay;
         uint64_t pd_len = static_cast<uint64_t>(h.cmp);
         if (h.type == kPageData) {
-            if (ch->codec == PqCodec::Snappy) {
-                uint8_t* dst = static_cast<uint8_t*>(
-                    arena->allocate(static_cast<uint64_t>(h.unc) + 1u, 8));
-                if (dst == nullptr) return false;
-                if (!snappy_decompress(pd, pd_len, dst,
-                                       static_cast<uint64_t>(h.unc))) {
-                    return false;
-                }
-                pd = dst;
-                pd_len = static_cast<uint64_t>(h.unc);
-            } else if (ch->codec == PqCodec::Uncompressed) {
-                if (h.cmp != h.unc) return false;
-            } else {
+            if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
+                                 &zscratch, &pd, &pd_len)) {
                 return false;
             }
             if (!decode_data_page(&cx, pd, pd_len, &h, rows_done,

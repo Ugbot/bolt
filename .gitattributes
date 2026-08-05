@@ -8,3 +8,7 @@
 # must stay that way, so they are not eligible for line-ending normalisation
 # either — even though pyiceberg happens to emit them with no newlines at all.
 tests/data/golden_iceberg_table/** binary
+
+# G2FEAT-134 zstd reference vectors: a binary container of compressed frames
+# (line-ending normalisation would silently corrupt them).
+tests/data/zstd_vectors.bin binary

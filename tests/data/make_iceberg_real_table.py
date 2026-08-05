@@ -12,8 +12,10 @@ test_bolt_iceberg_real_scan.cpp reads it end to end.
 
 Everything under golden_iceberg_table/ is written by **pyiceberg 0.11.1** driving
 a real `SqlCatalog` warehouse — `create_table` + two `append(pyarrow.Table)`
-calls. bolt writes none of it. Format-version 2, identity-partitioned on `sym`,
-`"avro.codec":"deflate"` manifests, two snapshots, five data files.
+calls, at pyiceberg's DEFAULT settings (no table properties are set at all).
+bolt writes none of it. Format-version 2, identity-partitioned on `sym`,
+`"avro.codec":"deflate"` manifests, **`zstd` Parquet data files** (the default),
+two snapshots, five data files.
 
 THE TABLE (db.trades — id:long, sym:string, price:double, active:boolean):
     append #1 -> 6 rows  AAPL(101.5,102.25) MSFT(310.0,311.75)
@@ -21,23 +23,22 @@ THE TABLE (db.trades — id:long, sym:string, price:double, active:boolean):
     append #2 -> 3 rows  AAPL(103.0) TSLA(250.5,251.0)          => 2 files
     current snapshot therefore sees BOTH manifests: 5 files, 9 rows.
 
-TWO DELIBERATE CHOICES, both disclosed rather than silently convenient:
+ONE DELIBERATE CHOICE, disclosed rather than silently convenient:
 
-1. `write.parquet.compression-codec = snappy`. pyiceberg's default is **zstd**,
-   and bolt's Parquet reader implements Snappy + uncompressed only (`PqCodec`
-   in bolt/ingest/bolt_parquet_meta.h; zstd is an OPTIONAL external library,
-   `BOLT_WITH_ZSTD`, and is not linked here). This is a writer PROPERTY that
-   Iceberg exposes as a first-class table setting, not a transformation of the
-   data — the rows, types, schema, partitioning and manifest encoding are all
-   exactly what pyiceberg produces. A zstd table reads its metadata fine and
-   then fails LOUDLY at the Parquet decode; it never silently returns short.
-
-2. The tree is committed with the ABSOLUTE `file://` locations baked in by the
+1. The tree is committed with the ABSOLUTE `file://` locations baked in by the
    generating machine, exactly as pyiceberg wrote them — they are NOT rewritten
    to be relative. That is the point: reading the fixture from wherever it is
    checked out exercises the scan's real relocation logic (strip the metadata
    `location` prefix, resolve under the table's actual directory), which is the
    same code path a table moved between buckets or restored from backup needs.
+
+HISTORY: this fixture originally set `write.parquet.compression-codec=snappy`,
+because bolt's Parquet reader had no zstd and pyiceberg's default is zstd — so
+the fixture was the happy path, disclosed but real. G2FEAT-134 gave bolt a
+self-contained zstd decoder (include/bolt/ingest/bolt_zstd_dec.h), so the
+property is gone and this warehouse is now written at pyiceberg's untouched
+defaults. That is the whole point: the table a user actually gets from the most
+common Python writer is the table bolt reads.
 
 Not wired into CMake — the tree is committed; this exists so it can be rebuilt
 or bumped to a newer Iceberg writer deliberately. If you change the data below
@@ -75,7 +76,7 @@ tbl = cat.create_table(
     partition_spec=PartitionSpec(
         PartitionField(source_id=2, field_id=1000,
                        transform=IdentityTransform(), name="sym")),
-    properties={"write.parquet.compression-codec": "snappy"},
+    # NO properties: pyiceberg's DEFAULTS, which means zstd data files.
 )
 
 schema = pa.schema([

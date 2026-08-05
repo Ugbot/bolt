@@ -1037,9 +1037,20 @@ bool decompress_block(AvroCodec codec, const uint8_t* in, uint64_t in_len,
         }
         return false;
     }
-    // zstd: the OCF block does not carry the decompressed length and our
-    // exact-fill zstd wrapper requires it, so zstd-coded OCFs are unsupported
-    // (null, deflate and snappy are). Fails closed, never silently empty.
+    // zstd: not supported here (null, deflate and snappy are). Fails closed,
+    // never silently empty.
+    //
+    // This is now a GAP, not an impossibility. It used to be the latter: the
+    // OCF block carries the object count and the COMPRESSED size but never the
+    // raw size, and the only zstd we had was bolt_zstd.h's exact-fill libzstd
+    // wrapper, which needs the raw size up front. G2FEAT-134 added a
+    // self-contained decoder (bolt_zstd_dec.h) that decodes into a bounded
+    // buffer instead, so the deflate branch's grow-and-retry shape would work
+    // here too. It is not wired up because no Iceberg writer we have produces
+    // zstd OCFs to test against -- `write.avro.compression-codec` defaults to
+    // deflate in both pyiceberg and Iceberg-Java -- and an untested codec
+    // branch is worse than an honest refusal. Wire it when a real zstd-coded
+    // manifest exists to verify against.
     (void)arena; (void)in; (void)in_len; (void)out_len;
     return false;
 }

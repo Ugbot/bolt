@@ -10,9 +10,16 @@
 // nothing about real-world compatibility): every byte under
 // data/golden_iceberg_table/ was written by **pyiceberg 0.11.1** driving a real
 // `SqlCatalog` warehouse — `create_table` + two `append(pyarrow.Table)` calls.
-// Regenerate with data/make_iceberg_real_table.py, which documents the two
-// disclosed choices (snappy Parquet; absolute locations left exactly as the
-// writer recorded them).
+// Regenerate with data/make_iceberg_real_table.py.
+//
+// The warehouse is written at pyiceberg's UNTOUCHED DEFAULTS -- no table
+// properties are set at all -- so the data files are **zstd**, pyiceberg's
+// default Parquet codec. Until G2FEAT-134 gave bolt a self-contained zstd
+// decoder this fixture had to pin `write.parquet.compression-codec=snappy`,
+// which meant the happy path: the table the most common Python writer actually
+// produces would NOT have read. It does now, and this test is what proves it.
+// The one remaining disclosed choice is that absolute `file://` locations are
+// left exactly as the writer recorded them (see the generator's docstring).
 //
 // THE SOURCE TABLE — db.trades (id:long, sym:string, price:double,
 // active:boolean), format-version 2, identity-partitioned on `sym`:
