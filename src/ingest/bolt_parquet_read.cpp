@@ -781,15 +781,26 @@ bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     cx->src_signed = 1;
     const bool out_unsigned = (t == BoltType::UInt8 || t == BoltType::UInt16 ||
                                t == BoltType::UInt32 || t == BoltType::UInt64);
+    // Extension policy follows the SOURCE's signedness, not the output lane's
+    // (G2FEAT-111). u32 now widens to the signed Int64 lane, so keying off the
+    // output alone would sign-extend it and hand back the very negatives the
+    // widening exists to avoid (4294967295 -> -1). A source annotated
+    // INT(N, false) is zero-extended whatever lane it lands on; DECIMAL
+    // mantissas and signed ints stay sign-extended.
+    const bool src_unsigned_int =
+        (pc->logical == static_cast<int32_t>(PqLogical::Int)) &&
+        pc->int_signed == 0;
+    const uint8_t ext_signed =
+        (out_unsigned || src_unsigned_int) ? uint8_t{0} : uint8_t{1};
     if (pc->physical == PqType::Int96) {
         cx->is_int96 = 1;                 // 12-byte legacy timestamp -> us
         cx->src_width = 12;
     } else if (pc->physical == PqType::Int32) {
         cx->src_width = 4;
-        cx->src_signed = out_unsigned ? 0 : 1;   // Decimal64 mantissa stays signed
+        cx->src_signed = ext_signed;      // Decimal64 mantissa stays signed
     } else if (pc->physical == PqType::Int64) {
         cx->src_width = 8;
-        cx->src_signed = out_unsigned ? 0 : 1;
+        cx->src_signed = ext_signed;
     }
     // Integer width conversion needed only when source != output width and
     // the physical is an integer (Float widen / Bool / FLBA have own paths).
@@ -862,17 +873,31 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             }
             if (is_date) { *out_type = BoltType::Date32; return true; }
             if (is_time) { *out_type = BoltType::Int32;  return true; }  // ms raw
-            // See the INTEGER WIDTH note on the Int64 branch above: signed
-            // widths are honoured, unsigned deliberately stays on the signed
-            // lane pending a downstream audit (an INT32-physical unsigned
-            // value is always representable in Int32 here).
+            // See the INTEGER WIDTH note on the Int64 branch above: exact
+            // unsigned lanes are not emitted; every unsigned width instead
+            // takes the NEXT WIDER SIGNED lane, which is the narrowest lane
+            // that holds every value it can carry.
             if (is_int) {
-                // SIGNED sub-word widths are honoured. UNSIGNED deliberately
-                // stays on the next wider SIGNED lane (see the note on the
-                // Int64 branch): a u16 does NOT fit Int16 -- the first draft of
-                // this rebase made exactly that mistake -- and Int32 holds every
-                // 8/16/32-bit unsigned INT32-physical value losslessly, which is
-                // also what main already produced for the TAQ u16 column.
+                // SIGNED sub-word widths are honoured exactly.
+                //
+                // UNSIGNED takes the next wider SIGNED lane, per width -- NOT
+                // one lane for all three (G2FEAT-111). u8 (0..255) and u16
+                // (0..65535) fit Int32 losslessly. u32 does NOT: 2^31..2^32-1
+                // is over half its range, and mapping it to Int32 made those
+                // values read back NEGATIVE (4294967295 -> -1). The comment
+                // that used to sit here claimed an INT32-physical unsigned
+                // value "is always representable in Int32", which is false for
+                // exactly that half of u32; it is corrected rather than
+                // deleted because it is what stopped the previous reader from
+                // checking. u32 therefore widens to Int64, and init_col_ctx
+                // ZERO-extends it at decode (src_signed = 0) -- sign-extending
+                // would reintroduce the same negatives one layer down.
+                //
+                // u64 has no wider signed lane and stays a raw Int64 bit
+                // pattern above 2^63-1; fixing that needs a real UInt64 lane
+                // plus the downstream kernel audit the Int64 note describes,
+                // not a widening. golden_taq_types.parquet pins the current
+                // bit-pattern behaviour.
                 if (col->int_signed) {
                     switch (col->int_bits) {
                         case 8:  *out_type = BoltType::Int8;  return true;
@@ -882,8 +907,12 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                     }
                 } else {
                     switch (col->int_bits) {
-                        case 8: case 16: case 32:
+                        // u8/u16 fit signed 32 -- unchanged, and what main
+                        // already produced for the TAQ u16 column.
+                        case 8: case 16:
                             *out_type = BoltType::Int32; return true;
+                        case 32:
+                            *out_type = BoltType::Int64; return true;
                         default: break;
                     }
                 }

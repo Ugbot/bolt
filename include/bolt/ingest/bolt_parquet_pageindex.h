@@ -125,17 +125,23 @@ bool pq_read_offset_index(const uint8_t* file, uint64_t file_len,
 // ---- evaluation helpers (mirror bolt_parquet_stats.h) ----------------------
 
 // Decode one page's min/max as a signed int64 range (INT64 8-byte LE /
-// INT32 4-byte LE sign-extended). False when absent, wrong width, a null
-// page, or a reversed pair — caller must then keep the page.
+// INT32 4-byte LE) — sign-extended for signed columns, ZERO-extended for
+// unsigned ones, exactly as pq_stat_range_i64 does for the chunk level
+// (G2FEAT-111; see that function for why the reversed-pair guard makes the
+// unsigned arm safe against legacy signed-ordered statistics). False when
+// absent, wrong width, a null page, or a reversed pair — caller must then
+// keep the page.
 inline bool pq_page_range_i64(const PqColumn& col, const PqPageStat& ps,
                               int64_t* lo, int64_t* hi) noexcept {
     assert(lo != nullptr && hi != nullptr);
     if (ps.null_page != 0) return false;
+    const bool uns = pq_col_is_unsigned_int(col);
     switch (col.physical) {
         case PqType::Int64: {
             if (ps.min_len != 8u || ps.max_len != 8u) return false;
             std::memcpy(lo, ps.min_bytes, 8);
             std::memcpy(hi, ps.max_bytes, 8);
+            if (uns && (*lo < 0 || *hi < 0)) return false;   // u64 >= 2^63
             break;
         }
         case PqType::Int32: {
@@ -143,8 +149,13 @@ inline bool pq_page_range_i64(const PqColumn& col, const PqPageStat& ps,
             int32_t lo32 = 0, hi32 = 0;
             std::memcpy(&lo32, ps.min_bytes, 4);
             std::memcpy(&hi32, ps.max_bytes, 4);
-            *lo = static_cast<int64_t>(lo32);
-            *hi = static_cast<int64_t>(hi32);
+            if (uns) {
+                *lo = static_cast<int64_t>(static_cast<uint32_t>(lo32));
+                *hi = static_cast<int64_t>(static_cast<uint32_t>(hi32));
+            } else {
+                *lo = static_cast<int64_t>(lo32);
+                *hi = static_cast<int64_t>(hi32);
+            }
             break;
         }
         default:

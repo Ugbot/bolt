@@ -586,4 +586,131 @@ TEST(BoltParquetPageRange, DictChunkFailClosed) {
                                               &arena, &sub, &srows, &next));
 }
 
+// ---- G2FEAT-111: UINT_32 above 2^31-1 -------------------------------------
+//
+// golden_uint32.parquet: 8 cols, 1000 rows, UNCOMPRESSED, data page v1,
+// row_group_size=250 -> 4 row groups. Every uint32 column deliberately
+// straddles the signed-int32 boundary, which is the case the pre-G2FEAT-111
+// mapping (INT32-physical unsigned -> BoltType::Int32) could not represent:
+// a value above 2^31-1 read back NEGATIVE. u8/u16/i32/u64 ride along as
+// regression guards that this fix changed nothing else.
+//
+//   u32_plain  INT32 (UINT_32) PLAIN      == BIG[i % 7]
+//   u32_hi     INT32 (UINT_32) PLAIN      == 4294967295 - i  (all > 2^31-1)
+//   u32_dict   INT32 (UINT_32) dict       == BIG[(i//97) % 7]
+//   u32_null   INT32 (UINT_32), nulls     == null if i%5==0 else BIG[i % 7]
+//   u8_c       INT32 (UINT_8)             == i % 251          -> Int32
+//   u16_c      INT32 (UINT_16)            == (i*37) % 65521   -> Int32
+//   i32_c      INT32 signed               == (-1)^i * i*1000  -> Int32
+//   u64_c      INT64 (UINT_64)            == 2^64-1 - i       -> Int64 (bit
+//                                            pattern; see the u64 note below)
+// with BIG = [0, 1, 2147483647, 2147483648, 3000000000, 4000000000,
+//             4294967295].
+//
+// Every expected value below is DuckDB 1.5.4's answer on this exact file,
+// not bolt's own output.
+//
+// Regenerate (documented generator):
+//   import pyarrow as pa, pyarrow.parquet as pq
+//   N = 1000
+//   BIG = [0,1,2147483647,2147483648,3000000000,4000000000,4294967295]
+//   t = pa.table({
+//     "u32_plain": pa.array([BIG[i%7] for i in range(N)], pa.uint32()),
+//     "u32_hi":    pa.array([4294967295-i for i in range(N)], pa.uint32()),
+//     "u32_dict":  pa.array([BIG[(i//97)%7] for i in range(N)], pa.uint32()),
+//     "u32_null":  pa.array([None if i%5==0 else BIG[i%7]
+//                            for i in range(N)], pa.uint32()),
+//     "u8_c":      pa.array([i%251 for i in range(N)], pa.uint8()),
+//     "u16_c":     pa.array([(i*37)%65521 for i in range(N)], pa.uint16()),
+//     "i32_c":     pa.array([(-1)**i*(i*1000) for i in range(N)], pa.int32()),
+//     "u64_c":     pa.array([18446744073709551615-i for i in range(N)],
+//                           pa.uint64()),
+//   })
+//   pq.write_table(t, "golden_uint32.parquet", row_group_size=250,
+//                  compression="none", version="2.6",
+//                  data_page_version="1.0", use_dictionary=["u32_dict"],
+//                  write_statistics=True)
+//
+// u64 SCOPE NOTE (deliberately NOT asserted as a value): INT64-physical
+// UINT_64 has no wider signed lane to widen into, so bolt keeps it on Int64
+// and a u64 above 2^63-1 stays a raw bit pattern. That is the same class of
+// gap G2FEAT-111 fixes for u32, but it is not fixable by widening — it needs
+// a real BoltType::UInt64 lane and a downstream kernel audit (see the
+// UNSIGNED WIDTHS note in test_bolt_parquet_types.cpp). golden_taq_types'
+// u64 column already pins the bit-pattern behaviour; u64_c is here only so
+// this fixture proves the fix did not disturb it.
+TEST(BoltParquetRead, Uint32AboveSignedRange) {
+    const auto buf = slurp(data_path("golden_uint32.parquet").c_str());
+    ASSERT_FALSE(buf.empty());
+    bolt::Arena arena;
+    bolt::BoltBatch* b = arena.allocate_array<bolt::BoltBatch>(1);
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &arena, b));
+    ASSERT_EQ(b->num_rows, 1000);
+    ASSERT_EQ(b->num_cols, 8u);
+    const bolt::BoltColumn* cols = b->columns[b->read_epoch];
+
+    // The mapping itself: u32 must land on a lane that HOLDS every value.
+    EXPECT_EQ(cols[0].type, bolt::BoltType::Int64) << "u32_plain";
+    EXPECT_EQ(cols[1].type, bolt::BoltType::Int64) << "u32_hi";
+    EXPECT_EQ(cols[2].type, bolt::BoltType::Int64) << "u32_dict";
+    EXPECT_EQ(cols[3].type, bolt::BoltType::Int64) << "u32_null";
+    // Unchanged: u8/u16 fit signed 32 losslessly, signed i32 is exact.
+    EXPECT_EQ(cols[4].type, bolt::BoltType::Int32) << "u8_c";
+    EXPECT_EQ(cols[5].type, bolt::BoltType::Int32) << "u16_c";
+    EXPECT_EQ(cols[6].type, bolt::BoltType::Int32) << "i32_c";
+    EXPECT_EQ(cols[7].type, bolt::BoltType::Int64) << "u64_c";
+    ASSERT_EQ(cols[0].type_size_bytes, 8u);
+    ASSERT_EQ(cols[1].type_size_bytes, 8u);
+    ASSERT_EQ(cols[2].type_size_bytes, 8u);
+    ASSERT_EQ(cols[3].type_size_bytes, 8u);
+
+    static const int64_t kBig[7] = {0, 1, 2147483647LL, 2147483648LL,
+                                    3000000000LL, 4000000000LL, 4294967295LL};
+    const auto* up = static_cast<const int64_t*>(cols[0].data);
+    const auto* uh = static_cast<const int64_t*>(cols[1].data);
+    const auto* ud = static_cast<const int64_t*>(cols[2].data);
+    const auto* un = static_cast<const int64_t*>(cols[3].data);
+    const auto* u8c = static_cast<const int32_t*>(cols[4].data);
+    const auto* u16c = static_cast<const int32_t*>(cols[5].data);
+    const auto* i32c = static_cast<const int32_t*>(cols[6].data);
+    const auto* u64c = static_cast<const uint64_t*>(cols[7].data);
+    ASSERT_NE(cols[3].validity, nullptr);
+
+    int64_t sum_p = 0, sum_h = 0, sum_d = 0, sum_n = 0;
+    int64_t sum_u8 = 0, sum_u16 = 0, sum_i32 = 0;
+    int64_t n_valid = 0, n_above = 0;
+    for (int64_t i = 0; i < 1000; ++i) {          // bounded: fixture rows
+        ASSERT_EQ(up[i], kBig[i % 7]) << "u32_plain row " << i;
+        ASSERT_EQ(uh[i], 4294967295LL - i) << "u32_hi row " << i;
+        ASSERT_EQ(ud[i], kBig[(i / 97) % 7]) << "u32_dict row " << i;
+        ASSERT_EQ(row_valid(cols[3], i), i % 5 != 0) << "u32_null row " << i;
+        ASSERT_EQ(u8c[i], static_cast<int32_t>(i % 251)) << "u8_c row " << i;
+        ASSERT_EQ(u16c[i], static_cast<int32_t>((i * 37) % 65521))
+            << "u16_c row " << i;
+        ASSERT_EQ(i32c[i], static_cast<int32_t>((i % 2 == 0 ? 1 : -1) * i * 1000))
+            << "i32_c row " << i;
+        ASSERT_EQ(u64c[i], 18446744073709551615ull - static_cast<uint64_t>(i))
+            << "u64_c row " << i;
+        sum_p += up[i];
+        sum_h += uh[i];
+        sum_d += ud[i];
+        sum_u8 += u8c[i];
+        sum_u16 += u16c[i];
+        sum_i32 += i32c[i];
+        if (i % 5 != 0) { sum_n += un[i]; ++n_valid; }
+        if (up[i] > 2147483647LL) ++n_above;
+    }
+    // DuckDB 1.5.4 on this exact file.
+    EXPECT_EQ(sum_p, 2225065679218LL);
+    EXPECT_EQ(sum_h, 4294966795500LL);
+    EXPECT_EQ(sum_d, 1784954078623LL);
+    EXPECT_EQ(sum_n, 1782400027021LL);
+    EXPECT_EQ(n_valid, 800);
+    EXPECT_EQ(n_above, 571);
+    EXPECT_EQ(sum_u8, 124506);
+    EXPECT_EQ(sum_u16, 18481500);
+    EXPECT_EQ(sum_i32, -500000);
+}
+
 }  // namespace

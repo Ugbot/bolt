@@ -106,15 +106,22 @@ TEST(BoltParquetTypes, Int32DecimalMapsToDecimal64) {
     EXPECT_EQ(scale, 4u);
 }
 
-TEST(BoltParquetTypes, UnsignedIntsMapToUIntTypes) {
+// Unsigned widths take the NEXT WIDER SIGNED lane, per width (G2FEAT-111) --
+// the narrowest lane that holds every value that width can carry. u8/u16 fit
+// Int32; u32 does NOT (2^31..2^32-1 read back negative) so it widens to
+// Int64. u64 is the one genuinely lossy case left and is documented as such
+// in parquet_map_type -- it has no wider signed lane, so closing it needs a
+// real UInt64 lane plus the downstream kernel audit the UNSIGNED WIDTHS note
+// above describes, not a mapping change.
+TEST(BoltParquetTypes, UnsignedIntsMapToNextWiderSignedLane) {
     EXPECT_EQ(map_ok(mk(PqType::Int32, PqLogical::Int, 0, 8, 0, 0, 0, 0)),
-              bolt::BoltType::Int32);   // see UNSIGNED WIDTHS note
+              bolt::BoltType::Int32);   // u8  -> fits signed 32
     EXPECT_EQ(map_ok(mk(PqType::Int32, PqLogical::Int, 0, 16, 0, 0, 0, 0)),
-              bolt::BoltType::Int32);   // see UNSIGNED WIDTHS note
+              bolt::BoltType::Int32);   // u16 -> fits signed 32
     EXPECT_EQ(map_ok(mk(PqType::Int32, PqLogical::Int, 0, 32, 0, 0, 0, 0)),
-              bolt::BoltType::Int32);   // see UNSIGNED WIDTHS note
+              bolt::BoltType::Int64);   // u32 -> needs signed 64 (G2FEAT-111)
     EXPECT_EQ(map_ok(mk(PqType::Int64, PqLogical::Int, 0, 64, 0, 0, 0, 0)),
-              bolt::BoltType::Int64);   // see UNSIGNED WIDTHS note
+              bolt::BoltType::Int64);   // u64 -> lossy above 2^63-1, tracked
 }
 
 TEST(BoltParquetTypes, SignedSubwordIntsMapToNarrowInts) {

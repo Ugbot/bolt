@@ -50,20 +50,48 @@ inline bool pq_chunk_no_nulls(const PqColumn& col, const PqChunk& ch) noexcept {
     return ch.null_count == 0 || col.optional == 0;
 }
 
+// True when this column's INT32/INT64 payload is an UNSIGNED integer, i.e.
+// its statistics bytes must be ZERO-extended rather than sign-extended
+// (G2FEAT-111). This has to match parquet_map_type/init_col_ctx's extension
+// policy exactly: a zone-map range decoded on a different convention than
+// the column values is worse than no zone map at all — it prunes rowgroups
+// that do contain matches.
+inline bool pq_col_is_unsigned_int(const PqColumn& col) noexcept {
+    return col.logical == static_cast<int32_t>(PqLogical::Int) &&
+           col.int_signed == 0;
+}
+
 // Decode the chunk's min/max statistics as a signed int64 range. Handles
-// physical INT64 (8-byte LE) and INT32 (4-byte LE, sign-extended — the
-// widened-to-Int64 read path's source type). Returns false when stats are
-// absent, the payload width is wrong for the physical type, or the pair is
-// reversed (corrupt / untrusted) — callers must then treat the rowgroup as
-// "may contain anything".
+// physical INT64 (8-byte LE) and INT32 (4-byte LE) — sign-extended for
+// signed columns, ZERO-extended for unsigned ones, matching how the read
+// path materialises the values. Returns false when stats are absent, the
+// payload width is wrong for the physical type, or the pair is reversed
+// (corrupt / untrusted) — callers must then treat the rowgroup as "may
+// contain anything".
+//
+// The reversed-pair guard is what makes the unsigned arm safe against
+// LEGACY statistics: the pre-`min_value` min/max fields were written with
+// SIGNED ordering even for unsigned columns, so a chunk whose values
+// straddle 2^31 records a "min" that is the larger unsigned value. Zero-
+// extending that yields lo > hi and the range is rejected rather than
+// trusted. Chunks entirely below or entirely above 2^31 order identically
+// under both conventions, so they stay prunable.
+//
+// u64 (INT64 physical, unsigned) above 2^63-1 still has no lossless int64
+// representation; it is rejected here rather than silently compared as a
+// negative, so those rowgroups are simply never pruned.
 inline bool pq_stat_range_i64(const PqColumn& col, const PqChunk& ch,
                               int64_t* lo, int64_t* hi) noexcept {
     assert(lo != nullptr && hi != nullptr);
+    const bool uns = pq_col_is_unsigned_int(col);
     switch (col.physical) {
         case PqType::Int64: {
             if (ch.min_len != 8u || ch.max_len != 8u) return false;
             std::memcpy(lo, ch.min_bytes, 8);
             std::memcpy(hi, ch.max_bytes, 8);
+            // Unsigned 64: no wider signed lane. Only trust the range when
+            // both ends are non-negative, i.e. genuinely below 2^63.
+            if (uns && (*lo < 0 || *hi < 0)) return false;
             break;
         }
         case PqType::Int32: {
@@ -71,8 +99,13 @@ inline bool pq_stat_range_i64(const PqColumn& col, const PqChunk& ch,
             int32_t lo32 = 0, hi32 = 0;
             std::memcpy(&lo32, ch.min_bytes, 4);
             std::memcpy(&hi32, ch.max_bytes, 4);
-            *lo = static_cast<int64_t>(lo32);
-            *hi = static_cast<int64_t>(hi32);
+            if (uns) {
+                *lo = static_cast<int64_t>(static_cast<uint32_t>(lo32));
+                *hi = static_cast<int64_t>(static_cast<uint32_t>(hi32));
+            } else {
+                *lo = static_cast<int64_t>(lo32);
+                *hi = static_cast<int64_t>(hi32);
+            }
             break;
         }
         default:
