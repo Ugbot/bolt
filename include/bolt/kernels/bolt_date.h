@@ -400,6 +400,74 @@ BOLT_FORCE_INLINE void ns64_extract_i64(
     }
 }
 
+// ---------------------------------------------------------------------------
+// G2FEAT-133 — CIVIL DATE FIELDS FROM AN INT64 NANOSECOND EPOCH.
+//
+// The date32_extract_* family above answers year/month/day/quarter/week for a
+// value that COUNTS DAYS. `ns64_extract_i64` answers hour/minute/second for a
+// value that COUNTS NANOSECONDS. Nothing answered the date fields for a
+// nanosecond epoch, so a caller holding one had to divide down to days itself
+// -- and the obvious spelling, C's `/`, TRUNCATES TOWARD ZERO. For any instant
+// before 1970 that is off by a whole day: -1 ns is 1969-12-31, but -1/86400e9
+// is 0, i.e. 1970-01-01. Exactly the class of error `floor_mod_i64` already
+// exists to prevent on the time-of-day side, one field family over.
+//
+// So the floor is done HERE, once, and the existing civil algorithm is reused
+// unchanged -- these are thin adapters, not a second calendar implementation.
+//
+// RANGE. int64 nanoseconds span 1677-09-21 .. 2262-04-11, so the day count is
+// within +/-106,752 and always fits int32; the assert states that rather than
+// assuming it.
+// ---------------------------------------------------------------------------
+
+// Floor-div: rounds toward NEGATIVE INFINITY, unlike C's `/`. Companion to
+// floor_mod_i64 above (a == floor_div_i64(a,m)*m + floor_mod_i64(a,m)).
+BOLT_FORCE_INLINE int64_t floor_div_i64(int64_t a, int64_t m) noexcept {
+    assert(m > 0);
+    const int64_t q = a / m;
+    const int64_t r = a % m;
+    assert(r > -m && r < m);
+    return (r < 0) ? (q - 1) : q;
+}
+
+// Whole days since 1970-01-01 for a nanosecond epoch. Floor semantics: every
+// instant inside 1969-12-31 maps to -1, never to 0.
+BOLT_FORCE_INLINE int32_t days_from_ns64(int64_t ns) noexcept {
+    const int64_t d = floor_div_i64(ns, kNsPerDay);
+    assert(d >= -3000000LL && d <= 3000000LL);   // int64-ns span is ~+/-106752
+    assert(d * kNsPerDay <= ns);                 // floor, not truncate
+    return static_cast<int32_t>(d);
+}
+
+// Batch int64-output form, mirroring date32_extract_i64's shape and field
+// numbering so the two are drop-in alternatives for the same caller.
+// `field`: 0=year 1=month(1..12) 2=day(1..31) 3=quarter(1..4) 4=ISO week(1..53).
+BOLT_FORCE_INLINE void ns64_extract_date_i64(
+        const int64_t* BOLT_RESTRICT ns_in, int64_t n, int field,
+        int64_t* BOLT_RESTRICT out) noexcept {
+    assert((ns_in != nullptr && out != nullptr) || n == 0);
+    assert(n >= 0 && field >= 0 && field <= 4);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t z = days_from_ns64(ns_in[i]);
+        const YMDDoy  r = civil_from_days32(z);
+        int64_t v;
+        switch (field) {
+            case 0:  v = r.y; break;
+            case 1:  v = r.m; break;
+            case 2:  v = r.d; break;
+            case 3:  v = (static_cast<int64_t>(r.m) - 1) / 3 + 1; break;
+            default: {
+                const int64_t jan1 = days_from_civil(r.y, 1, 1);
+                const int32_t doy1 =
+                    static_cast<int32_t>(static_cast<int64_t>(z) - jan1 + 1);
+                v = iso_week_from_components(r.y, doy1, dow_from_days32(z));
+                break;
+            }
+        }
+        out[i] = v;
+    }
+}
+
 } // namespace date
 } // namespace kernels
 } // namespace bolt
