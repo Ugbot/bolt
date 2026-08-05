@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "bolt/ingest/bolt_gzip.h"
+#include "bolt/ingest/bolt_inflate.h"
 #include "bolt/ingest/bolt_snappy.h"
 #include "bolt/ingest/bolt_zstd.h"
 #include "bolt/parse/bolt_json.h"
@@ -15,6 +16,12 @@ namespace ingest {
 namespace {
 
 const uint8_t kMagic[4] = {'O', 'b', 'j', 0x01};
+
+// Ceiling on ONE decompressed object block. A compressed block declares no
+// output size, so without a cap a crafted "zip bomb" block could ask for an
+// unbounded arena allocation. 256 MiB is far above any real manifest (they run
+// to kilobytes) and far below anything that could exhaust a host.
+constexpr uint64_t kAvroMaxBlockBytes = 256ull << 20;
 
 // ---- varint / zigzag ------------------------------------------------------
 
@@ -113,6 +120,13 @@ struct SFrame {
     uint8_t  union_null_idx;
     bool     union_have_type;
     AvroType union_type;
+    // A CONTAINER branch of this union (`union{null, array<...>}` — Iceberg's
+    // shape for every optional repeated field). The container type object
+    // closes before the union's ']' does, so it is parked here and committed
+    // when the union resolves, at which point the null branch index is known.
+    bool     union_have_cont;
+    AvroType union_ctype;
+    uint8_t  union_citem;
     bool     is_record;       // this object declared "type":"record"
     uint8_t  complex_kind;    // kCplxArray / kCplxMap for a container type obj
     uint8_t  item_type;       // its element type, or kAvroItemOpaque
@@ -249,11 +263,12 @@ void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
 // immediately AFTER it (that adjacency is the contract AvroField::elem_fields
 // documents, and it is what lets the decoder find them from the container).
 void sx_commit_container(SchemaCtx* s, int32_t fi, AvroType ct,
-                         uint8_t item_type) noexcept {
+                         uint8_t item_type, bool nullable,
+                         uint8_t null_branch) noexcept {
     assert(s != nullptr);
     assert(ct == AvroType::kArray || ct == AvroType::kMap);
     const uint32_t before = s->n;
-    sx_commit_leaf(s, fi, ct, /*nullable=*/false, /*null_branch=*/0u, item_type);
+    sx_commit_leaf(s, fi, ct, nullable, null_branch, item_type);
     const uint32_t captured = s->elem_n;
     s->elem_n = 0u;
     if (item_type != kAvroItemRecord || !s->ok) return;
@@ -450,11 +465,33 @@ bool sx_end_obj(void* c) noexcept {
         const uint8_t it = f->item_type;
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
-        // A container inside a union would need the branch index AND the
-        // block walk; the flat model cannot express that, so fail closed.
-        if (crossed_union) { s->ok = false; s->elem_n = 0u; }
-        else sx_commit_container(s, fi, ct, it);
+        if (!crossed_union) {
+            sx_commit_container(s, fi, ct, it, /*nullable=*/false,
+                                /*null_branch=*/0u);
+            sx_pop(s);
+            return true;
+        }
+        // `union{null, array<...>}` — how Iceberg declares EVERY optional
+        // repeated field (lower_bounds, split_offsets, partitions, ...), so
+        // this is the common case, not an exotic one. The union's own ']'
+        // has not arrived yet, so the null branch index is not final: park
+        // the container on the union frame and let sx_end_arr commit it.
+        // Any captured element descriptors stay in elem_buf until then.
         sx_pop(s);
+        SFrame* u = sx_top(s);
+        // Only a DIRECT union branch is expressible. A container nested deeper
+        // under a union (union{null, array<array<...>>}) still fails closed.
+        if (u->kind != kFrUnion || u->union_have_cont) {
+            s->ok = false;
+            s->elem_n = 0u;
+            return true;
+        }
+        u->union_have_cont = true;
+        u->union_ctype     = ct;
+        u->union_citem     = it;
+        // A complex branch occupies a branch INDEX just like a named one; not
+        // counting it made [array,"null"] resolve null to index 0 (the array).
+        if (u->union_n < 0xFEu) ++u->union_n;
         return true;
     }
     // A field that resolved to nothing means we could not model its type;
@@ -512,9 +549,20 @@ bool sx_end_arr(void* c) noexcept {
         const bool nullable = (f->union_null_idx != kNoNullBranch);
         const AvroType t = f->union_have_type ? f->union_type : AvroType::kNull;
         const uint8_t nb = nullable ? f->union_null_idx : 0u;
-        sx_pop(s);
+        const bool     have_cont = f->union_have_cont;
+        const bool     have_type = f->union_have_type;
+        const AvroType ct        = f->union_ctype;
+        const uint8_t  citem     = f->union_citem;
+        sx_pop(s);                       // `f` is stale past here — all read above
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
+        if (have_cont) {
+            // A union carrying BOTH a container and a named type is a real
+            // multi-type union, which no single positional slot can describe.
+            if (have_type) { s->ok = false; s->elem_n = 0u; return true; }
+            sx_commit_container(s, fi, ct, citem, nullable, nb);
+            return true;
+        }
         sx_commit_leaf(s, fi, t, nullable, nb, /*item_type=*/0u);
         return true;
     }
@@ -658,6 +706,49 @@ bool skip_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
     }
 }
 
+// Decode one primitive into `v`. The single primitive decoder: the row path,
+// the element path and the bare-datum path all call this, so a value can never
+// be read one way in a record and another way inside an array.
+// `v->type` is set by the caller; containers are not primitives and fail here.
+bool read_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
+                    AvroType t, AvroValue* v) noexcept {
+    assert(p != nullptr);
+    assert(v != nullptr);
+    switch (t) {
+        case AvroType::kNull:
+            v->is_null = true;
+            return true;
+        case AvroType::kBoolean:
+            if (*off >= len) return false;
+            v->num.i64 = p[(*off)++] != 0 ? 1 : 0;
+            return true;
+        case AvroType::kInt:
+        case AvroType::kLong:
+            return read_long(p, len, off, &v->num.i64);
+        case AvroType::kFloat: {
+            if (*off + 4u > len) return false;
+            float fv = 0.0f;
+            std::memcpy(&fv, p + *off, 4);
+            v->num.f64 = static_cast<double>(fv);
+            *off += 4u;
+            return true;
+        }
+        case AvroType::kDouble: {
+            if (*off + 8u > len) return false;
+            double dv = 0.0;
+            std::memcpy(&dv, p + *off, 8);
+            v->num.f64 = dv;
+            *off += 8u;
+            return true;
+        }
+        case AvroType::kBytes:
+        case AvroType::kString:
+            return read_bytes(p, len, off, &v->bytes, &v->bytes_len);
+        default:
+            return false;                            // kArray / kMap
+    }
+}
+
 // Advance past ONE element of an array<record> / map<record>. An Avro record
 // is inline with no delimiters, so its width is simply the sum of its fields'
 // widths -- which is exactly why modelling the element schema is what unlocks
@@ -667,18 +758,34 @@ bool skip_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
 // Element fields are primitives by construction: the schema parser refuses to
 // model an element whose own field is a container, so this stays flat -- no
 // recursion, no decoder stack.
+// `out` may be null (pure skip) or point at n_elem AvroValues to fill — the
+// value-delivering and skipping paths are ONE walk, so they cannot disagree
+// about an element's width.
 bool skip_elem_record(const uint8_t* p, uint64_t len, uint64_t* off,
-                      const AvroField* elem, uint32_t n_elem) noexcept {
+                      const AvroField* elem, uint32_t n_elem,
+                      AvroValue* out) noexcept {
     assert(elem != nullptr);
     assert(n_elem > 0u && n_elem <= kAvroMaxElemFields);
     for (uint32_t e = 0; e < n_elem; ++e) {         // bounded: kAvroMaxElemFields
         const AvroField* ef = &elem[e];
+        AvroValue* v = (out != nullptr) ? &out[e] : nullptr;
+        if (v != nullptr) {
+            std::memset(v, 0, sizeof(*v));
+            v->type = ef->type;
+        }
         if (ef->nullable) {                          // union index precedes value
             int64_t branch = 0;
             if (!read_long(p, len, off, &branch)) return false;
-            if (branch == static_cast<int64_t>(ef->null_branch)) continue;
+            if (branch == static_cast<int64_t>(ef->null_branch)) {
+                if (v != nullptr) v->is_null = true;
+                continue;
+            }
         }
-        if (!skip_primitive(p, len, off, ef->type)) return false;
+        if (v == nullptr) {
+            if (!skip_primitive(p, len, off, ef->type)) return false;
+        } else if (!read_primitive(p, len, off, ef->type, v)) {
+            return false;
+        }
     }
     return true;
 }
@@ -699,51 +806,117 @@ bool skip_elem_record(const uint8_t* p, uint64_t len, uint64_t* off,
 // first. Bounded: block count, and every element consumes at least one byte.
 constexpr uint32_t kAvroMaxBlocks = 1u << 20;
 
-bool skip_container(const uint8_t* p, uint64_t len, uint64_t* off,
+// Everything needed to publish one element to the caller. Null `fn` ⇒ skip
+// only, which is the pre-existing behaviour and still the default.
+struct ElemSink {
+    AvroElemFn fn;
+    void*      ctx;
+    uint32_t   field_index;
+    int64_t    row_index;
+};
+
+bool walk_container(const uint8_t* p, uint64_t len, uint64_t* off,
                     uint8_t item_type, bool is_map,
-                    const AvroField* elem, uint32_t n_elem) noexcept {
+                    const AvroField* elem, uint32_t n_elem,
+                    const ElemSink* sink) noexcept {
     assert(p != nullptr);
     assert(off != nullptr);
     const bool rec = (item_type == kAvroItemRecord);
     // A record element advertised with nothing to walk is unusable; refuse it
     // up front rather than silently treating the type byte as a primitive.
     if (rec && (elem == nullptr || n_elem == 0u)) return false;
+    if (n_elem > kAvroMaxElemFields) return false;      // sizes `ev` below
+    const bool deliver = (sink != nullptr && sink->fn != nullptr);
+    // A map prepends the string key, so the record element's values shift by 1.
+    const uint32_t key_slots = is_map ? 1u : 0u;
+    const uint32_t n_vals    = key_slots + (rec ? n_elem : 1u);
+    assert(n_vals <= kAvroMaxElemFields + 1u);
+    AvroValue ev[kAvroMaxElemFields + 1u];
+    int64_t elem_index = 0;
     for (uint32_t blk = 0; blk < kAvroMaxBlocks; ++blk) {
         int64_t count = 0;
         if (!read_long(p, len, off, &count)) return false;
         if (count == 0) return true;                    // terminator
+        bool sized = false;
+        uint64_t end_off = 0;
         if (count < 0) {                                // size-prefixed form
             int64_t nbytes = 0;
             if (!read_long(p, len, off, &nbytes)) return false;
             if (nbytes < 0 || static_cast<uint64_t>(nbytes) > len - *off) {
                 return false;
             }
-            *off += static_cast<uint64_t>(nbytes);
-            continue;
+            count = -count;
+            sized = true;
+            end_off = *off + static_cast<uint64_t>(nbytes);
+            // Only the byte size makes an OPAQUE element skippable. With no
+            // element model there is nothing to deliver either, so jump.
+            const bool walkable = rec || (item_type != kAvroItemOpaque);
+            if (!deliver || !walkable) { *off = end_off; continue; }
+        } else if (!rec && item_type == kAvroItemOpaque) {
+            return false;                               // no width, no size
         }
-        if (!rec && item_type == kAvroItemOpaque) return false;  // no width
         const AvroType it = static_cast<AvroType>(item_type);
         for (int64_t i = 0; i < count; ++i) {           // bounded by `count`
             if (*off >= len) return false;
             if (is_map) {
+                AvroValue* kv = deliver ? &ev[0] : nullptr;
+                if (kv != nullptr) {
+                    std::memset(kv, 0, sizeof(*kv));
+                    kv->type = AvroType::kString;
+                }
                 const uint8_t* kb = nullptr;
                 uint32_t kl = 0;
                 if (!read_bytes(p, len, off, &kb, &kl)) return false;
+                if (kv != nullptr) { kv->bytes = kb; kv->bytes_len = kl; }
             }
             if (rec) {
-                if (!skip_elem_record(p, len, off, elem, n_elem)) return false;
-            } else if (!skip_primitive(p, len, off, it)) {
+                if (!skip_elem_record(p, len, off, elem, n_elem,
+                                      deliver ? &ev[key_slots] : nullptr)) {
+                    return false;
+                }
+            } else if (!deliver) {
+                if (!skip_primitive(p, len, off, it)) return false;
+            } else {
+                AvroValue* v = &ev[key_slots];
+                std::memset(v, 0, sizeof(*v));
+                v->type = it;
+                if (!read_primitive(p, len, off, it, v)) return false;
+            }
+            if (deliver && !sink->fn(sink->ctx, sink->field_index,
+                                     sink->row_index, elem_index, ev, n_vals)) {
                 return false;
             }
+            ++elem_index;
         }
+        // A size-prefixed block we WALKED must land exactly on its own end;
+        // anything else means the element model disagrees with the writer.
+        if (sized && *off != end_off) return false;
     }
     return false;                                       // unterminated
 }
 
 // Decode one row of primitives at *off (decompressed block buffer `p`).
+// Publish the `elem_fields` descriptors that trail a container as null and
+// step the field cursor past them. They describe the ELEMENT, not the
+// enclosing record, so they are never part of its wire sequence — this must
+// happen whether the container was present or null, because skipping it only
+// on the present path mis-aligns every field after an absent one.
+void null_out_elem_descriptors(const AvroField* fields, AvroValue* vals,
+                               uint32_t f, uint32_t ne) noexcept {
+    assert(fields != nullptr);
+    assert(vals != nullptr);
+    for (uint32_t e = 1u; e <= ne; ++e) {           // bounded: elem_fields
+        AvroValue* ev = &vals[f + e];
+        std::memset(ev, 0, sizeof(*ev));
+        ev->type    = fields[f + e].type;
+        ev->is_null = true;
+    }
+}
+
 bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
                 const AvroField* fields, uint32_t n_fields,
-                AvroValue* vals) noexcept {
+                AvroValue* vals, AvroElemFn on_elem, void* ctx,
+                int64_t row_index) noexcept {
     assert(p != nullptr);
     assert(off != nullptr);
     for (uint32_t f = 0; f < n_fields; ++f) {       // bounded: n_fields
@@ -751,6 +924,8 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
         std::memset(val, 0, sizeof(*val));
         val->type = fields[f].type;
         const AvroField* fd = &fields[f];
+        const bool is_cont = (fd->type == AvroType::kArray ||
+                              fd->type == AvroType::kMap);
         if (fd->nullable) {                          // union index precedes value
             int64_t branch = 0;
             if (!read_long(p, len, off, &branch)) return false;
@@ -760,6 +935,13 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
             // predate this field are unaffected.
             if (branch == static_cast<int64_t>(fd->null_branch)) {
                 val->is_null = true;
+                // An ABSENT container still owns its trailing descriptors.
+                if (is_cont) {
+                    const uint32_t ne = fd->elem_fields;
+                    if (ne != 0u && (f + ne) >= n_fields) return false;
+                    null_out_elem_descriptors(fields, vals, f, ne);
+                    f += ne;
+                }
                 continue;
             }
         }
@@ -776,53 +958,35 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
                 // element -- so they are published as null and stepped over.
                 const uint32_t ne = fd->elem_fields;
                 if (ne != 0u && (f + ne) >= n_fields) return false;
+                // The schema parser caps this, but avro_decode_datum takes a
+                // CALLER-supplied field table, so it is enforced here too —
+                // walk_container sizes a stack element buffer from it.
+                if (ne > kAvroMaxElemFields) return false;
                 const AvroField* elem = (ne != 0u) ? &fields[f + 1u] : nullptr;
-                if (!skip_container(p, len, off, fd->item_type,
-                                    fd->type == AvroType::kMap, elem, ne)) {
+                ElemSink sink;
+                sink.fn          = on_elem;
+                sink.ctx         = ctx;
+                sink.field_index = f;
+                sink.row_index   = row_index;
+                if (!walk_container(p, len, off, fd->item_type,
+                                    fd->type == AvroType::kMap, elem, ne,
+                                    &sink)) {
                     return false;
                 }
                 val->is_null = true;
-                for (uint32_t e = 1u; e <= ne; ++e) {   // bounded: elem_fields
-                    AvroValue* ev = &vals[f + e];
-                    std::memset(ev, 0, sizeof(*ev));
-                    ev->type    = fields[f + e].type;
-                    ev->is_null = true;
-                }
+                null_out_elem_descriptors(fields, vals, f, ne);
                 f += ne;
                 break;
             }
-            case AvroType::kBoolean: {
-                if (*off >= len) return false;
-                val->num.i64 = p[(*off)++] != 0 ? 1 : 0;
-                break;
-            }
+            case AvroType::kBoolean:
             case AvroType::kInt:
-            case AvroType::kLong: {
-                if (!read_long(p, len, off, &val->num.i64)) return false;
-                break;
-            }
-            case AvroType::kFloat: {
-                if (*off + 4u > len) return false;
-                float fv = 0.0f;
-                std::memcpy(&fv, p + *off, 4);
-                val->num.f64 = static_cast<double>(fv);
-                *off += 4u;
-                break;
-            }
-            case AvroType::kDouble: {
-                if (*off + 8u > len) return false;
-                double dv = 0.0;
-                std::memcpy(&dv, p + *off, 8);
-                val->num.f64 = dv;
-                *off += 8u;
-                break;
-            }
+            case AvroType::kLong:
+            case AvroType::kFloat:
+            case AvroType::kDouble:
             case AvroType::kBytes:
-            case AvroType::kString: {
-                if (!read_bytes(p, len, off, &val->bytes, &val->bytes_len))
-                    return false;
+            case AvroType::kString:
+                if (!read_primitive(p, len, off, fd->type, val)) return false;
                 break;
-            }
         }
     }
     return true;
@@ -849,10 +1013,33 @@ bool decompress_block(AvroCodec codec, const uint8_t* in, uint64_t in_len,
         *out = buf; *out_len = ulen;
         return true;
     }
-    // deflate / zstd: the OCF block does not carry the decompressed length and
-    // our exact-fill codec wrappers require it, so the streaming deflate/zstd
-    // Avro blocks are not supported in W1 (null + snappy are). Callers writing
-    // OCFs here use the null codec; manifest reads we exercise are snappy/null.
+    if (codec == AvroCodec::kDeflate) {
+        // THE codec real Iceberg uses: `write.avro.compression-codec` defaults
+        // to gzip/deflate, so both pyiceberg and Iceberg-Java stamp
+        // "avro.codec":"deflate" on manifests and manifest lists.
+        //
+        // An OCF block carries the object count and the COMPRESSED size, never
+        // the raw size, so the exact-fill zlib wrapper (gzip_decompress) cannot
+        // be used — and zlib is an optional dependency besides. bolt's own
+        // inflate reports the exact size it needed when the buffer was short,
+        // so one retry always suffices: guess, then allocate the true answer.
+        uint64_t cap = (in_len < 4096u) ? 16384u : in_len * 6u;
+        // At most two passes: a guess, then the exact size inflate reports.
+        for (uint32_t attempt = 0; attempt < 2u; ++attempt) {   // bounded
+            if (cap == 0u || cap > kAvroMaxBlockBytes) return false;
+            uint8_t* buf = arena->allocate_array<uint8_t>(static_cast<size_t>(cap));
+            if (buf == nullptr) return false;
+            uint64_t got = 0;
+            const int rc = inflate_raw(in, in_len, buf, cap, &got);
+            if (rc == kInflateOk) { *out = buf; *out_len = got; return true; }
+            if (rc != kInflateNeedMore) return false;
+            cap = got;                       // exact requirement, not a guess
+        }
+        return false;
+    }
+    // zstd: the OCF block does not carry the decompressed length and our
+    // exact-fill zstd wrapper requires it, so zstd-coded OCFs are unsupported
+    // (null, deflate and snappy are). Fails closed, never silently empty.
     (void)arena; (void)in; (void)in_len; (void)out_len;
     return false;
 }
@@ -861,6 +1048,12 @@ bool decompress_block(AvroCodec codec, const uint8_t* in, uint64_t in_len,
 
 bool avro_read(const uint8_t* src, uint64_t src_len, Arena* arena,
                void* ctx, AvroRowFn on_row, int64_t* out_rows) noexcept {
+    return avro_read_ex(src, src_len, arena, ctx, on_row, nullptr, out_rows);
+}
+
+bool avro_read_ex(const uint8_t* src, uint64_t src_len, Arena* arena,
+                  void* ctx, AvroRowFn on_row, AvroElemFn on_elem,
+                  int64_t* out_rows) noexcept {
     assert(src != nullptr || src_len == 0);
     assert(on_row != nullptr);
     if (src == nullptr || arena == nullptr || on_row == nullptr) return false;
@@ -890,7 +1083,7 @@ bool avro_read(const uint8_t* src, uint64_t src_len, Arena* arena,
         uint64_t boff = 0;
         for (int64_t r = 0; r < count; ++r) {        // bounded by count
             if (!decode_row(body, body_len, &boff, hdr.field, hdr.n_fields,
-                            vals)) return false;
+                            vals, on_elem, ctx, row_index)) return false;
             if (!on_row(ctx, vals, hdr.n_fields, row_index)) return false;
             ++row_index;
         }
@@ -928,7 +1121,9 @@ bool avro_decode_datum(const uint8_t* src, uint64_t src_len,
     if (src == nullptr || fields == nullptr || out_vals == nullptr) return false;
     if (n_fields == 0u) return false;
     uint64_t off = 0;
-    if (!decode_row(src, src_len, &off, fields, n_fields, out_vals)) return false;
+    if (!decode_row(src, src_len, &off, fields, n_fields, out_vals,
+                    /*on_elem=*/nullptr, /*ctx=*/nullptr, /*row_index=*/0))
+        return false;
     assert(off <= src_len);              // decode_row never runs past the end
     if (out_consumed != nullptr) *out_consumed = off;
     return true;

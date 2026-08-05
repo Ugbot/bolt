@@ -1,43 +1,43 @@
 // bolt/lakehouse/iceberg/manifest.h — Iceberg manifest + manifest-list PODs.
 //
-// IMPORTANT (W4 deviation): Iceberg manifests are Avro files with nested
-// `data_file` records. W4 therefore reads manifests **as JSON arrays** —
-// guarded by `BOLT_ICEBERG_MANIFEST_JSON`.
+// REAL Iceberg manifests are AVRO, and bolt now reads them: see
+// `manifest_list_parse_avro` / `manifest_parse_avro` below. Proven end-to-end
+// against files written by **pyiceberg 0.11.1** against a real catalog —
+// format-version 2, identity-partitioned, deflate-coded — in
+// tests/test_bolt_iceberg_real_avro.cpp, which asserts VALUES from the source
+// table (bounds, null counts, partition values), not row counts. The
+// pre-change reader fails at the header on those same bytes.
 //
-// STATUS UPDATE: the original blocker is GONE. `bolt::ingest::avro_read` now
-// decodes nested records (they flatten positionally into dotted leaves such as
-// "data_file.record_count") and walks arrays and maps, verified against an
-// Iceberg-manifest-shaped OCF written by the stock Apache Avro JAVA writer —
-// the same stack Iceberg's ManifestWriter uses (tests/data/
-// golden_avro_manifest.avro, BoltAvroIceberg.RealJavaWrittenManifestShapeReads).
+// The three things that had to land for that (G2FEAT-76):
+//   1. `union{null, array<...>}`. Iceberg declares EVERY optional repeated
+//      field that way (lower_bounds, split_offsets, partitions, ...), and the
+//      schema parser used to fail closed on a container inside a union — so a
+//      real manifest did not parse AT ALL. Now modelled as a nullable
+//      container; an absent one still steps over its element descriptors.
+//   2. Per-ELEMENT value delivery (`bolt::ingest::avro_read_ex` +
+//      `AvroElemFn`). Containers were walked correctly but published null, so
+//      a repeated field's N values were unreachable. FileStats and
+//      equality_ids are exactly those repeated parts.
+//   3. The deflate codec. `write.avro.compression-codec` defaults to
+//      gzip/deflate, so real manifests are deflate-coded; bolt grew its own
+//      RFC-1951 inflate (bolt/ingest/bolt_inflate.h) because zlib is an
+//      optional dependency and its exact-fill API cannot be used for an Avro
+//      block, which declares no decompressed size.
 //
-// UPDATE 2: the array<record> blocker is GONE too. Iceberg encodes its
-// INT-KEYED maps — column_sizes, value_counts, null_value_counts,
-// lower_bounds, upper_bounds — as array<record<key,value>> (Avro maps only
-// take string keys), and the Java writer emits an array as a POSITIVE element
-// count with NO byte size, so there is nothing to jump over. bolt now MODELS
-// the element record (AvroField::item_type == kAvroItemRecord, its flattened
-// fields spliced in right after the container) and computes each element's
-// width by walking them — the only way to advance past that form.
-// BoltAvroIceberg.RealJavaArrayOfRecordReads pins it against the same real
-// Java-written file the old failure test pinned.
+// `BOLT_ICEBERG_MANIFEST_JSON` below is **documentation, not a switch** —
+// nothing reads it. The JSON entry points remain for the JSON-shaped fixtures
+// the W4 tests use; new callers reading real tables want the Avro ones.
 //
-// WHAT STILL BLOCKS FLIPPING THIS FLAG (measured, not assumed):
-//   1. There is no Avro manifest PARSER. This flag is documentation, not a
-//      switch: iceberg_manifest.cpp implements manifest_parse_json /
-//      manifest_list_parse_json only, and nothing reads the macro. Flipping it
-//      changes no code path.
-//   2. The Avro reader delivers one value per FIELD, so a REPEATED field has
-//      nowhere to put its N values: containers are walked correctly but
-//      publish as null, and the element descriptors publish as null too.
-//      DataFileRef needs exactly the repeated parts — FileStats (from those
-//      array<record> maps) and equality_ids — so a useful Avro manifest reader
-//      needs per-ELEMENT value delivery, not just a correct skip. The element
-//      schema now required to do that is already parsed and adjacent, so the
-//      shape is a per-element callback over the same walk skip_elem_record
-//      performs. Scalars and the nested `partition` record already flatten and
-//      would come through today.
-// TODO(W5-avro-manifest-reader): (2) then (1).
+// KNOWN GAPS in the Avro path (fail closed or degrade, never silently wrong):
+//   - `PartitionValue::field_id` is the ORDINAL within the partition struct,
+//     not the Avro "field-id" annotation (the flattened field table does not
+//     model field-ids). The partition struct's order IS the spec's order, so
+//     the ordinal is the stable join key against a PartitionSpec.
+//   - Bounds are truncated at kLakeMaxValBytes (64); `lower_len`/`upper_len`
+//     report the stored length.
+//   - Per-column stats past kIcebergMaxStatCols (32) are dropped — stats are a
+//     pruning aid, so this degrades pruning, never correctness.
+//   - `zstd`-coded OCFs are unsupported (null / deflate / snappy are).
 //
 // JSON Manifest-list:
 //   [{"manifest_path", "manifest_length", "partition_spec_id", "content",
@@ -123,6 +123,35 @@ namespace bolt { class Arena; }
 namespace bolt {
 namespace lakehouse {
 namespace iceberg {
+
+// ---------------------------------------------------------------------------
+// AVRO manifest readers — the REAL Iceberg on-disk form.
+//
+// A manifest list (`snap-<id>-<n>-<uuid>.avro`) and a manifest
+// (`<uuid>-m<n>.avro`) are Avro object container files, normally
+// deflate-compressed (`write.avro.compression-codec` defaults to gzip). These
+// read them directly via `bolt::ingest::avro_read_ex`, binding schema fields BY
+// NAME against the flattened field table, so Iceberg v1 and v2 layouts and
+// differing field ORDER all work without a positional assumption.
+//
+// Bounded exactly like the JSON entry points: at most `cap` entries, `*out_n`
+// set to what was produced. `scratch` holds the decompressed blocks — reset or
+// discard it after the call.
+// ---------------------------------------------------------------------------
+
+// Parse a manifest-list OCF into ManifestListEntry[].
+bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                              ManifestListEntry* out, uint32_t cap,
+                              uint32_t* out_n) noexcept;
+
+// Parse a manifest OCF into DataFileRef[] — including the repeated parts
+// (per-column lower/upper bounds and null counts from the array<record<key,
+// value>> maps, plus equality_ids), which is what per-element delivery in the
+// Avro reader exists to make possible.
+bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                         int32_t default_spec_id,
+                         DataFileRef* out, uint32_t cap,
+                         uint32_t* out_n) noexcept;
 
 bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
                               ManifestListEntry* out, uint32_t cap,

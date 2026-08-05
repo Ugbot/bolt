@@ -21,10 +21,22 @@ struct ColumnStatEntry {
     int64_t  null_count;
     bool     has_lower;
     bool     has_upper;
-    uint8_t  _pad[6];
+    // Byte lengths of `lower` / `upper`. A REAL Iceberg manifest stores bounds
+    // in Iceberg's binary single-value encoding — a double bound is 8 raw
+    // bytes, and `250.5` is 00 00 00 00 00 50 6F 40, which STARTS with NUL.
+    // Treating those as C strings (what the JSON path can get away with, since
+    // JSON bounds are text) would truncate almost every numeric bound to
+    // empty. Carving the lengths out of the existing padding keeps the struct
+    // the same size and leaves the JSON path's behaviour unchanged.
+    uint8_t  lower_len;
+    uint8_t  upper_len;
+    uint8_t  _pad[4];
     char     lower[kLakeMaxValBytes];
     char     upper[kLakeMaxValBytes];
 };
+// 4 field_id + 4 alignment + 8 null_count + 4 flags/lengths + 4 pad + bounds.
+static_assert(sizeof(ColumnStatEntry) == 24u + 2u * kLakeMaxValBytes,
+              "ColumnStatEntry layout pinned: lengths came from padding");
 
 struct FileStats {
     int64_t          record_count;

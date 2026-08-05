@@ -884,12 +884,148 @@ TEST(BoltAvroDatum, ContainerTruncationFailsClosed) {
     EXPECT_FALSE(avro_decode_datum(lie.data(), lie.size(), f, n, v, nullptr));
 }
 
-// A container inside a union needs the branch index AND the block walk, which
-// no fixed positional entry can express.
-TEST(BoltAvroDatum, NullableContainerFailsClosed) {
+// `union{null, array<T>}` — how Iceberg declares EVERY optional repeated field
+// (lower_bounds, split_offsets, partitions, ...). This used to fail closed,
+// which made a real Iceberg manifest unparseable; it is now modelled as a
+// nullable container. (G2FEAT-76)
+TEST(BoltAvroDatum, NullableContainerIsModelled) {
     const char* json =
         "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
         "{\"name\":\"a\",\"type\":[\"null\","
+        "{\"type\":\"array\",\"items\":\"long\"}]},"
+        "{\"name\":\"z\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_EQ(f[0].type, AvroType::kArray);
+    EXPECT_TRUE(f[0].nullable);
+    EXPECT_EQ(f[0].null_branch, 0u);
+    EXPECT_EQ(f[0].item_type, static_cast<uint8_t>(AvroType::kLong));
+    EXPECT_EQ(f[1].type, AvroType::kLong);
+
+    // Branch 1 (present): one block of two longs, terminator, then `z`.
+    std::vector<uint8_t> present;
+    put_long(present, 1);            // union branch -> the array
+    put_long(present, 2);            // block count
+    put_long(present, 7);
+    put_long(present, 8);
+    put_long(present, 0);            // terminator
+    put_long(present, 99);           // z
+    AvroValue v[4];
+    ASSERT_TRUE(avro_decode_datum(present.data(), present.size(), f, n, v,
+                                  nullptr));
+    EXPECT_TRUE(v[0].is_null);       // a container publishes no scalar
+    EXPECT_EQ(v[1].num.i64, 99);     // the field AFTER it stays aligned
+
+    // Branch 0 (absent): the array is not on the wire at all.
+    std::vector<uint8_t> absent;
+    put_long(absent, 0);             // union branch -> null
+    put_long(absent, 123);           // z
+    ASSERT_TRUE(avro_decode_datum(absent.data(), absent.size(), f, n, v,
+                                  nullptr));
+    EXPECT_TRUE(v[0].is_null);
+    EXPECT_EQ(v[1].num.i64, 123);
+}
+
+// The [T,"null"] ordering must resolve the null branch to 1, not 0 — a complex
+// branch occupies a branch index just like a named one.
+TEST(BoltAvroDatum, NullableContainerValueFirstOrdering) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":[{\"type\":\"array\",\"items\":\"long\"},"
+        "\"null\"]},"
+        "{\"name\":\"z\",\"type\":\"long\"}]}";
+    AvroField f[4];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 4, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_TRUE(f[0].nullable);
+    EXPECT_EQ(f[0].null_branch, 1u);          // NOT 0
+    std::vector<uint8_t> absent;
+    put_long(absent, 1);                      // branch 1 == null here
+    put_long(absent, 55);
+    AvroValue v[4];
+    ASSERT_TRUE(avro_decode_datum(absent.data(), absent.size(), f, n, v,
+                                  nullptr));
+    EXPECT_EQ(v[1].num.i64, 55);
+}
+
+// An ABSENT nullable array<record> must still step over its element
+// descriptors. Skipping them only on the present path mis-aligned every field
+// after a null container — the exact shape of Iceberg's `lower_bounds`.
+TEST(BoltAvroDatum, NullableArrayOfRecordAbsentStaysAligned) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"m\",\"type\":[\"null\",{\"type\":\"array\",\"items\":"
+        "{\"type\":\"record\",\"name\":\"kv\",\"fields\":["
+        "{\"name\":\"key\",\"type\":\"int\"},"
+        "{\"name\":\"value\",\"type\":\"long\"}]}}]},"
+        "{\"name\":\"tail\",\"type\":\"long\"}]}";
+    AvroField f[8];
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(json),
+                                  static_cast<uint32_t>(std::strlen(json)),
+                                  f, 8, &n));
+    ASSERT_EQ(n, 4u);                         // m, m[].key, m[].value, tail
+    EXPECT_EQ(f[0].elem_fields, 2u);
+    EXPECT_TRUE(f[0].nullable);
+    EXPECT_EQ(f[3].type, AvroType::kLong);
+
+    AvroValue v[8];
+    std::vector<uint8_t> absent;
+    put_long(absent, 0);                      // null branch
+    put_long(absent, 4242);                   // tail
+    ASSERT_TRUE(avro_decode_datum(absent.data(), absent.size(), f, n, v,
+                                  nullptr));
+    EXPECT_EQ(v[3].num.i64, 4242);            // would be garbage if misaligned
+
+    std::vector<uint8_t> present;
+    put_long(present, 1);                     // the array branch
+    put_long(present, 1);                     // one element
+    put_long(present, 3);                     // key
+    put_long(present, 77);                    // value
+    put_long(present, 0);                     // terminator
+    put_long(present, 4243);                  // tail
+    ASSERT_TRUE(avro_decode_datum(present.data(), present.size(), f, n, v,
+                                  nullptr));
+    EXPECT_EQ(v[3].num.i64, 4243);
+}
+
+// avro_decode_datum takes a CALLER-supplied field table, so an out-of-range
+// elem_fields must be rejected rather than overflowing the decoder's fixed
+// element buffer. (Hand-built table — the schema parser cannot produce this.)
+TEST(BoltAvroDatum, OversizedElemFieldsRejectedNotOverflowed) {
+    AvroField f[4];
+    std::memset(f, 0, sizeof(f));
+    std::strcpy(f[0].name, "a");
+    f[0].type        = AvroType::kArray;
+    f[0].item_type   = kAvroItemRecord;
+    f[0].elem_fields = static_cast<uint16_t>(kAvroMaxElemFields + 1u);
+    std::strcpy(f[1].name, "k");
+    f[1].type = AvroType::kLong;
+    std::strcpy(f[2].name, "z");
+    f[2].type = AvroType::kLong;
+
+    std::vector<uint8_t> wire;
+    put_long(wire, 1);
+    put_long(wire, 1);
+    put_long(wire, 0);
+    AvroValue v[4];
+    EXPECT_FALSE(avro_decode_datum(wire.data(), wire.size(), f, 3, v, nullptr));
+}
+
+// Still genuinely unsupported, and must stay fail-closed: a union carrying a
+// container AND a named type is a real multi-type union, which one positional
+// slot cannot describe.
+TEST(BoltAvroDatum, UnionOfContainerAndScalarFailsClosed) {
+    const char* json =
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+        "{\"name\":\"a\",\"type\":[\"long\","
         "{\"type\":\"array\",\"items\":\"long\"}]}]}";
     AvroField f[4];
     uint32_t n = 0;
@@ -1100,6 +1236,71 @@ TEST(BoltAvroIceberg, RealJavaArrayOfRecordReads) {
     // that carries no byte size, so only a correct element walk reaches it.
     EXPECT_EQ(m.tail[0], 909);
     EXPECT_TRUE(m.elem_null[0]);
+}
+
+namespace {
+struct ElemCapture {
+    uint32_t n;
+    uint32_t field_index[16];
+    int64_t  key[16];
+    int64_t  value[16];
+};
+bool capture_elem(void* c, uint32_t fi, int64_t, int64_t ei,
+                  const AvroValue* vals, uint32_t nv) noexcept {
+    ElemCapture* e = static_cast<ElemCapture*>(c);
+    if (e->n >= 16u || nv < 2u) return true;
+    e->field_index[e->n] = fi;
+    e->key[e->n]   = vals[0].num.i64;
+    e->value[e->n] = vals[1].num.i64;
+    ++e->n;
+    (void)ei;
+    return true;
+}
+}  // namespace
+
+// Per-ELEMENT delivery over the same Java-written array<record> fixture. Until
+// this landed the container walked correctly but published nothing, so a
+// repeated field's values were unreachable to any caller. (G2FEAT-76)
+TEST(BoltAvroIceberg, RealJavaArrayOfRecordDeliversElementValues) {
+    std::vector<uint8_t> buf;
+    ASSERT_TRUE(read_file("golden_avro_array_of_record.avro", &buf))
+        << "fixture missing";
+    bolt::Arena arena;
+    AorRows m;
+    ElemCapture e;
+    std::memset(&e, 0, sizeof(e));
+    int64_t rows = 0;
+    ASSERT_TRUE(avro_read_ex(buf.data(), buf.size(), &arena, &m, collect_aor,
+                             nullptr, &rows));
+    ASSERT_EQ(rows, 1);
+    // A null on_elem must behave exactly like avro_read (one walker, no drift).
+    ASSERT_EQ(e.n, 0u);
+
+    // The element sink is a separate ctx from the row sink in real callers, but
+    // reusing one struct here keeps the fixture-shape assertions together.
+    struct Both { AorRows* r; ElemCapture* e; } both{&m, &e};
+    auto row_fn = [](void* c, const AvroValue* v, uint32_t n,
+                     int64_t ri) noexcept -> bool {
+        return collect_aor(static_cast<Both*>(c)->r, v, n, ri);
+    };
+    auto elem_fn = [](void* c, uint32_t fi, int64_t ri, int64_t ei,
+                      const AvroValue* v, uint32_t nv) noexcept -> bool {
+        return capture_elem(static_cast<Both*>(c)->e, fi, ri, ei, v, nv);
+    };
+    std::memset(&m, 0, sizeof(m));
+    rows = 0;
+    ASSERT_TRUE(avro_read_ex(buf.data(), buf.size(), &arena, &both, row_fn,
+                             elem_fn, &rows));
+    ASSERT_EQ(rows, 1);
+    // The fixture's `parts` array holds 2 elements — previously invisible.
+    ASSERT_EQ(e.n, 2u);
+    EXPECT_EQ(e.field_index[0], 1u);          // the `parts` container field
+    EXPECT_EQ(e.field_index[1], 1u);
+    // Keys/values are distinct, so a decoder emitting the same element twice
+    // (or re-reading one) cannot pass.
+    EXPECT_NE(e.key[0], e.key[1]);
+    // Alignment still holds with delivery switched on.
+    EXPECT_EQ(m.tail[0], 909);
 }
 
 TEST(BoltAvro, HeaderParse) {

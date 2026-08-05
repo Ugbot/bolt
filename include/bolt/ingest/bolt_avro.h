@@ -102,7 +102,12 @@ struct AvroValue {
 struct AvroField {
     char     name[kAvroMaxName];
     AvroType type;            // resolved primitive (union → underlying type)
-    bool     nullable;        // union with "null"
+    // Union with "null". This applies to CONTAINERS too: `union{null, array}`
+    // is how Iceberg declares every optional repeated field (lower_bounds,
+    // split_offsets, partitions, ...), so a nullable kArray/kMap is normal —
+    // the branch index is read first and, when it selects null, the container
+    // is absent from the wire entirely.
+    bool     nullable;
     // Which union branch index encodes null. Avro writes the branch index
     // before the value, and BOTH orderings occur in the wild: ["null",T]
     // (the convention when a field has a null default) gives 0, ["T","null"]
@@ -136,6 +141,36 @@ struct AvroHeader {
 using AvroRowFn = bool (*)(void* ctx, const AvroValue* vals, uint32_t n,
                            int64_t row_index) noexcept;
 
+// Per-ELEMENT callback for a repeated field (array / map).
+//
+// The flat one-value-per-field row model cannot carry a repeated field's N
+// values, so a container publishes as null in the row callback (and always
+// has). This callback is where those values are delivered: it fires once per
+// element, DURING the walk of the enclosing row, before that row's `AvroRowFn`
+// runs.
+//
+//   field_index : index of the CONTAINER field in the header field array, so a
+//                 caller can tell `lower_bounds` from `upper_bounds`.
+//   elem_index  : 0-based position within the container, across all blocks.
+//   vals/n_vals : for a RECORD element (item_type == kAvroItemRecord), one
+//                 value per element field, in declared order — i.e. exactly
+//                 the `elem_fields` descriptors that follow the container.
+//                 For a PRIMITIVE element, exactly one value.
+//                 For a MAP, the string key is prepended as vals[0], so a map
+//                 record element yields 1 + elem_fields values.
+//
+// Iceberg needs precisely this: column_sizes / value_counts /
+// null_value_counts / lower_bounds / upper_bounds are array<record<key,value>>
+// (an Avro map may only key on string), and `split_offsets` / `equality_ids`
+// are array<long>.
+//
+// ZERO-COPY LIFETIME: identical to AvroRowFn — bytes/string point into the
+// decoded block buffer and are only valid for the duration of the call.
+// Return false to abort the scan.
+using AvroElemFn = bool (*)(void* ctx, uint32_t field_index, int64_t row_index,
+                            int64_t elem_index, const AvroValue* vals,
+                            uint32_t n_vals) noexcept;
+
 // Parse the OCF header (magic + metadata + sync). Returns false on malformed
 // input, an unsupported codec, or a schema we cannot flatten to primitives.
 bool avro_read_header(const uint8_t* src, uint64_t src_len,
@@ -148,6 +183,13 @@ bool avro_read_header(const uint8_t* src, uint64_t src_len,
 // when a callback aborts; *out_rows gets the count delivered.
 bool avro_read(const uint8_t* src, uint64_t src_len, Arena* arena,
                void* ctx, AvroRowFn on_row, int64_t* out_rows) noexcept;
+
+// As `avro_read`, plus per-element delivery for repeated fields. `on_elem` may
+// be null, in which case this is exactly `avro_read` (which is implemented as
+// this call with a null `on_elem` — there is one walker, not two).
+bool avro_read_ex(const uint8_t* src, uint64_t src_len, Arena* arena,
+                  void* ctx, AvroRowFn on_row, AvroElemFn on_elem,
+                  int64_t* out_rows) noexcept;
 
 // ---------------------------------------------------------------------------
 // Bare-datum surface — schema-driven, NO code generation.

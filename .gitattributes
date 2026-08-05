@@ -1,0 +1,4 @@
+# Binary golden fixtures. Without these, CRLF conversion silently corrupts a
+# committed test file and the failure surfaces as an unrelated parse error.
+*.avro    binary
+*.parquet binary

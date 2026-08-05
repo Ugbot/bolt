@@ -119,10 +119,15 @@ void read_stat_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
             std::strncpy(slot->lower, val, kLakeMaxValBytes - 1u);
             slot->lower[kLakeMaxValBytes - 1u] = '\0';
             slot->has_lower = true;
+            // JSON bounds are text, so the length is just the stored string's.
+            slot->lower_len =
+                static_cast<uint8_t>(std::strlen(slot->lower));
         } else {
             std::strncpy(slot->upper, val, kLakeMaxValBytes - 1u);
             slot->upper[kLakeMaxValBytes - 1u] = '\0';
             slot->has_upper = true;
+            slot->upper_len =
+                static_cast<uint8_t>(std::strlen(slot->upper));
         }
     }
 }

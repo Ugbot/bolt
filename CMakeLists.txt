@@ -606,6 +606,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_write.cpp
         src/ingest/bolt_avro.cpp
+        src/ingest/bolt_inflate.cpp
         src/ingest/bolt_protobuf.cpp
         src/ingest/bolt_roaring.cpp
         src/ingest/bolt_zstd.cpp
@@ -775,6 +776,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_metadata.cpp
     src/lakehouse/iceberg_snapshot.cpp
     src/lakehouse/iceberg_manifest.cpp
+    src/lakehouse/iceberg_manifest_avro.cpp
     src/lakehouse/iceberg_partition.cpp
     src/lakehouse/iceberg_statistics.cpp
     src/lakehouse/iceberg_delete_file.cpp

@@ -1178,6 +1178,16 @@ target_link_libraries(test_bolt_lakehouse_iceberg_read
 bolt_apply_hardening(test_bolt_lakehouse_iceberg_read)
 add_test(NAME test_bolt_lakehouse_iceberg_read COMMAND test_bolt_lakehouse_iceberg_read)
 
+# G2FEAT-76 — read a REAL Iceberg table's Avro manifests (pyiceberg-written
+# fixtures, deflate-coded). Distinct from the JSON-manifest tests above.
+add_executable(test_bolt_iceberg_real_avro test_bolt_iceberg_real_avro.cpp)
+target_link_libraries(test_bolt_iceberg_real_avro
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_iceberg_real_avro PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_iceberg_real_avro)
+add_test(NAME test_bolt_iceberg_real_avro COMMAND test_bolt_iceberg_real_avro)
+
 # W5 — Iceberg write path.
 add_executable(test_bolt_lakehouse_iceberg_write test_bolt_lakehouse_iceberg_write.cpp)
 target_link_libraries(test_bolt_lakehouse_iceberg_write
