@@ -245,6 +245,12 @@ struct ColCtx {
     uint64_t overflow_cursor;
     uint8_t* dict;              // decoded dict entries, elem stride
     uint32_t dict_n;
+    // G2FEAT-152 dictionary hint: per-row dictionary code, or nullptr when not
+    // tracked. `codes_ok` starts 1 and is cleared by ANY page that is not
+    // dictionary-encoded, so a chunk mixing PLAIN and dictionary pages emits no
+    // hint rather than a partial one. -1 marks a null row.
+    int32_t* codes;
+    uint32_t codes_ok;
     // Type-conformance decode controls (G2FEAT-46).
     uint32_t src_width;         // physical source element width (bytes)
     uint8_t  src_signed;        // 1 => sign-extend on widen (INT32-DECIMAL /
@@ -515,11 +521,15 @@ bool dict_gather(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] == 0u) {
             bit_clear(cx->validity, row0 + i);
+            if (cx->codes != nullptr) cx->codes[row0 + i] = -1;   // null row
             continue;
         }
         if (k >= nvalid) return false;
         const uint32_t id = idx[k++];
         if (id >= cx->dict_n) return false;
+        if (cx->codes != nullptr) {
+            cx->codes[row0 + i] = static_cast<int32_t>(id);
+        }
         std::memcpy(cx->out + (static_cast<uint64_t>(row0) + i) * w,
                     cx->dict + static_cast<uint64_t>(id) * w, w);
     }
@@ -618,6 +628,7 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         }
     }
     if (h->enc == kEncPlain) {
+        cx->codes_ok = 0;   // PLAIN page: no dictionary codes
         if (cx->is_int96) {
             return plain_int96(cx, v, vlen, def, row0, nvals, nvalid);
         }
@@ -643,6 +654,7 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         }
     }
     if (h->enc == kEncRle && cx->pc->physical == PqType::Boolean) {
+        cx->codes_ok = 0;                 // not dictionary-coded
         return rle_bool(cx, v, vlen, def, row0, nvals, nvalid, arena);
     }
     if (h->enc == kEncPlainDict || h->enc == kEncRleDict) {
@@ -761,6 +773,46 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
     return rows_done == rows;
 }
 
+// G2FEAT-152: publish the dictionary hint on a fully-decoded Flat column.
+//
+// The column KEEPS format == Flat and its gathered StringViews, so every
+// existing consumer is unaffected; `dict_child` is only read when
+// format == Dictionary today, which makes this purely additive. Shape:
+//     col.dict_child            -> Flat Int32 column, data = per-row codes
+//     col.dict_child->dict_child-> Flat Utf8 column, data = dict entries
+// A consumer may hash each dictionary entry ONCE and then index by code
+// instead of re-hashing the row's content. Correctness must never depend on
+// the hint: it is absent whenever any page was not dictionary-encoded, and
+// BoltColumn::clone_into drops it (a clone into another arena must not carry
+// a pointer into the source arena).
+bool attach_dict_hint(const ColCtx* cx, BoltColumn* col, Arena* arena) noexcept {
+    assert(cx != nullptr && col != nullptr && arena != nullptr);
+    if (cx->codes_ok == 0 || cx->codes == nullptr) return true;   // no hint
+    if (cx->dict == nullptr || cx->dict_n == 0) return true;
+    if (col->format != ColumnFormat::Flat || col->length <= 0) return true;
+    auto* vals = arena->allocate_array<BoltColumn>(1);
+    auto* keys = arena->allocate_array<BoltColumn>(1);
+    if (vals == nullptr || keys == nullptr) return true;           // skip hint
+    *vals = BoltColumn::make_empty();
+    vals->format            = ColumnFormat::Flat;
+    vals->type              = col->type;
+    vals->type_size_bytes   = col->type_size_bytes;
+    vals->data              = cx->dict;
+    vals->length            = static_cast<int64_t>(cx->dict_n);
+    vals->str_overflow_base = col->str_overflow_base;
+    vals->arena             = arena;
+    *keys = BoltColumn::make_empty();
+    keys->format          = ColumnFormat::Flat;
+    keys->type            = BoltType::Int32;
+    keys->type_size_bytes = 4;
+    keys->data            = cx->codes;
+    keys->length          = col->length;
+    keys->dict_child      = vals;
+    keys->arena           = arena;
+    col->dict_child = keys;
+    return true;
+}
+
 // Allocate one output column + its decode context for chunk range
 // [g0, g1) of column c. `rows` = total rows the column will hold.
 bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
@@ -802,6 +854,19 @@ bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     std::memset(cx, 0, sizeof(*cx));
     cx->pc = pc;
     cx->type = t;
+    // G2FEAT-152: track per-row dictionary codes for Utf8 only -- that is where
+    // re-hashing wide content per row actually costs (ClickBench `url` averages
+    // 88 bytes over 100M rows), and it bounds the extra memory to 4 B/row on one
+    // column rather than every column. MUST come after the memset above, which
+    // zeroes the whole context.
+    if (t == BoltType::Utf8 && rows > 0) {
+        auto* cb = static_cast<int32_t*>(
+            arena->allocate(static_cast<uint64_t>(rows) * 4u, 4));
+        if (cb != nullptr) {               // best-effort: no buffer => no hint
+            cx->codes = cb;
+            cx->codes_ok = 1;
+        }
+    }
     cx->elem = static_cast<uint32_t>(bolt::type_size(t));
     cx->out = static_cast<uint8_t*>(col->data);
     cx->validity = col->validity;
@@ -1021,6 +1086,7 @@ bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
         if (!decode_chunk(buf, len, ch, &cx, 0, rg->num_rows, arena)) {
             return false;
         }
+        (void)attach_dict_hint(&cx, &out_cols[c], arena);
     }
     *out_rows = rg->num_rows;
     return true;
@@ -1051,6 +1117,7 @@ bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
         if (!decode_chunk(buf, len, ch, &cx, 0, rg->num_rows, arena)) {
             return false;
         }
+        (void)attach_dict_hint(&cx, &out_cols[j], arena);
     }
     *out_rows = rg->num_rows;
     return true;

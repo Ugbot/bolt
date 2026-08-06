@@ -1529,6 +1529,15 @@ inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
     assert(length >= 0);
     BoltColumn c = *this;
     c.arena = arena_in;
+    // G2FEAT-152: a NON-Dictionary column may carry an ADVISORY dictionary hint
+    // on `dict_child` (the parquet reader publishes one for Utf8 so a consumer
+    // can hash each dictionary entry once instead of re-hashing every row's
+    // content). It points into the SOURCE arena, so a clone must DROP it rather
+    // than deep-copy it: correctness never depends on the hint, and a hint
+    // dangling into a reset arena is precisely the G2FEAT-307 use-after-free
+    // class. The Dictionary case below owns its child for real and still
+    // deep-copies it.
+    if (format != ColumnFormat::Dictionary) c.dict_child = nullptr;
 
     switch (format) {
         case ColumnFormat::Flat: {
