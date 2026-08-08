@@ -27,7 +27,10 @@ struct ArenaConfig {
 };
 
 /// Maximum number of backing blocks an arena can hold.
-/// 32 blocks with doubling = 4MB → 128GB addressable. Plenty.
+/// NOTE: doubling is CAPPED at config.max_block_size, so total capacity is
+/// roughly 32 x max_block_size (default 64 MB => ~1.8 GB), NOT the "128 GB"
+/// an uncapped doubling would suggest. Long-lived arenas that back operator
+/// state (the scheduler's worker arenas) pass a larger max_block_size.
 static constexpr uint32_t kArenaMaxBlocks = 32;
 
 /// Arena: Bump allocator. One per thread. Reset per morsel epoch.
@@ -106,6 +109,9 @@ public:
             cursor_ = reinterpret_cast<uintptr_t>(blocks_[0]);
             end_ = cursor_ + block_sizes_[0];
         }
+        // New epoch: blocks the oversize lane consumed become plain empty
+        // blocks again, visible to the normal lane's forward scan.
+        oversize_used_ = 0;
         total_allocated_ = 0;
     }
 
@@ -122,7 +128,31 @@ public:
             cursor_ = reinterpret_cast<uintptr_t>(blocks_[0]);
             end_ = cursor_ + block_sizes_[0];
         }
+        oversize_used_ = 0;
         total_allocated_ = 0;
+    }
+
+    /// reset() plus block-table trimming: free tail blocks until at most
+    /// `keep_bytes` stays reserved (block 0 always survives). The warm pool's
+    /// worker arenas live for the PROCESS, and their 32-slot block table only
+    /// ever grew — a heterogeneous query mix ratchets it to the cap within a
+    /// few heavy queries, after which allocations fail (surfacing as bogus
+    /// downstream errors) and, before that, throughput quietly degrades as
+    /// most of the reserved bytes sit in stranded blocks. Trimming at the
+    /// between-queries reset point keeps a bounded warm working set AND
+    /// returns table slots. Same no-tasks-in-flight contract as reset().
+    void reset_keep(size_t keep_bytes) noexcept {
+        assert(num_blocks_ >= 1);
+        size_t reserved = total_reserved();
+        while (num_blocks_ > 1 && reserved > keep_bytes) {
+            num_blocks_--;
+            reserved -= block_sizes_[num_blocks_];
+            aligned_free(blocks_[num_blocks_]);
+            blocks_[num_blocks_] = nullptr;
+            block_sizes_[num_blocks_] = 0;
+        }
+        assert(num_blocks_ >= 1);
+        reset();
     }
 
     /// Copy data into arena.
@@ -174,13 +204,63 @@ private:
     }
 
     void* allocate_slow(size_t size, size_t alignment) noexcept {
-        // Try reusing next pre-existing block
-        if (current_idx_ + 1 < num_blocks_) {
-            current_idx_++;
-            cursor_ = reinterpret_cast<uintptr_t>(blocks_[current_idx_]);
-            end_ = cursor_ + block_sizes_[current_idx_];
-            uintptr_t aligned = (cursor_ + alignment - 1) & ~(alignment - 1);
-            if (aligned + size <= end_) {
+        assert(alignment > 0 && (alignment & (alignment - 1)) == 0);
+        assert(size > 0);
+        // Oversize lane. A request bigger than the steady-state block size gets
+        // a bespoke block WITHOUT moving the bump cursor. The old code fell
+        // through to grow(), which jumps current_idx_ to the tail — a single
+        // 128 MB request at block 11 of 30 permanently stranded blocks 12..29
+        // for the rest of the epoch (measured on a warm-pool worker arena:
+        // 2.69 GB reserved, ~600 MB reachable, then a 208 KB allocation FAILED
+        // at the 32-block table cap). The bespoke block is consumed whole by
+        // this request, so there is nothing in it for the cursor to use anyway.
+        if (size + alignment > config_.max_block_size) {
+            // Reuse first: a bespoke block minted by an earlier epoch is a
+            // plain empty block after reset(), and re-malloc'ing 16-128 MB per
+            // epoch is both slow and exactly the table ratchet this lane
+            // exists to prevent. Any not-yet-used block past the cursor that
+            // fits is taken whole.
+            for (uint32_t i = current_idx_ + 1; i < num_blocks_; ++i) {
+                if ((oversize_used_ & (1u << i)) != 0u) continue;
+                const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
+                const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
+                if (aligned + size <= base + block_sizes_[i]) {
+                    oversize_used_ |= (1u << i);
+                    total_allocated_ += size;
+                    if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
+                    return reinterpret_cast<void*>(aligned);
+                }
+            }
+            if (num_blocks_ >= kArenaMaxBlocks) return nullptr;
+            const size_t sz = size + alignment;
+            void* block = aligned_alloc_impl(config_.alignment, sz);
+            if (block == nullptr) return nullptr;
+            blocks_[num_blocks_] = block;
+            block_sizes_[num_blocks_] = sz;
+            // The bespoke block sits PAST the cursor while fully in use, so it
+            // must be excluded from the forward scan below for the rest of
+            // this epoch — otherwise its memory would be handed out twice.
+            oversize_used_ |= (1u << num_blocks_);
+            num_blocks_++;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(block);
+            const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
+            assert(aligned + size <= base + sz);
+            total_allocated_ += size;
+            if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
+            return reinterpret_cast<void*>(aligned);
+        }
+        // Normal lane: scan FORWARD for the first pre-existing block that fits.
+        // Every block past current_idx_ is untouched this epoch, so skipping to
+        // the first fit reuses capacity the old probe-exactly-one code (and its
+        // grow() fallback) abandoned. Blocks skipped over are smaller than this
+        // request — bounded early-progression blocks, not the big tail ones.
+        for (uint32_t i = current_idx_ + 1; i < num_blocks_; ++i) {
+            if ((oversize_used_ & (1u << i)) != 0u) continue;   // in use this epoch
+            const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
+            const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
+            if (aligned + size <= base + block_sizes_[i]) {
+                current_idx_ = i;
+                end_ = base + block_sizes_[i];
                 cursor_ = aligned + size;
                 total_allocated_ += size;
                 if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
@@ -206,7 +286,12 @@ private:
     uintptr_t end_;
     size_t   total_allocated_;
     size_t   peak_usage_;
+    // Bitmask over blocks_ (kArenaMaxBlocks == 32 fits uint32_t exactly):
+    // blocks consumed whole by the oversize lane THIS epoch, so the normal
+    // lane's forward scan must not reuse them until the next reset().
+    uint32_t oversize_used_ = 0;
 };
+static_assert(kArenaMaxBlocks <= 32, "oversize_used_ bitmask is 32 bits");
 
 // Thread-local arena pointer. Set by slot, reset at morsel boundary.
 inline thread_local Arena* tl_arena = nullptr;

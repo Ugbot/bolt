@@ -484,9 +484,20 @@ struct Scheduler {
     /// allocates output from tl_arena would grow memory per call. Callers that
     /// reset between work units (e.g. per query, between scheduler-free points)
     /// keep worker-arena usage bounded. (G2FEAT-146)
+    /// Retained warm bytes per worker arena across queries. Covers the full
+    /// natural doubling progression (4+8+16+32+64+64+64 MB ≈ 252 MB) so a
+    /// steady workload never re-mallocs, while bespoke oversize blocks from a
+    /// heavy query are returned. Without trimming, the 32-slot block table
+    /// ratchets monotonically for the process lifetime — measured saturation
+    /// in ~3 heavy queries, after which allocations FAIL and, before that,
+    /// throughput quietly degrades ~2.8x (most reserved bytes stranded).
+    static constexpr size_t kWorkerArenaKeepBytes = 256ull * 1024 * 1024;
+
     void reset_worker_arenas() noexcept {
         for (uint32_t i = 0; i < num_workers; ++i) {
-            if (worker_arenas[i] != nullptr) worker_arenas[i]->reset();
+            if (worker_arenas[i] != nullptr) {
+                worker_arenas[i]->reset_keep(kWorkerArenaKeepBytes);
+            }
         }
     }
 
@@ -752,7 +763,17 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
 
     // Allocate per-worker arenas (startup allocation — permitted).
     for (uint32_t i = 0; i < num_threads; ++i) {
-        worker_arenas[i] = new (std::nothrow) Arena();
+        // Deliberate config, not the default: a pool worker arena backs whole
+        // OPERATOR states (join builds, aggregate tables) for the process
+        // lifetime, and with the default 64 MB max block the 32-slot table
+        // caps total capacity near ~1.8 GB — measured as spurious allocation
+        // failures on 60M-row aggregates whose memory budget said 51 GiB was
+        // fine. A 512 MB max block raises the ceiling to ~14 GB per worker;
+        // reset_keep() (kWorkerArenaKeepBytes) still trims the warm set back
+        // between queries, so steady-state footprint is unchanged.
+        ArenaConfig wa_cfg{};
+        wa_cfg.max_block_size = 512ull * 1024 * 1024;
+        worker_arenas[i] = new (std::nothrow) Arena(wa_cfg);
         if (!worker_arenas[i]) {
             for (uint32_t j = 0; j < i; ++j) { delete worker_arenas[j]; worker_arenas[j] = nullptr; }
             return false;
