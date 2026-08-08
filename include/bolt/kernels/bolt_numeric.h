@@ -133,7 +133,17 @@ inline int64_t filter_gt_i32_simd(const int32_t* BOLT_RESTRICT data, int64_t n,
 // point through the SIMD kernel when a vector ISA is compiled in. Under
 // scalar builds the bmm_* fallbacks fold back to the branchless template,
 // so behaviour is unchanged.
-#if BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42 || BOLT_SIMD_NEON
+//
+// NEON is DELIBERATELY EXCLUDED (2026-08-08 arm64 audit): bmm_compressstore's
+// NEON arm is a stack round-trip plus a data-dependent while(mask){ctz; scalar
+// store} loop — 109 instructions vs the 21-instruction branchless scalar
+// template — measured 2.3-7.1x SLOWER across 5-90% selectivities on Apple
+// Silicon (worst at 50%). The other five predicates (Lt/Le/Ge/Eq/Ne) never had
+// a NEON arm and already take the scalar path, so this also removes a 7x
+// Gt-vs-everything-else anomaly. A proper NEON compressstore (vqtbl1q_u8
+// LUT-permute, mirroring the AVX2 permutevar8x32 approach) can re-enable it —
+// re-measure before flipping the gate back.
+#if BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42
 template <>
 inline int64_t filter_gt<int64_t>(const int64_t* BOLT_RESTRICT data, int64_t n,
                                   int64_t scalar,
