@@ -18,6 +18,15 @@
 #include <cstdint>
 #include <cstring>
 
+// System headers must be included at GLOBAL scope so their declarations land
+// in the global namespace (and so a consumer that includes the same header
+// after us — past the include guard — still sees a global declaration). The
+// __APPLE__ branch below re-includes <sys/sysctl.h> inside `namespace bolt`;
+// declaring it here first ensures `::sysctlbyname` is visible everywhere.
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace bolt {
 
 inline constexpr uint32_t kTopologyMaxCpus = 256;

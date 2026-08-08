@@ -631,7 +631,14 @@ if(BOLT_BUILD_INGEST)
             target_link_libraries(bolt_ingest PRIVATE zstd::libzstd)
         elseif(ZSTD_PC_FOUND)
             target_include_directories(bolt_ingest PRIVATE ${ZSTD_PC_INCLUDE_DIRS})
-            target_link_libraries(bolt_ingest PRIVATE ${ZSTD_PC_LIBRARIES})
+            # Absolute-path form (…_LINK_LIBRARIES), not bare "-lzstd": a keg-only
+            # Homebrew zstd is not on clang's default link path (same fix as LZ4 below).
+            if(ZSTD_PC_LINK_LIBRARIES)
+                target_link_libraries(bolt_ingest PRIVATE ${ZSTD_PC_LINK_LIBRARIES})
+            else()
+                target_link_libraries(bolt_ingest PRIVATE ${ZSTD_PC_LIBRARIES})
+                target_link_directories(bolt_ingest PRIVATE ${ZSTD_PC_LIBRARY_DIRS})
+            endif()
         endif()
     endif()
     if(BOLT_WITH_ZLIB)
@@ -646,7 +653,17 @@ if(BOLT_BUILD_INGEST)
             target_link_libraries(bolt_ingest PRIVATE LZ4::lz4_shared)
         elseif(LZ4_PC_FOUND)
             target_include_directories(bolt_ingest PRIVATE ${LZ4_PC_INCLUDE_DIRS})
-            target_link_libraries(bolt_ingest PRIVATE ${LZ4_PC_LIBRARIES})
+            # Use the absolute-path form (…_LINK_LIBRARIES), not the bare
+            # names (…_LIBRARIES → "-llz4"): for a keg-only lz4 (Homebrew) the
+            # bare name propagates to consumers with no -L search dir and the
+            # final link fails. Fall back to bare names + link dirs if the
+            # absolute-path var is empty on this CMake/pkg-config.
+            if(LZ4_PC_LINK_LIBRARIES)
+                target_link_libraries(bolt_ingest PUBLIC ${LZ4_PC_LINK_LIBRARIES})
+            else()
+                target_link_libraries(bolt_ingest PUBLIC ${LZ4_PC_LIBRARIES})
+                target_link_directories(bolt_ingest PUBLIC ${LZ4_PC_LIBRARY_DIRS})
+            endif()
         endif()
     endif()
 

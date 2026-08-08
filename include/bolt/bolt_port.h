@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <bit>
 #include <cassert>
 #include <thread>
@@ -43,6 +44,8 @@
     #include <mach/mach_init.h>
     #include <mach/thread_act.h>
     #include <mach/thread_policy.h>
+    #include <unistd.h>          // getpid
+    #include <mach-o/dyld.h>     // _NSGetExecutablePath
 #endif
 
 // ---------------------------------------------------------------------------
@@ -522,6 +525,74 @@ BOLT_FORCE_INLINE bool bolt_set_numa_preferred(int node) noexcept {
 #endif
 
 #include <array>
+
+// ---------------------------------------------------------------------------
+// Process / environment / file — the single portable shim so call sites never
+// spell _getpid / _putenv_s / fopen_s / /proc/self/exe directly. Global-scope
+// bolt_* free functions, matching bolt_get_hardware_concurrency above.
+// ---------------------------------------------------------------------------
+
+// Current process id.
+BOLT_FORCE_INLINE int bolt_getpid() noexcept {
+#if defined(_WIN32)
+    return static_cast<int>(::GetCurrentProcessId());
+#else
+    return static_cast<int>(::getpid());
+#endif
+}
+
+// Set (value != nullptr) or clear (value == nullptr / "") an environment
+// variable. Returns true on success. Unifies _putenv_s (Windows) and
+// setenv/unsetenv (POSIX) — including the Windows "" == unset convention.
+BOLT_FORCE_INLINE bool bolt_setenv(const char* name, const char* value) noexcept {
+    if (name == nullptr) return false;
+#if defined(_WIN32)
+    return ::_putenv_s(name, value == nullptr ? "" : value) == 0;
+#else
+    if (value == nullptr || value[0] == '\0') return ::unsetenv(name) == 0;
+    return ::setenv(name, value, 1) == 0;
+#endif
+}
+
+// Clear an environment variable. Returns true on success.
+BOLT_FORCE_INLINE bool bolt_unsetenv(const char* name) noexcept {
+    return bolt_setenv(name, nullptr);
+}
+
+// Portable fopen — avoids MSVC's fopen_s deprecation without a global
+// _CRT_SECURE_NO_WARNINGS. Returns nullptr on failure.
+BOLT_FORCE_INLINE std::FILE* bolt_fopen(const char* path, const char* mode) noexcept {
+#if defined(_WIN32)
+    std::FILE* f = nullptr;
+    return (::fopen_s(&f, path, mode) == 0) ? f : nullptr;
+#else
+    return std::fopen(path, mode);
+#endif
+}
+
+// Absolute path of the current executable into buf (cap includes the NUL).
+// Returns bytes written (excl. NUL), or 0 on failure. Hides the three
+// platforms' distinct mechanisms (GetModuleFileNameA / _NSGetExecutablePath /
+// /proc/self/exe).
+BOLT_FORCE_INLINE size_t bolt_executable_path(char* buf, size_t cap) noexcept {
+    if (buf == nullptr || cap == 0u) return 0u;
+    buf[0] = '\0';
+#if defined(_WIN32)
+    const DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(cap));
+    if (n == 0u || n >= cap) return 0u;
+    return static_cast<size_t>(n);
+#elif defined(__APPLE__)
+    uint32_t sz = static_cast<uint32_t>(cap);
+    if (::_NSGetExecutablePath(buf, &sz) != 0) return 0u;  // cap too small
+    buf[cap - 1u] = '\0';
+    return std::strlen(buf);
+#else  // Linux / other: /proc/self/exe
+    const ssize_t n = ::readlink("/proc/self/exe", buf, cap - 1u);
+    if (n <= 0) return 0u;
+    buf[n] = '\0';
+    return static_cast<size_t>(n);
+#endif
+}
 
 namespace bolt {
 namespace simd {
