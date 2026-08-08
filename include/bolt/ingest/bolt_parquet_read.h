@@ -93,6 +93,27 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
 bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
                               bool lowercase_names) noexcept;
 
+// Fold one column's per-chunk min/max statistics into a single file-level
+// range, decoded into the units a consumer's catalog wants:
+//   - integer-like  -> the raw integer value
+//   - DECIMAL       -> the int64 MANTISSA (scale is on the column; the caller
+//                      already knows it from parquet_schema_from_meta)
+//   - DATE          -> days since epoch
+// The footer carries these EXACTLY and for free — no page decode, no scan —
+// yet a consumer that re-derives them has to read every row.
+//
+// FAILS CLOSED. Returns false (and leaves *out_min/*out_max untouched) unless
+// EVERY chunk of the column carries both stats and every one decodes. A single
+// chunk missing statistics means the file-level range is unproven, and a
+// half-proven range is worse than none: callers gate value-range lowering on
+// this, so a wrong bound silently produces wrong answers where an absent bound
+// merely forgoes an optimization.
+//
+// Types with no meaningful int64 range (Utf8/Binary/FLBA-non-decimal, floats)
+// return false — a consumer wanting string ranges needs a different accessor.
+bool parquet_column_int_range(const PqMeta* meta, uint32_t col_idx,
+                              int64_t* out_min, int64_t* out_max) noexcept;
+
 // Locate the footer and parse FileMetaData. The chunk table behind
 // out->chunks is allocated from `arena` (sized 4096 first, retried once
 // at the kPqMaxRowGroups * kPqMaxColumns hard cap for chunk-heavy files).

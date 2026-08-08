@@ -1080,6 +1080,79 @@ bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
     return true;
 }
 
+// Decode one raw parquet statistic blob into an int64 in catalog units.
+// Mirrors parquet_map_type's own physical/logical dispatch so a stat can
+// never be interpreted differently from the column it describes.
+bool pq_stat_to_i64(const PqColumn& col, const uint8_t* b, uint32_t len,
+                    int64_t* out) noexcept {
+    assert(b != nullptr);
+    assert(out != nullptr);
+    if (len == 0u) return false;
+    const bool is_dec = (col.converted == kConvDecimal) ||
+                        (col.logical == static_cast<int32_t>(PqLogical::Decimal));
+    switch (col.physical) {
+        case PqType::Int32: {                 // INT32, DATE, INT32-DECIMAL
+            if (len != 4u) return false;
+            int32_t v = 0;
+            std::memcpy(&v, b, 4);            // parquet stats are little-endian
+            *out = static_cast<int64_t>(v);   // DATE lands as day number
+            return true;
+        }
+        case PqType::Int64: {                 // INT64, INT64-DECIMAL mantissa
+            if (len != 8u) return false;
+            int64_t v = 0;
+            std::memcpy(&v, b, 8);
+            *out = v;
+            return true;
+        }
+        case PqType::FixedLenByteArray: {     // DECIMAL(p<=18) as big-endian FLBA
+            if (!is_dec || len == 0u || len > 8u) return false;
+            // Sign-extend from the top byte, then accumulate big-endian.
+            int64_t v = (b[0] & 0x80u) ? -1 : 0;
+            for (uint32_t i = 0; i < len; ++i) {
+                v = static_cast<int64_t>((static_cast<uint64_t>(v) << 8) | b[i]);
+            }
+            *out = v;
+            return true;
+        }
+        default:
+            // Utf8/Binary/float/double/bool/Int96: no meaningful int64 range.
+            return false;
+    }
+}
+
+bool parquet_column_int_range(const PqMeta* meta, uint32_t col_idx,
+                              int64_t* out_min, int64_t* out_max) noexcept {
+    assert(meta != nullptr);
+    assert(out_min != nullptr && out_max != nullptr);
+    if (col_idx >= meta->n_columns) return false;
+    if (meta->n_row_groups == 0u || meta->chunks == nullptr) return false;
+
+    const PqColumn& col = meta->columns[col_idx];
+    int64_t lo = 0, hi = 0;
+    bool seen = false;
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
+        const PqRowGroup& rg = meta->row_groups[g];
+        if (col_idx >= rg.chunk_count) return false;          // ragged: unproven
+        const PqChunk& ch = meta->chunks[rg.chunk_off + col_idx];
+        // A chunk with no rows carries no range but does not invalidate one.
+        if (ch.num_values == 0) continue;
+        int64_t cmin = 0, cmax = 0;
+        if (!pq_stat_to_i64(col, ch.min_bytes, ch.min_len, &cmin)) return false;
+        if (!pq_stat_to_i64(col, ch.max_bytes, ch.max_len, &cmax)) return false;
+        if (cmin > cmax) return false;                        // corrupt stat
+        if (!seen) { lo = cmin; hi = cmax; seen = true; }
+        else {
+            if (cmin < lo) lo = cmin;
+            if (cmax > hi) hi = cmax;
+        }
+    }
+    if (!seen) return false;                                  // all chunks empty
+    *out_min = lo;
+    *out_max = hi;
+    return true;
+}
+
 bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
                        PqMeta* out) noexcept {
     assert(arena != nullptr);
