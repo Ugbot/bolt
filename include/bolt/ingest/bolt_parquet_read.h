@@ -71,6 +71,28 @@ namespace parquet {
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept;
 
+// Derive a COMPLETE BoltSchema straight from a parsed footer. The parquet
+// metadata already states everything a consumer needs — name, logical type,
+// DECIMAL precision/scale, integer width/signedness, nullability — so no
+// caller should be re-deriving it, and none should have to squeeze it through
+// a lossy hand-maintained enum (a 4-value {int64,utf8,float32,float64} hint
+// cannot express DATE or DECIMAL at all, which is why TPC-H could not be
+// declared this way).
+//
+// This routes through `parquet_map_type` — the SAME mapping the reader
+// decodes with — so a consumer's declared schema cannot drift from what the
+// scan actually produces. That drift is a real, previously-shipped bug class
+// (G2FEAT-112: catalog said Int64 while the buffer was 2-byte), and it had
+// three separate hand-rolled copies of this loop to go wrong in.
+//
+// `out` must already own storage for >= meta->n_columns fields (see
+// BoltSchema::set_storage). `lowercase_names` folds A-Z for consumers whose
+// catalog is always-lowercased. No allocation. Returns false if the schema is
+// empty, `out` is under-sized, or any column has no supported mapping (the
+// caller learns WHICH via a subsequent parquet_map_type probe).
+bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
+                              bool lowercase_names) noexcept;
+
 // Locate the footer and parse FileMetaData. The chunk table behind
 // out->chunks is allocated from `arena` (sized 4096 first, retried once
 // at the kPqMaxRowGroups * kPqMaxColumns hard cap for chunk-heavy files).

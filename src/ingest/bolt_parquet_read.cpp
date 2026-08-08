@@ -1045,6 +1045,41 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
     }
 }
 
+bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
+                              bool lowercase_names) noexcept {
+    assert(meta != nullptr);
+    assert(out != nullptr);
+    if (meta->n_columns == 0u) return false;
+    // Caller owns the storage (BoltSchema::set_storage) — we never allocate.
+    if (out->fields == nullptr || out->cap < meta->n_columns) return false;
+
+    out->num_fields = 0;
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {
+        const PqColumn& pc = meta->columns[c];
+        BoltType bt    = BoltType::NA;
+        uint8_t  scale = 0;
+        // Same mapping the decoder uses — the schema cannot drift from it.
+        if (!parquet_map_type(&pc, &bt, &scale)) return false;
+
+        BoltField& f = out->fields[c];
+        std::memset(&f, 0, sizeof(f));
+        size_t i = 0;
+        for (; pc.name[i] != '\0' && i < kMaxFieldName; ++i) {
+            const char ch = pc.name[i];
+            f.name[i] = (lowercase_names && ch >= 'A' && ch <= 'Z')
+                            ? static_cast<char>(ch + 32)
+                            : ch;
+        }
+        f.name[i]       = '\0';
+        f.type          = bt;
+        f.nullable      = (pc.optional != 0u);
+        f.decimal_scale = scale;   // 0 for non-decimal columns
+        ++out->num_fields;
+    }
+    assert(out->num_fields == meta->n_columns);
+    return true;
+}
+
 bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
                        PqMeta* out) noexcept {
     assert(arena != nullptr);
