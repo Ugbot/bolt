@@ -49,8 +49,20 @@ static_assert(sizeof(SwissSlot) == 16, "SwissSlot must be 16 bytes");
 // docs/research/design-log.md ("Hash mixer — …"). No runtime branch.
 // ---------------------------------------------------------------------------
 BOLT_FORCE_INLINE uint8_t swiss_tag(uint64_t h) noexcept {
-    // Low 7 bits of the upper word; high bit 0 so we never collide with Empty.
-    return static_cast<uint8_t>((h >> 57) & 0x7Fu);
+    // 7 bits from the upper-middle of the hash; high ctrl bit stays 0 so a
+    // tag never collides with Empty.
+    //
+    // WHY bits 49..55 and not 57..63 (the historical choice): the hash join
+    // partitions its tables by hj_partition_of(h) == bits 58..63 of the SAME
+    // mixed hash. With the tag at 57..63, six of its seven bits were the
+    // partition selector — constant within a partition — leaving ONE bit of
+    // tag entropy: every SIMD group scan passed ~50% of slots to the full key
+    // compare instead of ~1/128 (found reading the DaMoN'24 unchained-hash-
+    // table paper against this file; TPC-H probe profiles bear the cost).
+    // Bits 49..55 are disjoint from BOTH the partition selector (58..63) and
+    // the table index (low 32 bits), restoring the full 1/128 filter inside
+    // partitioned and standalone tables alike.
+    return static_cast<uint8_t>((h >> 49) & 0x7Fu);
 }
 
 BOLT_FORCE_INLINE uint32_t swiss_round_up_pow2(uint64_t x) noexcept {
@@ -169,6 +181,69 @@ struct SwissTable {
             idx = (idx + 1) & mask;
         }
         return false;  // unreachable given size check above
+    }
+
+    // ------------------------------------------------------------------
+    // Upsert: ONE probe sequence that does what a find()+insert() pair does.
+    // If `key` exists, its value is replaced with `value` and the old value
+    // is written to *prev; if not, the pair is inserted at the first empty
+    // slot and *prev is set to -1. Returns false only when the table is full
+    // (nothing written).
+    //
+    // Motivation: the hash-join chain build wants "link to the previous head,
+    // then make me the head" — historically a full find() followed by a full
+    // insert(), i.e. two probe walks over the same group chain per build row.
+    // Measured on TPC-H SF10 Q18 (build side 15M rows) the build was 23% of
+    // query self-time with find+insert as separate walks. Uses find()'s
+    // 16-lane group scan (not insert()'s byte walk) for both halves.
+    // ------------------------------------------------------------------
+    bool upsert(uint64_t key, uint32_t value, int32_t* prev) noexcept {
+        assert(ctrl != nullptr && slots != nullptr);
+        assert(prev != nullptr);
+        using namespace bolt::simd;
+        const uint64_t h   = swiss_mix(key);
+        const uint8_t  tag = swiss_tag(h);
+        const bmm_vec_i8 vtag   = bmm_set1_i8(static_cast<int8_t>(tag));
+        const bmm_vec_i8 vempty = bmm_set1_i8(static_cast<int8_t>(kSwissCtrlEmpty));
+        uint32_t base = static_cast<uint32_t>(h) & mask;
+        constexpr uint32_t kGroup = kSwissGroupWidth;
+        for (uint32_t probes = 0; probes < capacity; probes += kGroup) {
+            const bmm_vec_i8 cgrp = bmm_loadu_i8(
+                reinterpret_cast<const int8_t*>(ctrl + base));
+            uint32_t tag_mask = static_cast<uint32_t>(bmm_movemask_i8(
+                                    bmm_cmpeq_i8(cgrp, vtag))) & 0xFFFFu;
+            const uint32_t empty_mask = static_cast<uint32_t>(bmm_movemask_i8(
+                                    bmm_cmpeq_i8(cgrp, vempty))) & 0xFFFFu;
+            // A tag match only counts if it sits BEFORE the first empty in
+            // probe order — matches past an empty belong to other probe chains.
+            const uint32_t first_empty =
+                empty_mask ? static_cast<uint32_t>(bolt_ctz32(empty_mask)) : kGroup;
+            while (tag_mask) {
+                const uint32_t lane = static_cast<uint32_t>(bolt_ctz32(tag_mask));
+                if (lane > first_empty) break;
+                const uint32_t p = (base + lane) & mask;
+                if (slots[p].key == key) {
+                    *prev = static_cast<int32_t>(slots[p].value);
+                    slots[p].value = value;
+                    return true;
+                }
+                tag_mask &= tag_mask - 1;
+            }
+            if (empty_mask != 0) {
+                if (size >= capacity) return false;
+                const uint32_t p = (base + first_empty) & mask;
+                assert(ctrl[p] == kSwissCtrlEmpty);
+                ctrl[p]        = tag;
+                slots[p].key   = key;
+                slots[p].value = value;
+                if (p < kSwissGroupWidth) ctrl[capacity + p] = tag;
+                ++size;
+                *prev = -1;
+                return true;
+            }
+            base = (base + kGroup) & mask;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------

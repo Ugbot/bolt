@@ -215,6 +215,17 @@ struct JoinBuildTyped {
     SplitBlockBloom bloom;
     uint8_t         has_bloom;
     uint8_t         _pad3[7];
+    // --- Additive (fan-out bound). Per-partition count of DISTINCT keys, i.e.
+    // inserts that found no existing chain head. Written only by the partition
+    // that owns it, so the parallel build needs no atomics. Consumers use
+    // jk_max_fanout() rather than build_rows to bound how many probe rows can
+    // safely go into one join_probe_typed call: `build_rows` is the true worst
+    // case ("one probe row matches every build row") but is wildly pessimistic
+    // for the common unique/PK build side, where the real fan-out is 1. A caller
+    // dividing a fixed pairs budget by build_rows collapses to ONE ROW PER CALL
+    // for any build over that budget, which drives this vectorized kernel
+    // scalar. distinct_per_part is computed for free during the build.
+    uint32_t distinct_per_part[kHJNumPartitions];
 };
 
 // Compile-/run-time key-shape tag. `OneInt64` (a single 64-bit-or-narrower
@@ -283,6 +294,8 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
     const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
     out->build_rows = n;
     out->n_keys     = n_keys;
+    // Fan-out accounting starts at zero on every build (see jk_max_fanout).
+    std::memset(out->distinct_per_part, 0, sizeof(out->distinct_per_part));
     jk_capture_key_meta(key_cols, n_keys, out);
     if (force_general) out->key_shape = static_cast<uint8_t>(JoinKeyShape::General);
     const bool one_int = (out->key_shape ==
@@ -331,8 +344,18 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
         const uint64_t h = one_int ? swiss_mix(tkey) : tkey;
         const uint32_t p = hj_partition_of(h);
         if (out->has_bloom != 0) sbbf_add(out->bloom, h);
-        out->chain_nodes[slot].next = out->partitions[p].find(tkey);  // prev head/-1
-        if (!out->partitions[p].insert(tkey, slot)) return false;
+        // ONE probe: link to the previous chain head (or -1) and become the
+        // new head. Was a full find() THEN a full insert() — two walks over
+        // the same probe chain per build row, measured at 23% of Q18 self.
+        int32_t prev_head = -1;
+        if (!out->partitions[p].upsert(tkey, static_cast<uint32_t>(slot),
+                                       &prev_head)) {
+            return false;
+        }
+        out->chain_nodes[slot].next = prev_head;
+        // No prior head => this key is new. Counting here is free: the branch
+        // is perfectly predicted for the all-distinct (PK) case.
+        if (prev_head < 0) ++out->distinct_per_part[p];
     }
     return true;
 }
@@ -406,6 +429,8 @@ inline bool jk_build_scatter_and_alloc(const BoltColumn* key_cols,
     const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
     out->build_rows = n;
     out->n_keys     = n_keys;
+    // Fan-out accounting starts at zero on every build (see jk_max_fanout).
+    std::memset(out->distinct_per_part, 0, sizeof(out->distinct_per_part));
     jk_capture_key_meta(key_cols, n_keys, out);
     const bool one_int = (out->key_shape ==
                           static_cast<uint8_t>(JoinKeyShape::OneInt64));
@@ -519,6 +544,8 @@ inline bool jk_build_phase1_prepare(const BoltColumn* key_cols, uint8_t n_keys,
     const size_t n_alloc = static_cast<size_t>(n);
     out->build_rows = n;
     out->n_keys     = n_keys;
+    // Fan-out accounting starts at zero on every build (see jk_max_fanout).
+    std::memset(out->distinct_per_part, 0, sizeof(out->distinct_per_part));
     jk_capture_key_meta(key_cols, n_keys, out);
     out->chain_nodes = arena->allocate_array<HashJoinChainNode>(n_alloc);
     out->keys_flat   = arena->allocate_array<GbCell16>(n_alloc * n_keys);
@@ -653,13 +680,45 @@ inline bool jk_build_partition_range(const BoltColumn* key_cols, uint8_t n_keys,
             const int64_t r    = slot;
             const uint64_t tkey = one_int ? jk_read_int64_key(key_cols[0], r)
                                           : jk_detail::hash_keys_typed(key_cols, n_keys, r);
-            out->chain_nodes[slot].next = out->partitions[p].find(tkey);
-            if (!out->partitions[p].insert(tkey, static_cast<uint32_t>(slot))) {
+            // One-probe upsert: previous head out, new head in (see the
+            // sibling site in jk_build_core for the measured motivation).
+            int32_t prev_head = -1;
+            if (!out->partitions[p].upsert(tkey, static_cast<uint32_t>(slot),
+                                           &prev_head)) {
                 return false;
             }
+            out->chain_nodes[slot].next = prev_head;
+            if (prev_head < 0) ++out->distinct_per_part[p];
         }
     }
     return true;
+}
+
+// Upper bound on how many build rows a single probe row can match.
+//
+// Exact (== 1) for the case that dominates analytical joins: a unique / primary
+// key build side, where every insert found an empty chain so distinct == rows.
+// With duplicates present, all of them could in principle sit on one chain, so
+// the safe bound is (rows - distinct + 1) — still far tighter than `rows`, and
+// additionally capped by kHJMaxChainLen, which the probe loops already assert
+// no chain can exceed.
+//
+// Never returns 0 (a caller dividing by this must not trip), and never returns
+// more than build_rows.
+BOLT_FORCE_INLINE uint64_t jk_max_fanout(const JoinBuildTyped* build) noexcept {
+    assert(build != nullptr);
+    if (build->build_rows == 0) return 1;
+    uint64_t distinct = 0;
+    for (uint32_t p = 0; p < kHJNumPartitions; ++p) {
+        distinct += build->distinct_per_part[p];
+    }
+    assert(distinct <= build->build_rows);
+    if (distinct >= build->build_rows) return 1;          // all keys unique
+    uint64_t fan = build->build_rows - distinct + 1;
+    if (fan > kHJMaxChainLen) fan = kHJMaxChainLen;
+    if (fan > build->build_rows) fan = build->build_rows;
+    assert(fan >= 1 && fan <= build->build_rows);
+    return fan;
 }
 
 // Decimal128 scale precondition: assert every Decimal128 key column's probe
@@ -692,7 +751,7 @@ BOLT_FORCE_INLINE bool join_decimal_scales_match(const JoinBuildTyped* build,
 // match rates most probe rows never touch the table. Compile-time flag (one
 // instantiation per arm, zero per-row dispatch); caller gates on
 // build->has_bloom.
-template <bool UseBloom>
+template <bool UseBloom, bool Unique = false>
 BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
                                             const BoltColumn* probe_keys,
                                             int64_t n_probe,
@@ -714,6 +773,24 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
         }
         const uint32_t p = hj_partition_of(mixed);
         int32_t  node = build->partitions[p].find(key);
+        if constexpr (Unique) {
+            // UNIQUE build side (jk_max_fanout()==1 — every key distinct, the
+            // PK build every TPC-H join has): a find() hit IS the single
+            // match, and every build init site stores build_idx == slot, so
+            // the hit emits the slot directly. The chain_nodes array — one
+            // extra dependent cache line per hit in the general loop, two
+            // counting the next-link read that only ever says -1 — is never
+            // touched. (DaMoN'24 unchained-layout reading applied to this
+            // probe: fewer dependent lines per probe, same output.)
+            if (node >= 0) {
+                assert(out < pairs_cap);
+                assert(build->chain_nodes[static_cast<uint32_t>(node)].next < 0);
+                out_build[out] = node;
+                out_probe[out] = static_cast<int32_t>(r);
+                ++out;
+            }
+            continue;
+        }
         uint32_t walk = 0;
         while (node >= 0) {
             assert(walk < kHJMaxChainLen);
@@ -803,6 +880,15 @@ inline size_t join_probe_typed(const JoinBuildTyped* build,
     assert(join_decimal_scales_match(build, probe_keys));
     const bool bloom = use_bloom && build->has_bloom != 0;
     if (build->key_shape == static_cast<uint8_t>(JoinKeyShape::OneInt64)) {
+        // jk_max_fanout is a 64-entry sum, paid once per multi-thousand-row
+        // probe call — noise next to one probe's cache misses.
+        if (jk_max_fanout(build) == 1) {
+            return bloom
+                ? jk_probe_one_int64<true, true>(build, probe_keys, n_probe,
+                                                 out_build, out_probe, pairs_cap)
+                : jk_probe_one_int64<false, true>(build, probe_keys, n_probe,
+                                                  out_build, out_probe, pairs_cap);
+        }
         return bloom ? jk_probe_one_int64<true>(build, probe_keys, n_probe,
                                                 out_build, out_probe, pairs_cap)
                      : jk_probe_one_int64<false>(build, probe_keys, n_probe,
