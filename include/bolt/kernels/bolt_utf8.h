@@ -423,6 +423,90 @@ BOLT_FORCE_INLINE int64_t utf8_filter_eq_selected(
     return count;
 }
 
+// ---------------------------------------------------------------------------
+// IN-list over ALL-INLINE (<=12 byte) values — the branchless masked compare
+// of inline_eq_match, applied k times per row.
+//
+// Why: the generic IN path resolves bytes per row (sv_bytes) and then calls
+// memcmp once PER LIST VALUE with a runtime length. On the shapes that matter
+// (TPC-H Q12's `l_shipmode IN ('MAIL','SHIP')` over 60M rows, every value 4-7
+// bytes) that is a function call per value per row for a comparison that fits
+// in two registers. An inline StringView is zero-padded at construction, so a
+// masked word compare answers it with no call, no branch, and no byte
+// resolution — the same technique utf8_filter_eq already uses for a scalar.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kInlineInMaxVals = 16;   // past this the per-row scan wins
+
+struct InlineInPattern {
+    InlineEqPattern p[kInlineInMaxVals];
+    uint32_t        n;
+};
+
+// Build the pattern set from the caller's concatenated value buffer.
+// Returns false (caller keeps its generic path) when the list is too long or
+// ANY value exceeds the 12-byte inline budget — a spilled value cannot be
+// answered by a word compare.
+BOLT_FORCE_INLINE bool inline_in_prepare(
+        const char* BOLT_RESTRICT buf, const uint32_t* BOLT_RESTRICT off,
+        const uint32_t* BOLT_RESTRICT len, uint32_t k,
+        InlineInPattern* out) noexcept {
+    assert(out != nullptr);
+    assert(buf != nullptr || k == 0);
+    if (k == 0 || k > kInlineInMaxVals) return false;
+    for (uint32_t v = 0; v < k; ++v) {
+        if (len[v] > 12u) return false;
+        out->p[v] = inline_eq_prepare(sv_make_inline(buf + off[v], len[v]));
+    }
+    out->n = k;
+    assert(out->n <= kInlineInMaxVals);
+    return true;
+}
+
+BOLT_FORCE_INLINE int64_t utf8_filter_in_selected(
+        const StringView* BOLT_RESTRICT data,
+        const int32_t*    BOLT_RESTRICT sel, int64_t in_n,
+        const InlineInPattern* BOLT_RESTRICT pat,
+        int32_t*          BOLT_RESTRICT sel_out) noexcept {
+    assert(data != nullptr || in_n == 0);
+    assert(sel  != nullptr || in_n == 0);
+    assert(pat  != nullptr && pat->n > 0 && pat->n <= kInlineInMaxVals);
+    assert(in_n >= 0);
+    int64_t count = 0;
+    const uint32_t k = pat->n;
+    for (int64_t i = 0; i < in_n; ++i) {
+        const int32_t r = sel[i];
+        const StringView& s = data[r];
+        int hit = 0;
+        for (uint32_t v = 0; v < k; ++v) {          // bounded, branchless
+            hit |= static_cast<int>(inline_eq_match(s, pat->p[v]));
+        }
+        sel_out[count] = r;
+        count += hit;
+    }
+    return count;
+}
+
+BOLT_FORCE_INLINE int64_t utf8_filter_in_dense(
+        const StringView* BOLT_RESTRICT data, int64_t n,
+        const InlineInPattern* BOLT_RESTRICT pat,
+        int32_t* BOLT_RESTRICT sel_out) noexcept {
+    assert(data != nullptr || n == 0);
+    assert(pat  != nullptr && pat->n > 0 && pat->n <= kInlineInMaxVals);
+    assert(n >= 0);
+    int64_t count = 0;
+    const uint32_t k = pat->n;
+    for (int64_t i = 0; i < n; ++i) {
+        const StringView& s = data[i];
+        int hit = 0;
+        for (uint32_t v = 0; v < k; ++v) {
+            hit |= static_cast<int>(inline_eq_match(s, pat->p[v]));
+        }
+        sel_out[count] = static_cast<int32_t>(i);
+        count += hit;
+    }
+    return count;
+}
+
 BOLT_FORCE_INLINE int64_t utf8_filter_ne_selected(
         const StringView* BOLT_RESTRICT data,
         const int32_t*    BOLT_RESTRICT sel, int64_t in_n,
@@ -720,6 +804,25 @@ BOLT_FORCE_INLINE int64_t utf8_filter_not_like(
         count += match ? 0 : 1;
     }
     return count;
+}
+
+// LIKE as a BOOLEAN COLUMN rather than a selection vector: out[i] = 0/1 in
+// the engine's canonical int64 boolean lane, so a LIKE can be an operand of
+// a vectorized expression (CASE / AND / OR) instead of only a filter.  Same
+// per-row matcher as utf8_filter_like, so the two cannot disagree.
+BOLT_FORCE_INLINE void utf8_like_mask(
+        const StringView*   BOLT_RESTRICT data, int64_t n,
+        const CompiledLike* pattern,
+        int64_t*            BOLT_RESTRICT out,
+        const char* spilled_base = nullptr) noexcept {
+    assert(data    != nullptr || n == 0);
+    assert(pattern != nullptr);
+    assert(out     != nullptr || n == 0);
+    assert(n >= 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const char* p = sv_bytes(data[i], spilled_base);
+        out[i] = utf8_like_match_one(pattern, p, data[i].length) ? 1 : 0;
+    }
 }
 
 // ===========================================================================
