@@ -149,6 +149,15 @@ struct SwissTable {
         BOLT_PREFETCH_READ(&slots[idx]);
     }
 
+    // Same, for a caller that already holds `swiss_mix(key)` (see find_mixed).
+    void prefetch_mixed(uint64_t h) const noexcept {
+        assert(ctrl != nullptr);
+        assert(slots != nullptr);
+        const uint32_t idx = static_cast<uint32_t>(h) & mask;
+        BOLT_PREFETCH_READ(&ctrl[idx]);
+        BOLT_PREFETCH_READ(&slots[idx]);
+    }
+
     // ------------------------------------------------------------------
     // Insert. Linear-probes for an empty slot. Returns false if the table
     // is full (size would exceed capacity) — Tiger Style: no growth.
@@ -256,11 +265,31 @@ struct SwissTable {
     // group at the tail, so group loads never run past the buffer).
     // ------------------------------------------------------------------
     int32_t find(uint64_t key) const noexcept {
+        return find_mixed(key, swiss_mix(key));
+    }
+
+    // ------------------------------------------------------------------
+    // find() for a caller that ALREADY holds `swiss_mix(key)`.
+    //
+    // The partitioned hash join computes the mixed hash itself (to pick the
+    // partition and to test the bloom) and then called find(), which mixed it
+    // a second time. Behaviour is identical by construction — find() is now
+    // literally this function with the mix applied — but the join's probe can
+    // hand the hash straight through. `h` MUST equal swiss_mix(key); passing
+    // anything else silently searches the wrong group.
+    //
+    // That precondition is deliberately NOT asserted: this repo's Release
+    // build keeps asserts ON, and `assert(h == swiss_mix(key))` would put a
+    // redundant hash on every find() in the codebase — an assert that costs
+    // the thing it guards. The invariant is instead pinned by construction
+    // (find() supplies it) and by the probe equivalence test, which fails
+    // loudly on any mismatch of the resulting pairs.
+    // ------------------------------------------------------------------
+    int32_t find_mixed(uint64_t key, uint64_t h) const noexcept {
         assert(ctrl != nullptr);
         assert(slots != nullptr);
 
         using namespace bolt::simd;
-        const uint64_t h   = swiss_mix(key);
         const uint8_t  tag = swiss_tag(h);
 
         // Build broadcast vectors for tag / empty once.

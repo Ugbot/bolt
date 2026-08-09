@@ -124,6 +124,17 @@ BOLT_FORCE_INLINE void sbbf_add(SplitBlockBloom& sbf,
     for (int l = 0; l < 8; ++l) blk.lane[l] |= mask[l];
 }
 
+// Prefetch the 256-bit block a future sbbf_test(mixed_hash) will read.
+// Additive; the filter itself is unchanged.  Exists for the WINDOWED probe
+// (bolt_joinkernel.h jk_probe_one_int64_mlp), which hashes a window of probe
+// rows and issues every block's prefetch before reading any of them, so the
+// independent misses overlap instead of serialising one per row.
+BOLT_FORCE_INLINE void sbbf_prefetch(const SplitBlockBloom& sbf,
+                                     uint64_t mixed_hash) noexcept {
+    assert(sbf.blocks != nullptr);
+    BOLT_PREFETCH_READ(&sbf.blocks[sbbf_block_index(sbf, mixed_hash)]);
+}
+
 // Test.  Returns true if the key MAY be present, false if definitely
 // absent.  8 ANDs + 1 combined compare; on AVX2 this auto-vectorises to
 // one 256-bit load + _mm256_and_si256 + _mm256_testc_si256 (or

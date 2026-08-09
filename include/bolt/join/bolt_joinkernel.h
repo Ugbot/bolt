@@ -56,6 +56,8 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>    // latched CHUKONU_HJ_MLP_TRACE diagnostic only
+#include <cstdlib>   // getenv/atoi — kill-switch latch only, never per row
 #include <cstring>
 
 namespace bolt {
@@ -808,6 +810,301 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
     return out;
 }
 
+// ===========================================================================
+// Windowed probe — memory-level parallelism (2026-08-09 perf campaign).
+//
+// The scalar loop above is one long dependent chain per row: hash -> bloom
+// block -> ctrl line -> slot line -> chain node -> emit. Every link is a load
+// that cannot issue until the previous one retires, so the core sustains ~ONE
+// outstanding miss where Apple M-series can hold 10-16. Measured on TPC-H
+// SF10 (60M lineitem probe rows, 12 workers): 15.2 core-ns/row against an
+// L2-resident 100K build vs ~88-99 against a 2M-15M one — the out-of-cache
+// figure is a full DRAM round trip per row, i.e. no overlap at all.
+//
+// This variant keeps the hash table EXACTLY as it is (the layout rewrite is a
+// separate, much larger change) and instead splits the loop into phases over a
+// window of W rows:
+//     A  hash the window   (pure ALU, no table touch) + bloom-block prefetch
+//     B  bloom test, compacting survivors            (the prefetched lines)
+//     C  prefetch every survivor's ctrl/slot line    (W independent misses)
+//     D  resolve + emit                              (lines already in flight)
+// The misses in C are mutually independent, so they overlap; D then reads
+// mostly-resident lines.
+//
+// EMISSION IS IDENTICAL, not merely equivalent: rows are visited in ascending
+// order within a window and windows in ascending order, so the (build_idx,
+// probe_idx) SEQUENCE matches the scalar path pair for pair.
+// ===========================================================================
+
+// Scratch window. 32 rows x 20 B = 640 B of stack, bounded by construction;
+// W is a template parameter so the phase loops have compile-time trip counts.
+inline constexpr uint32_t kJkProbeWindowMax = 64;
+
+// Phase A — hash `[base,end)` into the window arrays, dropping NULL keys
+// (NULL != NULL, same as the scalar loop's `continue`). Returns the count.
+template <bool UseBloom>
+BOLT_FORCE_INLINE uint32_t jk_window_hash(const JoinBuildTyped* build,
+                                          const BoltColumn& pk,
+                                          int64_t base, int64_t end,
+                                          uint64_t* BOLT_RESTRICT w_key,
+                                          uint64_t* BOLT_RESTRICT w_mix,
+                                          int32_t*  BOLT_RESTRICT w_row) noexcept {
+    assert(base >= 0 && end > base);
+    assert(w_key != nullptr && w_mix != nullptr && w_row != nullptr);
+    assert(end - base <= static_cast<int64_t>(kJkProbeWindowMax));
+    (void)build;
+    uint32_t n = 0;
+    for (int64_t r = base; r < end; ++r) {
+        if (!gb_detail::cell_valid(pk, r)) continue;   // NULL != NULL
+        const uint64_t key   = jk_read_int64_key(pk, r);
+        const uint64_t mixed = swiss_mix(key);
+        w_key[n] = key;
+        w_mix[n] = mixed;
+        w_row[n] = static_cast<int32_t>(r);
+        ++n;
+        if constexpr (UseBloom) sbbf_prefetch(build->bloom, mixed);
+    }
+    assert(n <= static_cast<uint32_t>(end - base));
+    return n;
+}
+
+// Phase B — bloom test over the (already prefetched) blocks, compacting the
+// survivors down in place. Order-preserving, so phase D still emits in row
+// order. Returns the surviving count.
+BOLT_FORCE_INLINE uint32_t jk_window_bloom(const JoinBuildTyped* build,
+                                           uint32_t n,
+                                           uint64_t* BOLT_RESTRICT w_key,
+                                           uint64_t* BOLT_RESTRICT w_mix,
+                                           int32_t*  BOLT_RESTRICT w_row) noexcept {
+    assert(build != nullptr && build->has_bloom != 0);
+    assert(n <= kJkProbeWindowMax);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!sbbf_test(build->bloom, w_mix[i])) continue;  // definitely absent
+        w_key[k] = w_key[i];
+        w_mix[k] = w_mix[i];
+        w_row[k] = w_row[i];
+        ++k;
+    }
+    assert(k <= n);
+    return k;
+}
+
+// Phase C — issue every survivor's ctrl/slot prefetch. THE point of the whole
+// structure: these W loads are mutually independent, so they queue together.
+BOLT_FORCE_INLINE void jk_window_prefetch(const JoinBuildTyped* build,
+                                          uint32_t n,
+                                          const uint64_t* BOLT_RESTRICT w_mix)
+                                          noexcept {
+    assert(build != nullptr);
+    assert(n <= kJkProbeWindowMax);
+    for (uint32_t i = 0; i < n; ++i) {
+        build->partitions[hj_partition_of(w_mix[i])].prefetch_mixed(w_mix[i]);
+    }
+}
+
+// Phase D — resolve and emit. `Unique` mirrors the scalar fast lane exactly
+// (a find() hit IS the single match; chain_nodes never touched). Returns the
+// new output cursor.
+template <bool Unique>
+BOLT_FORCE_INLINE size_t jk_window_resolve(const JoinBuildTyped* build,
+                                           uint32_t n,
+                                           const uint64_t* BOLT_RESTRICT w_key,
+                                           const uint64_t* BOLT_RESTRICT w_mix,
+                                           const int32_t*  BOLT_RESTRICT w_row,
+                                           int32_t* BOLT_RESTRICT out_build,
+                                           int32_t* BOLT_RESTRICT out_probe,
+                                           size_t out, size_t pairs_cap) noexcept {
+    assert(build != nullptr);
+    assert(n <= kJkProbeWindowMax);
+    (void)pairs_cap;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t p = hj_partition_of(w_mix[i]);
+        int32_t node = build->partitions[p].find_mixed(w_key[i], w_mix[i]);
+        if constexpr (Unique) {
+            if (node >= 0) {
+                assert(out < pairs_cap);
+                assert(build->chain_nodes[static_cast<uint32_t>(node)].next < 0);
+                out_build[out] = node;
+                out_probe[out] = w_row[i];
+                ++out;
+            }
+            continue;
+        }
+        uint32_t walk = 0;
+        while (node >= 0) {
+            assert(walk < kHJMaxChainLen);
+            const uint32_t slot = static_cast<uint32_t>(node);
+            assert(out < pairs_cap);
+            out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
+            out_probe[out] = w_row[i];
+            ++out;
+            node = build->chain_nodes[slot].next;
+            ++walk;
+        }
+    }
+    return out;
+}
+
+// Windowed OneInt64 probe. Same signature, same output sequence, same
+// pairs_cap contract as jk_probe_one_int64 — only the memory schedule differs.
+// Plain `inline` (not force-inline): it is entered once per multi-thousand-row
+// block, so a real call costs nothing and the 12 template instantiations stay
+// out of every caller.
+template <bool UseBloom, bool Unique, uint32_t W>
+inline size_t jk_probe_one_int64_mlp(const JoinBuildTyped* build,
+                                     const BoltColumn* probe_keys,
+                                     int64_t n_probe,
+                                     int32_t* BOLT_RESTRICT out_build,
+                                     int32_t* BOLT_RESTRICT out_probe,
+                                     size_t pairs_cap) noexcept {
+    assert(build != nullptr && probe_keys != nullptr);
+    assert(jk_is_int64_shape_type(probe_keys[0].type));
+    assert(!UseBloom || build->has_bloom != 0);
+    static_assert(W >= 4 && W <= kJkProbeWindowMax, "window must stay in L1");
+    const BoltColumn& pk = probe_keys[0];
+    uint64_t w_key[W];
+    uint64_t w_mix[W];
+    int32_t  w_row[W];
+    size_t out = 0;
+    for (int64_t base = 0; base < n_probe; base += static_cast<int64_t>(W)) {
+        int64_t end = base + static_cast<int64_t>(W);
+        if (end > n_probe) end = n_probe;
+        uint32_t n = jk_window_hash<UseBloom>(build, pk, base, end,
+                                              w_key, w_mix, w_row);
+        if constexpr (UseBloom) {
+            n = jk_window_bloom(build, n, w_key, w_mix, w_row);
+        }
+        jk_window_prefetch(build, n, w_mix);
+        out = jk_window_resolve<Unique>(build, n, w_key, w_mix, w_row,
+                                        out_build, out_probe, out, pairs_cap);
+    }
+    return out;
+}
+
+// Switch + tuning knobs for the windowed probe, latched ONCE. Deliberately NOT
+// a function-local static: this header sits on the probe path and a static's
+// thread-safe-init guard load has already been measured as real overhead on
+// this campaign.
+//   CHUKONU_HJ_MLP=1              -> windowed schedule (DEFAULT OFF, see below)
+//   CHUKONU_HJ_MLP_W=8|16|32|64   -> window size
+//   CHUKONU_HJ_MLP_MINROWS=<n>    -> cache-residency gate (0 = always window)
+//   CHUKONU_HJ_MLP_TRACE=1        -> latched proof that the arm was taken
+//
+// DEFAULT OFF, deliberately. At KERNEL level this is a clear, reproducible win
+// (see the residency-gate note below: 1.26-1.57x on every out-of-cache build
+// size TPC-H actually uses). At BOARD level it measured FLAT: TPC-H SF10 12w,
+// interleaved OFF/ON/ON/OFF, rows 21/21 exact, GEO 104.78 -> 106.54 ms (+1.7%
+// all-21) / -0.3% over the 19 join queries — and on that same run Q1, which
+// contains NO JOIN and therefore has a true delta of exactly zero, moved
+// +55.4%. The box (a working desktop with ~2.7 cores of Chrome) simply cannot
+// resolve the ~5% this is worth, so turning it on by default would be adopting
+// an unproven change. The campaign has already been burned twice by "obvious"
+// wins that measured flat. Flip the default only after a quiet-box interleaved
+// A/B shows the board move; the kernel harness that produced the ratios is
+// scratchpad/probe_mlp_micro.cpp.
+inline constexpr uint32_t kJkProbeWindowDefault = 32;
+
+// Cache-residency gate. Windowing BUYS nothing when the table already sits in
+// cache — there is no miss to overlap — and it costs a second pass over the
+// window plus the prefetch issues. Measured at 12 threads, 24 M probe rows,
+// paired within-rep ratios (W=32 vs scalar): 100 K entries / 1.6 MB **0.80x**
+// (a real LOSS), 1.5 M / 24 MB 1.40x, 2 M / 32 MB 1.26x, 15 M / 240 MB 1.57x.
+// So the windowed schedule engages only above a build size that cannot be
+// resident.
+// 262144 entries is ~8.9 MB of ctrl+slots, past a per-core slice of this
+// machine's L2 once 12 workers share it, and is the SAME threshold the
+// optimizer already uses to price a probe as cache-resident
+// (CHUKONU_PROBE_CACHE_ROWS in memo_build_winners.inc) — one residency story,
+// not two. Precedent: SwissTable::find_simd gates its prefetch on table
+// capacity for exactly this reason (bolt_swiss.h).
+inline constexpr uint64_t kJkMlpMinBuildRowsDefault = 262144;
+
+inline int      g_jk_mlp_enabled  = -1;
+inline uint32_t g_jk_mlp_window   = 0;
+inline uint64_t g_jk_mlp_min_rows = 0;
+// CHUKONU_HJ_MLP_TRACE=1: latched proof that the windowed arm is actually
+// TAKEN. This campaign has already shipped a fast path gated on a condition it
+// could never satisfy (the parallel spill finalize) and no test could see it —
+// a gated schedule needs a way to say out loud that it engaged.
+inline int      g_jk_mlp_trace    = 0;
+inline int      g_jk_mlp_shown    = 0;
+
+inline void jk_mlp_resolve_env() noexcept {
+    const char* e = std::getenv("CHUKONU_HJ_MLP");
+    const char* w = std::getenv("CHUKONU_HJ_MLP_W");
+    const char* m = std::getenv("CHUKONU_HJ_MLP_MINROWS");
+    const char* t = std::getenv("CHUKONU_HJ_MLP_TRACE");
+    g_jk_mlp_trace = (t != nullptr && t[0] == '1') ? 1 : 0;
+    uint32_t win = kJkProbeWindowDefault;
+    if (w != nullptr) {
+        const int v = std::atoi(w);
+        if (v == 8 || v == 16 || v == 32 || v == 64) win = static_cast<uint32_t>(v);
+    }
+    uint64_t minr = kJkMlpMinBuildRowsDefault;
+    if (m != nullptr) {
+        const long long v = std::atoll(m);
+        if (v >= 0) minr = static_cast<uint64_t>(v);
+    }
+    g_jk_mlp_window   = win;
+    g_jk_mlp_min_rows = minr;
+    // Opt-IN (see the default-OFF rationale above).
+    g_jk_mlp_enabled  = (e != nullptr && e[0] == '1') ? 1 : 0;
+}
+
+// One latched read per kernel call (thousands of rows), never per row.
+BOLT_FORCE_INLINE bool jk_mlp_enabled(const JoinBuildTyped* build) noexcept {
+    assert(build != nullptr);
+    if (g_jk_mlp_enabled < 0) jk_mlp_resolve_env();
+    assert(g_jk_mlp_window == 8 || g_jk_mlp_window == 16 ||
+           g_jk_mlp_window == 32 || g_jk_mlp_window == 64);
+    return g_jk_mlp_enabled == 1 && build->build_rows >= g_jk_mlp_min_rows;
+}
+
+// TEST hook: force the schedule within one process, so an equivalence test can
+// probe the SAME build with both paths and compare pair sequences. Sets the
+// residency gate to 0 so a small fixture still exercises the windowed path.
+inline void jk_mlp_force(bool enabled, uint32_t window) noexcept {
+    assert(window == 8 || window == 16 || window == 32 || window == 64);
+    g_jk_mlp_window   = window;
+    g_jk_mlp_min_rows = 0;
+    g_jk_mlp_enabled  = enabled ? 1 : 0;
+}
+
+// Dispatch the windowed probe on the latched window size — once per kernel
+// call (thousands of rows), never per row.
+template <bool UseBloom, bool Unique>
+inline size_t jk_probe_one_int64_windowed(const JoinBuildTyped* build,
+                                          const BoltColumn* probe_keys,
+                                          int64_t n_probe,
+                                          int32_t* BOLT_RESTRICT out_build,
+                                          int32_t* BOLT_RESTRICT out_probe,
+                                          size_t pairs_cap) noexcept {
+    assert(build != nullptr && probe_keys != nullptr);
+    assert(g_jk_mlp_window != 0);
+    if (g_jk_mlp_trace != 0 && g_jk_mlp_shown < 4) {
+        ++g_jk_mlp_shown;
+        std::fprintf(stderr, "[hjmlp] windowed probe ENGAGED: W=%u "
+                     "build_rows=%llu unique=%d bloom=%d\n", g_jk_mlp_window,
+                     static_cast<unsigned long long>(build->build_rows),
+                     Unique ? 1 : 0, UseBloom ? 1 : 0);
+    }
+    if (g_jk_mlp_window == 32) {
+        return jk_probe_one_int64_mlp<UseBloom, Unique, 32>(
+            build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+    }
+    if (g_jk_mlp_window == 64) {
+        return jk_probe_one_int64_mlp<UseBloom, Unique, 64>(
+            build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+    }
+    if (g_jk_mlp_window == 8) {
+        return jk_probe_one_int64_mlp<UseBloom, Unique, 8>(
+            build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+    }
+    return jk_probe_one_int64_mlp<UseBloom, Unique, 16>(
+        build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+}
+
 // General typed probe: composite hash + typed (Float64-canonical, Utf8
 // byte-resolved, Decimal128 raw-128-bit) equality on hit. UseBloom as above
 // (tests the composite hash, which the loop computes anyway).
@@ -882,7 +1179,24 @@ inline size_t join_probe_typed(const JoinBuildTyped* build,
     if (build->key_shape == static_cast<uint8_t>(JoinKeyShape::OneInt64)) {
         // jk_max_fanout is a 64-entry sum, paid once per multi-thousand-row
         // probe call — noise next to one probe's cache misses.
-        if (jk_max_fanout(build) == 1) {
+        const bool uniq = (jk_max_fanout(build) == 1);
+        // Windowed (memory-level-parallel) schedule; identical pair sequence.
+        // One latched read per kernel call, never per row.
+        if (jk_mlp_enabled(build)) {
+            if (uniq) {
+                return bloom
+                    ? jk_probe_one_int64_windowed<true, true>(
+                          build, probe_keys, n_probe, out_build, out_probe, pairs_cap)
+                    : jk_probe_one_int64_windowed<false, true>(
+                          build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+            }
+            return bloom
+                ? jk_probe_one_int64_windowed<true, false>(
+                      build, probe_keys, n_probe, out_build, out_probe, pairs_cap)
+                : jk_probe_one_int64_windowed<false, false>(
+                      build, probe_keys, n_probe, out_build, out_probe, pairs_cap);
+        }
+        if (uniq) {
             return bloom
                 ? jk_probe_one_int64<true, true>(build, probe_keys, n_probe,
                                                  out_build, out_probe, pairs_cap)
