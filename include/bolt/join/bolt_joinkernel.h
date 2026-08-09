@@ -1023,6 +1023,16 @@ inline constexpr uint64_t kJkMlpMinBuildRowsDefault = 262144;
 inline int      g_jk_mlp_enabled  = -1;
 inline uint32_t g_jk_mlp_window   = 0;
 inline uint64_t g_jk_mlp_min_rows = 0;
+// DEFAULT-ON RATIONALE (2026-08-09). This shipped opt-in because the only
+// board runs available were on a loaded desktop where the no-join Q1 control
+// swung +55% — a flat board there is not evidence. On a quiet box (control
+// drift +-2.3%, 3 identical passes at 4% median spread) the A/B reads:
+// TPC-H SF10 GEO 54.6 -> 53.7 ms (-1.5%), big-join subset -2.3%, Q13 -9.2%,
+// 16 of 21 queries improved (sign test p ~ 0.01), 21/21 rows exact. Smaller
+// than the ~5-7% the 25%-probe-share estimate suggested, because the
+// residency gate correctly declines the many small/cache-resident builds --
+// but real, consistent in direction, and free.
+//
 // CHUKONU_HJ_MLP_TRACE=1: latched proof that the windowed arm is actually
 // TAKEN. This campaign has already shipped a fast path gated on a condition it
 // could never satisfy (the parallel spill finalize) and no test could see it —
@@ -1048,8 +1058,9 @@ inline void jk_mlp_resolve_env() noexcept {
     }
     g_jk_mlp_window   = win;
     g_jk_mlp_min_rows = minr;
-    // Opt-IN (see the default-OFF rationale above).
-    g_jk_mlp_enabled  = (e != nullptr && e[0] == '1') ? 1 : 0;
+    // Default ON as of the 2026-08-09 quiet-box A/B (see below);
+    // CHUKONU_HJ_MLP=0 restores the scalar probe.
+    g_jk_mlp_enabled  = (e != nullptr && e[0] == '0') ? 0 : 1;
 }
 
 // One latched read per kernel call (thousands of rows), never per row.
