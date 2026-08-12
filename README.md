@@ -5,15 +5,23 @@ Chukonu, and BoltAPI. An alternative to Apache Arrow on the hot path, built
 around arena lifetime and branchless kernels; the Arrow C Data Interface is
 used at egress boundaries.
 
+**It builds on Windows out of the box.** Point MSVC at the headers and go —
+no vcpkg, no conan, no protobuf/gRPC/thrift/Boost toolchain, nothing to
+prebuild. That is the headline: getting Arrow C++ compiling on Windows is a
+multi-hour, multi-gigabyte ordeal, and Bolt skips it entirely because it is
+just C++20 standard-library headers.
+
 ## Why Not Arrow
 
-1. **Build cost.** Arrow C++ on Windows requires hundreds of GB of toolchain
-   (vcpkg, protobuf, gRPC, thrift, Boost). Bolt is a collection of headers.
+1. **Build cost — the big one.** Arrow C++ on Windows pulls in a heavy
+   toolchain (vcpkg, protobuf, gRPC, thrift, Boost) and a long prebuild. Bolt
+   is a collection of C++20 headers that MSVC compiles directly, so it works
+   on Windows out of the box with nothing to install or prebuild.
 
 2. **Runtime overhead.** Arrow uses `std::shared_ptr` for every Array, Buffer,
    and RecordBatch — an atomic refcount on every transit. Bolt uses arena
    allocation + epoch-based lifetime, avoiding that per-transit atomic
-   traffic. See the microbenchmarks below.
+   traffic.
 
 3. **No mutation path.** Arrow buffers are immutable; modifying a column
    requires a full copy. Bolt uses Venus tick-tock COW: first write copies,
