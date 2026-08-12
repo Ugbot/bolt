@@ -39,26 +39,23 @@ present.
 ## Performance
 
 Bolt is faster than Arrow for the workloads it was designed for: allocation,
-inter-operator transit, filtering, and constant-column scans. Three choices
-drive it — arena allocation instead of per-buffer malloc, epoch swaps instead
-of atomic refcounts, and selection vectors and constant folding instead of
-materializing new batches.
+inter-operator transit, filtering, and constant-column scans. The gains come
+from the architecture, not from tuning:
 
-It's early days, though, and the microbenchmarks below are vanity numbers.
-Each times one operation at a time on a single machine, and some rows compare
-different amounts of work — the filter returns a selection vector rather than a
-materialized batch, and a constant column folds a scan into a single multiply.
-They vary with hardware, compiler, and workload. Read them as evidence for the
-design choices, not as end-to-end speedups.
+- **Arena allocation instead of per-buffer malloc.** Buffers are bump-allocated
+  from a preallocated arena and freed in one pointer move, so there is no
+  per-allocation malloc/free traffic on the hot path.
+- **Epoch swaps instead of atomic refcounts.** Batches move between operators
+  by flipping an epoch index rather than incrementing a `shared_ptr` refcount,
+  removing an atomic on every transit.
+- **Selection vectors and constant folding instead of materializing batches.**
+  A filter emits a selection vector rather than a new batch, and a
+  constant-valued column collapses a scan into a single scalar operation — both
+  avoid touching every row.
 
-| Operation | Arrow / malloc | Bolt | Notes |
-|-----------|---------------|------|-------|
-| Buffer allocation (16KB) | 24,982 ns | 2.6 ns | malloc vs arena bump |
-| Inter-operator transit | 439 ns (mutex) | 17 ns (SPSC) | queue handoff |
-| Batch transit (8 operators) | 6.8 ns (shared_ptr) | 1.3 ns (epoch swap) | refcount vs swap |
-| Filter (16K rows) | 3,612 ns (materialize) | selection vector | different output, not comparable |
-| Constant column scan | 1,783 ns (iterate) | multiply | constant folds to a scalar op |
-| COW 64KB column | — | 1,941 ns (~34 GB/s) | first-write copy cost |
+It's early days, and the point above is architectural: these are the reasons
+Bolt is fast for its target workloads, not a claim about any particular
+benchmark result.
 
 ## What's in the Box
 
