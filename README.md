@@ -36,15 +36,20 @@ Interface (`ArrowSchema`/`ArrowArray`) with no libarrow link. Any Arrow consumer
 full Arrow C++ representation is available at I/O boundaries when libarrow is
 present.
 
-## Microbenchmarks
+## Performance
 
-These are targeted microbenchmarks on a single machine, each timing one
-operation in isolation. Several rows compare fundamentally different amounts
-of work rather than the same task done faster — Bolt's filter returns a
-selection vector instead of materializing a new batch, and a constant column
-folds a scan into a single multiply, so those "ratios" reflect a different
-strategy, not just a faster loop. Treat the numbers as directional; they vary
-with hardware, compiler, and workload, and are not end-to-end speedups.
+Bolt is faster than Arrow for the workloads it was designed for: allocation,
+inter-operator transit, filtering, and constant-column scans. Three choices
+drive it — arena allocation instead of per-buffer malloc, epoch swaps instead
+of atomic refcounts, and selection vectors and constant folding instead of
+materializing new batches.
+
+The microbenchmarks below quantify each choice, timed one operation at a time
+on a single machine. Numbers vary with hardware, compiler, and workload. Some
+rows compare different amounts of work — the filter returns a selection vector
+rather than a materialized batch, and a constant column folds a scan into a
+single multiply — so read them as evidence for the design, not as end-to-end
+speedups.
 
 | Operation | Arrow / malloc | Bolt | Notes |
 |-----------|---------------|------|-------|
