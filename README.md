@@ -44,12 +44,12 @@ drive it — arena allocation instead of per-buffer malloc, epoch swaps instead
 of atomic refcounts, and selection vectors and constant folding instead of
 materializing new batches.
 
-The microbenchmarks below quantify each choice, timed one operation at a time
-on a single machine. Numbers vary with hardware, compiler, and workload. Some
-rows compare different amounts of work — the filter returns a selection vector
-rather than a materialized batch, and a constant column folds a scan into a
-single multiply — so read them as evidence for the design, not as end-to-end
-speedups.
+It's early days, though, and the microbenchmarks below are vanity numbers.
+Each times one operation at a time on a single machine, and some rows compare
+different amounts of work — the filter returns a selection vector rather than a
+materialized batch, and a constant column folds a scan into a single multiply.
+They vary with hardware, compiler, and workload. Read them as evidence for the
+design choices, not as end-to-end speedups.
 
 | Operation | Arrow / malloc | Bolt | Notes |
 |-----------|---------------|------|-------|
