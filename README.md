@@ -1,18 +1,27 @@
-# Bolt — High-Performance Columnar Execution Core
+# Bolt — Columnar Execution Core
 
 Zero-dependency, header-heavy C++20 execution substrate underneath MarbleDB,
-Chukonu, and BoltAPI. Replaces Apache Arrow on the hot path with HFT-grade
-primitives; Arrow C Data Interface only at egress boundaries.
+Chukonu, and BoltAPI. An alternative to Apache Arrow on the hot path, built
+around arena lifetime and branchless kernels; the Arrow C Data Interface is
+used at egress boundaries.
+
+**It builds on Windows out of the box.** Point MSVC at the headers and go —
+no vcpkg, no conan, no protobuf/gRPC/thrift/Boost toolchain, nothing to
+prebuild. That is the headline: getting Arrow C++ compiling on Windows is a
+multi-hour, multi-gigabyte ordeal, and Bolt skips it entirely because it is
+just C++20 standard-library headers.
 
 ## Why Not Arrow
 
-1. **Build cost.** Arrow C++ on Windows requires hundreds of GB of toolchain
-   (vcpkg, protobuf, gRPC, thrift, Boost). Bolt is a collection of headers.
+1. **Build cost — the big one.** Arrow C++ on Windows pulls in a heavy
+   toolchain (vcpkg, protobuf, gRPC, thrift, Boost) and a long prebuild. Bolt
+   is a collection of C++20 headers that MSVC compiles directly, so it works
+   on Windows out of the box with nothing to install or prebuild.
 
 2. **Runtime overhead.** Arrow uses `std::shared_ptr` for every Array, Buffer,
-   and RecordBatch — atomic refcount on every transit. Bolt uses arena
-   allocation + epoch-based lifetime. Measured: **9,600× faster allocation,
-   25× faster inter-operator transit**.
+   and RecordBatch — an atomic refcount on every transit. Bolt uses arena
+   allocation + epoch-based lifetime, avoiding that per-transit atomic
+   traffic.
 
 3. **No mutation path.** Arrow buffers are immutable; modifying a column
    requires a full copy. Bolt uses Venus tick-tock COW: first write copies,
@@ -35,16 +44,26 @@ Interface (`ArrowSchema`/`ArrowArray`) with no libarrow link. Any Arrow consumer
 full Arrow C++ representation is available at I/O boundaries when libarrow is
 present.
 
-## Measured Performance
+## Performance
 
-| Metric | Arrow / malloc | Bolt | Speedup |
-|--------|---------------|------|---------|
-| Buffer allocation (16KB) | 24,982 ns | 2.6 ns | 9,600× |
-| Inter-operator transit | 439 ns (mutex) | 17 ns (SPSC) | 25× |
-| Batch transit (8 operators) | 6.8 ns (shared_ptr) | 1.3 ns (epoch swap) | 5× |
-| Filter (16K rows) | 3,612 ns (materialize) | 0.3 ns (selection vector) | 12,000× |
-| Constant column scan | 1,783 ns (iterate) | 0.7 ns (multiply) | 2,500× |
-| COW 64KB column | N/A | 1,941 ns (34 GB/s) | — |
+Bolt is faster than Arrow for the workloads it was designed for: allocation,
+inter-operator transit, filtering, and constant-column scans. The gains come
+from the architecture, not from tuning:
+
+- **Arena allocation instead of per-buffer malloc.** Buffers are bump-allocated
+  from a preallocated arena and freed in one pointer move, so there is no
+  per-allocation malloc/free traffic on the hot path.
+- **Epoch swaps instead of atomic refcounts.** Batches move between operators
+  by flipping an epoch index rather than incrementing a `shared_ptr` refcount,
+  removing an atomic on every transit.
+- **Selection vectors and constant folding instead of materializing batches.**
+  A filter emits a selection vector rather than a new batch, and a
+  constant-valued column collapses a scan into a single scalar operation — both
+  avoid touching every row.
+
+It's early days, and the point above is architectural: these are the reasons
+Bolt is fast for its target workloads, not a claim about any particular
+benchmark result.
 
 ## What's in the Box
 
@@ -81,7 +100,7 @@ build — there is no separate Bolt compile step.
 | Directory | What it provides |
 |-----------|-----------------|
 | `ingest/` | Parquet write (`bolt_parquet_write.h`), Parquet read (`bolt_parquet_read.h`), Avro (`bolt_avro.h`), Roaring bitmap (`bolt_roaring.h`), CSV, codecs (gzip/lz4/snappy/zstd) |
-| `lakehouse/` | Delta + Iceberg readers/writers; object stores (local FS, S3, Azure Blob, GCS); parallel scan + scan optimizer; REST catalog fleet: Iceberg REST (full Apache spec — OAuth2/SigV4/pagination/multi-table-commit/views/snapshots/branches-tags/stats/vended-creds), Unity Catalog, AWS Glue, Hive Metastore (Thrift), Polaris, Nessie, Gravitino |
+| `lakehouse/` | Delta + Iceberg readers/writers; object stores (local FS, S3, Azure Blob, GCS); parallel scan + scan optimizer; REST catalog fleet: Iceberg REST (OAuth2/SigV4/pagination/multi-table-commit/views/snapshots/branches-tags/stats/vended-creds), Unity Catalog, AWS Glue, Hive Metastore (Thrift), Polaris, Nessie, Gravitino |
 | `crypto/` | Noise XX (X25519 + ChaCha20-Poly1305), Ed25519 sign/verify/keygen, SigV4 |
 | `net/` | `bolt_tls.h` (OpenSSL TLS socket), `bolt_http_client.h` (outbound HTTP/HTTPS) |
 | `kernels/` | Numeric, string, temporal, hash, sort, join (Swiss/HashJoin/GroupBy), SIMD, fintech (microstructure, volatility, risk, liquidity, cross-asset) |
@@ -157,3 +176,7 @@ OpenSSL (for `net/` and `crypto/`) is the one accepted external runtime dep.
 - `../chukonu` — distributed query engine executing Bolt operator graphs
 - `../boltapi` — HTTP/WS/SSE framework using Bolt primitives
 - `docs/` — design notes, research catalogue, decision log
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
