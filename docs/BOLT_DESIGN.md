@@ -1,4 +1,4 @@
-# Project Bolt: Columnar Execution for Chukonu
+# Project Bolt: Columnar Execution
 
 ## Design Document — Arrow Performance Gap Analysis & Optimization Strategy
 

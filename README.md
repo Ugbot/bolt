@@ -1,9 +1,8 @@
 # Bolt — Columnar Execution Core
 
-Zero-dependency, header-heavy C++20 execution substrate underneath MarbleDB,
-Chukonu, and BoltAPI. An alternative to Apache Arrow on the hot path, built
-around arena lifetime and branchless kernels; the Arrow C Data Interface is
-used at egress boundaries.
+Zero-dependency, header-heavy C++20 execution substrate. An alternative to
+Apache Arrow on the hot path, built around arena lifetime and branchless
+kernels; the Arrow C Data Interface is used at egress boundaries.
 
 **It builds on Windows out of the box.** Point MSVC at the headers and go —
 no vcpkg, no conan, no protobuf/gRPC/thrift/Boost toolchain, nothing to
@@ -116,8 +115,8 @@ build — there is no separate Bolt compile step.
 
 Bolt exposes two targets: `bolt::bolt` (the main static library) and
 `bolt::ybolt` (the ycpp Yjs binding — enabled when `extern/ycpp` is present).
-Consumers guard with `if(NOT TARGET bolt::bolt)` so the shared bolt wiring in
-Gestalt2's top-level CMake prevents duplicate definitions.
+Guard with `if(NOT TARGET bolt::bolt)` if more than one component in your build
+adds Bolt, so the target is only defined once.
 
 ```cmake
 add_subdirectory(extern/bolt)
@@ -172,10 +171,14 @@ OpenSSL (for `net/` and `crypto/`) is the one accepted external runtime dep.
 
 ## Related
 
-- `../marbledb` — HTAP storage engine built on Bolt
-- `../chukonu` — distributed query engine executing Bolt operator graphs
-- `../boltapi` — HTTP/WS/SSE framework using Bolt primitives
 - `docs/` — design notes, research catalogue, decision log
+
+Bolt was extracted from a set of sibling projects — MarbleDB (storage engine),
+Chukonu (distributed query engine), BoltAPI (HTTP/WS/SSE framework), and
+BoltLLM (inference). **None of those are publicly available.** They are named
+throughout the docs and in some source comments because they are the workloads
+that motivated a given design decision; treat those mentions as context for
+*why* something is the way it is, not as code you can go and read.
 
 ## License
 

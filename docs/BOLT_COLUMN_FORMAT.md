@@ -303,7 +303,10 @@ Array (no stats)               →  Flat column + compute stats in one pass
 
 ---
 
-## 4. Integration with MarbleDB
+## 4. Integration with an LSM storage engine
+
+Worked against MarbleDB (not publicly available); the same alignment applies to
+any LSM engine that keeps per-block column metadata.
 
 MarbleDB's LSM storage already has column-level metadata in its SSTable format.
 The BoltColumn stats block should align with MarbleDB's metadata so that:

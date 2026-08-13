@@ -3,6 +3,15 @@
 Start with [`BOLT_PROJECT_MAP.md`](BOLT_PROJECT_MAP.md) for the file map and
 design principles, then follow whichever track below matches what you need.
 
+> **A note on the project names you'll see.** Bolt was extracted from a set of
+> sibling projects: **MarbleDB** (storage engine), **Chukonu** (distributed
+> query engine), **BoltAPI** (HTTP/WS/SSE framework), **BoltLLM** (inference),
+> and **Gestalt** (the engine several of these grew out of). **None of them are
+> publicly available.** They appear throughout these docs — and in some source
+> comments — because they are the workloads that drove a given decision. Read
+> those mentions as the reason a design choice was made, not as code or repos
+> you can go and look at. Bolt itself depends on none of them.
+
 ## Architecture and design
 
 | Document | What it covers |

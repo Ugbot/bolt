@@ -175,10 +175,10 @@ Ideas come from five sources, all documented with references:
 | **Pirk et al. (CWI/MIT/Imperial)** | Predicated partitioning, micro-adaptive kernels, cache-conscious layout, composable kernel algebra, LightSaber parallel aggregation |
 | **Chronicle Queue / LMAX** | Lock-free SPSC/MPSC, cache-line padding, pre-allocated ring buffers |
 
-## Dependencies on Bolt (within Chukonu)
+## Adoption path
 
-Bolt is currently standalone — nothing depends on it yet. Integration is
-incremental. The migration path:
+Bolt is designed to be adopted incrementally by an Arrow-based engine rather
+than in one cutover. The path the original consumers followed:
 
 ```
 Phase 1 (current):  Bolt headers exist alongside Arrow-based operators
@@ -191,12 +191,11 @@ Phase 5:            Own Parquet reader, Bolt Wire Protocol, full independence
 ## Quick Start
 
 ```bash
-# Everything compiles as part of the Chukonu build
-cd chukonu/build
-cmake .. -DCHUKONO_BUILD_TESTS=ON
-make test_bolt_primitives
-./test_bolt_primitives     # 25+ tests, zero Arrow dependency
-
-make bench_bolt
-./bench_bolt               # Arena, channel, epoch, COW benchmarks
+cmake -S . -B build -DBOLT_BUILD_TESTS=ON -DBOLT_BUILD_BENCHMARKS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
+
+Presets: `release`, `debug`, `msvc`, `ninja-msvc`, `clang-cl`. GTest is fetched
+via `FetchContent` when not found locally, so the build is self-contained on
+Windows without vcpkg.
