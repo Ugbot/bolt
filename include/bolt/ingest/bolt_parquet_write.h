@@ -123,6 +123,35 @@ bool parquet_write_row_group(ParquetWriter* w,
 // Always safe to call exactly once per successful open.
 bool parquet_write_close(ParquetWriter* w) noexcept;
 
+// ---------------------------------------------------------------------------
+// Memory sink — the same writer with no filesystem involved.
+//
+// For a producer that SYNTHESIZES parquet per request (serving a file that was
+// never stored), a temp file is the whole cost: two syscall-heavy copies and a
+// path to clean up, for bytes that are about to be written to a socket.
+//
+// The bytes are identical to the file path's. Every offset in the footer comes
+// from `file_pos`, which counts bytes rather than asking the sink where it is,
+// so the sink choice cannot change the output. `test_bolt_parquet_write_mem`
+// pins that as an equality, not an assumption.
+// ---------------------------------------------------------------------------
+
+// As `parquet_write_open`, accumulating into memory. Same validation, same
+// "PAR1" prologue. Finish with `parquet_write_close_mem`, NOT
+// `parquet_write_close` (which would drop the bytes on the floor).
+ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts) noexcept;
+
+// Finish the file and hand back its bytes, copied into `arena` so they outlive
+// the writer. Deletes the writer in every case, success or not — like
+// `parquet_write_close`, exactly one call per successful open.
+//
+// Returns false (and writes nothing) if `w` came from `parquet_write_open`:
+// those bytes already went to disk, and an empty buffer would be
+// indistinguishable from a valid zero-row file.
+bool parquet_write_close_mem(ParquetWriter* w, Arena* arena,
+                             const std::uint8_t** out,
+                             std::uint64_t* out_len) noexcept;
+
 }  // namespace parquet
 }  // namespace ingest
 }  // namespace bolt

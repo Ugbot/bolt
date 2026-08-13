@@ -1002,6 +1002,15 @@ target_link_libraries(test_bolt_parquet_write
 bolt_apply_hardening(test_bolt_parquet_write)
 add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
 
+# Phase 2 — the parquet MEMORY sink. Asserts byte-EQUALITY with the file sink
+# (a "does it parse" test cannot catch a sink that reorders or drops a region,
+# since parquet is read through its footer offsets).
+add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
+target_link_libraries(test_bolt_parquet_write_mem
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_mem)
+add_test(NAME test_bolt_parquet_write_mem COMMAND test_bolt_parquet_write_mem)
+
 # G2FEAT-46 — Parquet type conformance: TIMESTAMP (millis/micros/nanos),
 # TIME, INT96 legacy timestamp, INT32-DECIMAL, un/signed IntType mapping +
 # a Timestamp writer->reader round-trip.
