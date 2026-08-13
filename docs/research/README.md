@@ -108,7 +108,8 @@ Comparative analysis (validates the choices above):
   separation, circuit breakers. We adopt the connector model
   conceptually; skip the DSL.
 - [kdb-questdb-tick-models.md](kdb-questdb-tick-models.md) — the
-  user's explicit perf anchors. kdb+ tickerplant + RDB + HDB chain;
+  reference points Bolt's tick workloads are measured against. kdb+
+  tickerplant + RDB + HDB chain;
   QuestDB time-partitioned column files, symbol type, O3 ingest,
   JIT filters. The continuous-query shape these model is the same
   shape bolt::dataflow's push dispatch produces.

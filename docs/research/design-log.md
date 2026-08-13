@@ -11,10 +11,10 @@ what we kept and why**.
 
 ---
 
-## int8-activation IDOT GEMV — kernels moved into bolt (BLLM-14/15)
+## int8-activation IDOT GEMV — kernels moved into bolt
 
-**2026-07-17 · context.** `bolt::compute`'s matmul CPU tier (BLLM-13,
-`bolt_compute.h`) shipped as a WEIGHT-GENERIC SCALAR GEMV: F32 direct,
+**2026-07-17 · context.** `bolt::compute`'s matmul CPU tier
+(`bolt_compute.h`) shipped as a WEIGHT-GENERIC SCALAR GEMV: F32 direct,
 Int8/Int4/Int2 dequantized on the fly, dotted against a PLAIN FLOAT
 activation (`detail::matmul_row_dot_f32`). A separate, much faster shape
 existed only in boltllm: an int8-ACTIVATION GEMV where BOTH operands are
@@ -22,13 +22,13 @@ int8/int4-quantized, dotted in pure-integer AVX2 (VPMADDUBSW sign trick) /
 AVX-512VNNI (VPDPBUSD) arithmetic with a single final float rescale.
 
 **Tried / measured.** The int8-activation kernels are ~19-21x faster than a
-scalar float dot (boltllm BLLM-16: 142-155 GFLOPS). Originally they stayed
+scalar float dot (measured downstream at 142-155 GFLOPS). Originally they stayed
 OUT of bolt because they solve a *different* problem: they consume an
 already-int8-quantized activation, and `bolt::Tensor` had no
 "pre-quantized activation" concept — nothing bolt-native could produce their
 input. The weight-generic scalar path was the natural bolt-level
 generalization; the int8-activation tier was left as a documented open seam
-(`bolt_compute.h` architectural choice #1, "SEAM for BLLM-14 · TODO"). That
+(`bolt_compute.h` architectural choice #1, a documented "SEAM · TODO"). That
 same float-activation-vs-int8-activation split reappeared INDEPENDENTLY on
 the GPU side (a caller wanting the GPU int8-activation tier uses a separate
 device kernel family, not the float-activation one) — evidence the split is

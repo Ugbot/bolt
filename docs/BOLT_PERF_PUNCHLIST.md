@@ -6,15 +6,12 @@ design-doc gap, or a referenced-but-unbuilt primitive. We lock all of these
 down *before* starting ingest/watermarks, bitemporal, marbledb storage, or
 the chukonu planner.
 
-Plan blueprint: [`plans/to-bake-this-into-validated-thunder.md`](../../../../Users/Capta/.claude/plans/to-bake-this-into-validated-thunder.md)
-(local to the author's machine — content mirrored here).
-
 ## Scope / non-scope
 
 **In scope** — P0 hot-path items, P1 table-stakes items (minus the ingest
-cluster), P2 items the user explicitly wants done (huge pages, f32 SIMD,
-merge-join, auto-fusion primitives), and the two live code TODOs (dict
-validity, Windows >64-core pinning).
+cluster), P2 items (huge pages, f32 SIMD, merge-join, auto-fusion
+primitives), and the two live code TODOs (dict validity, Windows >64-core
+pinning).
 
 **Out of scope (deferred to the ingest / storage wave)**
 - O3 out-of-order tick ingest + watermarks + late-data handling

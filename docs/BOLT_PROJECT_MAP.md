@@ -2,20 +2,21 @@
 
 ## Overview
 
-Bolt is a zero-dependency columnar execution library embedded inside Chukonu.
-It replaces Apache Arrow's C++ runtime on the hot path while maintaining
-Arrow format compatibility at I/O boundaries.
+Bolt is a zero-dependency columnar execution library. It is an alternative to
+Apache Arrow's C++ runtime on the hot path, and keeps Arrow format
+compatibility at I/O boundaries.
 
-Total: ~2,600 lines of header-only C++20. Compiles in seconds.
+Header-only C++20, built directly by the consumer — including MSVC on
+Windows, with no package manager or prebuilt dependency.
 
 ## Directory Layout
 
 ```
-chukonu/
+bolt/
 ├── include/bolt/           ← Headers (the library)
 │   ├── bolt_types.h                   Type enum, StringView, Schema, Arrow C Data ABI
-│   ├── bolt_arena.h                   Per-thread bump allocator (9,600x faster than malloc)
-│   ├── bolt_channel.h                 Lock-free SPSC/MPSC ring buffers (25x faster than mutex)
+│   ├── bolt_arena.h                   Per-thread bump allocator
+│   ├── bolt_channel.h                 Lock-free SPSC/MPSC ring buffers
 │   ├── bolt_column.h                  Adaptive column + BoltBatch + BitmapIndex
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
 │   ├── bolt_scheduler.h               Task ring, worker pool, phase barriers
