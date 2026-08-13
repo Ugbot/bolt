@@ -14,7 +14,10 @@
 // iceberg_compaction.cpp, iceberg_expire.cpp, iceberg_branches_tags.cpp,
 // iceberg_view.cpp, iceberg_delete_writer.cpp) provide the externally-listed
 // per-feature entry points; this TU owns the shared TableHandle/AppendHandle
-// definitions + the JSON metadata + manifest writers.
+// definitions + the JSON metadata writer. Manifests and manifest lists are
+// AVRO (iceberg_manifest_writer.cpp) — that is the only form Iceberg defines,
+// and the JSON ones this file used to emit were unreadable by every real
+// reader.
 //
 // All commits go through put_if_absent emulated atop ObjectStore (head_object
 // then put if absent). Bounded everything: 256 manifests/snapshot,
@@ -35,6 +38,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
+#include "bolt/lakehouse/iceberg/manifest_avro.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
 #include "bolt/lakehouse/object_store.h"
@@ -520,71 +524,38 @@ bool persist_metadata(TableHandle* th) noexcept {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Manifest list + manifest writers (JSON).
+// Table schema JSON — the `schema` metadata key of a manifest OCF.
+//
+// The manifest and manifest-list BODIES are Avro (manifest_avro.h); the only
+// JSON left on the write path is this one string, which Iceberg requires the
+// manifest to carry so a reader can bind the data files' field ids. The JSON
+// manifest emitters that used to live here are gone: what they produced was
+// not a manifest, and nothing else called them.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-bool emit_manifest_json(Arena* a, const DataFileRef* files, uint32_t n,
-                        int64_t snap_id, const uint8_t** out,
-                        uint64_t* out_len) noexcept {
-    assert(a != nullptr && files != nullptr);
-    Buf b;
-    if (!buf_init(&b, a, 256u * 1024u)) return false;
-    if (!buf_put(&b, "[")) return false;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (i > 0 && !buf_put(&b, ",")) return false;
-        const DataFileRef& f = files[i];
-        const int content = static_cast<int>(f.content);
-        if (!buf_fmt(&b, "{\"status\":%d,\"snapshot_id\":%lld,"
-                     "\"data_file\":{\"content\":%d,\"file_path\":\"%s\","
-                     "\"file_format\":\"PARQUET\","
-                     "\"partition\":{},"
-                     "\"record_count\":%lld,\"file_size_in_bytes\":%lld,"
-                     "\"lower_bounds\":{},\"upper_bounds\":{},"
-                     "\"null_value_counts\":{},\"equality_ids\":[",
-                     static_cast<int>(f.status),
-                     static_cast<long long>(snap_id),
-                     content, f.file_path,
-                     static_cast<long long>(f.stats.record_count),
-                     static_cast<long long>(f.stats.file_size_in_bytes)))
-            return false;
-        for (uint32_t k = 0; k < f.n_equality_ids; ++k) {
-            if (k > 0 && !buf_put(&b, ",")) return false;
-            if (!buf_fmt(&b, "%d", f.equality_ids[k])) return false;
-        }
-        if (!buf_put(&b, "]}}")) return false;
-    }
-    if (!buf_put(&b, "]")) return false;
-    *out = b.data;
-    *out_len = b.len;
-    return true;
-}
-
-bool emit_manifest_list_json(Arena* a, const ManifestListEntry* mle,
-                              uint32_t n, const uint8_t** out,
-                              uint64_t* out_len) noexcept {
-    assert(a != nullptr && mle != nullptr);
+bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
+                      uint64_t* out_len) noexcept {
+    assert(a != nullptr && s != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    if (s->n_fields > kIcebergMaxFieldsPerSchema) return false;
     Buf b;
     if (!buf_init(&b, a, 64u * 1024u)) return false;
-    if (!buf_put(&b, "[")) return false;
-    for (uint32_t i = 0; i < n; ++i) {
+    if (!buf_fmt(&b, "{\"type\":\"struct\",\"schema-id\":%d,\"fields\":[",
+                 s->schema_id)) return false;
+    for (uint32_t i = 0; i < s->n_fields; ++i) {     // bounded by n_fields
         if (i > 0 && !buf_put(&b, ",")) return false;
-        if (!buf_fmt(&b, "{\"manifest_path\":\"%s\","
-                     "\"manifest_length\":%lld,"
-                     "\"partition_spec_id\":%d,\"content\":%d,"
-                     "\"added_snapshot_id\":%lld,"
-                     "\"added_files_count\":%lld}",
-                     mle[i].manifest_path,
-                     static_cast<long long>(mle[i].manifest_length),
-                     mle[i].partition_spec_id,
-                     static_cast<int>(mle[i].content),
-                     static_cast<long long>(mle[i].added_snapshot_id),
-                     static_cast<long long>(mle[i].added_files_count)))
-            return false;
+        const SchemaField& f = s->fields[i];
+        if (!buf_fmt(&b, "{\"id\":%d,", f.id)) return false;
+        if (!buf_kv_str(&b, "name", f.name, true)) return false;
+        if (!buf_fmt(&b, "\"required\":%s,",
+                     f.required ? "true" : "false")) return false;
+        if (!buf_kv_str(&b, "type", f.type, false)) return false;
+        if (!buf_put(&b, "}")) return false;
     }
-    if (!buf_put(&b, "]")) return false;
-    *out = b.data;
+    if (!buf_put(&b, "]}")) return false;
+    *out     = b.data;
     *out_len = b.len;
     return true;
 }
@@ -750,21 +721,48 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
 bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                       SnapshotOp op) noexcept {
     assert(th != nullptr);
+    assert(th->arena != nullptr && th->os != nullptr);
     if (th->meta.n_snapshots >= kIcebergMaxSnapshots) return false;
+    if (files == nullptr && nf != 0) return false;
+
+    // A manifest for a PARTITIONED table must carry each data file's partition
+    // tuple, whose shape comes from the spec. `manifest_write_avro` emits the
+    // unpartitioned schema only, and a manifest whose partition tuple does not
+    // match its spec parses cleanly and then LIES about where the rows are —
+    // a reader prunes on it and silently drops data. Refuse the commit; there
+    // is no correct fallback, and the old JSON one was not a manifest at all.
+    const PartitionSpec* spec = metadata_spec(&th->meta,
+                                              th->meta.current_spec_id);
+    if (spec != nullptr && spec->n_fields != 0) return false;
+
     const int64_t parent = th->meta.current_snapshot_id;
     const int64_t snap_id = now_ms() * 1000 +
         static_cast<int64_t>(th->meta.n_snapshots);
+    // The manifest records the sequence number the snapshot is about to take,
+    // so it is computed here and asserted equal to the one committed below.
+    const int64_t seq = th->meta.last_sequence_number + 1;
 
-    // Manifest body.
+    // The table schema, carried in the manifest's `schema` metadata key.
+    const Schema* sch = metadata_current_schema(&th->meta);
+    if (sch == nullptr) return false;
+    const uint8_t* sch_json = nullptr; uint64_t sch_len = 0;
+    if (!emit_schema_json(th->arena, sch, &sch_json, &sch_len)) return false;
+    if (sch_len == 0) return false;
+    assert(sch_len <= 0xFFFFFFFFull);   // Buf::len is uint32_t: cast is safe
+
+    // Manifest body — Avro OCF, the only form Iceberg defines.
     const uint8_t* manifest_body = nullptr; uint64_t manifest_len = 0;
-    if (!emit_manifest_json(th->arena, files, nf, snap_id,
+    if (!manifest_write_avro(files, nf, snap_id, seq,
+                             reinterpret_cast<const char*>(sch_json),
+                             static_cast<uint32_t>(sch_len),
+                             th->meta.current_spec_id, th->arena,
                              &manifest_body, &manifest_len)) return false;
     char mrel[128];
-    std::snprintf(mrel, sizeof(mrel), "metadata/manifest-%lld.json",
+    std::snprintf(mrel, sizeof(mrel), "metadata/manifest-%lld.avro",
                   static_cast<long long>(snap_id));
     if (!commit_object(th->os, mrel, manifest_body, manifest_len)) return false;
 
-    // Manifest-list body.
+    // Manifest-list body — Avro OCF likewise.
     ManifestListEntry mle{};
     mle.partition_spec_id = th->meta.current_spec_id;
     mle.content           = FileContent::kData;
@@ -773,7 +771,8 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     mle.added_files_count = nf;
     std::strncpy(mle.manifest_path, mrel, sizeof(mle.manifest_path) - 1u);
     const uint8_t* mlb = nullptr; uint64_t mll = 0;
-    if (!emit_manifest_list_json(th->arena, &mle, 1, &mlb, &mll)) return false;
+    if (!manifest_list_write_avro(&mle, 1, snap_id, seq, th->arena, &mlb, &mll))
+        return false;
     char mlrel[128];
     std::snprintf(mlrel, sizeof(mlrel), "metadata/snap-%lld.avro",
                   static_cast<long long>(snap_id));
@@ -786,6 +785,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     s.parent_snapshot_id = parent;
     s.timestamp_ms       = now_ms();
     s.sequence_number    = ++th->meta.last_sequence_number;
+    assert(s.sequence_number == seq);   // what the manifests were written with
     s.op                 = op;
     std::strncpy(s.manifest_list, mlrel, sizeof(s.manifest_list) - 1u);
     th->meta.current_snapshot_id = snap_id;

@@ -4,6 +4,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
+#include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/scan.h"
 #include "bolt/lakehouse/iceberg/view.h"
 #include "bolt/lakehouse/iceberg/writer.h"
@@ -213,4 +214,132 @@ TEST(IcebergWrite, RemoveOrphansDryRun) {
     char out[32][512];
     uint32_t n = 0;
     EXPECT_TRUE(table_remove_orphans(th, 0u, true, out, 32u, &n));
+}
+
+// ---------------------------------------------------------------------------
+// The manifests a commit actually LEAVES ON DISK.
+//
+// Iceberg defines a manifest as an Avro object container file. This writer
+// used to emit JSON with a `.json` name, which every real reader (pyiceberg,
+// Spark, Trino, DuckDB) rejects — and no test noticed, because the tests above
+// assert on the in-memory `Metadata` the writer keeps, never on the bytes.
+// These read the committed objects BACK OFF THE STORE and put them through
+// `manifest_parse_avro` / `manifest_list_parse_avro`, which were themselves
+// verified against pyiceberg 0.11.1 output (test_bolt_iceberg_real_avro.cpp).
+// Every assertion is a VALUE carried through, never a count, so a writer that
+// drops or misorders a field cannot pass.
+// ---------------------------------------------------------------------------
+
+TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
+    bolt::Arena arena;
+    const std::string root = unique_root("avromanifest");
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    Schema sch = make_schema_i64_utf8();
+    PartitionSpec spec{}; spec.spec_id = 0; spec.n_fields = 0;
+    SortOrder sort{}; sort.order_id = 0; sort.n_fields = 0;
+    WriteOptions wo; write_options_init(&wo);
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, &spec,
+                              &sort, &wo));
+
+    bolt::BoltBatch b0{};
+    make_batch(&arena, &b0, 0, 7);
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, th));
+    ASSERT_TRUE(append_write(ah, &b0));
+    ASSERT_TRUE(append_commit(ah));
+    append_close(ah);
+
+    const Metadata* m = table_metadata(th);
+    ASSERT_EQ(m->n_snapshots, 1u);
+    const Snapshot& snap = m->snapshots[0];
+
+    // 1. The manifest LIST the snapshot points at is a real OCF.
+    const uint8_t* mlb = nullptr; uint64_t mll = 0;
+    ASSERT_EQ(os_get(&os, snap.manifest_list, &arena, &mlb, &mll), kOsOk);
+    ASSERT_GE(mll, 4u);
+    EXPECT_EQ(std::memcmp(mlb, "Obj\x01", 4), 0) << "manifest list is not Avro";
+
+    ManifestListEntry mle[8]{};
+    uint32_t n_mle = 0;
+    ASSERT_TRUE(manifest_list_parse_avro(mlb, mll, &arena, mle, 8, &n_mle));
+    ASSERT_EQ(n_mle, 1u);
+    EXPECT_EQ(mle[0].added_snapshot_id, snap.snapshot_id);
+    EXPECT_EQ(mle[0].added_files_count, 1);
+    EXPECT_EQ(mle[0].partition_spec_id, 0);
+
+    // 2. The MANIFEST it names is a real OCF whose entry describes the file
+    //    the append just wrote — including the two fields readers trust
+    //    without verifying: record_count and file_size_in_bytes.
+    const uint8_t* mb = nullptr; uint64_t mbl = 0;
+    ASSERT_EQ(os_get(&os, mle[0].manifest_path, &arena, &mb, &mbl), kOsOk);
+    ASSERT_GE(mbl, 4u);
+    EXPECT_EQ(std::memcmp(mb, "Obj\x01", 4), 0) << "manifest is not Avro";
+    // The length the list advertises must be the manifest's real length, or a
+    // reader that ranged-reads it gets a truncated file.
+    EXPECT_EQ(mle[0].manifest_length, static_cast<int64_t>(mbl));
+
+    DataFileRef df[8]{};
+    uint32_t n_df = 0;
+    ASSERT_TRUE(manifest_parse_avro(mb, mbl, &arena, /*default_spec_id=*/0,
+                                    df, 8, &n_df));
+    ASSERT_EQ(n_df, 1u);
+    EXPECT_EQ(df[0].status, ManifestStatus::kAdded);
+    EXPECT_EQ(df[0].content, FileContent::kData);
+    EXPECT_EQ(df[0].snapshot_id, snap.snapshot_id);
+    EXPECT_EQ(df[0].stats.record_count, 7);        // the batch's real row count
+    EXPECT_GT(df[0].stats.file_size_in_bytes, 0);
+    EXPECT_EQ(df[0].n_partition, 0u);
+
+    // The data file the manifest names must exist at the size it claims.
+    ObjectMeta dm{};
+    ASSERT_EQ(os_head(&os, df[0].file_path, &dm), kOsOk);
+    EXPECT_TRUE(dm.exists);
+    EXPECT_EQ(df[0].stats.file_size_in_bytes, static_cast<int64_t>(dm.size));
+
+    // 3. Nothing was left behind under the old `.json` manifest name — a
+    //    lingering one would be a reader's first match and undo the fix.
+    char stale[256];
+    std::snprintf(stale, sizeof(stale), "metadata/manifest-%lld.json",
+                  static_cast<long long>(snap.snapshot_id));
+    ObjectMeta sm{};
+    (void)os_head(&os, stale, &sm);
+    EXPECT_FALSE(sm.exists);
+}
+
+// A partitioned table cannot be committed by this writer: the manifest schema
+// it emits declares no partition tuple, so the manifest would parse and then
+// report every file as unpartitioned — a reader prunes on that and silently
+// drops rows. Fail the commit; do not write something wrong.
+TEST(IcebergWrite, PartitionedCommitIsRefusedNotFaked) {
+    bolt::Arena arena;
+    const std::string root = unique_root("parted");
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    Schema sch = make_schema_i64_utf8();
+    PartitionSpec spec{};
+    spec.spec_id  = 0;
+    spec.n_fields = 1;
+    spec.fields[0].source_id = 1;
+    spec.fields[0].field_id  = 1000;
+    spec.fields[0].transform.kind = TransformKind::kIdentity;
+    std::strncpy(spec.fields[0].name, "id", sizeof(spec.fields[0].name) - 1u);
+    SortOrder sort{}; sort.order_id = 0; sort.n_fields = 0;
+    WriteOptions wo; write_options_init(&wo);
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, &spec,
+                              &sort, &wo));
+
+    bolt::BoltBatch b0{};
+    make_batch(&arena, &b0, 0, 4);
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, th));
+    ASSERT_TRUE(append_write(ah, &b0));
+    EXPECT_FALSE(append_commit(ah));
+    append_close(ah);
+
+    // No snapshot was published, so no reader can ever see a wrong manifest.
+    EXPECT_EQ(table_metadata(th)->n_snapshots, 0u);
+    EXPECT_EQ(table_metadata(th)->current_snapshot_id, -1);
 }

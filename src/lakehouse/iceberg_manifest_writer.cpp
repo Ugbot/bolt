@@ -1,11 +1,13 @@
 // bolt/lakehouse/iceberg_manifest_writer.cpp — W5 manifest + manifest-list
 // emitters.
 //
-// JSON form: the emitters (emit_manifest_json / emit_manifest_list_json) live
-// in iceberg_writer.cpp's anonymous namespace because they are called there.
-//
-// AVRO form (this file): the writers declared in manifest_avro.h — the mirror
-// of manifest.h's `manifest_parse_avro` / `manifest_list_parse_avro`.
+// The writers declared in manifest_avro.h — the mirror of manifest.h's
+// `manifest_parse_avro` / `manifest_list_parse_avro`, and what the write path
+// in iceberg_writer.cpp (`publish_snapshot`) commits. There is no JSON manifest
+// writer any more: Iceberg defines manifests as Avro only, so the JSON ones
+// that used to live in iceberg_writer.cpp produced files no real reader would
+// open. The JSON manifest PARSERS stay — W4 fixtures are JSON, and the scan
+// path sniffs the OCF magic to choose.
 //
 // The row encoding rides `bolt::ingest::avro_write_ex`. That is possible
 // because of one property of the format: **an Avro record's fields are inline
@@ -186,7 +188,21 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         put_str(&v[i++], kFileFormat);
         put_long(&v[i++], d->stats.record_count);
         put_long(&v[i++], d->stats.file_size_in_bytes);
-        for (uint32_t k = 0; k < 9; ++k) put_null(&v[i++]);  // stats + key_md
+        // SEVEN, not nine: column_sizes, value_counts, null_value_counts,
+        // nan_value_counts, lower_bounds, upper_bounds, key_metadata — the
+        // six stats maps plus key_metadata, exactly as build_entry_fields
+        // declares them. Writing nine put 21 values into a 19-wide row: each
+        // row spilled two values into the next row's slot (masked, because the
+        // next row promptly overwrote them) and the LAST row wrote one element
+        // past `rows`, whose `+ 1u` slack was hiding a real heap overflow.
+        //
+        // Invisible in a stock CMake Release, which defines NDEBUG and
+        // compiles the assert below away. THIS repo's Release does not
+        // (`CMAKE_CXX_FLAGS_RELEASE=-O3 -g`), so the assert is live code and
+        // fires — which is how registering these tests here (G2ICE-4) surfaced
+        // it. The bytes on the wire were always correct, because the encoder
+        // walks the 19 SCHEMA fields and never read the two extra values.
+        for (uint32_t k = 0; k < 7; ++k) put_null(&v[i++]);  // 6 stats + key_md
         put_null(&v[i++]);                                   // split_offsets
         put_null(&v[i++]);                                   // equality_ids
         put_null(&v[i++]);                                   // sort_order_id
