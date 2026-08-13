@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace bolt {
@@ -152,6 +153,44 @@ Transform transform_parse(const char* s, uint32_t len) noexcept {
         }
     }
     return t;
+}
+
+uint32_t transform_format(Transform t, char* dst, uint32_t cap) noexcept {
+    assert(dst != nullptr);
+    assert(cap > 0u);
+    if (dst == nullptr || cap == 0u) return 0u;
+
+    // Parameterless kinds: one memcpy. kUnknown deliberately has NO spelling --
+    // emitting a placeholder would round-trip through transform_parse as a
+    // DIFFERENT transform, silently changing what the spec says.
+    const char* name = nullptr;
+    switch (t.kind) {
+        case TransformKind::kIdentity: name = "identity"; break;
+        case TransformKind::kYear:     name = "year";     break;
+        case TransformKind::kMonth:    name = "month";    break;
+        case TransformKind::kDay:      name = "day";      break;
+        case TransformKind::kHour:     name = "hour";     break;
+        case TransformKind::kVoid:     name = "void";     break;
+        case TransformKind::kBucket:   break;
+        case TransformKind::kTruncate: break;
+        case TransformKind::kUnknown:  return 0u;
+    }
+    if (name != nullptr) {
+        const uint32_t n = static_cast<uint32_t>(std::strlen(name));
+        if (n + 1u > cap) return 0u;
+        std::memcpy(dst, name, n + 1u);
+        return n;
+    }
+
+    const char* base = (t.kind == TransformKind::kBucket) ? "bucket" : "truncate";
+    // A negative or zero parameter is not representable: bucket[0] would be a
+    // division by zero and truncate[0] a no-op that no reader expects.
+    if (t.param <= 0) return 0u;
+    char tmp[kIcebergMaxTransformName];
+    const int n = std::snprintf(tmp, sizeof(tmp), "%s[%d]", base, t.param);
+    if (n <= 0 || static_cast<uint32_t>(n) + 1u > cap) return 0u;
+    std::memcpy(dst, tmp, static_cast<uint32_t>(n) + 1u);
+    return static_cast<uint32_t>(n);
 }
 
 }  // namespace iceberg

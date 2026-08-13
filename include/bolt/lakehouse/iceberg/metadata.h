@@ -73,6 +73,24 @@ namespace iceberg {
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                     Metadata* out) noexcept;
 const Schema* metadata_current_schema(const Metadata* m) noexcept;
+
+// Serialize a Metadata POD to Iceberg's `metadata.json`, allocated in `a`.
+// The inverse of `metadata_parse`. Previously defined but never declared in a
+// header, so the only way to reach it was an extern declaration at the call
+// site -- which is why a caller wanting to serve metadata over REST (where the
+// spec carries it INLINE in LoadTableResult, never as a fetched file) had no
+// supported way to produce it.
+//
+// `last-column-id` is derived from the schemas. Emitting fails rather than
+// falling back if a partition transform cannot be represented.
+bool metadata_json_emit_plain(const Metadata* m, Arena* a,
+                              const uint8_t** out, uint64_t* out_len) noexcept;
+
+// Derive the RFC 4122 UUID this writer assigns to a table at `loc`. Stable for
+// a given location (the same table always gets the same id) and distinct
+// between locations. `cap` must be >= 37.
+void table_uuid_from_location(const char* loc, char* dst,
+                              uint32_t cap) noexcept;
 const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept;
 
 }  // namespace iceberg
