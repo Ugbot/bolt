@@ -1205,15 +1205,20 @@ uint64_t avro_write_max_len(const AvroField* fields, uint32_t n_fields,
            16u + 64u;
 }
 
-bool avro_write(const AvroField* fields, uint32_t n_fields,
-                const AvroValue* rows, int64_t n_rows,
-                const uint8_t sync[kAvroSyncLen],
-                uint8_t* dst, uint64_t* dst_len) noexcept {
+bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
+                   const AvroValue* rows, int64_t n_rows,
+                   const char* schema_json, uint32_t schema_len,
+                   const AvroMetaKV* extra_meta, uint32_t n_extra_meta,
+                   const uint8_t sync[kAvroSyncLen],
+                   uint8_t* dst, uint64_t* dst_len) noexcept {
     assert(fields != nullptr);
     assert(dst_len != nullptr);
+    assert(n_extra_meta == 0 || extra_meta != nullptr);
     if (dst == nullptr || dst_len == nullptr) return false;
     if (n_fields == 0 || n_fields > kAvroMaxFields) return false;
     if (n_rows < 0) return false;
+    if (n_extra_meta != 0 && extra_meta == nullptr) return false;
+    if (n_extra_meta > kAvroMaxMetaEntries) return false;
     const uint64_t cap = *dst_len;
     uint64_t o = 0;
 
@@ -1222,17 +1227,38 @@ bool avro_write(const AvroField* fields, uint32_t n_fields,
     if (!room(kAvroMagicLen)) return false;
     std::memcpy(dst + o, kMagic, kAvroMagicLen); o += kAvroMagicLen;
 
-    // Metadata map: 2 entries (avro.schema, avro.codec).
-    char schema[4096];
-    const uint32_t slen = build_schema_json(fields, n_fields, schema,
-                                            sizeof(schema));
+    // Metadata map: avro.schema, avro.codec, plus the caller's entries.
+    // The generated schema goes in a bounded local buffer; a caller-supplied
+    // one is referenced in place, because a real Iceberg manifest_entry schema
+    // (~3.8 KB minimal) all but fills that buffer on its own.
+    char gen_schema[4096];
+    const char* schema = schema_json;
+    uint32_t    slen   = schema_len;
+    if (schema == nullptr) {
+        slen = build_schema_json(fields, n_fields, gen_schema,
+                                 sizeof(gen_schema));
+        if (slen == 0) return false;
+        schema = gen_schema;
+    }
     if (slen == 0) return false;
     if (!room(64u + slen)) return false;
-    o += write_long(2, dst + o);                     // 2 map entries
+    o += write_long(2 + static_cast<int64_t>(n_extra_meta), dst + o);
     o += enc_bytes(dst + o, reinterpret_cast<const uint8_t*>("avro.schema"), 11);
     o += enc_bytes(dst + o, reinterpret_cast<const uint8_t*>(schema), slen);
     o += enc_bytes(dst + o, reinterpret_cast<const uint8_t*>("avro.codec"), 10);
     o += enc_bytes(dst + o, reinterpret_cast<const uint8_t*>("null"), 4);
+    for (uint32_t m = 0; m < n_extra_meta; ++m) {    // bounded by cap check
+        const AvroMetaKV* kv = &extra_meta[m];
+        if (kv->key == nullptr) return false;
+        if (kv->val_len != 0 && kv->val == nullptr) return false;
+        const size_t klen = std::strlen(kv->key);
+        if (klen == 0 || klen > kAvroMaxName) return false;
+        if (!room(20u + klen + kv->val_len)) return false;
+        o += enc_bytes(dst + o, reinterpret_cast<const uint8_t*>(kv->key),
+                       static_cast<uint32_t>(klen));
+        o += enc_bytes(dst + o, kv->val, kv->val_len);
+    }
+    if (!room(1u)) return false;
     o += write_long(0, dst + o);                     // end map
 
     if (!room(kAvroSyncLen)) return false;
@@ -1255,10 +1281,23 @@ bool avro_write(const AvroField* fields, uint32_t n_fields,
             const AvroField* fd = &fields[f];
             if (fd->nullable) {
                 if (!room(b - o + 10u)) return false;
-                b += write_long(v->is_null ? 0 : 1, dst + b);
+                // Honour the declared null branch. Both orderings occur:
+                // ["null",T] puts null at 0, ["T","null"] at 1, and the READER
+                // already reads `null_branch` -- writing a literal 0/1 here
+                // disagreed with it for any schema that is not null-first.
+                const int64_t null_br = static_cast<int64_t>(fd->null_branch);
+                b += write_long(v->is_null ? null_br : (1 - null_br), dst + b);
                 if (v->is_null) continue;
             }
             switch (fd->type) {
+                // A container carries no value in this flat model. Null is the
+                // only legal encoding, and the branch above already emitted it.
+                // Falling through the switch instead would write NOTHING,
+                // silently truncating the row and misaligning every field
+                // after it -- so a non-null container fails the write.
+                case AvroType::kArray:
+                case AvroType::kMap:
+                    return false;
                 case AvroType::kNull: break;
                 case AvroType::kBoolean:
                     if (b + 1u > cap) return false;
@@ -1301,6 +1340,29 @@ bool avro_write(const AvroField* fields, uint32_t n_fields,
 
     *dst_len = o;
     return true;
+}
+
+bool avro_write(const AvroField* fields, uint32_t n_fields,
+                const AvroValue* rows, int64_t n_rows,
+                const uint8_t sync[kAvroSyncLen],
+                uint8_t* dst, uint64_t* dst_len) noexcept {
+    assert(fields != nullptr);
+    assert(dst_len != nullptr);
+    return avro_write_ex(fields, n_fields, rows, n_rows,
+                         nullptr, 0u, nullptr, 0u, sync, dst, dst_len);
+}
+
+uint64_t avro_write_ex_max_len(const AvroField* fields, uint32_t n_fields,
+                               uint64_t total_value_bytes, int64_t n_rows,
+                               uint64_t meta_bytes) noexcept {
+    assert(fields != nullptr);
+    assert(n_rows >= 0);
+    // The base bound's fixed 4 KB allowance covers only the GENERATED schema;
+    // a caller-supplied one (plus its extra entries) is added on top, with a
+    // 10-byte length prefix per entry and a little slack for the map framing.
+    const uint64_t base = avro_write_max_len(fields, n_fields,
+                                             total_value_bytes, n_rows);
+    return base + meta_bytes + (kAvroMaxMetaEntries + 2u) * 10u + 64u;
 }
 
 }  // namespace ingest
