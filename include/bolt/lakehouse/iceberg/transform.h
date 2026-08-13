@@ -31,9 +31,21 @@ struct Transform {
     int32_t       param;  // bucket N, truncate W; 0 otherwise
 };
 
+// Longest spelling is `truncate[-2147483648]` (21 chars) + NUL; rounded up.
+static constexpr uint32_t kIcebergMaxTransformName = 32u;
+
 // Parse `"identity"`, `"year"`, `"bucket[16]"`, `"truncate[10]"`, ...
 // Returns kUnknown on failure (still safe to use).
 Transform transform_parse(const char* s, uint32_t len) noexcept;
+
+// The inverse: render a Transform in Iceberg's spec spelling, including the
+// parameter (`bucket[16]`, `truncate[10]`). Needed to SERIALIZE a partition
+// spec -- without it a writer can only hardcode one transform name, which
+// silently rewrites a bucketed or truncated spec into an identity one.
+// Writes a NUL-terminated string; returns the length written, or 0 if `cap`
+// is too small (leaving `dst` untouched) so a caller cannot emit a truncated
+// transform name that would parse back as something else.
+uint32_t transform_format(Transform t, char* dst, uint32_t cap) noexcept;
 
 // Murmur3 32-bit (Iceberg uses seed 0). Public so callers can hash partition
 // values for bucket() outside of full row evaluation.

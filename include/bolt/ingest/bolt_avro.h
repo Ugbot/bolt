@@ -47,6 +47,10 @@ static constexpr uint32_t kAvroMagicLen   = 4u;       // "Obj" 0x01
 static constexpr uint32_t kAvroSyncLen     = 16u;
 static constexpr uint32_t kAvroMaxFields   = 256u;    // top-level record fields
 static constexpr uint32_t kAvroMaxName     = 128u;
+// Extra OCF metadata entries a writer may add beside avro.schema/avro.codec.
+// Iceberg uses five (schema, partition-spec, partition-spec-id,
+// format-version, content); the cap leaves room without being unbounded.
+static constexpr uint32_t kAvroMaxMetaEntries = 16u;
 
 enum class AvroType : uint8_t {
     kNull = 0, kBoolean = 1, kInt = 2, kLong = 3, kFloat = 4, kDouble = 5,
@@ -255,6 +259,50 @@ bool avro_write(const AvroField* fields, uint32_t n_fields,
                 const AvroValue* rows, int64_t n_rows,
                 const uint8_t sync[kAvroSyncLen],
                 uint8_t* dst, uint64_t* dst_len) noexcept;
+
+// One extra OCF metadata entry. `key` is NUL-terminated; the value is opaque
+// bytes (Avro metadata values are `bytes`, not `string`).
+struct AvroMetaKV {
+    const char*    key;
+    const uint8_t* val;
+    uint32_t       val_len;
+    uint32_t       _pad;
+};
+
+// As `avro_write`, but the caller supplies the schema JSON and any extra
+// metadata entries. Both exist for Iceberg manifests, which the generated
+// schema cannot express:
+//
+//   * The generated schema is a FLAT record named "r" carrying primitives and
+//     no `field-id` annotations. Iceberg requires `manifest_entry` /
+//     `manifest_file` with nested `data_file` + `partition` records and a
+//     field-id on every field. The WIRE BYTES are unaffected by that nesting —
+//     an Avro record's fields are inline and positional, so a flattened field
+//     list encodes identically — but the reader must be told the real shape.
+//   * A real `manifest_entry` schema measures ~3.8 KB for a minimal two-column
+//     unpartitioned table, against `build_schema_json`'s 4096-byte buffer. The
+//     caller's string is referenced, never copied into that buffer.
+//   * Iceberg readers expect `schema`, `partition-spec`, `partition-spec-id`,
+//     `format-version` and `content` alongside `avro.schema` / `avro.codec`.
+//
+// `schema_json` == nullptr falls back to the generated schema. Container-typed
+// fields (kArray / kMap) are writable ONLY as a null union branch: the encoder
+// emits the branch index and skips the value, which is exactly how Iceberg's
+// optional repeated fields (`lower_bounds`, `split_offsets`, ...) are omitted.
+// A non-null container value is rejected rather than mis-encoded.
+bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
+                   const AvroValue* rows, int64_t n_rows,
+                   const char* schema_json, uint32_t schema_len,
+                   const AvroMetaKV* extra_meta, uint32_t n_extra_meta,
+                   const uint8_t sync[kAvroSyncLen],
+                   uint8_t* dst, uint64_t* dst_len) noexcept;
+
+// Upper bound for `avro_write_ex`. `meta_bytes` is the total of the caller's
+// schema JSON plus every extra metadata key and value; the fixed allowance in
+// `avro_write_max_len` covers only the generated schema.
+uint64_t avro_write_ex_max_len(const AvroField* fields, uint32_t n_fields,
+                               uint64_t total_value_bytes, int64_t n_rows,
+                               uint64_t meta_bytes) noexcept;
 
 }  // namespace ingest
 }  // namespace bolt

@@ -268,9 +268,41 @@ struct ParquetWriter {
     std::vector<ChunkRec>    chunks;
     std::vector<RowGroupRec> row_groups;
     std::int64_t      total_rows;
+    // MEMORY SINK. When set, bytes accumulate in `mem` and `fout` is never
+    // opened. Everything else -- page layout, offsets, footer -- is identical,
+    // because `file_pos` was already the single source of truth for every
+    // offset written into the metadata; the sink only decides where the bytes
+    // land. That is what makes a memory-written file byte-identical to the
+    // file-written one.
+    bool                     to_mem;
+    std::vector<std::uint8_t> mem;
 };
 
 namespace {
+
+// Append to whichever sink is active. The ONE place that knows the difference.
+bool sink_write(ParquetWriter* w, const void* p, std::size_t n) noexcept {
+    assert(w != nullptr);
+    assert(p != nullptr || n == 0u);
+    if (n == 0u) return true;
+    if (w->to_mem) {
+        const std::uint8_t* b = static_cast<const std::uint8_t*>(p);
+        // Allocation failure terminates rather than returning false: bolt
+        // builds -fno-exceptions, so there is no throw to catch. That is the
+        // SAME exposure the file path already carries -- the footer and every
+        // compressed page are accumulated in std::vector here too -- so the
+        // memory sink adds no new failure mode, it just holds the bytes longer.
+        w->mem.insert(w->mem.end(), b, b + n);
+        return true;
+    }
+    w->fout.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
+    return w->fout.good();
+}
+
+bool sink_ok(const ParquetWriter* w) noexcept {
+    assert(w != nullptr);
+    return w->to_mem ? !w->failed : w->fout.good();
+}
 
 // ===== type validation ====================================================
 
@@ -777,11 +809,9 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
 
     // Position & write.
     rec->data_page_offset = w->file_pos;
-    w->fout.write(reinterpret_cast<const char*>(hdr.data()),
-                  static_cast<std::streamsize>(hdr.size()));
-    w->fout.write(reinterpret_cast<const char*>(compressed.data()),
-                  static_cast<std::streamsize>(compressed.size()));
-    if (!w->fout.good()) return false;
+    if (!sink_write(w, hdr.data(), hdr.size())) return false;
+    if (!sink_write(w, compressed.data(), compressed.size())) return false;
+    if (!sink_ok(w)) return false;
     w->file_pos += static_cast<std::int64_t>(hdr.size() + compressed.size());
     rec->total_unc = static_cast<std::int64_t>(hdr.size()) + unc;
     rec->total_cmp = static_cast<std::int64_t>(hdr.size()) + cmp;
@@ -979,14 +1009,50 @@ ParquetWriter* parquet_write_open(const char* path,
     w->file_pos = 0;
     w->failed = false;
     w->total_rows = 0;
+    w->to_mem = false;
     w->fout.open(path, std::ios::binary | std::ios::trunc);
     if (!w->fout.is_open()) {
         delete w;
         return nullptr;
     }
     static const char kMagic[4] = {'P', 'A', 'R', '1'};
-    w->fout.write(kMagic, 4);
-    if (!w->fout.good()) {
+    if (!sink_write(w, kMagic, 4) || !sink_ok(w)) {
+        delete w;
+        return nullptr;
+    }
+    w->file_pos = 4;
+    return w;
+}
+
+ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
+                                      std::uint64_t reserve_bytes) noexcept {
+    assert(opts != nullptr);
+    if (opts == nullptr) return nullptr;
+    if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
+    if (opts->compression != 0u && opts->compression != 1u) return nullptr;
+    for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
+        if (!type_supported(opts->columns[i])) return nullptr;
+    }
+    ParquetWriter* w = new (std::nothrow) ParquetWriter();
+    if (w == nullptr) return nullptr;
+    w->opts = *opts;
+    if (w->opts.row_group_target_bytes == 0u ||
+        w->opts.row_group_target_bytes > kPwMaxRowGroupBytes) {
+        w->opts.row_group_target_bytes = kPwMaxRowGroupBytes;
+    }
+    w->file_pos = 0;
+    w->failed = false;
+    w->total_rows = 0;
+    w->to_mem = true;
+    // One allocation up front instead of a growth curve. Capped so a bad
+    // estimate cannot commit an unbounded reservation.
+    constexpr std::uint64_t kMaxReserve = 1ull << 31;   // 2 GiB
+    if (reserve_bytes != 0u) {
+        w->mem.reserve(static_cast<std::size_t>(
+            reserve_bytes < kMaxReserve ? reserve_bytes : kMaxReserve));
+    }
+    static const char kMagic[4] = {'P', 'A', 'R', '1'};
+    if (!sink_write(w, kMagic, 4)) {
         delete w;
         return nullptr;
     }
@@ -1093,28 +1159,71 @@ bool parquet_write_row_group(ParquetWriter* w,
     return true;
 }
 
+namespace {
+
+// Footer + length + trailing magic. Shared by both close paths so a
+// memory-written file cannot drift from a file-written one.
+bool finish_footer(ParquetWriter* w) noexcept {
+    assert(w != nullptr);
+    assert(!w->failed);
+    std::vector<std::uint8_t> footer;
+    write_file_metadata(&footer, w);
+    const std::uint32_t flen = static_cast<std::uint32_t>(footer.size());
+    if (!sink_write(w, footer.data(), footer.size())) return false;
+    const std::uint8_t lb[4] = {
+        static_cast<std::uint8_t>(flen & 0xFFu),
+        static_cast<std::uint8_t>((flen >> 8) & 0xFFu),
+        static_cast<std::uint8_t>((flen >> 16) & 0xFFu),
+        static_cast<std::uint8_t>((flen >> 24) & 0xFFu),
+    };
+    if (!sink_write(w, lb, 4)) return false;
+    static const char kMagic[4] = {'P', 'A', 'R', '1'};
+    if (!sink_write(w, kMagic, 4)) return false;
+    return sink_ok(w);
+}
+
+}  // namespace
+
 bool parquet_write_close(ParquetWriter* w) noexcept {
     assert(w != nullptr);
     if (w == nullptr) return false;
-    bool ok = !w->failed && w->fout.good();
-    if (ok) {
-        std::vector<std::uint8_t> footer;
-        write_file_metadata(&footer, w);
-        const std::uint32_t flen = static_cast<std::uint32_t>(footer.size());
-        w->fout.write(reinterpret_cast<const char*>(footer.data()),
-                      static_cast<std::streamsize>(footer.size()));
-        const std::uint8_t lb[4] = {
-            static_cast<std::uint8_t>(flen & 0xFFu),
-            static_cast<std::uint8_t>((flen >> 8) & 0xFFu),
-            static_cast<std::uint8_t>((flen >> 16) & 0xFFu),
-            static_cast<std::uint8_t>((flen >> 24) & 0xFFu),
-        };
-        w->fout.write(reinterpret_cast<const char*>(lb), 4);
-        static const char kMagic[4] = {'P', 'A', 'R', '1'};
-        w->fout.write(kMagic, 4);
-        ok = w->fout.good();
-    }
+    bool ok = !w->failed && sink_ok(w);
+    if (ok) ok = finish_footer(w);
     w->fout.close();
+    delete w;
+    return ok;
+}
+
+bool parquet_write_close_mem(ParquetWriter* w, Arena* arena,
+                             const std::uint8_t** out,
+                             std::uint64_t* out_len) noexcept {
+    assert(w != nullptr);
+    assert(arena != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    if (w == nullptr) return false;
+    if (arena == nullptr || out == nullptr || out_len == nullptr) {
+        delete w;
+        return false;
+    }
+    // A writer opened on a PATH has already streamed its bytes to disk; there
+    // is nothing in `mem` to hand back, and returning an empty buffer would
+    // look like a valid zero-row file.
+    if (!w->to_mem) {
+        delete w;
+        return false;
+    }
+    bool ok = !w->failed && finish_footer(w);
+    if (ok) {
+        const std::uint64_t n = w->mem.size();
+        std::uint8_t* dst = arena->allocate_array<std::uint8_t>(n);
+        if (dst != nullptr) {
+            std::memcpy(dst, w->mem.data(), n);
+            *out     = dst;
+            *out_len = n;
+        } else {
+            ok = false;
+        }
+    }
     delete w;
     return ok;
 }

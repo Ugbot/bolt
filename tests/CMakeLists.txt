@@ -1002,6 +1002,15 @@ target_link_libraries(test_bolt_parquet_write
 bolt_apply_hardening(test_bolt_parquet_write)
 add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
 
+# Phase 2 — the parquet MEMORY sink. Asserts byte-EQUALITY with the file sink
+# (a "does it parse" test cannot catch a sink that reorders or drops a region,
+# since parquet is read through its footer offsets).
+add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
+target_link_libraries(test_bolt_parquet_write_mem
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_mem)
+add_test(NAME test_bolt_parquet_write_mem COMMAND test_bolt_parquet_write_mem)
+
 # G2FEAT-46 — Parquet type conformance: TIMESTAMP (millis/micros/nanos),
 # TIME, INT96 legacy timestamp, INT32-DECIMAL, un/signed IntType mapping +
 # a Timestamp writer->reader round-trip.
@@ -1197,6 +1206,15 @@ target_compile_definitions(test_bolt_iceberg_real_avro PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_iceberg_real_avro)
 add_test(NAME test_bolt_iceberg_real_avro COMMAND test_bolt_iceberg_real_avro)
+
+# Phase 1 — the Avro manifest WRITE path, checked against bolt's own
+# pyiceberg-verified reader (see the test's header for why that is a real
+# oracle rather than a self-consistency check).
+add_executable(test_bolt_iceberg_manifest_write test_bolt_iceberg_manifest_write.cpp)
+target_link_libraries(test_bolt_iceberg_manifest_write
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_manifest_write)
+add_test(NAME test_bolt_iceberg_manifest_write COMMAND test_bolt_iceberg_manifest_write)
 
 # G2FEAT-125 — SCAN a real Iceberg table end to end (metadata -> manifests ->
 # Parquet -> rows) over the complete pyiceberg warehouse in

@@ -124,6 +124,53 @@ bool buf_putn(Buf* b, const void* p, uint32_t n) noexcept {
     return true;
 }
 
+// Append `s` as a JSON string BODY (no surrounding quotes), escaping what
+// RFC 8259 requires. Without this a table, column or location name containing
+// a quote or backslash -- `he said "hi"`, a Windows path -- emitted JSON that
+// no parser would accept, turning a naming choice into a corrupt table.
+bool buf_put_jstr(Buf* b, const char* s) noexcept {
+    assert(b != nullptr);
+    assert(s != nullptr);
+    for (const char* p = s; *p != '\0'; ++p) {   // bounded by NUL
+        const unsigned char c = static_cast<unsigned char>(*p);
+        const char* esc = nullptr;
+        char ubuf[7];
+        switch (c) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\b': esc = "\\b";  break;
+            case '\f': esc = "\\f";  break;
+            case '\n': esc = "\\n";  break;
+            case '\r': esc = "\\r";  break;
+            case '\t': esc = "\\t";  break;
+            default:
+                if (c < 0x20u) {                  // other control chars
+                    std::snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+                    esc = ubuf;
+                }
+                break;
+        }
+        if (esc != nullptr) {
+            if (!buf_put(b, esc)) return false;
+        } else {
+            if (b->len + 1u > b->cap) return false;
+            b->data[b->len++] = static_cast<uint8_t>(c);
+        }
+    }
+    return true;
+}
+
+// `"key":"escaped value",` — the shape almost every metadata field wants.
+bool buf_kv_str(Buf* b, const char* key, const char* val,
+                bool trailing_comma) noexcept {
+    assert(b != nullptr && key != nullptr);
+    if (!buf_put(b, "\"")) return false;
+    if (!buf_put(b, key)) return false;
+    if (!buf_put(b, "\":\"")) return false;
+    if (!buf_put_jstr(b, val != nullptr ? val : "")) return false;
+    return buf_put(b, trailing_comma ? "\"," : "\"");
+}
+
 bool buf_fmt(Buf* b, const char* fmt, ...) noexcept {
     assert(b != nullptr && fmt != nullptr);
     va_list ap;
@@ -221,6 +268,61 @@ ingest::parquet::ParquetWriteOpts make_pq_opts(const Schema* sch,
 // re-create the Metadata POD).
 // ---------------------------------------------------------------------------
 
+// Derive a spec-valid RFC 4122 UUID from the table location.
+//
+// Two separate bugs are fixed here. The old value was `bolt-<epoch_ms>`, which
+// is not a UUID at all: pyiceberg parses `table-uuid` as one and REJECTS the
+// metadata ("invalid character: found `o`"), so every table bolt wrote was
+// unreadable by an external Iceberg engine.
+//
+// And it was TIME-based, so re-emitting a table's metadata minted a NEW
+// identity each time. For a surface that regenerates metadata per request that
+// is worse than wrong -- a client would see the table's identity change under
+// it. Deriving from the location makes it stable for the same table forever,
+// and distinct between tables.
+//
+// This is a name-based UUID in the spirit of v5 without pulling in SHA-1: a
+// 128-bit value from four decorrelated 64-bit hashes of the location, with the
+// version (4) and variant (RFC 4122) bits forced so the result is well-formed.
+void table_uuid_from_location(const char* loc, char* dst,
+                              uint32_t cap) noexcept {
+    assert(loc != nullptr);
+    assert(dst != nullptr);
+    assert(cap >= 37u);                       // 36 chars + NUL
+    if (dst == nullptr || cap < 37u) return;
+
+    // FNV-1a over the location, four times with different offset bases so the
+    // halves are not correlated.
+    uint64_t acc[4] = {0xcbf29ce484222325ull, 0x9e3779b97f4a7c15ull,
+                       0xff51afd7ed558ccdull, 0xc4ceb9fe1a85ec53ull};
+    for (uint32_t k = 0; k < 4u; ++k) {                    // bounded
+        uint64_t hv = acc[k];
+        for (const char* p = (loc != nullptr ? loc : ""); *p != '\0'; ++p) {
+            hv ^= static_cast<uint8_t>(*p);
+            hv *= 0x100000001b3ull;
+        }
+        acc[k] = hv;
+    }
+    uint8_t u[16];
+    for (uint32_t k = 0; k < 2u; ++k) {                    // bounded
+        for (uint32_t i = 0; i < 8u; ++i) {
+            u[k * 8u + i] = static_cast<uint8_t>((acc[k] >> (i * 8u)) & 0xFFu);
+        }
+    }
+    u[6] = static_cast<uint8_t>((u[6] & 0x0Fu) | 0x40u);   // version 4
+    u[8] = static_cast<uint8_t>((u[8] & 0x3Fu) | 0x80u);   // RFC 4122 variant
+
+    static const char* kHex = "0123456789abcdef";
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < 16u; ++i) {                   // bounded
+        if (i == 4u || i == 6u || i == 8u || i == 10u) dst[o++] = '-';
+        dst[o++] = kHex[(u[i] >> 4) & 0x0Fu];
+        dst[o++] = kHex[u[i] & 0x0Fu];
+    }
+    dst[o] = '\0';
+    assert(o == 36u);
+}
+
 bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         bool is_view, const char* view_dialect,
                         const char* view_sql, int64_t view_version_id,
@@ -229,8 +331,21 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
     Buf b;
     if (!buf_init(&b, a, 64u * 1024u)) return false;
     if (!buf_fmt(&b, "{\"format-version\":%d,", m->format_version)) return false;
-    if (!buf_fmt(&b, "\"table-uuid\":\"%s\",", m->table_uuid)) return false;
-    if (!buf_fmt(&b, "\"location\":\"%s\",", m->location)) return false;
+    if (!buf_kv_str(&b, "table-uuid", m->table_uuid, true)) return false;
+    if (!buf_kv_str(&b, "location", m->location, true)) return false;
+
+    // `last-column-id` is REQUIRED by the spec, and pyiceberg rejects metadata
+    // without it outright ("Field required"). It is DERIVED here rather than
+    // stored on Metadata so it cannot drift from the schema it describes: it
+    // is exactly the largest field id assigned so far.
+    int32_t last_col_id = 0;
+    for (uint32_t i = 0; i < m->n_schemas; ++i) {          // bounded
+        const Schema& s = m->schemas[i];
+        for (uint32_t j = 0; j < s.n_fields; ++j) {        // bounded
+            if (s.fields[j].id > last_col_id) last_col_id = s.fields[j].id;
+        }
+    }
+    if (!buf_fmt(&b, "\"last-column-id\":%d,", last_col_id)) return false;
     if (!buf_fmt(&b, "\"last-updated-ms\":%lld,",
                  static_cast<long long>(m->last_updated_ms))) return false;
     if (!buf_fmt(&b, "\"last-sequence-number\":%lld,",
@@ -254,8 +369,10 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
         for (uint32_t j = 0; j < s.n_fields; ++j) {
             if (j > 0 && !buf_put(&b, ",")) return false;
             const SchemaField& f = s.fields[j];
-            if (!buf_fmt(&b, "{\"id\":%d,\"name\":\"%s\",\"type\":\"%s\","
-                         "\"required\":%s}", f.id, f.name, f.type,
+            if (!buf_fmt(&b, "{\"id\":%d,", f.id)) return false;
+            if (!buf_kv_str(&b, "name", f.name, true)) return false;
+            if (!buf_kv_str(&b, "type", f.type, true)) return false;
+            if (!buf_fmt(&b, "\"required\":%s}",
                          f.required ? "true" : "false")) return false;
         }
         if (!buf_put(&b, "]}")) return false;
@@ -272,9 +389,20 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
         for (uint32_t j = 0; j < sp.n_fields; ++j) {
             if (j > 0 && !buf_put(&b, ",")) return false;
             const PartitionField& pf = sp.fields[j];
-            if (!buf_fmt(&b, "{\"source-id\":%d,\"field-id\":%d,"
-                         "\"name\":\"%s\",\"transform\":\"identity\"}",
-                         pf.source_id, pf.field_id, pf.name)) return false;
+            // The transform was HARDCODED "identity" here, silently rewriting
+            // a bucketed or truncated spec into an identity one -- a reader
+            // would then partition-prune against a transform the data was
+            // never written with. An unrepresentable transform fails the emit
+            // rather than being papered over with a default.
+            char tname[kIcebergMaxTransformName];
+            if (transform_format(pf.transform, tname, sizeof(tname)) == 0u) {
+                return false;
+            }
+            if (!buf_fmt(&b, "{\"source-id\":%d,\"field-id\":%d,",
+                         pf.source_id, pf.field_id)) return false;
+            if (!buf_kv_str(&b, "name", pf.name, true)) return false;
+            if (!buf_kv_str(&b, "transform", tname, false)) return false;
+            if (!buf_put(&b, "}")) return false;
         }
         if (!buf_put(&b, "]}")) return false;
     }
@@ -302,14 +430,13 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
             default: break;
         }
         if (!buf_fmt(&b, "{\"snapshot-id\":%lld,\"parent-snapshot-id\":%lld,"
-                     "\"timestamp-ms\":%lld,\"sequence-number\":%lld,"
-                     "\"manifest-list\":\"%s\","
-                     "\"summary\":{\"operation\":\"%s\"}}",
+                     "\"timestamp-ms\":%lld,\"sequence-number\":%lld,",
                      static_cast<long long>(s.snapshot_id),
                      static_cast<long long>(s.parent_snapshot_id),
                      static_cast<long long>(s.timestamp_ms),
-                     static_cast<long long>(s.sequence_number),
-                     s.manifest_list, op)) return false;
+                     static_cast<long long>(s.sequence_number))) return false;
+        if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
+        if (!buf_fmt(&b, "\"summary\":{\"operation\":\"%s\"}}", op)) return false;
     }
     if (!buf_put(&b, "],")) return false;
 
@@ -317,8 +444,9 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
     if (!buf_put(&b, "\"refs\":{")) return false;
     for (uint32_t i = 0; i < nr; ++i) {
         if (i > 0 && !buf_put(&b, ",")) return false;
-        if (!buf_fmt(&b, "\"%s\":{\"snapshot-id\":%lld,\"type\":\"%s\"}",
-                     refs[i].name,
+        if (!buf_put(&b, "\"")) return false;
+        if (!buf_put_jstr(&b, refs[i].name)) return false;
+        if (!buf_fmt(&b, "\":{\"snapshot-id\":%lld,\"type\":\"%s\"}",
                      static_cast<long long>(refs[i].snapshot_id),
                      refs[i].kind == 0u ? "branch" : "tag")) return false;
     }
@@ -326,14 +454,16 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
 
     // view extras
     if (is_view) {
+        // View SQL is the single most likely field to contain a quote or a
+        // newline, so it must go through the escaper.
         if (!buf_fmt(&b, ",\"view-version\":{\"version-id\":%lld,"
                      "\"timestamp-ms\":%lld,"
-                     "\"representations\":[{\"type\":\"sql\","
-                     "\"dialect\":\"%s\",\"sql\":\"%s\"}]}",
+                     "\"representations\":[{\"type\":\"sql\",",
                      static_cast<long long>(view_version_id),
-                     static_cast<long long>(m->last_updated_ms),
-                     view_dialect ? view_dialect : "",
-                     view_sql ? view_sql : "")) return false;
+                     static_cast<long long>(m->last_updated_ms))) return false;
+        if (!buf_kv_str(&b, "dialect", view_dialect, true)) return false;
+        if (!buf_kv_str(&b, "sql", view_sql, false)) return false;
+        if (!buf_put(&b, "}]}")) return false;
     }
 
     if (!buf_put(&b, "}")) return false;
@@ -485,8 +615,8 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     h->meta.last_sequence_number = 0;
     h->meta.last_updated_ms      = now_ms();
     h->meta.current_snapshot_id  = -1;
-    std::snprintf(h->meta.table_uuid, sizeof(h->meta.table_uuid),
-                  "bolt-%lld", static_cast<long long>(now_ms()));
+    table_uuid_from_location(path, h->meta.table_uuid,
+                             sizeof(h->meta.table_uuid));
     std::strncpy(h->meta.location, path, sizeof(h->meta.location) - 1u);
     h->meta.n_schemas        = 1;
     h->meta.schemas[0]       = *schema;
