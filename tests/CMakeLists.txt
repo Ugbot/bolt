@@ -1198,6 +1198,15 @@ target_compile_definitions(test_bolt_iceberg_real_avro PRIVATE
 bolt_apply_hardening(test_bolt_iceberg_real_avro)
 add_test(NAME test_bolt_iceberg_real_avro COMMAND test_bolt_iceberg_real_avro)
 
+# Phase 1 — the Avro manifest WRITE path, checked against bolt's own
+# pyiceberg-verified reader (see the test's header for why that is a real
+# oracle rather than a self-consistency check).
+add_executable(test_bolt_iceberg_manifest_write test_bolt_iceberg_manifest_write.cpp)
+target_link_libraries(test_bolt_iceberg_manifest_write
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_manifest_write)
+add_test(NAME test_bolt_iceberg_manifest_write COMMAND test_bolt_iceberg_manifest_write)
+
 # G2FEAT-125 — SCAN a real Iceberg table end to end (metadata -> manifests ->
 # Parquet -> rows) over the complete pyiceberg warehouse in
 # data/golden_iceberg_table. The test above only decodes manifests.
