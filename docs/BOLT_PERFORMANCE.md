@@ -2,31 +2,51 @@
 
 ## What Bolt Is
 
-Bolt is a zero-dependency columnar execution library. It replaces Apache
-Arrow's C++ runtime on the hot path with primitives tuned for HFT- and
-streaming-grade latency: arena allocation, lock-free channels, branchless
-kernels, and adaptive column encoding. Arrow compatibility is preserved at
-I/O boundaries via the Arrow C Data Interface — no libarrow link required.
+Bolt is a zero-dependency columnar execution library. It is an alternative to
+Apache Arrow's C++ runtime on the hot path, built from arena allocation,
+lock-free channels, branchless kernels, and adaptive column encoding. Arrow
+compatibility is preserved at I/O boundaries via the Arrow C Data Interface —
+no libarrow link required.
 
-**Size:** ~2,600 lines of C++20 across 6 headers. Compiles in seconds.
-**Dependencies:** none (C++20 standard library only).
-**Build cost:** ~5 seconds cold vs. hours for Arrow on Windows.
+**Dependencies:** none in the core (C++20 standard library only).
+**Build:** headers compiled directly by the consumer, MSVC included — no
+package manager, nothing to prebuild.
 
 ---
 
-## Headline Numbers
+## Why Bolt Is Fast
 
-All measured with `g++ -O3 -std=c++20 -march=native` on a commodity x86 core.
-Microbenchmarks in `benchmarks/bench_bolt.cpp`; run with `./bench_bolt`.
+The gains come from the architecture rather than from tuning:
 
-| Operation                     | Baseline (Arrow / mutex / malloc) | Bolt                     | Speedup     |
-|-------------------------------|-----------------------------------|--------------------------|-------------|
-| 16 KB buffer allocation       | 24,982 ns (malloc + free)         | **2.6 ns** (arena bump)  | **9,600×**  |
-| Inter-operator transit        | 439 ns (mutex queue)              | **17 ns** (SPSC ring)    | **25×**     |
-| Batch transit, 8 operators    | 6.8 ns (8 × `shared_ptr` copy)    | **1.3 ns** (epoch swap)  | **5×**      |
-| Mutation of 3/20 columns      | 76.5 ns (3 × new array + batch)   | **40.5 ns** (COW)        | **1.9×**    |
-| Filter, 16 K rows             | 3,612 ns (materialize)            | **0.3 ns** (selection)   | **12,000×** |
-| Constant column scan, 16 K    | 1,783 ns (iterate every row)      | **0.7 ns** (one multiply)| **2,500×**  |
+- **Arena allocation instead of per-buffer malloc.** Buffers are
+  bump-allocated from a preallocated arena and released in one pointer move,
+  so the hot path carries no malloc/free traffic.
+- **Epoch swaps instead of atomic refcounts.** Batches move between operators
+  by flipping an epoch index rather than touching a `shared_ptr` refcount.
+- **Selection vectors and constant folding instead of materializing batches.**
+  A filter emits a selection vector rather than a new batch, and a
+  constant-valued column collapses a scan into a single scalar operation.
+
+## Microbenchmarks
+
+The numbers below quantify each of those choices. They are microbenchmarks:
+each times one operation in isolation with `g++ -O3 -std=c++20 -march=native`
+on a single commodity x86 core, from `benchmarks/bench_bolt.cpp`. Results
+vary with hardware, compiler, and workload.
+
+Two rows compare different amounts of work rather than the same task done
+faster — the filter returns a selection vector instead of a materialized
+batch, and the constant column folds a scan into a multiply. Read the table
+as evidence for the design choices above, not as end-to-end speedups.
+
+| Operation                     | Baseline (Arrow / mutex / malloc) | Bolt                     | Notes                          |
+|-------------------------------|-----------------------------------|--------------------------|--------------------------------|
+| 16 KB buffer allocation       | 24,982 ns (malloc + free)         | 2.6 ns (arena bump)      | like-for-like                  |
+| Inter-operator transit        | 439 ns (mutex queue)              | 17 ns (SPSC ring)        | like-for-like                  |
+| Batch transit, 8 operators    | 6.8 ns (8 × `shared_ptr` copy)    | 1.3 ns (epoch swap)      | like-for-like                  |
+| Mutation of 3/20 columns      | 76.5 ns (3 × new array + batch)   | 40.5 ns (COW)            | like-for-like                  |
+| Filter, 16 K rows             | 3,612 ns (materialize)            | 0.3 ns (selection)       | different output — no batch is built |
+| Constant column scan, 16 K    | 1,783 ns (iterate every row)      | 0.7 ns (one multiply)    | scan folded away, not sped up  |
 | COW memcpy, 8 KB column       | —                                 | 50 ns (163 GB/s)         | —           |
 | COW memcpy, 64 KB column      | —                                 | 1,941 ns (34 GB/s)       | —           |
 
@@ -178,9 +198,9 @@ directly enables a measured speedup.
 | No smart pointers; raw pointers         | No atomic refcount traffic            |
 | No `std::string`; `char[64]` + view     | No heap on every field name           |
 | No `std::vector` in hot structs         | Fixed-capacity, inline arrays         |
-| No heap on the hot path; arena only     | 9,600× allocation speedup             |
+| No heap on the hot path; arena only     | Allocation is a pointer bump          |
 | `alignas(64)` on shared atomics         | No false sharing                      |
-| Branchless inner loops                  | 12,000× filter speedup                |
+| Branchless inner loops                  | No mispredict penalty on filters      |
 | `__restrict__` on kernel parameters     | Auto-vectorization to SIMD            |
 | Compile-time type dispatch via X-macros | One boundary switch, specialized loop |
 

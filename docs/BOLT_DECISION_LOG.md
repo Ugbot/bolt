@@ -2,6 +2,11 @@
 
 ## Why each design decision was made, with references.
 
+Each entry records the problem, the choice, and the microbenchmark that
+supported it. The measurements are isolated single-operation timings on one
+machine — they justify the decision that follows them, and are not end-to-end
+speedups. See [`BOLT_PERFORMANCE.md`](BOLT_PERFORMANCE.md) for methodology.
+
 ---
 
 ### Decision 1: Arena allocation instead of malloc/shared_ptr
@@ -15,7 +20,8 @@ Arrow's `MemoryPool` wraps `malloc` which contends across threads.
 Allocation is pointer arithmetic (~3ns). Deallocation is a pointer reset (~5ns).
 No per-object refcounting. No cross-thread allocator contention.
 
-**Measured:** 9,600x faster than malloc+free for 16KB allocations.
+**Measured:** 2.6 ns arena bump vs 24,982 ns malloc+free, for 16KB
+allocations.
 
 **Precedent:** Game engine frame allocators (Venus), Chronicle Queue off-heap
 allocation, LMAX Disruptor pre-allocated ring buffers.
@@ -52,7 +58,9 @@ column must be materialized to flat before most compute kernels can operate.
 directly. A constant column is a single value + length. An aggregation over
 a constant column is a single multiply, not a 16K-element loop.
 
-**Measured:** Constant column scan: 0.7ns (vs 1,783ns flat scan). 2,500x.
+**Measured:** Constant column scan: 0.7ns for the folded multiply, vs 1,783ns
+to iterate every row of the equivalent flat column. Different amounts of work
+— the constant format avoids the scan rather than speeding it up.
 
 **Precedent:** DuckDB Vector (Flat, Constant, Dictionary, Sequence, FSST),
 QuestDB Symbol type (dictionary + optional bitmap index).

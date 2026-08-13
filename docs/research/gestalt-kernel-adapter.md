@@ -2,14 +2,13 @@
 
 ## Context
 
-The user has 74 fintech kernels in `C:\code\gestalt\chukonu\include\
-chukonu\fintech\kernels.h` written for Apache Arrow. They are the
-forcing function for Bolt's dataflow runtime — the API shape that
-satisfies them is the API shape that ships. This file fixes the
-mechanical port pattern (Tier 1 stateless, Tier 2 stateful) and
-documents the worked example for EMA.
+74 fintech kernels written for Apache Arrow in a predecessor engine (not
+publicly available) are the forcing function for Bolt's dataflow runtime
+— the API shape that satisfies them is the API shape that ships. This
+file fixes the mechanical port pattern (Tier 1 stateless, Tier 2
+stateful) and documents the worked example for EMA.
 
-Categories from the gestalt survey:
+Categories from the survey of those kernels:
 
 - **Tier 1 — mechanical (~26 kernels, ~35%):** stateless within batch.
   Midprice, microprice, spread, imbalance, log returns, Sharpe,

@@ -1,0 +1,47 @@
+Bolt
+Copyright 2026 Ben Gamble
+
+This product includes software developed by Ben Gamble and contributors,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------
+
+Bolt's core has no third-party dependencies. The attributions below cover
+external work that Bolt studied or drew technique from. No third-party source
+is vendored into this repository.
+
+llama.cpp / ggml (MIT License)
+Copyright (c) 2023-2024 The ggml authors
+https://github.com/ggerganov/llama.cpp
+
+  The Vulkan matmul+dequant compute shaders in `shaders/` were written from
+  scratch for Bolt's own quantization layout (low-nibble-first Int4, separate
+  per-row scale array) after studying the design of ggml-vulkan's
+  `mul_mat_vec.comp` for transferable technique. No ggml source is copied or
+  included. See each `.comp` file's header comment for Bolt's byte-packing
+  details.
+
+libuv (MIT License)
+Copyright (c) 2015-present libuv project contributors
+https://github.com/libuv/libuv
+
+  `src/api/net/event_loop_iocp.cpp` follows IOCP usage patterns documented in
+  libuv's `src/win/winsock.c` and `src/win/tcp.c`. The implementation is
+  Bolt's own; libuv is referenced for its treatment of the Windows IOCP API.
+
+QuestDB (Apache License 2.0)
+Copyright QuestDB Limited
+https://github.com/questdb/questdb
+
+  `docs/research/questdb-symbol-code-audit.md` cites QuestDB source file paths
+  and line ranges to verify claims about the SYMBOL column layout. Quotation
+  is limited to short identifiers and file names for citation purposes.
+
+--------------------------------------------------------------------------
+
+Research notes under `docs/research/` cite published papers and open-source
+projects (DuckDB, Polars, simdjson, kdb+, the 1BRC entries, and others) as
+primary sources. Those citations are attributed inline in each note and
+carry the license of their respective projects.

@@ -346,10 +346,13 @@ Expected compile times:
 
 ---
 
-## 5. Migration Path (Chukonu → Bolt)
+## 5. Migration Path (Arrow-based engine → Bolt)
 
-### Phase 1: Parallel existence (current)
-- Bolt headers in `chukonu/include/chukonu/bolt/`
+Written against the original consumer, Chukonu (a distributed query engine,
+not publicly available). The shape generalizes to any Arrow-based engine.
+
+### Phase 1: Parallel existence
+- Bolt headers vendored alongside the existing engine headers
 - Arena and Channel used directly (no Arrow dependency)
 - Existing Arrow-based operators untouched
 

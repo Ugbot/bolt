@@ -1,9 +1,9 @@
-# Bolt fintech kernel port — from chukonu/gestalt
+# Bolt fintech kernel port
 
 ## Source
 
-`C:\code\gestalt\chukonu\include\chukonu\fintech\kernels.h` — 74 kernels
-written against Apache Arrow, `MorselProcessorFunc` signature, 5
+74 fintech kernels from a predecessor engine (not publicly available),
+written against Apache Arrow: `MorselProcessorFunc` signature, 5
 allocations per batch, `std::deque` rolling windows, `std::string`
 column names in the hot path. This plan ports the survivable subset
 into Bolt's zero-allocation Tiger-Style shape.

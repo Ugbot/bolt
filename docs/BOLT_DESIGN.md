@@ -1,9 +1,11 @@
-# Project Bolt: HFT-Grade Columnar Execution for Chukonu
+# Project Bolt: Columnar Execution
 
 ## Design Document — Arrow Performance Gap Analysis & Optimization Strategy
 
-**Author:** Ben / Gestalt Architecture
-**Status:** Draft
+**Status:** Draft — the original design rationale, kept as a historical
+record. Current behaviour is described in
+[`BOLT_PROJECT_MAP.md`](BOLT_PROJECT_MAP.md) and
+[`BOLT_PERFORMANCE.md`](BOLT_PERFORMANCE.md).
 **Date:** April 2026
 
 ---
@@ -81,7 +83,7 @@ The Venus entity_db is a double-buffered SoA columnar store. Its patterns map di
 
 ## 5. Architecture: Bolt Execution Layer
 
-Bolt sits between Arrow (I/O, interop) and Chukonu operators (compute). Replaces Arrow runtime overhead with HFT-grade primitives.
+Bolt sits between Arrow (I/O, interop) and Chukonu operators (compute), taking over the runtime work Arrow does on the hot path.
 
 Components:
 - **BoltBatch**: Double-buffered RecordBatch replacement with COW
@@ -94,7 +96,12 @@ Components:
 
 ## 6. Benchmark Results (Measured)
 
-All benchmarks run with g++ -O3 -std=c++20 -march=native.
+All benchmarks run with g++ -O3 -std=c++20 -march=native. These are
+microbenchmarks — each times one operation in isolation, and the filter and
+constant-scan rows compare different amounts of work rather than the same task
+done faster (selection vector vs materialized batch; constant fold vs
+per-row scan). Read them as evidence for the design choices, not as
+end-to-end speedups.
 
 | Metric | Arrow Baseline | Bolt Measured | Speedup |
 |--------|---------------|---------------|---------|
