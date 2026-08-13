@@ -139,7 +139,14 @@ bool parquet_write_close(ParquetWriter* w) noexcept;
 // As `parquet_write_open`, accumulating into memory. Same validation, same
 // "PAR1" prologue. Finish with `parquet_write_close_mem`, NOT
 // `parquet_write_close` (which would drop the bytes on the floor).
-ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts) noexcept;
+// `reserve_bytes` pre-sizes the accumulator ONCE. Without it the buffer grows
+// by repeated reallocation as row groups are appended -- for a synthesis path
+// that produces a file per request, that is realloc churn and a memcpy of
+// everything written so far on each growth. A caller that can estimate the
+// output (rows x row width is enough; the encoding is PLAIN and uncompressed)
+// should pass it. 0 means "grow as needed" and is always correct, just slower.
+ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
+                                      std::uint64_t reserve_bytes = 0) noexcept;
 
 // Finish the file and hand back its bytes, copied into `arena` so they outlive
 // the writer. Deletes the writer in every case, success or not — like

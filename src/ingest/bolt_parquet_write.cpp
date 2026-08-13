@@ -1024,7 +1024,8 @@ ParquetWriter* parquet_write_open(const char* path,
     return w;
 }
 
-ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts) noexcept {
+ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
+                                      std::uint64_t reserve_bytes) noexcept {
     assert(opts != nullptr);
     if (opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
@@ -1043,6 +1044,13 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts) noexcept {
     w->failed = false;
     w->total_rows = 0;
     w->to_mem = true;
+    // One allocation up front instead of a growth curve. Capped so a bad
+    // estimate cannot commit an unbounded reservation.
+    constexpr std::uint64_t kMaxReserve = 1ull << 31;   // 2 GiB
+    if (reserve_bytes != 0u) {
+        w->mem.reserve(static_cast<std::size_t>(
+            reserve_bytes < kMaxReserve ? reserve_bytes : kMaxReserve));
+    }
     static const char kMagic[4] = {'P', 'A', 'R', '1'};
     if (!sink_write(w, kMagic, 4)) {
         delete w;
