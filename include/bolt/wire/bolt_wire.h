@@ -633,14 +633,23 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
             out->columns[0][i] = c;
             out->columns[1][i] = c;
         } else {
-            // VarBinary needs make_var_binary, which allocates a child offset
-            // column from `arena`. A zero-copy view has no arena, so it declines
-            // var columns — the caller (e.g. mt_apply_entry) falls back to the
-            // copying deserialize path. Fixed-width (Flat) tables — the P6 target
-            // and the common ingest case — view fully zero-copy above.
-            if (kView) return false;
             // VarBinary: rebuild via make_var_binary over the offsets + data
-            // buffers (arena-copied for deserialize; aliased for a view).
+            // buffers (arena-copied for deserialize; ALIASED for a view).
+            //
+            // G2ICE-76 — view mode used to decline VarBinary outright ("a
+            // zero-copy view has no arena"), forcing every consumer down the
+            // copying deserialize path. That rationale expired at G2FEAT-47:
+            // view mode REQUIRES an arena now (the per-column descriptor
+            // arrays live there), and `make_var_binary` only allocates the
+            // small child offset DESCRIPTOR from it — the offsets and payload
+            // bytes themselves alias `buf` like any Flat buffer. The decline
+            // was not free: MarbleDB's WAL-apply retry loop re-deserialized a
+            // multi-MB Utf8 kBatch payload into the MONOTONIC memtable arena
+            // on every kPoolExhausted retry, exhausting the arena's hard
+            // 32-block ceiling in seconds. Aliased offsets are int32s at
+            // 64-aligned wire offsets over an 8-aligned base — aligned reads
+            // on every supported target; consumers remain read-only per the
+            // view contract.
             int32_t* offs = nullptr;
             uint8_t* data = nullptr;
             if (l1) {
