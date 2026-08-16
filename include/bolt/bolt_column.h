@@ -848,8 +848,26 @@ struct BoltColumn {
     // Arrow C Data Interface export (zero-copy, no libarrow link)
     // =====================================================================
 
+    /// DEPRECATED — DO NOT USE. Superseded by bolt/bolt_arrow.h
+    /// (`bolt::arrow::export_column`).
+    ///
+    /// Audited against pyarrow 21 on 2026-08-16: this export cannot be
+    /// consumed by any real Arrow implementation. The release callback below
+    /// is an empty body, and the spec REQUIRES it to set `release = NULL` to
+    /// mark the struct released — pyarrow aborts the process on every import
+    /// without it. Beyond that: `fill_arrow_array` stores its buffer pointers
+    /// in a `static thread_local` array, so every exported column aliases the
+    /// last one; Utf8 declares "vu" (StringView) while exporting two buffers
+    /// and never exporting `str_overflow_base`; Bool hands byte-packed data to
+    /// a bit-packed format; Decimal128 hardcodes "d:38,10" regardless of the
+    /// column's real scale; and `null_count` reads a stat that is zero unless
+    /// someone called compute_stats_numeric().
+    ///
+    /// Kept only so the existing tests that pin this behaviour still compile.
+    /// New code must use bolt::arrow::export_column, which owns its buffers
+    /// and is validated against real pyarrow (tests/test_arrow_pyarrow.py).
+    ///
     /// Fill an ArrowSchema struct for this column's type.
-    /// The schema's release callback will be set to a no-op (Bolt owns memory).
     void fill_arrow_schema(ArrowSchema* out, const char* name) const noexcept {
         memset(out, 0, sizeof(ArrowSchema));
         out->format = arrow_format_string(type);
