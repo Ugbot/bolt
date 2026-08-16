@@ -1537,9 +1537,48 @@ inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
     // dangling into a reset arena is precisely the G2FEAT-307 use-after-free
     // class. The Dictionary case below owns its child for real and still
     // deep-copies it.
-    if (format != ColumnFormat::Dictionary) c.dict_child = nullptr;
+    if (format != ColumnFormat::Dictionary &&
+        format != ColumnFormat::VarBinary) {
+        c.dict_child = nullptr;
+    }
 
     switch (format) {
+        case ColumnFormat::VarBinary: {
+            // A VarBinary column's OFFSETS live on `dict_child` — they are
+            // load-bearing, not the advisory dictionary hint the comment
+            // above describes. Before this case existed, the switch matched
+            // nothing: `data` was carried over UNCOPIED (a dangling pointer
+            // into the source arena the moment it reset — precisely the
+            // G2FEAT-307 use-after-free class) and the blanket
+            // `dict_child = nullptr` above threw the offsets away, so
+            // `var_binary_at` null-dereferenced on the first read.
+            //
+            // Reached by every MarbleDB-scanned Utf8/Binary column: the scan
+            // op deep-copies each column into the fragment's own arena
+            // (G2FEAT-307), and MarbleDB hands strings back as VarBinary.
+            if (length <= 0 || dict_child == nullptr ||
+                dict_child->data == nullptr) {
+                return make_empty();
+            }
+            const int32_t* offs = static_cast<const int32_t*>(dict_child->data);
+            const int64_t  nbytes = static_cast<int64_t>(offs[length]);
+            void* ndata = nullptr;
+            if (nbytes > 0) {
+                if (data == nullptr) return make_empty();
+                ndata = arena_in->copy_into(data, static_cast<size_t>(nbytes));
+                if (ndata == nullptr) return make_empty();
+            }
+            void* noffs = arena_in->copy_into(
+                offs, static_cast<size_t>(length + 1) * sizeof(int32_t));
+            if (noffs == nullptr) return make_empty();
+            BoltColumn* oc = arena_in->allocate_array<BoltColumn>(1);
+            if (oc == nullptr) return make_empty();
+            *oc = BoltColumn::make_flat(static_cast<int32_t*>(noffs), nullptr,
+                                        length + 1, BoltType::Int32);
+            c.data       = ndata;
+            c.dict_child = oc;
+            break;
+        }
         case ColumnFormat::Flat: {
             if (length > 0 && type_size_bytes > 0 && data) {
                 size_t bytes = (size_t)length * (size_t)type_size_bytes;
