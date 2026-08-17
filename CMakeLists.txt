@@ -20,6 +20,19 @@ option(BOLT_BUILD_BENCHMARKS   "Build bolt benchmarks"     ${BOLT_IS_TOPLEVEL})
 option(BOLT_WARNINGS_AS_ERRORS "Treat warnings as errors"  OFF)
 option(BOLT_ENABLE_NATIVE      "Compile benches with -march=native / /arch:AVX2" OFF)
 
+# Declared HERE, with the other options, not next to the install block at the
+# bottom. ybolt/CMakeLists.txt gates its header install on this, and ybolt is
+# added ~400 lines before that block — so a late declaration left BOLT_INSTALL
+# undefined at the point ybolt read it, and bolt::ybolt shipped WITHOUT its
+# header while the target itself exported fine. A package that exports a target
+# whose only header is missing fails in the consumer, not here.
+option(BOLT_INSTALL "Generate install/export rules for bolt" ${BOLT_IS_TOPLEVEL})
+if(SKBUILD)
+    # scikit-build packages whatever cmake-install produces; static archives
+    # have no business inside a Python wheel.
+    set(BOLT_INSTALL OFF)
+endif()
+
 # SIMD tier for bolt::core (propagates to every consumer).
 #   NATIVE   — MSVC /arch:AVX2, GCC/Clang -march=native (best on build host)
 #   AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -msse4.2 (portable modern x86)
@@ -903,8 +916,32 @@ endif()
 # have fired the moment someone built bolt's tests inside a superproject that
 # supplies ycpp. Still before the install block, so `if(TARGET bolt_ybolt)`
 # there still sees it.
+# Dual-mode ycpp resolution. Previously this ONLY tested for an
+# already-defined target, so ybolt could be built exclusively inside a
+# superproject that had already added ycpp — a standalone bolt could not
+# produce bolt::ybolt even with ycpp fully installed and on
+# CMAKE_PREFIX_PATH (measured: the target was simply absent). That matters
+# more than it looks, because bolt::ybolt is the binding consumers actually
+# link; the parent-supplied case was the only one that worked.
+#
+# bolt vendors nothing — it has no .gitmodules — so there is no third
+# "vendored submodule" branch here as there is in marbledb/boltapi/chukonu.
+# ycpp is either supplied by a parent or found as an installed package.
+if(NOT TARGET ycpp::headers AND NOT TARGET ycpp::ycpp)
+    find_package(ycpp QUIET)
+    if(ycpp_FOUND)
+        message(STATUS "bolt: ycpp found as an installed package -- building bolt::ybolt")
+    endif()
+else()
+    message(STATUS "bolt: ycpp supplied by the enclosing project -- building bolt::ybolt")
+endif()
+
 if(TARGET ycpp::headers OR TARGET ycpp::ycpp)
     add_subdirectory(ybolt)
+else()
+    message(STATUS
+        "bolt: ycpp not present -- bolt::ybolt will NOT be built. Install ycpp "
+        "and set CMAKE_PREFIX_PATH, or add it before bolt in a superproject.")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -923,11 +960,6 @@ endif()
 # inside the Python wheel. It also matters for correctness here: bolt_ybolt is
 # only exportable once ycpp is an exported package, so a superproject that
 # supplies ycpp via add_subdirectory must not try to export it.
-option(BOLT_INSTALL "Generate install/export rules for bolt" ${BOLT_IS_TOPLEVEL})
-if(SKBUILD)
-    set(BOLT_INSTALL OFF)
-endif()
-
 include(GNUInstallDirs)          # unconditional: ybolt/ reads CMAKE_INSTALL_*
 include(CMakePackageConfigHelpers)
 
