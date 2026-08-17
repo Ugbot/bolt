@@ -105,6 +105,17 @@ target_include_directories(bolt_core INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(bolt_core INTERFACE cxx_std_20)
+# bolt_scheduler.h spawns std::thread, and bolt_port.h:361 calls
+# pthread_setaffinity_np directly on Linux. Neither implies a link to the
+# threading library on its own. glibc only folded libpthread into libc in
+# 2.34, so on any older platform (manylinux_2_28 is glibc 2.28) every
+# consumer's executables failed with `undefined symbol: pthread_create /
+# pthread_join / pthread_setaffinity_np`. Invisible on macOS (pthread lives
+# in libSystem, always linked) and on new-glibc Linux, which is why nothing
+# caught it until a manylinux build. Attached here, on the target every other
+# bolt module links, so it propagates to all consumers exactly once.
+find_package(Threads REQUIRED)
+target_link_libraries(bolt_core INTERFACE Threads::Threads)
 bolt_apply_hardening(bolt_core)
 bolt_apply_simd(bolt_core ${BOLT_SIMD_TIER})
 bolt_apply_feature_toggles(bolt_core)
@@ -129,7 +140,19 @@ target_link_libraries(bolt INTERFACE
 # invariant intact. The .cpp hosts the 8 KB slicing-by-8 CRC32C tables so
 # they link once per binary.
 # ---------------------------------------------------------------------------
-option(BOLT_BUILD_IO "Build bolt::io compiled library" ${BOLT_IS_TOPLEVEL})
+# Default ON (not ${BOLT_IS_TOPLEVEL}), same reasoning as BOLT_BUILD_RIBBON
+# below: this library is not optional garnish, it is the ONLY definition of
+# `crc32c_software`, which `bolt/io/bolt_crc32c.h` declares unconditionally and
+# CALLS from `crc32c()` whenever neither hardware path is compiled in
+# (BOLT_CRC32C_HW_X86 == 0 && BOLT_CRC32C_HW_ARM == 0). Gating it on "is bolt
+# the top-level project" made a correctness-critical fallback depend on how the
+# consumer happened to vendor us: every submodule consumer (marbledb -> chukonu
+# -> Gestalt2) got BOLT_BUILD_IO=OFF and therefore no definition at all.
+# That was invisible on macOS/arm64 (Apple clang defines __ARM_FEATURE_CRC32 by
+# default, so the header inlines the hardware path and never names the symbol)
+# and on x86_64 built with SSE4.2 — and it is a hard link failure on Linux
+# aarch64 at the default -march=armv8-a, i.e. exactly a manylinux wheel.
+option(BOLT_BUILD_IO "Build bolt::io compiled library" ON)
 
 if(BOLT_BUILD_IO)
     add_library(bolt_io STATIC src/io/bolt_crc32c.cpp)
