@@ -965,9 +965,17 @@ include(CMakePackageConfigHelpers)
 
 if(BOLT_INSTALL)
 
+# `.inc` as well as `.h`. bolt has two .inc files and they are #include'd BY
+# headers (bolt_groupby.h pulls bolt_groupby_twopass.inc), so a *.h-only filter
+# produced an installed bolt that looked complete — 248 of 250 files — and then
+# failed in any consumer that reached the groupby path:
+#   fatal error: 'bolt/join/bolt_groupby_twopass.inc' file not found
+# Found by chukonu, not by bolt's own consumer test, because that test only
+# touched bolt_arena.h. A partial header install is worse than none: it passes
+# every check that counts files or asks whether install succeeded.
 install(DIRECTORY include/bolt
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING PATTERN "*.h"
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.inc"
 )
 
 # Every optional target is included only if it was actually CREATED, tested by
