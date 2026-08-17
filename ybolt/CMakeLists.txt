@@ -23,10 +23,23 @@ target_link_libraries(bolt_ybolt INTERFACE
     ycpp::headers
 )
 
-# NOTE: ybolt is NOT folded into the bolt umbrella INTERFACE target — its
-# install set is independent. Consumers that want the binding link
-# `bolt::ybolt` explicitly. This keeps bolt's existing `bolt-targets`
-# install export clean.
+# ybolt is NOT folded into the bolt umbrella INTERFACE target — consumers that
+# want the binding link `bolt::ybolt` explicitly.
+#
+# The previous note here claimed ybolt's "install set is independent". No such
+# install set existed anywhere in the repo, so bolt::ybolt could not be
+# installed at all while `$<INSTALL_INTERFACE:include>` above promised a header
+# location nothing ever populated. bolt_ybolt now joins bolt's own export set
+# (see the parent CMakeLists), and the header it promises is installed here.
+#
+# Note this target links ycpp::headers INTERFACE, so exporting it requires ycpp
+# to be an exported package too — bolt-config.cmake.in find_dependency's ycpp
+# when ybolt was built.
+if(BOLT_INSTALL)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/bolt
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            FILES_MATCHING PATTERN "*.h")
+endif()
 
 if(BOLT_BUILD_TESTS)
     add_subdirectory(tests)
@@ -34,8 +47,16 @@ endif()
 
 # Yjs interop CLI — exercises ycpp's algorithm through bolt::Arena.
 # Driven by extern/ycpp/tools/yjs_interop/test.js with `node test.js path/to/ybolt_cli`.
-add_executable(ybolt_cli tools/ybolt_cli.cpp)
-target_link_libraries(ybolt_cli PRIVATE bolt::ybolt)
-if(COMMAND bolt_apply_hardening)
-    bolt_apply_hardening(ybolt_cli)
+#
+# Gated: this was the one unguarded add_executable in bolt. It was built
+# whenever a ycpp target happened to be present, regardless of
+# BOLT_BUILD_TESTS/BENCHMARKS — so an embedding build that asked for no tests
+# and no benchmarks still compiled and linked a CLI it never uses.
+option(BOLT_BUILD_YBOLT_CLI "Build the ybolt Yjs-interop CLI" ${BOLT_BUILD_TESTS})
+if(BOLT_BUILD_YBOLT_CLI)
+    add_executable(ybolt_cli tools/ybolt_cli.cpp)
+    target_link_libraries(ybolt_cli PRIVATE bolt::ybolt)
+    if(COMMAND bolt_apply_hardening)
+        bolt_apply_hardening(ybolt_cli)
+    endif()
 endif()

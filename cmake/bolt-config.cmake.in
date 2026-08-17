@@ -1,5 +1,68 @@
 @PACKAGE_INIT@
 
+# bolt's exported targets carry IMPORTED dependencies in their interfaces —
+# OpenSSL::SSL / OpenSSL::Crypto (bolt::crypto, bolt::net), Vulkan::Vulkan
+# (bolt::vulkan), ZLIB::ZLIB (bolt::ingest). Nothing re-found them here, so
+# `find_package(bolt)` in a fresh project failed at generate time complaining
+# about undefined imported targets: the export named them but the consumer had
+# no way to resolve them. That made the installed package effectively unusable
+# even though the install rules themselves were correct.
+#
+# Each find_dependency is guarded by what this bolt was ACTUALLY built with —
+# the flags are baked in by configure_package_config_file — so a consumer of a
+# minimal bolt is not forced to have OpenSSL or Vulkan on the machine.
+include(CMakeFindDependencyMacro)
+
+set(BOLT_BUILT_WITH_CRYPTO    @BOLT_BUILD_CRYPTO@)
+set(BOLT_BUILT_WITH_NET       @BOLT_BUILD_NET@)
+set(BOLT_BUILT_WITH_TLS       @BOLT_WITH_TLS@)
+set(BOLT_BUILT_WITH_VULKAN    @BOLT_BUILD_VULKAN@)
+set(BOLT_BUILT_WITH_INGEST    @BOLT_BUILD_INGEST@)
+set(BOLT_BUILT_WITH_ZLIB      @BOLT_WITH_ZLIB@)
+set(BOLT_BUILT_WITH_REACTOR   @BOLT_BUILD_REACTOR@)
+set(BOLT_BUILT_WITH_PARSE     @BOLT_BUILD_PARSE@)
+set(BOLT_BUILT_WITH_LAKEHOUSE @BOLT_BUILD_LAKEHOUSE@)
+
+# OpenSSL reaches the interface through bolt::crypto and bolt::net, but only
+# when TLS was actually enabled (BOLT_WITH_TLS is itself derived from whether
+# OpenSSL was found at bolt's own configure time).
+if(BOLT_BUILT_WITH_TLS AND (BOLT_BUILT_WITH_CRYPTO OR BOLT_BUILT_WITH_NET))
+    find_dependency(OpenSSL)
+endif()
+
+if(BOLT_BUILT_WITH_VULKAN)
+    find_dependency(Vulkan)
+endif()
+
+if(BOLT_BUILT_WITH_INGEST AND BOLT_BUILT_WITH_ZLIB)
+    find_dependency(ZLIB)
+endif()
+
+# bolt::ybolt links ycpp::headers in its INTERFACE, so a consumer of an
+# installed bolt that uses the binding needs ycpp resolved first. bolt does not
+# vendor ycpp — it only binds to it when a superproject supplies the target —
+# so this fires only for a bolt that was actually built with ybolt.
+set(BOLT_BUILT_WITH_YBOLT @BOLT_HAS_YBOLT@)
+if(BOLT_BUILT_WITH_YBOLT)
+    find_dependency(ycpp)
+endif()
+
+# zstd and lz4 ARE needed here, which is not obvious. bolt links them PRIVATEly,
+# but bolt_ingest is a STATIC library — and CMake records a static library's
+# PRIVATE link deps as `$<LINK_ONLY:...>` in INTERFACE_LINK_LIBRARIES so they
+# still reach the consumer's final link line. Verified in the generated
+# bolt-targets.cmake, which contains
+# `$<LINK_ONLY:zstd::libzstd_shared>;$<LINK_ONLY:ZLIB::ZLIB>`. A LINK_ONLY
+# entry is not exempt from having to EXIST: the consumer's configure fails on
+# the undefined imported target exactly as it would for a PUBLIC one.
+# "PRIVATE means the consumer does not need it" is true for include dirs and
+# compile flags, and false for link libraries of a static archive.
+set(BOLT_BUILT_WITH_ZSTD @BOLT_WITH_ZSTD@)
+set(BOLT_BUILT_WITH_LZ4  @BOLT_WITH_LZ4@)
+if(BOLT_BUILT_WITH_INGEST AND BOLT_BUILT_WITH_ZSTD)
+    find_dependency(zstd)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/bolt-targets.cmake")
 
 check_required_components(bolt)

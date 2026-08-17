@@ -17,6 +17,34 @@
 
 include_guard(GLOBAL)
 
+# _bolt_build_only_opts(tgt scope flags...)
+#   Apply compile options that must NOT travel to a consumer of an INSTALLED
+#   bolt. For an INTERFACE library these are wrapped in $<BUILD_INTERFACE:...>,
+#   so in-tree consumers still get them (behaviour unchanged, including the
+#   perf-critical ISA flag) while install(EXPORT) emits nothing.
+#
+#   Why this exists: bolt_core is an INTERFACE library, so bolt_apply_hardening
+#   and bolt_apply_simd applied their flags with INTERFACE scope — meaning the
+#   exported bolt-targets.cmake handed every third-party consumer bolt's entire
+#   warning policy AND `-march=native`. A shipped library must not dictate a
+#   consumer's warnings, and -march=native is actively wrong on any machine
+#   other than the one that built it.
+#
+#   Conformance flags (/permissive-, /Zc:*, /EHsc, /utf-8, /wd*, /DNOMINMAX)
+#   are deliberately NOT routed through here: they affect whether bolt's own
+#   headers compile correctly in the consumer, so they must be exported.
+function(_bolt_build_only_opts tgt scope)
+    if(scope STREQUAL "INTERFACE")
+        set(_wrapped "")
+        foreach(_f IN LISTS ARGN)
+            list(APPEND _wrapped "$<BUILD_INTERFACE:${_f}>")
+        endforeach()
+        target_compile_options(${tgt} INTERFACE ${_wrapped})
+    else()
+        target_compile_options(${tgt} ${scope} ${ARGN})
+    endif()
+endfunction()
+
 function(bolt_apply_hardening tgt)
     get_target_property(type ${tgt} TYPE)
     if(type STREQUAL "INTERFACE_LIBRARY")
@@ -36,8 +64,8 @@ function(bolt_apply_hardening tgt)
         # llm-station's tool-registry dynamic_cast); propagating `/GR-` via
         # INTERFACE caused silent crashes in consumer code on Windows where
         # consumer dynamic_cast sites compiled to UB.
+        _bolt_build_only_opts(${tgt} ${scope} /W4)
         target_compile_options(${tgt} ${scope}
-            /W4
             /permissive-
             /Zc:__cplusplus
             /Zc:preprocessor
@@ -53,10 +81,10 @@ function(bolt_apply_hardening tgt)
             target_compile_options(${tgt} PRIVATE /GR-)
         endif()
         if(BOLT_WARNINGS_AS_ERRORS)
-            target_compile_options(${tgt} ${scope} /WX)
+            _bolt_build_only_opts(${tgt} ${scope} /WX)
         endif()
     else()
-        target_compile_options(${tgt} ${scope}
+        _bolt_build_only_opts(${tgt} ${scope}
             -Wall
             -Wextra
             -Wpedantic
@@ -73,7 +101,7 @@ function(bolt_apply_hardening tgt)
             target_compile_options(${tgt} PRIVATE -fno-exceptions -fno-rtti)
         endif()
         if(BOLT_WARNINGS_AS_ERRORS)
-            target_compile_options(${tgt} ${scope} -Werror)
+            _bolt_build_only_opts(${tgt} ${scope} -Werror)
         endif()
     endif()
 endfunction()
@@ -108,22 +136,22 @@ function(bolt_apply_simd tgt mode)
 
     if(mode_up STREQUAL "NATIVE")
         if(MSVC)
-            target_compile_options(${tgt} ${scope} /arch:AVX2)
+            _bolt_build_only_opts(${tgt} ${scope} /arch:AVX2)
         else()
-            target_compile_options(${tgt} ${scope} -march=native)
+            _bolt_build_only_opts(${tgt} ${scope} -march=native)
         endif()
     elseif(mode_up STREQUAL "AVX512")
         if(MSVC)
-            target_compile_options(${tgt} ${scope} /arch:AVX512)
+            _bolt_build_only_opts(${tgt} ${scope} /arch:AVX512)
         else()
-            target_compile_options(${tgt} ${scope}
+            _bolt_build_only_opts(${tgt} ${scope}
                 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx2 -msse4.2)
         endif()
     elseif(mode_up STREQUAL "AVX2")
         if(MSVC)
-            target_compile_options(${tgt} ${scope} /arch:AVX2)
+            _bolt_build_only_opts(${tgt} ${scope} /arch:AVX2)
         else()
-            target_compile_options(${tgt} ${scope} -mavx2 -msse4.2)
+            _bolt_build_only_opts(${tgt} ${scope} -mavx2 -msse4.2)
         endif()
     elseif(mode_up STREQUAL "SSE42")
         if(MSVC)
@@ -132,7 +160,7 @@ function(bolt_apply_simd tgt mode)
             # NOT auto-defined, so bolt_port.h will fall through to the
             # scalar path unless /arch:AVX2 is used.
         else()
-            target_compile_options(${tgt} ${scope} -msse4.2)
+            _bolt_build_only_opts(${tgt} ${scope} -msse4.2)
         endif()
     elseif(mode_up STREQUAL "PORTABLE")
         # Intentionally no flag — compiler baseline only.

@@ -658,11 +658,28 @@ if(BOLT_BUILD_INGEST)
             # bare name propagates to consumers with no -L search dir and the
             # final link fails. Fall back to bare names + link dirs if the
             # absolute-path var is empty on this CMake/pkg-config.
+            # PRIVATE, not PUBLIC. bolt_ingest is a STATIC library, so CMake
+            # records its PRIVATE link deps as $<LINK_ONLY:...> in
+            # INTERFACE_LINK_LIBRARIES — they still reach a consumer's final
+            # link line, which is the behaviour the note above wanted. PUBLIC
+            # additionally put them in the consumer's *usage* interface for no
+            # benefit.
+            #
+            # HONEST LIMITATION for a SHIPPED bolt: this branch only runs when
+            # lz4 was found by pkg-config and NOT as a CMake config package, and
+            # in that case the path baked into bolt-targets.cmake is an absolute
+            # build-machine path (e.g. /opt/homebrew/...). That is fine for an
+            # in-tree build and wrong for a binary handed to someone else. A
+            # distributable bolt should be configured against a CMake-config lz4
+            # (giving the lz4::lz4 branch above) or with -DBOLT_WITH_LZ4=OFF.
+            # The check further down warns when this combination is about to be
+            # installed rather than letting it ship silently.
+            set(BOLT_LZ4_VIA_PKGCONFIG_ABSPATH ON)
             if(LZ4_PC_LINK_LIBRARIES)
-                target_link_libraries(bolt_ingest PUBLIC ${LZ4_PC_LINK_LIBRARIES})
+                target_link_libraries(bolt_ingest PRIVATE ${LZ4_PC_LINK_LIBRARIES})
             else()
-                target_link_libraries(bolt_ingest PUBLIC ${LZ4_PC_LIBRARIES})
-                target_link_directories(bolt_ingest PUBLIC ${LZ4_PC_LIBRARY_DIRS})
+                target_link_libraries(bolt_ingest PRIVATE ${LZ4_PC_LIBRARIES})
+                target_link_directories(bolt_ingest PRIVATE ${LZ4_PC_LIBRARY_DIRS})
             endif()
         endif()
     endif()
@@ -681,7 +698,17 @@ endif()
 # below -- bolt::lakehouse genuinely cannot link without crypto/net/parse.
 option(BOLT_BUILD_CRYPTO    "Build bolt::crypto (SigV4 + Noise XX + Ed25519)" ON)
 option(BOLT_BUILD_NET       "Build bolt::net (TLS + HTTP client)"             ON)
-option(BOLT_BUILD_LAKEHOUSE "Build bolt::lakehouse (Delta + Iceberg + catalogs + object stores)" ON)
+# DEFAULT follows BOLT_BUILD_PARSE rather than being a flat ON. lakehouse
+# requires crypto + net + parse (enforced below). crypto and net also default
+# ON, but parse defaults to ${BOLT_IS_TOPLEVEL} — so with plain defaults a
+# `add_subdirectory(bolt)` embedder got LAKEHOUSE=ON and PARSE=OFF and the
+# configure died on an impossible combination it never asked for. Every
+# embedder in this family had to know to force PARSE=ON first, which is exactly
+# the kind of undocumented handshake that makes a library hard to consume.
+# An EXPLICIT -DBOLT_BUILD_LAKEHOUSE=ON with parse off still errors below: that
+# request really is impossible, and silently flipping a switch the caller set
+# is worse than saying so.
+option(BOLT_BUILD_LAKEHOUSE "Build bolt::lakehouse (Delta + Iceberg + catalogs + object stores)" ${BOLT_BUILD_PARSE})
 
 # bolt::lakehouse links bolt::crypto (SigV4), bolt::net (HTTP/TLS for the REST
 # catalogs) and bolt::parse (fionn JSON). Fail loudly on an impossible combo
@@ -858,10 +885,6 @@ endif()  # BOLT_BUILD_LAKEHOUSE
 # and a `make_doc(arena, client_id)` helper once ycpp W3 ships. The seam
 # is policy-based templates — every alloc inlines through bolt::Arena.
 # ---------------------------------------------------------------------------
-if(TARGET ycpp::headers OR TARGET ycpp::ycpp)
-    add_subdirectory(ybolt)
-endif()
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -869,6 +892,19 @@ if(BOLT_BUILD_TESTS)
     enable_testing()
     include(BoltGTest)
     add_subdirectory(tests)
+endif()
+
+# ybolt is added AFTER the tests block on purpose. ybolt/tests links
+# GTest::gtest / GTest::gtest_main, and those targets are defined by
+# include(BoltGTest) above — with ybolt added first, a build with
+# BOLT_BUILD_TESTS=ON and ycpp present referenced GTest before it existed.
+# That never fired in practice (bolt standalone has no ycpp, and Gestalt2
+# forces BOLT_BUILD_TESTS=OFF), which is exactly why it survived; it would
+# have fired the moment someone built bolt's tests inside a superproject that
+# supplies ycpp. Still before the install block, so `if(TARGET bolt_ybolt)`
+# there still sees it.
+if(TARGET ycpp::headers OR TARGET ycpp::ycpp)
+    add_subdirectory(ybolt)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -881,24 +917,44 @@ endif()
 # ---------------------------------------------------------------------------
 # Install + export
 # ---------------------------------------------------------------------------
-include(GNUInstallDirs)
+# Gated. These rules used to be unconditional, which is wrong in two ways for
+# an embedded build: a superproject acquires install rules it never asked for,
+# and — under scikit-build's cmake-install packaging — the static archives land
+# inside the Python wheel. It also matters for correctness here: bolt_ybolt is
+# only exportable once ycpp is an exported package, so a superproject that
+# supplies ycpp via add_subdirectory must not try to export it.
+option(BOLT_INSTALL "Generate install/export rules for bolt" ${BOLT_IS_TOPLEVEL})
+if(SKBUILD)
+    set(BOLT_INSTALL OFF)
+endif()
+
+include(GNUInstallDirs)          # unconditional: ybolt/ reads CMAKE_INSTALL_*
 include(CMakePackageConfigHelpers)
+
+if(BOLT_INSTALL)
 
 install(DIRECTORY include/bolt
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h"
 )
 
-set(_bolt_install_targets bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt bolt_ribbon bolt_net bolt_crypto bolt_lakehouse)
-if(BOLT_BUILD_IO)
-    list(APPEND _bolt_install_targets bolt_io)
-endif()
-if(BOLT_BUILD_PARSE)
-    list(APPEND _bolt_install_targets bolt_parse)
-endif()
-if(BOLT_BUILD_VULKAN)
-    list(APPEND _bolt_install_targets bolt_vulkan)
-endif()
+# Every optional target is included only if it was actually CREATED, tested by
+# `if(TARGET ...)` rather than by re-deriving its option. The previous list
+# named bolt_ribbon / bolt_net / bolt_crypto / bolt_lakehouse unconditionally
+# even though each is option-gated, so `-DBOLT_BUILD_NET=OFF` made
+# install(TARGETS) hard-error at configure on a target that does not exist.
+# Re-deriving the option is what caused that; asking whether the target exists
+# cannot drift from the code that creates it.
+#
+# bolt_reactor was missing from this list entirely, with no comment. That is
+# not cosmetic: boltapi links bolt::reactor, so an INSTALLED bolt could never
+# satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
+# "its install set is independent", but no such install set exists anywhere.
+set(_bolt_exportable
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt
+    bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
+    bolt_io bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
+    bolt_ybolt)
 ## BLLM-99: bolt_rocm is an IMPORTED target (built via a direct clang++
 ## invocation, not enable_language(HIP) -- see that block's own comment) --
 ## install(TARGETS) does not support imported targets ("given target
@@ -906,14 +962,38 @@ endif()
 ## the install list. A consumer wanting to install bolt::rocm's own
 ## artifact would need to install "${_bolt_rocm_lib}" as a FILE, not a
 ## TARGET -- not needed for this repo's own build+test use, so not added.
-if(BOLT_BUILD_INGEST)
-    list(APPEND _bolt_install_targets bolt_ingest)
-endif()
-if(BOLT_BUILD_COMPUTE_IDOT)
-    list(APPEND _bolt_install_targets bolt_compute_idot)
-endif()
+set(_bolt_install_targets "")
+foreach(_bolt_t IN LISTS _bolt_exportable)
+    if(TARGET ${_bolt_t})
+        list(APPEND _bolt_install_targets ${_bolt_t})
+    endif()
+endforeach()
+# The five header-only targets always exist; if one is missing the list above
+# has a typo and a consumer would discover it as a missing target much later.
+foreach(_bolt_t IN ITEMS bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt)
+    if(NOT TARGET ${_bolt_t})
+        message(FATAL_ERROR "bolt: core target ${_bolt_t} missing from the build")
+    endif()
+endforeach()
+
+# ONE VOCABULARY. Without EXPORT_NAME, `install(EXPORT ... NAMESPACE bolt::)`
+# exports bolt::bolt_core / bolt::bolt_net / bolt::bolt_ingest, while
+# add_subdirectory gives bolt::core / bolt::net / bolt::ingest. Only bolt::bolt
+# coincided. A consumer written against one resolution mode then fails to
+# configure against the other, which is a silent trap for anyone linking an
+# installed bolt. Every alias in this file is `bolt::` + the target name with
+# its `bolt_` prefix stripped (verified for all 15), so deriving EXPORT_NAME the
+# same way keeps the two spellings identical by construction.
+foreach(_bolt_t IN LISTS _bolt_install_targets)
+    string(REGEX REPLACE "^bolt_" "" _bolt_export_name "${_bolt_t}")
+    set_target_properties(${_bolt_t} PROPERTIES EXPORT_NAME ${_bolt_export_name})
+endforeach()
+
 install(TARGETS ${_bolt_install_targets}
     EXPORT bolt-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 install(EXPORT bolt-targets
@@ -942,6 +1022,14 @@ message(STATUS "bolt: compiled targets -- "
                "vulkan=${BOLT_BUILD_VULKAN} rocm=${BOLT_BUILD_ROCM} "
                "compute_idot=${BOLT_BUILD_COMPUTE_IDOT}")
 
+# Whether ybolt actually got built — bolt-config.cmake.in find_dependency's
+# ycpp only in that case.
+if(TARGET bolt_ybolt)
+    set(BOLT_HAS_YBOLT ON)
+else()
+    set(BOLT_HAS_YBOLT OFF)
+endif()
+
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bolt-config.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/bolt-config.cmake
@@ -953,3 +1041,17 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/bolt-config-version.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/bolt
 )
+
+# An lz4 resolved only via pkg-config bakes an absolute build-machine path into
+# bolt-targets.cmake (see the BOLT_WITH_LZ4 block). That is invisible until
+# someone unpacks the package on a different machine, so say it out loud at the
+# moment the package is about to be produced.
+if(BOLT_LZ4_VIA_PKGCONFIG_ABSPATH)
+    message(WARNING
+        "bolt: lz4 was found only via pkg-config, so bolt-targets.cmake will "
+        "carry an absolute path from THIS machine. Fine for a local build; for "
+        "a distributable package configure against a CMake-config lz4 or use "
+        "-DBOLT_WITH_LZ4=OFF.")
+endif()
+
+endif()  # BOLT_INSTALL
