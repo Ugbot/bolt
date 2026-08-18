@@ -512,11 +512,38 @@ bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
 }
 
 // Gather dictionary entries (already in output representation).
-bool dict_gather(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
-                 int64_t row0, uint32_t nrows, uint32_t nvalid) noexcept {
+//
+// The element width is a COMPILE-TIME parameter on purpose. Written as
+// `memcpy(dst, src, cx->elem)` with a runtime width, the compiler cannot see
+// the size and emits a call to libc `memmove` for every single value; on
+// ClickBench `hits` (99,997,497 rows) that call was measured at ~34% of ALL
+// decode CPU — more than snappy and the RLE unpacker combined — to move four
+// bytes a hundred million times. With `W` constant the same `memcpy` lowers to
+// one load/store pair and no call at all. `memcpy` (not a typed `T*` store) is
+// deliberate: it keeps the gather alignment-agnostic and free of any
+// strict-aliasing assumption about the arena buffers.
+template <uint32_t W>
+void dict_gather_dense(uint8_t* BOLT_RESTRICT out,
+                       const uint8_t* BOLT_RESTRICT dict,
+                       const uint32_t* BOLT_RESTRICT idx,
+                       uint32_t n) noexcept {
+    assert(out != nullptr || n == 0);
+    assert(dict != nullptr || n == 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        std::memcpy(out + static_cast<uint64_t>(i) * W,
+                    dict + static_cast<uint64_t>(idx[i]) * W, W);
+    }
+}
+
+// Nullable / code-tracking gather: one row at a time, but still a
+// compile-time-width copy. Reached only by an OPTIONAL column that actually
+// contains nulls, or by Utf8 (which carries the G2FEAT-152 code hint).
+template <uint32_t W>
+bool dict_gather_sparse(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
+                        int64_t row0, uint32_t nrows,
+                        uint32_t nvalid) noexcept {
     assert(cx != nullptr && cx->out != nullptr);
-    if (cx->dict == nullptr) return false;
-    const uint32_t w = cx->elem;
+    assert(cx->dict != nullptr);
     uint32_t k = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] == 0u) {
@@ -525,15 +552,55 @@ bool dict_gather(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
             continue;
         }
         if (k >= nvalid) return false;
-        const uint32_t id = idx[k++];
-        if (id >= cx->dict_n) return false;
+        const uint32_t id = idx[k++];          // range pre-validated by caller
         if (cx->codes != nullptr) {
             cx->codes[row0 + i] = static_cast<int32_t>(id);
         }
-        std::memcpy(cx->out + (static_cast<uint64_t>(row0) + i) * w,
-                    cx->dict + static_cast<uint64_t>(id) * w, w);
+        std::memcpy(cx->out + (static_cast<uint64_t>(row0) + i) * W,
+                    cx->dict + static_cast<uint64_t>(id) * W, W);
     }
     return k == nvalid;
+}
+
+bool dict_gather(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
+                 int64_t row0, uint32_t nrows, uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(idx != nullptr || nvalid == 0);
+    if (cx->dict == nullptr) return false;
+    const uint32_t w = cx->elem;
+
+    // Validate the whole index block ONCE with a max-reduction the compiler
+    // vectorizes, instead of an `id >= dict_n` branch per value. Every index
+    // the gather below can consume lies in [0, nvalid), so this is a superset
+    // of the old per-value check: any page the old code accepted is accepted
+    // here with byte-identical output, and a corrupt page is now rejected
+    // BEFORE any row is written rather than partway through.
+    uint32_t mx = 0;
+    for (uint32_t k = 0; k < nvalid; ++k) mx = (idx[k] > mx) ? idx[k] : mx;
+    if (nvalid > 0 && mx >= cx->dict_n) return false;
+
+    // Dense fast path: no nulls to skip and no code hint to record, so the
+    // gather is a pure permutation of `nrows` values.
+    if (def == nullptr && cx->codes == nullptr) {
+        if (nrows != nvalid) return false;   // dense page: every row valid
+        uint8_t* out = cx->out + static_cast<uint64_t>(row0) * w;
+        switch (w) {
+            case 8:  dict_gather_dense<8>(out, cx->dict, idx, nrows);  return true;
+            case 4:  dict_gather_dense<4>(out, cx->dict, idx, nrows);  return true;
+            case 16: dict_gather_dense<16>(out, cx->dict, idx, nrows); return true;
+            case 2:  dict_gather_dense<2>(out, cx->dict, idx, nrows);  return true;
+            case 1:  dict_gather_dense<1>(out, cx->dict, idx, nrows);  return true;
+            default: return false;
+        }
+    }
+    switch (w) {
+        case 8:  return dict_gather_sparse<8>(cx, idx, def, row0, nrows, nvalid);
+        case 4:  return dict_gather_sparse<4>(cx, idx, def, row0, nrows, nvalid);
+        case 16: return dict_gather_sparse<16>(cx, idx, def, row0, nrows, nvalid);
+        case 2:  return dict_gather_sparse<2>(cx, idx, def, row0, nrows, nvalid);
+        case 1:  return dict_gather_sparse<1>(cx, idx, def, row0, nrows, nvalid);
+        default: return false;
+    }
 }
 
 // ---- pages -------------------------------------------------------------------
