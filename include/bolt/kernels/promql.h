@@ -15,3 +15,4 @@
 #include "bolt/kernels/promql_rate.h"
 #include "bolt/kernels/promql_deriv.h"
 #include "bolt/kernels/promql_histogram.h"
+#include "bolt/kernels/promql_over_time.h"

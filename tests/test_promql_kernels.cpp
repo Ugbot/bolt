@@ -278,3 +278,28 @@ TEST(PromqlRate, TooFewSamplesIsNan) {
     EXPECT_EQ(promql_resets(val, 1), 0);
     EXPECT_EQ(promql_changes(val, 1), 0);
 }
+
+// functions.test: stdvar_over_time(metric[2m]) of 0,8,8,2,3 => 10.56
+TEST(PromqlOverTime, StdvarStddevQuantileMad) {
+    double a[5] = {0, 8, 8, 2, 3};
+    EXPECT_NEAR(bolt::promql::promql_stdvar(a, 5), 10.56, 1e-10);
+    EXPECT_NEAR(bolt::promql::promql_stddev(a, 5), 3.249615, 1e-6);
+
+    double two[2] = {0, 1};
+    EXPECT_NEAR(bolt::promql::promql_quantile(two, 2, 0.5), 0.5, 1e-12);
+    double three[3] = {0, 1, 2};
+    EXPECT_NEAR(bolt::promql::promql_quantile(three, 3, 0.75), 1.5, 1e-12);
+    double uneven[3] = {0, 1, 4};
+    EXPECT_NEAR(bolt::promql::promql_quantile(uneven, 3, 0.75), 2.5, 1e-12);
+
+    double mad[7] = {4, 6, 2, 1, 999, 1, 2};
+    EXPECT_NEAR(bolt::promql::promql_mad(mad, 7), 1.0, 1e-12);
+
+    double nanv[3] = {1, std::numeric_limits<double>::quiet_NaN(), 4};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_mad(nanv, 3)));
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(two, 0, 0.5)));
+    double qn[2] = {0, 1};
+    EXPECT_EQ(bolt::promql::promql_quantile(qn, 2, -1.0), -kInf);
+    double qp[2] = {0, 1};
+    EXPECT_EQ(bolt::promql::promql_quantile(qp, 2, 2.0), kInf);
+}
