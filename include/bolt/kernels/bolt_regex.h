@@ -190,6 +190,7 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
             if (stack_n == 0) return false;
             const uint16_t start_idx = group_stack[--stack_n];
             n->kind = NodeKind::GroupEnd;
+            n->group_id = out->nodes[start_idx].group_id;
             ++i;
             out->nodes[start_idx].match_group_end =
                 static_cast<uint16_t>(out->n_nodes);
@@ -380,7 +381,20 @@ inline bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
             return regex_match_seq(cp, st, static_cast<uint16_t>(node_i + 1),
                                    outer_hi, pos, out_pos);
         case NodeKind::GroupStart:
+            // An ordinary group is a structural boundary, not an isolated
+            // sub-match. Walking straight through its body lets greedy atoms
+            // backtrack against the sequence after ')' (for example
+            // `^(.*)-value-(.*)$`) and permits an empty `(.*)` capture.
+            if (n.min_rep == 1 && n.max_rep == 1) {
+                if (n.group_id > 0) st->mr->g_start[n.group_id] = pos;
+                return regex_match_seq(cp, st,
+                    static_cast<uint16_t>(node_i + 1), outer_hi, pos, out_pos);
+            }
             return regex_match_group_rep(cp, st, node_i, outer_hi, pos, out_pos);
+        case NodeKind::GroupEnd:
+            if (n.group_id > 0) st->mr->g_end[n.group_id] = pos;
+            return regex_match_seq(cp, st,
+                static_cast<uint16_t>(node_i + 1), outer_hi, pos, out_pos);
         case NodeKind::Char:
         case NodeKind::Any:
         case NodeKind::Class:

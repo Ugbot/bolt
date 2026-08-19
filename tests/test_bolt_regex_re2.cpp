@@ -58,6 +58,14 @@ bool BSearch(const char* pat, const char* text) {
     return regex_search(&cp, text, static_cast<int32_t>(std::strlen(text)), &mr);
 }
 
+bool BCapture(const char* pat, const char* text, MatchResult* out) {
+    CompiledPattern cp;
+    const bool ok = regex_compile(pat, static_cast<uint32_t>(std::strlen(pat)), &cp);
+    EXPECT_TRUE(ok) << "compile failed for /" << pat << "/";
+    if (!ok) return false;
+    return regex_search(&cp, text, static_cast<int32_t>(std::strlen(text)), out);
+}
+
 TEST(RegexBacktrack, DotDoesNotMatchNewline) {
     // The exact ClickBench Q29 shape, reduced.
     const char* pat = "^https?://(?:www\.)?([^/]+)/.*$";
@@ -85,6 +93,19 @@ TEST(RegexBacktrack, DotDoesNotMatchNewline) {
     EXPECT_EQ(BSearch("^a.b$", "a\nb"), M("^a.b$", "a\nb"));
     EXPECT_EQ(BSearch("^a.b$", "axb"),  M("^a.b$", "axb"));
     EXPECT_EQ(BSearch("^.*$",  "a\nb"), M("^.*$",  "a\nb"));
+}
+
+TEST(RegexBacktrack, CapturesBacktrackAcrossGroupBoundary) {
+    MatchResult mr{};
+    ASSERT_TRUE(BCapture("^(.*)-value-(.*)$", "source-value-10", &mr));
+    ASSERT_EQ(mr.g_start[1], 0);
+    ASSERT_EQ(mr.g_end[1], 6);
+    ASSERT_EQ(mr.g_start[2], 13);
+    ASSERT_EQ(mr.g_end[2], 15);
+
+    ASSERT_TRUE(BCapture("^(.*)$", "", &mr));
+    EXPECT_EQ(mr.g_start[1], 0);
+    EXPECT_EQ(mr.g_end[1], 0);
 }
 
 }  // namespace
