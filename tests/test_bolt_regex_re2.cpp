@@ -260,6 +260,14 @@ TEST(Re2ICase, ScopedGroupFlag) {
     EXPECT_FALSE(M("(?i:ab)CD", "ABcd"));         // 'cd' lower, but CD required
 }
 
+TEST(Re2Quantifier, LazySuffixPreservesMembership) {
+    EXPECT_TRUE(M(".*?(?i:PRO).*", "production"));
+    EXPECT_TRUE(M(".*(?i:TION).*?", "production"));
+    EXPECT_TRUE(M("a+?b", "aaab"));
+    EXPECT_TRUE(M("a{2,4}?b", "aaab"));
+    EXPECT_FALSE(M(".*?(?i:PRO).*", "staging"));
+}
+
 TEST(Re2ICase, PrefixFlag) {
     // (?i) applies to the rest of the pattern
     EXPECT_TRUE(M("(?i)hello", "HELLO"));

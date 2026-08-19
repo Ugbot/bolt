@@ -487,7 +487,7 @@ inline int32_t regex_substitute(const MatchResult* mr, const char* text,
 //
 // Supported (RE2 common subset):
 //   a|b|c            alternation (top-level and inside any group)
-//   *  +  ?          greedy quantifiers
+//   *  +  ?          quantifiers; optional lazy suffix accepted for membership
 //   {m} {m,} {m,n}   counted repetition (m,n bounded by kRe2MaxRepeat)
 //   .                any byte EXCEPT newline (RE2 default, no `s` flag)
 //   [abc] [a-z] [^..] character class, ranges, negation, leading `]` literal
@@ -803,13 +803,18 @@ inline void re2_parse_quantifier(Re2C* c, uint32_t* pos, uint32_t end,
     assert(*pos <= end);
     *mn = 1; *mx = 1;
     if (*pos >= end) return;
+    bool quantified = true;
     switch (c->pat[*pos]) {
-        case '*': *mn = 0; *mx = -1; ++(*pos); return;
-        case '+': *mn = 1; *mx = -1; ++(*pos); return;
-        case '?': *mn = 0; *mx = 1;  ++(*pos); return;
-        case '{': re2_parse_brace(c, pos, end, mn, mx); return;
-        default:  return;
+        case '*': *mn = 0; *mx = -1; ++(*pos); break;
+        case '+': *mn = 1; *mx = -1; ++(*pos); break;
+        case '?': *mn = 0; *mx = 1;  ++(*pos); break;
+        case '{': re2_parse_brace(c, pos, end, mn, mx); break;
+        default:  quantified = false; break;
     }
+    // Thompson membership is independent of greedy/lazy preference. Consume
+    // RE2's lazy suffix so `.*?x` has the same accept set as `.*x` without
+    // introducing ordered backtracking into the bounded NFA.
+    if (quantified && c->ok && *pos < end && c->pat[*pos] == '?') ++(*pos);
 }
 
 // ------------------------------ compile (mutually recursive) ----------
