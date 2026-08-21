@@ -17,6 +17,8 @@
 #include "bolt/ingest/bolt_parquet_read.h"
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "bolt/bolt_arena.h"
@@ -260,6 +262,21 @@ struct ColCtx {
     int32_t  ts_rescale;        // 0 none / 1 millis*1000 / 2 nanos/1000 -> us
 };
 
+// BOLT_PQ_DIAG=1 names WHICH bound a spilled-string decode hit. All three
+// paths returned a bare false, reported upstream as an opaque decode
+// failure. They are different problems: allocation, capacity sizing, and a
+// format ceiling. Latched to one report per process.
+bool bolt_pq_diag() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("BOLT_PQ_DIAG");
+        return e != nullptr && e[0] == '1';
+    }();
+    static bool fired = false;
+    if (!on || fired) return false;
+    fired = true;
+    return true;
+}
+
 // Build a StringView; >12-byte payloads spill into the column overflow.
 bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
                    StringView* out) noexcept {
@@ -274,10 +291,27 @@ bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
         if (len > 4u) std::memcpy(out->inline_data, p + 4, len - 4u);
         return true;
     }
-    if (cx->overflow == nullptr) return false;
+    if (cx->overflow == nullptr) {
+        if (bolt_pq_diag())
+            std::fprintf(stderr, "bolt parquet: NO OVERFLOW BUFFER for a "
+                                 ">12-byte string (allocation failed)\n");
+        return false;
+    }
     const uint64_t cur = cx->overflow_cursor;
-    if (cur + len > cx->overflow_cap) return false;
-    if (cur > 0xFFFFFFFFull) return false;       // StringView::ref.offset u32
+    if (cur + len > cx->overflow_cap) {
+        if (bolt_pq_diag())
+            std::fprintf(stderr, "bolt parquet: OVERFLOW BUFFER FULL -- "
+                "cursor %llu + len %u > cap %llu (capacity, not the u32)\n",
+                (unsigned long long)cur, len,
+                (unsigned long long)cx->overflow_cap);
+        return false;
+    }
+    if (cur > 0xFFFFFFFFull) {                   // StringView::ref.offset u32
+        if (bolt_pq_diag())
+            std::fprintf(stderr, "bolt parquet: U32 SPILL OFFSET EXCEEDED -- "
+                "cursor %llu past 4 GB\n", (unsigned long long)cur);
+        return false;
+    }
     std::memcpy(out->prefix, p, 4);
     std::memcpy(cx->overflow + cur, p, len);
     out->ref.buf_idx = 0;
