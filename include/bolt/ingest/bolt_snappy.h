@@ -43,9 +43,60 @@ inline uint32_t snappy_uncompressed_len(const uint8_t* src, uint64_t src_len,
     return 0;
 }
 
+// Copy an 8-byte word. Fixed size, so this compiles to one load + one
+// store — never a call into libc's runtime size-dispatch ladder.
+inline void snappy_copy8(uint8_t* dst, const uint8_t* src) noexcept {
+    uint64_t w;
+    std::memcpy(&w, src, 8);
+    std::memcpy(dst, &w, 8);
+}
+
+// Copy `len` bytes to dst+op from dst+op-off, where `off` may be SMALLER
+// than `len` (a repeating pattern — snappy's overlapping copy).
+//
+// Why not std::memcpy: a snappy back-reference is 1..64 bytes BY FORMAT, so
+// a runtime-length memcpy pays a call plus libc's size dispatch to move a
+// handful of bytes. Measured at ~22% of total query CPU on TPC-H SF100
+// (dtrace run 7f5b0152, `_platform_memmove` under decompress_page). This
+// moves the same bytes with fixed-size 8-byte stores and no call.
+//
+// It OVERCOPIES up to 7 bytes past the run, so the caller must have proven
+// `op + len + 8 <= dst_len`. Only the first `len` bytes are meaningful;
+// anything past them is either rewritten by a later tag or lies beyond the
+// final `op == dst_len` fill point.
+//
+// Every 8-byte read lands entirely inside bytes that are already final. For
+// off >= 8 that is immediate. For off < 8 the offset is first grown to the
+// smallest multiple of `off` that is >= 8 (legal because the source region
+// is periodic with period `off`) and the few bytes that multiple needs are
+// materialised one at a time — so this never reads uninitialised memory,
+// which the naive "just read 16 bytes back" formulation does.
+inline void snappy_copy_match(uint8_t* dst, uint64_t op, uint64_t off,
+                              uint64_t len) noexcept {
+    assert(off > 0 && off <= op);
+    assert(len > 0);
+    uint64_t k = 0;
+    uint64_t d = off;
+    if (d < 8) {
+        while (d < 8) d += off;              // bounded: <= 8 iterations
+        const uint64_t prime = d - off;      // <= 7
+        const uint64_t stop = (prime < len) ? prime : len;
+        for (; k < stop; ++k) dst[op + k] = dst[op + k - off];
+    }
+    for (; k < len; k += 8) {                // bounded: len <= 64 => <= 8
+        snappy_copy8(dst + op + k, dst + op + k - d);
+    }
+}
+
 // Decompress one snappy block into dst (exactly dst_len bytes — the
 // caller sizes dst from snappy_uncompressed_len). False on any corrupt
 // shape: truncated tags, out-of-range offsets, output over/underflow.
+//
+// Writes NEVER exceed dst_len. The wide-store fast lanes are taken only
+// when there is provably room; the tail falls back to exact copies. That
+// keeps the exact-fill contract every caller relies on (kafka_wire sizes
+// its output buffer to exactly the decoded length, as do the tests) rather
+// than requiring callers to append slop bytes.
 inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
                               uint8_t* dst, uint64_t dst_len) noexcept {
     assert(src != nullptr || src_len == 0);
@@ -70,7 +121,15 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
                 len = v + 1u;
             }
             if (ip + len > src_len || op + len > dst_len) return false;
-            std::memcpy(dst + op, src + ip, len);
+            // Short literals dominate dictionary/RLE-encoded parquet pages.
+            // Two fixed 8-byte moves beat a call whose whole job is to
+            // dispatch on a size that is almost always < 16.
+            if (len <= 16u && ip + 16u <= src_len && op + 16u <= dst_len) {
+                snappy_copy8(dst + op, src + ip);
+                snappy_copy8(dst + op + 8u, src + ip + 8u);
+            } else {
+                std::memcpy(dst + op, src + ip, len);
+            }
             ip += len;
             op += len;
             continue;
@@ -101,9 +160,11 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
         }
         if (off == 0 || off > op) return false;          // bad back-ref
         if (op + len > dst_len) return false;            // output overflow
-        if (off >= len) {                                // non-overlapping
+        if (op + len + 8u <= dst_len) {                  // room to overcopy
+            snappy_copy_match(dst, op, off, len);
+        } else if (off >= len) {                         // tail, no overlap
             std::memcpy(dst + op, dst + op - off, len);
-        } else {                                         // overlapping run
+        } else {                                         // tail, overlapping
             for (uint64_t k = 0; k < len; ++k) {
                 dst[op + k] = dst[op + k - off];
             }
