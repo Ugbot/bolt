@@ -278,6 +278,47 @@ bool bolt_pq_diag() noexcept {
 }
 
 // Build a StringView; >12-byte payloads spill into the column overflow.
+// Fixed-size moves. The size is a compile-time constant, so each of these
+// lowers to one load/store pair -- never a call into libc's runtime
+// size-dispatch ladder. Same reasoning dict_gather_dense already records
+// below: the cost here is CALLS, not bytes.
+inline void sv_copy8(uint8_t* d, const uint8_t* s) noexcept {
+    uint64_t w; std::memcpy(&w, s, 8); std::memcpy(d, &w, 8);
+}
+inline void sv_copy4(uint8_t* d, const uint8_t* s) noexcept {
+    uint32_t w; std::memcpy(&w, s, 4); std::memcpy(d, &w, 4);
+}
+
+// Copy exactly n bytes for n in [1,12] -- the inline StringView case.
+//
+// Overlapping fixed-width moves rather than one runtime-length memcpy: the
+// pair covers every byte with no read past s+n and no write past d+n, so a
+// caller holding only n readable bytes and a 12-byte destination is safe.
+inline void sv_copy_small(uint8_t* d, const uint8_t* s, uint32_t n) noexcept {
+    assert(n >= 1u && n <= 12u);
+    if (n >= 8u) {                       // 8..12: two 8-byte moves, overlapping
+        sv_copy8(d, s);
+        sv_copy8(d + n - 8u, s + n - 8u);
+    } else if (n >= 4u) {                // 4..7:  two 4-byte moves, overlapping
+        sv_copy4(d, s);
+        sv_copy4(d + n - 4u, s + n - 4u);
+    } else {                             // 1..3:  too short to overlap-cover
+        d[0] = s[0];
+        if (n > 1u) d[1] = s[1];
+        if (n > 2u) d[2] = s[2];
+    }
+}
+
+// Copy n >= 8 bytes with 8-byte moves and an overlapping tail. Used for the
+// spilled (>12 byte) string body, which on real data averages a few tens of
+// bytes -- far too few to amortise a libc call, and there is one per ROW.
+inline void sv_copy_bulk(uint8_t* d, const uint8_t* s, uint64_t n) noexcept {
+    assert(n >= 8u);
+    uint64_t k = 0;
+    for (; k + 8u <= n; k += 8u) sv_copy8(d + k, s + k);   // bounded by n
+    if (k < n) sv_copy8(d + n - 8u, s + n - 8u);           // exact tail
+}
+
 bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
                    StringView* out) noexcept {
     assert(cx != nullptr && out != nullptr);
@@ -286,9 +327,9 @@ bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
     out->length = len;
     if (len == 0) return true;
     if (len <= 12u) {
-        const uint32_t pfx = (len < 4u) ? len : 4u;
-        std::memcpy(out->prefix, p, pfx);
-        if (len > 4u) std::memcpy(out->inline_data, p + 4, len - 4u);
+        // prefix[4] and inline_data[8] are contiguous by StringView's layout,
+        // so the inline form is one 12-byte region starting at prefix.
+        sv_copy_small(reinterpret_cast<uint8_t*>(out->prefix), p, len);
         return true;
     }
     if (cx->overflow == nullptr) {
@@ -312,8 +353,8 @@ bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
                 "cursor %llu past 4 GB\n", (unsigned long long)cur);
         return false;
     }
-    std::memcpy(out->prefix, p, 4);
-    std::memcpy(cx->overflow + cur, p, len);
+    sv_copy4(reinterpret_cast<uint8_t*>(out->prefix), p);
+    sv_copy_bulk(reinterpret_cast<uint8_t*>(cx->overflow) + cur, p, len);
     out->ref.buf_idx = 0;
     out->ref.offset  = static_cast<uint32_t>(cur);
     cx->overflow_cursor = cur + len;
