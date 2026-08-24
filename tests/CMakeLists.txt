@@ -1052,6 +1052,15 @@ target_link_libraries(test_bolt_parquet_write_par
 bolt_apply_hardening(test_bolt_parquet_write_par)
 add_test(NAME test_bolt_parquet_write_par COMMAND test_bolt_parquet_write_par)
 
+# Page-level skipping end to end: write a page index, decode only the pages a
+# predicate can match, prove the kept rows are right AND that pages really
+# were skipped. Only possible now that bolt can write a page index.
+add_executable(test_bolt_parquet_page_skip test_bolt_parquet_page_skip.cpp)
+target_link_libraries(test_bolt_parquet_page_skip
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_page_skip)
+add_test(NAME test_bolt_parquet_page_skip COMMAND test_bolt_parquet_page_skip)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

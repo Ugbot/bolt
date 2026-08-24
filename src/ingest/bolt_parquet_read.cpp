@@ -2135,12 +2135,19 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     *next_off = 0;
     const PqRowGroup* rg = &meta->row_groups[row_group];
     const PqChunk* ch = &meta->chunks[rg->chunk_off + col];
-    if (ch->dictionary_page_offset > 0) return false;   // v1: PLAIN only
     if (ch->data_page_offset <= 0 || ch->total_compressed_size <= 0) return false;
+    // A dictionary chunk's byte region starts at the DICTIONARY page --
+    // total_compressed_size spans from there -- while the data pages this
+    // function walks start at data_page_offset. Conflating the two truncates
+    // the region by the dictionary page's length and the last data page then
+    // reads as out of bounds.
     const uint64_t region_start = static_cast<uint64_t>(ch->data_page_offset);
+    const uint64_t chunk_start = (ch->dictionary_page_offset > 0)
+        ? static_cast<uint64_t>(ch->dictionary_page_offset) : region_start;
+    if (chunk_start > region_start) return false;      // dict must precede data
     const uint64_t end =
-        region_start + static_cast<uint64_t>(ch->total_compressed_size);
-    if (end > len) return false;
+        chunk_start + static_cast<uint64_t>(ch->total_compressed_size);
+    if (end > len || end < region_start) return false;
     const uint64_t p_start = (start_off == 0) ? region_start : start_off;
     if (p_start < region_start || p_start > end) return false;
     if (p_start == end) return true;                    // exhausted (rows=0)
@@ -2172,6 +2179,26 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
         p = p_next;
     }
     if (rows_sum == 0) return true;                      // no data pages left
+
+    // For a dictionary column the STRING bytes live in the dictionary page;
+    // the data pages hold only indices, so unc_sum above says nothing about
+    // how much overflow room the Utf8 values need. Add the dictionary page's
+    // uncompressed size. ensure_overflow_room grows on demand anyway, so an
+    // under-estimate costs a realloc rather than a failure -- but starting
+    // from the index-stream size alone would realloc on essentially every
+    // dictionary Utf8 read.
+    PageHdr dict_hdr;
+    uint64_t dict_pay = 0;
+    const bool has_dict = ch->dictionary_page_offset > 0;
+    if (has_dict) {
+        TcCursor dc{buf + chunk_start, buf + end};
+        if (!parse_page_header(&dc, &dict_hdr)) return false;
+        if (dict_hdr.type != kPageDict) return false;
+        dict_pay = chunk_start +
+                   static_cast<uint64_t>(dc.p - (buf + chunk_start));
+        if (static_cast<uint64_t>(dict_hdr.cmp) > end - dict_pay) return false;
+        if (dict_hdr.unc > 0) unc_sum += static_cast<uint64_t>(dict_hdr.unc);
+    }
     // ---- Allocate a fresh sub-chunk column sized to rows_sum ----
     const PqColumn* pc = &meta->columns[col];
     BoltType t;
@@ -2204,10 +2231,23 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
         cx.overflow_cap = unc_sum;
         out_col->str_overflow_base = ob;
     }
+    // ---- Decode the dictionary, once, before anything references it ----
+    void* zscratch = nullptr;                 // lazily allocated, chunk-scoped
+    if (has_dict) {
+        const uint8_t* dd = buf + dict_pay;
+        uint64_t dd_len = static_cast<uint64_t>(dict_hdr.cmp);
+        if (!decompress_page(ch->codec, dd, dd_len, dict_hdr.unc, arena,
+                             &zscratch, &dd, &dd_len)) {
+            return false;
+        }
+        if (!decode_dict_page(&cx, dd, dd_len, dict_hdr.nvals, arena)) {
+            return false;
+        }
+    }
+
     // ---- Pass 2: decode the same pages (reuses the whole-chunk page path) ----
     p = p_start;
     int64_t rows_done = 0;
-    void* zscratch = nullptr;                 // lazily allocated, chunk-scoped
     for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
         if (rows_done >= rows_sum) break;
         if (p >= end) break;

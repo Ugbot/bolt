@@ -570,7 +570,15 @@ TEST(BoltParquetPageRange, SpilledStringsByteExact) {
 }
 
 // Fail-closed: a dictionary-encoded chunk (golden_flat name) is rejected in v1.
-TEST(BoltParquetPageRange, DictChunkFailClosed) {
+// Was DictChunkFailClosed, pinning the resumable decoder's v1 "PLAIN only"
+// limitation. That limitation is gone: dictionary encoding is what
+// parquet-mr, Arrow and bolt's own writer emit by DEFAULT, so a PLAIN-only
+// resumable decoder could not skip pages in most real files, which is the
+// one thing it exists for. The boundary is still worth a test, so this now
+// asserts the capability instead of the refusal -- and asserts VALUES, since
+// a dictionary chunk resumed from the wrong place still returns plausible
+// strings.
+TEST(BoltParquetPageRange, DictChunkResumesAndMatchesWholeChunk) {
     const auto buf = slurp(data_path("golden_flat.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena arena;
@@ -578,12 +586,59 @@ TEST(BoltParquetPageRange, DictChunkFailClosed) {
     ASSERT_NE(meta, nullptr);
     const int uc = find_utf8_col(meta);
     ASSERT_GE(uc, 0);
-    bolt::BoltColumn sub;
-    int64_t srows = 0;
-    uint64_t next = 0;
-    EXPECT_FALSE(parquet_read_col_chunk_pages(buf.data(), buf.size(), meta, 0,
-                                              static_cast<uint16_t>(uc), 0, 128,
-                                              &arena, &sub, &srows, &next));
+    // The chunk really is dictionary encoded -- otherwise this test would
+    // silently be exercising the PLAIN path it used to reject.
+    ASSERT_GT(meta->chunks[uc].dictionary_page_offset, 0);
+
+    // Whole-file decode of the same column, as the reference.
+    bolt::Arena wa;
+    bolt::BoltBatch* whole = wa.allocate_array<bolt::BoltBatch>(1);
+    ASSERT_NE(whole, nullptr);
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &wa, whole));
+    const bolt::BoltColumn& wc = whole->columns[whole->read_epoch][uc];
+    const auto* wsv = static_cast<const bolt::StringView*>(wc.data);
+    const auto* wsp = static_cast<const uint8_t*>(wc.str_overflow_base);
+    ASSERT_NE(wsv, nullptr);
+
+    // parquet_read_col_chunk_pages walks ONE row group's chunk, and this
+    // fixture has four (256/256/256/232). Comparing the walk against the
+    // whole FILE's row count would fail for a perfectly correct reader.
+    const int64_t rg_rows = meta->row_groups[0].num_rows;
+    ASSERT_GT(rg_rows, 0);
+    ASSERT_LE(rg_rows, whole->num_rows);
+
+    uint64_t off = 0;
+    int64_t row = 0;
+    int guard = 0;
+    do {
+        ASSERT_LT(++guard, 1000) << "resume loop did not terminate";
+        bolt::Arena pa;
+        bolt::BoltColumn sub;
+        int64_t srows = 0;
+        uint64_t next = 0;
+        ASSERT_TRUE(parquet_read_col_chunk_pages(
+            buf.data(), buf.size(), meta, 0, static_cast<uint16_t>(uc), off,
+            128, &pa, &sub, &srows, &next)) << "resume failed at row " << row;
+        if (srows == 0) break;
+        const auto* sv = static_cast<const bolt::StringView*>(sub.data);
+        const auto* sp = static_cast<const uint8_t*>(sub.str_overflow_base);
+        ASSERT_NE(sv, nullptr);
+        for (int64_t i = 0; i < srows; ++i) {
+            const uint32_t wl = wsv[row + i].length;
+            const uint32_t sl = sv[i].length;
+            ASSERT_EQ(sl, wl) << "row " << (row + i) << " length";
+            const uint8_t* wp = (wl <= 12u)
+                ? reinterpret_cast<const uint8_t*>(&wsv[row + i].prefix[0])
+                : (wsp + wsv[row + i].ref.offset);
+            const uint8_t* pp = (sl <= 12u)
+                ? reinterpret_cast<const uint8_t*>(&sv[i].prefix[0])
+                : (sp + sv[i].ref.offset);
+            ASSERT_EQ(0, std::memcmp(pp, wp, sl)) << "row " << (row + i);
+        }
+        row += srows;
+        off = next;
+    } while (off != 0);
+    EXPECT_EQ(row, rg_rows) << "resume walk did not cover the chunk";
 }
 
 // ---- G2FEAT-111: UINT_32 above 2^31-1 -------------------------------------

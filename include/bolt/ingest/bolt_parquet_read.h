@@ -148,9 +148,24 @@ bool parquet_read_row_group_cols(const uint8_t* buf, uint64_t len,
 // >= `max_rows` rows (whole pages, may overshoot), into a FRESH Flat `out_col`
 // sized to exactly the decoded rows; returns the row count in *out_rows and the
 // next undecoded page offset in *next_off (0 = chunk exhausted). Walk `next_off`
-// to stream a chunk in bounded sub-chunks. v1: PLAIN chunks only (returns false
-// on a dictionary page). Byte-exact (value-level) vs a whole-chunk decode of the
-// same pages. Enables bounded per-worker footprint for wide single-column scans.
+// to stream a chunk in bounded sub-chunks. Byte-exact (value-level) vs a
+// whole-chunk decode of the same pages. Enables bounded per-worker footprint
+// for wide single-column scans.
+//
+// Dictionary chunks are supported: the DICTIONARY_PAGE is decoded once per
+// call, before the requested data pages, and the chunk's byte region is taken
+// to start there (total_compressed_size spans from the dictionary page, not
+// from data_page_offset). This is what makes the function usable as the jump
+// target for PAGE-level skipping driven by bolt_parquet_pageindex.h -- which
+// matters because dictionary encoding is the writer's recommended default and
+// what parquet-mr and Arrow emit by default too, so a PLAIN-only resumable
+// decoder could not skip pages in most real files.
+//
+// The cost of resuming mid-chunk on a dictionary column is re-decoding the
+// dictionary page on every call. That is the correct trade for a skipping
+// reader (it decodes ONE dictionary instead of every data page it skipped),
+// and callers streaming a whole chunk in order should keep using
+// parquet_read_row_group_cols, which decodes the dictionary once.
 bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
                                   const PqMeta* meta, uint32_t row_group,
                                   uint16_t col, uint64_t start_off,
