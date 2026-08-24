@@ -5,8 +5,18 @@
 // round-trip without round-trip-only divergence.
 //
 // Scope v1 (FLAT schemas only):
-//   - file layout: "PAR1" + row_groups + Thrift FileMetaData + u32 LE len + "PAR1"
-//   - encodings:   PLAIN only (no dictionary, no RLE / DELTA on values)
+//   - file layout: "PAR1" + row_groups + [page index] + Thrift FileMetaData
+//                  + u32 LE len + "PAR1"
+//   - encodings:   PLAIN, and RLE_DICTIONARY (the parquet-mr / Arrow default)
+//                  when ParquetWriteOpts::use_dictionary is set. A column
+//                  whose dictionary would exceed dictionary_max_bytes falls
+//                  back to PLAIN for the whole chunk -- never mid-chunk, so a
+//                  chunk's data pages all carry one encoding.
+//   - pages:       a column chunk is split into data pages of at most
+//                  ParquetWriteOpts::data_page_target_bytes (default 1 MiB,
+//                  matching parquet-mr / Arrow). Previously one page carried
+//                  a whole chunk, which silently truncated the int32 page
+//                  size fields past 2 GiB.
 //   - codecs:      UNCOMPRESSED, SNAPPY (others -> false on open)
 //   - types:       Int32, Int64, Float32, Float64, Utf8, Binary,
 //                  Decimal128 (FLBA(16) BE two's-complement),
@@ -41,11 +51,9 @@
 //                  that many rows (scan-skip granularity control).
 //
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - Dictionary encoding, RLE / DELTA, nested types, LIST / MAP / STRUCT
-//   - Page index (ColumnIndex/OffsetIndex — tracked as a follow-up; the
-//     writer emits exactly one data page per column chunk, so chunk
-//     Statistics already carry page-granularity bounds today),
-//     bloom filters, encryption
+//   - DELTA_* / BYTE_STREAM_SPLIT value encodings, DATA_PAGE_V2
+//   - nested types, LIST / MAP / STRUCT
+//   - bloom filters, encryption
 //   - GZIP / ZSTD / LZ4 codecs
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
@@ -93,14 +101,53 @@ struct ParquetWriteOpts {
                                                  //  rejected at open: false)
     bool               emit_statistics;
     bool               emit_bloom_filter;        // accepted, ignored (stub)
-    bool               emit_page_index;          // accepted, ignored (stub)
+    // Emit a ColumnIndex + OffsetIndex per column chunk, in the index region
+    // between the last row group and the footer, located by ColumnChunk
+    // fields 4-7. Per-page min/max/null_count let a reader skip whole pages
+    // on a predicate without decoding them. Costs a per-page statistics pass
+    // at write time, so it is opt-in.
+    bool               emit_page_index;
     // G2FEAT-24: rowgroup size control. 0 (the zero-init default) keeps the
     // legacy contract — one parquet_write_row_group call == one row group.
     // >0: each call's batch is split into consecutive row groups of at most
     // this many rows (the last one carries the remainder). Occupies the old
     // _pad[4] bytes, so struct size / layout are unchanged.
     std::uint32_t      row_group_max_rows;
+
+    // ---- page splitting -------------------------------------------------
+    // Maximum UNCOMPRESSED value bytes per data page. 0 selects the default
+    // (kPwDefaultPageBytes, 1 MiB -- parquet-mr's and Arrow's default). There
+    // is deliberately no "unlimited" setting: the PageHeader's size fields are
+    // int32, so a single page carrying a multi-GiB chunk truncates them and
+    // emits a corrupt file. Clamped internally to [4 KiB, 512 MiB].
+    // A page always holds at least one row, so a single row wider than the
+    // budget still writes (as its own page) rather than failing.
+    std::uint32_t      data_page_target_bytes;
+
+    // ---- dictionary encoding --------------------------------------------
+    // When set, each column chunk is dictionary-encoded: a DICTIONARY_PAGE of
+    // PLAIN distinct values followed by RLE_DICTIONARY data pages of indices.
+    // This is what parquet-mr and Arrow emit by default and is typically a
+    // large size win on low-cardinality columns.
+    //
+    // Fallback is per CHUNK, never mid-chunk: if the distinct values exceed
+    // dictionary_max_bytes (or kPwMaxDictEntries) the chunk is rewritten
+    // PLAIN, so every data page in a chunk shares one encoding. Deciding
+    // mid-chunk is legal parquet but leaves a chunk whose pages disagree,
+    // which is a well-known source of reader bugs; we decline to produce it.
+    bool               use_dictionary;
+    std::uint8_t       _pad2[3];
+    // Dictionary size ceiling in bytes of PLAIN-encoded distinct values.
+    // 0 selects the default (kPwDefaultDictBytes, 1 MiB -- Arrow's default).
+    std::uint32_t      dictionary_max_bytes;
 };
+
+// Defaults referenced by the option comments above.
+inline constexpr std::uint32_t kPwDefaultPageBytes = 1u << 20;   // 1 MiB
+inline constexpr std::uint32_t kPwMinPageBytes     = 4u << 10;   // 4 KiB
+inline constexpr std::uint32_t kPwMaxPageBytes     = 512u << 20; // 512 MiB
+inline constexpr std::uint32_t kPwDefaultDictBytes = 1u << 20;   // 1 MiB
+inline constexpr std::uint32_t kPwMaxDictEntries   = 1u << 20;
 
 // Opaque writer state. One new at open, one delete at close.
 struct ParquetWriter;

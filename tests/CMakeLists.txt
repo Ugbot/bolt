@@ -1015,6 +1015,16 @@ add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
 # Phase 2 — the parquet MEMORY sink. Asserts byte-EQUALITY with the file sink
 # (a "does it parse" test cannot catch a sink that reorders or drops a region,
 # since parquet is read through its footer offsets).
+# Writer: dictionary encoding (RLE_DICTIONARY), data-page splitting, and the
+# ColumnIndex/OffsetIndex page index. Asserts VALUES against an independent
+# model, sweeps index bit widths and page-boundary alignments, and proves the
+# comparison discriminates.
+add_executable(test_bolt_parquet_write_dict test_bolt_parquet_write_dict.cpp)
+target_link_libraries(test_bolt_parquet_write_dict
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_dict)
+add_test(NAME test_bolt_parquet_write_dict COMMAND test_bolt_parquet_write_dict)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

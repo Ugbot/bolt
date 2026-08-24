@@ -50,7 +50,9 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
-#include "bolt/ingest/bolt_snappy.h"   // snappy_compress (added in this CL)
+#include "bolt/ingest/bolt_snappy.h"        // snappy_compress
+#include "bolt/ingest/bolt_parquet_bloom.h"  // pq_xxh64 (dictionary hashing)
+#include "bolt/ingest/bolt_parquet_pageindex.h"  // kPqMaxPagesPerChunk
 
 namespace bolt {
 namespace ingest {
@@ -76,8 +78,9 @@ constexpr std::int32_t kPtFlba      = 7;
 constexpr std::int32_t kRepRequired = 0;
 constexpr std::int32_t kRepOptional = 1;
 
-constexpr std::int32_t kEncPlain = 0;
-constexpr std::int32_t kEncRle   = 3;     // for def-level hybrid
+constexpr std::int32_t kEncPlain    = 0;
+constexpr std::int32_t kEncRle      = 3;   // for def-level hybrid
+constexpr std::int32_t kEncRleDict  = 8;   // RLE_DICTIONARY data pages
 
 constexpr std::int32_t kCodecUncompressed = 0;
 constexpr std::int32_t kCodecSnappy       = 1;
@@ -88,6 +91,7 @@ constexpr std::int32_t kConvTsMicro = 10;
 constexpr std::int32_t kConvDecimal = 5;
 
 constexpr std::int32_t kPageData = 0;
+constexpr std::int32_t kPageDict = 2;
 
 // ===== thrift compact write codec ==========================================
 //
@@ -226,27 +230,59 @@ inline std::uint8_t read_valid(const std::uint8_t* bm, std::int64_t off,
     return static_cast<std::uint8_t>((v >> (bit & 7)) & 1u);
 }
 
+// Value encoders, page planning, the RLE/bit-packed hybrid and the
+// dictionary builder. A size seam, not a public header -- see the file's
+// own banner. It needs hybrid_varint_emit and the parquet constants above,
+// so it is included here rather than at the top.
+#include "bolt_parquet_write_enc.inc"
+
 // ===== writer state =======================================================
 
 // Per-chunk record built up while writing the chunk; flushed into the
 // footer at close.
+// Min / max as raw little-endian (or BE for Decimal128, raw bytes for
+// BYTE_ARRAY) payloads the reader can copy straight into
+// PqChunk::min_bytes / max_bytes. Sized to the reader's kPqMaxStatBytes (64)
+// so Utf8 stats round-trip; a range whose extreme string is longer than this
+// simply omits stats (compute_stats). Shared by chunk Statistics and by the
+// per-page bounds a ColumnIndex carries -- they are the same computation over
+// a different row range, so they are the same code.
+struct StatBuf {
+    std::uint8_t  min_buf[64];
+    std::uint8_t  max_buf[64];
+    std::uint32_t min_len;
+    std::uint32_t max_len;
+    bool          have_stats;
+};
+
+// One data page, as the OffsetIndex / ColumnIndex need to describe it.
+struct PageRec {
+    std::int64_t  offset;       // file offset of the page header
+    std::int32_t  comp_size;    // page header + compressed body
+    std::int64_t  first_row;    // row index of the page within its row group
+    std::int64_t  null_count;
+    bool          all_null;
+    StatBuf       st;
+};
+
 struct ChunkRec {
     std::int64_t num_values;
     std::int64_t total_unc;
     std::int64_t total_cmp;
     std::int64_t data_page_offset;
+    std::int64_t dict_page_offset;   // 0 when the chunk is not dictionary-encoded
     std::int64_t null_count;
-    bool         have_stats;
     bool         null_count_known;
-    // Min / max as raw little-endian (or BE for Decimal128, raw bytes for
-    // BYTE_ARRAY) payloads the reader can copy straight into
-    // PqChunk::min_bytes / max_bytes. Sized to the reader's
-    // kPqMaxStatBytes (64) so Utf8 stats round-trip; a chunk whose extreme
-    // string is longer than this simply omits stats (compute_stats).
-    std::uint8_t min_buf[64];
-    std::uint8_t max_buf[64];
-    std::uint32_t min_len;
-    std::uint32_t max_len;
+    bool         dictionary;         // RLE_DICTIONARY data pages
+    StatBuf      st;
+    // Page index: [page_off, page_off + page_count) into ParquetWriter::pages,
+    // and where the two index structs landed in the file (filled at close).
+    std::uint32_t page_off;
+    std::uint32_t page_count;
+    std::int64_t  col_index_off;
+    std::int32_t  col_index_len;
+    std::int64_t  off_index_off;
+    std::int32_t  off_index_len;
 };
 
 struct RowGroupRec {
@@ -276,6 +312,14 @@ struct ParquetWriter {
     // file-written one.
     bool                     to_mem;
     std::vector<std::uint8_t> mem;
+    // Page index accumulator: every data page of every chunk, in write
+    // order. Only populated when opts.emit_page_index is set. ChunkRec
+    // carries the [page_off, page_off + page_count) window into it.
+    std::vector<PageRec>     pages;
+    // Dictionary scratch, reused across column chunks so a wide schema pays
+    // for the hash table's growth once rather than per chunk.
+    DictBuilder              dict;
+    std::vector<std::uint32_t> dict_idx;
 };
 
 namespace {
@@ -359,14 +403,15 @@ bool has_converted(BoltType t) noexcept {
 // ===== PLAIN value encoders ===============================================
 
 bool encode_plain_fixed(const BoltColumn& col, std::size_t elem,
-                        std::int64_t n_rows,
+                        std::int64_t r_begin, std::int64_t r_end,
                         const std::uint8_t* def_bits,
                         bool nullable,
                         std::vector<std::uint8_t>* dst) noexcept {
     assert(dst != nullptr);
-    assert(col.data != nullptr || n_rows == 0);
+    assert(r_begin <= r_end);
+    assert(col.data != nullptr || r_begin == r_end);
     const std::uint8_t* src = static_cast<const std::uint8_t*>(col.data);
-    for (std::int64_t r = 0; r < n_rows; ++r) {
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
         const std::uint8_t* p = src + static_cast<std::size_t>(r) * elem;
@@ -375,17 +420,19 @@ bool encode_plain_fixed(const BoltColumn& col, std::size_t elem,
     return true;
 }
 
-bool encode_plain_bool(const BoltColumn& col, std::int64_t n_rows,
+bool encode_plain_bool(const BoltColumn& col, std::int64_t r_begin,
+                       std::int64_t r_end,
                        const std::uint8_t* def_bits, bool nullable,
                        std::vector<std::uint8_t>* dst) noexcept {
     assert(dst != nullptr);
-    assert(col.data != nullptr || n_rows == 0);
+    assert(r_begin <= r_end);
+    assert(col.data != nullptr || r_begin == r_end);
     // BoltColumn stores bool as one byte per row (see bolt_types.h line 53).
     const std::uint8_t* src = static_cast<const std::uint8_t*>(col.data);
     // Pack PLAIN bool: bit-packed LE, 8 values per byte.
     std::uint8_t pack = 0;
     std::uint32_t nb = 0;
-    for (std::int64_t r = 0; r < n_rows; ++r) {
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
         if (src[r] != 0u) pack = static_cast<std::uint8_t>(pack | (1u << nb));
@@ -396,14 +443,16 @@ bool encode_plain_bool(const BoltColumn& col, std::int64_t n_rows,
     return true;
 }
 
-bool encode_plain_byte_array(const BoltColumn& col, std::int64_t n_rows,
+bool encode_plain_byte_array(const BoltColumn& col, std::int64_t r_begin,
+                             std::int64_t r_end,
                              const std::uint8_t* def_bits, bool nullable,
                              std::vector<std::uint8_t>* dst) noexcept {
     assert(dst != nullptr);
-    assert(col.data != nullptr || n_rows == 0);
+    assert(r_begin <= r_end);
+    assert(col.data != nullptr || r_begin == r_end);
     const auto* sv = static_cast<const StringView*>(col.data);
     const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
-    for (std::int64_t r = 0; r < n_rows; ++r) {
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
         const std::uint32_t len = sv[r].length;
@@ -473,16 +522,18 @@ int stat_lex_cmp(const std::uint8_t* a, std::uint32_t a_len,
 // containing any value longer than the stat buffer (== the reader's
 // kPqMaxStatBytes) therefore omits stats entirely; omission is always
 // legal and the reader treats it as "cannot prune".
-bool compute_stats_utf8(const BoltColumn& col, std::int64_t n_rows,
+bool compute_stats_utf8(const BoltColumn& col, std::int64_t r_begin,
+                        std::int64_t r_end,
                         const std::uint8_t* def_bits, bool nullable,
-                        ChunkRec* rec) noexcept {
+                        StatBuf* rec) noexcept {
     assert(rec != nullptr);
-    assert(col.data != nullptr || n_rows == 0);
+    assert(r_begin <= r_end);
+    assert(col.data != nullptr || r_begin == r_end);
     const auto* sv    = static_cast<const StringView*>(col.data);
     const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
     const std::uint8_t* mn_p = nullptr; std::uint32_t mn_n = 0;
     const std::uint8_t* mx_p = nullptr; std::uint32_t mx_n = 0;
-    for (std::int64_t r = 0; r < n_rows; ++r) {
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
         const std::uint32_t len = sv[r].length;
@@ -512,18 +563,21 @@ bool compute_stats_utf8(const BoltColumn& col, std::int64_t n_rows,
     return true;
 }
 
-bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
+bool compute_stats(const BoltColumn& col, std::int64_t r_begin,
+                   std::int64_t r_end,
                    const std::uint8_t* def_bits, bool nullable,
-                   ChunkRec* rec) noexcept {
+                   StatBuf* rec) noexcept {
     assert(rec != nullptr);
+    assert(r_begin <= r_end);
     rec->have_stats = false;
-    if (n_rows == 0) return true;
+    rec->min_len = rec->max_len = 0u;
+    if (r_begin == r_end) return true;
     const auto valid_at = [&](std::int64_t r) noexcept {
         return (!nullable) || def_bits[r] != 0;
     };
-    // Find first valid row.
+    // Find first valid row in the range.
     std::int64_t r0 = -1;
-    for (std::int64_t r = 0; r < n_rows; ++r) {
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
         if (valid_at(r)) { r0 = r; break; }
     }
     if (r0 < 0) return true;   // all null -> no min/max
@@ -532,7 +586,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
         case BoltType::Date32: {
             const auto* p = static_cast<const std::int32_t*>(col.data);
             std::int32_t mn = p[r0], mx = p[r0];
-            for (std::int64_t r = r0 + 1; r < n_rows; ++r) {
+            for (std::int64_t r = r0 + 1; r < r_end; ++r) {
                 if (!valid_at(r)) continue;
                 if (p[r] < mn) mn = p[r];
                 if (p[r] > mx) mx = p[r];
@@ -547,7 +601,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
         case BoltType::Timestamp: {
             const auto* p = static_cast<const std::int64_t*>(col.data);
             std::int64_t mn = p[r0], mx = p[r0];
-            for (std::int64_t r = r0 + 1; r < n_rows; ++r) {
+            for (std::int64_t r = r0 + 1; r < r_end; ++r) {
                 if (!valid_at(r)) continue;
                 if (p[r] < mn) mn = p[r];
                 if (p[r] > mx) mx = p[r];
@@ -562,7 +616,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
             const auto* p = static_cast<const float*>(col.data);
             bool seen = false;
             float mn = 0.0f, mx = 0.0f;
-            for (std::int64_t r = r0; r < n_rows; ++r) {
+            for (std::int64_t r = r0; r < r_end; ++r) {
                 if (!valid_at(r)) continue;
                 const float v = p[r];
                 if (v != v) continue;               // NaN: never a bound
@@ -585,7 +639,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
             const auto* p = static_cast<const double*>(col.data);
             bool seen = false;
             double mn = 0.0, mx = 0.0;
-            for (std::int64_t r = r0; r < n_rows; ++r) {
+            for (std::int64_t r = r0; r < r_end; ++r) {
                 if (!valid_at(r)) continue;
                 const double v = p[r];
                 if (v != v) continue;               // NaN: never a bound
@@ -607,7 +661,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
             // payload for BOOLEAN is a single PLAIN byte 0x00 / 0x01.
             const auto* p = static_cast<const std::uint8_t*>(col.data);
             std::uint8_t mn = 1u, mx = 0u;
-            for (std::int64_t r = r0; r < n_rows; ++r) {
+            for (std::int64_t r = r0; r < r_end; ++r) {
                 if (!valid_at(r)) continue;
                 const std::uint8_t v = (p[r] != 0u) ? 1u : 0u;
                 if (v < mn) mn = v;
@@ -622,7 +676,7 @@ bool compute_stats(const BoltColumn& col, std::int64_t n_rows,
         }
         case BoltType::Utf8:
         case BoltType::Binary:
-            return compute_stats_utf8(col, n_rows, def_bits, nullable, rec);
+            return compute_stats_utf8(col, r_begin, r_end, def_bits, nullable, rec);
         default:
             // Decimal128: min/max skipped (v1 gap, documented in the header).
             return true;
@@ -651,14 +705,22 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
     return false;
 }
 
+// ColumnIndex / OffsetIndex emission. Needs the thrift codec, stat_lex_cmp,
+// PageRec and ParquetWriter, so it is included here rather than at the top.
+#include "bolt_parquet_write_index.inc"
+
 // ===== page header writer =================================================
 
+// PageHeader for a v1 DATA_PAGE. `num_values` counts rows INCLUDING nulls --
+// it is the number of definition levels, which is what a reader advances the
+// row cursor by.
 void write_page_header(std::vector<std::uint8_t>* hdr,
                        std::int32_t unc, std::int32_t cmp,
-                       std::int32_t num_values) noexcept {
+                       std::int32_t num_values,
+                       std::int32_t encoding) noexcept {
     assert(hdr != nullptr);
+    assert(unc >= 0 && cmp >= 0);
     TcOut o{hdr};
-    // PageHeader.type = DATA_PAGE
     tc_put_field(&o, 1, kFI32);
     tc_put_zigzag(&o, kPageData);
     tc_put_field(&o, 2, kFI32);
@@ -671,11 +733,41 @@ void write_page_header(std::vector<std::uint8_t>* hdr,
         tc_put_field(&o, 1, kFI32);
         tc_put_zigzag(&o, num_values);
         tc_put_field(&o, 2, kFI32);
-        tc_put_zigzag(&o, kEncPlain);
+        tc_put_zigzag(&o, encoding);
         tc_put_field(&o, 3, kFI32);
         tc_put_zigzag(&o, kEncRle);     // def-level encoding
         tc_put_field(&o, 4, kFI32);
-        tc_put_zigzag(&o, kEncRle);     // rep-level encoding (unused; flat schema)
+        tc_put_zigzag(&o, kEncRle);     // rep-level encoding (unused; flat)
+        tc_put_stop(&o);
+    }
+    tc_put_stop(&o);
+}
+
+// PageHeader for a DICTIONARY_PAGE. The dictionary itself is PLAIN-encoded;
+// the modern encoding code for that is PLAIN (0). parquet-mr historically
+// wrote PLAIN_DICTIONARY (2) here and readers accept both -- bolt's reader
+// ignores the field for dictionary pages entirely (decode_dict_page keys off
+// the physical type), and pyarrow accepts PLAIN.
+void write_dict_page_header(std::vector<std::uint8_t>* hdr,
+                            std::int32_t unc, std::int32_t cmp,
+                            std::int32_t num_values) noexcept {
+    assert(hdr != nullptr);
+    assert(unc >= 0 && cmp >= 0);
+    TcOut o{hdr};
+    tc_put_field(&o, 1, kFI32);
+    tc_put_zigzag(&o, kPageDict);
+    tc_put_field(&o, 2, kFI32);
+    tc_put_zigzag(&o, unc);
+    tc_put_field(&o, 3, kFI32);
+    tc_put_zigzag(&o, cmp);
+    // DictionaryPageHeader (field 7)
+    tc_put_field(&o, 7, kFStruct);
+    {
+        tc_put_field(&o, 1, kFI32);
+        tc_put_zigzag(&o, num_values);
+        tc_put_field(&o, 2, kFI32);
+        tc_put_zigzag(&o, kEncPlain);
+        tc_put_field(&o, 3, kFFalse);   // is_sorted = false
         tc_put_stop(&o);
     }
     tc_put_stop(&o);
@@ -683,103 +775,104 @@ void write_page_header(std::vector<std::uint8_t>* hdr,
 
 // ===== chunk writer (one column of one row group) ========================
 
-// Build the in-memory page payload (def levels + PLAIN values), then
-// compress and write [page header][compressed bytes]. Updates rec.
-bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
-                        const ParquetWriteColumn& sch,
-                        std::int64_t n_rows, ChunkRec* rec) noexcept {
-    assert(w != nullptr && rec != nullptr);
-    std::memset(rec, 0, sizeof(*rec));
-    rec->num_values = n_rows;
-    rec->null_count = 0;
+// Effective, clamped page / dictionary budgets. 0 means "the default", never
+// "unlimited" -- see the header: an unlimited page overflows the int32 size
+// fields in the page header and emits a corrupt file.
+std::uint32_t page_budget_bytes(const ParquetWriteOpts& o) noexcept {
+    std::uint32_t b = (o.data_page_target_bytes != 0u) ? o.data_page_target_bytes
+                                                       : kPwDefaultPageBytes;
+    if (b < kPwMinPageBytes) b = kPwMinPageBytes;
+    if (b > kPwMaxPageBytes) b = kPwMaxPageBytes;
+    assert(b >= kPwMinPageBytes && b <= kPwMaxPageBytes);
+    return b;
+}
 
-    // Validate column type matches schema.
-    if (col.type != sch.type) return false;
-    if (col.length < n_rows) return false;
+std::uint32_t dict_budget_bytes(const ParquetWriteOpts& o) noexcept {
+    const std::uint32_t b = (o.dictionary_max_bytes != 0u)
+        ? o.dictionary_max_bytes : kPwDefaultDictBytes;
+    assert(b > 0u);
+    return b;
+}
 
-    // Allocate def-level workspace if the column is OPTIONAL.
-    std::vector<std::uint8_t> def_bits;
-    const bool nullable = sch.nullable;
-    if (nullable) {
-        def_bits.resize(static_cast<std::size_t>(n_rows));
-        fill_def_bits(col, n_rows, def_bits.data(), &rec->null_count);
-    }
-    // G2FEAT-24: null_count is always known — counted for OPTIONAL columns,
-    // structurally 0 for REQUIRED ones — so the footer always carries it
-    // (pyarrow/DuckDB surface it; bolt's pq_chunk_no_nulls accepts either
-    // null_count == 0 or REQUIRED, so both readers agree).
-    rec->null_count_known = true;
-
-    // Encode PLAIN values.
-    std::vector<std::uint8_t> values;
-    values.reserve(static_cast<std::size_t>(n_rows) * 8u);
-    bool ok = false;
-    switch (sch.type) {
-        case BoltType::Bool:
-            ok = encode_plain_bool(col, n_rows,
-                                   nullable ? def_bits.data() : nullptr,
-                                   nullable, &values);
-            break;
+// BOOLEAN is deliberately excluded: a two-entry dictionary plus an index
+// stream is strictly larger than the one-bit-per-value PLAIN form, which is
+// why parquet-mr and Arrow never dictionary-encode it either.
+bool dict_eligible(BoltType t) noexcept {
+    switch (t) {
         case BoltType::Int32:
         case BoltType::Date32:
         case BoltType::Float32:
-            ok = encode_plain_fixed(col, 4, n_rows,
-                                    nullable ? def_bits.data() : nullptr,
-                                    nullable, &values);
-            break;
         case BoltType::Int64:
         case BoltType::Timestamp:
         case BoltType::Float64:
-            ok = encode_plain_fixed(col, 8, n_rows,
-                                    nullable ? def_bits.data() : nullptr,
-                                    nullable, &values);
-            break;
+        case BoltType::Decimal128:
         case BoltType::Utf8:
         case BoltType::Binary:
-            ok = encode_plain_byte_array(col, n_rows,
-                                         nullable ? def_bits.data() : nullptr,
-                                         nullable, &values);
-            break;
-        case BoltType::Decimal128:
-            // FLBA 16 BE — caller supplies decimal128 already as BE 16-byte
-            // values, OR as little-endian Decimal128 (Bolt's in-memory shape).
-            // Bolt stores Decimal128 inline 16 bytes; spec says the on-disk
-            // form must be big-endian two's complement. Convert per value.
-            {
-                const auto* p = static_cast<const std::uint8_t*>(col.data);
-                for (std::int64_t r = 0; r < n_rows; ++r) {
-                    const bool valid = (!nullable) || def_bits[r] != 0;
-                    if (!valid) continue;
-                    std::uint8_t be[16];
-                    for (std::size_t k = 0; k < 16u; ++k) be[k] = p[r * 16 + 15 - k];
-                    values.insert(values.end(), be, be + 16);
-                }
-                ok = true;
-            }
-            break;
+            return true;
         default:
             return false;
     }
-    if (!ok) return false;
+}
 
-    // Stats (after def_bits computed).
-    if (w->opts.emit_statistics) {
-        if (!compute_stats(col, n_rows,
-                           nullable ? def_bits.data() : nullptr,
-                           nullable, rec)) {
-            return false;
+// Decimal128 on disk is FLBA(16) BIG-endian two's complement; bolt stores it
+// little-endian in memory. One value's worth of byte-reversal.
+inline void decimal_to_be(const std::uint8_t* le, std::uint8_t* be) noexcept {
+    assert(le != nullptr && be != nullptr);
+    for (std::size_t k = 0; k < 16u; ++k) be[k] = le[15u - k];
+}
+
+// PLAIN-encode rows [r0, r1) of one column.
+bool encode_plain_range(const BoltColumn& col, const ParquetWriteColumn& sch,
+                        std::int64_t r0, std::int64_t r1,
+                        const std::uint8_t* def_bits, bool nullable,
+                        std::vector<std::uint8_t>* dst) noexcept {
+    assert(dst != nullptr);
+    assert(r0 <= r1);
+    switch (sch.type) {
+        case BoltType::Bool:
+            return encode_plain_bool(col, r0, r1, def_bits, nullable, dst);
+        case BoltType::Int32:
+        case BoltType::Date32:
+        case BoltType::Float32:
+            return encode_plain_fixed(col, 4, r0, r1, def_bits, nullable, dst);
+        case BoltType::Int64:
+        case BoltType::Timestamp:
+        case BoltType::Float64:
+            return encode_plain_fixed(col, 8, r0, r1, def_bits, nullable, dst);
+        case BoltType::Utf8:
+        case BoltType::Binary:
+            return encode_plain_byte_array(col, r0, r1, def_bits, nullable, dst);
+        case BoltType::Decimal128: {
+            const auto* p = static_cast<const std::uint8_t*>(col.data);
+            if (p == nullptr && r0 != r1) return false;
+            for (std::int64_t r = r0; r < r1; ++r) {
+                if (nullable && def_bits[r] == 0u) continue;
+                std::uint8_t be[16];
+                decimal_to_be(p + r * 16, be);
+                dst->insert(dst->end(), be, be + 16);
+            }
+            return true;
         }
+        default:
+            return false;
     }
+}
 
-    // Build the data page bytes: [u32 LE def-level byte len][hybrid bytes][PLAIN values]
-    std::vector<std::uint8_t> page;
+// Prepend the def-level stream to `values` to form the final page payload.
+// Layout (v1): [u32 LE hybrid byte length][hybrid bytes][values]. A REQUIRED
+// column has no def levels and the payload is the values verbatim.
+bool build_page_payload(const std::vector<std::uint8_t>& values,
+                        const std::uint8_t* def_bits, bool nullable,
+                        std::int64_t r0, std::int64_t r1,
+                        std::vector<std::uint8_t>* payload) noexcept {
+    assert(payload != nullptr);
+    assert(r0 <= r1);
+    payload->clear();
     if (nullable) {
+        assert(def_bits != nullptr);
         std::vector<std::uint8_t> def_hybrid;
-        if (!def_levels_encode(def_bits.data(),
-                               static_cast<std::uint32_t>(n_rows),
-                               &def_hybrid)) {
-            return false;
-        }
+        const std::uint32_t n = static_cast<std::uint32_t>(r1 - r0);
+        if (!def_levels_encode(def_bits + r0, n, &def_hybrid)) return false;
         const std::uint32_t dlen = static_cast<std::uint32_t>(def_hybrid.size());
         const std::uint8_t lb[4] = {
             static_cast<std::uint8_t>(dlen & 0xFFu),
@@ -787,35 +880,294 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
             static_cast<std::uint8_t>((dlen >> 16) & 0xFFu),
             static_cast<std::uint8_t>((dlen >> 24) & 0xFFu),
         };
-        page.insert(page.end(), lb, lb + 4);
-        page.insert(page.end(), def_hybrid.begin(), def_hybrid.end());
+        payload->insert(payload->end(), lb, lb + 4);
+        payload->insert(payload->end(), def_hybrid.begin(), def_hybrid.end());
     }
-    page.insert(page.end(), values.begin(), values.end());
+    payload->insert(payload->end(), values.begin(), values.end());
+    return true;
+}
 
-    const std::int32_t unc = static_cast<std::int32_t>(page.size());
+// Compress `payload`, write [header][body], and fold the page's sizes into
+// `rec`. `dict_page` selects the dictionary page header. Fails closed if the
+// page would overflow the int32 size fields rather than truncating them --
+// the bug this page-splitting work exists to remove.
+bool emit_page(ParquetWriter* w, const std::vector<std::uint8_t>& payload,
+               bool dict_page, std::int64_t num_values,
+               std::int32_t encoding, ChunkRec* rec,
+               std::int64_t* out_offset, std::int32_t* out_size) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(num_values >= 0);
+    if (payload.size() > 0x7FFFFFFFull) return false;
+    if (num_values > 0x7FFFFFFF) return false;
+    const std::int32_t unc = static_cast<std::int32_t>(payload.size());
 
-    // Compress.
     std::vector<std::uint8_t> compressed;
-    if (!maybe_compress(page.data(), page.size(), w->opts.compression,
+    if (!maybe_compress(payload.data(), payload.size(), w->opts.compression,
                         &compressed)) {
         return false;
     }
+    if (compressed.size() > 0x7FFFFFFFull) return false;
     const std::int32_t cmp = static_cast<std::int32_t>(compressed.size());
 
-    // Header.
     std::vector<std::uint8_t> hdr;
-    write_page_header(&hdr, unc, cmp,
-                      static_cast<std::int32_t>(n_rows));
+    if (dict_page) {
+        write_dict_page_header(&hdr, unc, cmp,
+                               static_cast<std::int32_t>(num_values));
+    } else {
+        write_page_header(&hdr, unc, cmp,
+                          static_cast<std::int32_t>(num_values), encoding);
+    }
 
-    // Position & write.
-    rec->data_page_offset = w->file_pos;
+    const std::int64_t off = w->file_pos;
     if (!sink_write(w, hdr.data(), hdr.size())) return false;
     if (!sink_write(w, compressed.data(), compressed.size())) return false;
     if (!sink_ok(w)) return false;
-    w->file_pos += static_cast<std::int64_t>(hdr.size() + compressed.size());
-    rec->total_unc = static_cast<std::int64_t>(hdr.size()) + unc;
-    rec->total_cmp = static_cast<std::int64_t>(hdr.size()) + cmp;
+    const std::size_t total = hdr.size() + compressed.size();
+    w->file_pos += static_cast<std::int64_t>(total);
+    rec->total_unc += static_cast<std::int64_t>(hdr.size()) + unc;
+    rec->total_cmp += static_cast<std::int64_t>(hdr.size()) + cmp;
+    if (out_offset != nullptr) *out_offset = off;
+    if (out_size != nullptr) *out_size = static_cast<std::int32_t>(total);
     return true;
+}
+
+// Record one data page in the writer's page table (consumed at close by the
+// ColumnIndex / OffsetIndex writers). Only populated when the caller asked
+// for a page index; otherwise the table stays empty and costs nothing.
+void note_page(ParquetWriter* w, ChunkRec* rec, std::int64_t offset,
+               std::int32_t size, std::int64_t first_row,
+               std::int64_t nulls, std::int64_t n_vals,
+               const StatBuf& st) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(nulls >= 0 && n_vals >= 0);
+    if (!w->opts.emit_page_index) return;
+    PageRec pr;
+    std::memset(&pr, 0, sizeof(pr));
+    pr.offset = offset;
+    pr.comp_size = size;
+    pr.first_row = first_row;
+    pr.null_count = nulls;
+    pr.all_null = (n_vals > 0) && (nulls == n_vals);
+    pr.st = st;
+    w->pages.push_back(pr);
+    ++rec->page_count;
+}
+
+// Count nulls in [r0, r1). Branch-free accumulate over the def bits.
+std::int64_t count_nulls(const std::uint8_t* def_bits, bool nullable,
+                         std::int64_t r0, std::int64_t r1) noexcept {
+    assert(r0 <= r1);
+    if (!nullable) return 0;
+    assert(def_bits != nullptr);
+    std::int64_t n = 0;
+    for (std::int64_t r = r0; r < r1; ++r) n += (def_bits[r] == 0u);
+    return n;
+}
+
+// Guard matching the reader's own per-chunk page ceiling
+// (kPqMaxPagesPerChunk). At the 1 MiB default that is 64 GiB in one column
+// chunk; a chunk that large should have been split into row groups. Fail
+// closed rather than emit a file bolt itself cannot read back.
+constexpr std::uint32_t kPwMaxPagesPerChunk = 1u << 16;
+
+// PLAIN data pages for the whole chunk.
+bool chunk_write_plain(ParquetWriter* w, const BoltColumn& col,
+                       const ParquetWriteColumn& sch, std::int64_t n_rows,
+                       const std::uint8_t* def_bits, bool nullable,
+                       ChunkRec* rec) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(n_rows >= 0);
+    const std::uint64_t budget = page_budget_bytes(w->opts);
+    std::vector<std::uint8_t> vals, payload;
+    std::int64_t r0 = 0;
+    std::uint32_t pages = 0;
+    for (;;) {
+        if (++pages > kPwMaxPagesPerChunk) return false;
+        const std::int64_t r1 = (r0 < n_rows)
+            ? plan_page_rows(col, sch.type, r0, n_rows, def_bits, nullable,
+                             budget, /*bits_per_value=*/0u)
+            : r0;
+        assert(r1 >= r0 && r1 <= n_rows);
+        vals.clear();
+        if (!encode_plain_range(col, sch, r0, r1, def_bits, nullable, &vals)) {
+            return false;
+        }
+        if (!build_page_payload(vals, def_bits, nullable, r0, r1, &payload)) {
+            return false;
+        }
+        StatBuf ps;
+        std::memset(&ps, 0, sizeof(ps));
+        if (w->opts.emit_page_index &&
+            !compute_stats(col, r0, r1, def_bits, nullable, &ps)) {
+            return false;
+        }
+        std::int64_t off = 0;
+        std::int32_t sz = 0;
+        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, kEncPlain,
+                       rec, &off, &sz)) {
+            return false;
+        }
+        if (rec->data_page_offset == 0) rec->data_page_offset = off;
+        note_page(w, rec, off, sz, r0, count_nulls(def_bits, nullable, r0, r1),
+                  r1 - r0, ps);
+        r0 = r1;
+        if (r0 >= n_rows) break;
+    }
+    return true;
+}
+
+// Intern every non-null value of [0, n_rows) into `d`, appending each row's
+// index to `idx` (one entry per NON-NULL row, in row order). Returns false
+// when the dictionary exceeded its bounds -- the caller then writes PLAIN.
+bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
+                      std::int64_t n_rows, const std::uint8_t* def_bits,
+                      bool nullable, std::uint32_t max_bytes,
+                      DictBuilder* d, std::vector<std::uint32_t>* idx) noexcept {
+    assert(d != nullptr && idx != nullptr);
+    assert(n_rows >= 0);
+    const bool var_len = (sch.type == BoltType::Utf8 ||
+                          sch.type == BoltType::Binary);
+    dict_init(d, max_bytes, var_len, n_rows);
+    idx->clear();
+    idx->reserve(static_cast<std::size_t>(n_rows));
+    const std::size_t elem = plain_elem_width(sch.type);
+    const bool is_dec = (sch.type == BoltType::Decimal128);
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+        if (nullable && def_bits[r] == 0u) continue;
+        std::uint32_t id;
+        if (var_len) {
+            const RowVal v = row_val_bytes(col, r);
+            if (v.n == 0xFFFFFFFFu) return false;   // spilled with no base
+            id = dict_intern(d, v.p, v.n);
+        } else if (is_dec) {
+            std::uint8_t be[16];
+            decimal_to_be(static_cast<const std::uint8_t*>(col.data) + r * 16,
+                          be);
+            id = dict_intern(d, be, 16u);
+        } else {
+            assert(elem != 0u);
+            const RowVal v = row_val_fixed(col, elem, r);
+            id = dict_intern(d, v.p, v.n);
+        }
+        if (id == 0xFFFFFFFFu) return false;        // overflow -> PLAIN
+        idx->push_back(id);
+    }
+    return true;
+}
+
+// DICTIONARY_PAGE + RLE_DICTIONARY data pages for the whole chunk.
+bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
+                      const ParquetWriteColumn& sch, std::int64_t n_rows,
+                      const std::uint8_t* def_bits, bool nullable,
+                      const DictBuilder& d,
+                      const std::vector<std::uint32_t>& idx,
+                      ChunkRec* rec) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(d.count > 0u);
+    rec->dictionary = true;
+    // Dictionary page first: its offset is the chunk's start, and the reader
+    // requires it to precede the data pages that reference it.
+    std::vector<std::uint8_t> dict_payload(d.plain.begin(), d.plain.end());
+    std::int64_t doff = 0;
+    if (!emit_page(w, dict_payload, /*dict_page=*/true, d.count, kEncPlain,
+                   rec, &doff, nullptr)) {
+        return false;
+    }
+    rec->dict_page_offset = doff;
+
+    const std::uint32_t bw = bit_width_for(d.count - 1u);
+    const std::uint64_t budget = page_budget_bytes(w->opts);
+    // A zero-bit-width dictionary (one distinct value) still costs a run
+    // header per page; size such pages by row count instead of by bits.
+    const std::uint32_t bits = (bw != 0u) ? bw : 1u;
+
+    std::vector<std::uint8_t> vals, payload;
+    std::int64_t r0 = 0;
+    std::size_t vi = 0;            // cursor into idx (non-null rows so far)
+    std::uint32_t pages = 0;
+    for (;;) {
+        if (++pages > kPwMaxPagesPerChunk) return false;
+        const std::int64_t r1 = (r0 < n_rows)
+            ? plan_page_rows(col, sch.type, r0, n_rows, def_bits, nullable,
+                             budget, bits)
+            : r0;
+        assert(r1 >= r0 && r1 <= n_rows);
+        const std::int64_t nv = r1 - r0 - count_nulls(def_bits, nullable, r0, r1);
+        assert(nv >= 0);
+        assert(vi + static_cast<std::size_t>(nv) <= idx.size());
+        vals.clear();
+        vals.push_back(static_cast<std::uint8_t>(bw));
+        rle_hybrid_encode(idx.data() + vi, static_cast<std::size_t>(nv), bw,
+                          &vals);
+        vi += static_cast<std::size_t>(nv);
+        if (!build_page_payload(vals, def_bits, nullable, r0, r1, &payload)) {
+            return false;
+        }
+        StatBuf ps;
+        std::memset(&ps, 0, sizeof(ps));
+        if (w->opts.emit_page_index &&
+            !compute_stats(col, r0, r1, def_bits, nullable, &ps)) {
+            return false;
+        }
+        std::int64_t off = 0;
+        std::int32_t sz = 0;
+        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, kEncRleDict,
+                       rec, &off, &sz)) {
+            return false;
+        }
+        if (rec->data_page_offset == 0) rec->data_page_offset = off;
+        note_page(w, rec, off, sz, r0, (r1 - r0) - nv, r1 - r0, ps);
+        r0 = r1;
+        if (r0 >= n_rows) break;
+    }
+    assert(vi == idx.size());
+    return true;
+}
+
+// Build the def levels + statistics that both encodings need, choose the
+// encoding, and delegate. Fallback from dictionary to PLAIN happens here and
+// only here, so a chunk's data pages never disagree about their encoding.
+bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
+                        const ParquetWriteColumn& sch,
+                        std::int64_t n_rows, ChunkRec* rec) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(n_rows >= 0);
+    std::memset(rec, 0, sizeof(*rec));
+    rec->num_values = n_rows;
+    rec->page_off = static_cast<std::uint32_t>(w->pages.size());
+
+    if (col.type != sch.type) return false;
+    if (col.length < n_rows) return false;
+
+    std::vector<std::uint8_t> def_bits;
+    const bool nullable = sch.nullable;
+    if (nullable) {
+        def_bits.resize(static_cast<std::size_t>(n_rows));
+        fill_def_bits(col, n_rows, def_bits.data(), &rec->null_count);
+    }
+    // G2FEAT-24: null_count is always known -- counted for OPTIONAL columns,
+    // structurally 0 for REQUIRED ones -- so the footer always carries it.
+    rec->null_count_known = true;
+    const std::uint8_t* db = nullable ? def_bits.data() : nullptr;
+
+    if (w->opts.emit_statistics &&
+        !compute_stats(col, 0, n_rows, db, nullable, &rec->st)) {
+        return false;
+    }
+
+    if (w->opts.use_dictionary && dict_eligible(sch.type) && n_rows > 0) {
+        if (dict_build_chunk(col, sch, n_rows, db, nullable,
+                             dict_budget_bytes(w->opts), &w->dict,
+                             &w->dict_idx) &&
+            w->dict.count > 0u) {
+            return chunk_write_dict(w, col, sch, n_rows, db, nullable, w->dict,
+                                    w->dict_idx, rec);
+        }
+        // Dictionary overflowed its ceiling (or the chunk is all-null):
+        // PLAIN for the whole chunk. Nothing has been written yet, so this
+        // costs only the abandoned build.
+    }
+    return chunk_write_plain(w, col, sch, n_rows, db, nullable, rec);
 }
 
 // ===== footer (FileMetaData) =============================================
@@ -860,11 +1212,11 @@ void write_statistics(TcOut* o, const ChunkRec& rec) noexcept {
         tc_put_field(o, 3, kFI64);
         tc_put_zigzag(o, rec.null_count);
     }
-    if (rec.have_stats) {
+    if (rec.st.have_stats) {
         tc_put_field(o, 5, kFBinary);
-        tc_put_binary(o, rec.max_buf, rec.max_len);
+        tc_put_binary(o, rec.st.max_buf, rec.st.max_len);
         tc_put_field(o, 6, kFBinary);
-        tc_put_binary(o, rec.min_buf, rec.min_len);
+        tc_put_binary(o, rec.st.min_buf, rec.st.min_len);
     }
     tc_put_stop(o);
 }
@@ -874,11 +1226,22 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ChunkRec& rec) noexcept {
     tc_put_field(o, 1, kFI32);
     tc_put_zigzag(o, bolt_to_pq_physical(sch.type));
-    // encodings: list<i32> = {PLAIN, RLE}
+    // encodings: the set actually used by this chunk. RLE always appears --
+    // it encodes the definition levels even for a REQUIRED column's absent
+    // stream, and parquet-mr lists it unconditionally. A dictionary chunk
+    // adds RLE_DICTIONARY for the data pages and keeps PLAIN for the
+    // dictionary page itself.
     tc_put_field(o, 2, kFList);
-    tc_put_list_hdr(o, kFI32, 2);
-    tc_put_zigzag(o, kEncPlain);
-    tc_put_zigzag(o, kEncRle);
+    if (rec.dictionary) {
+        tc_put_list_hdr(o, kFI32, 3);
+        tc_put_zigzag(o, kEncPlain);
+        tc_put_zigzag(o, kEncRle);
+        tc_put_zigzag(o, kEncRleDict);
+    } else {
+        tc_put_list_hdr(o, kFI32, 2);
+        tc_put_zigzag(o, kEncPlain);
+        tc_put_zigzag(o, kEncRle);
+    }
     // path_in_schema: list<binary> = {name}
     tc_put_field(o, 3, kFList);
     tc_put_list_hdr(o, kFBinary, 1);
@@ -895,7 +1258,16 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     tc_put_zigzag(o, rec.total_cmp);
     tc_put_field(o, 9, kFI64);
     tc_put_zigzag(o, rec.data_page_offset);
-    if (w->opts.emit_statistics && (rec.have_stats || rec.null_count_known)) {
+    // 11 dictionary_page_offset. Readers (bolt's own included) take the
+    // chunk's byte region to start at the dictionary page when this is set,
+    // so it must be the FIRST page of the chunk and total_compressed_size
+    // must span from it -- which is why emit_page folds the dictionary page
+    // into the same running totals.
+    if (rec.dictionary && rec.dict_page_offset > 0) {
+        tc_put_field(o, 11, kFI64);
+        tc_put_zigzag(o, rec.dict_page_offset);
+    }
+    if (w->opts.emit_statistics && (rec.st.have_stats || rec.null_count_known)) {
         tc_put_field(o, 12, kFStruct);
         write_statistics(o, rec);
     }
@@ -916,6 +1288,21 @@ void write_column_chunk_struct(TcOut* o, const ParquetWriter* w,
     // ColumnChunk: 3 = meta_data (struct)
     tc_put_field(o, 3, kFStruct);
     write_column_meta(o, w, sch, rec);
+    // 4/5 = offset_index_offset/length, 6/7 = column_index_offset/length.
+    // These live on ColumnChunk, NOT on ColumnMetaData -- a reader looks
+    // here to find the index region without parsing any page.
+    if (rec.off_index_len > 0) {
+        tc_put_field(o, 4, kFI64);
+        tc_put_zigzag(o, rec.off_index_off);
+        tc_put_field(o, 5, kFI32);
+        tc_put_zigzag(o, rec.off_index_len);
+    }
+    if (rec.col_index_len > 0) {
+        tc_put_field(o, 6, kFI64);
+        tc_put_zigzag(o, rec.col_index_off);
+        tc_put_field(o, 7, kFI32);
+        tc_put_zigzag(o, rec.col_index_len);
+    }
     tc_put_stop(o);
 }
 
@@ -1166,6 +1553,10 @@ namespace {
 bool finish_footer(ParquetWriter* w) noexcept {
     assert(w != nullptr);
     assert(!w->failed);
+    // The page index sits between the last row group and the footer, and
+    // writing it fills in the ColumnChunk locators the footer then emits --
+    // so it must run BEFORE write_file_metadata, not after.
+    if (!write_page_index(w)) return false;
     std::vector<std::uint8_t> footer;
     write_file_metadata(&footer, w);
     const std::uint32_t flen = static_cast<std::uint32_t>(footer.size());
