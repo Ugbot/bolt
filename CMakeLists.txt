@@ -198,7 +198,7 @@ endif()
 option(BOLT_BUILD_PARSE "Build bolt::parse compiled library" ${BOLT_IS_TOPLEVEL})
 
 if(BOLT_BUILD_PARSE)
-    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
+    add_library(bolt_parse STATIC src/parse/bolt_ascii.cpp src/parse/bolt_json.cpp src/parse/bolt_json_writer.cpp src/parse/bolt_jinja.cpp src/parse/bolt_jinja_ast.cpp src/parse/bolt_jinja_stmt.cpp src/parse/bolt_jinja_value.cpp src/parse/bolt_jinja_eval.cpp)
     add_library(bolt::parse ALIAS bolt_parse)
     target_link_libraries(bolt_parse PUBLIC bolt::core)
     target_include_directories(bolt_parse PUBLIC
@@ -225,6 +225,7 @@ option(BOLT_BUILD_REACTOR "Build bolt::reactor native async event loop / I/O" ${
 if(BOLT_BUILD_REACTOR)
     set(_bolt_reactor_sources
         src/api/core/async_io.cpp
+        src/api/core/timer_queue.cpp
         src/api/core/logger.cpp
         src/api/core/worker_pool.cpp
         src/api/net/event_loop.cpp
