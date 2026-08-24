@@ -1682,6 +1682,18 @@ bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     assert(m != nullptr && cx != nullptr);
     assert(c < m->n_columns && col != nullptr);
     const PqColumn* pc = &m->columns[c];
+    // A leaf under a REPEATED group produces a variable number of values per
+    // row, so it cannot be materialised as one value per row the way every
+    // other column here is. Refuse THIS column; the rest of the file is fine,
+    // and a projection that omits it reads normally.
+    if (pc->max_rep != 0u) {
+        if (bolt_pq_diag()) {
+            std::fprintf(stderr, "bolt parquet: column '%s' is REPEATED "
+                         "(list/map, max_rep=%u) -- not supported\n",
+                         pc->name, static_cast<unsigned>(pc->max_rep));
+        }
+        return false;
+    }
     BoltType t;
     uint8_t scale = 0;
     if (!parquet_map_type(pc, &t, &scale)) return false;

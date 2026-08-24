@@ -598,7 +598,15 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         continue;
                     }
                     if (!se.has_type) return false;     // leaf without a type
-                    if (rep != 0u) return false;        // list/map: needs Dremel
+                    // A REPEATED leaf (list/map) is recorded, NOT rejected.
+                    // Rejecting it here failed the whole FILE: a table with
+                    // three scalar columns and one list field could not be
+                    // opened at all, though every scalar column was readable.
+                    // The leaf must still occupy a slot because a row group's
+                    // ColumnChunks are indexed by leaf position -- dropping it
+                    // would silently misalign every column after it. Decode
+                    // refuses it individually instead, so a projection that
+                    // does not ask for the list reads normally.
                     if (out->n_columns >= kPqMaxColumns) return false;
                     PqColumn col = se.col;
                     col.max_def = def;
