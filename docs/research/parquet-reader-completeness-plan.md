@@ -1,15 +1,34 @@
 # Parquet reader completeness: everything hardwood reads that bolt does not
 
-> **STATUS 2026-08-24: six of nine gaps closed.** BYTE_STREAM_SPLIT, all three
-> delta encodings, DATA_PAGE_V2, and the GZIP/LZ4_RAW codecs now read, verified
-> byte-exact against pyarrow across 78 fixtures. Remaining: nested/repeated
-> columns (the large one), and wiring the page index and bloom filter — both of
-> which are optimisations, not readability. BROTLI/LZO still fail closed.
+> **STATUS 2026-08-24: eight of nine gaps closed.** Everything below now reads
+> except list/map VALUES. Verified byte-exact against pyarrow on 82 fixtures:
+> BYTE_STREAM_SPLIT, all three delta encodings, DATA_PAGE_V2, GZIP + LZ4_RAW,
+> nested structs (including all three definition levels with nulls), and any
+> file that merely CONTAINS a list — its scalar columns read via projection.
 >
-> A detail worth keeping: the same logical data written four different ways
-> (PLAIN/dict, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT) now
-> decodes to the SAME checksum, 373c6b93d4394863 — a stronger statement than any
-> single comparison, because four independent decode paths agree.
+> The same logical data written four ways decodes to one checksum,
+> 373c6b93d4394863, so four independent decode paths agree.
+>
+> **The one remaining readability gap, and why it stops here.** Materialising
+> list/map values needs Dremel record assembly AND a list column shape, and the
+> shape is the blocker, not the decoding. bolt has a single general `dict_child`
+> slot reused three ways — run-ends, VarBinary BYTE offsets, dictionary
+> keys→values. A typed list needs offsets in ELEMENTS plus a typed child column,
+> which collides with VarBinary's byte-offset meaning. So it needs either a new
+> `ColumnFormat` or a two-level `dict_child` chain in `bolt_column.h` — a public
+> type chukonu and marbledb both consume. That is an API decision to take
+> deliberately, not a decode detail to improvise.
+>
+> Sequence when picking it up: settle the representation in `bolt_column.h`
+> FIRST; then repetition-level decoding, which is nearly free because
+> `unpack_le_bounded` and `level_bit_width()` already generalise and `max_rep`
+> is already computed per leaf; then assembly. The fixtures and
+> `scripts/parquet_ref_hash.py` already cover the verification.
+>
+> Also still open, both smaller and neither a readability gap: page-index and
+> bloom-filter wiring need a predicate plumbed through the read API, which has
+> no predicate parameter today — so they are more than "wiring". BROTLI and LZO
+> have no decoder in bolt at all and fail closed.
 
 Written 2026-08-24, after a day spent making the reader 1.53x faster and then
 discovering it cannot open several kinds of file the ecosystem routinely
@@ -35,7 +54,9 @@ bug. It is absence.
 | 3 | `DELTA_LENGTH_BYTE_ARRAY` | **DONE** | reads |
 | 4 | `BYTE_STREAM_SPLIT` | **DONE** | reads; width must come from the PHYSICAL type |
 | 5 | `DATA_PAGE_V2` | **DONE** | reads; levels assembled uncompressed ahead of values |
-| 6 | Nested / repeated columns | not supported | reader is documented "FLAT-schema subset"; no repetition-level handling exists |
+| 6a | Nested STRUCT columns | **DONE** | schema walked depth-first; decoder generalised to max_def |
+| 6b | Files CONTAINING a list | **DONE** | the list blocks only itself; scalars read via projection |
+| 6c | List/map VALUES | open | needs Dremel assembly + a list column shape (see status) |
 | 7 | GZIP / LZ4_RAW | **DONE** | GZIP via bolt's own inflate_raw, not zlib. BROTLI/LZO still fail closed |
 | 8 | Page index (skip pages by stats) | BUILT, NOT WIRED | `bolt_parquet_pageindex.h` included only by its own .cpp and test |
 | 9 | Bloom filter (prune by equality) | BUILT, NOT WIRED | `bolt_parquet_bloom.h` same |
