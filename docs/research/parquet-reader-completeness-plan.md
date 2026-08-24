@@ -1,5 +1,16 @@
 # Parquet reader completeness: everything hardwood reads that bolt does not
 
+> **STATUS 2026-08-24: six of nine gaps closed.** BYTE_STREAM_SPLIT, all three
+> delta encodings, DATA_PAGE_V2, and the GZIP/LZ4_RAW codecs now read, verified
+> byte-exact against pyarrow across 78 fixtures. Remaining: nested/repeated
+> columns (the large one), and wiring the page index and bloom filter — both of
+> which are optimisations, not readability. BROTLI/LZO still fail closed.
+>
+> A detail worth keeping: the same logical data written four different ways
+> (PLAIN/dict, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT) now
+> decodes to the SAME checksum, 373c6b93d4394863 — a stronger statement than any
+> single comparison, because four independent decode paths agree.
+
 Written 2026-08-24, after a day spent making the reader 1.53x faster and then
 discovering it cannot open several kinds of file the ecosystem routinely
 produces. Speed on files we can already read is worth less than being able to
@@ -19,13 +30,13 @@ bug. It is absence.
 
 | # | Gap | Status in bolt | Evidence |
 |---|---|---|---|
-| 1 | `DELTA_BINARY_PACKED` | rejected | measured: "row group 0 failed" |
-| 2 | `DELTA_BYTE_ARRAY` | rejected | measured: "row group 0 failed" |
-| 3 | `DELTA_LENGTH_BYTE_ARRAY` | rejected | not in the encoding dispatch |
-| 4 | `BYTE_STREAM_SPLIT` | rejected | measured: "row group 0 failed" |
-| 5 | `DATA_PAGE_V2` | rejected | `kPageData`/`kPageDict` only; header says "DATA_PAGE_V2 rejected" |
+| 1 | `DELTA_BINARY_PACKED` | **DONE** | reads; verified vs pyarrow |
+| 2 | `DELTA_BYTE_ARRAY` | **DONE** | reads; needed a growable Utf8 spill buffer |
+| 3 | `DELTA_LENGTH_BYTE_ARRAY` | **DONE** | reads |
+| 4 | `BYTE_STREAM_SPLIT` | **DONE** | reads; width must come from the PHYSICAL type |
+| 5 | `DATA_PAGE_V2` | **DONE** | reads; levels assembled uncompressed ahead of values |
 | 6 | Nested / repeated columns | not supported | reader is documented "FLAT-schema subset"; no repetition-level handling exists |
-| 7 | GZIP / BROTLI / LZ4 / LZO codecs | rejected | `decompress_page` handles Uncompressed, Snappy, Zstd; enum declares 8 |
+| 7 | GZIP / LZ4_RAW | **DONE** | GZIP via bolt's own inflate_raw, not zlib. BROTLI/LZO still fail closed |
 | 8 | Page index (skip pages by stats) | BUILT, NOT WIRED | `bolt_parquet_pageindex.h` included only by its own .cpp and test |
 | 9 | Bloom filter (prune by equality) | BUILT, NOT WIRED | `bolt_parquet_bloom.h` same |
 
