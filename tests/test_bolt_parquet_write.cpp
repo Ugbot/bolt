@@ -271,15 +271,23 @@ TEST(BoltParquetWrite, NullableInt64Roundtrip) {
 
 // Build a 2-col (id int64, tag utf8) batch whose tag values come from a
 // caller list (cycled). Strings >12 bytes spill into a shared buffer.
+// `n_cols_cap` sizes the column array. It exists because a caller that fills
+// in EXTRA columns afterwards (InteropFixtureForExternalReaders does, taking
+// the batch to 5) must say so here: alloc_columns sizes the array exactly,
+// and assigning past it wrote over whatever the arena handed out next --
+// which is this function's own StringView and spill buffers. The symptom was
+// an "interop fixture" whose bytes changed on every run, because the values
+// it wrote were address-dependent garbage.
 void build_stats_batch(bolt::Arena* arena, std::int64_t base, std::int64_t n,
                        const char* const* tags, std::size_t n_tags,
-                       bolt::BoltBatch* out) {
+                       bolt::BoltBatch* out, std::uint32_t n_cols_cap = 2) {
     ASSERT_NE(arena, nullptr);
     ASSERT_NE(out, nullptr);
+    ASSERT_GE(n_cols_cap, 2u);
     bolt::BoltBatch::init_empty(out);
     out->num_cols = 2;
     out->num_rows = n;
-    bolt::BoltBatch::alloc_columns(out, arena, 2);  // G2FEAT-47: size columns[2]
+    bolt::BoltBatch::alloc_columns(out, arena, n_cols_cap);
 
     bolt::BoltColumn& id = out->columns[out->read_epoch][0];
     id = bolt::BoltColumn::make_flat_alloc(n, bolt::BoltType::Int64, arena);
@@ -728,7 +736,7 @@ TEST(BoltParquetWrite, InteropFixtureForExternalReaders) {
     bolt::BoltBatch* b = arena.allocate_array<bolt::BoltBatch>(1);
     ASSERT_NE(b, nullptr);
     const char* tags[] = {"kiwi", "a_spilled_string_over_12b", "mango"};
-    build_stats_batch(&arena, 1000, kRows, tags, 3, b);  // id, tag
+    build_stats_batch(&arena, 1000, kRows, tags, 3, b, /*n_cols_cap=*/5);
     b->num_cols = 5;
     bolt::BoltColumn* cols = b->columns[b->read_epoch];
     // c2: int32

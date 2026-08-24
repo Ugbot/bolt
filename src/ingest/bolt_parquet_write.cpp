@@ -275,8 +275,11 @@ struct ChunkRec {
     std::int64_t num_values;
     std::int64_t total_unc;
     std::int64_t total_cmp;
+    // RELATIVE to the chunk's buffer while encoding; absolute after the emit
+    // pass adds the base. -1 means "no data page written yet" -- 0 cannot be
+    // that sentinel any more, because the first page starts at relative 0.
     std::int64_t data_page_offset;
-    std::int64_t dict_page_offset;   // 0 when the chunk is not dictionary-encoded
+    std::int64_t dict_page_offset;   // -1 when the chunk is not dictionary-encoded
     std::int64_t null_count;
     bool         null_count_known;
     bool         dictionary;         // RLE_DICTIONARY data pages
@@ -294,6 +297,22 @@ struct ChunkRec {
     // patched in after the chunk itself.
     std::int64_t  bloom_off;
     std::int32_t  bloom_len;
+};
+
+// One column chunk, encoded but not yet placed in the file. Every offset in
+// `rec` and `pages` is RELATIVE to the start of `bytes`; the serial emit pass
+// adds the chunk's base file position exactly once.
+//
+// Encoding into a buffer rather than straight to the sink is what lets the
+// per-column encode run off the write path at all -- and it is a better
+// serial shape too, since a chunk becomes one sink append instead of two per
+// page.
+struct ChunkOut {
+    std::vector<std::uint8_t> bytes;
+    std::vector<PageRec>      pages;
+    std::vector<std::uint8_t> bloom;    // serialized filter, empty if none
+    ChunkRec                  rec;
+    bool                      ok;
 };
 
 struct RowGroupRec {
@@ -341,6 +360,7 @@ struct ParquetWriter {
     // cleared at the end of each row group so live filter memory is bounded
     // by one row group's columns, not the file's.
     BloomBuilder               bloom;
+    ChunkOut                   chunk_out;   // reused across columns
     std::vector<std::vector<std::uint8_t>> rg_blooms;   // serialized
     std::vector<std::uint32_t>             rg_bloom_chunk;  // chunk index
 };
@@ -958,11 +978,12 @@ bool build_page_payload(const std::vector<std::uint8_t>& values,
 // `rec`. `dict_page` selects the dictionary page header. Fails closed if the
 // page would overflow the int32 size fields rather than truncating them --
 // the bug this page-splitting work exists to remove.
-bool emit_page(ParquetWriter* w, const std::vector<std::uint8_t>& payload,
+bool emit_page(ParquetWriter* w, ChunkOut* out,
+               const std::vector<std::uint8_t>& payload,
                bool dict_page, std::int64_t num_values,
                std::int32_t encoding, ChunkRec* rec,
                std::int64_t* out_offset, std::int32_t* out_size) noexcept {
-    assert(w != nullptr && rec != nullptr);
+    assert(w != nullptr && rec != nullptr && out != nullptr);
     assert(num_values >= 0);
     if (payload.size() > 0x7FFFFFFFull) return false;
     if (num_values > 0x7FFFFFFF) return false;
@@ -985,12 +1006,11 @@ bool emit_page(ParquetWriter* w, const std::vector<std::uint8_t>& payload,
                           static_cast<std::int32_t>(num_values), encoding);
     }
 
-    const std::int64_t off = w->file_pos;
-    if (!sink_write(w, hdr.data(), hdr.size())) return false;
-    if (!sink_write(w, compressed.data(), compressed.size())) return false;
-    if (!sink_ok(w)) return false;
+    // Offsets are relative to the chunk buffer; the emit pass rebases them.
+    const std::int64_t off = static_cast<std::int64_t>(out->bytes.size());
+    out->bytes.insert(out->bytes.end(), hdr.begin(), hdr.end());
+    out->bytes.insert(out->bytes.end(), compressed.begin(), compressed.end());
     const std::size_t total = hdr.size() + compressed.size();
-    w->file_pos += static_cast<std::int64_t>(total);
     rec->total_unc += static_cast<std::int64_t>(hdr.size()) + unc;
     rec->total_cmp += static_cast<std::int64_t>(hdr.size()) + cmp;
     if (out_offset != nullptr) *out_offset = off;
@@ -1001,11 +1021,11 @@ bool emit_page(ParquetWriter* w, const std::vector<std::uint8_t>& payload,
 // Record one data page in the writer's page table (consumed at close by the
 // ColumnIndex / OffsetIndex writers). Only populated when the caller asked
 // for a page index; otherwise the table stays empty and costs nothing.
-void note_page(ParquetWriter* w, ChunkRec* rec, std::int64_t offset,
-               std::int32_t size, std::int64_t first_row,
+void note_page(ParquetWriter* w, ChunkOut* out, ChunkRec* rec,
+               std::int64_t offset, std::int32_t size, std::int64_t first_row,
                std::int64_t nulls, std::int64_t n_vals,
                const StatBuf& st) noexcept {
-    assert(w != nullptr && rec != nullptr);
+    assert(w != nullptr && rec != nullptr && out != nullptr);
     assert(nulls >= 0 && n_vals >= 0);
     if (!w->opts.emit_page_index) return;
     PageRec pr;
@@ -1016,7 +1036,7 @@ void note_page(ParquetWriter* w, ChunkRec* rec, std::int64_t offset,
     pr.null_count = nulls;
     pr.all_null = (n_vals > 0) && (nulls == n_vals);
     pr.st = st;
-    w->pages.push_back(pr);
+    out->pages.push_back(pr);
     ++rec->page_count;
 }
 
@@ -1076,7 +1096,7 @@ bool encode_direct_range(ParquetWriter* w, const BoltColumn& col,
 // does not change the byte count), and an UPPER bound for the DELTA family,
 // whose whole purpose is to be smaller. So a delta page lands at or under the
 // budget -- conservative, never over.
-bool chunk_write_direct(ParquetWriter* w, const BoltColumn& col,
+bool chunk_write_direct(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
                         const ParquetWriteColumn& sch, PqWriteEncoding enc,
                         std::int64_t n_rows,
                         const std::uint8_t* def_bits, bool nullable,
@@ -1112,12 +1132,12 @@ bool chunk_write_direct(ParquetWriter* w, const BoltColumn& col,
         }
         std::int64_t off = 0;
         std::int32_t sz = 0;
-        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, enc_code,
+        if (!emit_page(w, out, payload, /*dict_page=*/false, r1 - r0, enc_code,
                        rec, &off, &sz)) {
             return false;
         }
-        if (rec->data_page_offset == 0) rec->data_page_offset = off;
-        note_page(w, rec, off, sz, r0, count_nulls(def_bits, nullable, r0, r1),
+        if (rec->data_page_offset < 0) rec->data_page_offset = off;
+        note_page(w, out, rec, off, sz, r0, count_nulls(def_bits, nullable, r0, r1),
                   r1 - r0, ps);
         r0 = r1;
         if (r0 >= n_rows) break;
@@ -1165,7 +1185,7 @@ bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
 }
 
 // DICTIONARY_PAGE + RLE_DICTIONARY data pages for the whole chunk.
-bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
+bool chunk_write_dict(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
                       const ParquetWriteColumn& sch, std::int64_t n_rows,
                       const std::uint8_t* def_bits, bool nullable,
                       const DictBuilder& d,
@@ -1178,7 +1198,7 @@ bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
     // requires it to precede the data pages that reference it.
     std::vector<std::uint8_t> dict_payload(d.plain.begin(), d.plain.end());
     std::int64_t doff = 0;
-    if (!emit_page(w, dict_payload, /*dict_page=*/true, d.count, kEncPlain,
+    if (!emit_page(w, out, dict_payload, /*dict_page=*/true, d.count, kEncPlain,
                    rec, &doff, nullptr)) {
         return false;
     }
@@ -1220,12 +1240,12 @@ bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
         }
         std::int64_t off = 0;
         std::int32_t sz = 0;
-        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, kEncRleDict,
+        if (!emit_page(w, out, payload, /*dict_page=*/false, r1 - r0, kEncRleDict,
                        rec, &off, &sz)) {
             return false;
         }
-        if (rec->data_page_offset == 0) rec->data_page_offset = off;
-        note_page(w, rec, off, sz, r0, (r1 - r0) - nv, r1 - r0, ps);
+        if (rec->data_page_offset < 0) rec->data_page_offset = off;
+        note_page(w, out, rec, off, sz, r0, (r1 - r0) - nv, r1 - r0, ps);
         r0 = r1;
         if (r0 >= n_rows) break;
     }
@@ -1238,11 +1258,11 @@ bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
 // distinct-value count; otherwise the non-null row count is used, which
 // over-estimates and so over-SIZES the filter -- the safe direction, since
 // an under-sized filter is over-full and its false-positive rate degrades.
-bool chunk_build_bloom(ParquetWriter* w, const BoltColumn& col,
+bool chunk_build_bloom(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
                        const ParquetWriteColumn& sch, std::int64_t n_rows,
                        const std::uint8_t* def_bits, bool nullable,
                        bool ndv_exact, ChunkRec* rec) noexcept {
-    assert(w != nullptr && rec != nullptr);
+    assert(w != nullptr && rec != nullptr && out != nullptr);
     assert(n_rows >= 0);
     if (!w->opts.emit_bloom_filter) return true;
     if (!bloom_eligible(sch.type)) return true;
@@ -1261,23 +1281,27 @@ bool chunk_build_bloom(ParquetWriter* w, const BoltColumn& col,
                            &w->bloom)) {
         return false;
     }
-    w->rg_blooms.emplace_back();
-    bloom_serialize(w->bloom, &w->rg_blooms.back());
-    w->rg_bloom_chunk.push_back(static_cast<std::uint32_t>(w->chunks.size()));
+    bloom_serialize(w->bloom, &out->bloom);
     return true;
 }
 
 // Build the def levels + statistics that both encodings need, choose the
 // encoding, and delegate. Fallback from dictionary to PLAIN happens here and
 // only here, so a chunk's data pages never disagree about their encoding.
-bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
+bool write_column_chunk(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
                         const ParquetWriteColumn& sch,
-                        std::int64_t n_rows, ChunkRec* rec) noexcept {
-    assert(w != nullptr && rec != nullptr);
+                        std::int64_t n_rows) noexcept {
+    assert(w != nullptr && out != nullptr);
     assert(n_rows >= 0);
+    out->bytes.clear();
+    out->pages.clear();
+    out->bloom.clear();
+    out->ok = false;
+    ChunkRec* rec = &out->rec;
     std::memset(rec, 0, sizeof(*rec));
     rec->num_values = n_rows;
-    rec->page_off = static_cast<std::uint32_t>(w->pages.size());
+    rec->data_page_offset = -1;      // relative-0 is a real offset now
+    rec->dict_page_offset = -1;
 
     if (col.type != sch.type) return false;
     if (col.length < n_rows) return false;
@@ -1306,20 +1330,24 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
                          dict_budget_bytes(w->opts), &w->dict, &w->dict_idx) &&
         w->dict.count > 0u) {
         dict_ndv_exact = true;
-        ok = chunk_write_dict(w, col, sch, n_rows, db, nullable, w->dict,
+        ok = chunk_write_dict(w, out, col, sch, n_rows, db, nullable, w->dict,
                               w->dict_idx, rec);
     } else if (enc == PqWriteEncoding::Dictionary) {
         // Dictionary overflowed its ceiling (or the chunk is all-null):
         // PLAIN for the whole chunk. Nothing has been written yet, so this
         // costs only the abandoned build.
-        ok = chunk_write_direct(w, col, sch, PqWriteEncoding::Plain, n_rows,
+        ok = chunk_write_direct(w, out, col, sch, PqWriteEncoding::Plain, n_rows,
                                 db, nullable, rec);
     } else {
-        ok = chunk_write_direct(w, col, sch, enc, n_rows, db, nullable, rec);
+        ok = chunk_write_direct(w, out, col, sch, enc, n_rows, db, nullable, rec);
     }
     if (!ok) return false;
-    return chunk_build_bloom(w, col, sch, n_rows, db, nullable,
-                             dict_ndv_exact, rec);
+    if (!chunk_build_bloom(w, out, col, sch, n_rows, db, nullable,
+                           dict_ndv_exact, rec)) {
+        return false;
+    }
+    out->ok = true;
+    return true;
 }
 
 // ===== footer (FileMetaData) =============================================
@@ -1679,6 +1707,39 @@ BoltColumn slice_column(const BoltColumn& c, BoltType t,
 
 // Append exactly one row group covering rows [start, start + rows) of the
 // batch's columns. Bookkeeping mirrors the pre-split writer verbatim.
+// Place one encoded chunk into the file: append its bytes, then rebase every
+// offset it recorded by the position they landed at. This is the ONLY place
+// that turns a relative offset into an absolute one, which is what keeps the
+// encode side ignorant of where in the file it will end up -- and therefore
+// safe to run off the write path.
+bool place_chunk(ParquetWriter* w, ChunkOut* out) noexcept {
+    assert(w != nullptr && out != nullptr);
+    assert(out->ok);
+    const std::int64_t base = w->file_pos;
+    if (!sink_write(w, out->bytes.data(), out->bytes.size())) return false;
+    if (!sink_ok(w)) return false;
+    w->file_pos += static_cast<std::int64_t>(out->bytes.size());
+
+    ChunkRec rec = out->rec;
+    assert(rec.data_page_offset >= 0);
+    rec.data_page_offset += base;
+    if (rec.dictionary) {
+        assert(rec.dict_page_offset >= 0);
+        rec.dict_page_offset += base;
+    } else {
+        rec.dict_page_offset = 0;      // 0 = absent, per the footer contract
+    }
+    rec.page_off = static_cast<std::uint32_t>(w->pages.size());
+    assert(rec.page_count == out->pages.size());
+    for (std::size_t i = 0; i < out->pages.size(); ++i) {
+        PageRec pr = out->pages[i];
+        pr.offset += base;
+        w->pages.push_back(pr);
+    }
+    w->chunks.push_back(rec);
+    return true;
+}
+
 bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
                          std::int64_t start, std::int64_t rows) noexcept {
     assert(w != nullptr && cols != nullptr);
@@ -1689,14 +1750,24 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     rg.num_rows = rows;
     rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
     rg.chunk_count = w->opts.n_columns;
+
+    // Encode, then place. Splitting the two is what bounds the write path to
+    // one append per chunk instead of two per page, and is the seam a
+    // parallel encode plugs into without touching offset arithmetic.
     for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
         const BoltColumn sc = slice_column(cols[c], w->opts.columns[c].type,
                                            start, rows);
-        ChunkRec rec{};
-        if (!write_column_chunk(w, sc, w->opts.columns[c], rows, &rec)) {
+        if (!write_column_chunk(w, &w->chunk_out, sc, w->opts.columns[c], rows)) {
             return false;
         }
-        w->chunks.push_back(rec);
+        if (!place_chunk(w, &w->chunk_out)) return false;
+        // The bloom filter is flushed after the row group, so hold the bytes
+        // and the chunk index it belongs to.
+        if (!w->chunk_out.bloom.empty()) {
+            w->rg_blooms.push_back(w->chunk_out.bloom);
+            w->rg_bloom_chunk.push_back(
+                static_cast<std::uint32_t>(w->chunks.size() - 1u));
+        }
     }
     rg.total_byte_size = w->file_pos - rg_start;
     // Flush this row group's bloom filters now (parquet-mr's AFTER_ROWGROUP
