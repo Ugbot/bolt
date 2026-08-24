@@ -76,6 +76,10 @@
 #include "bolt/bolt_column.h"     // BoltBatch / BoltColumn
 
 namespace bolt {
+
+// Borrowed, never owned by the writer -- see ParquetWriteOpts::encode_pool.
+struct Scheduler;
+
 namespace ingest {
 namespace parquet {
 
@@ -198,6 +202,22 @@ struct ParquetWriteOpts {
     // than over-full.
     std::uint32_t      bloom_max_bytes;
     std::uint32_t      _pad3;
+
+    // ---- parallel column encoding ---------------------------------------
+    // Optional worker pool used to encode a row group's column chunks
+    // concurrently. BORROWED: the writer never creates, resizes or shuts
+    // down a pool, so it cannot be responsible for one outliving its
+    // scheduler. nullptr (the zero-init default) encodes serially.
+    //
+    // Only the ENCODE is parallel. Placement into the file stays strictly
+    // serial and in column order, which is why the output is byte-identical
+    // to a serial write for any pool size -- the property the tests assert,
+    // rather than merely checking that a threaded run still parses.
+    //
+    // Columns are processed in waves sized to the pool, so peak scratch is
+    // bounded by the worker count rather than by the column count. A 256
+    // column schema does not allocate 256 dictionaries.
+    Scheduler*         encode_pool;
 };
 
 // Defaults referenced by the option comments above.

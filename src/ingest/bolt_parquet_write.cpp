@@ -51,6 +51,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
+#include "bolt/bolt_scheduler.h"
 #include "bolt/ingest/bolt_snappy.h"        // snappy_compress
 #include "bolt/ingest/bolt_parquet_bloom.h"  // pq_xxh64 (dictionary hashing)
 #include "bolt/ingest/bolt_parquet_pageindex.h"  // kPqMaxPagesPerChunk
@@ -65,6 +66,10 @@ namespace {
 
 constexpr std::uint32_t kPwMaxRowGroupBytes = 64u * 1024u * 1024u;  // 64 MiB
 constexpr std::uint32_t kPwMaxRowGroups     = 4096u;
+// Ceiling on concurrent column encodes. Each slot holds a dictionary, a bloom
+// builder and the DELTA scratch, so this bounds peak encode memory
+// independently of how wide the pool or the schema is.
+constexpr std::uint32_t kPwMaxEncodeWave    = 64u;
 constexpr std::uint32_t kPwMaxColumns       = kMaxFixedColumns;  // G2FEAT-47
 
 // Parquet enum codes we emit (parquet.thrift).
@@ -315,6 +320,19 @@ struct ChunkOut {
     bool                      ok;
 };
 
+// All mutable scratch one column-chunk encode needs. One instance per
+// concurrent encode slot, never per column: a 256-column schema would
+// otherwise hold 256 dictionaries at once.
+struct ChunkWorkspace {
+    DictBuilder                dict;
+    std::vector<std::uint32_t> dict_idx;
+    // DELTA encoder scratch (length / prefix / suffix arrays, suffix bytes).
+    std::vector<std::int64_t>  i64a;
+    std::vector<std::int64_t>  i64b;
+    std::vector<std::uint8_t>  bytes;
+    BloomBuilder               bloom;
+};
+
 struct RowGroupRec {
     std::int64_t  num_rows;
     std::int64_t  total_byte_size;
@@ -346,21 +364,15 @@ struct ParquetWriter {
     // order. Only populated when opts.emit_page_index is set. ChunkRec
     // carries the [page_off, page_off + page_count) window into it.
     std::vector<PageRec>     pages;
-    // Dictionary scratch, reused across column chunks so a wide schema pays
-    // for the hash table's growth once rather than per chunk.
-    DictBuilder              dict;
-    std::vector<std::uint32_t> dict_idx;
-    // Scratch for the DELTA encoders (length / prefix / suffix arrays and the
-    // suffix byte run). Reused across pages and chunks so the per-page cost
-    // is a clear(), not an allocation.
-    std::vector<std::int64_t>  i64_scratch;
-    std::vector<std::int64_t>  i64_scratch2;
-    std::vector<std::uint8_t>  byte_scratch;
+    // Encode slots. `ws` is one workspace per CONCURRENT encode (a wave), so
+    // its length is the pool width, not the column count. `outs` is one
+    // encoded chunk per wave slot, placed into the file serially afterwards.
+    // Both are grown once and reused for the writer's lifetime.
+    std::vector<ChunkWorkspace> ws;
+    std::vector<ChunkOut>       outs;
     // Bloom filters for the row group currently being written. Flushed and
     // cleared at the end of each row group so live filter memory is bounded
     // by one row group's columns, not the file's.
-    BloomBuilder               bloom;
-    ChunkOut                   chunk_out;   // reused across columns
     std::vector<std::vector<std::uint8_t>> rg_blooms;   // serialized
     std::vector<std::uint32_t>             rg_bloom_chunk;  // chunk index
 };
@@ -1058,7 +1070,8 @@ std::int64_t count_nulls(const std::uint8_t* def_bits, bool nullable,
 constexpr std::uint32_t kPwMaxPagesPerChunk = 1u << 16;
 
 // Encode rows [r0, r1) with a non-dictionary encoding.
-bool encode_direct_range(ParquetWriter* w, const BoltColumn& col,
+bool encode_direct_range(ParquetWriter* w, ChunkWorkspace* ws,
+                         const BoltColumn& col,
                          const ParquetWriteColumn& sch, PqWriteEncoding enc,
                          std::int64_t r0, std::int64_t r1,
                          const std::uint8_t* def_bits, bool nullable,
@@ -1071,21 +1084,21 @@ bool encode_direct_range(ParquetWriter* w, const BoltColumn& col,
                                             nullable, dst);
         case PqWriteEncoding::DeltaBinaryPacked: {
             if (gather_ints(col, sch.type, r0, r1, def_bits, nullable,
-                            &w->i64_scratch) < 0) {
+                            &ws->i64a) < 0) {
                 return false;
             }
             return delta_encode_ints(
-                w->i64_scratch.data(),
-                static_cast<std::uint32_t>(w->i64_scratch.size()), dst);
+                ws->i64a.data(),
+                static_cast<std::uint32_t>(ws->i64a.size()), dst);
         }
         case PqWriteEncoding::DeltaLengthByteArray:
             return encode_delta_length_byte_array(col, r0, r1, def_bits,
-                                                  nullable, &w->i64_scratch,
+                                                  nullable, &ws->i64a,
                                                   dst);
         case PqWriteEncoding::DeltaByteArray:
             return encode_delta_byte_array(col, r0, r1, def_bits, nullable,
-                                           &w->i64_scratch, &w->i64_scratch2,
-                                           &w->byte_scratch, dst);
+                                           &ws->i64a, &ws->i64b,
+                                           &ws->bytes, dst);
         default:
             return encode_plain_range(col, sch, r0, r1, def_bits, nullable, dst);
     }
@@ -1096,7 +1109,8 @@ bool encode_direct_range(ParquetWriter* w, const BoltColumn& col,
 // does not change the byte count), and an UPPER bound for the DELTA family,
 // whose whole purpose is to be smaller. So a delta page lands at or under the
 // budget -- conservative, never over.
-bool chunk_write_direct(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
+bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
+                        const BoltColumn& col,
                         const ParquetWriteColumn& sch, PqWriteEncoding enc,
                         std::int64_t n_rows,
                         const std::uint8_t* def_bits, bool nullable,
@@ -1117,7 +1131,7 @@ bool chunk_write_direct(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
             : r0;
         assert(r1 >= r0 && r1 <= n_rows);
         vals.clear();
-        if (!encode_direct_range(w, col, sch, enc, r0, r1, def_bits, nullable,
+        if (!encode_direct_range(w, ws, col, sch, enc, r0, r1, def_bits, nullable,
                                  &vals)) {
             return false;
         }
@@ -1185,7 +1199,8 @@ bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
 }
 
 // DICTIONARY_PAGE + RLE_DICTIONARY data pages for the whole chunk.
-bool chunk_write_dict(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
+bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
+                      const BoltColumn& col,
                       const ParquetWriteColumn& sch, std::int64_t n_rows,
                       const std::uint8_t* def_bits, bool nullable,
                       const DictBuilder& d,
@@ -1258,7 +1273,8 @@ bool chunk_write_dict(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
 // distinct-value count; otherwise the non-null row count is used, which
 // over-estimates and so over-SIZES the filter -- the safe direction, since
 // an under-sized filter is over-full and its false-positive rate degrades.
-bool chunk_build_bloom(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
+bool chunk_build_bloom(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
+                       const BoltColumn& col,
                        const ParquetWriteColumn& sch, std::int64_t n_rows,
                        const std::uint8_t* def_bits, bool nullable,
                        bool ndv_exact, ChunkRec* rec) noexcept {
@@ -1269,26 +1285,27 @@ bool chunk_build_bloom(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
     const std::int64_t non_null = n_rows - rec->null_count;
     if (non_null <= 0) return true;               // nothing to assert absent
     const std::uint64_t ndv = ndv_exact
-        ? static_cast<std::uint64_t>(w->dict.count)
+        ? static_cast<std::uint64_t>(ws->dict.count)
         : static_cast<std::uint64_t>(non_null);
     std::uint32_t cap = (w->opts.bloom_max_bytes != 0u)
         ? w->opts.bloom_max_bytes : kPwDefaultBloomBytes;
     if (cap < kPwBloomMinBytes) cap = kPwBloomMinBytes;
     const double fpp = (w->opts.bloom_fpp > 0.0 && w->opts.bloom_fpp < 1.0)
         ? w->opts.bloom_fpp : kPwDefaultBloomFpp;
-    bloom_reset(&w->bloom, bloom_optimal_bytes(ndv, fpp, cap));
+    bloom_reset(&ws->bloom, bloom_optimal_bytes(ndv, fpp, cap));
     if (!bloom_build_chunk(col, sch.type, n_rows, def_bits, nullable,
-                           &w->bloom)) {
+                           &ws->bloom)) {
         return false;
     }
-    bloom_serialize(w->bloom, &out->bloom);
+    bloom_serialize(ws->bloom, &out->bloom);
     return true;
 }
 
 // Build the def levels + statistics that both encodings need, choose the
 // encoding, and delegate. Fallback from dictionary to PLAIN happens here and
 // only here, so a chunk's data pages never disagree about their encoding.
-bool write_column_chunk(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
+bool write_column_chunk(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
+                        const BoltColumn& col,
                         const ParquetWriteColumn& sch,
                         std::int64_t n_rows) noexcept {
     assert(w != nullptr && out != nullptr);
@@ -1327,22 +1344,23 @@ bool write_column_chunk(ParquetWriter* w, ChunkOut* out, const BoltColumn& col,
     bool dict_ndv_exact = false;
     if (enc == PqWriteEncoding::Dictionary && n_rows > 0 &&
         dict_build_chunk(col, sch, n_rows, db, nullable,
-                         dict_budget_bytes(w->opts), &w->dict, &w->dict_idx) &&
-        w->dict.count > 0u) {
+                         dict_budget_bytes(w->opts), &ws->dict, &ws->dict_idx) &&
+        ws->dict.count > 0u) {
         dict_ndv_exact = true;
-        ok = chunk_write_dict(w, out, col, sch, n_rows, db, nullable, w->dict,
-                              w->dict_idx, rec);
+        ok = chunk_write_dict(w, ws, out, col, sch, n_rows, db, nullable, ws->dict,
+                              ws->dict_idx, rec);
     } else if (enc == PqWriteEncoding::Dictionary) {
         // Dictionary overflowed its ceiling (or the chunk is all-null):
         // PLAIN for the whole chunk. Nothing has been written yet, so this
         // costs only the abandoned build.
-        ok = chunk_write_direct(w, out, col, sch, PqWriteEncoding::Plain, n_rows,
-                                db, nullable, rec);
+        ok = chunk_write_direct(w, ws, out, col, sch, PqWriteEncoding::Plain,
+                                n_rows, db, nullable, rec);
     } else {
-        ok = chunk_write_direct(w, out, col, sch, enc, n_rows, db, nullable, rec);
+        ok = chunk_write_direct(w, ws, out, col, sch, enc, n_rows, db, nullable,
+                                rec);
     }
     if (!ok) return false;
-    if (!chunk_build_bloom(w, out, col, sch, n_rows, db, nullable,
+    if (!chunk_build_bloom(w, ws, out, col, sch, n_rows, db, nullable,
                            dict_ndv_exact, rec)) {
         return false;
     }
@@ -1707,6 +1725,53 @@ BoltColumn slice_column(const BoltColumn& c, BoltType t,
 
 // Append exactly one row group covering rows [start, start + rows) of the
 // batch's columns. Bookkeeping mirrors the pre-split writer verbatim.
+// One wave of concurrent column encodes. `base` is the first column, `n` the
+// wave width; slot i encodes column base + i using workspace i and output i.
+struct EncodeWave {
+    ParquetWriter*    w;
+    const BoltColumn* cols;
+    std::int64_t      start;
+    std::int64_t      rows;
+    std::uint32_t     base;
+};
+
+// Runs on a pool worker. Touches only opts (read-only for the duration of the
+// write), its own column's input, and the workspace/output at its own slot --
+// so no two tasks share mutable state and none of them touches file_pos, the
+// chunk list or the page list. Placement does all of that, serially, after.
+void encode_wave_task(void* user, std::uint32_t lo, std::uint32_t hi,
+                      std::uint32_t /*thread_id*/) noexcept {
+    EncodeWave* e = static_cast<EncodeWave*>(user);
+    assert(e != nullptr);
+    assert(lo <= hi);
+    for (std::uint32_t i = lo; i < hi; ++i) {
+        const std::uint32_t c = e->base + i;
+        assert(c < e->w->opts.n_columns);
+        const BoltColumn sc = slice_column(e->cols[c],
+                                           e->w->opts.columns[c].type,
+                                           e->start, e->rows);
+        // Failure is recorded on the output (ChunkOut::ok) rather than
+        // returned: a pool task has nowhere to return a status to, and the
+        // placement pass checks every slot before writing anything.
+        (void)write_column_chunk(e->w, &e->w->ws[i], &e->w->outs[i], sc,
+                                 e->w->opts.columns[c], e->rows);
+    }
+}
+
+// How many columns to encode at once. One workspace per concurrent encode,
+// so this is also the scratch bound. Serial (1) unless a pool was supplied.
+std::uint32_t encode_wave_width(const ParquetWriter* w) noexcept {
+    assert(w != nullptr);
+    if (w->opts.encode_pool == nullptr) return 1u;
+    if (w->opts.n_columns <= 1u) return 1u;
+    const std::uint32_t threads = w->opts.encode_pool->thread_count();
+    std::uint32_t width = (threads > 0u) ? threads : 1u;
+    if (width > w->opts.n_columns) width = w->opts.n_columns;
+    if (width > kPwMaxEncodeWave) width = kPwMaxEncodeWave;
+    assert(width >= 1u);
+    return width;
+}
+
 // Place one encoded chunk into the file: append its bytes, then rebase every
 // offset it recorded by the position they landed at. This is the ONLY place
 // that turns a relative offset into an absolute one, which is what keeps the
@@ -1714,7 +1779,7 @@ BoltColumn slice_column(const BoltColumn& c, BoltType t,
 // safe to run off the write path.
 bool place_chunk(ParquetWriter* w, ChunkOut* out) noexcept {
     assert(w != nullptr && out != nullptr);
-    assert(out->ok);
+    if (!out->ok) return false;
     const std::int64_t base = w->file_pos;
     if (!sink_write(w, out->bytes.data(), out->bytes.size())) return false;
     if (!sink_ok(w)) return false;
@@ -1737,6 +1802,11 @@ bool place_chunk(ParquetWriter* w, ChunkOut* out) noexcept {
         w->pages.push_back(pr);
     }
     w->chunks.push_back(rec);
+    if (!out->bloom.empty()) {
+        w->rg_blooms.push_back(out->bloom);
+        w->rg_bloom_chunk.push_back(
+            static_cast<std::uint32_t>(w->chunks.size() - 1u));
+    }
     return true;
 }
 
@@ -1751,24 +1821,47 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
     rg.chunk_count = w->opts.n_columns;
 
-    // Encode, then place. Splitting the two is what bounds the write path to
-    // one append per chunk instead of two per page, and is the seam a
-    // parallel encode plugs into without touching offset arithmetic.
-    for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
-        const BoltColumn sc = slice_column(cols[c], w->opts.columns[c].type,
-                                           start, rows);
-        if (!write_column_chunk(w, &w->chunk_out, sc, w->opts.columns[c], rows)) {
-            return false;
+    const std::uint32_t width = encode_wave_width(w);
+    if (w->ws.size() < width) w->ws.resize(width);
+    if (w->outs.size() < width) w->outs.resize(width);
+
+    // Encode a wave of columns, then place that wave IN COLUMN ORDER. The
+    // placement order is what makes the bytes independent of the pool size:
+    // whatever order the workers finished in, column c always lands before
+    // column c+1.
+    for (std::uint32_t base = 0; base < w->opts.n_columns; base += width) {
+        std::uint32_t n = w->opts.n_columns - base;
+        if (n > width) n = width;
+        if (n == 1u || w->opts.encode_pool == nullptr) {
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const std::uint32_t c = base + i;
+                const BoltColumn sc = slice_column(cols[c],
+                                                   w->opts.columns[c].type,
+                                                   start, rows);
+                if (!write_column_chunk(w, &w->ws[i], &w->outs[i], sc,
+                                        w->opts.columns[c], rows)) {
+                    return false;
+                }
+            }
+        } else {
+            // Invalidate every slot BEFORE dispatching. The slots are reused
+            // across waves, and submit_range drops a task silently if its
+            // payload pool is exhausted -- a slot still carrying the previous
+            // wave's ok=true would then be placed into the file as that
+            // column's chunk. Clearing here turns a dropped task into a clean
+            // write failure instead of silently wrong bytes.
+            for (std::uint32_t i = 0; i < n; ++i) w->outs[i].ok = false;
+            EncodeWave e{w, cols, start, rows, base};
+            // grain 1: one task per column, so a slow column cannot hold a
+            // fast one hostage behind it in the same task.
+            w->opts.encode_pool->submit_range(&encode_wave_task, &e, n, 1u);
+            w->opts.encode_pool->wait_all();
         }
-        if (!place_chunk(w, &w->chunk_out)) return false;
-        // The bloom filter is flushed after the row group, so hold the bytes
-        // and the chunk index it belongs to.
-        if (!w->chunk_out.bloom.empty()) {
-            w->rg_blooms.push_back(w->chunk_out.bloom);
-            w->rg_bloom_chunk.push_back(
-                static_cast<std::uint32_t>(w->chunks.size() - 1u));
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (!place_chunk(w, &w->outs[i])) return false;
         }
     }
+
     rg.total_byte_size = w->file_pos - rg_start;
     // Flush this row group's bloom filters now (parquet-mr's AFTER_ROWGROUP
     // placement). Doing it here rather than at close is what keeps live

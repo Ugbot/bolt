@@ -1044,6 +1044,14 @@ target_link_libraries(test_bolt_parquet_write_bloom
 bolt_apply_hardening(test_bolt_parquet_write_bloom)
 add_test(NAME test_bolt_parquet_write_bloom COMMAND test_bolt_parquet_write_bloom)
 
+# Writer: parallel column encoding. Acceptance is BYTE-IDENTITY with a serial
+# write at every pool size, repeated -- not "the threaded run still parses".
+add_executable(test_bolt_parquet_write_par test_bolt_parquet_write_par.cpp)
+target_link_libraries(test_bolt_parquet_write_par
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_par)
+add_test(NAME test_bolt_parquet_write_par COMMAND test_bolt_parquet_write_par)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
