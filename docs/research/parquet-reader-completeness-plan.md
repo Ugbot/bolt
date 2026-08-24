@@ -1,0 +1,148 @@
+# Parquet reader completeness: everything hardwood reads that bolt does not
+
+Written 2026-08-24, after a day spent making the reader 1.53x faster and then
+discovering it cannot open several kinds of file the ecosystem routinely
+produces. Speed on files we can already read is worth less than being able to
+read the files at all — that lesson is already in this tree once, as the zstd
+finding in PROJECT_MAP ("a reader that needs a find_package to open a real table
+is not a reader").
+
+Comparison target: [hardwood](https://hardwood.dev), a Java parquet parser whose
+stated goal is "support all Parquet files which are supported by the canonical
+parquet-java library".
+
+## What bolt cannot read today
+
+Every row below is a file bolt REJECTS. It fails closed — `decode_data_page`
+returns false and the row group fails loudly — so none of this is a correctness
+bug. It is absence.
+
+| # | Gap | Status in bolt | Evidence |
+|---|---|---|---|
+| 1 | `DELTA_BINARY_PACKED` | rejected | measured: "row group 0 failed" |
+| 2 | `DELTA_BYTE_ARRAY` | rejected | measured: "row group 0 failed" |
+| 3 | `DELTA_LENGTH_BYTE_ARRAY` | rejected | not in the encoding dispatch |
+| 4 | `BYTE_STREAM_SPLIT` | rejected | measured: "row group 0 failed" |
+| 5 | `DATA_PAGE_V2` | rejected | `kPageData`/`kPageDict` only; header says "DATA_PAGE_V2 rejected" |
+| 6 | Nested / repeated columns | not supported | reader is documented "FLAT-schema subset"; no repetition-level handling exists |
+| 7 | GZIP / BROTLI / LZ4 / LZO codecs | rejected | `decompress_page` handles Uncompressed, Snappy, Zstd; enum declares 8 |
+| 8 | Page index (skip pages by stats) | BUILT, NOT WIRED | `bolt_parquet_pageindex.h` included only by its own .cpp and test |
+| 9 | Bloom filter (prune by equality) | BUILT, NOT WIRED | `bolt_parquet_bloom.h` same |
+
+Items 8 and 9 are the cheapest wins in the table: the code exists and is tested,
+it is simply not connected to the read path. `PqChunk::column_index_offset` is
+parsed and never read.
+
+## Why the benchmarks never caught any of this
+
+TPC-H and ClickBench are both written PLAIN/dictionary, DATA_PAGE v1, SNAPPY,
+flat schema, and neither carries a page index or bloom filter. The entire
+standing gate is blind to items 1-9 by construction. That is not a criticism of
+the benchmarks; it is the reason a capability inventory has to be done against
+a reference implementation rather than against our own test data.
+
+## Sequence
+
+Ordered by (files unlocked) / (effort), not by interest.
+
+### Phase 1 — wire up what already exists
+
+**1.1 Page index.** `bolt_parquet_pageindex.h` is complete and tested. Read
+`PqChunk::column_index_offset`, and where a scan carries a predicate, skip pages
+whose min/max excludes it. Note the honest caveat already recorded in
+PROJECT_MAP: neither `lineitem.parquet` nor `hits.parquet` carries an index, so
+this fires on ZERO files in this tree — it is capability for real lakehouse
+data, and must not be sold as a benchmark win.
+
+**1.2 Bloom filter.** Same shape: parse `bloom_filter_offset`, consult on
+equality predicates. Same caveat — no file here has one.
+
+Both are wiring, not new algorithms. Verify with files written by pyarrow with
+`write_page_index=True` / `write_bloom_filter=True`, asserting that a predicate
+that excludes everything reads zero pages, and that results are unchanged.
+
+### Phase 2 — the encodings (the actual blocker)
+
+**2.1 `BYTE_STREAM_SPLIT`.** Start here: it is a pure transpose and needs no new
+concepts. For a width-W type the page holds all byte 0s, then all byte 1s, and
+so on; the decoder is a strided gather that vectorises well. Increasingly the
+default for FLOAT/DOUBLE.
+
+**2.2 `DELTA_BINARY_PACKED`.** The integer encoding of the parquet V2 writer —
+Spark with `writer.version=v2` emits it for every INT32/INT64. Blocks of
+miniblocks, each with its own bit width, a per-block minimum delta, and a
+zig-zag varint first value. Reuses the group-of-8 unpack lane already in
+`unpack_le_bounded`.
+
+**2.3 `DELTA_LENGTH_BYTE_ARRAY`.** A DELTA_BINARY_PACKED length block followed by
+concatenated bytes. Nearly free once 2.2 exists.
+
+**2.4 `DELTA_BYTE_ARRAY`.** Prefix lengths and suffix lengths, both
+delta-packed, plus suffix bytes; each value is rebuilt from its predecessor's
+prefix. The usual choice for sorted string columns.
+
+### Phase 3 — DATA_PAGE_V2
+
+Independent of the encodings and equally blocking: a V2 file fails on BOTH the
+page type and the encoding. V2 moves def/rep levels OUT of the compressed body
+(they are stored uncompressed with explicit byte lengths) and adds an
+`is_compressed` flag and a null count. Mechanically simpler than v1 in places —
+the level sections no longer have to be found by decoding.
+
+### Phase 4 — codecs
+
+GZIP and LZ4_RAW are the two that appear in the wild often enough to matter
+(LZ4_RAW is Hadoop-era, GZIP is everywhere). bolt already owns a zlib inflate
+(`bolt_inflate.h`) and an LZ4 wrapper, so this is dispatch plumbing, with the
+same "no find_package required" rule the zstd decoder was written to satisfy.
+BROTLI and LZO are rarer; decline explicitly rather than silently.
+
+### Phase 5 — nested columns
+
+The largest by far, and deliberately last. bolt's reader is flat-only by design;
+supporting lists and maps means repetition levels and inverse-Dremel record
+assembly, which changes the output model (a leaf value no longer corresponds to
+a row). Worth doing only when a real workload needs it, and worth designing
+against `BoltColumn`'s list representation before any decoding is written.
+
+## Verification standard for every item
+
+The same standard the group-of-8 unpack was held to today, because these are all
+silent-wrong-data risks:
+
+1. **Fixtures written by a reference writer**, not by bolt. pyarrow can emit
+   every encoding and page version above; bolt's own writer cannot, so a
+   round-trip through it proves nothing about interoperability.
+2. **Assert VALUES, not row counts.** A transpose off by one stride, or a delta
+   block with a wrong miniblock width, still produces exactly the right number
+   of rows. Compare against `table.to_pydict()`.
+3. **Sweep the parameter space**, not one happy case: bit widths, block and
+   miniblock boundaries, first/last value, empty pages, single-row pages, nulls
+   interleaved.
+4. **Prove the gate discriminates** by injecting a defect and confirming the
+   test fails. Twice today a passing suite turned out not to reach the code
+   under test.
+
+## What NOT to take from hardwood
+
+Recorded so the comparison is not re-run:
+
+- **SIMD `countNonNulls` / `markNulls`** — bolt beats these by DELETING the work
+  (definition levels for a nullable-but-null-free column are no longer
+  materialised at all), which is strictly better than vectorising them.
+- **Per-type `applyDictionary*`** — bolt's compile-time `W` gather is the same
+  idea, already in place.
+- **Virtual-thread parallelism** — JVM-specific; chukonu already parallelises
+  across row groups.
+- **Dictionary string interning** — relies on Java object identity; does not map
+  onto `StringView`.
+
+## One idea worth taking that is not a gap
+
+`BatchSizing` computes a batch size so that all projected column arrays fit in
+L2 (6 MB target), derived from per-column byte width and list fan-out, rather
+than a fixed row count. chukonu uses a fixed 65536-row morsel regardless of
+schema width — about right for TPC-H's 16 columns, far past L2 for ClickBench's
+105. Worth a probe. Note PROJECT_MAP already records morsel size as "ruled out",
+but that was about INCREASING it; shrinking it for wide schemas is a different
+question and has not been measured.
