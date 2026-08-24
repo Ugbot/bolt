@@ -208,7 +208,12 @@ struct BoltColumn {
                                   // (Arrow stores scale in the type; we carry
                                   // it on the column so it travels with the
                                   // value through operators). 0 for non-decimal.
-    uint8_t      _scale_pad[3];   // keep stats alignment explicit
+    BoltLogical  logical;         // Refinement of `type` -- JSON over Utf8,
+                                  // VARIANT over a nested Struct, etc. None
+                                  // for an ordinary column, so a zeroed
+                                  // BoltColumn keeps its previous meaning.
+                                  // Occupies a byte that was already padding.
+    uint8_t      _scale_pad[2];   // keep stats alignment explicit
 
     // --- Inline stats (always present) ---
     ColumnStats stats;
@@ -319,6 +324,30 @@ struct BoltColumn {
         c.stats.all_valid = (validity == nullptr);
         c.arena = arena;
         return c;
+    }
+
+    /// VARIANT column: a two-field struct of {metadata, value} binaries, the
+    /// shape parquet's VARIANT logical type and Spark's variant encoding both
+    /// use. Both children must be `length` rows of Binary.
+    static BoltColumn make_variant(const BoltColumn* metadata,
+                                   const BoltColumn* value, int64_t length,
+                                   uint8_t* validity, Arena* arena) noexcept {
+        BoltColumn c = make_empty();
+        if (metadata == nullptr || value == nullptr) return c;
+        BoltColumn kids[2] = {*metadata, *value};
+        c = make_struct(kids, 2, length, validity, arena);
+        if (c.data == nullptr) return c;
+        c.type = BoltType::Variant;
+        c.logical = BoltLogical::Variant;
+        return c;
+    }
+
+    /// VARIANT accessors: the two binary children, or nullptr.
+    const BoltColumn* variant_metadata() const noexcept {
+        return (type == BoltType::Variant) ? child_at(0) : nullptr;
+    }
+    const BoltColumn* variant_value() const noexcept {
+        return (type == BoltType::Variant) ? child_at(1) : nullptr;
     }
 
     /// Nested accessors. All return nullptr / 0 on a non-nested column, so a

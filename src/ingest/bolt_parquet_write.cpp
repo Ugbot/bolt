@@ -96,6 +96,8 @@ constexpr std::int32_t kCodecUncompressed = 0;
 constexpr std::int32_t kCodecSnappy       = 1;
 
 constexpr std::int32_t kConvUtf8    = 0;
+constexpr std::int32_t kConvJson    = 24;
+constexpr std::int32_t kConvBson    = 25;
 constexpr std::int32_t kConvDate    = 6;
 constexpr std::int32_t kConvTsMicro = 10;
 constexpr std::int32_t kConvDecimal = 5;
@@ -1483,7 +1485,14 @@ void write_schema_element_col(TcOut* o,
     tc_put_string(o, c.name);
     tc_put_field(o, 5, kFI32);
     tc_put_zigzag(o, 0);                     // num_children
-    if (has_converted(c.type)) {
+    // 6 converted_type. A JSON/BSON annotation REPLACES the type's default
+    // (a JSON column is not additionally UTF8-annotated -- parquet allows one
+    // ConvertedType, and JSON already implies the bytes are a string).
+    const BoltLogical lg = static_cast<BoltLogical>(c.logical);
+    if (lg == BoltLogical::Json || lg == BoltLogical::Bson) {
+        tc_put_field(o, 6, kFI32);
+        tc_put_zigzag(o, (lg == BoltLogical::Json) ? kConvJson : kConvBson);
+    } else if (has_converted(c.type)) {
         tc_put_field(o, 6, kFI32);
         tc_put_zigzag(o, bolt_to_pq_converted(c.type));
     }
@@ -1492,6 +1501,15 @@ void write_schema_element_col(TcOut* o,
         tc_put_zigzag(o, c.scale);
         tc_put_field(o, 8, kFI32);
         tc_put_zigzag(o, c.precision);
+    }
+    // 10 logicalType. Modern readers prefer this over the legacy
+    // ConvertedType; both are written so old and new readers agree. The union
+    // arm is an empty struct -- JSON is 12, BSON is 13 in parquet.thrift.
+    if (lg == BoltLogical::Json || lg == BoltLogical::Bson) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, (lg == BoltLogical::Json) ? 12 : 13, kFStruct);
+        tc_put_stop(o);                      // empty JsonType / BsonType
+        tc_put_stop(o);                      // end LogicalType union
     }
     tc_put_stop(o);
 }
@@ -1694,6 +1712,22 @@ ParquetWriter* parquet_write_open(const char* path,
                 PqWriteEncoding::ByteStreamSplit)) {
             return nullptr;
         }
+        // A JSON annotation on an integer column is a caller bug; refuse it
+        // rather than writing a file whose schema lies about its bytes.
+        {
+            const BoltLogical lg =
+                static_cast<BoltLogical>(opts->columns[i].logical);
+            const BoltType ct = opts->columns[i].type;
+            if (lg == BoltLogical::Json && ct != BoltType::Utf8) return nullptr;
+            if (lg == BoltLogical::Bson && ct != BoltType::Binary &&
+                ct != BoltType::Utf8) {
+                return nullptr;
+            }
+            if (opts->columns[i].logical > 
+                static_cast<std::uint8_t>(BoltLogical::Variant)) {
+                return nullptr;
+            }
+        }
         if (!encoding_applies(
                 static_cast<PqWriteEncoding>(opts->columns[i].encoding),
                 opts->columns[i].type)) {
@@ -1739,6 +1773,22 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
         if (opts->columns[i].encoding > static_cast<std::uint8_t>(
                 PqWriteEncoding::ByteStreamSplit)) {
             return nullptr;
+        }
+        // A JSON annotation on an integer column is a caller bug; refuse it
+        // rather than writing a file whose schema lies about its bytes.
+        {
+            const BoltLogical lg =
+                static_cast<BoltLogical>(opts->columns[i].logical);
+            const BoltType ct = opts->columns[i].type;
+            if (lg == BoltLogical::Json && ct != BoltType::Utf8) return nullptr;
+            if (lg == BoltLogical::Bson && ct != BoltType::Binary &&
+                ct != BoltType::Utf8) {
+                return nullptr;
+            }
+            if (opts->columns[i].logical > 
+                static_cast<std::uint8_t>(BoltLogical::Variant)) {
+                return nullptr;
+            }
         }
         if (!encoding_applies(
                 static_cast<PqWriteEncoding>(opts->columns[i].encoding),

@@ -107,6 +107,7 @@ struct SchemaElem {
 };
 
 // ConvertedType numeric values (parquet.thrift ConvertedType enum).
+constexpr int32_t kCtJson = 24, kCtBson = 25;
 constexpr int32_t kCtDecimal = 5, kCtDate = 6, kCtTimeMillis = 7,
                   kCtTimeMicros = 8, kCtTsMillis = 9, kCtTsMicros = 10,
                   kCtUint8 = 11, kCtUint16 = 12, kCtUint32 = 13,
@@ -201,6 +202,14 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
                 col->int_signed = sgn;
                 break;
             }
+            // parquet.thrift LogicalType union ids: 12 JSON, 13 BSON,
+            // 14 UUID, 16 VARIANT. All carry an empty struct.
+            case 12: col->logical = static_cast<int32_t>(PqLogical::Json);
+                     (void)tc_skip(c, ft, 0); break;
+            case 13: col->logical = static_cast<int32_t>(PqLogical::Bson);
+                     (void)tc_skip(c, ft, 0); break;
+            case 16: col->logical = static_cast<int32_t>(PqLogical::Variant);
+                     (void)tc_skip(c, ft, 0); break;
             default: (void)tc_skip(c, ft, 0); break;
         }
     }
@@ -212,6 +221,8 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
 void derive_logical_from_converted(PqColumn* col) noexcept {
     assert(col != nullptr);
     switch (col->converted) {
+        case kCtJson:       col->logical = static_cast<int32_t>(PqLogical::Json); break;
+        case kCtBson:       col->logical = static_cast<int32_t>(PqLogical::Bson); break;
         case kCtTsMillis:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 1; break;
         case kCtTsMicros:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 2; break;
         case kCtTimeMillis: col->logical = static_cast<int32_t>(PqLogical::Time);      col->time_unit = 1; break;

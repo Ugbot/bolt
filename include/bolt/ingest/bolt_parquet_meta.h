@@ -152,6 +152,13 @@ enum class PqType : int32_t {
 enum class PqLogical : int32_t {
     None = -1, Timestamp = 0, Time = 1, Int = 2, Decimal = 3,
     Date = 4, String = 5, Other = 6,
+    // JSON / BSON annotate a BYTE_ARRAY whose bytes are a serialized
+    // document. The storage is a string or a blob either way; the annotation
+    // is what tells a consumer to parse it. Mapped onto BoltLogical, NOT onto
+    // a separate BoltType -- see the note on BoltLogical.
+    Json = 7, Bson = 8,
+    // VARIANT annotates a GROUP of {metadata, value} binaries.
+    Variant = 9,
 };
 
 // parquet::CompressionCodec.

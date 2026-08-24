@@ -1737,6 +1737,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     uint8_t scale = 0;
     if (!parquet_map_type(pc, &t, &scale)) return false;
     *col = BoltColumn::make_flat_alloc(rows, t, arena);
+    col->logical = parquet_map_logical(pc);
     if (col->data == nullptr && rows > 0) return false;
     if (rows == 0) {       // typed empty column (make_flat_alloc bails at 0)
         *col = BoltColumn::make_empty();
@@ -2100,6 +2101,16 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
 }
 
 // ---- public API ---------------------------------------------------------------
+
+BoltLogical parquet_map_logical(const PqColumn* col) noexcept {
+    if (col == nullptr) return BoltLogical::None;
+    switch (static_cast<PqLogical>(col->logical)) {
+        case PqLogical::Json:    return BoltLogical::Json;
+        case PqLogical::Bson:    return BoltLogical::Bson;
+        case PqLogical::Variant: return BoltLogical::Variant;
+        default:                 return BoltLogical::None;
+    }
+}
 
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept {

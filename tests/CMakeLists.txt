@@ -1072,6 +1072,17 @@ target_compile_definitions(test_bolt_parquet_list PRIVATE
 bolt_apply_hardening(test_bolt_parquet_list)
 add_test(NAME test_bolt_parquet_list COMMAND test_bolt_parquet_list)
 
+# JSON / BSON / VARIANT logical refinements. JSON is an annotation over Utf8
+# STORAGE (Arrow's own model), not a new physical type -- so the key property
+# is that a JSON column still reads as an ordinary string column.
+add_executable(test_bolt_parquet_json test_bolt_parquet_json.cpp)
+target_link_libraries(test_bolt_parquet_json
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_json PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_json)
+add_test(NAME test_bolt_parquet_json COMMAND test_bolt_parquet_json)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

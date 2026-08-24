@@ -71,6 +71,14 @@ namespace parquet {
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept;
 
+// The logical refinement a leaf carries, independent of its storage type:
+// parquet JSON / BSON / UUID / VARIANT -> BoltLogical. Decoded columns get
+// this set on BoltColumn::logical, so a JSON column arrives as an ordinary
+// Utf8 column that also says it is JSON -- which is Arrow's own model
+// (`extension<arrow.json>` over string storage) and means a consumer that
+// does not care is unaffected.
+BoltLogical parquet_map_logical(const PqColumn* col) noexcept;
+
 // Derive a COMPLETE BoltSchema straight from a parsed footer. The parquet
 // metadata already states everything a consumer needs — name, logical type,
 // DECIMAL precision/scale, integer width/signedness, nullability — so no

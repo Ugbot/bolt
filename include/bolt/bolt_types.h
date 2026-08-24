@@ -28,6 +28,10 @@ enum class BoltType : uint8_t {
     Date32    = 16, Date64 = 17, Timestamp = 18, Duration = 19,
     Utf8      = 25, Binary = 26,
     List      = 30, Struct = 31, Map    = 32,
+    // Nested Struct{metadata, value} carrying a self-describing value --
+    // parquet's VARIANT logical type. Zero-width like the other nested types:
+    // the data lives in the child columns.
+    Variant   = 33,
     Dictionary= 40,
     FixedSizeBinary = 41, Decimal128 = 42, Decimal256 = 43,
     // W-DEC: exact decimal with an int64 MANTISSA (scale lives on the
@@ -49,6 +53,32 @@ enum class BoltType : uint8_t {
 };
 
 // Compile-time byte-size table. 0 = variable width.
+// Logical refinement of a column's PHYSICAL type.
+//
+// This is Arrow's model, not a departure from it: pyarrow reports a JSON
+// column as `extension<arrow.json>` over string storage, and parquet
+// annotates a BYTE_ARRAY with a JSON logical type. The bytes are a string;
+// what changes is how a consumer should interpret them.
+//
+// Deliberately NOT a new BoltType. A Json BoltType would be StringView-shaped
+// and yet fail every one of the ~70 `type == BoltType::Utf8` tests across
+// bolt, chukonu and marbledb -- silently, since those are equality tests and
+// not exhaustive switches. Carrying the refinement beside the type instead
+// means a JSON column IS a string column to everything that has not been
+// taught otherwise, which is the behaviour that degrades safely.
+//
+// Lives in a byte that was already padding on BoltColumn, so nothing grows.
+enum class BoltLogical : uint8_t {
+    None    = 0,
+    Json    = 1,   // Utf8 storage; parquet JSON / Arrow arrow.json
+    Bson    = 2,   // Binary storage; parquet BSON
+    Uuid    = 3,   // FixedSizeBinary(16) storage
+    // Struct{metadata: Binary, value: Binary} storage, i.e. a
+    // ColumnFormat::Nested column of BoltType::Variant. The parquet VARIANT
+    // logical type and Spark's variant binary encoding.
+    Variant = 4,
+};
+
 inline constexpr uint8_t kTypeSize[64] = {
     0,                       // NA
     1,                       // Bool (byte-packed for SIMD, not bit-packed)
@@ -61,7 +91,8 @@ inline constexpr uint8_t kTypeSize[64] = {
     16, 0,                   // Utf8 (16-byte view), Binary
     0, 0, 0,                 // 27-29 reserved
     0, 0, 0,                 // List, Struct, Map
-    0, 0, 0, 0, 0, 0, 0,   // 33-39 reserved
+    0,                       // Variant (nested: data is in the children)
+    0, 0, 0, 0, 0, 0,       // 34-39 reserved
     0, 0, 16, 32,           // Dictionary, FixedSizeBinary, Decimal128, Decimal256
     8,                       // Decimal64 (int64 mantissa; scale on the column)
     0, 0, 0, 0, 0,          // 45-49 reserved

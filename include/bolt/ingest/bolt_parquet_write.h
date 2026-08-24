@@ -119,7 +119,13 @@ struct ParquetWriteColumn {
     std::uint8_t scale;         // Decimal128 only.
     bool         nullable;      // OPTIONAL when true; REQUIRED otherwise.
     std::uint8_t encoding;      // PqWriteEncoding; 0 (Auto) is the default.
-    std::uint8_t _pad[4];       // explicit alignment / future use
+    // BoltLogical refinement to annotate the column with. Json/Bson on a
+    // Utf8/Binary column emit the parquet JSON / BSON logical type (and the
+    // matching legacy ConvertedType, which older readers still key off), so
+    // the column round-trips as a document rather than degrading to an
+    // anonymous string. None (0) writes no annotation.
+    std::uint8_t logical;       // BoltLogical
+    std::uint8_t _pad[3];       // explicit alignment / future use
 };
 
 // Writer options. POD; copied into the writer at open.
