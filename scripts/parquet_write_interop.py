@@ -151,6 +151,11 @@ ENC_FIXTURES = [
     ("interop_bss_f64", "BYTE_STREAM_SPLIT",        _f64),
     ("interop_dba",     "DELTA_BYTE_ARRAY",         _str),
     ("interop_dlba",    "DELTA_LENGTH_BYTE_ARRAY",  _str),
+    # DATA_PAGE_V2. The page TYPE is not visible through pyarrow's metadata,
+    # but reading it is the assertion that matters: v2 stores the levels raw
+    # ahead of separately-compressed values, so a size field that forgets the
+    # level bytes, or a codec applied to the levels, fails here and only here.
+    ("interop_v2",      "DELTA_BINARY_PACKED",      _i64),
 ]
 
 

@@ -101,7 +101,8 @@ constexpr std::int32_t kConvTsMicro = 10;
 constexpr std::int32_t kConvDecimal = 5;
 
 constexpr std::int32_t kPageData = 0;
-constexpr std::int32_t kPageDict = 2;
+constexpr std::int32_t kPageDict   = 2;
+constexpr std::int32_t kPageDataV2 = 3;
 
 // ===== thrift compact write codec ==========================================
 //
@@ -798,6 +799,54 @@ void write_page_header(std::vector<std::uint8_t>* hdr,
     tc_put_stop(&o);
 }
 
+// PageHeader for a DATA_PAGE_V2. The level byte lengths are what make this
+// format worth having: a reader knows exactly how many bytes to step over
+// without decompressing anything, because v2 stores the levels RAW ahead of
+// the (separately compressed) values.
+//
+// `unc` and `cmp` both INCLUDE the level bytes -- the levels are not
+// compressed, so they contribute their own length to each. Getting that wrong
+// makes a reader compute a negative values length.
+void write_page_header_v2(std::vector<std::uint8_t>* hdr,
+                          std::int32_t unc, std::int32_t cmp,
+                          std::int32_t num_values, std::int32_t num_nulls,
+                          std::int32_t num_rows, std::int32_t encoding,
+                          std::int32_t def_len, std::int32_t rep_len,
+                          bool is_compressed) noexcept {
+    assert(hdr != nullptr);
+    assert(unc >= 0 && cmp >= 0);
+    assert(def_len >= 0 && rep_len >= 0);
+    assert(num_nulls >= 0 && num_nulls <= num_values);
+    TcOut o{hdr};
+    tc_put_field(&o, 1, kFI32);
+    tc_put_zigzag(&o, kPageDataV2);
+    tc_put_field(&o, 2, kFI32);
+    tc_put_zigzag(&o, unc);
+    tc_put_field(&o, 3, kFI32);
+    tc_put_zigzag(&o, cmp);
+    // DataPageHeaderV2 (field 8)
+    tc_put_field(&o, 8, kFStruct);
+    {
+        tc_put_field(&o, 1, kFI32);
+        tc_put_zigzag(&o, num_values);
+        tc_put_field(&o, 2, kFI32);
+        tc_put_zigzag(&o, num_nulls);
+        tc_put_field(&o, 3, kFI32);
+        tc_put_zigzag(&o, num_rows);
+        tc_put_field(&o, 4, kFI32);
+        tc_put_zigzag(&o, encoding);
+        tc_put_field(&o, 5, kFI32);
+        tc_put_zigzag(&o, def_len);
+        tc_put_field(&o, 6, kFI32);
+        tc_put_zigzag(&o, rep_len);
+        // 7 is_compressed: a thrift compact bool inside a struct is carried
+        // BY the field header type, with no separate value byte.
+        tc_put_field(&o, 7, is_compressed ? kFTrue : kFFalse);
+        tc_put_stop(&o);
+    }
+    tc_put_stop(&o);
+}
+
 // PageHeader for a DICTIONARY_PAGE. The dictionary itself is PLAIN-encoded;
 // the modern encoding code for that is PLAIN (0). parquet-mr historically
 // wrote PLAIN_DICTIONARY (2) here and readers accept both -- bolt's reader
@@ -960,27 +1009,36 @@ bool encode_plain_range(const BoltColumn& col, const ParquetWriteColumn& sch,
 // Prepend the def-level stream to `values` to form the final page payload.
 // Layout (v1): [u32 LE hybrid byte length][hybrid bytes][values]. A REQUIRED
 // column has no def levels and the payload is the values verbatim.
+// v1 prefixes the def-level stream with its own u32 byte length; v2 does not,
+// because DataPageHeaderV2 carries definition_levels_byte_length instead.
+// `*out_level_bytes` reports how many leading bytes of the payload are levels
+// -- v2 needs that both for the header and to know what NOT to compress.
 bool build_page_payload(const std::vector<std::uint8_t>& values,
                         const std::uint8_t* def_bits, bool nullable,
-                        std::int64_t r0, std::int64_t r1,
-                        std::vector<std::uint8_t>* payload) noexcept {
-    assert(payload != nullptr);
+                        std::int64_t r0, std::int64_t r1, bool v2,
+                        std::vector<std::uint8_t>* payload,
+                        std::uint32_t* out_level_bytes) noexcept {
+    assert(payload != nullptr && out_level_bytes != nullptr);
     assert(r0 <= r1);
     payload->clear();
+    *out_level_bytes = 0;
     if (nullable) {
         assert(def_bits != nullptr);
         std::vector<std::uint8_t> def_hybrid;
         const std::uint32_t n = static_cast<std::uint32_t>(r1 - r0);
         if (!def_levels_encode(def_bits + r0, n, &def_hybrid)) return false;
         const std::uint32_t dlen = static_cast<std::uint32_t>(def_hybrid.size());
-        const std::uint8_t lb[4] = {
-            static_cast<std::uint8_t>(dlen & 0xFFu),
-            static_cast<std::uint8_t>((dlen >> 8) & 0xFFu),
-            static_cast<std::uint8_t>((dlen >> 16) & 0xFFu),
-            static_cast<std::uint8_t>((dlen >> 24) & 0xFFu),
-        };
-        payload->insert(payload->end(), lb, lb + 4);
+        if (!v2) {
+            const std::uint8_t lb[4] = {
+                static_cast<std::uint8_t>(dlen & 0xFFu),
+                static_cast<std::uint8_t>((dlen >> 8) & 0xFFu),
+                static_cast<std::uint8_t>((dlen >> 16) & 0xFFu),
+                static_cast<std::uint8_t>((dlen >> 24) & 0xFFu),
+            };
+            payload->insert(payload->end(), lb, lb + 4);
+        }
         payload->insert(payload->end(), def_hybrid.begin(), def_hybrid.end());
+        if (v2) *out_level_bytes = dlen;
     }
     payload->insert(payload->end(), values.begin(), values.end());
     return true;
@@ -990,39 +1048,68 @@ bool build_page_payload(const std::vector<std::uint8_t>& values,
 // `rec`. `dict_page` selects the dictionary page header. Fails closed if the
 // page would overflow the int32 size fields rather than truncating them --
 // the bug this page-splitting work exists to remove.
+// How to write one page. Grouped into a struct because v2 needs five more
+// facts than v1 and threading them as positional arguments was already at the
+// limit of readable.
+struct PageSpec {
+    bool          dict_page;
+    bool          v2;
+    std::int64_t  num_values;    // rows in the page, INCLUDING nulls
+    std::int64_t  num_nulls;
+    std::int32_t  encoding;
+    std::uint32_t level_bytes;   // v2: leading payload bytes that are levels
+};
+
 bool emit_page(ParquetWriter* w, ChunkOut* out,
-               const std::vector<std::uint8_t>& payload,
-               bool dict_page, std::int64_t num_values,
-               std::int32_t encoding, ChunkRec* rec,
+               const std::vector<std::uint8_t>& payload, const PageSpec& spec,
+               ChunkRec* rec,
                std::int64_t* out_offset, std::int32_t* out_size) noexcept {
     assert(w != nullptr && rec != nullptr && out != nullptr);
-    assert(num_values >= 0);
+    assert(spec.num_values >= 0 && spec.num_nulls >= 0);
+    assert(spec.level_bytes <= payload.size());
     if (payload.size() > 0x7FFFFFFFull) return false;
-    if (num_values > 0x7FFFFFFF) return false;
+    if (spec.num_values > 0x7FFFFFFF) return false;
     const std::int32_t unc = static_cast<std::int32_t>(payload.size());
 
+    // v2 compresses ONLY the values: the levels are stored raw so a reader can
+    // step over them without inflating anything. So the codec is applied from
+    // level_bytes onward and the level bytes are copied through verbatim.
+    const std::uint32_t lv = spec.v2 ? spec.level_bytes : 0u;
     std::vector<std::uint8_t> compressed;
-    if (!maybe_compress(payload.data(), payload.size(), w->opts.compression,
-                        &compressed)) {
+    if (!maybe_compress(payload.data() + lv, payload.size() - lv,
+                        w->opts.compression, &compressed)) {
         return false;
     }
-    if (compressed.size() > 0x7FFFFFFFull) return false;
-    const std::int32_t cmp = static_cast<std::int32_t>(compressed.size());
+    if (compressed.size() + lv > 0x7FFFFFFFull) return false;
+    const std::int32_t cmp =
+        static_cast<std::int32_t>(compressed.size() + lv);
 
     std::vector<std::uint8_t> hdr;
-    if (dict_page) {
+    if (spec.dict_page) {
         write_dict_page_header(&hdr, unc, cmp,
-                               static_cast<std::int32_t>(num_values));
+                               static_cast<std::int32_t>(spec.num_values));
+    } else if (spec.v2) {
+        write_page_header_v2(
+            &hdr, unc, cmp, static_cast<std::int32_t>(spec.num_values),
+            static_cast<std::int32_t>(spec.num_nulls),
+            static_cast<std::int32_t>(spec.num_values),   // flat: rows == values
+            spec.encoding, static_cast<std::int32_t>(lv), 0,
+            w->opts.compression != 0u);
     } else {
         write_page_header(&hdr, unc, cmp,
-                          static_cast<std::int32_t>(num_values), encoding);
+                          static_cast<std::int32_t>(spec.num_values),
+                          spec.encoding);
     }
 
     // Offsets are relative to the chunk buffer; the emit pass rebases them.
     const std::int64_t off = static_cast<std::int64_t>(out->bytes.size());
     out->bytes.insert(out->bytes.end(), hdr.begin(), hdr.end());
+    if (lv != 0u) {
+        out->bytes.insert(out->bytes.end(), payload.begin(),
+                          payload.begin() + lv);
+    }
     out->bytes.insert(out->bytes.end(), compressed.begin(), compressed.end());
-    const std::size_t total = hdr.size() + compressed.size();
+    const std::size_t total = hdr.size() + compressed.size() + lv;
     rec->total_unc += static_cast<std::int64_t>(hdr.size()) + unc;
     rec->total_cmp += static_cast<std::int64_t>(hdr.size()) + cmp;
     if (out_offset != nullptr) *out_offset = off;
@@ -1135,7 +1222,9 @@ bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
                                  &vals)) {
             return false;
         }
-        if (!build_page_payload(vals, def_bits, nullable, r0, r1, &payload)) {
+        std::uint32_t lv = 0;
+        if (!build_page_payload(vals, def_bits, nullable, r0, r1,
+                                w->opts.data_page_v2, &payload, &lv)) {
             return false;
         }
         StatBuf ps;
@@ -1144,15 +1233,14 @@ bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
             !compute_stats(col, r0, r1, def_bits, nullable, &ps)) {
             return false;
         }
+        const std::int64_t page_nulls = count_nulls(def_bits, nullable, r0, r1);
         std::int64_t off = 0;
         std::int32_t sz = 0;
-        if (!emit_page(w, out, payload, /*dict_page=*/false, r1 - r0, enc_code,
-                       rec, &off, &sz)) {
-            return false;
-        }
+        PageSpec spec{false, w->opts.data_page_v2, r1 - r0, page_nulls,
+                      enc_code, lv};
+        if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
         if (rec->data_page_offset < 0) rec->data_page_offset = off;
-        note_page(w, out, rec, off, sz, r0, count_nulls(def_bits, nullable, r0, r1),
-                  r1 - r0, ps);
+        note_page(w, out, rec, off, sz, r0, page_nulls, r1 - r0, ps);
         r0 = r1;
         if (r0 >= n_rows) break;
     }
@@ -1213,8 +1301,10 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     // requires it to precede the data pages that reference it.
     std::vector<std::uint8_t> dict_payload(d.plain.begin(), d.plain.end());
     std::int64_t doff = 0;
-    if (!emit_page(w, out, dict_payload, /*dict_page=*/true, d.count, kEncPlain,
-                   rec, &doff, nullptr)) {
+    // A dictionary page has no v2 variant -- the format defines only
+    // DATA_PAGE_V2 -- so it is written the same way regardless.
+    PageSpec dspec{true, false, d.count, 0, kEncPlain, 0u};
+    if (!emit_page(w, out, dict_payload, dspec, rec, &doff, nullptr)) {
         return false;
     }
     rec->dict_page_offset = doff;
@@ -1244,7 +1334,9 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         rle_hybrid_encode(idx.data() + vi, static_cast<std::size_t>(nv), bw,
                           &vals);
         vi += static_cast<std::size_t>(nv);
-        if (!build_page_payload(vals, def_bits, nullable, r0, r1, &payload)) {
+        std::uint32_t lv = 0;
+        if (!build_page_payload(vals, def_bits, nullable, r0, r1,
+                                w->opts.data_page_v2, &payload, &lv)) {
             return false;
         }
         StatBuf ps;
@@ -1255,10 +1347,9 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         }
         std::int64_t off = 0;
         std::int32_t sz = 0;
-        if (!emit_page(w, out, payload, /*dict_page=*/false, r1 - r0, kEncRleDict,
-                       rec, &off, &sz)) {
-            return false;
-        }
+        PageSpec spec{false, w->opts.data_page_v2, r1 - r0, (r1 - r0) - nv,
+                      kEncRleDict, lv};
+        if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
         if (rec->data_page_offset < 0) rec->data_page_offset = off;
         note_page(w, out, rec, off, sz, r0, (r1 - r0) - nv, r1 - r0, ps);
         r0 = r1;

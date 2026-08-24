@@ -680,4 +680,114 @@ TEST(BoltParquetWriteEnc, InteropFixtures) {
     }
 }
 
+// ---- DATA_PAGE_V2 --------------------------------------------------------
+
+TEST(BoltParquetWriteEnc, DataPageV2RoundTripsEveryEncoding) {
+    // v2 moves the levels OUT of the compressed body, stores them raw with an
+    // explicit byte length, and adds a null count. The failure modes are all
+    // arithmetic: a page whose declared uncompressed size forgets to include
+    // the level bytes makes a reader compute a negative values length, and one
+    // that compresses the levels along with the values decodes as garbage.
+    // Both still produce a plausible-looking page header, so this asserts
+    // VALUES for every encoding and both nullability shapes.
+    for (std::uint8_t codec : {std::uint8_t{0}, std::uint8_t{1}}) {
+        for (int null_every : {0, 4}) {
+            const bool nullable = null_every > 0;
+            std::vector<std::int64_t> v(3000);
+            std::vector<std::uint8_t> valid(3000, 1u);
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                v[i] = static_cast<std::int64_t>(i) * 13 - 5000;
+                if (nullable && (i % 4) == 0) valid[i] = 0u;
+            }
+            for (PqWriteEncoding e : {PqWriteEncoding::Plain,
+                                      PqWriteEncoding::DeltaBinaryPacked,
+                                      PqWriteEncoding::ByteStreamSplit,
+                                      PqWriteEncoding::Dictionary}) {
+                bolt::Arena a;
+                auto* b = a.allocate_array<bolt::BoltBatch>(1);
+                build_fixed_batch(&a, bolt::BoltType::Int64, 8, v.data(),
+                                  static_cast<std::int64_t>(v.size()),
+                                  nullable ? &valid : nullptr, b);
+                auto o = one_col_opts(bolt::BoltType::Int64, e, nullable,
+                                      codec, 4096);
+                o.data_page_v2 = true;
+                o.use_dictionary = (e == PqWriteEncoding::Dictionary);
+                const auto buf = write_batch(b, o, "v2");
+                SCOPED_TRACE(testing::Message()
+                             << "enc=" << static_cast<int>(e)
+                             << " codec=" << static_cast<int>(codec)
+                             << " nullable=" << nullable);
+                const std::string err = read_back(
+                    buf, static_cast<std::int64_t>(v.size()),
+                    [&](const bolt::BoltColumn& c) {
+                        return check_i64(c, v, nullable ? &valid : nullptr);
+                    });
+                EXPECT_EQ(err, std::string());
+            }
+        }
+    }
+}
+
+TEST(BoltParquetWriteEnc, DataPageV2AndV1AgreeAndAreDistinct) {
+    // The two page formats must decode to the same values -- and must really
+    // be different files, or the option did nothing and the test above was
+    // silently re-checking v1.
+    std::vector<std::string> vals;
+    for (std::size_t i = 0; i < 2000; ++i) {
+        vals.push_back("key-" + std::to_string(i % 250));
+    }
+    bolt::Arena a1, a2;
+    auto* b1 = a1.allocate_array<bolt::BoltBatch>(1);
+    auto* b2 = a2.allocate_array<bolt::BoltBatch>(1);
+    build_str_batch(&a1, vals, nullptr, b1);
+    build_str_batch(&a2, vals, nullptr, b2);
+    auto o1 = one_col_opts(bolt::BoltType::Utf8, PqWriteEncoding::Dictionary,
+                           false, 1, 4096);
+    o1.use_dictionary = true;
+    auto o2 = o1;
+    o2.data_page_v2 = true;
+    const auto v1 = write_batch(b1, o1, "v1cmp");
+    const auto v2 = write_batch(b2, o2, "v2cmp");
+    ASSERT_FALSE(v1.empty());
+    ASSERT_FALSE(v2.empty());
+    EXPECT_NE(v1.size(), v2.size())
+        << "data_page_v2 produced a byte-identical file -- the option is inert";
+    const std::string e2 = read_back(
+        v2, static_cast<std::int64_t>(vals.size()),
+        [&](const bolt::BoltColumn& c) -> std::string {
+            const auto* sv = static_cast<const bolt::StringView*>(c.data);
+            const auto* spill =
+                static_cast<const std::uint8_t*>(c.str_overflow_base);
+            if (sv == nullptr) return "null data";
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                const std::uint32_t len = sv[i].length;
+                const std::uint8_t* p =
+                    (len <= 12u)
+                        ? reinterpret_cast<const std::uint8_t*>(&sv[i].prefix[0])
+                        : (spill + sv[i].ref.offset);
+                if (len != vals[i].size() ||
+                    std::memcmp(p, vals[i].data(), len) != 0) {
+                    return "v2 string mismatch at row " + std::to_string(i);
+                }
+            }
+            return std::string();
+        });
+    EXPECT_EQ(e2, std::string());
+}
+
+TEST(BoltParquetWriteEnc, DataPageV2InteropFixture) {
+    std::vector<std::int64_t> v(8000);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        v[i] = static_cast<std::int64_t>(i) * 7 - 3;
+    }
+    bolt::Arena a;
+    auto* b = a.allocate_array<bolt::BoltBatch>(1);
+    build_fixed_batch(&a, bolt::BoltType::Int64, 8, v.data(), 8000, nullptr, b);
+    auto o = one_col_opts(bolt::BoltType::Int64,
+                          PqWriteEncoding::DeltaBinaryPacked, false, 1, 4096);
+    o.data_page_v2 = true;
+    const auto buf = write_batch(b, o, "interop_v2");
+    EXPECT_FALSE(buf.empty());
+}
+
 }  // namespace

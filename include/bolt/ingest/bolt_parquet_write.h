@@ -57,7 +57,6 @@
 //                  that many rows (scan-skip granularity control).
 //
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - DATA_PAGE_V2 (v1 data pages only)
 //   - nested types, LIST / MAP / STRUCT
 //   - encryption
 //   - GZIP / ZSTD / LZ4 codecs
@@ -218,6 +217,20 @@ struct ParquetWriteOpts {
     // bounded by the worker count rather than by the column count. A 256
     // column schema does not allocate 256 dictionaries.
     Scheduler*         encode_pool;
+
+    // ---- page format -----------------------------------------------------
+    // Emit DATA_PAGE_V2 instead of v1 data pages. v2 moves the definition and
+    // repetition levels OUT of the compressed body -- they are stored raw with
+    // explicit byte lengths in the header -- and adds an explicit null count
+    // and row count, so a reader can size and skip a page without decoding
+    // anything. bolt has READ v2 for some time; this closes the writer half.
+    //
+    // Off by default, and honestly so: every parquet reader handles v1, so v2
+    // buys interoperability with nothing. What it buys is cheaper skipping,
+    // because the levels do not have to be decompressed to be counted.
+    // Dictionary pages are unaffected -- there is no v2 dictionary page.
+    bool               data_page_v2;
+    std::uint8_t       _pad4[7];
 };
 
 // Defaults referenced by the option comments above.
