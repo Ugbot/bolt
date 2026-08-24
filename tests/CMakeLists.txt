@@ -1095,6 +1095,21 @@ target_compile_definitions(test_bolt_lz4_raw PRIVATE
 bolt_apply_hardening(test_bolt_lz4_raw)
 add_test(NAME test_bolt_lz4_raw COMMAND test_bolt_lz4_raw)
 
+# Self-contained DEFLATE compressor + GZIP writer. bolt could READ gzip
+# parquet (bolt_inflate.h) and never write it. The real interop gate is
+# scripts/deflate_zlib_check.py, which hands bolt's output to python zlib.
+add_executable(test_bolt_deflate test_bolt_deflate.cpp)
+target_link_libraries(test_bolt_deflate
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_deflate)
+add_test(NAME test_bolt_deflate COMMAND test_bolt_deflate)
+# Produces the streams scripts/deflate_zlib_check.py hands to python zlib --
+# the check that an INDEPENDENT inflater accepts bolt's output, which bolt's
+# own inflate cannot establish.
+add_executable(test_bolt_deflate_dump test_bolt_deflate_dump.cpp)
+target_link_libraries(test_bolt_deflate_dump PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_deflate_dump)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

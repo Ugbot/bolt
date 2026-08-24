@@ -853,12 +853,60 @@ TEST(BoltParquetWriteEnc, Lz4RawCodecRoundTripsAndIsDeclared) {
     }
 }
 
+TEST(BoltParquetWriteEnc, GzipCodecRoundTripsAndIsDeclared) {
+    // bolt could READ gzip parquet (via its own inflate) and never write it.
+    // Both directions are now dependency-free.
+    for (int null_every : {0, 4}) {
+        const bool nullable = null_every > 0;
+        std::vector<std::int64_t> v(6000);
+        std::vector<std::uint8_t> valid(6000, 1u);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            v[i] = static_cast<std::int64_t>((i / 8) % 50);
+            if (nullable && (i % 4) == 0) valid[i] = 0u;
+        }
+        bolt::Arena a;
+        auto* b = a.allocate_array<bolt::BoltBatch>(1);
+        build_fixed_batch(&a, bolt::BoltType::Int64, 8, v.data(),
+                          static_cast<std::int64_t>(v.size()),
+                          nullable ? &valid : nullptr, b);
+        auto o = one_col_opts(bolt::BoltType::Int64, PqWriteEncoding::Plain,
+                              nullable, /*codec=*/2, 4096);
+        const auto buf = write_batch(b, o, "gzip");
+        ASSERT_FALSE(buf.empty());
+        SCOPED_TRACE(testing::Message() << "nullable=" << nullable);
+        const std::string err = read_back(
+            buf, static_cast<std::int64_t>(v.size()),
+            [&](const bolt::BoltColumn& c) {
+                return check_i64(c, v, nullable ? &valid : nullptr);
+            });
+        EXPECT_EQ(err, std::string());
+
+        bolt::Arena ma;
+        PqMeta meta{};
+        ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+        EXPECT_EQ(static_cast<int>(meta.chunks[0].codec),
+                  static_cast<int>(PqCodec::Gzip));
+
+        auto o_none = o;
+        o_none.compression = 0;
+        bolt::Arena a2;
+        auto* b2 = a2.allocate_array<bolt::BoltBatch>(1);
+        build_fixed_batch(&a2, bolt::BoltType::Int64, 8, v.data(),
+                          static_cast<std::int64_t>(v.size()),
+                          nullable ? &valid : nullptr, b2);
+        const auto plain = write_batch(b2, o_none, "gzipnone");
+        EXPECT_LT(buf.size(), plain.size())
+            << "GZIP did not shrink highly repetitive data";
+    }
+}
+
 TEST(BoltParquetWriteEnc, UnsupportedCodecsAreRejectedAtOpen) {
-    // GZIP and ZSTD have self-contained DECODERS in bolt but no
-    // dependency-free compressor, so asking to write them must fail loudly
-    // rather than silently producing an uncompressed file.
-    for (std::uint8_t codec : {std::uint8_t{2}, std::uint8_t{3},
-                               std::uint8_t{5}, std::uint8_t{99}}) {
+    // ZSTD has a self-contained DECODER in bolt but no dependency-free
+    // compressor, so asking to write it must fail loudly rather than silently
+    // producing an uncompressed file. 5 is parquet's deprecated Hadoop-framed
+    // "LZ4", which bolt deliberately never emits.
+    for (std::uint8_t codec : {std::uint8_t{3}, std::uint8_t{5},
+                               std::uint8_t{6}, std::uint8_t{99}}) {
         auto o = one_col_opts(bolt::BoltType::Int64, PqWriteEncoding::Plain,
                               false, codec, 0);
         ParquetWriter* w = parquet_write_open(tmp_path("badcodec").c_str(), &o);
