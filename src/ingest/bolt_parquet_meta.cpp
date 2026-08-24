@@ -103,6 +103,7 @@ struct SchemaElem {
     PqColumn col;
     int32_t  num_children;   // >0 => group node (root or nested)
     bool     has_type;
+    bool     repeated;       // repetition_type == REPEATED (list/map element)
 };
 
 // ConvertedType numeric values (parquet.thrift ConvertedType enum).
@@ -236,6 +237,7 @@ bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
     out->col.logical = static_cast<int32_t>(PqLogical::None);
     out->col.int_signed = 1;
     out->num_children = 0;
+    out->repeated = false;
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {
@@ -253,6 +255,7 @@ bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
             case 3:
                 if (!tc_zigzag(c, &v)) return false;
                 out->col.optional = (v == 1) ? 1 : 0;   // OPTIONAL
+                out->repeated = (v == 2);                // REPEATED
                 break;
             case 4: {
                 const uint8_t* p; uint32_t n;
@@ -538,21 +541,81 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                 if (et != kTcStruct || n == 0 || n > kPqMaxColumns + 1) {
                     return false;
                 }
+                // Depth-first walk of the schema tree. SchemaElements are
+                // serialised in DFS order, so one stack of open groups is
+                // enough -- no second pass, no recursion.
+                //
+                // This replaces a check that required the root's child count to
+                // equal every remaining element, which is true only of a
+                // completely flat schema. A struct is not flat, yet each of its
+                // leaves still holds exactly one value per row: it raises the
+                // leaf's max_def (one more level to say "the struct is
+                // present") and leaves max_rep at zero. Only a REPEATED
+                // ancestor -- a list or map -- makes a leaf produce a variable
+                // number of values per row, and that is the case still refused.
+                struct Frame {
+                    int32_t  left;     // children still expected
+                    uint8_t  def;      // max_def accumulated to here
+                    uint8_t  rep;      // max_rep accumulated to here
+                    uint16_t plen;     // dotted-path length so far
+                };
+                Frame stk[16];
+                int32_t sp = 0;
+                char path[kPqMaxNameBytes];
                 for (uint32_t i = 0; i < n; ++i) {
                     SchemaElem se;
                     if (!parse_schema_element(&c, &se)) return false;
-                    if (i == 0) {
-                        // Root group node. Children count must equal the
-                        // remaining elements or the schema is NESTED.
-                        if (se.num_children !=
-                            static_cast<int32_t>(n - 1)) return false;
+                    if (i == 0) {                       // root group
+                        stk[0].left = se.num_children;
+                        stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
+                        sp = 1;
                         continue;
                     }
-                    if (se.num_children != 0 || !se.has_type) {
-                        return false;   // nested group: unsupported v1
+                    if (sp == 0) return false;          // element past the root
+                    const uint8_t def = static_cast<uint8_t>(
+                        stk[sp - 1].def + (se.col.optional ? 1 : 0) +
+                        (se.repeated ? 1 : 0));
+                    const uint8_t rep = static_cast<uint8_t>(
+                        stk[sp - 1].rep + (se.repeated ? 1 : 0));
+                    // Dotted path, so a struct field is addressable as "s.x"
+                    // exactly as every other parquet tool names it.
+                    uint16_t plen = stk[sp - 1].plen;
+                    const uint16_t base = plen;
+                    if (plen != 0u && plen + 1u < kPqMaxNameBytes) {
+                        path[plen++] = '.';
                     }
+                    for (uint32_t k = 0; se.col.name[k] != '\0' &&
+                                         plen + 1u < kPqMaxNameBytes; ++k) {
+                        path[plen++] = se.col.name[k];
+                    }
+                    if (se.num_children > 0) {          // group: descend
+                        if (sp >= 16) return false;     // depth cap
+                        stk[sp].left = se.num_children;
+                        stk[sp].def = def;
+                        stk[sp].rep = rep;
+                        stk[sp].plen = plen;
+                        ++sp;
+                        continue;
+                    }
+                    if (!se.has_type) return false;     // leaf without a type
+                    if (rep != 0u) return false;        // list/map: needs Dremel
                     if (out->n_columns >= kPqMaxColumns) return false;
-                    out->columns[out->n_columns++] = se.col;
+                    PqColumn col = se.col;
+                    col.max_def = def;
+                    col.max_rep = rep;
+                    // `optional` drives the def-level path; a leaf below an
+                    // optional ancestor has levels even if it is itself
+                    // REQUIRED.
+                    col.optional = (def != 0u) ? 1u : 0u;
+                    uint16_t w = 0;
+                    for (; w < plen && w + 1u < kPqMaxNameBytes; ++w) {
+                        col.name[w] = path[w];
+                    }
+                    col.name[w] = '\0';
+                    out->columns[out->n_columns++] = col;
+                    (void)base;
+                    // close finished groups
+                    while (sp > 0 && --stk[sp - 1].left == 0) --sp;
                 }
                 break;
             }

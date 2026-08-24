@@ -237,8 +237,16 @@ bool rle_hybrid_decode(const uint8_t* in, uint64_t in_len, uint32_t bw,
 // malformed stream, a run set that does not cover the page — and the caller
 // then does exactly what it did before. Fail-closed: this can only skip work it
 // has proven unnecessary, never guess.
-bool rle_def_all_present(const uint8_t* in, uint64_t in_len,
-                         uint32_t n) noexcept {
+// Bits needed to hold a level in [0, max]. Parquet uses exactly this for both
+// definition and repetition levels.
+inline uint32_t level_bit_width(uint32_t max_lvl) noexcept {
+    uint32_t w = 0;
+    while ((1u << w) <= max_lvl) ++w;      // bounded: max_lvl <= 255 => w <= 8
+    return (w == 0u) ? 1u : w;
+}
+
+bool rle_def_all_present(const uint8_t* in, uint64_t in_len, uint32_t n,
+                         uint32_t max_def, uint32_t bw) noexcept {
     assert(in != nullptr || in_len == 0);
     if (n == 0) return false;                 // nothing to elide
     uint64_t ip = 0;
@@ -248,9 +256,17 @@ bool rle_def_all_present(const uint8_t* in, uint64_t in_len,
         if (!uleb(in, in_len, &ip, &h)) return false;
         if ((h & 1u) != 0u) return false;     // bit-packed: caller decodes
         const uint64_t count = h >> 1;
-        if (count == 0 || ip + 1u > in_len) return false;
-        if ((in[ip] & 1u) != 1u) return false;   // a 0 level = a null present
-        ip += 1u;                             // bw==1 => one value byte
+        const uint64_t vbytes = (bw + 7u) / 8u;
+        if (count == 0 || ip + vbytes > in_len) return false;
+        uint32_t val = 0;
+        for (uint64_t k = 0; k < vbytes; ++k) {
+            val |= static_cast<uint32_t>(in[ip + k]) << (8u * k);
+        }
+        if (bw < 32u) val &= (1u << bw) - 1u;
+        // Present means the level reached its MAXIMUM. For a flat optional
+        // column that is 1; for a leaf inside an optional struct it is 2.
+        if (val != max_def) return false;
+        ip += vbytes;
         uint64_t emit = count;
         if (emit > n - got) emit = n - got;
         got += static_cast<uint32_t>(emit);
@@ -588,7 +604,7 @@ bool plain_fixed(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     }
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
-        if (def[i] == 0u) { bit_clear(cx->validity, row0 + i); continue; }
+        if (def[i] != cx->pc->max_def) { bit_clear(cx->validity, row0 + i); continue; }
         std::memcpy(dst + static_cast<uint64_t>(i) * w, v + src * w, w);
         ++src;
     }
@@ -607,7 +623,7 @@ bool plain_f32_widen(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     double* dst = reinterpret_cast<double*>(cx->out) + row0;
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -635,7 +651,7 @@ bool plain_int_conv(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     if (static_cast<uint64_t>(nvalid) * sw > vlen) return false;
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -666,7 +682,7 @@ bool plain_int96(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -694,7 +710,7 @@ bool plain_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -727,7 +743,7 @@ bool rle_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     int64_t* dst = reinterpret_cast<int64_t*>(cx->out) + row0;
     uint32_t k = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -748,7 +764,7 @@ bool plain_flba(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     if (static_cast<uint64_t>(nvalid) * fw > vlen) return false;
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -779,7 +795,7 @@ bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t pos = 0;
     uint32_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             continue;
         }
@@ -858,7 +874,7 @@ bool dict_gather_sparse(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
     assert(cx->dict != nullptr);
     uint32_t k = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
-        if (def != nullptr && def[i] == 0u) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
             bit_clear(cx->validity, row0 + i);
             if (cx->codes != nullptr) cx->codes[row0 + i] = -1;   // null row
             continue;
@@ -1362,7 +1378,9 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         // Settle it from the run headers instead of expanding the levels only
         // to sum them and throw them away: same `def == nullptr` dense path,
         // without the allocation, the fill, or the sum.
-        if (rle_def_all_present(v, dl, nvals)) {
+        const uint32_t max_def = cx->pc->max_def;
+        const uint32_t lbw = level_bit_width(max_def);
+        if (rle_def_all_present(v, dl, nvals, max_def, lbw)) {
             def = nullptr;
             nvalid = nvals;
             v += dl;
@@ -1371,11 +1389,13 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
             def = static_cast<uint32_t*>(
                 arena->allocate(uint64_t{nvals} * 4u, 4));
             if (def == nullptr) return false;
-            if (!rle_hybrid_decode(v, dl, 1, nvals, def)) return false;
+            if (!rle_hybrid_decode(v, dl, lbw, nvals, def)) return false;
             v += dl;
             vlen -= dl;
             nvalid = 0;
-            for (uint32_t i = 0; i < nvals; ++i) nvalid += def[i];
+            for (uint32_t i = 0; i < nvals; ++i) {
+                nvalid += (def[i] == max_def) ? 1u : 0u;
+            }
             if (nvalid == nvals) def = nullptr;     // all-valid: dense path
             if (def != nullptr && cx->validity == nullptr) {
                 return false;                       // chunk stats said no nulls

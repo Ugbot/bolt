@@ -178,7 +178,14 @@ struct PqColumn {
     uint8_t  int_bits;                // Int logical bit width (0 = n/a)
     uint8_t  int_signed;              // Int logical signedness (1 = signed)
     uint8_t  ts_utc;                  // Timestamp/Time isAdjustedToUTC
-    uint8_t  _pad[4];
+    // Dremel levels for this LEAF, computed by walking the schema tree.
+    // A flat OPTIONAL column is max_def 1 / max_rep 0; a field inside an
+    // optional struct is max_def 2 / max_rep 0. max_rep > 0 means the leaf is
+    // inside a repeated group (a list or map) and needs record assembly, which
+    // this reader does not do -- such a column is refused, not guessed at.
+    uint8_t  max_def;
+    uint8_t  max_rep;
+    uint8_t  _pad[2];
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics
