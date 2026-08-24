@@ -132,6 +132,46 @@ bool rle_hybrid_decode(const uint8_t* in, uint64_t in_len, uint32_t bw,
     return true;
 }
 
+// Does a max_def_level==1 definition-level stream say "every value present",
+// without materialising it?
+//
+// A nullable-but-null-free column is the common case, not a corner: a writer
+// marks a column OPTIONAL from the schema, so a column with no nulls in it
+// still carries a full definition-level stream of 1s. MEASURED on SF10
+// lineitem, every one of the 959,776,832 definition levels (59,986,052 rows x
+// 16 columns) arrives as an RLE RUN, and not one arrives bit-packed.
+//
+// decode_data_page already ends up on a dense path for these — it decodes the
+// levels, sums them, finds nvalid == nvals and sets `def = nullptr`. The
+// answer was never in doubt; the cost was reaching it. Expanding those runs
+// writes 3.84 GB of uint32 that is then summed and discarded.
+//
+// So read the run headers and answer from them. Returns false for anything not
+// provably all-present — a zero value, a bit-packed group, a short or
+// malformed stream, a run set that does not cover the page — and the caller
+// then does exactly what it did before. Fail-closed: this can only skip work it
+// has proven unnecessary, never guess.
+bool rle_def_all_present(const uint8_t* in, uint64_t in_len,
+                         uint32_t n) noexcept {
+    assert(in != nullptr || in_len == 0);
+    if (n == 0) return false;                 // nothing to elide
+    uint64_t ip = 0;
+    uint32_t got = 0;
+    while (got < n) {                  // bounded: every run consumes >=1 byte
+        uint64_t h = 0;
+        if (!uleb(in, in_len, &ip, &h)) return false;
+        if ((h & 1u) != 0u) return false;     // bit-packed: caller decodes
+        const uint64_t count = h >> 1;
+        if (count == 0 || ip + 1u > in_len) return false;
+        if ((in[ip] & 1u) != 1u) return false;   // a 0 level = a null present
+        ip += 1u;                             // bw==1 => one value byte
+        uint64_t emit = count;
+        if (emit > n - got) emit = n - got;
+        got += static_cast<uint32_t>(emit);
+    }
+    return got == n;
+}
+
 // Big-endian two's-complement FLBA -> 128-bit (hi, lo).
 bool flba_to_i128(const uint8_t* p, uint32_t len, uint64_t* lo,
                   int64_t* hi) noexcept {
@@ -756,17 +796,28 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         uint32_t dl = 0;
         std::memcpy(&dl, v, 4);
         if (4ull + dl > vlen) return false;
-        def = static_cast<uint32_t*>(
-            arena->allocate(uint64_t{nvals} * 4u, 4));
-        if (def == nullptr) return false;
-        if (!rle_hybrid_decode(v + 4, dl, 1, nvals, def)) return false;
-        v += 4ull + dl;
-        vlen -= 4ull + dl;
-        nvalid = 0;
-        for (uint32_t i = 0; i < nvals; ++i) nvalid += def[i];
-        if (nvalid == nvals) def = nullptr;         // all-valid: dense path
-        if (def != nullptr && cx->validity == nullptr) {
-            return false;                           // chunk stats said no nulls
+        // Nullable but null-free is the common case (see rle_def_all_present).
+        // Settle it from the run headers instead of expanding the levels only
+        // to sum them and throw them away: same `def == nullptr` dense path,
+        // without the allocation, the fill, or the sum.
+        if (rle_def_all_present(v + 4, dl, nvals)) {
+            def = nullptr;
+            nvalid = nvals;
+            v += 4ull + dl;
+            vlen -= 4ull + dl;
+        } else {
+            def = static_cast<uint32_t*>(
+                arena->allocate(uint64_t{nvals} * 4u, 4));
+            if (def == nullptr) return false;
+            if (!rle_hybrid_decode(v + 4, dl, 1, nvals, def)) return false;
+            v += 4ull + dl;
+            vlen -= 4ull + dl;
+            nvalid = 0;
+            for (uint32_t i = 0; i < nvals; ++i) nvalid += def[i];
+            if (nvalid == nvals) def = nullptr;     // all-valid: dense path
+            if (def != nullptr && cx->validity == nullptr) {
+                return false;                       // chunk stats said no nulls
+            }
         }
     }
     if (h->enc == kEncPlain) {
