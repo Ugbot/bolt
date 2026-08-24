@@ -152,14 +152,17 @@ inline constexpr SnappyTagTable kSnappyTag = snappy_make_tag_table();
 // branch: literal contributes nothing, copy-1 one byte, copy-2 two, copy-4 all
 // four.
 //
-// UNTESTED ALTERNATIVE: packing these into a single 64-bit constant and
-// shifting by `type * 16` — what Google's ExtractOffset does on aarch64,
-// specifically to avoid this table load. It was tried and measured 3% slower,
-// but that measurement is VOID: it was taken while the fast loop was reached
-// by only 4.4% of tags (see the resume note in snappy_decompress), so it
-// described almost none of the work. Re-measure before believing either way.
+// MEASURED NEGATIVE: packing these into a single 64-bit constant and shifting
+// by `type * 16` — what Google's ExtractOffset does on aarch64, specifically to
+// avoid this table load — is slower here. 190.0 ms vs 187.5 on the same 512 MB,
+// re-measured at 100% fast-loop coverage after the earlier reading (taken at
+// 4.4% coverage, and therefore void) happened to point the same way.
 //
-// The array does compile to a real load (`ldr w10, [x22, w10, uxtw #2]`).
+// The array does compile to a real load (`ldr w10, [x22, w10, uxtw #2]`), but
+// it is 16 bytes, permanently L1-resident and fully pipelined, whereas the
+// shift-and-mask chain adds latency to the offset itself — which feeds the
+// copy's source address. Worth revisiting only on a machine with a tighter
+// load pipeline than this one.
 inline constexpr uint32_t kSnappyOffMask[4] = {0u, 0xFFu, 0xFFFFu, 0xFFFFFFFFu};
 
 // Input/output headroom the fast loop keeps in reserve so that NO per-tag
