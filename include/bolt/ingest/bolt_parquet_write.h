@@ -7,11 +7,17 @@
 // Scope v1 (FLAT schemas only):
 //   - file layout: "PAR1" + row_groups + [page index] + Thrift FileMetaData
 //                  + u32 LE len + "PAR1"
-//   - encodings:   PLAIN, and RLE_DICTIONARY (the parquet-mr / Arrow default)
-//                  when ParquetWriteOpts::use_dictionary is set. A column
-//                  whose dictionary would exceed dictionary_max_bytes falls
-//                  back to PLAIN for the whole chunk -- never mid-chunk, so a
-//                  chunk's data pages all carry one encoding.
+//   - encodings:   PLAIN, RLE_DICTIONARY (the parquet-mr / Arrow default,
+//                  selected by ParquetWriteOpts::use_dictionary),
+//                  DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY,
+//                  DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT -- the full set
+//                  bolt's reader decodes, so anything bolt can read it can
+//                  now also write. Chosen per column via
+//                  ParquetWriteColumn::encoding (see PqWriteEncoding).
+//                  A column whose dictionary would exceed
+//                  dictionary_max_bytes falls back to PLAIN for the whole
+//                  chunk -- never mid-chunk, so a chunk's data pages all
+//                  carry one encoding.
 //   - pages:       a column chunk is split into data pages of at most
 //                  ParquetWriteOpts::data_page_target_bytes (default 1 MiB,
 //                  matching parquet-mr / Arrow). Previously one page carried
@@ -51,7 +57,7 @@
 //                  that many rows (scan-skip granularity control).
 //
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - DELTA_* / BYTE_STREAM_SPLIT value encodings, DATA_PAGE_V2
+//   - DATA_PAGE_V2 (v1 data pages only)
 //   - nested types, LIST / MAP / STRUCT
 //   - bloom filters, encryption
 //   - GZIP / ZSTD / LZ4 codecs
@@ -73,6 +79,35 @@ namespace bolt {
 namespace ingest {
 namespace parquet {
 
+// Per-column value encoding. `Auto` is the only value that consults
+// ParquetWriteOpts::use_dictionary; naming an encoding explicitly overrides
+// it for that column, which is how Arrow's column_encoding option behaves.
+//
+// An encoding that does not apply to the column's type is rejected at
+// parquet_write_open (which returns nullptr) rather than silently ignored --
+// a caller who asked for DELTA_BYTE_ARRAY on an integer column has a bug,
+// and quietly writing PLAIN would hide it.
+enum class PqWriteEncoding : std::uint8_t {
+    Auto                 = 0,
+    Plain                = 1,
+    // Dictionary: DICTIONARY_PAGE + RLE_DICTIONARY. Falls back to PLAIN for
+    // the whole chunk if the dictionary exceeds its ceiling -- so asking for
+    // it is a preference, not a guarantee, exactly as in parquet-mr.
+    Dictionary           = 2,
+    // DELTA_BINARY_PACKED. INT32 / INT64 (and Date32 / Timestamp, which are
+    // those physically). The integer encoding of the parquet V2 writer.
+    DeltaBinaryPacked    = 3,
+    // DELTA_LENGTH_BYTE_ARRAY: delta-packed lengths, then the bytes.
+    DeltaLengthByteArray = 4,
+    // DELTA_BYTE_ARRAY: incremental (prefix, suffix) encoding. The usual
+    // choice for sorted or common-prefix strings.
+    DeltaByteArray       = 5,
+    // BYTE_STREAM_SPLIT: a pure transpose. FLOAT / DOUBLE, and since parquet
+    // 2.9 the fixed-width integer and FLBA types (so Decimal128 too).
+    // Increasingly the recommended encoding for floating point.
+    ByteStreamSplit      = 6,
+};
+
 // One column's worth of writer-side schema. Fixed-size POD.
 struct ParquetWriteColumn {
     char         name[64];      // NUL-terminated; truncated past 63 chars.
@@ -80,7 +115,8 @@ struct ParquetWriteColumn {
     std::uint8_t precision;     // Decimal128 only.
     std::uint8_t scale;         // Decimal128 only.
     bool         nullable;      // OPTIONAL when true; REQUIRED otherwise.
-    std::uint8_t _pad[5];       // explicit alignment / future use
+    std::uint8_t encoding;      // PqWriteEncoding; 0 (Auto) is the default.
+    std::uint8_t _pad[4];       // explicit alignment / future use
 };
 
 // Writer options. POD; copied into the writer at open.

@@ -1025,6 +1025,15 @@ target_link_libraries(test_bolt_parquet_write_dict
 bolt_apply_hardening(test_bolt_parquet_write_dict)
 add_test(NAME test_bolt_parquet_write_dict COMMAND test_bolt_parquet_write_dict)
 
+# Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
+# decoded all four; these close the asymmetry and sweep block/miniblock
+# boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.
+add_executable(test_bolt_parquet_write_enc test_bolt_parquet_write_enc.cpp)
+target_link_libraries(test_bolt_parquet_write_enc
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_enc)
+add_test(NAME test_bolt_parquet_write_enc COMMAND test_bolt_parquet_write_enc)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

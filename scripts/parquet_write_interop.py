@@ -129,6 +129,58 @@ def check_page_index(path, want_index, errs):
                             % (path, r, c, col.has_offset_index, want_index))
 
 
+# ---- single-column encoding fixtures (test_bolt_parquet_write_enc.cpp) ----
+ENC_ROWS = 8000
+
+
+def _i64(i):
+    return i * 7 - 3
+
+
+def _f64(i):
+    return i * 0.25 - 3.0
+
+
+def _str(i):
+    return "com.example.package.name.%08d" % i
+
+
+ENC_FIXTURES = [
+    ("interop_dbp",     "DELTA_BINARY_PACKED",      _i64),
+    ("interop_bss_i64", "BYTE_STREAM_SPLIT",        _i64),
+    ("interop_bss_f64", "BYTE_STREAM_SPLIT",        _f64),
+    ("interop_dba",     "DELTA_BYTE_ARRAY",         _str),
+    ("interop_dlba",    "DELTA_LENGTH_BYTE_ARRAY",  _str),
+]
+
+
+def check_encoding_fixture(path, want_enc, gen, errs):
+    """Values AND the declared encoding.
+
+    The encoding assertion is not decoration: if the writer silently fell
+    back to PLAIN, every value would still match and the test would pass
+    while the feature did nothing. pyarrow reporting DELTA_BINARY_PACKED is
+    what proves the delta stream was really produced -- and that pyarrow,
+    not just bolt, can decode it.
+    """
+    md = pq.ParquetFile(path).metadata
+    for r in range(md.num_row_groups):
+        encs = set(md.row_group(r).column(0).encodings)
+        if want_enc not in encs:
+            errs.append("%s: rg%d declared %r, wanted %s"
+                        % (path, r, sorted(encs), want_enc))
+            return
+    got = pq.read_table(path).column("v").to_pylist()
+    if len(got) != ENC_ROWS:
+        errs.append("%s: %d rows, want %d" % (path, len(got), ENC_ROWS))
+        return
+    for i in range(ENC_ROWS):
+        want = gen(i)
+        if got[i] != want:
+            errs.append("%s: row %d: got %r want %r" % (path, i, got[i], want))
+            return
+
+
 def main():
     d = sys.argv[1] if len(sys.argv) > 1 else "."
     errs = []
@@ -142,6 +194,15 @@ def main():
         check_values(path, distinct, nullable, errs)
         check_encoding(path, want_dict, errs)
         check_page_index(path, want_idx, errs)
+        checked += 1
+        print("checked %s" % os.path.basename(path))
+    for tag, want_enc, gen in ENC_FIXTURES:
+        path = os.path.join(d, "test_bolt_parquet_write_enc_%s.parquet" % tag)
+        if not os.path.exists(path):
+            errs.append("missing fixture %s (run test_bolt_parquet_write_enc "
+                        "in that directory first)" % path)
+            continue
+        check_encoding_fixture(path, want_enc, gen, errs)
         checked += 1
         print("checked %s" % os.path.basename(path))
     if errs:

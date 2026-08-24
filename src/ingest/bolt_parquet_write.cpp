@@ -81,6 +81,10 @@ constexpr std::int32_t kRepOptional = 1;
 constexpr std::int32_t kEncPlain    = 0;
 constexpr std::int32_t kEncRle      = 3;   // for def-level hybrid
 constexpr std::int32_t kEncRleDict  = 8;   // RLE_DICTIONARY data pages
+constexpr std::int32_t kEncDeltaBinaryPacked = 5;
+constexpr std::int32_t kEncDeltaLenByteArray = 6;
+constexpr std::int32_t kEncDeltaByteArray    = 7;
+constexpr std::int32_t kEncByteStreamSplit   = 9;
 
 constexpr std::int32_t kCodecUncompressed = 0;
 constexpr std::int32_t kCodecSnappy       = 1;
@@ -274,6 +278,7 @@ struct ChunkRec {
     std::int64_t null_count;
     bool         null_count_known;
     bool         dictionary;         // RLE_DICTIONARY data pages
+    std::int32_t encoding;           // parquet Encoding code of the data pages
     StatBuf      st;
     // Page index: [page_off, page_off + page_count) into ParquetWriter::pages,
     // and where the two index structs landed in the file (filled at close).
@@ -320,6 +325,12 @@ struct ParquetWriter {
     // for the hash table's growth once rather than per chunk.
     DictBuilder              dict;
     std::vector<std::uint32_t> dict_idx;
+    // Scratch for the DELTA encoders (length / prefix / suffix arrays and the
+    // suffix byte run). Reused across pages and chunks so the per-page cost
+    // is a clear(), not an allocation.
+    std::vector<std::int64_t>  i64_scratch;
+    std::vector<std::int64_t>  i64_scratch2;
+    std::vector<std::uint8_t>  byte_scratch;
 };
 
 namespace {
@@ -814,11 +825,55 @@ bool dict_eligible(BoltType t) noexcept {
     }
 }
 
-// Decimal128 on disk is FLBA(16) BIG-endian two's complement; bolt stores it
-// little-endian in memory. One value's worth of byte-reversal.
-inline void decimal_to_be(const std::uint8_t* le, std::uint8_t* be) noexcept {
-    assert(le != nullptr && be != nullptr);
-    for (std::size_t k = 0; k < 16u; ++k) be[k] = le[15u - k];
+// Which encodings a type can carry. Consulted at open (to reject a caller's
+// impossible request loudly) and when resolving Auto.
+bool encoding_applies(PqWriteEncoding e, BoltType t) noexcept {
+    switch (e) {
+        case PqWriteEncoding::Auto:
+        case PqWriteEncoding::Plain:
+            return true;
+        case PqWriteEncoding::Dictionary:
+            return dict_eligible(t);
+        case PqWriteEncoding::DeltaBinaryPacked:
+            // INT32/INT64 physical only -- Date32 and Timestamp are those.
+            return t == BoltType::Int32 || t == BoltType::Int64 ||
+                   t == BoltType::Date32 || t == BoltType::Timestamp;
+        case PqWriteEncoding::DeltaLengthByteArray:
+        case PqWriteEncoding::DeltaByteArray:
+            return t == BoltType::Utf8 || t == BoltType::Binary;
+        case PqWriteEncoding::ByteStreamSplit:
+            // FLOAT/DOUBLE, plus the fixed-width integer and FLBA types the
+            // spec added in 2.9 -- which is what bolt's reader accepts.
+            return t == BoltType::Float32 || t == BoltType::Float64 ||
+                   t == BoltType::Int32 || t == BoltType::Int64 ||
+                   t == BoltType::Date32 || t == BoltType::Timestamp ||
+                   t == BoltType::Decimal128;
+    }
+    return false;
+}
+
+// Resolve a column's encoding. Auto is the ONLY value that consults
+// use_dictionary; naming an encoding overrides it, matching Arrow.
+PqWriteEncoding resolve_encoding(const ParquetWriteColumn& sch,
+                                 const ParquetWriteOpts& o) noexcept {
+    const PqWriteEncoding want = static_cast<PqWriteEncoding>(sch.encoding);
+    if (want != PqWriteEncoding::Auto) return want;
+    if (o.use_dictionary && dict_eligible(sch.type)) {
+        return PqWriteEncoding::Dictionary;
+    }
+    return PqWriteEncoding::Plain;
+}
+
+// The parquet Encoding code a resolved encoding writes into its data pages.
+std::int32_t pq_encoding_code(PqWriteEncoding e) noexcept {
+    switch (e) {
+        case PqWriteEncoding::Dictionary:           return kEncRleDict;
+        case PqWriteEncoding::DeltaBinaryPacked:    return kEncDeltaBinaryPacked;
+        case PqWriteEncoding::DeltaLengthByteArray: return kEncDeltaLenByteArray;
+        case PqWriteEncoding::DeltaByteArray:       return kEncDeltaByteArray;
+        case PqWriteEncoding::ByteStreamSplit:      return kEncByteStreamSplit;
+        default:                                    return kEncPlain;
+    }
 }
 
 // PLAIN-encode rows [r0, r1) of one column.
@@ -970,14 +1025,55 @@ std::int64_t count_nulls(const std::uint8_t* def_bits, bool nullable,
 // closed rather than emit a file bolt itself cannot read back.
 constexpr std::uint32_t kPwMaxPagesPerChunk = 1u << 16;
 
-// PLAIN data pages for the whole chunk.
-bool chunk_write_plain(ParquetWriter* w, const BoltColumn& col,
-                       const ParquetWriteColumn& sch, std::int64_t n_rows,
-                       const std::uint8_t* def_bits, bool nullable,
-                       ChunkRec* rec) noexcept {
+// Encode rows [r0, r1) with a non-dictionary encoding.
+bool encode_direct_range(ParquetWriter* w, const BoltColumn& col,
+                         const ParquetWriteColumn& sch, PqWriteEncoding enc,
+                         std::int64_t r0, std::int64_t r1,
+                         const std::uint8_t* def_bits, bool nullable,
+                         std::vector<std::uint8_t>* dst) noexcept {
+    assert(w != nullptr && dst != nullptr);
+    assert(r0 <= r1);
+    switch (enc) {
+        case PqWriteEncoding::ByteStreamSplit:
+            return encode_byte_stream_split(col, sch.type, r0, r1, def_bits,
+                                            nullable, dst);
+        case PqWriteEncoding::DeltaBinaryPacked: {
+            if (gather_ints(col, sch.type, r0, r1, def_bits, nullable,
+                            &w->i64_scratch) < 0) {
+                return false;
+            }
+            return delta_encode_ints(
+                w->i64_scratch.data(),
+                static_cast<std::uint32_t>(w->i64_scratch.size()), dst);
+        }
+        case PqWriteEncoding::DeltaLengthByteArray:
+            return encode_delta_length_byte_array(col, r0, r1, def_bits,
+                                                  nullable, &w->i64_scratch,
+                                                  dst);
+        case PqWriteEncoding::DeltaByteArray:
+            return encode_delta_byte_array(col, r0, r1, def_bits, nullable,
+                                           &w->i64_scratch, &w->i64_scratch2,
+                                           &w->byte_scratch, dst);
+        default:
+            return encode_plain_range(col, sch, r0, r1, def_bits, nullable, dst);
+    }
+}
+
+// Non-dictionary data pages for the whole chunk. Page planning uses the PLAIN
+// size for every encoding: exact for PLAIN and BYTE_STREAM_SPLIT (a transpose
+// does not change the byte count), and an UPPER bound for the DELTA family,
+// whose whole purpose is to be smaller. So a delta page lands at or under the
+// budget -- conservative, never over.
+bool chunk_write_direct(ParquetWriter* w, const BoltColumn& col,
+                        const ParquetWriteColumn& sch, PqWriteEncoding enc,
+                        std::int64_t n_rows,
+                        const std::uint8_t* def_bits, bool nullable,
+                        ChunkRec* rec) noexcept {
     assert(w != nullptr && rec != nullptr);
     assert(n_rows >= 0);
     const std::uint64_t budget = page_budget_bytes(w->opts);
+    const std::int32_t enc_code = pq_encoding_code(enc);
+    rec->encoding = enc_code;
     std::vector<std::uint8_t> vals, payload;
     std::int64_t r0 = 0;
     std::uint32_t pages = 0;
@@ -989,7 +1085,8 @@ bool chunk_write_plain(ParquetWriter* w, const BoltColumn& col,
             : r0;
         assert(r1 >= r0 && r1 <= n_rows);
         vals.clear();
-        if (!encode_plain_range(col, sch, r0, r1, def_bits, nullable, &vals)) {
+        if (!encode_direct_range(w, col, sch, enc, r0, r1, def_bits, nullable,
+                                 &vals)) {
             return false;
         }
         if (!build_page_payload(vals, def_bits, nullable, r0, r1, &payload)) {
@@ -1003,7 +1100,7 @@ bool chunk_write_plain(ParquetWriter* w, const BoltColumn& col,
         }
         std::int64_t off = 0;
         std::int32_t sz = 0;
-        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, kEncPlain,
+        if (!emit_page(w, payload, /*dict_page=*/false, r1 - r0, enc_code,
                        rec, &off, &sz)) {
             return false;
         }
@@ -1155,7 +1252,8 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
         return false;
     }
 
-    if (w->opts.use_dictionary && dict_eligible(sch.type) && n_rows > 0) {
+    const PqWriteEncoding enc = resolve_encoding(sch, w->opts);
+    if (enc == PqWriteEncoding::Dictionary && n_rows > 0) {
         if (dict_build_chunk(col, sch, n_rows, db, nullable,
                              dict_budget_bytes(w->opts), &w->dict,
                              &w->dict_idx) &&
@@ -1166,8 +1264,10 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
         // Dictionary overflowed its ceiling (or the chunk is all-null):
         // PLAIN for the whole chunk. Nothing has been written yet, so this
         // costs only the abandoned build.
+        return chunk_write_direct(w, col, sch, PqWriteEncoding::Plain, n_rows,
+                                  db, nullable, rec);
     }
-    return chunk_write_plain(w, col, sch, n_rows, db, nullable, rec);
+    return chunk_write_direct(w, col, sch, enc, n_rows, db, nullable, rec);
 }
 
 // ===== footer (FileMetaData) =============================================
@@ -1234,9 +1334,13 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     tc_put_field(o, 2, kFList);
     if (rec.dictionary) {
         tc_put_list_hdr(o, kFI32, 3);
-        tc_put_zigzag(o, kEncPlain);
+        tc_put_zigzag(o, kEncPlain);      // the dictionary page itself
         tc_put_zigzag(o, kEncRle);
         tc_put_zigzag(o, kEncRleDict);
+    } else if (rec.encoding != kEncPlain) {
+        tc_put_list_hdr(o, kFI32, 2);
+        tc_put_zigzag(o, kEncRle);
+        tc_put_zigzag(o, rec.encoding);
     } else {
         tc_put_list_hdr(o, kFI32, 2);
         tc_put_zigzag(o, kEncPlain);
@@ -1385,6 +1489,18 @@ ParquetWriter* parquet_write_open(const char* path,
     if (opts->compression != 0u && opts->compression != 1u) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
+        // Reject an encoding the column's type cannot carry, loudly. Quietly
+        // writing PLAIN instead would hide the caller's bug in a file that
+        // reads back fine.
+        if (opts->columns[i].encoding > static_cast<std::uint8_t>(
+                PqWriteEncoding::ByteStreamSplit)) {
+            return nullptr;
+        }
+        if (!encoding_applies(
+                static_cast<PqWriteEncoding>(opts->columns[i].encoding),
+                opts->columns[i].type)) {
+            return nullptr;
+        }
     }
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
@@ -1419,6 +1535,18 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     if (opts->compression != 0u && opts->compression != 1u) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
+        // Reject an encoding the column's type cannot carry, loudly. Quietly
+        // writing PLAIN instead would hide the caller's bug in a file that
+        // reads back fine.
+        if (opts->columns[i].encoding > static_cast<std::uint8_t>(
+                PqWriteEncoding::ByteStreamSplit)) {
+            return nullptr;
+        }
+        if (!encoding_applies(
+                static_cast<PqWriteEncoding>(opts->columns[i].encoding),
+                opts->columns[i].type)) {
+            return nullptr;
+        }
     }
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
