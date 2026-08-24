@@ -25,6 +25,8 @@
 #include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_snappy.h"
 #include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt/ingest/bolt_inflate.h"
+#include "bolt/ingest/bolt_lz4.h"
 
 namespace bolt {
 namespace ingest {
@@ -1443,6 +1445,48 @@ bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
     if (dst == nullptr) return false;
     if (codec == PqCodec::Snappy) {
         if (!snappy_decompress(src, src_len, dst, unc_len)) return false;
+    } else if (codec == PqCodec::Gzip) {
+        // Parquet's GZIP is the gzip CONTAINER, not a bare deflate stream, and
+        // gzip_decompress inflates raw deflate -- so the frame has to come off
+        // first. Header is 10 bytes plus whatever the flag bits add; trailer is
+        // CRC32 + ISIZE. Everything is bounds-checked before it is skipped: a
+        // truncated frame must fail, not read past the page.
+        uint64_t off = 10u;
+        if (src_len < 18u) return false;                 // 10 header + 8 trailer
+        if (src[0] != 0x1Fu || src[1] != 0x8Bu || src[2] != 0x08u) return false;
+        const uint8_t flg = src[3];
+        if ((flg & 0x04u) != 0u) {                       // FEXTRA
+            if (off + 2u > src_len) return false;
+            const uint64_t xlen = static_cast<uint64_t>(src[off]) |
+                                  (static_cast<uint64_t>(src[off + 1]) << 8);
+            off += 2u + xlen;
+        }
+        if ((flg & 0x08u) != 0u) {                       // FNAME, NUL-terminated
+            while (off < src_len && src[off] != 0u) ++off;
+            ++off;
+        }
+        if ((flg & 0x10u) != 0u) {                       // FCOMMENT
+            while (off < src_len && src[off] != 0u) ++off;
+            ++off;
+        }
+        if ((flg & 0x02u) != 0u) off += 2u;              // FHCRC
+        if (off + 8u > src_len) return false;
+        // inflate_raw, NOT gzip_decompress: the latter wraps zlib behind an
+        // optional find_package, and this file's own bolt_inflate.h states the
+        // rule -- "a reader that needs a find_package to open a real table is
+        // not a reader". inflate_raw is bolt's self-contained RFC 1951 decoder.
+        uint64_t got = 0;
+        if (inflate_raw(src + off, src_len - off - 8u, dst, unc_len, &got)
+                != kInflateOk) {
+            return false;
+        }
+        if (got != unc_len) return false;        // page header size must match
+    } else if (codec == PqCodec::Lz4Raw) {
+        // LZ4_RAW is a bare LZ4 block. The legacy LZ4 codec (5) is the
+        // Hadoop-framed variant and is deliberately NOT accepted here: it would
+        // need the frame stripped too, and no writer in this tree emits it.
+        if (!lz4_available()) return false;              // build without liblz4
+        if (lz4_decompress(src, src_len, dst, unc_len) != 0) return false;
     } else if (codec == PqCodec::Zstd) {
         if (*zscratch == nullptr) {
             *zscratch = arena->allocate(zstd_scratch_size(), 8);
