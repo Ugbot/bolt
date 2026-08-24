@@ -29,6 +29,25 @@
 > bloom-filter wiring need a predicate plumbed through the read API, which has
 > no predicate parameter today — so they are more than "wiring". BROTLI and LZO
 > have no decoder in bolt at all and fail closed.
+>
+> **UPDATE 2026-08-24, after the WRITER work
+> ([`parquet-writer-completeness.md`](parquet-writer-completeness.md)):**
+> two corrections to the table below.
+>
+> Rows 8 and 9 said "BUILT, NOT WIRED" and called them "the cheapest wins in
+> the table". Half of that is wrong: chukonu's `parquet_scan_op.cpp` already
+> calls `pq_bloom_may_contain` and `pq_stat_range_i64` to skip whole chunks,
+> so chunk-level pruning IS wired, just on the consumer side rather than
+> inside bolt. What genuinely has no consumer is PAGE-level skipping via
+> `pq_read_column_index` — and until now bolt could not WRITE a page index or
+> a bloom filter at all, so neither path could be exercised end to end from
+> within this tree. Both can now, and both are covered by fixtures.
+>
+> The remaining bolt-side blocker for general page skipping is narrower than
+> "a predicate parameter": `parquet_read_col_chunk_pages`, the resumable
+> page-range decoder a consumer would jump with, is documented PLAIN-only and
+> returns false on a dictionary page. Dictionary encoding is now the writer's
+> recommended default, so that is the next thing to close.
 
 Written 2026-08-24, after a day spent making the reader 1.53x faster and then
 discovering it cannot open several kinds of file the ecosystem routinely
