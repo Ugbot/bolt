@@ -192,3 +192,23 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_bench_tuning(bench_compute_idot)
     add_test(NAME bench_compute_idot COMMAND bench_compute_idot)
 endif()
+
+# -----------------------------------------------------------------------
+# Snappy + parquet decode. Runs standalone with NO data file (synthesises a
+# corpus and compresses it with a reference compressor in the benchmark
+# itself), or against a real parquet file when given a path. Both modes verify
+# correctness before reporting a time.
+# -----------------------------------------------------------------------
+add_executable(bench_parquet_decode bench_parquet_decode.cpp)
+
+target_link_libraries(bench_parquet_decode PRIVATE bolt::bolt)
+
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_parquet_decode PRIVATE Threads::Threads)
+endif()
+
+bolt_apply_hardening(bench_parquet_decode)
+bolt_apply_bench_tuning(bench_parquet_decode)
