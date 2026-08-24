@@ -71,20 +71,41 @@ void unpack_le_bounded(const uint8_t* BOLT_RESTRICT in, uint64_t in_len,
     assert(in != nullptr || in_len == 0);
     assert(bw >= 1u && bw <= 32u);
     const uint64_t mask = (bw == 32u) ? 0xFFFFFFFFull : ((1ull << bw) - 1ull);
-    for (uint32_t i = 0; i < n; ++i) {
+
+    // How many values can be read with an unconditional 8-byte load? The last
+    // safe one is the largest i with (i*bw >> 3) + 8 <= in_len, i.e.
+    // i*bw <= (in_len-8)*8 + 7. Solve it once instead of testing it per value.
+    //
+    // The per-value test was a branch on every one of 654M dictionary indices
+    // in an SF10 lineitem decode (MEASURED), inside a loop whose whole body is
+    // a load, a shift and a mask. It also blocked vectorisation: a loop with a
+    // conditional load in it cannot be widened, so the tail-handling case cost
+    // far more than the tail.
+    uint32_t n_fast = 0;
+    if (in_len >= 8u) {
+        const uint64_t last = ((in_len - 8u) * 8u + 7u) / bw;
+        n_fast = (last + 1u < static_cast<uint64_t>(n))
+                     ? static_cast<uint32_t>(last + 1u)
+                     : n;
+    }
+    assert(n_fast <= n);
+
+    uint32_t i = 0;
+    for (; i < n_fast; ++i) {          // no bounds test: proven above
+        const uint64_t bit  = static_cast<uint64_t>(i) * bw;
+        uint64_t w;
+        std::memcpy(&w, in + (bit >> 3), 8);
+        out[i] = static_cast<uint32_t>((w >> (bit & 7u)) & mask);
+    }
+    for (; i < n; ++i) {               // tail: fewer than 8 bytes remain
         const uint64_t bit  = static_cast<uint64_t>(i) * bw;
         const uint64_t byte = bit >> 3;
-        const uint32_t sh   = static_cast<uint32_t>(bit & 7u);
+        uint8_t tmp[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        assert(byte <= in_len);        // caller pre-checked total payload
+        std::memcpy(tmp, in + byte, in_len - byte);
         uint64_t w = 0;
-        if (byte + 8 <= in_len) {
-            std::memcpy(&w, in + byte, 8);
-        } else {
-            uint8_t tmp[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            assert(byte <= in_len);   // caller pre-checked total payload
-            std::memcpy(tmp, in + byte, in_len - byte);
-            std::memcpy(&w, tmp, 8);
-        }
-        out[i] = static_cast<uint32_t>((w >> sh) & mask);
+        std::memcpy(&w, tmp, 8);
+        out[i] = static_cast<uint32_t>((w >> (bit & 7u)) & mask);
     }
 }
 
