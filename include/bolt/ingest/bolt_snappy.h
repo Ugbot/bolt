@@ -88,6 +88,96 @@ inline void snappy_copy_match(uint8_t* dst, uint64_t op, uint64_t off,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tag decode table.
+//
+// A snappy tag byte determines, on its own, the element length, any offset
+// bits carried inside the tag, and how many further input bytes the tag
+// consumes. Deriving those with a `switch (tag & 3)` costs a multi-way branch
+// on every element, and at a MEASURED 6.3 output bytes per tag on real parquet
+// text the per-tag cost IS the decode cost.
+//
+// So resolve all three with one L1 lookup instead. 512 bytes, one cache line
+// per 32 tags.
+//
+// GENERATED, not transcribed: the entries are computed from the format rules
+// below at compile time, so the table cannot silently disagree with the spec
+// the way a hand-copied literal table can (this file already carries the scar
+// of exactly that — see bolt_zstd_dec.cpp, where a mis-transcribed RFC 8878
+// distribution decoded a 100000-byte block to 38 bytes).
+//
+// Layout, chosen so `len` needs no shift on the hot path:
+//     bits  0..7   element length      (copy: 1..64, literal: 1..60, 0 = long)
+//     bits  8..10  offset bits held in the tag byte, in units of 256 (copy-1)
+//     bits 11..13  extra input bytes consumed after the tag
+struct SnappyTagTable { uint16_t e[256]; };
+
+constexpr SnappyTagTable snappy_make_tag_table() noexcept {
+    SnappyTagTable t{};
+    for (int i = 0; i < 256; ++i) {
+        const uint32_t tag = static_cast<uint32_t>(i);
+        uint32_t len = 0, off_hi = 0, extra = 0;
+        switch (tag & 3u) {
+            case 0: {                       // literal
+                const uint32_t inline_len = (tag >> 2) + 1u;
+                // 61..64 encode "1..4 length bytes follow" rather than a
+                // length. Store 0 as the sentinel that sends the tag to the
+                // careful path; the fast loop never handles a long literal.
+                len   = (inline_len <= 60u) ? inline_len : 0u;
+                extra = (inline_len <= 60u) ? 0u : (inline_len - 60u);
+                break;
+            }
+            case 1:                          // copy, 1 offset byte, 3 in tag
+                len    = ((tag >> 2) & 7u) + 4u;
+                off_hi = tag >> 5;           // 0..7, scaled by 256 at use
+                extra  = 1u;
+                break;
+            case 2:                          // copy, 2 offset bytes
+                len   = (tag >> 2) + 1u;
+                extra = 2u;
+                break;
+            default:                         // copy, 4 offset bytes
+                len   = (tag >> 2) + 1u;
+                extra = 4u;
+                break;
+        }
+        t.e[i] = static_cast<uint16_t>((extra << 11) | (off_hi << 8) | len);
+    }
+    return t;
+}
+
+inline constexpr SnappyTagTable kSnappyTag = snappy_make_tag_table();
+
+// Offset mask per tag type, so the offset falls out of ONE 4-byte load with no
+// branch: literal contributes nothing, copy-1 one byte, copy-2 two, copy-4 all
+// four.
+//
+// MEASURED NEGATIVE, recorded so it is not re-attempted: packing these into a
+// single 64-bit constant and shifting by `type * 16` — which is what Google's
+// ExtractOffset does on aarch64, specifically to avoid a table load — is
+// SLOWER here (259.7 ms vs 251.3). The emitted code does show the array as a
+// real load (`ldr w10, [x22, w10, uxtw #2]`), but it is L1-resident and fully
+// pipelined, whereas the shift-and-mask chain adds latency to the offset
+// itself. Their form presumably pays off inside their deferred-copy loop,
+// where the offset is not on the critical path.
+inline constexpr uint32_t kSnappyOffMask[4] = {0u, 0xFFu, 0xFFFFu, 0xFFFFFFFFu};
+
+// Input/output headroom the fast loop keeps in reserve so that NO per-tag
+// bounds check is needed inside it. The worst-case single tag reads 1 tag byte
+// + 60 literal bytes (or 1 + 4 offset bytes), plus up to 16 bytes of
+// deliberate overcopy, and writes at most 64 (a copy element's format maximum)
+// plus overcopy. 80 covers every case with room to spare.
+//
+// This is where bolt departs from Google's decoder rather than copying it.
+// Theirs requires the CALLER to append 64 slop bytes to the output buffer,
+// because their fast loop runs to the end. Bolt cannot: snappy_decompress
+// promises an exact fill, and three callers size their destination exactly
+// (kafka_wire.cpp passes `needed`; both tests pass exactly-sized vectors), so
+// a slop-requiring decoder would be a heap overflow in each. Stopping the fast
+// loop 80 bytes early and letting the pre-existing careful loop finish the
+// tail buys the same freedom from bounds checks with no contract change.
+inline constexpr uint64_t kSnappyFastSlop = 80u;
+
 // Decompress one snappy block into dst (exactly dst_len bytes — the
 // caller sizes dst from snappy_uncompressed_len). False on any corrupt
 // shape: truncated tags, out-of-range offsets, output over/underflow.
@@ -106,6 +196,99 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
     if (consumed == 0 || hdr_len != dst_len) return false;
     uint64_t ip = consumed;
     uint64_t op = 0;
+
+    // ---- fast loop -------------------------------------------------------
+    // Runs only while both streams have kSnappyFastSlop bytes in hand, which
+    // is what lets every per-tag buffer-overflow check go away: the loop
+    // condition has already proven the room. The only test left inside is
+    // `off > op`, which is not a bounds check but a correctness check on
+    // untrusted input (a back-reference before the start of the block), and
+    // it predicts perfectly on real data.
+    //
+    // Everything the careful loop below does, this does identically — it is a
+    // faster route to the same bytes, not a different decode. The differential
+    // fuzz in test_bolt_snappy.cpp compares both against a naive oracle.
+    if (src_len > kSnappyFastSlop && dst_len > kSnappyFastSlop) {
+        const uint64_t ip_fast = src_len - kSnappyFastSlop;
+        const uint64_t op_fast = dst_len - kSnappyFastSlop;
+        // The tag is carried in a REGISTER across iterations. This is the
+        // whole point of the loop's shape, and it is worth more than the table
+        // or the hoisted bounds checks combined.
+        //
+        // Written the obvious way, each iteration loads the tag, looks the tag
+        // up in the table to learn how far to advance, then loads the next tag
+        // from the new position: two DEPENDENT L1 loads, ~10 cycles, serialised
+        // and unhideable. Measured at 10.6 cycles/tag, which is the entire
+        // decode cost at 6.3 output bytes per tag.
+        //
+        // The advance below is therefore derived from the tag byte by
+        // ARITHMETIC ONLY — never from the table — so the next tag's load
+        // depends on nothing but the tag already in hand and issues at once,
+        // while the table lookup for length/offset proceeds in parallel with
+        // it. One load latency per tag instead of two chained.
+        uint32_t tag = src[ip];
+        while (ip < ip_fast && op < op_fast) {
+            const uint32_t type = tag & 3u;
+            const uint32_t e    = kSnappyTag.e[tag];
+            const uint64_t len  = e & 0xFFu;
+
+            // Both from `tag` alone. Literal advance is 1 tag byte + len
+            // payload bytes, and len == (tag >> 2) + 1, hence 2 + (tag >> 2).
+            // Copy advance is 1 tag byte + type offset bytes; copy-4 is not
+            // handled here (see kSnappyOffMasks) so type + 1 is exact.
+            const uint64_t adv     = (type == 0u) ? (2u + (tag >> 2))
+                                                  : (1u + type);
+            const uint64_t next_ip = ip + adv;
+            // In bounds by the slop reservation: adv is at most 65.
+            const uint32_t next_tag = src[next_ip];
+
+            // Offset. For a literal the mask is 0 and the tag carries no
+            // offset bits, so this yields 0 and is simply unused.
+            uint32_t next;
+            std::memcpy(&next, src + ip + 1u, 4);
+            const uint64_t off = (e & 0x700u) | (next & kSnappyOffMask[type]);
+
+            // MEASURED NEGATIVE, recorded so it is not re-attempted: folding
+            // literal and copy into one branch-free copy site with a csel'd
+            // source pointer — Google's shape — is SLOWER here (256.5 ms vs
+            // 251.3). The single combined guard it needs (len sentinel, len>16,
+            // copy-4, off<8, off>op) lands on the critical path and costs more
+            // than the 13%/87% literal-vs-copy mispredict it removes. Their
+            // version only pays off together with the deferred copy, which is
+            // what actually takes the store and the `op` update off the
+            // dependency chain.
+            if (type == 0u) {                    // literal
+                if (len == 0u) break;            // >60 bytes: careful loop
+                const uint64_t s = ip + 1u;
+                // 99.6% of literals on real parquet text are <= 16 bytes
+                // (measured: mean 2.2). Two fixed stores, no size dispatch.
+                if (len <= 16u) {
+                    snappy_copy8(dst + op, src + s);
+                    snappy_copy8(dst + op + 8u, src + s + 8u);
+                } else {
+                    std::memcpy(dst + op, src + s, len);
+                }
+                op += len;
+                ip = next_ip;
+                tag = next_tag;
+                continue;
+            }
+            if (type == 3u) break;               // copy-4: careful loop
+            if (off == 0u || off > op) return false;
+
+            if (len <= 16u && off >= 8u) {
+                snappy_copy8(dst + op, dst + op - off);
+                snappy_copy8(dst + op + 8u, dst + op + 8u - off);
+            } else {
+                snappy_copy_match(dst, op, off, len);
+            }
+            op += len;
+            ip = next_ip;
+            tag = next_tag;
+        }
+    }
+
+    // ---- careful loop: the tail, and any tag the fast lane declined -------
     while (ip < src_len) {                       // bounded: ip advances >=1
         const uint8_t tag = src[ip++];
         if ((tag & 3u) == 0) {                   // literal
@@ -160,7 +343,27 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
         }
         if (off == 0 || off > op) return false;          // bad back-ref
         if (op + len > dst_len) return false;            // output overflow
-        if (op + len + 8u <= dst_len) {                  // room to overcopy
+        // THE lane. Measured over 512 MB of real TPC-H l_comment text
+        // (85.5M tags, 6.3 output bytes per tag, so per-tag cost is
+        // everything): 86.7% of tags are matches, and 99.3% of those are
+        // len <= 16 with off >= 8. Serve exactly that with two unconditional
+        // 8-byte stores — no trip count, no loop, no overlap test.
+        //
+        // snappy_copy_match below is correct for all of it, but pays a
+        // data-dependent `for (k < len; k += 8)` whose exit is unpredictable
+        // (75.5% of matches want one iteration, 23.9% want two) plus a branch
+        // on the off < 8 overlap case that only 0.11% of matches ever take.
+        // Overcopying to a fixed 16 costs nothing here and deletes both.
+        //
+        // Safe because off >= 8 means the second load starts at op+8-off <= op,
+        // and the first store has already made dst[op .. op+7] final. Bytes
+        // past op+len are meaningless but in bounds, and a later tag rewrites
+        // them — the same argument snappy_copy_match's overcopy already relies
+        // on, with a fixed bound instead of a computed one.
+        if (len <= 16u && off >= 8u && op + 16u <= dst_len) {
+            snappy_copy8(dst + op, dst + op - off);
+            snappy_copy8(dst + op + 8u, dst + op + 8u - off);
+        } else if (op + len + 8u <= dst_len) {           // room to overcopy
             snappy_copy_match(dst, op, off, len);
         } else if (off >= len) {                         // tail, no overlap
             std::memcpy(dst + op, dst + op - off, len);
