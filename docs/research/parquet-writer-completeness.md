@@ -26,7 +26,7 @@ filter. Arrow and parquet-mr both default to dictionary-encoded ~1 MiB pages.
 | DELTA_LENGTH_BYTE_ARRAY | readable, not writable | writes |
 | DELTA_BYTE_ARRAY | readable, not writable | writes; front coding |
 | Parallel encoding | none | per-column, on a borrowed pool |
-| DATA_PAGE_V2 | not written | still not written (v1 only) |
+| DATA_PAGE_V2 | readable, not writable | writes; levels raw, values compressed |
 | GZIP / ZSTD / LZ4 | not written | still not written — see below |
 
 ## One of these was a corruption bug, not a size choice
@@ -77,6 +77,15 @@ consumes `miniblocks_per_block` width bytes unconditionally but only reads
 data for the miniblocks it needs — and DELTA_LENGTH_BYTE_ARRAY and
 DELTA_BYTE_ARRAY locate their byte payload by how many bytes the length block
 consumed. One miniblock too many or too few silently relocates every string.
+
+**DATA_PAGE_V2 is written but off by default.** Every parquet reader handles
+v1, so v2 buys interoperability with nothing; what it buys is cheaper page
+skipping, because the levels can be counted and stepped over without
+inflating anything. Two arithmetic facts do all the damage if got wrong, and
+both yield a well-formed page: the two size fields INCLUDE the level bytes
+(the levels are uncompressed, so they contribute their own length to each),
+and the codec applies from `definition_levels_byte_length` onward and never
+over the levels.
 
 **Bloom filters are flushed after each row group**, parquet-mr's
 AFTER_ROWGROUP default, so live filter memory is one row group's worth rather
@@ -154,12 +163,6 @@ would then be written as that column's chunk. Slots are invalidated before
 dispatch, so a dropped task is a clean write failure instead of wrong bytes.
 
 ## Still open
-
-**DATA_PAGE_V2 is not written.** bolt READS it. Writing it is mechanical —
-levels move out of the compressed body with explicit byte lengths, plus an
-`is_compressed` flag and a null count — and buys interoperability with
-nothing that cannot already read v1, which is why it sits below the items
-above rather than being skipped for a hard reason.
 
 **GZIP / ZSTD / LZ4_RAW are not written, and this one is not merely
 unfinished.** bolt has no COMPRESSOR for any of them that does not need a
