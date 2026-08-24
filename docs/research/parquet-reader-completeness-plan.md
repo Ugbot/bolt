@@ -1,5 +1,12 @@
 # Parquet reader completeness: everything hardwood reads that bolt does not
 
+> **STATUS 2026-08-25: ALL NINE closed, plus one that was not on the list.**
+> List/map values now read via Dremel assembly (see
+> [`parquet-writer-completeness.md`](parquet-writer-completeness.md) for the
+> column-shape decision that unblocked it), and LZ4_RAW — which this plan did
+> not flag — turned out to be unreadable too, since bolt's only LZ4 was behind
+> a find_package. Both are fixed. The status below is the 2026-08-24 snapshot.
+>
 > **STATUS 2026-08-24: eight of nine gaps closed.** Everything below now reads
 > except list/map VALUES. Verified byte-exact against pyarrow on 82 fixtures:
 > BYTE_STREAM_SPLIT, all three delta encodings, DATA_PAGE_V2, GZIP + LZ4_RAW,
@@ -75,8 +82,8 @@ bug. It is absence.
 | 5 | `DATA_PAGE_V2` | **DONE** | reads; levels assembled uncompressed ahead of values |
 | 6a | Nested STRUCT columns | **DONE** | schema walked depth-first; decoder generalised to max_def |
 | 6b | Files CONTAINING a list | **DONE** | the list blocks only itself; scalars read via projection |
-| 6c | List/map VALUES | open | needs Dremel assembly + a list column shape (see status) |
-| 7 | GZIP / LZ4_RAW | **DONE** | GZIP via bolt's own inflate_raw, not zlib. BROTLI/LZO still fail closed |
+| 6c | List/map VALUES | **DONE** | Dremel assembly; ColumnFormat::Nested settled the shape |
+| 7 | GZIP / LZ4_RAW | **DONE** | GZIP via bolt's own inflate_raw. LZ4_RAW needed find_package(lz4) and so did NOT read on a default build — now bolt's own block codec. BROTLI/LZO still fail closed |
 | 8 | Page index (skip pages by stats) | BUILT, NOT WIRED | `bolt_parquet_pageindex.h` included only by its own .cpp and test |
 | 9 | Bloom filter (prune by equality) | BUILT, NOT WIRED | `bolt_parquet_bloom.h` same |
 

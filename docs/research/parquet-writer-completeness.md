@@ -27,7 +27,11 @@ filter. Arrow and parquet-mr both default to dictionary-encoded ~1 MiB pages.
 | DELTA_BYTE_ARRAY | readable, not writable | writes; front coding |
 | Parallel encoding | none | per-column, on a borrowed pool |
 | DATA_PAGE_V2 | readable, not writable | writes; levels raw, values compressed |
-| GZIP / ZSTD / LZ4 | not written | still not written — see below |
+| LZ4_RAW | NOT EVEN READABLE (find_package) | self-contained codec, both ways |
+| GZIP | readable, not writable | self-contained DEFLATE compressor |
+| ZSTD | readable, not writable | still not written — see below |
+| LIST / MAP values | not readable | Dremel assembly, ColumnFormat::Nested |
+| JSON / BSON / VARIANT | not represented | BoltLogical annotation, read + write |
 
 ## One of these was a corruption bug, not a size choice
 
@@ -164,17 +168,25 @@ dispatch, so a dropped task is a clean write failure instead of wrong bytes.
 
 ## Still open
 
-**GZIP / ZSTD / LZ4_RAW are not written, and this one is not merely
-unfinished.** bolt has no COMPRESSOR for any of them that does not need a
-`find_package`: `bolt_gzip.h`, `bolt_lz4.h` and `bolt_zstd.h` are all
-opt-in shims, and none is available on a default build. bolt owns a
-self-contained zstd DECODER (`bolt_zstd_dec.cpp`) precisely because the same
-problem blocked READING pyiceberg's default output; the writing side would
-need the same treatment — a self-contained DEFLATE for GZIP, and a zstd
-compressor — which is a much larger piece of work than a codec dispatch. The
-honest statement is that bolt writes UNCOMPRESSED and SNAPPY because those
-are the two it can compress without a dependency, not because the others were
-overlooked.
+**Codecs: three of four closed, and one of them was a READ gap.** LZ4_RAW
+could not be READ at all on a default build — `bolt_lz4.h` is behind
+`find_package(lz4)` — so a Hadoop-era LZ4_RAW file simply did not open.
+`bolt_lz4_raw.{h,cpp}` implements the block format both ways.
+`bolt_deflate.{h,cpp}` adds the DEFLATE compressor and GZIP container that
+`bolt_inflate.h` was already the other half of. bolt now writes
+UNCOMPRESSED, SNAPPY, GZIP and LZ4_RAW without any find_package.
+
+**ZSTD remains write-only-absent, and deliberately so.** bolt DECODES zstd
+self-contained (`bolt_zstd_dec.cpp`, written because the same problem blocked
+reading pyiceberg's default output). A compressor is a much larger and
+different piece of work: zstd cannot express a single match without its
+sequences section, and that section requires FSE entropy coding — three
+interleaved states written in reverse order — or Huffman for the literals.
+There is no small correct version. Since bolt can already write SNAPPY, GZIP
+and LZ4_RAW, all of which every reader accepts, this is a parity gap rather
+than a capability one, and a rushed entropy coder in a storage library is
+silent data corruption. bolt's own FSE DECODER and libzstd (for reference
+vectors) are both available to verify one against when it is written.
 
 **Page-level pruning on the READ side is a consumer step, not a bolt gap.**
 `bolt_parquet_pageindex.h` and `bolt_parquet_bloom.h` were described in the
@@ -191,7 +203,25 @@ would jump with) is documented PLAIN-only and returns false on a dictionary
 page. Since dictionary encoding is now the writer's recommended default, that
 is the next thing to close.
 
-**List/map values remain the one readability gap**, for the reason the reader
-plan records: the blocker is the COLUMN SHAPE, not the decoding, and it is an
-API decision about `bolt_column.h` — a public type chukonu and marbledb both
-consume — that should be taken deliberately rather than improvised.
+**List/map values are no longer a gap.** The column-shape decision the reader
+plan said to take deliberately was taken: `ColumnFormat::Nested` carries LIST,
+MAP, STRUCT and VARIANT, with `data` pointing at a child array and
+`dict_child` holding element offsets for the list kinds. It is purely
+additive — nothing produced a Nested column before, so no existing consumer
+can meet one — and it costs no growth in `BoltColumn`, which matters because
+`BoltBatch` embeds `columns[2][kMaxBatchColumns]`.
+
+Assembly turns on two definition levels recorded at schema-walk time
+(`list_def`, `rep_def`), because four cases must be distinguished and two of
+them — an EMPTY list and a NULL list — have identical element counts and
+differ only in a validity bit. Scope is `max_rep == 1`; a list OF lists is
+refused rather than guessed at.
+
+**JSON / BSON / VARIANT are logical refinements, not new physical types.**
+`BoltColumn::logical` (a byte that was already padding) carries them, which is
+Arrow's own model — pyarrow reports a JSON column as `extension<arrow.json>`
+over string storage. A `BoltType::Json` would have been StringView-shaped and
+yet failed every one of the ~70 `type == BoltType::Utf8` equality tests across
+bolt, chukonu and marbledb, silently, since none of those is an exhaustive
+switch. VARIANT is a two-field struct of {metadata, value} binaries, built on
+the Nested shape.
