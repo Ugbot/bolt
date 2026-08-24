@@ -140,7 +140,45 @@ enum class ColumnFormat : uint8_t {
                       //                row i spans bytes [offsets[i], offsets[i+1]).
                       // `validity` = optional null bitmap (Arrow shape).
                       // `type_size_bytes` = 0 (variable width).
+    Nested     = 9,   // LIST / MAP / STRUCT (and VARIANT, which is a STRUCT).
+                      // `type` says which. See the note below.
 };
+
+// ---------------------------------------------------------------------------
+// ColumnFormat::Nested
+// ---------------------------------------------------------------------------
+//
+// One format carries every nested shape, distinguished by `BoltColumn::type`:
+//
+//   type == List   : `data` = BoltColumn[1], the ELEMENT column.
+//                    `dict_child` = Flat Int32 column of `length + 1` offsets
+//                    measured in ELEMENTS -- row i spans elements
+//                    [offsets[i], offsets[i+1]).
+//                    `validity` distinguishes a NULL list from an EMPTY one;
+//                    an empty list is valid with offsets[i] == offsets[i+1].
+//   type == Map    : as List, whose element column is a Struct of {key, value}.
+//   type == Struct : `data` = BoltColumn[n_children], the fields, in schema
+//                    order. `dict_child` is nullptr -- a struct has one value
+//                    per row, so there are no offsets.
+//
+//   `seq_offset` (the format-specific union, unused by Nested otherwise)
+//   holds n_children. `type_size_bytes` is 0: a nested column has no per-row
+//   value buffer of its own.
+//
+// WHY THIS SHAPE. The obvious alternative -- reusing `dict_child` for the
+// element column the way VarBinary reuses it for byte offsets -- does not
+// work: a typed list needs offsets in ELEMENTS *and* a typed child, which is
+// two things, and `dict_child` is one slot already spoken for three ways
+// (dictionary values, RLE run-ends, VarBinary byte offsets). Adding a second
+// pointer field would grow BoltColumn, and BoltBatch embeds
+// columns[2][kMaxBatchColumns], so a pointer costs kilobytes per batch.
+// Pointing `data` at a child ARRAY costs nothing: no existing format uses
+// `data` as anything but a value buffer, and `type_size_bytes == 0` already
+// marks a column as having no value buffer.
+//
+// This is purely ADDITIVE. Nothing produced a Nested column before, so no
+// existing consumer can encounter one; code that switches on format falls
+// through to whatever it already did for an unrecognised format.
 
 // ============================================================================
 // BoltColumn
@@ -223,6 +261,89 @@ struct BoltColumn {
         c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
         c.stats.all_valid = (validity == nullptr);
         return c;
+    }
+
+    /// LIST column over `element`, with `length + 1` element offsets.
+    /// `offsets` is borrowed (caller/arena owned) and must be non-decreasing
+    /// with offsets[0] == 0 and offsets[length] == element->length.
+    /// `validity` may be null (every list present). An EMPTY list is a VALID
+    /// row whose offsets are equal -- that is the distinction a null bitmap
+    /// alone cannot express, which is why both exist.
+    static BoltColumn make_list(const BoltColumn* element,
+                                const int32_t* offsets, int64_t length,
+                                uint8_t* validity, Arena* arena) noexcept {
+        BoltColumn c = make_empty();
+        if (element == nullptr || offsets == nullptr || arena == nullptr) {
+            return c;
+        }
+        auto* kids = static_cast<BoltColumn*>(
+            arena->allocate(sizeof(BoltColumn), alignof(BoltColumn)));
+        if (kids == nullptr) return c;
+        kids[0] = *element;
+        auto* off = static_cast<BoltColumn*>(
+            arena->allocate(sizeof(BoltColumn), alignof(BoltColumn)));
+        if (off == nullptr) return c;
+        *off = make_flat(const_cast<int32_t*>(offsets), nullptr, length + 1,
+                         BoltType::Int32);
+        c.format = ColumnFormat::Nested;
+        c.type = BoltType::List;
+        c.type_size_bytes = 0;
+        c.length = length;
+        c.data = kids;
+        c.dict_child = off;
+        c.seq_offset = 1;                 // n_children
+        c.validity = validity;
+        c.stats.all_valid = (validity == nullptr);
+        c.arena = arena;
+        return c;
+    }
+
+    /// STRUCT column over `n` field columns, copied into arena storage.
+    static BoltColumn make_struct(const BoltColumn* fields, int64_t n,
+                                  int64_t length, uint8_t* validity,
+                                  Arena* arena) noexcept {
+        BoltColumn c = make_empty();
+        if (fields == nullptr || n <= 0 || arena == nullptr) return c;
+        auto* kids = static_cast<BoltColumn*>(arena->allocate(
+            static_cast<size_t>(n) * sizeof(BoltColumn), alignof(BoltColumn)));
+        if (kids == nullptr) return c;
+        for (int64_t i = 0; i < n; ++i) kids[i] = fields[i];
+        c.format = ColumnFormat::Nested;
+        c.type = BoltType::Struct;
+        c.type_size_bytes = 0;
+        c.length = length;
+        c.data = kids;
+        c.dict_child = nullptr;
+        c.seq_offset = n;
+        c.validity = validity;
+        c.stats.all_valid = (validity == nullptr);
+        c.arena = arena;
+        return c;
+    }
+
+    /// Nested accessors. All return nullptr / 0 on a non-nested column, so a
+    /// consumer can probe without first switching on the format.
+    bool is_nested() const noexcept {
+        return format == ColumnFormat::Nested;
+    }
+    int64_t child_count() const noexcept {
+        return is_nested() ? seq_offset : 0;
+    }
+    const BoltColumn* child_at(int64_t i) const noexcept {
+        if (!is_nested() || data == nullptr) return nullptr;
+        if (i < 0 || i >= seq_offset) return nullptr;
+        return static_cast<const BoltColumn*>(data) + i;
+    }
+    /// LIST/MAP only: the `length + 1` element offsets, or nullptr.
+    const int32_t* list_offsets() const noexcept {
+        if (!is_nested() || dict_child == nullptr) return nullptr;
+        if (type != BoltType::List && type != BoltType::Map) return nullptr;
+        return static_cast<const int32_t*>(dict_child->data);
+    }
+    /// LIST/MAP only: the element column, or nullptr.
+    const BoltColumn* list_element() const noexcept {
+        if (type != BoltType::List && type != BoltType::Map) return nullptr;
+        return child_at(0);
     }
 
     /// Flat column allocated from arena

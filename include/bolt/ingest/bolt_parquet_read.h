@@ -173,6 +173,26 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
                                   BoltColumn* out_col, int64_t* out_rows,
                                   uint64_t* next_off) noexcept;
 
+// Decode ONE repeated (LIST / MAP-leaf) column of a row group into a
+// ColumnFormat::Nested BoltColumn of BoltType::List. This is the path a leaf
+// under a REPEATED group takes; every other entry point here refuses such a
+// column, because it produces a VARIABLE number of values per row and cannot
+// be materialised one-value-per-row.
+//
+// The result carries `out_rows` rows: `col.list_offsets()` gives rows+1
+// element offsets and `col.list_element()` the typed element column. An EMPTY
+// list is a valid row whose offsets are equal; a NULL list is marked in
+// `col.validity`. Those are different values and both are represented.
+//
+// Scope: max_rep == 1 -- one level of repetition, which is `list<T>` and each
+// leaf of a `map<K,V>`. A list OF lists (max_rep >= 2) returns false rather
+// than being guessed at. Every value encoding and both page formats the flat
+// path supports work here, because the two share one encoding dispatch.
+bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
+                              const PqMeta* meta, uint32_t row_group,
+                              uint16_t col, Arena* arena,
+                              BoltColumn* out_col, int64_t* out_rows) noexcept;
+
 // Whole file: locate + parse meta, allocate full-length columns, then
 // decode every row group into its row offset (serial v1; the row-group
 // function above is the future parallel unit).

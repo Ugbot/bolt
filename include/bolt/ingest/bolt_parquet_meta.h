@@ -185,7 +185,17 @@ struct PqColumn {
     // this reader does not do -- such a column is refused, not guessed at.
     uint8_t  max_def;
     uint8_t  max_rep;
-    uint8_t  _pad[2];
+    // The two definition levels a LIST leaf needs, both computed by the same
+    // schema walk. For `optional group g (LIST) { repeated group list {
+    // optional element } }` they are 1 and 2, and max_def is 3:
+    //   def <  list_def            -> the LIST itself is NULL
+    //   list_def <= def < rep_def  -> the list is PRESENT but EMPTY
+    //   def >= rep_def             -> one element (NULL iff def < max_def)
+    // An empty list and a null list are different values, and a null bitmap
+    // alone cannot tell them apart -- which is why both levels are recorded
+    // rather than deriving one from max_def. Zero when max_rep == 0.
+    uint8_t  list_def;   // def accumulated at the repeated node's PARENT
+    uint8_t  rep_def;    // def accumulated AT the repeated node
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

@@ -1061,6 +1061,17 @@ target_link_libraries(test_bolt_parquet_page_skip
 bolt_apply_hardening(test_bolt_parquet_page_skip)
 add_test(NAME test_bolt_parquet_page_skip COMMAND test_bolt_parquet_page_skip)
 
+# Reading LIST / MAP columns (Dremel record assembly). Fixtures written by
+# pyarrow; the four cases that matter are a present element, a NULL element,
+# an EMPTY list and a NULL list -- the last two differ only in a validity bit.
+add_executable(test_bolt_parquet_list test_bolt_parquet_list.cpp)
+target_link_libraries(test_bolt_parquet_list
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_list PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_list)
+add_test(NAME test_bolt_parquet_list COMMAND test_bolt_parquet_list)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

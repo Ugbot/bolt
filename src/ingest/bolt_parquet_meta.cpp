@@ -557,6 +557,9 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     int32_t  left;     // children still expected
                     uint8_t  def;      // max_def accumulated to here
                     uint8_t  rep;      // max_rep accumulated to here
+                    uint8_t  ldef;     // def at the innermost REPEATED node's
+                                       // parent (0 if none seen yet)
+                    uint8_t  rdef;     // def AT the innermost REPEATED node
                     uint16_t plen;     // dotted-path length so far
                 };
                 Frame stk[16];
@@ -568,6 +571,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     if (i == 0) {                       // root group
                         stk[0].left = se.num_children;
                         stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
+                        stk[0].ldef = 0; stk[0].rdef = 0;
                         sp = 1;
                         continue;
                     }
@@ -593,6 +597,12 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[sp].left = se.num_children;
                         stk[sp].def = def;
                         stk[sp].rep = rep;
+                        // A REPEATED group opens a new list level: remember
+                        // the def AT it and the def at its parent. Otherwise
+                        // inherit whatever the enclosing list level was.
+                        stk[sp].ldef = se.repeated ? stk[sp - 1].def
+                                                   : stk[sp - 1].ldef;
+                        stk[sp].rdef = se.repeated ? def : stk[sp - 1].rdef;
                         stk[sp].plen = plen;
                         ++sp;
                         continue;
@@ -611,6 +621,12 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     PqColumn col = se.col;
                     col.max_def = def;
                     col.max_rep = rep;
+                    // A REPEATED LEAF is itself the repeated node (the legacy
+                    // 2-level list shape); otherwise the levels come from the
+                    // innermost repeated ancestor.
+                    col.list_def = se.repeated ? stk[sp - 1].def
+                                               : stk[sp - 1].ldef;
+                    col.rep_def  = se.repeated ? def : stk[sp - 1].rdef;
                     // `optional` drives the def-level path; a leaf below an
                     // optional ancestor has levels even if it is itself
                     // REQUIRED.
