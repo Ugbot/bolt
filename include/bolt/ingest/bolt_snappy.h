@@ -274,6 +274,27 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
         // bytes. It writes 16 bytes at op with def_len == 0, which the next
         // flush immediately overwrites at the same op — harmless, and it keeps
         // the loop free of a first-iteration special case.
+        // MEASURED NEGATIVE — the two-way unroll, tried WITH the deferred copy
+        // in place because Google's own comments tie the two together ("the
+        // throughput is limited by instructions, unrolling the inner loop twice
+        // reduces the amount of instructions checking limits").
+        //
+        // It is slower here, both ways round: codec 72.8 vs 71.8 ms, real
+        // l_comment 962.7 vs 955.1. And it was genuinely unrolled, not silently
+        // ignored — a plain `for (u < 2)` did NOT unroll (the tag-table load
+        // `ldrh ..., uxtw #1` appeared once in the emitted arm64, and that
+        // version was slower still, having added a counter for nothing), so it
+        // needed `#pragma clang loop unroll_count(2)` to reach two loads. Both
+        // configurations lost.
+        //
+        // The guard this removes is two compares and a predictable branch per
+        // tag. On a machine this wide, with a reorder window this deep, that was
+        // already hidden; unrolling only adds register pressure and code
+        // footprint. It also forced kSnappyFastSlop from 96 to 192, since the
+        // second tag runs before the guard is re-tested.
+        //
+        // Worth re-testing on a narrower core (and on x86), where the guard is a
+        // larger share of the loop. Not here.
         uint8_t safe_src[16] = {0};
         const uint8_t* def_src = safe_src;
         uint64_t def_len = 0;
