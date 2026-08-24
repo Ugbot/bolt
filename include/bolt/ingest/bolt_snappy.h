@@ -292,6 +292,13 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
             const uint64_t next_ip = ip + adv;
             // In bounds by the slop reservation: adv is at most 65.
             const uint32_t next_tag = src[next_ip];
+            // MEASURED NEUTRAL: an explicit BOLT_PREFETCH_READ(src + ip + 128)
+            // here, which is what Google's decoder does at this point, changed
+            // nothing (codec 72.3 vs 71.8 ms, real l_comment 954.9 vs 955.1).
+            // The stream is walked strictly forward at ~2.5 input bytes per
+            // tag, so the hardware prefetcher already has the line long before
+            // the tag load needs it. Not kept: it would also have made this
+            // header depend on bolt_port.h, which it currently does not.
 
             // Where THIS tag's bytes land: past the copy still owed.
             const uint64_t cur_op = op + def_len;
