@@ -40,7 +40,9 @@ constexpr uint32_t kPqMetaChunksFirst  = 4096;
 // parquet::PageType / Encoding / ConvertedType values we consume.
 constexpr int32_t kPageData = 0, kPageIndex = 1, kPageDict = 2;
 constexpr int32_t kEncPlain = 0, kEncPlainDict = 2, kEncRle = 3,
-                  kEncRleDict = 8;
+                  kEncRleDict = 8, kEncByteStreamSplit = 9,
+                  kEncDeltaBinaryPacked = 5, kEncDeltaLenByteArray = 6,
+                  kEncDeltaByteArray = 7;
 constexpr int32_t kConvDecimal = 5, kConvDate = 6;
 
 inline void bit_clear(uint8_t* bm, int64_t i) noexcept {
@@ -381,7 +383,48 @@ struct ColCtx {
     uint8_t  int_convert;       // 1 => src_width != elem integer conversion
     uint8_t  is_int96;          // 1 => INT96 legacy timestamp -> Timestamp[us]
     int32_t  ts_rescale;        // 0 none / 1 millis*1000 / 2 nanos/1000 -> us
+    // Utf8 spill growth (delta byte-array encodings only -- see
+    // ensure_overflow_room). `ovf_base` points at the COLUMN's
+    // str_overflow_base so a grow updates the view consumers read through.
+    Arena*   arena;
+    void**   ovf_base;
 };
+
+// Guarantee `need` more bytes of Utf8 spill room, growing if necessary.
+//
+// The spill buffer is sized from the chunk's UNCOMPRESSED page bytes. That is a
+// valid bound for PLAIN byte arrays -- every value there carries a 4-byte
+// length prefix, so uncompressed always exceeds materialised. It is NOT a bound
+// for DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY: front coding means the page
+// holds far fewer bytes than the strings it expands to, and DELTA_BYTE_ARRAY's
+// expansion is not even linear in the page size, since each value may reuse an
+// arbitrary prefix of its predecessor. MEASURED on a 31-row fixture: 527 bytes
+// of text out of a 342-byte page, which failed with "OVERFLOW BUFFER FULL".
+//
+// Growing is safe because a StringView stores an OFFSET, not a pointer: moving
+// the buffer and repointing str_overflow_base leaves every view already written
+// still correct. The old block is left behind in the arena, which is bump
+// allocated -- acceptable because this fires once per page at most, and only
+// for encodings that need it.
+inline bool ensure_overflow_room(ColCtx* cx, uint64_t need) noexcept {
+    assert(cx != nullptr);
+    if (cx->overflow_cursor + need <= cx->overflow_cap) return true;
+    if (cx->arena == nullptr || cx->ovf_base == nullptr) return false;
+    uint64_t cap = (cx->overflow_cap != 0u) ? cx->overflow_cap : 1024u;
+    while (cap < cx->overflow_cursor + need) {      // bounded: doubles to fit
+        if (cap > (1ull << 40)) return false;
+        cap *= 2u;
+    }
+    char* nb = static_cast<char*>(cx->arena->allocate(cap, 1));
+    if (nb == nullptr) return false;
+    if (cx->overflow != nullptr && cx->overflow_cursor != 0u) {
+        std::memcpy(nb, cx->overflow, cx->overflow_cursor);
+    }
+    cx->overflow = nb;
+    cx->overflow_cap = cap;
+    *cx->ovf_base = nb;
+    return true;
+}
 
 // BOLT_PQ_DIAG=1 names WHICH bound a spilled-string decode hit. All three
 // paths returned a bare false, reported upstream as an opaque decode
@@ -899,6 +942,344 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     return true;
 }
 
+
+
+bool decode_plain_values(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                         const uint32_t* def, int64_t row0, uint32_t nvals,
+                         uint32_t nvalid) noexcept;
+
+// Zig-zag: the spec stores signed deltas so that small magnitudes of either
+// sign use few bits.
+inline int64_t zigzag_decode(uint64_t n) noexcept {
+    return static_cast<int64_t>(n >> 1) ^ -static_cast<int64_t>(n & 1u);
+}
+
+// Bit-unpack to 64 bits. unpack_le_bounded tops out at bw <= 32, but a
+// DELTA_BINARY_PACKED miniblock over int64 data needs up to 64 -- a column of
+// random int64s has deltas near 2^41, which is already past 32. Values can
+// straddle a 64-bit word, so this reads two words; the tail copies into a
+// zero-filled 16-byte window rather than reading past the page.
+void unpack_le64(const uint8_t* BOLT_RESTRICT in, uint64_t in_len, uint32_t n,
+                 uint32_t bw, uint64_t* BOLT_RESTRICT out) noexcept {
+    assert(bw >= 1u && bw <= 64u);
+    const uint64_t mask = (bw == 64u) ? ~0ull : ((1ull << bw) - 1ull);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t bit  = static_cast<uint64_t>(i) * bw;
+        const uint64_t byte = bit >> 3;
+        const uint32_t sh   = static_cast<uint32_t>(bit & 7u);
+        uint64_t lo = 0, hi = 0;
+        if (byte + 16u <= in_len) {
+            std::memcpy(&lo, in + byte, 8);
+            std::memcpy(&hi, in + byte + 8, 8);
+        } else {
+            uint8_t tmp[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+            const uint64_t avail = (byte < in_len) ? (in_len - byte) : 0;
+            std::memcpy(tmp, in + byte, (avail < 16u) ? avail : 16u);
+            std::memcpy(&lo, tmp, 8);
+            std::memcpy(&hi, tmp + 8, 8);
+        }
+        uint64_t val = lo >> sh;
+        if (sh != 0u) val |= hi << (64u - sh);
+        out[i] = val & mask;
+    }
+}
+
+// DELTA_BINARY_PACKED (encoding 5) -- the INT32/INT64 encoding of the parquet
+// V2 writer, so Spark with writer.version=v2 emits it for every integer column.
+//
+//   header: block_size (values, multiple of 128), miniblocks_per_block,
+//           total_value_count, first_value (zig-zag)
+//   block:  min_delta (zig-zag), one bit-width byte per miniblock,
+//           then each miniblock's deltas bit-packed at its own width
+//
+// value[0] = first_value;  value[i] = value[i-1] + min_delta + unpacked[i]
+//
+// Decoded into a PLAIN-layout buffer at the physical width and handed to
+// decode_plain_values, so the logical-type and widening rules are inherited
+// rather than restated.
+// Decode `want` values from a DELTA_BINARY_PACKED block into int64, reporting
+// how many bytes the block consumed. Split out of delta_binary_packed because
+// DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY encode their length arrays this
+// way and then place raw bytes immediately after -- so the consumed count is
+// what locates the data.
+bool delta_decode_ints(const uint8_t* v, uint64_t vlen, uint32_t want,
+                       int64_t* out, uint64_t* consumed, Arena* arena) noexcept {
+    assert(out != nullptr || want == 0);
+    assert(consumed != nullptr && arena != nullptr);
+    uint64_t ip = 0, block_size = 0, n_mini = 0, total = 0, first_zz = 0;
+    if (!uleb(v, vlen, &ip, &block_size)) return false;
+    if (!uleb(v, vlen, &ip, &n_mini)) return false;
+    if (!uleb(v, vlen, &ip, &total)) return false;
+    if (!uleb(v, vlen, &ip, &first_zz)) return false;
+    if (block_size == 0u || n_mini == 0u || n_mini > 64u) return false;
+    if ((block_size % n_mini) != 0u) return false;
+    const uint64_t vpm = block_size / n_mini;
+    if (vpm == 0u || (vpm % 8u) != 0u) return false;      // spec: multiple of 8
+    if (total < want) return false;
+    if (want == 0u) { *consumed = ip; return true; }
+
+    auto* tmp = static_cast<uint64_t*>(arena->allocate(vpm * 8u, 8));
+    if (tmp == nullptr) return false;
+    uint64_t produced = 0;
+    int64_t cur = zigzag_decode(first_zz);
+    out[produced++] = cur;
+    while (produced < want) {        // bounded: every block consumes >= 1 byte
+        uint64_t min_zz = 0;
+        if (!uleb(v, vlen, &ip, &min_zz)) return false;
+        const int64_t min_delta = zigzag_decode(min_zz);
+        if (ip + n_mini > vlen) return false;
+        const uint8_t* widths = v + ip;
+        ip += n_mini;
+        for (uint64_t m = 0; m < n_mini && produced < want; ++m) {
+            const uint32_t bw = widths[m];
+            if (bw > 64u) return false;
+            const uint64_t bytes = (vpm * bw) / 8u;
+            if (ip + bytes > vlen) return false;
+            if (bw == 0u) {
+                for (uint64_t k = 0; k < vpm && produced < want; ++k) {
+                    cur += min_delta;
+                    out[produced++] = cur;
+                }
+            } else {
+                unpack_le64(v + ip, vlen - ip, static_cast<uint32_t>(vpm), bw, tmp);
+                for (uint64_t k = 0; k < vpm && produced < want; ++k) {
+                    cur += min_delta + static_cast<int64_t>(tmp[k]);
+                    out[produced++] = cur;
+                }
+            }
+            ip += bytes;
+        }
+    }
+    *consumed = ip;
+    return true;
+}
+
+// DELTA_BINARY_PACKED (encoding 5) -- the INT32/INT64 encoding of the parquet
+// V2 writer, so Spark with writer.version=v2 emits it for every integer column.
+// Decoded into a PLAIN-layout buffer at the physical width and handed to
+// decode_plain_values, so logical-type and widening rules are inherited.
+bool delta_binary_packed(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                         const uint32_t* def, int64_t row0, uint32_t nvals,
+                         uint32_t nvalid, Arena* arena) noexcept {
+    assert(cx != nullptr && arena != nullptr);
+    const PqType phys = cx->pc->physical;
+    if (phys != PqType::Int32 && phys != PqType::Int64) return false;
+    const uint32_t w = (phys == PqType::Int32) ? 4u : 8u;
+    if (nvalid == 0u) return decode_plain_values(cx, v, 0, def, row0, nvals, 0);
+
+    auto* vals = static_cast<int64_t*>(
+        arena->allocate(static_cast<uint64_t>(nvalid) * 8u, 8));
+    auto* outbuf = static_cast<uint8_t*>(
+        arena->allocate(static_cast<uint64_t>(nvalid) * w, 8));
+    if (vals == nullptr || outbuf == nullptr) return false;
+    uint64_t used = 0;
+    if (!delta_decode_ints(v, vlen, nvalid, vals, &used, arena)) return false;
+    for (uint32_t i = 0; i < nvalid; ++i) {
+        if (w == 8u) {
+            std::memcpy(outbuf + static_cast<uint64_t>(i) * 8u, &vals[i], 8);
+        } else {
+            // Narrowing is intentional: the spec's arithmetic is modular.
+            const int32_t t = static_cast<int32_t>(vals[i]);
+            std::memcpy(outbuf + static_cast<uint64_t>(i) * 4u, &t, 4);
+        }
+    }
+    return decode_plain_values(cx, outbuf, static_cast<uint64_t>(nvalid) * w,
+                               def, row0, nvals, nvalid);
+}
+
+// DELTA_LENGTH_BYTE_ARRAY (encoding 6): a delta-packed length array, then all
+// the bytes concatenated. Rebuilt into the PLAIN byte-array layout (u32 length
+// then bytes, per value) and handed to the PLAIN decoder, so the Utf8 spill
+// handling and null skipping are inherited rather than restated.
+bool delta_length_byte_array(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                             const uint32_t* def, int64_t row0, uint32_t nvals,
+                             uint32_t nvalid, Arena* arena) noexcept {
+    assert(cx != nullptr && arena != nullptr);
+    if (cx->pc->physical != PqType::ByteArray) return false;
+    if (nvalid == 0u) return decode_plain_values(cx, v, 0, def, row0, nvals, 0);
+    auto* lens = static_cast<int64_t*>(
+        arena->allocate(static_cast<uint64_t>(nvalid) * 8u, 8));
+    if (lens == nullptr) return false;
+    uint64_t used = 0;
+    if (!delta_decode_ints(v, vlen, nvalid, lens, &used, arena)) return false;
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < nvalid; ++i) {
+        if (lens[i] < 0) return false;
+        total += static_cast<uint64_t>(lens[i]);
+    }
+    if (used + total > vlen) return false;
+    const uint8_t* data = v + used;
+    if (!ensure_overflow_room(cx, total)) return false;
+    const uint64_t plain_len = total + static_cast<uint64_t>(nvalid) * 4u;
+    auto* plain = static_cast<uint8_t*>(arena->allocate(plain_len, 8));
+    if (plain == nullptr) return false;
+    uint64_t sp = 0, dp = 0;
+    for (uint32_t i = 0; i < nvalid; ++i) {
+        const uint32_t l = static_cast<uint32_t>(lens[i]);
+        std::memcpy(plain + dp, &l, 4);
+        dp += 4;
+        std::memcpy(plain + dp, data + sp, l);
+        dp += l;
+        sp += l;
+    }
+    return decode_plain_values(cx, plain, plain_len, def, row0, nvals, nvalid);
+}
+
+// DELTA_BYTE_ARRAY (encoding 7): incremental (front-coded) strings -- a
+// delta-packed prefix-length array, a delta-packed suffix-length array, then
+// the suffix bytes. Each value reuses the first `prefix[i]` bytes of its
+// PREDECESSOR, which is why sorted string columns compress so well with it.
+bool delta_byte_array(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                      const uint32_t* def, int64_t row0, uint32_t nvals,
+                      uint32_t nvalid, Arena* arena) noexcept {
+    assert(cx != nullptr && arena != nullptr);
+    if (cx->pc->physical != PqType::ByteArray) return false;
+    if (nvalid == 0u) return decode_plain_values(cx, v, 0, def, row0, nvals, 0);
+
+    auto* pre = static_cast<int64_t*>(
+        arena->allocate(static_cast<uint64_t>(nvalid) * 8u, 8));
+    auto* suf = static_cast<int64_t*>(
+        arena->allocate(static_cast<uint64_t>(nvalid) * 8u, 8));
+    if (pre == nullptr || suf == nullptr) return false;
+    uint64_t used_p = 0, used_s = 0;
+    if (!delta_decode_ints(v, vlen, nvalid, pre, &used_p, arena)) return false;
+    if (!delta_decode_ints(v + used_p, vlen - used_p, nvalid, suf, &used_s,
+                           arena)) {
+        return false;
+    }
+    const uint64_t hdr = used_p + used_s;
+    if (hdr > vlen) return false;
+    const uint8_t* data = v + hdr;
+    const uint64_t data_len = vlen - hdr;
+
+    // Bound the output before writing any of it: value i is
+    // prefix[i] + suffix[i] long, and prefix[i] may not exceed the length of
+    // value i-1 (a value cannot borrow bytes its predecessor does not have).
+    uint64_t total = 0, prev_len = 0, sufsum = 0;
+    for (uint32_t i = 0; i < nvalid; ++i) {
+        if (pre[i] < 0 || suf[i] < 0) return false;
+        const uint64_t p = static_cast<uint64_t>(pre[i]);
+        const uint64_t sfx = static_cast<uint64_t>(suf[i]);
+        if (p > prev_len) return false;             // corrupt back-reference
+        sufsum += sfx;
+        if (sufsum > data_len) return false;
+        prev_len = p + sfx;
+        total += prev_len;
+    }
+    if (!ensure_overflow_room(cx, total)) return false;
+    const uint64_t plain_len = total + static_cast<uint64_t>(nvalid) * 4u;
+    auto* plain = static_cast<uint8_t*>(arena->allocate(plain_len, 8));
+    if (plain == nullptr) return false;
+
+    // `last` points at the previous value inside `plain`, so the prefix copy
+    // reads bytes already materialised -- no second scratch buffer.
+    uint64_t dp = 0, sp = 0, last_off = 0, last_len = 0;
+    for (uint32_t i = 0; i < nvalid; ++i) {
+        const uint32_t p = static_cast<uint32_t>(pre[i]);
+        const uint32_t sfx = static_cast<uint32_t>(suf[i]);
+        const uint32_t l = p + sfx;
+        std::memcpy(plain + dp, &l, 4);
+        dp += 4;
+        if (p != 0u) std::memcpy(plain + dp, plain + last_off, p);
+        std::memcpy(plain + dp + p, data + sp, sfx);
+        last_off = dp;
+        last_len = l;
+        (void)last_len;
+        dp += l;
+        sp += sfx;
+    }
+    return decode_plain_values(cx, plain, plain_len, def, row0, nvals, nvalid);
+}
+
+// PLAIN value dispatch, by physical type. Lifted out of decode_data_page so
+// BYTE_STREAM_SPLIT can hand it a transposed buffer and inherit every width
+// and logical-type conversion rather than restating them.
+bool decode_plain_values(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                         const uint32_t* def, int64_t row0, uint32_t nvals,
+                         uint32_t nvalid) noexcept {
+    assert(cx != nullptr);
+    if (cx->is_int96) {
+        return plain_int96(cx, v, vlen, def, row0, nvals, nvalid);
+    }
+    switch (cx->pc->physical) {
+        case PqType::Int32:
+        case PqType::Int64:
+            return cx->int_convert
+                       ? plain_int_conv(cx, v, vlen, def, row0, nvals, nvalid)
+                       : plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
+        case PqType::Double:
+            return plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
+        case PqType::Float:
+            return plain_f32_widen(cx, v, vlen, def, row0, nvals, nvalid);
+        case PqType::Boolean:
+            return plain_bool(cx, v, vlen, def, row0, nvals, nvalid);
+        case PqType::FixedLenByteArray:
+            return plain_flba(cx, v, vlen, def, row0, nvals, nvalid);
+        case PqType::ByteArray:
+            return plain_utf8(cx, v, vlen, def, row0, nvals, nvalid);
+        default:
+            return false;
+    }
+}
+
+// BYTE_STREAM_SPLIT (encoding 9).
+//
+// The page holds W byte-streams laid end to end: every value's byte 0, then
+// every value's byte 1, and so on. Value i's byte j lives at in[j*N + i]. The
+// point of the encoding is that a column of similar floats has low entropy in
+// its exponent bytes, so grouping like bytes together compresses far better
+// than interleaved IEEE-754 does. It is increasingly the default for
+// FLOAT/DOUBLE, which is why a reader without it cannot open modern numeric
+// datasets.
+//
+// Transpose into PLAIN layout and hand it to decode_plain_values. Doing the
+// conversion inline instead would mean restating the f32->f64 widening, the
+// integer widen/sign-extend rules and the FLBA path -- four places to drift
+// from the PLAIN decoder. A page is bounded, the scratch is one arena bump,
+// and the transpose is the only new logic.
+bool decode_byte_stream_split(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                              const uint32_t* def, int64_t row0, uint32_t nvals,
+                              uint32_t nvalid, Arena* arena) noexcept {
+    assert(cx != nullptr && arena != nullptr);
+    // The width is the PHYSICAL one, from the schema -- not cx->src_width.
+    // src_width is a decode control that only the paths needing a width
+    // conversion set: for FLOAT it stays at its default of cx->elem (8, the
+    // Float64 output stride) because plain_f32_widen hardcodes its 4-byte
+    // source instead of consulting it. Using it here made the f32 case demand
+    // 8 bytes per value from a 4-byte-per-value page and fail closed -- caught
+    // by the per-type fixtures, and invisible in a file whose float column
+    // happened to be DOUBLE.
+    uint32_t w = 0;
+    switch (cx->pc->physical) {
+        case PqType::Float:  case PqType::Int32:  w = 4u; break;
+        case PqType::Double: case PqType::Int64:  w = 8u; break;
+        case PqType::FixedLenByteArray:
+            w = static_cast<uint32_t>(cx->pc->type_length);
+            break;
+        default: return false;      // BOOLEAN / BYTE_ARRAY: not a fixed width
+    }
+    // The spec allows FLOAT/DOUBLE and, since 2.9, the fixed-width integer and
+    // FLBA types. Anything whose element width we do not know fails closed.
+    if (w == 0u || w > 16u) return false;
+    if (nvalid == 0u) {
+        return decode_plain_values(cx, v, 0, def, row0, nvals, 0);
+    }
+    const uint64_t n = nvalid;
+    if (n * w > vlen) return false;              // page shorter than it claims
+    auto* plain = static_cast<uint8_t*>(arena->allocate(n * w, 8));
+    if (plain == nullptr) return false;
+    // Stream-major outer loop: each pass reads one stream sequentially and
+    // writes with stride w. The opposite nesting would read w streams
+    // scattered per value.
+    for (uint32_t j = 0; j < w; ++j) {
+        const uint8_t* BOLT_RESTRICT s = v + static_cast<uint64_t>(j) * n;
+        uint8_t* BOLT_RESTRICT d = plain + j;
+        for (uint64_t i = 0; i < n; ++i) d[i * w] = s[i];
+    }
+    return decode_plain_values(cx, plain, n * w, def, row0, nvals, nvalid);
+}
+
 // DATA_PAGE (v1): [def levels if OPTIONAL: u32 LE byte-len + RLE hybrid]
 // then PLAIN values or [bit-width byte + RLE hybrid dictionary indices].
 bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
@@ -944,29 +1325,25 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
     }
     if (h->enc == kEncPlain) {
         cx->codes_ok = 0;   // PLAIN page: no dictionary codes
-        if (cx->is_int96) {
-            return plain_int96(cx, v, vlen, def, row0, nvals, nvalid);
-        }
-        switch (cx->pc->physical) {
-            case PqType::Int32:
-            case PqType::Int64:
-                return cx->int_convert
-                           ? plain_int_conv(cx, v, vlen, def, row0, nvals, nvalid)
-                           : plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
-            case PqType::Double:
-                return plain_fixed(cx, v, vlen, def, row0, nvals, nvalid);
-            case PqType::Float:
-                return plain_f32_widen(cx, v, vlen, def, row0, nvals,
-                                       nvalid);
-            case PqType::Boolean:
-                return plain_bool(cx, v, vlen, def, row0, nvals, nvalid);
-            case PqType::FixedLenByteArray:
-                return plain_flba(cx, v, vlen, def, row0, nvals, nvalid);
-            case PqType::ByteArray:
-                return plain_utf8(cx, v, vlen, def, row0, nvals, nvalid);
-            default:
-                return false;
-        }
+        return decode_plain_values(cx, v, vlen, def, row0, nvals, nvalid);
+    }
+    if (h->enc == kEncDeltaBinaryPacked) {
+        cx->codes_ok = 0;                 // not dictionary-coded
+        return delta_binary_packed(cx, v, vlen, def, row0, nvals, nvalid, arena);
+    }
+    if (h->enc == kEncDeltaLenByteArray) {
+        cx->codes_ok = 0;                 // not dictionary-coded
+        return delta_length_byte_array(cx, v, vlen, def, row0, nvals, nvalid,
+                                       arena);
+    }
+    if (h->enc == kEncDeltaByteArray) {
+        cx->codes_ok = 0;                 // not dictionary-coded
+        return delta_byte_array(cx, v, vlen, def, row0, nvals, nvalid, arena);
+    }
+    if (h->enc == kEncByteStreamSplit) {
+        cx->codes_ok = 0;                 // not dictionary-coded
+        return decode_byte_stream_split(cx, v, vlen, def, row0, nvals, nvalid,
+                                        arena);
     }
     if (h->enc == kEncRle && cx->pc->physical == PqType::Boolean) {
         cx->codes_ok = 0;                 // not dictionary-coded
@@ -1222,6 +1599,8 @@ bool init_col_ctx(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
         if (pc->time_unit == 1) cx->ts_rescale = 1;        // millis -> us
         else if (pc->time_unit == 3) cx->ts_rescale = 2;   // nanos  -> us
     }
+    cx->arena = arena;
+    cx->ovf_base = &col->str_overflow_base;
     if (t == BoltType::Utf8 && ovf > 0 && rows > 0) {
         char* ob = static_cast<char*>(arena->allocate(ovf, 1));
         if (ob == nullptr) return false;
@@ -1635,6 +2014,8 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
         out_col->stats.all_valid = false;
         cx.validity = bm;
     }
+    cx.arena = arena;
+    cx.ovf_base = &out_col->str_overflow_base;
     if (t == BoltType::Utf8 && unc_sum > 0) {
         char* ob = static_cast<char*>(arena->allocate(unc_sum, 1));
         if (ob == nullptr) return false;
