@@ -671,9 +671,37 @@ void dict_gather_dense(uint8_t* BOLT_RESTRICT out,
     }
 }
 
+// Dense gather that ALSO records the code hint.
+//
+// A dictionary Utf8 column carries the G2FEAT-152 code hint, and that alone
+// used to send it to dict_gather_sparse even when the page has no nulls at
+// all -- so every row paid a null test and a `k >= nvalid` bound test to
+// support a null that was not there. On SF10 lineitem the four
+// dictionary-encoded Utf8 columns are 258.0 ms; forcing them down the plain
+// dense path (which drops the code hint, so it is not a legal fix, only a
+// ceiling) gives 174.5 ms. This recovers most of that gap while still
+// recording codes: dense means k == i, so both tests go.
+template <uint32_t W>
+void dict_gather_dense_codes(uint8_t* BOLT_RESTRICT out,
+                             const uint8_t* BOLT_RESTRICT dict,
+                             const uint32_t* BOLT_RESTRICT idx,
+                             int32_t* BOLT_RESTRICT codes,
+                             uint32_t n) noexcept {
+    assert(out != nullptr || n == 0);
+    assert(dict != nullptr || n == 0);
+    assert(codes != nullptr || n == 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t id = idx[i];       // range pre-validated by the caller
+        codes[i] = static_cast<int32_t>(id);
+        std::memcpy(out + static_cast<uint64_t>(i) * W,
+                    dict + static_cast<uint64_t>(id) * W, W);
+    }
+}
+
 // Nullable / code-tracking gather: one row at a time, but still a
 // compile-time-width copy. Reached only by an OPTIONAL column that actually
-// contains nulls, or by Utf8 (which carries the G2FEAT-152 code hint).
+// contains nulls -- a dense page with a code hint now takes
+// dict_gather_dense_codes above.
 template <uint32_t W>
 bool dict_gather_sparse(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
                         int64_t row0, uint32_t nrows,
@@ -715,17 +743,30 @@ bool dict_gather(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
     for (uint32_t k = 0; k < nvalid; ++k) mx = (idx[k] > mx) ? idx[k] : mx;
     if (nvalid > 0 && mx >= cx->dict_n) return false;
 
-    // Dense fast path: no nulls to skip and no code hint to record, so the
-    // gather is a pure permutation of `nrows` values.
-    if (def == nullptr && cx->codes == nullptr) {
+    // Dense fast path: no nulls to skip, so the gather is a pure permutation
+    // of `nrows` values. Whether a code hint has to be recorded alongside
+    // decides WHICH dense gather, not whether one is possible -- a dense page
+    // with codes used to fall all the way through to the sparse gather.
+    if (def == nullptr) {
         if (nrows != nvalid) return false;   // dense page: every row valid
         uint8_t* out = cx->out + static_cast<uint64_t>(row0) * w;
+        if (cx->codes == nullptr) {
+            switch (w) {
+                case 8:  dict_gather_dense<8>(out, cx->dict, idx, nrows);  return true;
+                case 4:  dict_gather_dense<4>(out, cx->dict, idx, nrows);  return true;
+                case 16: dict_gather_dense<16>(out, cx->dict, idx, nrows); return true;
+                case 2:  dict_gather_dense<2>(out, cx->dict, idx, nrows);  return true;
+                case 1:  dict_gather_dense<1>(out, cx->dict, idx, nrows);  return true;
+                default: return false;
+            }
+        }
+        int32_t* codes = cx->codes + row0;
         switch (w) {
-            case 8:  dict_gather_dense<8>(out, cx->dict, idx, nrows);  return true;
-            case 4:  dict_gather_dense<4>(out, cx->dict, idx, nrows);  return true;
-            case 16: dict_gather_dense<16>(out, cx->dict, idx, nrows); return true;
-            case 2:  dict_gather_dense<2>(out, cx->dict, idx, nrows);  return true;
-            case 1:  dict_gather_dense<1>(out, cx->dict, idx, nrows);  return true;
+            case 16: dict_gather_dense_codes<16>(out, cx->dict, idx, codes, nrows); return true;
+            case 8:  dict_gather_dense_codes<8>(out, cx->dict, idx, codes, nrows);  return true;
+            case 4:  dict_gather_dense_codes<4>(out, cx->dict, idx, codes, nrows);  return true;
+            case 2:  dict_gather_dense_codes<2>(out, cx->dict, idx, codes, nrows);  return true;
+            case 1:  dict_gather_dense_codes<1>(out, cx->dict, idx, codes, nrows);  return true;
             default: return false;
         }
     }
