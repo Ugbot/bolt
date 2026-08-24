@@ -43,6 +43,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -239,6 +240,7 @@ inline std::uint8_t read_valid(const std::uint8_t* bm, std::int64_t off,
 // own banner. It needs hybrid_varint_emit and the parquet constants above,
 // so it is included here rather than at the top.
 #include "bolt_parquet_write_enc.inc"
+#include "bolt_parquet_write_bloom.inc"
 
 // ===== writer state =======================================================
 
@@ -288,6 +290,10 @@ struct ChunkRec {
     std::int32_t  col_index_len;
     std::int64_t  off_index_off;
     std::int32_t  off_index_len;
+    // Bloom filter: written just after the row group, so the offset is
+    // patched in after the chunk itself.
+    std::int64_t  bloom_off;
+    std::int32_t  bloom_len;
 };
 
 struct RowGroupRec {
@@ -331,6 +337,12 @@ struct ParquetWriter {
     std::vector<std::int64_t>  i64_scratch;
     std::vector<std::int64_t>  i64_scratch2;
     std::vector<std::uint8_t>  byte_scratch;
+    // Bloom filters for the row group currently being written. Flushed and
+    // cleared at the end of each row group so live filter memory is bounded
+    // by one row group's columns, not the file's.
+    BloomBuilder               bloom;
+    std::vector<std::vector<std::uint8_t>> rg_blooms;   // serialized
+    std::vector<std::uint32_t>             rg_bloom_chunk;  // chunk index
 };
 
 namespace {
@@ -1221,6 +1233,40 @@ bool chunk_write_dict(ParquetWriter* w, const BoltColumn& col,
     return true;
 }
 
+// Build this chunk's bloom filter and queue it for the flush that happens
+// after the row group. `ndv_exact` says the dictionary count is the real
+// distinct-value count; otherwise the non-null row count is used, which
+// over-estimates and so over-SIZES the filter -- the safe direction, since
+// an under-sized filter is over-full and its false-positive rate degrades.
+bool chunk_build_bloom(ParquetWriter* w, const BoltColumn& col,
+                       const ParquetWriteColumn& sch, std::int64_t n_rows,
+                       const std::uint8_t* def_bits, bool nullable,
+                       bool ndv_exact, ChunkRec* rec) noexcept {
+    assert(w != nullptr && rec != nullptr);
+    assert(n_rows >= 0);
+    if (!w->opts.emit_bloom_filter) return true;
+    if (!bloom_eligible(sch.type)) return true;
+    const std::int64_t non_null = n_rows - rec->null_count;
+    if (non_null <= 0) return true;               // nothing to assert absent
+    const std::uint64_t ndv = ndv_exact
+        ? static_cast<std::uint64_t>(w->dict.count)
+        : static_cast<std::uint64_t>(non_null);
+    std::uint32_t cap = (w->opts.bloom_max_bytes != 0u)
+        ? w->opts.bloom_max_bytes : kPwDefaultBloomBytes;
+    if (cap < kPwBloomMinBytes) cap = kPwBloomMinBytes;
+    const double fpp = (w->opts.bloom_fpp > 0.0 && w->opts.bloom_fpp < 1.0)
+        ? w->opts.bloom_fpp : kPwDefaultBloomFpp;
+    bloom_reset(&w->bloom, bloom_optimal_bytes(ndv, fpp, cap));
+    if (!bloom_build_chunk(col, sch.type, n_rows, def_bits, nullable,
+                           &w->bloom)) {
+        return false;
+    }
+    w->rg_blooms.emplace_back();
+    bloom_serialize(w->bloom, &w->rg_blooms.back());
+    w->rg_bloom_chunk.push_back(static_cast<std::uint32_t>(w->chunks.size()));
+    return true;
+}
+
 // Build the def levels + statistics that both encodings need, choose the
 // encoding, and delegate. Fallback from dictionary to PLAIN happens here and
 // only here, so a chunk's data pages never disagree about their encoding.
@@ -1253,21 +1299,27 @@ bool write_column_chunk(ParquetWriter* w, const BoltColumn& col,
     }
 
     const PqWriteEncoding enc = resolve_encoding(sch, w->opts);
-    if (enc == PqWriteEncoding::Dictionary && n_rows > 0) {
-        if (dict_build_chunk(col, sch, n_rows, db, nullable,
-                             dict_budget_bytes(w->opts), &w->dict,
-                             &w->dict_idx) &&
-            w->dict.count > 0u) {
-            return chunk_write_dict(w, col, sch, n_rows, db, nullable, w->dict,
-                                    w->dict_idx, rec);
-        }
+    bool ok;
+    bool dict_ndv_exact = false;
+    if (enc == PqWriteEncoding::Dictionary && n_rows > 0 &&
+        dict_build_chunk(col, sch, n_rows, db, nullable,
+                         dict_budget_bytes(w->opts), &w->dict, &w->dict_idx) &&
+        w->dict.count > 0u) {
+        dict_ndv_exact = true;
+        ok = chunk_write_dict(w, col, sch, n_rows, db, nullable, w->dict,
+                              w->dict_idx, rec);
+    } else if (enc == PqWriteEncoding::Dictionary) {
         // Dictionary overflowed its ceiling (or the chunk is all-null):
         // PLAIN for the whole chunk. Nothing has been written yet, so this
         // costs only the abandoned build.
-        return chunk_write_direct(w, col, sch, PqWriteEncoding::Plain, n_rows,
-                                  db, nullable, rec);
+        ok = chunk_write_direct(w, col, sch, PqWriteEncoding::Plain, n_rows,
+                                db, nullable, rec);
+    } else {
+        ok = chunk_write_direct(w, col, sch, enc, n_rows, db, nullable, rec);
     }
-    return chunk_write_direct(w, col, sch, enc, n_rows, db, nullable, rec);
+    if (!ok) return false;
+    return chunk_build_bloom(w, col, sch, n_rows, db, nullable,
+                             dict_ndv_exact, rec);
 }
 
 // ===== footer (FileMetaData) =============================================
@@ -1374,6 +1426,15 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     if (w->opts.emit_statistics && (rec.st.have_stats || rec.null_count_known)) {
         tc_put_field(o, 12, kFStruct);
         write_statistics(o, rec);
+    }
+    // 14/15 = bloom_filter_offset / bloom_filter_length. Length is the
+    // header PLUS the bitset, which is what bolt's pq_read_bloom and
+    // parquet-cpp both expect to bound the slice by.
+    if (rec.bloom_len > 0) {
+        tc_put_field(o, 14, kFI64);
+        tc_put_zigzag(o, rec.bloom_off);
+        tc_put_field(o, 15, kFI32);
+        tc_put_zigzag(o, rec.bloom_len);
     }
     tc_put_stop(o);
 }
@@ -1638,6 +1699,25 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
         w->chunks.push_back(rec);
     }
     rg.total_byte_size = w->file_pos - rg_start;
+    // Flush this row group's bloom filters now (parquet-mr's AFTER_ROWGROUP
+    // placement). Doing it here rather than at close is what keeps live
+    // filter memory to one row group; at 256 columns the difference is real.
+    // The bytes deliberately do NOT count toward any chunk's
+    // total_compressed_size -- that field bounds the chunk's PAGE region,
+    // and a reader walking pages past its end would fail.
+    for (std::size_t i = 0; i < w->rg_blooms.size(); ++i) {
+        const std::vector<std::uint8_t>& bf = w->rg_blooms[i];
+        if (bf.size() > 0x7FFFFFFFull) return false;
+        const std::uint32_t ci = w->rg_bloom_chunk[i];
+        assert(ci < w->chunks.size());
+        w->chunks[ci].bloom_off = w->file_pos;
+        w->chunks[ci].bloom_len = static_cast<std::int32_t>(bf.size());
+        if (!sink_write(w, bf.data(), bf.size())) return false;
+        w->file_pos += static_cast<std::int64_t>(bf.size());
+    }
+    w->rg_blooms.clear();
+    w->rg_bloom_chunk.clear();
+    if (!sink_ok(w)) return false;
     w->row_groups.push_back(rg);
     w->total_rows += rows;
     return true;

@@ -181,6 +181,30 @@ def check_encoding_fixture(path, want_enc, gen, errs):
             return
 
 
+def check_bloom_fixture(path, errs):
+    """A file whose bloom filters sit BETWEEN row groups still reads.
+
+    The filters are written after each row group's data, so their bytes fall
+    inside the span a reader might naively walk as pages. If
+    total_compressed_size wrongly counted them, a page walk would run off the
+    end of the chunk -- and bolt's own reader is not the one to ask, since it
+    would share the mistake. pyarrow is.
+    """
+    md = pq.ParquetFile(path).metadata
+    if md.num_row_groups < 2:
+        errs.append("%s: expected several row groups, got %d"
+                    % (path, md.num_row_groups))
+        return
+    got = pq.read_table(path).column("v").to_pylist()
+    if len(got) != 30000:
+        errs.append("%s: %d rows, want 30000" % (path, len(got)))
+        return
+    for i in range(30000):
+        if got[i] != i * 3 - 7:
+            errs.append("%s: row %d: got %r want %r" % (path, i, got[i], i * 3 - 7))
+            return
+
+
 def main():
     d = sys.argv[1] if len(sys.argv) > 1 else "."
     errs = []
@@ -205,6 +229,15 @@ def main():
         check_encoding_fixture(path, want_enc, gen, errs)
         checked += 1
         print("checked %s" % os.path.basename(path))
+    bloom_path = os.path.join(
+        d, "test_bolt_parquet_write_bloom_interleaved.parquet")
+    if os.path.exists(bloom_path):
+        check_bloom_fixture(bloom_path, errs)
+        checked += 1
+        print("checked %s" % os.path.basename(bloom_path))
+    else:
+        errs.append("missing fixture %s (run test_bolt_parquet_write_bloom "
+                    "in that directory first)" % bloom_path)
     if errs:
         print("\nFAIL (%d):" % len(errs))
         for e in errs:

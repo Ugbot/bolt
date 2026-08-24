@@ -1034,6 +1034,16 @@ target_link_libraries(test_bolt_parquet_write_enc
 bolt_apply_hardening(test_bolt_parquet_write_enc)
 add_test(NAME test_bolt_parquet_write_enc COMMAND test_bolt_parquet_write_enc)
 
+# Writer: split-block bloom filters, checked against bolt's own probe. Asserts
+# BOTH properties: no false negatives (correctness -- a miss drops real rows)
+# and a bounded false-positive rate (usefulness -- a saturated filter parses
+# fine and prunes nothing).
+add_executable(test_bolt_parquet_write_bloom test_bolt_parquet_write_bloom.cpp)
+target_link_libraries(test_bolt_parquet_write_bloom
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_bloom)
+add_test(NAME test_bolt_parquet_write_bloom COMMAND test_bolt_parquet_write_bloom)
+
 add_executable(test_bolt_parquet_write_mem test_bolt_parquet_write_mem.cpp)
 target_link_libraries(test_bolt_parquet_write_mem
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

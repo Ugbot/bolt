@@ -59,7 +59,7 @@
 // Out of scope (open returns false, or the option is silently a no-op):
 //   - DATA_PAGE_V2 (v1 data pages only)
 //   - nested types, LIST / MAP / STRUCT
-//   - bloom filters, encryption
+//   - encryption
 //   - GZIP / ZSTD / LZ4 codecs
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
@@ -136,7 +136,15 @@ struct ParquetWriteOpts {
                                                  // (2=GZIP, 3=ZSTD, 4=LZ4_RAW
                                                  //  rejected at open: false)
     bool               emit_statistics;
-    bool               emit_bloom_filter;        // accepted, ignored (stub)
+    // Emit a split-block bloom filter per column chunk, located by
+    // ColumnMetaData fields 14/15. A probe returning false PROVES the value
+    // is absent, so an equality or IN predicate can skip the whole chunk.
+    // Filters are flushed immediately after the row group whose chunks they
+    // describe (parquet-mr's AFTER_ROWGROUP default), which bounds live
+    // filter memory to one row group rather than the whole file.
+    // BOOLEAN columns are skipped -- a two-valued domain makes one useless,
+    // and parquet-mr skips it too.
+    bool               emit_bloom_filter;
     // Emit a ColumnIndex + OffsetIndex per column chunk, in the index region
     // between the last row group and the footer, located by ColumnChunk
     // fields 4-7. Per-page min/max/null_count let a reader skip whole pages
@@ -176,6 +184,20 @@ struct ParquetWriteOpts {
     // Dictionary size ceiling in bytes of PLAIN-encoded distinct values.
     // 0 selects the default (kPwDefaultDictBytes, 1 MiB -- Arrow's default).
     std::uint32_t      dictionary_max_bytes;
+
+    // ---- bloom filter sizing --------------------------------------------
+    // Target false-positive rate. 0 selects the default (0.05, parquet-mr's).
+    // Values outside (0, 1) are treated as the default rather than rejected,
+    // because a filter is only ever an accelerator -- a mis-sized one costs
+    // pruning, never correctness.
+    double             bloom_fpp;
+    // Per-filter byte ceiling. 0 selects the default (kPwDefaultBloomBytes).
+    // The size is derived from the chunk's distinct-value count, which is
+    // EXACT when the chunk was dictionary encoded and otherwise falls back to
+    // the row count -- an over-estimate, so the filter is over-sized rather
+    // than over-full.
+    std::uint32_t      bloom_max_bytes;
+    std::uint32_t      _pad3;
 };
 
 // Defaults referenced by the option comments above.
@@ -184,6 +206,8 @@ inline constexpr std::uint32_t kPwMinPageBytes     = 4u << 10;   // 4 KiB
 inline constexpr std::uint32_t kPwMaxPageBytes     = 512u << 20; // 512 MiB
 inline constexpr std::uint32_t kPwDefaultDictBytes = 1u << 20;   // 1 MiB
 inline constexpr std::uint32_t kPwMaxDictEntries   = 1u << 20;
+inline constexpr std::uint32_t kPwDefaultBloomBytes = 1u << 20;  // 1 MiB
+inline constexpr double        kPwDefaultBloomFpp   = 0.05;
 
 // Opaque writer state. One new at open, one delete at close.
 struct ParquetWriter;
