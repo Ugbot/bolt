@@ -38,7 +38,8 @@ constexpr int64_t  kPqMaxPageBytes     = int64_t{1} << 30;
 constexpr uint32_t kPqMetaChunksFirst  = 4096;
 
 // parquet::PageType / Encoding / ConvertedType values we consume.
-constexpr int32_t kPageData = 0, kPageIndex = 1, kPageDict = 2;
+constexpr int32_t kPageData = 0, kPageIndex = 1, kPageDict = 2,
+                  kPageDataV2 = 3;
 constexpr int32_t kEncPlain = 0, kEncPlainDict = 2, kEncRle = 3,
                   kEncRleDict = 8, kEncByteStreamSplit = 9,
                   kEncDeltaBinaryPacked = 5, kEncDeltaLenByteArray = 6,
@@ -284,6 +285,13 @@ struct PageHdr {
     int32_t nvals;      // data/dict num_values
     int32_t enc;        // data/dict encoding
     int32_t def_enc;    // definition_level_encoding
+    // DATA_PAGE_V2 only. V2 moves the levels OUT of the compressed body and
+    // gives them explicit byte lengths, so they no longer have to be found by
+    // decoding, and it drops v1's redundant 4-byte length prefix on each.
+    int32_t def_len;    // definition_levels_byte_length
+    int32_t rep_len;    // repetition_levels_byte_length
+    uint8_t v2;         // 1 => DATA_PAGE_V2 layout
+    uint8_t compressed; // v2's is_compressed (thrift default is TRUE)
 };
 
 // DataPageHeader {1 num_values, 2 encoding, 3 def_enc, 4 rep_enc, 5 stats}
@@ -306,6 +314,36 @@ bool parse_data_hdr(TcCursor* c, PageHdr* h) noexcept {
     return true;
 }
 
+// DataPageHeaderV2 {1 num_values, 2 num_nulls, 3 num_rows, 4 encoding,
+//                   5 def_levels_byte_length, 6 rep_levels_byte_length,
+//                   7 is_compressed, 8 statistics}
+bool parse_data_hdr_v2(TcCursor* c, PageHdr* h) noexcept {
+    assert(c != nullptr && h != nullptr);
+    h->v2 = 1;
+    h->compressed = 1;            // thrift default when the field is absent
+    h->def_enc = kEncRle;         // v2 levels are always RLE by spec
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {
+        int64_t v = 0;
+        switch (fid) {
+            case 1: if (!tc_zigzag(c, &v)) return false;
+                    h->nvals = static_cast<int32_t>(v); break;
+            case 4: if (!tc_zigzag(c, &v)) return false;
+                    h->enc = static_cast<int32_t>(v); break;
+            case 5: if (!tc_zigzag(c, &v)) return false;
+                    h->def_len = static_cast<int32_t>(v); break;
+            case 6: if (!tc_zigzag(c, &v)) return false;
+                    h->rep_len = static_cast<int32_t>(v); break;
+            case 7: // compact protocol encodes bool in the field header type
+                    h->compressed = (ft == 1u) ? 1u : 0u;
+                    break;
+            default: if (!tc_skip(c, ft, 0)) return false; break;
+        }
+    }
+    return h->def_len >= 0 && h->rep_len >= 0;
+}
+
 // DictionaryPageHeader {1 num_values, 2 encoding, 3 is_sorted}
 bool parse_dict_hdr(TcCursor* c, PageHdr* h) noexcept {
     assert(c != nullptr && h != nullptr);
@@ -325,11 +363,12 @@ bool parse_dict_hdr(TcCursor* c, PageHdr* h) noexcept {
 }
 
 // PageHeader {1 type, 2 unc, 3 cmp, 5 data_page_header,
-//             7 dictionary_page_header} (4 crc / 8 v2 header skipped).
+//             7 dictionary_page_header, 8 data_page_header_v2} (4 crc skipped).
 bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
     assert(c != nullptr && h != nullptr);
     h->type = -1; h->unc = -1; h->cmp = -1;
     h->nvals = -1; h->enc = -1; h->def_enc = -1;
+    h->def_len = 0; h->rep_len = 0; h->v2 = 0; h->compressed = 1;
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {
@@ -348,6 +387,10 @@ bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
             case 7:
                 if (ft != kTcStruct) return false;
                 if (!parse_dict_hdr(c, h)) return false;
+                break;
+            case 8:
+                if (ft != kTcStruct) return false;
+                if (!parse_data_hdr_v2(c, h)) return false;
                 break;
             default: if (!tc_skip(c, ft, 0)) return false; break;
         }
@@ -1295,26 +1338,40 @@ bool decode_data_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
     uint32_t nvalid = nvals;
     if (cx->pc->optional != 0) {                    // max_def_level == 1
         if (h->def_enc != kEncRle) return false;
-        if (vlen < 4) return false;
         uint32_t dl = 0;
-        std::memcpy(&dl, v, 4);
-        if (4ull + dl > vlen) return false;
+        uint32_t skip = 0;
+        if (h->v2 != 0) {
+            // v2 carries the length in the header and stores repetition levels
+            // first; neither section has v1's 4-byte prefix.
+            dl = static_cast<uint32_t>(h->def_len);
+            skip = static_cast<uint32_t>(h->rep_len);
+            if (static_cast<uint64_t>(skip) + dl > vlen) return false;
+            v += skip;
+            vlen -= skip;
+        } else {
+            if (vlen < 4) return false;
+            std::memcpy(&dl, v, 4);
+            skip = 4u;
+            if (4ull + dl > vlen) return false;
+            v += 4u;
+            vlen -= 4u;
+        }
         // Nullable but null-free is the common case (see rle_def_all_present).
         // Settle it from the run headers instead of expanding the levels only
         // to sum them and throw them away: same `def == nullptr` dense path,
         // without the allocation, the fill, or the sum.
-        if (rle_def_all_present(v + 4, dl, nvals)) {
+        if (rle_def_all_present(v, dl, nvals)) {
             def = nullptr;
             nvalid = nvals;
-            v += 4ull + dl;
-            vlen -= 4ull + dl;
+            v += dl;
+            vlen -= dl;
         } else {
             def = static_cast<uint32_t*>(
                 arena->allocate(uint64_t{nvals} * 4u, 4));
             if (def == nullptr) return false;
-            if (!rle_hybrid_decode(v + 4, dl, 1, nvals, def)) return false;
-            v += 4ull + dl;
-            vlen -= 4ull + dl;
+            if (!rle_hybrid_decode(v, dl, 1, nvals, def)) return false;
+            v += dl;
+            vlen -= dl;
             nvalid = 0;
             for (uint32_t i = 0; i < nvals; ++i) nvalid += def[i];
             if (nvalid == nvals) def = nullptr;     // all-valid: dense path
@@ -1404,6 +1461,11 @@ bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
     return true;
 }
 
+bool assemble_v2_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
+                      const PageHdr* h, Arena* arena, void** zscratch,
+                      const uint8_t** out, uint64_t* out_len) noexcept;
+
+
 // One column chunk: walk its pages, decode rows [row0, row0+rows).
 bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
                   ColCtx* cx, int64_t row0, int64_t rows,
@@ -1433,22 +1495,27 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
         if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
         const uint8_t* pd = buf + pay;
         uint64_t pd_len = static_cast<uint64_t>(h.cmp);
-        if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena, &zscratch,
-                             &pd, &pd_len)) {
+        if (h.type == kPageDataV2) {
+            if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena, &zscratch,
+                                  &pd, &pd_len)) {
+                return false;
+            }
+        } else if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
+                                    &zscratch, &pd, &pd_len)) {
             return false;
         }
         if (h.type == kPageDict) {
             if (!decode_dict_page(cx, pd, pd_len, h.nvals, arena)) {
                 return false;
             }
-        } else if (h.type == kPageData) {
+        } else if (h.type == kPageData || h.type == kPageDataV2) {
             if (!decode_data_page(cx, pd, pd_len, &h, row0 + rows_done,
                                   rows - rows_done, arena)) {
                 return false;
             }
             rows_done += h.nvals;
         } else if (h.type != kPageIndex) {
-            return false;                     // DATA_PAGE_V2 etc.: rejected
+            return false;                     // unknown page type
         }
         p = pay + static_cast<uint64_t>(h.cmp);
     }
@@ -1502,6 +1569,44 @@ bool attach_dict_hint(const ColCtx* cx, BoltColumn* col, Arena* arena) noexcept 
     keys->dict_child      = vals;
     keys->arena           = arena;
     col->dict_child = keys;
+    return true;
+}
+
+
+// Assemble a DATA_PAGE_V2 into one contiguous buffer shaped like the rest of
+// the reader expects: [rep levels][def levels][values].
+//
+// v2 stores the levels UNCOMPRESSED ahead of the values and compresses only the
+// values, so the page cannot be inflated as a single blob. Copy the levels
+// through verbatim and decompress the remainder after them.
+bool assemble_v2_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
+                      const PageHdr* h, Arena* arena, void** zscratch,
+                      const uint8_t** out, uint64_t* out_len) noexcept {
+    assert(h != nullptr && arena != nullptr && out != nullptr);
+    const uint64_t lv = static_cast<uint64_t>(h->rep_len) +
+                        static_cast<uint64_t>(h->def_len);
+    if (lv > src_len) return false;
+    if (static_cast<uint64_t>(h->unc) < lv) return false;
+    const uint64_t val_unc = static_cast<uint64_t>(h->unc) - lv;
+    if (h->compressed == 0u || codec == PqCodec::Uncompressed) {
+        // Nothing to do: the page is already in the target shape.
+        *out = src;
+        *out_len = src_len;
+        return true;
+    }
+    const uint8_t* vals = nullptr;
+    uint64_t vals_len = 0;
+    if (!decompress_page(codec, src + lv, src_len - lv,
+                         static_cast<int32_t>(val_unc), arena, zscratch,
+                         &vals, &vals_len)) {
+        return false;
+    }
+    auto* whole = static_cast<uint8_t*>(arena->allocate(lv + vals_len, 8));
+    if (whole == nullptr) return false;
+    if (lv != 0u) std::memcpy(whole, src, lv);
+    if (vals_len != 0u) std::memcpy(whole + lv, vals, vals_len);
+    *out = whole;
+    *out_len = lv + vals_len;
     return true;
 }
 
