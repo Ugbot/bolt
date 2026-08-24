@@ -610,6 +610,13 @@ else()
     option(BOLT_WITH_ZSTD "Build bolt codecs with libzstd" OFF)
 endif()
 
+# Prefer static archives for third-party codecs/crypto when both forms exist.
+# OFF for developer builds (system shared libs, security updates); ON for
+# redistributable artifacts, where a shared dependency either has to be
+# vendored in by auditwheel/delocate or is simply missing on the user's box.
+option(BOLT_PREFER_STATIC_DEPS
+       "Link third-party deps (zstd/lz4/zlib) statically where possible" OFF)
+
 find_package(ZLIB QUIET)
 if(ZLIB_FOUND)
     option(BOLT_WITH_ZLIB "Build bolt codecs with zlib" ON)
@@ -659,7 +666,17 @@ if(BOLT_BUILD_INGEST)
 
     if(BOLT_WITH_ZSTD)
         target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_ZSTD=1)
-        if(TARGET zstd::libzstd_shared)
+        # BOLT_PREFER_STATIC_DEPS: link the STATIC archive when one exists, so
+        # the codec is baked into the consumer binary and there is no external
+        # .so/.dylib at runtime. This is what makes a redistributable artifact
+        # (a Python wheel, a tarballed CLI) genuinely standalone WITHOUT
+        # dropping the feature: auditwheel/delocate then have nothing to vendor
+        # because there is no shared dependency left to find.
+        # Default OFF so ordinary developer builds keep the system's shared
+        # library and its security updates.
+        if(BOLT_PREFER_STATIC_DEPS AND TARGET zstd::libzstd_static)
+            target_link_libraries(bolt_ingest PRIVATE zstd::libzstd_static)
+        elseif(TARGET zstd::libzstd_shared)
             target_link_libraries(bolt_ingest PRIVATE zstd::libzstd_shared)
         elseif(TARGET zstd::libzstd_static)
             target_link_libraries(bolt_ingest PRIVATE zstd::libzstd_static)
@@ -683,12 +700,31 @@ if(BOLT_BUILD_INGEST)
     endif()
     if(BOLT_WITH_LZ4)
         target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_LZ4=1)
-        if(TARGET lz4::lz4)
+        # Static first when BOLT_PREFER_STATIC_DEPS — see the zstd block above.
+        if(BOLT_PREFER_STATIC_DEPS AND TARGET LZ4::lz4_static)
+            target_link_libraries(bolt_ingest PRIVATE LZ4::lz4_static)
+        elseif(TARGET lz4::lz4)
             target_link_libraries(bolt_ingest PRIVATE lz4::lz4)
         elseif(TARGET LZ4::lz4_shared)
             target_link_libraries(bolt_ingest PRIVATE LZ4::lz4_shared)
         elseif(LZ4_PC_FOUND)
             target_include_directories(bolt_ingest PRIVATE ${LZ4_PC_INCLUDE_DIRS})
+            # Static preference for the PKG-CONFIG path too. Homebrew's lz4
+            # ships no CMake config at all, so the LZ4::lz4_static branch above
+            # can never fire there and pkg-config hands back the .dylib by
+            # absolute path — which is how a "static" build still ended up with
+            # an external liblz4 dependency. Look for the sibling archive in
+            # pkg-config's own library dirs and link that instead when present.
+            if(BOLT_PREFER_STATIC_DEPS)
+                find_library(BOLT_LZ4_STATIC_LIB
+                    NAMES liblz4.a lz4_static
+                    PATHS ${LZ4_PC_LIBRARY_DIRS}
+                    NO_DEFAULT_PATH)
+            endif()
+            if(BOLT_PREFER_STATIC_DEPS AND BOLT_LZ4_STATIC_LIB)
+                message(STATUS "bolt: lz4 STATIC ${BOLT_LZ4_STATIC_LIB}")
+                target_link_libraries(bolt_ingest PRIVATE ${BOLT_LZ4_STATIC_LIB})
+            else()
             # Use the absolute-path form (…_LINK_LIBRARIES), not the bare
             # names (…_LIBRARIES → "-llz4"): for a keg-only lz4 (Homebrew) the
             # bare name propagates to consumers with no -L search dir and the
@@ -716,6 +752,7 @@ if(BOLT_BUILD_INGEST)
             else()
                 target_link_libraries(bolt_ingest PRIVATE ${LZ4_PC_LIBRARIES})
                 target_link_directories(bolt_ingest PRIVATE ${LZ4_PC_LIBRARY_DIRS})
+            endif()
             endif()
         endif()
     endif()
@@ -796,7 +833,50 @@ endif()
 # MQTT, S3) link bolt::net to get bolt::net::TlsSocket. Toggle off if
 # OpenSSL is unavailable; the header still compiles via stubs.
 # ---------------------------------------------------------------------------
+# Static-first for OpenSSL as well (BOLT_PREFER_STATIC_DEPS). FindOpenSSL
+# reads OPENSSL_USE_STATIC_LIBS at find time, so it MUST be set before the
+# find_package below — setting it afterwards silently does nothing and you get
+# libssl/libcrypto as shared dependencies of a supposedly standalone artifact.
+#
+# Static crypto is a deliberate trade for a redistributable build: the binary
+# stops depending on the user having OpenSSL 3.x (it frequently does not, or
+# has 1.1), at the cost of owning CVE patching — a vendored libcrypto does not
+# receive the OS's security updates, so an OpenSSL advisory means re-releasing.
+if(BOLT_PREFER_STATIC_DEPS)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+endif()
 find_package(OpenSSL 3.0 QUIET)
+# Report what was RESOLVED, not what was requested. Saying "STATIC" merely
+# because the preference is on is a lie whenever only a .so exists (EPEL's
+# openssl3 on manylinux is exactly that case), and a build log that misreports
+# its own linkage is worse than a silent one.
+if(OpenSSL_FOUND)
+    if(OPENSSL_CRYPTO_LIBRARY MATCHES "\\.a$")
+        message(STATUS "bolt: OpenSSL static  ${OPENSSL_CRYPTO_LIBRARY}")
+    elseif(BOLT_PREFER_STATIC_DEPS)
+        message(STATUS "bolt: OpenSSL SHARED (no static archive found) "
+                       "${OPENSSL_CRYPTO_LIBRARY} -- the artifact will need it "
+                       "vendored in by auditwheel/delocate")
+    endif()
+endif()
+
+# If the caller ASKED for TLS and OpenSSL 3.x is not here, fail — do not
+# silently build a TLS-less artifact. Every OpenSSL link site is guarded by
+# `BOLT_WITH_TLS AND OpenSSL_FOUND`, so an explicit -DBOLT_WITH_TLS=ON with no
+# OpenSSL used to produce a binary WITHOUT TLS and no diagnostic at all.
+#
+# That is how the wheels came to differ by platform: macOS runners have
+# Homebrew OpenSSL 3.x, while manylinux_2_28 ships only 1.1.1k (3.x lives in
+# EPEL as openssl3-devel), so the same -DBOLT_WITH_TLS=ON produced a
+# TLS-capable macOS wheel and a TLS-less Linux one. Two different products from
+# one flag, discovered only by dumping symbols out of the built artifact.
+if(BOLT_WITH_TLS AND NOT OpenSSL_FOUND)
+    message(FATAL_ERROR
+        "BOLT_WITH_TLS=ON but OpenSSL >= 3.0 was not found. Install it (on "
+        "manylinux_2_28: yum install -y epel-release openssl3-devel, then pass "
+        "-DOPENSSL_ROOT_DIR=/usr/lib64/openssl3), or pass -DBOLT_WITH_TLS=OFF "
+        "to build without TLS deliberately.")
+endif()
 if(OpenSSL_FOUND)
     option(BOLT_WITH_TLS "Build bolt::net with OpenSSL 3.x TLS client" ON)
 else()
