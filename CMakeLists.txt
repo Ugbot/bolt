@@ -906,7 +906,28 @@ target_include_directories(bolt_lakehouse PUBLIC
     $<INSTALL_INTERFACE:include>)
 bolt_apply_hardening(bolt_lakehouse)
 # W7: GCS RS256 signing uses OpenSSL EVP.
-if(OpenSSL_FOUND)
+#
+# Gated on BOLT_WITH_TLS as well as OpenSSL_FOUND — the other two OpenSSL
+# link sites (bolt_crypto, bolt_net) already are, and this one being the odd
+# one out made BOLT_WITH_TLS=OFF a lie: with OpenSSL merely PRESENT on the
+# build machine, lakehouse still linked libcrypto and still defined
+# BOLT_WITH_TLS=1 while the option said OFF. Consumers that turn TLS off to
+# keep OpenSSL out of a redistributable artifact got it anyway, decided by
+# what happened to be installed on the builder.
+#
+# Concretely: chukonu's wheels set BOLT_WITH_TLS=OFF precisely so
+# auditwheel/delocate has no libssl/libcrypto to vendor, and
+# THIRD-PARTY-NOTICES lists OpenSSL under "Components NOT in this build".
+# On a macOS runner with Homebrew OpenSSL this shipped libcrypto inside the
+# wheel while documenting its absence. The manylinux container has no
+# OpenSSL, so Linux wheels were clean and the divergence stayed invisible.
+#
+# object_store_gcs.cpp already guards every OpenSSL use with
+# `#if defined(BOLT_WITH_TLS)` and gcs.h documents "Returns 0 if
+# BOLT_WITH_TLS is OFF", so the signer degrades to an explicit runtime
+# failure exactly as designed — this only stops the CMake from contradicting
+# the option.
+if(BOLT_WITH_TLS AND OpenSSL_FOUND)
     target_compile_definitions(bolt_lakehouse PRIVATE BOLT_WITH_TLS=1)
     target_link_libraries(bolt_lakehouse PRIVATE OpenSSL::Crypto)
 endif()
