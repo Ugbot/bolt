@@ -91,6 +91,66 @@ void unpack_le_bounded(const uint8_t* BOLT_RESTRICT in, uint64_t in_len,
     assert(n_fast <= n);
 
     uint32_t i = 0;
+
+    // Group-of-8 lane. Parquet bit-packs in groups of EIGHT, and eight values
+    // of `bw` bits occupy exactly `bw` bytes (8*bw bits), so a group is always
+    // byte-aligned and, for bw <= 8, fits in a single 64-bit load. Read the
+    // group once and shift a running accumulator down by bw per value: no load
+    // per value, and no variable shift either.
+    //
+    // The per-value loop below reads EIGHT BYTES FOR EVERY VALUE. At bw=3 that
+    // is eight loads to extract the three bytes this lane loads once. Measured
+    // width mix on SF10 lineitem dictionary indices: bw2 114M, bw3 180M,
+    // bw4 120M, bw6 60M, bw12 180M -- so bw <= 8 covers 474M of 654M values.
+    //
+    // Technique from hardwood (dev.hardwood.internal.encoding.simd), which
+    // structures its scalar unpacker the same way. bw > 8 stays on the general
+    // loop: eight values would span up to 16 bytes and need a second load plus
+    // cross-boundary handling, for the 28% of values at bw=12.
+    if (bw <= 8u && in_len >= 8u) {
+        const uint64_t max_group = (in_len - 8u) / bw;   // largest k: k*bw+8 <= in_len
+        uint32_t groups = n / 8u;
+        if (static_cast<uint64_t>(groups) > max_group + 1u) {
+            groups = static_cast<uint32_t>(max_group + 1u);
+        }
+        for (uint32_t g = 0; g < groups; ++g) {
+            uint64_t w;
+            std::memcpy(&w, in + static_cast<uint64_t>(g) * bw, 8);
+            out[i + 0] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 1] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 2] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 3] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 4] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 5] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 6] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 7] = static_cast<uint32_t>(w & mask);
+            i += 8u;
+        }
+    }
+
+    // Group-of-4 lane, for EVEN widths in 10..16. Four values span 4*bw bits
+    // = bw/2 bytes, which is a whole number of bytes only when bw is even --
+    // and 4*16 = 64 bits still fits one load. That reaches bw=12, which is 180M
+    // of the 654M dictionary indices here (the other 28%), without the
+    // cross-boundary handling a group of 8 would need at these widths.
+    if (bw >= 10u && bw <= 16u && (bw & 1u) == 0u && in_len >= 8u) {
+        const uint32_t half = bw / 2u;                   // bytes per 4 values
+        const uint64_t max_group = (in_len - 8u) / half;
+        uint32_t groups = (n - i) / 4u;
+        if (static_cast<uint64_t>(groups) > max_group + 1u) {
+            groups = static_cast<uint32_t>(max_group + 1u);
+        }
+        for (uint32_t g = 0; g < groups; ++g) {
+            uint64_t w;
+            std::memcpy(&w, in + static_cast<uint64_t>(g) * half, 8);
+            out[i + 0] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 1] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 2] = static_cast<uint32_t>(w & mask); w >>= bw;
+            out[i + 3] = static_cast<uint32_t>(w & mask);
+            i += 4u;
+        }
+    }
+
     for (; i < n_fast; ++i) {          // no bounds test: proven above
         const uint64_t bit  = static_cast<uint64_t>(i) * bw;
         uint64_t w;
