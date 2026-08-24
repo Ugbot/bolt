@@ -53,6 +53,7 @@
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_scheduler.h"
 #include "bolt/ingest/bolt_snappy.h"        // snappy_compress
+#include "bolt/ingest/bolt_lz4_raw.h"      // lz4_raw_compress
 #include "bolt/ingest/bolt_parquet_bloom.h"  // pq_xxh64 (dictionary hashing)
 #include "bolt/ingest/bolt_parquet_pageindex.h"  // kPqMaxPagesPerChunk
 
@@ -94,6 +95,10 @@ constexpr std::int32_t kEncByteStreamSplit   = 9;
 
 constexpr std::int32_t kCodecUncompressed = 0;
 constexpr std::int32_t kCodecSnappy       = 1;
+// parquet.thrift CompressionCodec: LZ4 (5) is the DEPRECATED Hadoop-framed
+// variant; LZ4_RAW (7) is the bare block format, which is what bolt's
+// self-contained codec speaks and what modern writers emit.
+constexpr std::int32_t kCodecLz4Raw       = 7;
 
 constexpr std::int32_t kConvUtf8    = 0;
 constexpr std::int32_t kConvJson    = 24;
@@ -741,7 +746,25 @@ bool compute_stats(const BoltColumn& col, std::int64_t r_begin,
     }
 }
 
-// ===== snappy compression wrapper =========================================
+// ===== compression =========================================================
+
+// Writer codec ids (ParquetWriteOpts::compression) -> parquet CompressionCodec.
+constexpr std::uint8_t kPwCodecNone   = 0;
+constexpr std::uint8_t kPwCodecSnappy = 1;
+constexpr std::uint8_t kPwCodecLz4Raw = 4;
+
+std::int32_t pq_codec_code(std::uint8_t c) noexcept {
+    switch (c) {
+        case kPwCodecSnappy: return kCodecSnappy;
+        case kPwCodecLz4Raw: return kCodecLz4Raw;
+        default:             return kCodecUncompressed;
+    }
+}
+
+bool pw_codec_supported(std::uint8_t c) noexcept {
+    return c == kPwCodecNone || c == kPwCodecSnappy || c == kPwCodecLz4Raw;
+}
+
 
 bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
                     std::uint8_t codec, std::vector<std::uint8_t>* dst) noexcept {
@@ -755,6 +778,17 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
         dst->resize(cap);
         std::uint64_t out_len = 0;
         if (!snappy_compress(src, src_len, dst->data(), cap, &out_len)) {
+            return false;
+        }
+        dst->resize(static_cast<std::size_t>(out_len));
+        return true;
+    }
+    if (codec == kPwCodecLz4Raw) {
+        const std::size_t cap =
+            static_cast<std::size_t>(lz4_raw_bound(src_len));
+        dst->resize(cap);
+        std::uint64_t out_len = 0;
+        if (!lz4_raw_compress(src, src_len, dst->data(), cap, &out_len)) {
             return false;
         }
         dst->resize(static_cast<std::size_t>(out_len));
@@ -1559,8 +1593,7 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     tc_put_string(o, sch.name);
     // codec
     tc_put_field(o, 4, kFI32);
-    tc_put_zigzag(o, (w->opts.compression == 1u) ? kCodecSnappy
-                                                 : kCodecUncompressed);
+    tc_put_zigzag(o, pq_codec_code(w->opts.compression));
     tc_put_field(o, 5, kFI64);
     tc_put_zigzag(o, rec.num_values);
     tc_put_field(o, 6, kFI64);
@@ -1702,7 +1735,7 @@ ParquetWriter* parquet_write_open(const char* path,
     if (path == nullptr || opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
     // Reject unsupported codecs up-front.
-    if (opts->compression != 0u && opts->compression != 1u) return nullptr;
+    if (!pw_codec_supported(opts->compression)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly
@@ -1764,7 +1797,7 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     assert(opts != nullptr);
     if (opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
-    if (opts->compression != 0u && opts->compression != 1u) return nullptr;
+    if (!pw_codec_supported(opts->compression)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly

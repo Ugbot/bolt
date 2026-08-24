@@ -790,4 +790,82 @@ TEST(BoltParquetWriteEnc, DataPageV2InteropFixture) {
     EXPECT_FALSE(buf.empty());
 }
 
+// ---- LZ4_RAW codec --------------------------------------------------------
+
+TEST(BoltParquetWriteEnc, Lz4RawCodecRoundTripsAndIsDeclared) {
+    // bolt could neither read nor write LZ4_RAW on a default build: the only
+    // LZ4 available was behind find_package(lz4). Both directions now go
+    // through bolt's own block codec, so this checks the parquet layer wires
+    // it correctly -- values back, and the footer naming codec 7 (LZ4_RAW),
+    // never codec 5 (the deprecated Hadoop-framed "LZ4").
+    for (int null_every : {0, 5}) {
+        const bool nullable = null_every > 0;
+        std::vector<std::int64_t> v(6000);
+        std::vector<std::uint8_t> valid(6000, 1u);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            // Repetitive enough that the codec has something to do.
+            v[i] = static_cast<std::int64_t>((i / 8) % 50);
+            if (nullable && (i % 5) == 0) valid[i] = 0u;
+        }
+        SCOPED_TRACE(testing::Message() << "nullable=" << nullable);
+        EXPECT_EQ(roundtrip_i64(v, PqWriteEncoding::Plain, "lz4",
+                                nullable ? &valid : nullptr, 4096),
+                  std::string())
+            << "sanity: uncompressed path";
+
+        bolt::Arena a;
+        auto* b = a.allocate_array<bolt::BoltBatch>(1);
+        build_fixed_batch(&a, bolt::BoltType::Int64, 8, v.data(),
+                          static_cast<std::int64_t>(v.size()),
+                          nullable ? &valid : nullptr, b);
+        auto o = one_col_opts(bolt::BoltType::Int64, PqWriteEncoding::Plain,
+                              nullable, /*codec=*/4, 4096);
+        const auto buf = write_batch(b, o, "lz4raw");
+        ASSERT_FALSE(buf.empty());
+        const std::string err = read_back(
+            buf, static_cast<std::int64_t>(v.size()),
+            [&](const bolt::BoltColumn& c) {
+                return check_i64(c, v, nullable ? &valid : nullptr);
+            });
+        EXPECT_EQ(err, std::string());
+
+        bolt::Arena ma;
+        PqMeta meta{};
+        ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+        ASSERT_GE(meta.n_chunks, 1u);
+        EXPECT_EQ(static_cast<int>(meta.chunks[0].codec),
+                  static_cast<int>(PqCodec::Lz4Raw))
+            << "footer must name LZ4_RAW (7), not the deprecated LZ4 (5)";
+
+        // And it must actually compress: this data is highly repetitive, so
+        // an LZ4 page that is no smaller than the uncompressed one means the
+        // codec was silently skipped.
+        auto o_none = o;
+        o_none.compression = 0;
+        bolt::Arena a2;
+        auto* b2 = a2.allocate_array<bolt::BoltBatch>(1);
+        build_fixed_batch(&a2, bolt::BoltType::Int64, 8, v.data(),
+                          static_cast<std::int64_t>(v.size()),
+                          nullable ? &valid : nullptr, b2);
+        const auto plain = write_batch(b2, o_none, "lz4none");
+        EXPECT_LT(buf.size(), plain.size())
+            << "LZ4_RAW did not shrink highly repetitive data";
+    }
+}
+
+TEST(BoltParquetWriteEnc, UnsupportedCodecsAreRejectedAtOpen) {
+    // GZIP and ZSTD have self-contained DECODERS in bolt but no
+    // dependency-free compressor, so asking to write them must fail loudly
+    // rather than silently producing an uncompressed file.
+    for (std::uint8_t codec : {std::uint8_t{2}, std::uint8_t{3},
+                               std::uint8_t{5}, std::uint8_t{99}}) {
+        auto o = one_col_opts(bolt::BoltType::Int64, PqWriteEncoding::Plain,
+                              false, codec, 0);
+        ParquetWriter* w = parquet_write_open(tmp_path("badcodec").c_str(), &o);
+        EXPECT_EQ(w, nullptr) << "codec " << static_cast<int>(codec)
+                              << " was accepted";
+        if (w != nullptr) parquet_write_close(w);
+    }
+}
+
 }  // namespace

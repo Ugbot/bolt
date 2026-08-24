@@ -23,7 +23,7 @@
 //                  matching parquet-mr / Arrow). Previously one page carried
 //                  a whole chunk, which silently truncated the int32 page
 //                  size fields past 2 GiB.
-//   - codecs:      UNCOMPRESSED, SNAPPY (others -> false on open)
+//   - codecs:      UNCOMPRESSED, SNAPPY, LZ4_RAW (others -> false on open)
 //   - types:       Int32, Int64, Float32, Float64, Utf8, Binary,
 //                  Decimal128 (FLBA(16) BE two's-complement),
 //                  Date32 (INT32), Timestamp[us] (INT64 isAdjustedToUTC=true),
@@ -59,7 +59,8 @@
 // Out of scope (open returns false, or the option is silently a no-op):
 //   - nested types, LIST / MAP / STRUCT
 //   - encryption
-//   - GZIP / ZSTD / LZ4 codecs
+//   - GZIP / ZSTD compression (bolt DECODES both self-contained, but has no
+//     dependency-free compressor for either)
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
 // PODs at the API edge, asserts >= 2 per non-trivial function, functions
@@ -141,9 +142,14 @@ struct ParquetWriteOpts {
                                                  // performed; use
                                                  // row_group_max_rows for real
                                                  // rowgroup size control.
-    std::uint8_t       compression;              // 0=none, 1=SNAPPY
-                                                 // (2=GZIP, 3=ZSTD, 4=LZ4_RAW
-                                                 //  rejected at open: false)
+    // 0 = UNCOMPRESSED, 1 = SNAPPY, 4 = LZ4_RAW. Anything else is rejected
+    // at open. These are the three bolt can compress WITHOUT a find_package:
+    // GZIP and ZSTD have self-contained DECODERS here but no dependency-free
+    // compressor, so writing them would need a DEFLATE and a zstd encoder.
+    // Note 4 is bolt's own id, not parquet's -- on the wire LZ4_RAW is
+    // codec 7, and parquet's codec 5 ("LZ4") is a different, deprecated,
+    // Hadoop-framed thing bolt deliberately does not emit.
+    std::uint8_t       compression;
     bool               emit_statistics;
     // Emit a split-block bloom filter per column chunk, located by
     // ColumnMetaData fields 14/15. A probe returning false PROVES the value

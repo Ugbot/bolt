@@ -27,6 +27,7 @@
 #include "bolt/ingest/bolt_zstd_dec.h"
 #include "bolt/ingest/bolt_inflate.h"
 #include "bolt/ingest/bolt_lz4.h"
+#include "bolt/ingest/bolt_lz4_raw.h"
 
 namespace bolt {
 namespace ingest {
@@ -1527,8 +1528,12 @@ bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
         // LZ4_RAW is a bare LZ4 block. The legacy LZ4 codec (5) is the
         // Hadoop-framed variant and is deliberately NOT accepted here: it would
         // need the frame stripped too, and no writer in this tree emits it.
-        if (!lz4_available()) return false;              // build without liblz4
-        if (lz4_decompress(src, src_len, dst, unc_len) != 0) return false;
+        // bolt's OWN block decoder, not bolt_lz4.h's liblz4 shim: that shim
+        // is behind find_package(lz4) and absent from a default build, so an
+        // LZ4_RAW file simply did not open. Same reasoning as inflate_raw
+        // above and the self-contained zstd decoder -- a reader that needs a
+        // find_package to open a real table is not a reader.
+        if (!lz4_raw_decompress(src, src_len, dst, unc_len)) return false;
     } else if (codec == PqCodec::Zstd) {
         if (*zscratch == nullptr) {
             *zscratch = arena->allocate(zstd_scratch_size(), 8);
