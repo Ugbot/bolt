@@ -91,13 +91,25 @@ static_assert(sizeof(Iterator) == 16, "Iterator is 16 bytes");
 
 // Build the index over the entire source. Returns false on malformed JSON,
 // invalid UTF-8, depth overflow, or arena exhaustion.
+//
+// LIFETIME: `src` is BORROWED, never copied. StructuralIndex stores the
+// pointer and every Token is an (offset, length) into it, so `src` must
+// outlive the index and every Iterator over it -- iter_int64, iter_float64
+// and iter_string all read the original bytes on demand. That is the point
+// of the design (numbers materialise lazily; strings are not unescaped until
+// asked for), but it is easy to violate by accident: passing a temporary
+// std::string, or a std::string built from a literal at the call site,
+// leaves every token pointing at freed memory. This exact mistake was live
+// in bolt's OWN test suite -- and, because the short-string optimisation put
+// the bytes on the stack, it passed at -O0 and failed only at -O3.
 bool build_index(const uint8_t* src, int32_t src_len,
                  Arena* arena, StructuralIndex* out) noexcept;
 
 // Build the index, but skip subtrees whose path is not a prefix of any path
 // in `filter`. The skip happens at the structural level — the parser still
 // reads bytes to find the matching close, but emits NO tokens for the skipped
-// subtree. Filter == nullptr behaves like build_index.
+// subtree. Filter == nullptr behaves like build_index. Same `src` lifetime
+// requirement as build_index.
 bool build_index_filtered(const uint8_t* src, int32_t src_len,
                           const PathFilter* filter,
                           Arena* arena, StructuralIndex* out) noexcept;

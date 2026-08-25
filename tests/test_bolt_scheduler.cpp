@@ -3,6 +3,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <thread>
+
+#include <atomic>
 #include <cstdint>
 
 #include "bolt/bolt_arena.h"
@@ -88,10 +91,35 @@ TEST(BoltScheduler, WithProfileThroughputPresets) {
     EXPECT_FALSE(cfg.prefer_p_cores);
 }
 
+// Whether this platform can actually pin a thread.
+//
+// Not every platform can. Darwin's THREAD_AFFINITY_POLICY is documented as a
+// hint, and on arm64 it is not implemented at all -- thread_policy_set
+// returns KERN_NOT_SUPPORTED, so bolt_pin_current_thread returns false and
+// the scheduler correctly records UINT32_MAX for that worker ("honest
+// diagnostics: record the failure", scheduler_worker_entry). There is nothing
+// wrong for this test to catch there, and asserting otherwise made it fail
+// permanently on every Apple Silicon machine.
+//
+// Probed on a THROWAWAY thread: pinning the test's own thread would leave it
+// pinned for every test that runs afterwards in this binary.
+bool platform_can_pin() {
+    std::atomic<bool> ok{false};
+    std::thread t([&ok] { ok.store(bolt_pin_current_thread(0)); });
+    t.join();
+    return ok.load();
+}
+
 TEST(BoltScheduler, PinnedWorkersReportCpus) {
     bolt::SchedulerConfig cfg;
     cfg.num_workers = 2;
     cfg.pin_workers = true;
+    if (!platform_can_pin()) {
+        GTEST_SKIP() << "thread pinning is unsupported on this platform "
+                        "(Darwin/arm64 does not implement "
+                        "THREAD_AFFINITY_POLICY); the scheduler reports the "
+                        "sentinel, which is correct";
+    }
     bolt::Scheduler s{};
     ASSERT_TRUE(s.init(cfg));
 

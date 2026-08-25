@@ -1243,10 +1243,9 @@ inline int64_t sum_avx2_i64(const int64_t* BOLT_RESTRICT data, int64_t n) noexce
 }
 
 /// SIMD branchless filter: float32 column > scalar. (A5)
-/// Mirrors filter_gt_avx2_f64 — two loads per step, combined mask into
-/// bmm_compressstore_i32. 8 f32 lanes per load on AVX2 fill the 8-lane
-/// i32 compressstore exactly; on SSE/NEON (4+4=8) the step naturally
-/// doubles relative to a single load.  Uses ordered GT: NaN → no match.
+/// Two f32 loads per step; the combined mask is drained through
+/// bmm_compressstore_i32 in chunks of bmm_lanes_i32, because that is how
+/// many mask bits it consumes. Uses ordered GT: NaN → no match.
 inline int64_t filter_gt_avx2_f32(const float* BOLT_RESTRICT data, int64_t n,
                                    float scalar,
                                    int32_t* BOLT_RESTRICT out) noexcept {
@@ -1258,6 +1257,11 @@ inline int64_t filter_gt_avx2_f32(const float* BOLT_RESTRICT data, int64_t n,
     const bmm_vec_f32 vscalar = bmm_set1_f32(scalar);
     constexpr int Li = bmm_lanes_f32;          // 8 on AVX2, 4 on SSE/NEON
     constexpr int Lo = Li + Li;                // two loads per iter
+    constexpr int Lv = bmm_lanes_i32;          // compressstore width
+    static_assert(Lo % Lv == 0,
+                  "filter_gt_avx2_f32: the f32 group must be a whole number "
+                  "of i32 compressstore widths, or a mask chunk would span "
+                  "two stores");
     int64_t count = 0;
     int64_t i = 0;
 
@@ -1268,30 +1272,27 @@ inline int64_t filter_gt_avx2_f32(const float* BOLT_RESTRICT data, int64_t n,
         const uint32_t m1 = static_cast<uint32_t>(bmm_movemask_f32(bmm_cmpgt_f32(v1, vscalar)));
         const uint32_t mask = (m0 | (m1 << Li)) & ((1u << Lo) - 1u);
 
-        // compressstore_i32 takes an 8-lane i32 vec; fill one-to-one on
-        // AVX2 (Lo=16 > 8 there → skip the wide path) or two-to-one on
-        // SSE/NEON (Lo=8 exactly matches the 4-lane i32 buf upper half).
-        // The simpler portable path: emit per mask bit when Lo > 8; the
-        // AVX2 path gets the SIMD win when Lo == 8.
-        if constexpr (Lo <= 8) {
-            alignas(32) int32_t idx_buf[16];
-            for (int k = 0; k < Lo; ++k) idx_buf[k] = static_cast<int32_t>(i) + k;
-            const bmm_vec_i32 vidx = bmm_loadu_i32(idx_buf);
-            count += bmm_compressstore_i32(out + count, vidx, mask);
-        } else {
-            // AVX2 (Lo=16): split into two 8-lane compressstores.
-            alignas(32) int32_t idx_buf0[16];
-            alignas(32) int32_t idx_buf1[16];
-            for (int k = 0; k < 8; ++k) {
-                idx_buf0[k] = static_cast<int32_t>(i) + k;
-                idx_buf1[k] = static_cast<int32_t>(i) + k + 8;
+        // Emit in chunks of EXACTLY bmm_lanes_i32. bmm_compressstore_i32
+        // consumes that many mask bits and no more -- the SSE/NEON
+        // implementation hard-masks with `mask & 0xf` -- so handing it a
+        // wider mask silently DISCARDS the upper lanes.
+        //
+        // That is what this kernel did on every 4-lane platform. Lo was tied
+        // to the f32 lane count (2 x 4 = 8) rather than to the i32
+        // compressstore width (4), so half of every group vanished: the
+        // filter returned 543 of 1068 matching rows on NEON. It happened to
+        // be correct on AVX2 only because the two widths coincide at 8 there
+        // and the old code special-cased that. filter_gt_avx2_f64 next door
+        // never had the bug precisely because it sets Lo = bmm_lanes_i32 and
+        // static_asserts the relationship.
+        for (int base = 0; base < Lo; base += Lv) {
+            alignas(32) int32_t idx_buf[bmm_lanes_i32];
+            for (int k = 0; k < Lv; ++k) {
+                idx_buf[k] = static_cast<int32_t>(i) + base + k;
             }
-            const uint32_t mask_lo = mask & 0xFFu;
-            const uint32_t mask_hi = (mask >> 8) & 0xFFu;
+            const uint32_t m = (mask >> base) & ((1u << Lv) - 1u);
             count += bmm_compressstore_i32(out + count,
-                                           bmm_loadu_i32(idx_buf0), mask_lo);
-            count += bmm_compressstore_i32(out + count,
-                                           bmm_loadu_i32(idx_buf1), mask_hi);
+                                           bmm_loadu_i32(idx_buf), m);
         }
     }
     // Scalar tail.

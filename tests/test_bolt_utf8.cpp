@@ -716,7 +716,20 @@ TEST_F(Utf8Test, BytesLike_ExhaustiveVsReferenceWithWildcardsInHaystack) {
         }
     }
     EXPECT_EQ(mismatches, 0);
-    EXPECT_GT(checked, 1000000) << "the sweep must actually be exhaustive";
+    // The EXACT size of the space, not a magic lower bound. Strings are every
+    // word of length 0..5 over a 4-symbol alphabet and patterns every word of
+    // length 0..4, so:
+    //     (4^0+...+4^5) * (4^0+...+4^4) = 1365 * 341 = 465465
+    // The previous guard asserted `> 1000000`, which no sweep of this shape
+    // can ever reach -- nobody did the arithmetic, so the test failed
+    // permanently while the matcher underneath it was correct (mismatches
+    // has always been 0). An exact count still catches the thing the guard
+    // was for, a silently narrowed sweep, and additionally catches a widened
+    // or double-counted one.
+    constexpr std::int64_t kStrings  = 1 + 4 + 16 + 64 + 256 + 1024;   // 1365
+    constexpr std::int64_t kPatterns = 1 + 4 + 16 + 64 + 256;          // 341
+    EXPECT_EQ(checked, kStrings * kPatterns)
+        << "the sweep is no longer the exhaustive space";
 }
 
 

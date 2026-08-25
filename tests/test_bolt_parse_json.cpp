@@ -33,10 +33,29 @@ Arena make_arena() {
     return Arena(cfg);
 }
 
+// Copies the source into the ARENA before indexing.
+//
+// build_index borrows `src` and never copies it: every Token is an offset
+// into those bytes, and iter_int64 / iter_float64 / iter_string read them on
+// demand. Every call site below passes a string LITERAL, which materialises a
+// temporary std::string that dies at the end of the full expression -- so
+// without this copy the index points at freed stack memory the moment build()
+// returns.
+//
+// It behaved for a long time because the short-string optimisation keeps such
+// a literal inside the temporary object, and the dead stack slot usually
+// still held the right bytes. At -O3 it does not: NumbersLazyMaterialise
+// parsed 42 and -17 correctly and then failed on 3.14, because only part of
+// the slot had been reused. Copying into the arena ties the bytes to the
+// arena's lifetime, which outlives the index in every test here.
 bool build(Arena& a, const std::string& s, StructuralIndex* out) {
+    auto* buf = static_cast<uint8_t*>(
+        a.allocate(s.size() + 1u, 1u));
+    if (buf == nullptr) return false;
+    if (!s.empty()) std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = 0;
     return bolt::parse::json::build_index(
-        reinterpret_cast<const uint8_t*>(s.data()),
-        static_cast<int32_t>(s.size()), &a, out);
+        buf, static_cast<int32_t>(s.size()), &a, out);
 }
 
 }  // namespace
