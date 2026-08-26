@@ -337,17 +337,21 @@ struct BoltColumn {
         BoltColumn kids[2] = {*metadata, *value};
         c = make_struct(kids, 2, length, validity, arena);
         if (c.data == nullptr) return c;
-        c.type = BoltType::Variant;
+        // Stays a STRUCT; the logical annotation is what makes it a variant.
+        // See BoltLogical::Variant for why this is not its own BoltType.
         c.logical = BoltLogical::Variant;
         return c;
     }
 
     /// VARIANT accessors: the two binary children, or nullptr.
+    bool is_variant() const noexcept {
+        return logical == BoltLogical::Variant && type == BoltType::Struct;
+    }
     const BoltColumn* variant_metadata() const noexcept {
-        return (type == BoltType::Variant) ? child_at(0) : nullptr;
+        return is_variant() ? child_at(0) : nullptr;
     }
     const BoltColumn* variant_value() const noexcept {
-        return (type == BoltType::Variant) ? child_at(1) : nullptr;
+        return is_variant() ? child_at(1) : nullptr;
     }
 
     /// Nested accessors. All return nullptr / 0 on a non-nested column, so a

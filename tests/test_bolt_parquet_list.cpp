@@ -18,6 +18,7 @@
 // against itself.
 
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 
 #include <gtest/gtest.h>
@@ -408,6 +409,161 @@ TEST(BoltParquetList, DiscriminatingPower) {
     // ...and a row that does have values is neither.
     EXPECT_TRUE(((col.validity[0] >> 1) & 1u) != 0u);
     EXPECT_EQ(offs[2] - offs[1], len_of(1));
+}
+
+// ---- writing lists --------------------------------------------------------
+
+// Build a Nested/List column: `lists[r]` is nullopt for a NULL list, else the
+// elements, each of which may itself be nullopt for a NULL element.
+struct ListModel {
+    std::vector<int> len;                 // -1 = NULL list, 0 = empty
+    std::vector<std::int64_t> elems;      // flattened
+    std::vector<std::uint8_t> evalid;     // per element
+};
+
+ListModel make_list_model(int n) {
+    ListModel m;
+    for (int i = 0; i < n; ++i) {
+        const RowKind k = kind_of(i);
+        if (k == RowKind::Null)  { m.len.push_back(-1); continue; }
+        if (k == RowKind::Empty) { m.len.push_back(0);  continue; }
+        const int L = len_of(i);
+        m.len.push_back(L);
+        for (int j = 0; j < L; ++j) {
+            m.elems.push_back(static_cast<std::int64_t>(i) * 10 + j);
+            m.evalid.push_back(((i + j) % 11 == 0) ? 0u : 1u);
+        }
+    }
+    return m;
+}
+
+bolt::BoltColumn build_list_column(bolt::Arena* a, const ListModel& m,
+                                   bool elem_nullable) {
+    const std::int64_t n = static_cast<std::int64_t>(m.len.size());
+    const std::int64_t ne = static_cast<std::int64_t>(m.elems.size());
+    bolt::BoltColumn elem =
+        bolt::BoltColumn::make_flat_alloc(ne ? ne : 1, bolt::BoltType::Int64, a);
+    elem.length = ne;
+    auto* ep = static_cast<std::int64_t*>(elem.data);
+    for (std::int64_t i = 0; i < ne; ++i) ep[i] = m.elems[static_cast<std::size_t>(i)];
+    if (elem_nullable && ne > 0) {
+        const std::size_t nb = static_cast<std::size_t>((ne + 7) / 8);
+        auto* bm = static_cast<std::uint8_t*>(a->allocate(nb, 8));
+        std::memset(bm, 0, nb);
+        for (std::int64_t i = 0; i < ne; ++i) {
+            if (m.evalid[static_cast<std::size_t>(i)]) {
+                bm[i >> 3] = static_cast<std::uint8_t>(bm[i >> 3] | (1u << (i & 7)));
+            }
+        }
+        elem.validity = bm;
+        elem.stats.all_valid = false;
+    }
+    auto* offs = a->allocate_array<std::int32_t>(n + 1);
+    const std::size_t vb = static_cast<std::size_t>((n + 7) / 8);
+    auto* lval = static_cast<std::uint8_t*>(a->allocate(vb, 8));
+    std::memset(lval, 0xFF, vb);
+    std::int32_t cur = 0;
+    for (std::int64_t r = 0; r < n; ++r) {
+        offs[r] = cur;
+        const int L = m.len[static_cast<std::size_t>(r)];
+        if (L < 0) {
+            lval[r >> 3] = static_cast<std::uint8_t>(lval[r >> 3] & ~(1u << (r & 7)));
+        } else {
+            cur += L;
+        }
+    }
+    offs[n] = cur;
+    return bolt::BoltColumn::make_list(&elem, offs, n, lval, a);
+}
+
+TEST(BoltParquetList, WriteListRoundTripsThroughBoltAndPyarrow) {
+    // The asymmetry this closes: bolt could READ lists and not write them.
+    // Both nullability shapes, because an element-nullable list has a
+    // different max_def and so a different level stream.
+    for (bool elem_nullable : {false, true}) {
+        const int n = 500;
+        const ListModel m = make_list_model(n);
+        bolt::Arena a;
+        auto* b = a.allocate_array<bolt::BoltBatch>(1);
+        bolt::BoltBatch::init_empty(b);
+        b->num_cols = 1;
+        b->num_rows = n;
+        bolt::BoltBatch::alloc_columns(b, &a, 1);
+        b->schema.add_field("li", bolt::BoltType::List, true);
+        b->columns[b->read_epoch][0] = build_list_column(&a, m, elem_nullable);
+
+        ParquetWriteOpts o{};
+        o.n_columns = 1;
+        o.compression = 1;
+        o.emit_statistics = true;
+        std::strncpy(o.columns[0].name, "li", sizeof(o.columns[0].name) - 1);
+        o.columns[0].type = bolt::BoltType::List;
+        o.columns[0].nullable = true;
+        o.columns[0].element_type = bolt::BoltType::Int64;
+        o.columns[0].element_nullable = elem_nullable;
+
+        const std::string path =
+            std::string("test_bolt_parquet_list_written_") +
+            (elem_nullable ? "en" : "er") + ".parquet";
+        ParquetWriter* w = parquet_write_open(path.c_str(), &o);
+        ASSERT_NE(w, nullptr);
+        ASSERT_TRUE(parquet_write_row_group(w, b));
+        ASSERT_TRUE(parquet_write_close(w));
+
+        const auto buf = slurp(path.c_str());
+        ASSERT_FALSE(buf.empty());
+        SCOPED_TRACE(testing::Message() << "elem_nullable=" << elem_nullable);
+
+        // The schema must be the 3-level LIST shape, which is what makes the
+        // derived Dremel levels match what every other reader computes.
+        bolt::Arena ma;
+        PqMeta meta{};
+        ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+        ASSERT_EQ(meta.n_columns, 1u);
+        EXPECT_STREQ(meta.columns[0].name, "li.list.element");
+        EXPECT_EQ(meta.columns[0].max_rep, 1u);
+        EXPECT_EQ(meta.columns[0].list_def, 1u);
+        EXPECT_EQ(meta.columns[0].rep_def, 2u);
+        EXPECT_EQ(meta.columns[0].max_def, elem_nullable ? 3u : 2u);
+
+        // Read it back through the Dremel path and compare to the model.
+        bolt::Arena ra;
+        bolt::BoltColumn col{};
+        std::int64_t rows = 0;
+        ASSERT_TRUE(parquet_read_list_column(buf.data(), buf.size(), &meta, 0,
+                                             0, &ra, &col, &rows));
+        ASSERT_EQ(rows, n);
+        const std::int32_t* offs = col.list_offsets();
+        const bolt::BoltColumn* elem = col.list_element();
+        ASSERT_NE(offs, nullptr);
+        ASSERT_NE(elem, nullptr);
+        const auto* ep = static_cast<const std::int64_t*>(elem->data);
+        std::int64_t ei = 0;
+        for (int r = 0; r < n; ++r) {
+            const int L = m.len[static_cast<std::size_t>(r)];
+            const bool valid = (col.validity == nullptr) ||
+                (((col.validity[r >> 3] >> (r & 7)) & 1u) != 0u);
+            SCOPED_TRACE(testing::Message() << "row " << r);
+            if (L < 0) {
+                EXPECT_FALSE(valid) << "a NULL list came back present";
+                EXPECT_EQ(offs[r + 1] - offs[r], 0);
+                continue;
+            }
+            ASSERT_TRUE(valid) << "a present list came back NULL";
+            ASSERT_EQ(offs[r + 1] - offs[r], L) << "list length";
+            for (int j = 0; j < L; ++j) {
+                const std::int64_t e = offs[r] + j;
+                const bool want_valid =
+                    !elem_nullable || m.evalid[static_cast<std::size_t>(ei + j)];
+                const bool got_valid = (elem->validity == nullptr) ||
+                    (((elem->validity[e >> 3] >> (e & 7)) & 1u) != 0u);
+                ASSERT_EQ(got_valid, want_valid) << "element " << j;
+                if (!want_valid) continue;
+                EXPECT_EQ(ep[e], m.elems[static_cast<std::size_t>(ei + j)]);
+            }
+            ei += L;
+        }
+    }
 }
 
 }  // namespace

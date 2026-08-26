@@ -302,7 +302,11 @@ TEST(BoltParquetJson, VariantColumnShape) {
     bolt::BoltColumn v = bolt::BoltColumn::make_variant(&md, &vl, n, nullptr, &a);
     ASSERT_NE(v.data, nullptr);
     EXPECT_TRUE(v.is_nested());
-    EXPECT_EQ(v.type, bolt::BoltType::Variant);
+    // A variant stays a STRUCT: the logical annotation is what identifies
+    // it. bolt's separate VariantColumn is an unrelated discriminated union,
+    // and giving both the same BoltType would have conflated them.
+    EXPECT_EQ(v.type, bolt::BoltType::Struct);
+    EXPECT_TRUE(v.is_variant());
     EXPECT_EQ(v.logical, bolt::BoltLogical::Variant);
     EXPECT_EQ(v.child_count(), 2);
     EXPECT_EQ(v.length, n);
@@ -315,6 +319,7 @@ TEST(BoltParquetJson, VariantColumnShape) {
     EXPECT_EQ(v.list_element(), nullptr);
     // And the accessors refuse a non-variant column rather than reinterpreting
     // whatever is in `data`.
+    EXPECT_FALSE(md.is_variant());
     EXPECT_EQ(md.variant_metadata(), nullptr);
     EXPECT_EQ(md.child_count(), 0);
     EXPECT_EQ(md.child_at(0), nullptr);

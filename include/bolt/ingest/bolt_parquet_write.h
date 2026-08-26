@@ -24,6 +24,13 @@
 //                  a whole chunk, which silently truncated the int32 page
 //                  size fields past 2 GiB.
 //   - codecs:      UNCOMPRESSED, SNAPPY, GZIP, LZ4_RAW (others -> false)
+//   - LIST:        a column declared BoltType::List writes the standard
+//                  3-level shape -- optional group <name> (LIST) { repeated
+//                  group list { <element> } } -- from a ColumnFormat::Nested
+//                  column. An EMPTY list and a NULL list are distinct values
+//                  and both round-trip. Element type/nullability come from
+//                  ParquetWriteColumn::element_type / element_nullable.
+//                  One level of nesting only, mirroring the reader.
 //   - types:       Int32, Int64, Float32, Float64, Utf8, Binary,
 //                  Decimal128 (FLBA(16) BE two's-complement),
 //                  Date32 (INT32), Timestamp[us] (INT64 isAdjustedToUTC=true),
@@ -57,7 +64,7 @@
 //                  that many rows (scan-skip granularity control).
 //
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - nested types, LIST / MAP / STRUCT
+//   - MAP / STRUCT columns (LIST is supported; see below)
 //   - encryption
 //   - ZSTD compression (bolt DECODES it self-contained, but a dependency-free
 //     zstd COMPRESSOR is Huffman + FSE entropy coding, not codec dispatch)
@@ -126,7 +133,13 @@ struct ParquetWriteColumn {
     // the column round-trips as a document rather than degrading to an
     // anonymous string. None (0) writes no annotation.
     std::uint8_t logical;       // BoltLogical
-    std::uint8_t _pad[3];       // explicit alignment / future use
+    // LIST columns only (type == BoltType::List). The batch column must be a
+    // ColumnFormat::Nested list; these declare the ELEMENT's schema, which
+    // parquet needs as its own SchemaElement and bolt's reader recovers as
+    // "<name>.list.element".
+    BoltType     element_type;
+    bool         element_nullable;
+    std::uint8_t _pad[2];       // explicit alignment / future use
 };
 
 // Writer options. POD; copied into the writer at open.

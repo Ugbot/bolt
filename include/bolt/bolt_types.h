@@ -28,10 +28,6 @@ enum class BoltType : uint8_t {
     Date32    = 16, Date64 = 17, Timestamp = 18, Duration = 19,
     Utf8      = 25, Binary = 26,
     List      = 30, Struct = 31, Map    = 32,
-    // Nested Struct{metadata, value} carrying a self-describing value --
-    // parquet's VARIANT logical type. Zero-width like the other nested types:
-    // the data lives in the child columns.
-    Variant   = 33,
     Dictionary= 40,
     FixedSizeBinary = 41, Decimal128 = 42, Decimal256 = 43,
     // W-DEC: exact decimal with an int64 MANTISSA (scale lives on the
@@ -73,9 +69,15 @@ enum class BoltLogical : uint8_t {
     Json    = 1,   // Utf8 storage; parquet JSON / Arrow arrow.json
     Bson    = 2,   // Binary storage; parquet BSON
     Uuid    = 3,   // FixedSizeBinary(16) storage
-    // Struct{metadata: Binary, value: Binary} storage, i.e. a
-    // ColumnFormat::Nested column of BoltType::Variant. The parquet VARIANT
-    // logical type and Spark's variant binary encoding.
+    // parquet's VARIANT logical type / Spark's variant binary encoding:
+    // a ColumnFormat::Nested STRUCT of {metadata: Binary, value: Binary}.
+    //
+    // Deliberately NOT a BoltType. bolt already has a `VariantColumn`
+    // (bolt_variant_column.h) and it is a different thing entirely -- a
+    // ClickHouse-style discriminated union, a byte selecting one of N typed
+    // columns. Two unrelated concepts under one name in one library is a
+    // trap, and a parquet variant genuinely IS a struct of two binaries, so
+    // the annotation alone identifies it and no new type is needed.
     Variant = 4,
 };
 
@@ -91,8 +93,7 @@ inline constexpr uint8_t kTypeSize[64] = {
     16, 0,                   // Utf8 (16-byte view), Binary
     0, 0, 0,                 // 27-29 reserved
     0, 0, 0,                 // List, Struct, Map
-    0,                       // Variant (nested: data is in the children)
-    0, 0, 0, 0, 0, 0,       // 34-39 reserved
+    0, 0, 0, 0, 0, 0, 0,   // 33-39 reserved
     0, 0, 16, 32,           // Dictionary, FixedSizeBinary, Decimal128, Decimal256
     8,                       // Decimal64 (int64 mantissa; scale on the column)
     0, 0, 0, 0, 0,          // 45-49 reserved

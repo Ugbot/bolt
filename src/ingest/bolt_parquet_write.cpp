@@ -85,6 +85,8 @@ constexpr std::int32_t kPtFlba      = 7;
 
 constexpr std::int32_t kRepRequired = 0;
 constexpr std::int32_t kRepOptional = 1;
+constexpr std::int32_t kRepRepeated = 2;
+constexpr std::int32_t kConvList    = 3;   // ConvertedType LIST
 
 constexpr std::int32_t kEncPlain    = 0;
 constexpr std::int32_t kEncRle      = 3;   // for def-level hybrid
@@ -415,6 +417,8 @@ bool sink_ok(const ParquetWriter* w) noexcept {
 
 // ===== type validation ====================================================
 
+bool type_supported_flat(const ParquetWriteColumn& c) noexcept;
+
 bool type_supported(const ParquetWriteColumn& c) noexcept {
     switch (c.type) {
         case BoltType::Bool:
@@ -429,6 +433,43 @@ bool type_supported(const ParquetWriteColumn& c) noexcept {
             return true;
         case BoltType::Decimal128:
             // Tolerate p=0 (no statistics use scale) but require scale < 38.
+            return c.scale <= 38u && c.precision <= 38u;
+        case BoltType::List: {
+            // A LIST is only as writable as its ELEMENT, and the element must
+            // itself be a flat type -- one level of nesting, mirroring what
+            // the reader assembles. A list of lists is refused here rather
+            // than producing a schema the reader would then decline.
+            if (c.element_type == BoltType::List ||
+                c.element_type == BoltType::Struct ||
+                c.element_type == BoltType::Map) {
+                return false;
+            }
+            ParquetWriteColumn e{};
+            e.type = c.element_type;
+            e.scale = c.scale;
+            e.precision = c.precision;
+            return type_supported_flat(e);
+        }
+        default:
+            return false;
+    }
+}
+
+// The flat subset, used to validate a LIST's element without recursing into
+// another List arm.
+bool type_supported_flat(const ParquetWriteColumn& c) noexcept {
+    switch (c.type) {
+        case BoltType::Bool:
+        case BoltType::Int32:
+        case BoltType::Int64:
+        case BoltType::Float32:
+        case BoltType::Float64:
+        case BoltType::Utf8:
+        case BoltType::Binary:
+        case BoltType::Date32:
+        case BoltType::Timestamp:
+            return true;
+        case BoltType::Decimal128:
             return c.scale <= 38u && c.precision <= 38u;
         default:
             return false;
@@ -1449,6 +1490,206 @@ bool chunk_build_bloom(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     return true;
 }
 
+// ---- LIST chunks ---------------------------------------------------------
+//
+// The inverse of the reader's Dremel assembly. For the 3-level shape the
+// schema writer emits, list_def == 1 and rep_def == 2 and max_def == 2 or 3
+// depending on element nullability, so per row:
+//
+//   NULL list   -> one slot, rep 0, def 0
+//   EMPTY list  -> one slot, rep 0, def 1        (present, no elements)
+//   n elements  -> n slots, rep 0 then 1..1,
+//                  def 2 for a NULL element, 3 for a present one
+//
+// An empty list and a null list are different values that both occupy one
+// leaf slot and carry no element; only the definition level separates them,
+// which is why they are spelled out here rather than derived.
+struct ListLevels {
+    std::vector<std::uint8_t> rep;      // one per leaf slot
+    std::vector<std::uint8_t> def;
+    std::vector<std::int64_t> row_slot; // row -> first leaf slot (rows+1)
+    std::int64_t n_elems;
+};
+
+bool build_list_levels(const BoltColumn& col, const ParquetWriteColumn& sch,
+                       std::int64_t n_rows, ListLevels* out) noexcept {
+    assert(out != nullptr);
+    if (col.format != ColumnFormat::Nested) return false;
+    if (col.type != BoltType::List && col.type != BoltType::Map) return false;
+    const std::int32_t* offs = col.list_offsets();
+    const BoltColumn* elem = col.list_element();
+    if (offs == nullptr || elem == nullptr) return false;
+
+    const std::uint8_t max_def =
+        static_cast<std::uint8_t>(sch.element_nullable ? 3u : 2u);
+    out->rep.clear();
+    out->def.clear();
+    out->row_slot.assign(static_cast<std::size_t>(n_rows) + 1u, 0);
+    out->n_elems = 0;
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+        out->row_slot[static_cast<std::size_t>(r)] =
+            static_cast<std::int64_t>(out->rep.size());
+        const bool present = (col.validity == nullptr) ||
+            (((col.validity[(col.validity_offset + r) >> 3] >>
+               ((col.validity_offset + r) & 7)) & 1u) != 0u);
+        const std::int32_t lo = offs[r];
+        const std::int32_t hi = offs[r + 1];
+        if (hi < lo) return false;
+        if (!present) {                       // NULL list
+            out->rep.push_back(0u);
+            out->def.push_back(0u);
+            continue;
+        }
+        if (hi == lo) {                       // EMPTY list, present
+            out->rep.push_back(0u);
+            out->def.push_back(1u);
+            continue;
+        }
+        for (std::int32_t e = lo; e < hi; ++e) {
+            out->rep.push_back(static_cast<std::uint8_t>((e == lo) ? 0u : 1u));
+            bool evalid = true;
+            if (sch.element_nullable && elem->validity != nullptr) {
+                const std::int64_t bit = elem->validity_offset + e;
+                evalid = ((elem->validity[bit >> 3] >> (bit & 7)) & 1u) != 0u;
+            }
+            out->def.push_back(evalid ? max_def
+                                      : static_cast<std::uint8_t>(2u));
+            ++out->n_elems;
+        }
+    }
+    out->row_slot[static_cast<std::size_t>(n_rows)] =
+        static_cast<std::int64_t>(out->rep.size());
+    return true;
+}
+
+// RLE/bit-packed hybrid for a level stream, prefixed with its u32 byte length
+// (the v1 layout). Levels use the minimum bit width for their max.
+bool encode_level_stream(const std::uint8_t* lv, std::size_t n,
+                         std::uint32_t max_lvl,
+                         std::vector<std::uint8_t>* out) noexcept {
+    assert(out != nullptr);
+    std::vector<std::uint32_t> tmp(n);
+    for (std::size_t i = 0; i < n; ++i) tmp[i] = lv[i];
+    std::vector<std::uint8_t> body;
+    rle_hybrid_encode(tmp.data(), n, bit_width_for(max_lvl), &body);
+    const std::uint32_t blen = static_cast<std::uint32_t>(body.size());
+    const std::uint8_t pfx[4] = {
+        static_cast<std::uint8_t>(blen & 0xFFu),
+        static_cast<std::uint8_t>((blen >> 8) & 0xFFu),
+        static_cast<std::uint8_t>((blen >> 16) & 0xFFu),
+        static_cast<std::uint8_t>((blen >> 24) & 0xFFu),
+    };
+    out->insert(out->end(), pfx, pfx + 4);
+    out->insert(out->end(), body.begin(), body.end());
+    return true;
+}
+
+// One LIST column chunk. Pages are cut on ROW boundaries -- a data page must
+// contain whole records, so a page may never start mid-list.
+bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
+                      const BoltColumn& col, const ParquetWriteColumn& sch,
+                      std::int64_t n_rows, ChunkRec* rec) noexcept {
+    assert(w != nullptr && rec != nullptr && out != nullptr);
+    ListLevels lv;
+    if (!build_list_levels(col, sch, n_rows, &lv)) return false;
+    const BoltColumn* elem = col.list_element();
+    const std::uint8_t max_def = static_cast<std::uint8_t>(
+        sch.element_nullable ? 3u : 2u);
+
+    // The chunk describes LEAF values, so num_values counts slots and
+    // null_count counts slots carrying no present element.
+    rec->num_values = static_cast<std::int64_t>(lv.rep.size());
+    rec->null_count = 0;
+    for (std::size_t i = 0; i < lv.def.size(); ++i) {
+        rec->null_count += (lv.def[i] < max_def) ? 1 : 0;
+    }
+    rec->null_count_known = true;
+    rec->encoding = kEncPlain;
+
+    // Element validity as the flat encoders expect: one byte per element.
+    std::vector<std::uint8_t> ebits;
+    const bool enullable = sch.element_nullable && elem->validity != nullptr;
+    if (enullable) {
+        ebits.resize(static_cast<std::size_t>(lv.n_elems), 1u);
+        for (std::int64_t e = 0; e < lv.n_elems; ++e) {
+            const std::int64_t bit = elem->validity_offset + e;
+            ebits[static_cast<std::size_t>(e)] =
+                ((elem->validity[bit >> 3] >> (bit & 7)) & 1u) ? 1u : 0u;
+        }
+    }
+    if (w->opts.emit_statistics) {
+        ParquetWriteColumn eschema = sch;
+        eschema.type = sch.element_type;
+        (void)compute_stats(*elem, 0, lv.n_elems,
+                            enullable ? ebits.data() : nullptr, enullable,
+                            &rec->st);
+    }
+
+    const std::uint64_t budget = page_budget_bytes(w->opts);
+    ParquetWriteColumn eschema = sch;
+    eschema.type = sch.element_type;
+    std::vector<std::uint8_t> vals, payload;
+    std::int64_t r0 = 0;
+    std::uint32_t pages = 0;
+    for (;;) {
+        if (++pages > kPwMaxPagesPerChunk) return false;
+        // Grow the page a row at a time until the slot budget is met. Cutting
+        // anywhere else would split a record across pages, which parquet
+        // forbids.
+        std::int64_t r1 = r0;
+        while (r1 < n_rows) {
+            const std::int64_t slots = lv.row_slot[static_cast<std::size_t>(r1 + 1)] -
+                                       lv.row_slot[static_cast<std::size_t>(r0)];
+            if (r1 > r0 && static_cast<std::uint64_t>(slots) * 8u > budget) break;
+            ++r1;
+        }
+        const std::int64_t s0 = lv.row_slot[static_cast<std::size_t>(r0)];
+        const std::int64_t s1 = lv.row_slot[static_cast<std::size_t>(r1)];
+        // Element range for these rows: count present elements before s0.
+        std::int64_t e0 = 0;
+        for (std::int64_t i = 0; i < s0; ++i) e0 += (lv.def[i] >= 2u) ? 1 : 0;
+        std::int64_t e1 = e0;
+        for (std::int64_t i = s0; i < s1; ++i) e1 += (lv.def[i] >= 2u) ? 1 : 0;
+
+        vals.clear();
+        if (!encode_plain_range(*elem, eschema, e0, e1,
+                                enullable ? ebits.data() : nullptr, enullable,
+                                &vals)) {
+            return false;
+        }
+        payload.clear();
+        // v1 order: repetition levels first, then definition levels.
+        if (!encode_level_stream(lv.rep.data() + s0,
+                                 static_cast<std::size_t>(s1 - s0), 1u,
+                                 &payload)) {
+            return false;
+        }
+        if (!encode_level_stream(lv.def.data() + s0,
+                                 static_cast<std::size_t>(s1 - s0), max_def,
+                                 &payload)) {
+            return false;
+        }
+        payload.insert(payload.end(), vals.begin(), vals.end());
+
+        std::int64_t off = 0;
+        std::int32_t sz = 0;
+        std::int64_t page_nulls = 0;
+        for (std::int64_t i = s0; i < s1; ++i) {
+            page_nulls += (lv.def[i] < max_def) ? 1 : 0;
+        }
+        PageSpec spec{false, false, s1 - s0, page_nulls, kEncPlain, 0u};
+        if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
+        if (rec->data_page_offset < 0) rec->data_page_offset = off;
+        StatBuf ps;
+        std::memset(&ps, 0, sizeof(ps));
+        note_page(w, out, rec, off, sz, r0, page_nulls, s1 - s0, ps);
+        r0 = r1;
+        if (r0 >= n_rows) break;
+    }
+    (void)ws;
+    return true;
+}
+
 // Build the def levels + statistics that both encodings need, choose the
 // encoding, and delegate. Fallback from dictionary to PLAIN happens here and
 // only here, so a chunk's data pages never disagree about their encoding.
@@ -1470,6 +1711,10 @@ bool write_column_chunk(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
 
     if (col.type != sch.type) return false;
     if (col.length < n_rows) return false;
+    if (sch.type == BoltType::List) {
+        out->ok = chunk_write_list(w, ws, out, col, sch, n_rows, rec);
+        return out->ok;
+    }
 
     std::vector<std::uint8_t> def_bits;
     const bool nullable = sch.nullable;
@@ -1569,6 +1814,57 @@ void write_schema_element_col(TcOut* o,
     tc_put_stop(o);
 }
 
+// A LIST column is three SchemaElements, not one:
+//
+//   optional group <name> (LIST) {        // num_children = 1
+//     repeated group list {               // num_children = 1
+//       <optional|required> <element>;    // the leaf
+//     }
+//   }
+//
+// That exact shape is what makes bolt's own reader derive list_def = 1 and
+// rep_def = 2 (and pyarrow name the leaf "<name>.list.element"). Emitting a
+// 2-level legacy list instead would still parse, but every consumer would
+// compute different levels.
+void write_schema_elements_list(TcOut* o,
+                                const ParquetWriteColumn& c) noexcept {
+    assert(c.type == BoltType::List);
+    // 1. the outer LIST group
+    tc_put_field(o, 3, kFI32);
+    tc_put_zigzag(o, c.nullable ? kRepOptional : kRepRequired);
+    tc_put_field(o, 4, kFBinary);
+    tc_put_string(o, c.name);
+    tc_put_field(o, 5, kFI32);
+    tc_put_zigzag(o, 1);                       // num_children
+    tc_put_field(o, 6, kFI32);
+    tc_put_zigzag(o, kConvList);
+    tc_put_stop(o);
+    // 2. the repeated group. Named "list" because that is what parquet-mr,
+    //    Arrow and pyarrow all emit; the name is not load-bearing for
+    //    correctness but it is what tools display.
+    tc_put_field(o, 3, kFI32);
+    tc_put_zigzag(o, kRepRepeated);
+    tc_put_field(o, 4, kFBinary);
+    tc_put_string(o, "list");
+    tc_put_field(o, 5, kFI32);
+    tc_put_zigzag(o, 1);
+    tc_put_stop(o);
+    // 3. the element leaf
+    ParquetWriteColumn leaf{};
+    leaf.type = c.element_type;
+    leaf.nullable = c.element_nullable;
+    leaf.precision = c.precision;
+    leaf.scale = c.scale;
+    leaf.logical = c.logical;
+    std::strncpy(leaf.name, "element", sizeof(leaf.name) - 1);
+    write_schema_element_col(o, leaf);
+}
+
+// How many SchemaElements a column contributes to the footer.
+std::uint32_t schema_element_count(const ParquetWriteColumn& c) noexcept {
+    return (c.type == BoltType::List) ? 3u : 1u;
+}
+
 void write_statistics(TcOut* o, const ChunkRec& rec) noexcept {
     if (rec.null_count_known) {
         tc_put_field(o, 3, kFI64);
@@ -1587,7 +1883,8 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ParquetWriteColumn& sch,
                        const ChunkRec& rec) noexcept {
     tc_put_field(o, 1, kFI32);
-    tc_put_zigzag(o, bolt_to_pq_physical(sch.type));
+    tc_put_zigzag(o, bolt_to_pq_physical(
+        (sch.type == BoltType::List) ? sch.element_type : sch.type));
     // encodings: the set actually used by this chunk. RLE always appears --
     // it encodes the definition levels even for a REQUIRED column's absent
     // stream, and parquet-mr lists it unconditionally. A dictionary chunk
@@ -1608,10 +1905,18 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
         tc_put_zigzag(o, kEncPlain);
         tc_put_zigzag(o, kEncRle);
     }
-    // path_in_schema: list<binary> = {name}
+    // path_in_schema. A LIST's chunk describes its LEAF, so the path is the
+    // three-segment one the schema above declares.
     tc_put_field(o, 3, kFList);
-    tc_put_list_hdr(o, kFBinary, 1);
-    tc_put_string(o, sch.name);
+    if (sch.type == BoltType::List) {
+        tc_put_list_hdr(o, kFBinary, 3);
+        tc_put_string(o, sch.name);
+        tc_put_string(o, "list");
+        tc_put_string(o, "element");
+    } else {
+        tc_put_list_hdr(o, kFBinary, 1);
+        tc_put_string(o, sch.name);
+    }
     // codec
     tc_put_field(o, 4, kFI32);
     tc_put_zigzag(o, pq_codec_code(w->opts.compression));
@@ -1707,10 +2012,18 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     // 2 schema: list<SchemaElement>: root + N cols
     const std::uint32_t n = w->opts.n_columns;
     tc_put_field(&o, 2, kFList);
-    tc_put_list_hdr(&o, kFStruct, n + 1u);
+    std::uint32_t n_elems = 1u;                // the root
+    for (std::uint32_t i = 0; i < n; ++i) {
+        n_elems += schema_element_count(w->opts.columns[i]);
+    }
+    tc_put_list_hdr(&o, kFStruct, n_elems);
     write_schema_element_root(&o, n);
     for (std::uint32_t i = 0; i < n; ++i) {
-        write_schema_element_col(&o, w->opts.columns[i]);
+        if (w->opts.columns[i].type == BoltType::List) {
+            write_schema_elements_list(&o, w->opts.columns[i]);
+        } else {
+            write_schema_element_col(&o, w->opts.columns[i]);
+        }
     }
     // 3 num_rows
     tc_put_field(&o, 3, kFI64);
@@ -1782,10 +2095,14 @@ ParquetWriter* parquet_write_open(const char* path,
                 return nullptr;
             }
         }
-        if (!encoding_applies(
-                static_cast<PqWriteEncoding>(opts->columns[i].encoding),
-                opts->columns[i].type)) {
-            return nullptr;
+        {
+            const ParquetWriteColumn& pc = opts->columns[i];
+            const BoltType et = (pc.type == BoltType::List) ? pc.element_type
+                                                            : pc.type;
+            if (!encoding_applies(
+                    static_cast<PqWriteEncoding>(pc.encoding), et)) {
+                return nullptr;
+            }
         }
     }
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
@@ -1844,10 +2161,14 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
                 return nullptr;
             }
         }
-        if (!encoding_applies(
-                static_cast<PqWriteEncoding>(opts->columns[i].encoding),
-                opts->columns[i].type)) {
-            return nullptr;
+        {
+            const ParquetWriteColumn& pc = opts->columns[i];
+            const BoltType et = (pc.type == BoltType::List) ? pc.element_type
+                                                            : pc.type;
+            if (!encoding_applies(
+                    static_cast<PqWriteEncoding>(pc.encoding), et)) {
+                return nullptr;
+            }
         }
     }
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
