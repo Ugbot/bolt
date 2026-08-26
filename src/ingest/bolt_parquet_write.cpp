@@ -55,6 +55,7 @@
 #include "bolt/ingest/bolt_snappy.h"        // snappy_compress
 #include "bolt/ingest/bolt_lz4_raw.h"      // lz4_raw_compress
 #include "bolt/ingest/bolt_deflate.h"      // gzip_compress
+#include "bolt/ingest/bolt_zstd_enc.h"     // zstd_compress_self
 #include "bolt/ingest/bolt_parquet_bloom.h"  // pq_xxh64 (dictionary hashing)
 #include "bolt/ingest/bolt_parquet_pageindex.h"  // kPqMaxPagesPerChunk
 
@@ -103,6 +104,7 @@ constexpr std::int32_t kCodecSnappy       = 1;
 // self-contained codec speaks and what modern writers emit.
 constexpr std::int32_t kCodecLz4Raw       = 7;
 constexpr std::int32_t kCodecGzip         = 2;
+constexpr std::int32_t kCodecZstd         = 6;
 
 constexpr std::int32_t kConvUtf8    = 0;
 constexpr std::int32_t kConvJson    = 24;
@@ -796,19 +798,21 @@ constexpr std::uint8_t kPwCodecNone   = 0;
 constexpr std::uint8_t kPwCodecSnappy = 1;
 constexpr std::uint8_t kPwCodecLz4Raw = 4;
 constexpr std::uint8_t kPwCodecGzip   = 2;
+constexpr std::uint8_t kPwCodecZstd   = 3;
 
 std::int32_t pq_codec_code(std::uint8_t c) noexcept {
     switch (c) {
         case kPwCodecSnappy: return kCodecSnappy;
         case kPwCodecLz4Raw: return kCodecLz4Raw;
         case kPwCodecGzip:   return kCodecGzip;
+        case kPwCodecZstd:   return kCodecZstd;
         default:             return kCodecUncompressed;
     }
 }
 
 bool pw_codec_supported(std::uint8_t c) noexcept {
     return c == kPwCodecNone || c == kPwCodecSnappy ||
-           c == kPwCodecLz4Raw || c == kPwCodecGzip;
+           c == kPwCodecLz4Raw || c == kPwCodecGzip || c == kPwCodecZstd;
 }
 
 
@@ -824,6 +828,23 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
         dst->resize(cap);
         std::uint64_t out_len = 0;
         if (!snappy_compress(src, src_len, dst->data(), cap, &out_len)) {
+            return false;
+        }
+        dst->resize(static_cast<std::size_t>(out_len));
+        return true;
+    }
+    if (codec == kPwCodecZstd) {
+        const std::size_t cap = static_cast<std::size_t>(zstd_enc_bound(src_len));
+        dst->resize(cap);
+        std::uint64_t out_len = 0;
+        // ~1.6 MB of match-finder + sequence scratch: one per thread, reused
+        // for the process. Thread-local because parallel column encoding runs
+        // this concurrently.
+        static thread_local std::vector<std::uint8_t> zs_mem(
+            static_cast<std::size_t>(zstd_enc_state_size()));
+        ZstdEncState* zst = zstd_enc_state_init(zs_mem.data(), zs_mem.size());
+        if (zst == nullptr) return false;
+        if (!zstd_compress_self(src, src_len, dst->data(), cap, &out_len, zst)) {
             return false;
         }
         dst->resize(static_cast<std::size_t>(out_len));

@@ -23,7 +23,9 @@
 //                  matching parquet-mr / Arrow). Previously one page carried
 //                  a whole chunk, which silently truncated the int32 page
 //                  size fields past 2 GiB.
-//   - codecs:      UNCOMPRESSED, SNAPPY, GZIP, LZ4_RAW (others -> false)
+//   - codecs:      UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW -- every codec
+//                  bolt can read, it can now also write, none needing a
+//                  find_package (others -> false on open)
 //   - LIST:        a column declared BoltType::List writes the standard
 //                  3-level shape -- optional group <name> (LIST) { repeated
 //                  group list { <element> } } -- from a ColumnFormat::Nested
@@ -66,8 +68,6 @@
 // Out of scope (open returns false, or the option is silently a no-op):
 //   - MAP / STRUCT columns (LIST is supported; see below)
 //   - encryption
-//   - ZSTD compression (bolt DECODES it self-contained, but a dependency-free
-//     zstd COMPRESSOR is Huffman + FSE entropy coding, not codec dispatch)
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
 // PODs at the API edge, asserts >= 2 per non-trivial function, functions
@@ -155,11 +155,10 @@ struct ParquetWriteOpts {
                                                  // performed; use
                                                  // row_group_max_rows for real
                                                  // rowgroup size control.
-    // 0 = UNCOMPRESSED, 1 = SNAPPY, 2 = GZIP, 4 = LZ4_RAW. Anything else is
-    // rejected at open. These are the four bolt can compress WITHOUT a
-    // find_package; ZSTD has a self-contained DECODER here but no
-    // dependency-free compressor, which is a much larger piece of work than
-    // codec dispatch (Huffman literals plus FSE sequence coding).
+    // 0 = UNCOMPRESSED, 1 = SNAPPY, 2 = GZIP, 3 = ZSTD, 4 = LZ4_RAW.
+    // Anything else is rejected at open. All five compress WITHOUT a
+    // find_package -- bolt owns every one of these codecs in both
+    // directions.
     // Note 4 is bolt's own id, not parquet's -- on the wire LZ4_RAW is
     // codec 7, and parquet's codec 5 ("LZ4") is a different, deprecated,
     // Hadoop-framed thing bolt deliberately does not emit.

@@ -646,6 +646,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_csv.cpp
         src/ingest/bolt_lz4_raw.cpp
         src/ingest/bolt_deflate.cpp
+        src/ingest/bolt_zstd_enc.cpp
         src/ingest/bolt_parquet_meta.cpp
         src/ingest/bolt_parquet_pageindex.cpp
         src/ingest/bolt_parquet_bloom.cpp

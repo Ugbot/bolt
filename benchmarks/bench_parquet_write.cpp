@@ -236,7 +236,13 @@ double decode_ms(const Cfg& c, bolt::BoltBatch* batch) {
         bolt::Arena ra;
         auto* rb = ra.allocate_array<bolt::BoltBatch>(1);
         const auto t0 = Clock::now();
-        if (!parquet_read_file(bytes, len, &ra, rb)) return -1.0;
+        if (!parquet_read_file(bytes, len, &ra, rb)) {
+            std::printf("    [decode failed: codec=%u dict=%d enc=%d len=%llu]\n",
+                        static_cast<unsigned>(c.codec), (int)c.dictionary,
+                        static_cast<int>(c.enc),
+                        static_cast<unsigned long long>(len));
+            return -1.0;
+        }
         const double ms = ms_since(t0);
         if (ms < best) best = ms;
     }
@@ -282,6 +288,7 @@ int main() {
             Cfg{"none",    0, true, PqWriteEncoding::Auto, false, false, false, nullptr},
             Cfg{"snappy",  1, true, PqWriteEncoding::Auto, false, false, false, nullptr},
             Cfg{"lz4_raw", 4, true, PqWriteEncoding::Auto, false, false, false, nullptr},
+            Cfg{"zstd",    3, true, PqWriteEncoding::Auto, false, false, false, nullptr},
             Cfg{"gzip",    2, true, PqWriteEncoding::Auto, false, false, false, nullptr},
         }) {
         row(c.name, run_one(c, batch), decode_ms(c, batch), bb);
