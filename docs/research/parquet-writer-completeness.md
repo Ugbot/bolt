@@ -29,8 +29,10 @@ filter. Arrow and parquet-mr both default to dictionary-encoded ~1 MiB pages.
 | DATA_PAGE_V2 | readable, not writable | writes; levels raw, values compressed |
 | LZ4_RAW | NOT EVEN READABLE (find_package) | self-contained codec, both ways |
 | GZIP | readable, not writable | self-contained DEFLATE compressor |
-| ZSTD | readable, not writable | still not written — see below |
+| ZSTD | readable, not writable | self-contained compressor (FSE sequences) |
 | LIST / MAP values | not readable | Dremel assembly, ColumnFormat::Nested |
+| LIST writing | not writable | 3-level schema + level generation |
+| SNAPPY compression | LITERALS ONLY — no ratio at all | real LZ77, 2.05x smaller files |
 | JSON / BSON / VARIANT | not represented | BoltLogical annotation, read + write |
 
 ## One of these was a corruption bug, not a size choice
@@ -168,25 +170,37 @@ dispatch, so a dropped task is a clean write failure instead of wrong bytes.
 
 ## Still open
 
-**Codecs: three of four closed, and one of them was a READ gap.** LZ4_RAW
-could not be READ at all on a default build — `bolt_lz4.h` is behind
-`find_package(lz4)` — so a Hadoop-era LZ4_RAW file simply did not open.
-`bolt_lz4_raw.{h,cpp}` implements the block format both ways.
-`bolt_deflate.{h,cpp}` adds the DEFLATE compressor and GZIP container that
-`bolt_inflate.h` was already the other half of. bolt now writes
-UNCOMPRESSED, SNAPPY, GZIP and LZ4_RAW without any find_package.
+**Codecs: all four closed, and one was a READ gap.** LZ4_RAW could not be
+READ at all on a default build -- `bolt_lz4.h` is behind `find_package(lz4)`
+-- so a Hadoop-era LZ4_RAW file simply did not open. bolt now compresses
+UNCOMPRESSED / SNAPPY / GZIP / ZSTD / LZ4_RAW with no find_package for any,
+which is every codec its reader accepts.
 
-**ZSTD remains write-only-absent, and deliberately so.** bolt DECODES zstd
-self-contained (`bolt_zstd_dec.cpp`, written because the same problem blocked
-reading pyiceberg's default output). A compressor is a much larger and
-different piece of work: zstd cannot express a single match without its
-sequences section, and that section requires FSE entropy coding — three
-interleaved states written in reverse order — or Huffman for the literals.
-There is no small correct version. Since bolt can already write SNAPPY, GZIP
-and LZ4_RAW, all of which every reader accepts, this is a parity gap rather
-than a capability one, and a rushed entropy coder in a storage library is
-silent data corruption. bolt's own FSE DECODER and libzstd (for reference
-vectors) are both available to verify one against when it is written.
+**SNAPPY never compressed, and only a BENCHMARK found it.** The compressor
+emitted "one literal chunk that covers the entire input" -- valid snappy
+containing no back-reference. Every round-trip passed. Since snappy is
+parquet's most common codec and this writer's default, every "compressed"
+file bolt produced was uncompressed-sized: 53,008,583 bytes against 53,008,131
+raw, while LZ4 got 2.37x on identical input. Now real LZ77 over 64 KiB
+blocks: 25,832,966 bytes, 2.05x smaller. The lesson is narrow and worth
+keeping -- correctness testing cannot see a compressor that does nothing, and
+the tree's own notes had already recorded "bolt's own compressor emits a
+single literal chunk and can never produce a back-reference" as a fact about
+TEST COVERAGE without anyone drawing the conclusion.
+
+**ZSTD is the one with no small correct version**, which is why it went last.
+zstd cannot express a match without its sequences section, and that is FSE
+entropy coding -- three interleaved states written in reverse into a stream
+the decoder reads backwards. Scope is RAW literals plus PREDEFINED FSE
+tables; Huffman literals and custom tables are what separate it from
+libzstd's ratio, not from correctness. Two bugs, both caught by libzstd and
+neither by round-tripping: a doubled block on empty input, and a 3-byte
+literals header split 2/8/8 instead of 4/8/8. The second is the instructive
+one -- it needs a block that BOTH compresses and has a literal run past 4096,
+and the first synthetic corpus had neither together, so it took a real
+high-cardinality Utf8 page to surface. Its first symptom was bolt's own
+decoder failing, which looked like a decoder bug; handing the same bytes to
+libzstd is what proved the encoder wrong.
 
 **Page-level pruning on the READ side is a consumer step, not a bolt gap.**
 `bolt_parquet_pageindex.h` and `bolt_parquet_bloom.h` were described in the
@@ -202,6 +216,12 @@ The one thing that WOULD need a bolt change to make page skipping general:
 would jump with) is documented PLAIN-only and returns false on a dictionary
 page. Since dictionary encoding is now the writer's recommended default, that
 is the next thing to close.
+
+**List WRITING landed too**, so the reader/writer asymmetry the LIST work
+opened is closed: a BoltType::List column writes the standard 3-level shape
+(`optional group <name> (LIST) { repeated group list { <element> } }`), which
+is what makes every consumer derive the same Dremel levels. pyarrow reads it
+and its arrow schema even reflects element nullability.
 
 **List/map values are no longer a gap.** The column-shape decision the reader
 plan said to take deliberately was taken: `ColumnFormat::Nested` carries LIST,
