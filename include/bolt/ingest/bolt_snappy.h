@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -558,6 +559,78 @@ inline uint32_t sn_hash(uint32_t v) noexcept {
     return (v * 0x1E35A7BDu) >> (32u - kHashBits);
 }
 
+// Length of the common prefix of `a` and `b`, capped at `max`.
+//
+// SHORT HEAD, WIDE TAIL -- and the split is measured, not assumed. A histogram
+// of every match this compressor finds says the extension past the 4-byte
+// minimum is TINY on real page shapes: exactly 3 bytes for 99-100% of matches
+// in a PLAIN int64/float64 column, and 0 for 66% in a high-cardinality Utf8
+// page. Only genuinely repetitive input (a constant-valued column) produces
+// long runs.
+//
+// That distribution defeats a pure 8-bytes-at-a-time loop. It is the textbook
+// formulation -- XOR two 64-bit loads, and `countr_zero(d) >> 3` names the
+// first differing byte on a little-endian load, the same idiom bolt_port.h's
+// own bolt_swar_find_byte_u64 uses -- but for a 3-byte extension it can never
+// complete a single step, so it pays two loads plus a load->xor->rbit->clz
+// dependency chain to learn what a handful of byte compares already knew.
+// MEASURED as a 1.66x REGRESSION on int64/f64 PLAIN (1488 -> 891 MB/s), while
+// being 8.3x on repetitive input. A first-byte peel does NOT rescue it: the
+// int64 extension is 3, not 0, so the peel fires on 0% of those matches
+// (measured: no change, 891 -> 877).
+//
+// So: byte compares for the first 8, which is perfectly branch-predicted when
+// the extension is near-constant and answers almost every real match; the wide
+// loop only after 8 bytes have ALREADY matched, i.e. once the match has proven
+// itself long enough to pay for it. Both classes get their best case.
+//
+// Never reads past `max`: the head is bounded by min(max,8), the wide loop by
+// `n + 8 <= max`, and the tail is scalar. No caller needs slack bytes.
+inline uint32_t sn_match_len(const uint8_t* a, const uint8_t* b,
+                             uint32_t max) noexcept {
+    assert(a != nullptr && b != nullptr);
+    uint32_t n = 0;
+    if (max < 8u) {                       // only near the end of a block
+        while (n < max && a[n] == b[n]) ++n;
+        return n;
+    }
+    // Constant bound, so this unrolls; a runtime `min(max,8)` bound does not,
+    // and measured 13% slower on int64/f64 PLAIN for exactly that reason.
+    while (n < 8u && a[n] == b[n]) ++n;
+    if (n < 8u) return n;                 // the common case, and it is done
+    while (n + 8u <= max) {
+        uint64_t x, y;
+        std::memcpy(&x, a + n, 8);
+        std::memcpy(&y, b + n, 8);
+        const uint64_t d = x ^ y;
+        if (d != 0u) {
+            const uint32_t lane = static_cast<uint32_t>(std::countr_zero(d) >> 3);
+            assert(n + lane <= max);
+            return n + lane;
+        }
+        n += 8u;
+    }
+    while (n < max && a[n] == b[n]) ++n;
+    assert(n <= max);
+    return n;
+}
+
+// MEASURED NEGATIVE, recorded so it is not re-attempted: replacing the
+// literal-run std::memcpy below with fixed-width overlapping stores (two
+// 8-byte moves for 8..16 bytes, two 4-byte for 4..7, a byte tail under 4 --
+// the sv_copy_small shape that IS worth 1.17x in bolt_parquet_read.cpp, and
+// the snappy_copy_match shape that is worth 1.55x on the decode side of this
+// very header) is 1% SLOWER here, consistently across three runs each way
+// (aggregate 1122/1122/1128 against 1131/1132/1136 MB/s).
+//
+// The premise was right and the conclusion still did not follow: a literal
+// run between two matches IS tiny -- 1..3 bytes for 95-100% of runs on every
+// page shape measured, and 0 for 60% of them in a high-cardinality Utf8 page.
+// But at those lengths the size-dispatch ladder replacing memcpy has an
+// unpredictable trip count of its own, and the branches cost more than the
+// call it removes. The decode side differs because its runs are back-
+// references of 1..64 bytes, long enough for the fixed-width stores to win.
+
 // Emit a literal run of `len` bytes from `lit`. Tag low 2 bits 00; the upper
 // 6 bits carry len-1 when it fits, otherwise 60..63 select 1..4 extra
 // little-endian length bytes.
@@ -694,11 +767,12 @@ inline bool snappy_compress(const uint8_t* src, uint64_t src_len,
 
             // Extend forward, stopping short of the mandatory trailing
             // literals so the decoder's wide copies stay in bounds.
-            uint32_t mlen = kMinMatch;
             const uint32_t mmax = static_cast<uint32_t>(blen) - 5u;
-            while (ip + mlen < mmax && base[match + mlen] == base[ip + mlen]) {
-                ++mlen;
-            }
+            assert(mmax > ip + kMinMatch);   // ip < limit == blen - 15
+            const uint32_t mlen =
+                kMinMatch + sn_match_len(base + match + kMinMatch,
+                                         base + ip + kMinMatch,
+                                         mmax - ip - kMinMatch);
             if (!sn_emit_literal(dst, dst_cap, &op, base + anchor,
                                  ip - anchor)) {
                 return false;

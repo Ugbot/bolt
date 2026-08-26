@@ -1366,6 +1366,26 @@ bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     return true;
 }
 
+// MEASURED NEGATIVE, recorded so it is not re-attempted. An early-abandon
+// probe was built here: intern the first 4096 non-null values and, if >=90%
+// of them are distinct, give up immediately instead of interning until the
+// dictionary crosses its byte ceiling (1 MiB / 8 bytes = 131,072 entries for
+// an int64 column, a third of a 400,000-row chunk, all of it discarded).
+//
+// It worked -- it fired on exactly the near-unique columns and never on the
+// low-cardinality ones, and file bytes were identical -- and it bought
+// NOTHING. On the 16-column vs-Arrow benchmark, 14 of whose columns are
+// near-unique, encode with the probe was 87.9/88.2 ms against 85.7/89.6 ms
+// without it. Disabling it cost nothing, which is the measurement that
+// matters: interning is not where dictionary time goes. Dictionary encoding
+// really does cost ~24 ms of an ~87 ms encode here (dict on vs off, same
+// binary, same directory), but that cost belongs to the TWO columns that
+// genuinely build and use a dictionary, not to the fourteen that abandon one.
+//
+// Anyone optimising this next should start by measuring chunk_write_dict --
+// the 400,000 index values it RLE-encodes per real dictionary column -- and
+// not the intern loop.
+
 // Intern every non-null value of [0, n_rows) into `d`, appending each row's
 // index to `idx` (one entry per NON-NULL row, in row order). Returns false
 // when the dictionary exceeded its bounds -- the caller then writes PLAIN.
@@ -1402,6 +1422,7 @@ bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
         if (id == 0xFFFFFFFFu) return false;        // overflow -> PLAIN
         idx->push_back(id);
     }
+    assert(idx->size() <= static_cast<std::size_t>(n_rows));
     return true;
 }
 

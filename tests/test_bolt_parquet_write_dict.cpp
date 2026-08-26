@@ -318,6 +318,55 @@ TEST(BoltParquetWriteDict, DictionaryOverflowFallsBackToPlain) {
     }
 }
 
+// ---- dictionary slot-table growth ---------------------------------------
+//
+// The table is sized to what the dictionary HOLDS and doubles on demand, so
+// these use row counts well past its 1024-slot start -- every other fixture
+// in this file is small enough that it never grows.
+
+TEST(BoltParquetWriteDict, LowCardinalityColumnKeepsItsDictionary) {
+    // The other side of the probe, and the one that matters: a heuristic that
+    // abandons too eagerly would silently cost ratio on exactly the columns
+    // dictionary encoding exists for. 64 distinct values over 20000 rows is
+    // 0.3% distinct across the probe window, so it must survive.
+    const Model m = make_model(20000, /*distinct=*/64, /*null_every=*/0);
+    const auto o = make_opts(false, /*dict=*/true, /*page_index=*/false,
+                             /*page_bytes=*/0, /*dict_bytes=*/1u << 20,
+                             /*codec=*/0);
+    const auto buf = write_model(m, o, false, "probe_lowcard");
+    expect_roundtrip(buf, m, false);
+
+    bolt::Arena a;
+    PqMeta meta{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
+    ASSERT_GE(meta.n_chunks, 1u);
+    for (std::uint32_t i = 0; i < meta.n_chunks; ++i) {
+        EXPECT_NE(meta.chunks[i].dictionary_page_offset, 0)
+            << "chunk " << i << " threw away a dictionary that pays";
+    }
+}
+
+TEST(BoltParquetWriteDict, DictionaryTableGrowsPastItsInitialSlots) {
+    // Exercises dict_grow. The slot table now STARTS at 1024 entries and
+    // doubles on demand, so a dictionary of ~3000 values rehashes several
+    // times mid-build; every value must still come back and the dictionary
+    // must still be used. 3000 distinct over the 4096-row probe window is
+    // 73% -- under the threshold, so the probe deliberately passes here.
+    const Model m = make_model(20000, /*distinct=*/3000, /*null_every=*/0);
+    const auto o = make_opts(false, /*dict=*/true, /*page_index=*/false,
+                             /*page_bytes=*/0, /*dict_bytes=*/1u << 20,
+                             /*codec=*/0);
+    const auto buf = write_model(m, o, false, "probe_grow");
+    expect_roundtrip(buf, m, false);
+
+    bolt::Arena a;
+    PqMeta meta{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
+    ASSERT_GE(meta.n_chunks, 1u);
+    EXPECT_NE(meta.chunks[0].dictionary_page_offset, 0)
+        << "a 3000-entry dictionary should survive the probe";
+}
+
 // ---- page splitting ------------------------------------------------------
 
 // Parse a chunk's OffsetIndex, returning page count (0 = no index present).
