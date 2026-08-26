@@ -1106,6 +1106,13 @@ add_test(NAME test_bolt_deflate COMMAND test_bolt_deflate)
 # Produces the streams scripts/deflate_zlib_check.py hands to python zlib --
 # the check that an INDEPENDENT inflater accepts bolt's output, which bolt's
 # own inflate cannot establish.
+# Produces the blocks scripts/snappy_ref_check.py hands to pyarrow's snappy.
+# bolt's own decoder cannot establish that bolt's compressor is snappy --
+# an encoder/decoder pair sharing a misreading agree perfectly.
+add_executable(test_bolt_snappy_dump test_bolt_snappy_dump.cpp)
+target_link_libraries(test_bolt_snappy_dump PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_snappy_dump)
+
 add_executable(test_bolt_deflate_dump test_bolt_deflate_dump.cpp)
 target_link_libraries(test_bolt_deflate_dump PRIVATE bolt::bolt)
 bolt_apply_hardening(test_bolt_deflate_dump)
