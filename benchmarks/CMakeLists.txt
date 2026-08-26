@@ -199,6 +199,11 @@ endif()
 # itself), or against a real parquet file when given a path. Both modes verify
 # correctness before reporting a time.
 # -----------------------------------------------------------------------
+add_executable(bench_parquet_vs_arrow bench_parquet_vs_arrow.cpp)
+target_link_libraries(bench_parquet_vs_arrow PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_parquet_vs_arrow)
+bolt_apply_bench_tuning(bench_parquet_vs_arrow)
+
 add_executable(bench_parquet_write bench_parquet_write.cpp)
 target_link_libraries(bench_parquet_write PRIVATE bolt::bolt)
 if(Threads_FOUND)
