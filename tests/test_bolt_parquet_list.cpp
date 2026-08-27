@@ -579,6 +579,155 @@ TEST(BoltParquetList, WriteListRoundTripsAndEmitsInteropFixtures) {
     }
 }
 
+// ---- lists through the whole-file entry point ----------------------------
+
+// parquet_read_file used to refuse any column with max_rep != 0, so a file
+// whose only column was list<int64> could not be opened by the obvious call
+// even though parquet_read_list_column decoded it correctly. These assert the
+// VALUES that come back, because "it opens now" is not the claim.
+TEST(BoltParquetList, ReadFileReturnsListColumns) {
+    for (const char* fixture : {"golden_list.parquet",
+                                "golden_list_dict.parquet"}) {
+        const auto buf = slurp(data_path(fixture).c_str());
+        if (buf.empty()) continue;
+        SCOPED_TRACE(fixture);
+
+        // Ground truth from the per-column API, which is independently
+        // verified against pyarrow by scripts/parquet_list_interop.py.
+        bolt::Arena ma;
+        PqMeta meta{};
+        ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+        int lc = -1;
+        for (std::uint32_t c = 0; c < meta.n_columns; ++c) {
+            if (meta.columns[c].max_rep == 1u) { lc = static_cast<int>(c); break; }
+        }
+        ASSERT_GE(lc, 0) << "fixture has no repeated column";
+
+        bolt::Arena ba;
+        auto* batch = ba.allocate_array<bolt::BoltBatch>(1);
+        ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &ba, batch))
+            << "a file containing a list column must open";
+        ASSERT_EQ(batch->num_rows, meta.num_rows);
+
+        const bolt::BoltColumn& got = batch->columns[batch->read_epoch][lc];
+        ASSERT_TRUE(got.is_nested()) << "the list column came back flat";
+
+        bolt::Arena ra;
+        bolt::BoltColumn want{};
+        std::int64_t rows = 0;
+        ASSERT_TRUE(parquet_read_list_column(buf.data(), buf.size(), &meta,
+                                             static_cast<std::uint16_t>(lc), 0,
+                                             &ra, &want, &rows));
+        // Single-row-group fixtures, so the two must agree exactly.
+        if (meta.n_row_groups == 1u) {
+            const std::int32_t* go = got.list_offsets();
+            const std::int32_t* wo = want.list_offsets();
+            ASSERT_NE(go, nullptr);
+            ASSERT_NE(wo, nullptr);
+            for (std::int64_t r = 0; r <= rows; ++r) {
+                ASSERT_EQ(go[r], wo[r]) << "offset " << r;
+            }
+            const bolt::BoltColumn* ge = got.list_element();
+            const bolt::BoltColumn* we = want.list_element();
+            ASSERT_NE(ge, nullptr);
+            ASSERT_NE(we, nullptr);
+            ASSERT_EQ(ge->length, we->length);
+            if (ge->type == bolt::BoltType::Int64) {
+                const auto* gp = static_cast<const std::int64_t*>(ge->data);
+                const auto* wp = static_cast<const std::int64_t*>(we->data);
+                for (std::int64_t i2 = 0; i2 < ge->length; ++i2) {
+                    ASSERT_EQ(gp[i2], wp[i2]) << "element " << i2;
+                }
+            }
+        }
+    }
+}
+
+// A list column now spans every row group in one assembly, and each row group
+// carries its OWN dictionary. Carrying the first group's dictionary into the
+// second returns real values from the wrong rows -- a silent misread, not a
+// crash -- so this writes several row groups of dictionary-encoded lists and
+// checks every value.
+TEST(BoltParquetList, ReadFileAssemblesListsAcrossRowGroups) {
+    constexpr int kN = 900;
+    const ListModel m = make_list_model(kN);
+    bolt::Arena a;
+    auto* b = a.allocate_array<bolt::BoltBatch>(1);
+    bolt::BoltBatch::init_empty(b);
+    b->num_cols = 1;
+    b->num_rows = kN;
+    bolt::BoltBatch::alloc_columns(b, &a, 1);
+    b->schema.add_field("li", bolt::BoltType::List, true);
+    b->columns[b->read_epoch][0] = build_list_column(&a, m, /*elem_nullable=*/true);
+
+    ParquetWriteOpts o{};
+    o.n_columns = 1;
+    o.compression = 1;
+    o.use_dictionary = true;              // per-row-group dictionaries
+    o.row_group_max_rows = 200;           // -> 5 row groups
+    o.emit_statistics = true;
+    std::strncpy(o.columns[0].name, "li", sizeof(o.columns[0].name) - 1);
+    o.columns[0].type = bolt::BoltType::List;
+    o.columns[0].nullable = true;
+    o.columns[0].element_type = bolt::BoltType::Int64;
+    o.columns[0].element_nullable = true;
+
+    const char* path = "test_bolt_parquet_list_multirg.parquet";
+    ParquetWriter* w = parquet_write_open(path, &o);
+    ASSERT_NE(w, nullptr);
+    ASSERT_TRUE(parquet_write_row_group(w, b));
+    ASSERT_TRUE(parquet_write_close(w));
+    const auto buf = slurp(path);
+    ASSERT_FALSE(buf.empty());
+
+    bolt::Arena ma;
+    PqMeta meta{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+    ASSERT_GT(meta.n_row_groups, 1u) << "the multi-row-group path never ran";
+
+    bolt::Arena ba;
+    auto* batch = ba.allocate_array<bolt::BoltBatch>(1);
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &ba, batch));
+    ASSERT_EQ(batch->num_rows, kN);
+
+    const bolt::BoltColumn& col = batch->columns[batch->read_epoch][0];
+    ASSERT_TRUE(col.is_nested());
+    const std::int32_t* offs = col.list_offsets();
+    const bolt::BoltColumn* elem = col.list_element();
+    ASSERT_NE(offs, nullptr);
+    ASSERT_NE(elem, nullptr);
+    const auto* ep = static_cast<const std::int64_t*>(elem->data);
+    std::int64_t ei = 0;
+    for (int r = 0; r < kN; ++r) {
+        const int L = m.len[static_cast<std::size_t>(r)];
+        const bool valid = (col.validity == nullptr) ||
+            (((col.validity[r >> 3] >> (r & 7)) & 1u) != 0u);
+        SCOPED_TRACE(testing::Message() << "row " << r);
+        if (L < 0) { EXPECT_FALSE(valid); EXPECT_EQ(offs[r + 1] - offs[r], 0); continue; }
+        ASSERT_TRUE(valid);
+        ASSERT_EQ(offs[r + 1] - offs[r], L);
+        for (int j = 0; j < L; ++j) {
+            const std::int64_t e = offs[r] + j;
+            if (!m.evalid[static_cast<std::size_t>(ei + j)]) continue;
+            EXPECT_EQ(ep[e], m.elems[static_cast<std::size_t>(ei + j)]);
+        }
+        ei += L;
+    }
+}
+
+// max_rep >= 2 must still be REFUSED through this path. build_list_column is
+// reached directly from parquet_read_file, so it does not inherit
+// parquet_read_list_column's guard; without an explicit check a list of lists
+// assembles as a flat list, silently reshaping the data.
+TEST(BoltParquetList, ReadFileRefusesNestedRepetition) {
+    const auto buf = slurp(data_path("golden_list_nested.parquet").c_str());
+    if (buf.empty()) GTEST_SKIP() << "no nested fixture";
+    bolt::Arena ba;
+    auto* batch = ba.allocate_array<bolt::BoltBatch>(1);
+    EXPECT_FALSE(parquet_read_file(buf.data(), buf.size(), &ba, batch))
+        << "a list of lists must be refused, not reshaped";
+}
+
 // ---- corrupt-input fuzzing for the Dremel path ---------------------------
 
 // The flat reader's CorruptPagesNeverCrash (test_bolt_parquet_read.cpp)

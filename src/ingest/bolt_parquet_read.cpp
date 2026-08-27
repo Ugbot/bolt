@@ -1964,28 +1964,41 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
 }
 
 // Walk a repeated leaf's chunk and assemble the LIST column.
+// Assemble a repeated leaf across the row-group range [g0, g1) into one list
+// column. A range rather than a single group because parquet_read_file builds
+// ONE batch for the whole file, exactly as the flat path does with
+// init_col_ctx_any(meta, c, 0, n_row_groups, ...).
+//
+// Row groups are independent on the wire -- each has its own chunk region and
+// its own dictionary -- so the walk resets the dictionary per group. Getting
+// that wrong is a silent misread, not a crash: group 1 would gather through
+// group 0's dictionary and return real strings from the wrong rows.
 bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
-                       uint32_t row_group, uint32_t col, Arena* arena,
+                       uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
                        BoltColumn* out_col, int64_t* out_rows) noexcept {
     assert(buf != nullptr && meta != nullptr && arena != nullptr);
     assert(out_col != nullptr && out_rows != nullptr);
+    if (g0 >= g1 || g1 > meta->n_row_groups) return false;
     const PqColumn* pc = &meta->columns[col];
-    const PqRowGroup* rg = &meta->row_groups[row_group];
-    const PqChunk* ch = &meta->chunks[rg->chunk_off + col];
-    const int64_t n_slots = ch->num_values;      // leaf values, nulls included
-    if (n_slots < 0) return false;
+    int64_t n_slots = 0, n_rows_total = 0;
+    for (uint32_t g = g0; g < g1; ++g) {
+        const PqChunk* c2 = &meta->chunks[meta->row_groups[g].chunk_off + col];
+        if (c2->num_values < 0) return false;
+        n_slots += c2->num_values;
+        n_rows_total += meta->row_groups[g].num_rows;
+    }
     *out_rows = 0;
     if (n_slots == 0) {
-        // A chunk with no leaf values still has rg->num_rows rows, every one
-        // of them an empty list. Offsets are all zero and there is no element.
+        // Chunks with no leaf values still have rows, every one of them an
+        // empty list. Offsets are all zero and there is no element.
         BoltColumn elem = BoltColumn::make_flat_alloc(1, BoltType::Int64, arena);
         elem.length = 0;
-        auto* offs = arena->allocate_array<int32_t>(rg->num_rows + 1);
+        auto* offs = arena->allocate_array<int32_t>(n_rows_total + 1);
         if (offs == nullptr) return false;
-        for (int64_t i = 0; i <= rg->num_rows; ++i) offs[i] = 0;
-        *out_col = BoltColumn::make_list(&elem, offs, rg->num_rows, nullptr,
+        for (int64_t i = 0; i <= n_rows_total; ++i) offs[i] = 0;
+        *out_col = BoltColumn::make_list(&elem, offs, n_rows_total, nullptr,
                                          arena);
-        *out_rows = rg->num_rows;
+        *out_rows = n_rows_total;
         return true;
     }
 
@@ -1994,15 +2007,18 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     // read, so the length is trimmed at the end rather than guessed at.
     BoltColumn elem = BoltColumn::make_empty();
     ColCtx cx;
-    if (!init_col_ctx_any(meta, col, row_group, row_group + 1u, n_slots, arena,
-                          &elem, &cx)) {
+    if (!init_col_ctx_any(meta, col, g0, g1, n_slots, arena, &elem, &cx)) {
         return false;
     }
     // Elements can be null whenever there is a definition level between the
     // repeated node and the leaf; init_col_ctx_any sized validity from the
     // chunk's null_count, which counts NULL ELEMENTS and so is the right test.
+    int64_t range_nulls = 0;
+    for (uint32_t g = g0; g < g1; ++g) {
+        range_nulls += meta->chunks[meta->row_groups[g].chunk_off + col].null_count;
+    }
     if (cx.validity == nullptr && pc->max_def > pc->rep_def &&
-        ch->null_count != 0) {
+        range_nulls != 0) {
         const uint64_t nb = (static_cast<uint64_t>(n_slots) + 7u) / 8u;
         auto* bm = static_cast<uint8_t*>(arena->allocate(nb, 1));
         if (bm == nullptr) return false;
@@ -2019,57 +2035,67 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     b.n_slots = 0;
     b.cap_slots = n_slots;
 
-    const int64_t start = (ch->dictionary_page_offset > 0)
-        ? ch->dictionary_page_offset : ch->data_page_offset;
-    if (start <= 0 || ch->total_compressed_size <= 0) return false;
-    const uint64_t s = static_cast<uint64_t>(start);
-    const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
-    if (s > len || region > len - s) return false;
-    const uint64_t end = s + region;
-    uint64_t p = s;
     int64_t elem_n = 0;
     void* zscratch = nullptr;
-    cx.dict = nullptr;
-    cx.dict_n = 0;
-    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
-        if (b.n_slots >= n_slots) break;
-        if (p >= end) return false;
-        TcCursor c{buf + p, buf + end};
-        PageHdr h;
-        if (!parse_page_header(&c, &h)) return false;
-        const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
-        if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
-        const uint8_t* pd = buf + pay;
-        uint64_t pd_len = static_cast<uint64_t>(h.cmp);
-        if (h.type == kPageDataV2) {
-            if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena, &zscratch,
-                                  &pd, &pd_len)) {
+    for (uint32_t g = g0; g < g1; ++g) {
+        const PqChunk* ch = &meta->chunks[meta->row_groups[g].chunk_off + col];
+        const int64_t start = (ch->dictionary_page_offset > 0)
+            ? ch->dictionary_page_offset : ch->data_page_offset;
+        if (start <= 0 || ch->total_compressed_size <= 0) return false;
+        const uint64_t s = static_cast<uint64_t>(start);
+        const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
+        if (s > len || region > len - s) return false;
+        const uint64_t end = s + region;
+        uint64_t p = s;
+        // PER CHUNK, not per column: a dictionary belongs to one column chunk,
+        // so carrying group 0's dictionary into group 1 would gather real
+        // values from the wrong rows -- a silent misread.
+        cx.dict = nullptr;
+        cx.dict_n = 0;
+        const int64_t want = b.n_slots + ch->num_values;
+        for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+            if (b.n_slots >= want) break;
+            if (p >= end) return false;
+            TcCursor c{buf + p, buf + end};
+            PageHdr h;
+            if (!parse_page_header(&c, &h)) return false;
+            const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
+            if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
+            const uint8_t* pd = buf + pay;
+            uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+            if (h.type == kPageDataV2) {
+                if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena,
+                                      &zscratch, &pd, &pd_len)) {
+                    return false;
+                }
+            } else if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
+                                        &zscratch, &pd, &pd_len)) {
                 return false;
             }
-        } else if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
-                                    &zscratch, &pd, &pd_len)) {
-            return false;
-        }
-        if (h.type == kPageDict) {
-            if (!decode_dict_page(&cx, pd, pd_len, h.nvals, arena)) return false;
-        } else if (h.type == kPageData || h.type == kPageDataV2) {
-            uint32_t got = 0;
-            if (!list_decode_page(&cx, pd, pd_len, &h, &b, elem_n, &got,
-                                  arena)) {
+            if (h.type == kPageDict) {
+                if (!decode_dict_page(&cx, pd, pd_len, h.nvals, arena)) {
+                    return false;
+                }
+            } else if (h.type == kPageData || h.type == kPageDataV2) {
+                uint32_t got = 0;
+                if (!list_decode_page(&cx, pd, pd_len, &h, &b, elem_n, &got,
+                                      arena)) {
+                    return false;
+                }
+                elem_n += got;
+            } else if (h.type != kPageIndex) {
                 return false;
             }
-            elem_n += got;
-        } else if (h.type != kPageIndex) {
-            return false;
+            p = pay + static_cast<uint64_t>(h.cmp);
         }
-        p = pay + static_cast<uint64_t>(h.cmp);
+        if (b.n_slots != want) return false;
     }
     if (b.n_slots != n_slots) return false;
 
     // ---- assembly: rep says where rows start, def says what each slot is ---
     int64_t rows = 0;
     for (int64_t j = 0; j < n_slots; ++j) rows += (b.rep[j] == 0u) ? 1 : 0;
-    if (rows != rg->num_rows) return false;      // levels disagree with the footer
+    if (rows != n_rows_total) return false;      // levels disagree with the footer
     auto* offs = arena->allocate_array<int32_t>(rows + 1);
     if (offs == nullptr) return false;
     const uint64_t vb = (static_cast<uint64_t>(rows) + 7u) / 8u;
@@ -2621,7 +2647,8 @@ bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
         }
         return false;
     }
-    return build_list_column(buf, len, meta, row_group, col, arena, out_col,
+    return build_list_column(buf, len, meta, row_group, row_group + 1u, col,
+                             arena, out_col,
                              out_rows);
 }
 
@@ -2644,7 +2671,40 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     BoltColumn* cols = out_batch->columns[out_batch->read_epoch];
     ColCtx* cxs = arena->allocate_array<ColCtx>(meta->n_columns);
     if (cxs == nullptr) return false;
+    // A REPEATED leaf is a list (or a map leaf) and cannot be built by the
+    // flat path, which assumes one value per row. Build those through Dremel
+    // assembly instead of refusing the file: parquet_read_list_column already
+    // decodes them correctly, and refusing here meant a file with a single
+    // list<int64> column could not be opened by the obvious call at all.
+    bool* is_list = arena->allocate_array<bool>(meta->n_columns);
+    if (is_list == nullptr) return false;
     for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
+        is_list[c] = (meta->columns[c].max_rep != 0u);
+        if (is_list[c]) {
+            // ONE level of repetition only. build_list_column is reached
+            // directly here, so it does NOT get parquet_read_list_column's
+            // max_rep guard -- and without this an unsupported list-of-lists
+            // would assemble as if it were a flat list, which is a silent
+            // reshape of the data rather than a refusal.
+            if (meta->columns[c].max_rep != 1u) {
+                if (bolt_pq_diag()) {
+                    std::fprintf(stderr, "bolt parquet: column '%s' max_rep=%u"
+                                 " -- only one level of repetition is "
+                                 "supported\n", meta->columns[c].name,
+                                 static_cast<unsigned>(meta->columns[c].max_rep));
+                }
+                return false;
+            }
+            int64_t lrows = 0;
+            if (!build_list_column(buf, len, meta, 0, meta->n_row_groups, c,
+                                   arena, &cols[c], &lrows)) {
+                return false;
+            }
+            if (lrows != meta->num_rows) return false;
+            (void)out_batch->schema.add_field(meta->columns[c].name,
+                                              BoltType::List);
+            continue;
+        }
         if (!init_col_ctx(meta, c, 0, meta->n_row_groups, meta->num_rows,
                           arena, &cols[c], &cxs[c])) {
             return false;
@@ -2658,6 +2718,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
             return false;
         }
         for (uint32_t c = 0; c < meta->n_columns; ++c) {
+            if (is_list[c]) continue;    // already assembled across all groups
             const PqChunk* ch = &meta->chunks[rg->chunk_off + c];
             if (ch->num_values != rg->num_rows) return false;
             if (!decode_chunk(buf, len, ch, &cxs[c], row_off, rg->num_rows,

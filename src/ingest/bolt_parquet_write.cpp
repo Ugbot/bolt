@@ -338,6 +338,10 @@ struct ChunkOut {
 // concurrent encode slot, never per column: a 256-column schema would
 // otherwise hold 256 dictionaries at once.
 struct ChunkWorkspace {
+    // Storage for a NESTED column's sliced offsets view. slice_column cannot
+    // allocate, and a list's offsets live in a BoltColumn of their own, so the
+    // caller lends this one per encode slot.
+    BoltColumn                 off_slice;
     DictBuilder                dict;
     std::vector<std::uint32_t> dict_idx;
     // DELTA encoder scratch (length / prefix / suffix arrays, suffix bytes).
@@ -1551,6 +1555,14 @@ struct ListLevels {
     std::vector<std::uint8_t> def;
     std::vector<std::int64_t> row_slot; // row -> first leaf slot (rows+1)
     std::int64_t n_elems;
+    // Index of this slice's FIRST element in the (unsliced) element column.
+    // Non-zero for every row group after the first: a list column is sliced
+    // by advancing its OFFSETS, and the values in those offsets stay absolute
+    // indices into one shared element array. Ignoring this wrote every row
+    // group's elements starting from element 0 of the whole column -- wrong
+    // values, and a count disagreeing with the levels beside them, which
+    // pyarrow rejects outright as "Unexpected end of stream".
+    std::int64_t elem_base;
 };
 
 bool build_list_levels(const BoltColumn& col, const ParquetWriteColumn& sch,
@@ -1568,6 +1580,7 @@ bool build_list_levels(const BoltColumn& col, const ParquetWriteColumn& sch,
     out->def.clear();
     out->row_slot.assign(static_cast<std::size_t>(n_rows) + 1u, 0);
     out->n_elems = 0;
+    out->elem_base = (n_rows > 0) ? static_cast<std::int64_t>(offs[0]) : 0;
     for (std::int64_t r = 0; r < n_rows; ++r) {
         out->row_slot[static_cast<std::size_t>(r)] =
             static_cast<std::int64_t>(out->rep.size());
@@ -1634,7 +1647,23 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     assert(w != nullptr && rec != nullptr && out != nullptr);
     ListLevels lv;
     if (!build_list_levels(col, sch, n_rows, &lv)) return false;
-    const BoltColumn* elem = col.list_element();
+    // Slice the ELEMENT column to this row group's element range, once, so
+    // every index below stays slice-relative. The alternative -- absolute
+    // indices -- has to be applied to the value range, the element validity
+    // bytes and the statistics range in step, and missing any one of them
+    // writes a page whose declared value count disagrees with its payload.
+    const BoltColumn* elem_full = col.list_element();
+    if (elem_full == nullptr) return false;
+    BoltColumn elem_sliced = *elem_full;
+    if (lv.elem_base > 0) {
+        if (elem_full->data == nullptr) return false;
+        elem_sliced.data = static_cast<std::uint8_t*>(elem_full->data) +
+            static_cast<std::size_t>(lv.elem_base) *
+            static_cast<std::size_t>(elem_full->type_size_bytes);
+        elem_sliced.validity_offset = elem_full->validity_offset + lv.elem_base;
+        elem_sliced.length = elem_full->length - lv.elem_base;
+    }
+    const BoltColumn* elem = &elem_sliced;
     const std::uint8_t max_def = static_cast<std::uint8_t>(
         sch.element_nullable ? 3u : 2u);
 
@@ -2266,13 +2295,40 @@ std::size_t slice_stride(BoltType t) noexcept {
 // A shallow row-window view of `c` starting at `start` for `rows` rows.
 // Data pointer advances by the type stride; the validity bitmap pointer is
 // left alone and validity_offset absorbs the shift (read_valid honors it).
+// Slice rows [start, start+rows) of a column for one row group.
+//
+// A NESTED column cannot be advanced the flat way. Its `data` is a pointer to
+// the CHILD column, not a row-indexed buffer, so `data + start * stride` walks
+// off the child entirely; and its row->element mapping lives in the offsets
+// array, which the flat path never touches. Doing the flat thing to a list
+// produced a file that bolt wrote happily and PYARROW REJECTED outright
+// ("Unexpected end of stream") -- silent for as long as every list fixture
+// used a single row group.
+//
+// The offsets are advanced instead, and the element column is left ALONE: the
+// values in `offsets` are absolute indices into it, so re-basing them would
+// mean rewriting the array. Slicing the offsets pointer keeps
+// offsets[i] - offsets[0] as this group's element range with no copy.
 BoltColumn slice_column(const BoltColumn& c, BoltType t,
-                        std::int64_t start, std::int64_t rows) noexcept {
+                        std::int64_t start, std::int64_t rows,
+                        BoltColumn* off_scratch = nullptr) noexcept {
     assert(start >= 0);
     assert(rows >= 0);
     BoltColumn s = c;
     s.length = rows;
-    if (start > 0 && c.data != nullptr) {
+    if (start == 0) return s;
+    if (c.format == ColumnFormat::Nested) {
+        // Offsets live in dict_child as a Flat Int32 column of length+1.
+        if (off_scratch == nullptr) return s;          // cannot slice safely
+        if (c.dict_child == nullptr || c.dict_child->data == nullptr) return s;
+        *off_scratch = *c.dict_child;
+        off_scratch->data = static_cast<std::int32_t*>(c.dict_child->data) + start;
+        off_scratch->length = rows + 1;
+        s.dict_child = off_scratch;
+        s.validity_offset = c.validity_offset + start;
+        return s;
+    }
+    if (c.data != nullptr) {
         const std::size_t stride = slice_stride(t);
         s.data = static_cast<std::uint8_t*>(c.data) +
                  static_cast<std::size_t>(start) * stride;
@@ -2307,7 +2363,8 @@ void encode_wave_task(void* user, std::uint32_t lo, std::uint32_t hi,
         assert(c < e->w->opts.n_columns);
         const BoltColumn sc = slice_column(e->cols[c],
                                            e->w->opts.columns[c].type,
-                                           e->start, e->rows);
+                                           e->start, e->rows,
+                                           &e->w->ws[i].off_slice);
         // Failure is recorded on the output (ChunkOut::ok) rather than
         // returned: a pool task has nowhere to return a status to, and the
         // placement pass checks every slot before writing anything.
@@ -2395,7 +2452,8 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
                 const std::uint32_t c = base + i;
                 const BoltColumn sc = slice_column(cols[c],
                                                    w->opts.columns[c].type,
-                                                   start, rows);
+                                                   start, rows,
+                                                   &w->ws[i].off_slice);
                 if (!write_column_chunk(w, &w->ws[i], &w->outs[i], sc,
                                         w->opts.columns[c], rows)) {
                     return false;

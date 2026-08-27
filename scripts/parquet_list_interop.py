@@ -34,10 +34,10 @@ import pyarrow.parquet as pq
 N_ROWS = 500
 
 
-def model(elem_nullable):
+def model(elem_nullable, n=N_ROWS):
     """The expected column, derived from the generating rules alone."""
     rows = []
-    for i in range(N_ROWS):
+    for i in range(n):
         if i % 17 == 0:
             rows.append(None)
             continue
@@ -89,6 +89,39 @@ def check(path, elem_nullable, mutate=None):
     return None
 
 
+def check_multirg(d):
+    """The list column SPLIT ACROSS ROW GROUPS, read by pyarrow.
+
+    This is the shape that exposed a real writer bug: a list column is sliced
+    for each row group by advancing its OFFSETS, and the values in those
+    offsets are absolute indices into one shared element array. Every row
+    group after the first was written from element 0 of the whole column, so
+    the page's declared value count disagreed with its payload and pyarrow
+    rejected the file outright ("Unexpected end of stream"). Every list
+    fixture before this used a single row group, so nothing caught it.
+    """
+    name = "test_bolt_parquet_list_multirg.parquet"
+    path = os.path.join(d, name)
+    if not os.path.exists(path):
+        return "missing %s (run test_bolt_parquet_list first)" % name
+    table = pq.read_table(path)
+    md = pq.ParquetFile(path).metadata
+    if md.num_row_groups < 2:
+        return "%s has %d row groups; the split path never ran" % (
+            name, md.num_row_groups)
+    got = table.column(0).to_pylist()
+    want = model(True, n=900)
+    if got != want:
+        for i, (g, w) in enumerate(zip(got, want)):
+            if g != w:
+                return ("%s row %d: pyarrow read %r, model says %r"
+                        % (name, i, g, w))
+        return "%s: %d rows, model has %d" % (name, len(got), len(want))
+    print("checked %s (%d row groups, %d rows)"
+          % (name, md.num_row_groups, len(got)))
+    return None
+
+
 def check_json_annotation(d):
     """bolt's JSON logical annotation, read by an independent reader.
 
@@ -134,6 +167,11 @@ def main():
             rc = 1
         else:
             print("checked %s (element_nullable=%s)" % (name, elem_nullable))
+
+    err = check_multirg(d)
+    if err:
+        print("FAIL: %s" % err)
+        rc = 1
 
     err = check_json_annotation(d)
     if err:
