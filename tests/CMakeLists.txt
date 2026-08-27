@@ -1043,6 +1043,12 @@ target_link_libraries(test_bolt_parquet_write_bloom
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_parquet_write_bloom)
 add_test(NAME test_bolt_parquet_write_bloom COMMAND test_bolt_parquet_write_bloom)
+# Emits the fixtures scripts/parquet_bloom_check.py probes with DuckDB's
+# INDEPENDENT split-block bloom implementation. A bloom filter's only
+# consumer is a reader deciding what to SKIP, so a wrong one loses rows with
+# no diagnostic anywhere -- and bolt's own probe cannot detect that, since a
+# writer and probe sharing a misunderstanding of the salts, block index or
+# hash agree perfectly. The pyarrow gate only checks such a file still READS.
 
 # Writer: parallel column encoding. Acceptance is BYTE-IDENTITY with a serial
 # write at every pool size, repeated -- not "the threaded run still parses".
