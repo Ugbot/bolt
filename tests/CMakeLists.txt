@@ -1071,6 +1071,11 @@ target_compile_definitions(test_bolt_parquet_list PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_list)
 add_test(NAME test_bolt_parquet_list COMMAND test_bolt_parquet_list)
+# Emits test_bolt_parquet_list_written_{er,en}.parquet for
+# scripts/parquet_list_interop.py, which reads them with pyarrow. bolt's own
+# reader cannot establish that bolt's LIST WRITER emits correct Dremel
+# levels -- a writer/reader pair sharing a misreading agree perfectly, and a
+# level bug preserves row counts and values while moving list contents.
 
 # JSON / BSON / VARIANT logical refinements. JSON is an annotation over Utf8
 # STORAGE (Arrow's own model), not a new physical type -- so the key property

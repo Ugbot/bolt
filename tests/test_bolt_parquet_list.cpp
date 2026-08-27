@@ -476,7 +476,20 @@ bolt::BoltColumn build_list_column(bolt::Arena* a, const ListModel& m,
     return bolt::BoltColumn::make_list(&elem, offs, n, lval, a);
 }
 
-TEST(BoltParquetList, WriteListRoundTripsThroughBoltAndPyarrow) {
+// NAME IS DELIBERATE: this round-trips through BOLT, and that is all it can
+// establish. Reading back what bolt wrote proves the writer and the reader
+// agree; it cannot prove the FILE is right, because a writer and reader that
+// share a misreading of Dremel level semantics agree perfectly with each
+// other. That matters more here than anywhere else in the parquet code: a
+// NULL list, an EMPTY list, and a list containing a null carry the same
+// element counts and differ only in level bits, so a level bug preserves the
+// row count, the list count and every value, and surfaces only as contents
+// that moved rows.
+//
+// The independent half is scripts/parquet_list_interop.py, which reads the
+// two files this writes with pyarrow and compares them against the model
+// re-derived from its generating rules. This test emits those fixtures.
+TEST(BoltParquetList, WriteListRoundTripsAndEmitsInteropFixtures) {
     // The asymmetry this closes: bolt could READ lists and not write them.
     // Both nullability shapes, because an element-nullable list has a
     // different max_def and so a different level stream.
@@ -564,6 +577,115 @@ TEST(BoltParquetList, WriteListRoundTripsThroughBoltAndPyarrow) {
             ei += L;
         }
     }
+}
+
+// ---- corrupt-input fuzzing for the Dremel path ---------------------------
+
+// The flat reader's CorruptPagesNeverCrash (test_bolt_parquet_read.cpp)
+// fuzzes golden_flat.parquet, which has no repeated column -- so it cannot
+// reach a single line of record assembly. That leaves the riskiest decoder in
+// the parquet reader unfuzzed: assembly turns attacker-controlled repetition
+// and definition LEVEL bytes into ARRAY INDICES, writing one element per
+// level and one offset per record. A corrupt level stream can claim more
+// elements than the page declared values for, or more records than the row
+// group has rows, and the failure mode is an out-of-bounds WRITE rather than
+// a wrong answer.
+//
+// Contract, same as the flat fuzzer's: "false, or a clean decode". Returning
+// true is legitimate when a flip lands in value bytes. ASAN and UBSAN are
+// what actually enforce it, so this test is only as strong as the sanitizer
+// build it is run under.
+TEST(BoltParquetList, CorruptLevelsNeverCrash) {
+    // A fuzz that never reaches the code under test is indistinguishable
+    // from a passing one, so count what actually happened and assert on it.
+    int repeated_cols = 0;
+    long attempts = 0, decoded = 0;
+    for (const char* fixture : {"golden_list.parquet",
+                                "golden_list_dict.parquet",
+                                "golden_map.parquet"}) {
+        const auto buf = slurp(data_path(fixture).c_str());
+        if (buf.empty()) continue;               // fixture optional
+        SCOPED_TRACE(fixture);
+
+        bolt::Arena ma;
+        PqMeta meta{};
+        if (!parquet_read_meta(buf.data(), buf.size(), &ma, &meta)) continue;
+        // Fuzz every repeated column the file has; a map has two leaves and
+        // they assemble independently.
+        for (std::uint32_t c = 0; c < meta.n_columns; ++c) {
+            if (meta.columns[c].max_rep == 0u) continue;
+            ++repeated_cols;
+
+            bolt::Arena a;
+            bolt::BoltColumn col{};
+            std::int64_t rows = 0;
+
+            // 1) Truncations: cuts the level stream mid-run, so the decoder
+            //    meets a page that promises more levels than it carries.
+            for (std::size_t cut = 1; cut <= buf.size(); cut += 613) {
+                a.reset();
+                bolt::Arena la;
+                PqMeta lm{};
+                const std::size_t n = buf.size() - cut;
+                if (!parquet_read_meta(buf.data(), n, &la, &lm)) continue;
+                if (c >= lm.n_columns) continue;
+                ++attempts;
+                decoded += parquet_read_list_column(buf.data(), n, &lm, c, 0,
+                                                    &a, &col, &rows) ? 1 : 0;
+            }
+
+            // 2) Byte flips across the page region. The level bytes sit at
+            //    the front of every data page, which is exactly what the
+            //    dense sweep over the first 4 KiB targets.
+            std::vector<std::uint8_t> mut(buf);
+            std::uint64_t moff = 0;
+            std::uint32_t mlen = 0;
+            if (!pq_locate_footer(buf.data(), buf.size(), &moff, &mlen)) continue;
+            const std::size_t page_end = static_cast<std::size_t>(moff);
+            for (std::size_t i = 4; i < page_end;
+                 i = (i < 4096) ? i + 1 : i + 29) {
+                mut[i] ^= 0xFF;
+                a.reset();
+                bolt::Arena la;
+                PqMeta lm{};
+                if (parquet_read_meta(mut.data(), mut.size(), &la, &lm) &&
+                    c < lm.n_columns) {
+                    ++attempts;
+                    decoded += parquet_read_list_column(mut.data(), mut.size(),
+                                                        &lm, c, 0, &a, &col,
+                                                        &rows) ? 1 : 0;
+                }
+                mut[i] ^= 0xFF;
+            }
+
+            // 3) Saturated level bytes: 0xFF everywhere is the shape that
+            //    maximises the claimed element and record counts, which is
+            //    the overflow a bounds check has to stop.
+            for (std::size_t z = 4; z + 48 < page_end; z += 401) {
+                std::memset(mut.data() + z, 0xFF, 48);
+                a.reset();
+                bolt::Arena la;
+                PqMeta lm{};
+                if (parquet_read_meta(mut.data(), mut.size(), &la, &lm) &&
+                    c < lm.n_columns) {
+                    ++attempts;
+                    decoded += parquet_read_list_column(mut.data(), mut.size(),
+                                                        &lm, c, 0, &a, &col,
+                                                        &rows) ? 1 : 0;
+                }
+                std::memcpy(mut.data() + z, buf.data() + z, 48);
+            }
+        }
+    }
+    // The fixtures must exist, the sweep must have run, and a real share of
+    // mutations must have reached assembly and come back with a decode --
+    // if everything were rejected at the footer, the level code would never
+    // execute and this test would prove nothing.
+    EXPECT_GE(repeated_cols, 1) << "no repeated column was fuzzed";
+    EXPECT_GT(attempts, 1000L) << "the mutation sweep barely ran";
+    EXPECT_GT(decoded, 100L)
+        << "every mutation was rejected before record assembly; this fuzz "
+           "never exercised the Dremel path";
 }
 
 }  // namespace
