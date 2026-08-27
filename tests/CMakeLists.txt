@@ -1043,6 +1043,12 @@ target_link_libraries(test_bolt_parquet_write_bloom
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_parquet_write_bloom)
 add_test(NAME test_bolt_parquet_write_bloom COMMAND test_bolt_parquet_write_bloom)
+# Fixtures for scripts/parquet_pageindex_check.py, which decodes the
+# ColumnIndex/OffsetIndex straight from the thrift compact protocol and
+# checks every page's declared bounds BRACKET that page. pyarrow gives Python
+# no way to read either struct, and DuckDB was measured NOT to consult the
+# ColumnIndex (flipping every byte of the index region changes no query
+# result), so a from-spec decoder is the only independent oracle available.
 # Emits the fixtures scripts/parquet_bloom_check.py probes with DuckDB's
 # INDEPENDENT split-block bloom implementation. A bloom filter's only
 # consumer is a reader deciding what to SKIP, so a wrong one loses rows with
