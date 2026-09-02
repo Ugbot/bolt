@@ -607,6 +607,17 @@ bolt_apply_hardening(test_bolt_arrow)
 
 add_test(NAME test_bolt_arrow COMMAND test_bolt_arrow)
 
+# G2ARROW-17: bolt + a real Arrow C ABI header must compile in BOTH include
+# orders (two TUs, one per order, one binary). tests/arrow_abi_mimic.h is the
+# spec-verbatim global-scope block every real ABI header ships.
+add_executable(test_bolt_arrow_guard_order
+    test_bolt_arrow_guard_order.cpp
+    test_bolt_arrow_guard_order_b.cpp)
+target_link_libraries(test_bolt_arrow_guard_order
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arrow_guard_order)
+add_test(NAME test_bolt_arrow_guard_order COMMAND test_bolt_arrow_guard_order)
+
 add_executable(test_bolt_stream test_bolt_stream.cpp)
 
 target_link_libraries(test_bolt_stream
@@ -1025,6 +1036,17 @@ target_link_libraries(test_bolt_parquet_write_dict
 bolt_apply_hardening(test_bolt_parquet_write_dict)
 add_test(NAME test_bolt_parquet_write_dict COMMAND test_bolt_parquet_write_dict)
 
+# Writer chunk-level Statistics fixture (G2PQ-21/22). The gtest only WRITES
+# the fixture; scripts/parquet_stats_check.py decodes the chunk Statistics +
+# column_orders with a from-spec thrift reader and holds the assertions
+# (unsigned BYTE_ARRAY ordering on bytes >= 0x80, NaN never a bound, all-NaN
+# omission, conservative signed zeros, deprecated min/max absent).
+add_executable(test_bolt_parquet_write_stats test_bolt_parquet_write_stats.cpp)
+target_link_libraries(test_bolt_parquet_write_stats
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_stats)
+add_test(NAME test_bolt_parquet_write_stats COMMAND test_bolt_parquet_write_stats)
+
 # Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
 # decoded all four; these close the asymmetry and sweep block/miniblock
 # boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.
@@ -1083,6 +1105,18 @@ target_compile_definitions(test_bolt_parquet_list PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_list)
 add_test(NAME test_bolt_parquet_list COMMAND test_bolt_parquet_list)
+
+# Legacy 2-level LIST shapes (G2PQ-14): backward-compat rules from
+# LogicalTypes.md. Fixtures are hand-constructed from the spec by
+# scripts/make_legacy_list_fixtures.py (pyarrow cannot write them) and
+# certified by a pyarrow read-back before bolt is tested against them.
+add_executable(test_bolt_parquet_list_legacy test_bolt_parquet_list_legacy.cpp)
+target_link_libraries(test_bolt_parquet_list_legacy
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_list_legacy PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_list_legacy)
+add_test(NAME test_bolt_parquet_list_legacy COMMAND test_bolt_parquet_list_legacy)
 # Emits test_bolt_parquet_list_written_{er,en}.parquet for
 # scripts/parquet_list_interop.py, which reads them with pyarrow. bolt's own
 # reader cannot establish that bolt's LIST WRITER emits correct Dremel
@@ -1179,6 +1213,17 @@ if(BOLT_BUILD_INGEST)
         BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     bolt_apply_hardening(test_bolt_avro)
     add_test(NAME test_bolt_avro COMMAND test_bolt_avro)
+
+    # G2ARROW-10 — Arrow IPC stream writer. Structural gates here; the
+    # value gate is scripts/arrow_ipc_check.py (pyarrow oracle) over the
+    # fixture this test writes next to the data dir.
+    add_executable(test_bolt_arrow_ipc test_bolt_arrow_ipc.cpp)
+    target_link_libraries(test_bolt_arrow_ipc
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    target_compile_definitions(test_bolt_arrow_ipc PRIVATE
+        BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    bolt_apply_hardening(test_bolt_arrow_ipc)
+    add_test(NAME test_bolt_arrow_ipc COMMAND test_bolt_arrow_ipc)
 
     add_executable(test_bolt_protobuf test_bolt_protobuf.cpp)
     target_link_libraries(test_bolt_protobuf
@@ -1436,3 +1481,12 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_hardening(test_bolt_idot)
     add_test(NAME test_bolt_idot COMMAND test_bolt_idot)
 endif()
+
+# json-functions lane — bounded JSON path kernel (json_extract / -> / ->>
+# SQL surface). Plain main() test (no gtest dep needed): value-asserted
+# fixtures incl. nested paths, missing keys, malformed docs, escape decode,
+# and every documented cap.
+add_executable(test_bolt_json_path test_bolt_json_path.cpp)
+target_link_libraries(test_bolt_json_path PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_json_path)
+add_test(NAME test_bolt_json_path COMMAND test_bolt_json_path)

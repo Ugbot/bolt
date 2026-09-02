@@ -449,6 +449,8 @@ struct BoltSchema {
     }
 };
 
+}  // namespace bolt
+
 // ============================================================================
 // Arrow C Data Interface (ABI-level, zero dependency)
 // ============================================================================
@@ -457,6 +459,16 @@ struct BoltSchema {
 // Pandas) without linking libarrow. Just fill the struct and hand it over.
 //
 // Spec: https://arrow.apache.org/docs/format/CDataInterface.html
+//
+// GLOBAL scope, standard guard (G2ARROW-17). They used to sit inside
+// namespace bolt while still defining the industry-standard guard macro, so
+// including bolt BEFORE arrow/c/abi.h (or nanoarrow, or DuckDB's copy)
+// suppressed the real global definitions while providing only namespaced
+// ones -- "incomplete type ArrowSchema" in any TU that mixed the two in that
+// order. At global scope under the shared guard, whichever header is
+// included first defines the one canonical type and the other is skipped;
+// both orders compile (tests/test_bolt_arrow_guard_order.cpp). bolt code
+// below refers to them unqualified; global-namespace lookup finds these.
 
 #ifndef ARROW_C_DATA_INTERFACE
 #define ARROW_C_DATA_INTERFACE
@@ -491,5 +503,3 @@ struct ArrowArray {
 #define ARROW_ARRAY_CAPSULE_NAME  "arrow_array"
 
 #endif  // ARROW_C_DATA_INTERFACE
-
-}  // namespace bolt

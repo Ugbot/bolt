@@ -652,6 +652,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_parquet_bloom.cpp
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_write.cpp
+        src/ingest/bolt_arrow_ipc.cpp
         src/ingest/bolt_avro.cpp
         src/ingest/bolt_inflate.cpp
         src/ingest/bolt_protobuf.cpp
