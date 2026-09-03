@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -64,20 +65,33 @@ public:
     Arena(Arena&&) = delete;
     Arena& operator=(Arena&&) = delete;
 
+    /// Opt-in shared-across-threads mode. An Arena is single-thread by design
+    /// ("Arena per Slot"); the bump cursor is a plain uintptr_t. When more than
+    /// one thread legitimately shares ONE arena — e.g. chukonu's parallel
+    /// driver, which runs several operators concurrently but hands them all the
+    /// same fragment arena — concurrent allocate() calls race the cursor and
+    /// return torn / overlapping blocks (a wild BoltColumn pointer, then an
+    /// EXC_BAD_ACCESS in a downstream memcpy). Enabling this serializes the
+    /// allocate() body with a spinlock. OFF by default, so every per-slot arena
+    /// keeps the lock-free ~3ns fast path (one predictable-false branch). The
+    /// caller MUST guarantee no allocate() is in flight when it flips the flag.
+    void set_concurrent(bool on) noexcept { concurrent_ = on; }
+    bool concurrent() const noexcept { return concurrent_; }
+
     /// Bump-allocate. Returns nullptr if OOM or block table full.
     /// Cost: ~3ns fast path (pointer arithmetic + branch).
     void* allocate(size_t size, size_t alignment = 0) noexcept {
-        if (alignment == 0) alignment = config_.alignment;
-
-        uintptr_t aligned = (cursor_ + alignment - 1) & ~(alignment - 1);
-
-        if (aligned + size <= end_) {
-            cursor_ = aligned + size;
-            total_allocated_ += size;
-            if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
-            return reinterpret_cast<void*>(aligned);
+        if (!concurrent_) return allocate_unlocked(size, alignment);
+        // Serialize concurrent sharers of ONE arena (see set_concurrent).
+        // Short critical section (a bump, occasionally a grow), so a bare
+        // test-and-set spin is the right primitive — no OS wait, no fairness
+        // needed; contention is per-buffer, not per-row.
+        while (alloc_lock_.test_and_set(std::memory_order_acquire)) {
+            BOLT_PAUSE();
         }
-        return allocate_slow(size, alignment);
+        void* p = allocate_unlocked(size, alignment);
+        alloc_lock_.clear(std::memory_order_release);
+        return p;
     }
 
     /// Typed allocation. Returns nullptr on failure.
@@ -203,6 +217,22 @@ private:
         return true;
     }
 
+    // The original lock-free bump body. Called directly on the fast path
+    // (concurrent_ == false) and under alloc_lock_ when shared.
+    void* allocate_unlocked(size_t size, size_t alignment) noexcept {
+        if (alignment == 0) alignment = config_.alignment;
+
+        uintptr_t aligned = (cursor_ + alignment - 1) & ~(alignment - 1);
+
+        if (aligned + size <= end_) {
+            cursor_ = aligned + size;
+            total_allocated_ += size;
+            if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
+            return reinterpret_cast<void*>(aligned);
+        }
+        return allocate_slow(size, alignment);
+    }
+
     void* allocate_slow(size_t size, size_t alignment) noexcept {
         assert(alignment > 0 && (alignment & (alignment - 1)) == 0);
         assert(size > 0);
@@ -290,6 +320,12 @@ private:
     // blocks consumed whole by the oversize lane THIS epoch, so the normal
     // lane's forward scan must not reuse them until the next reset().
     uint32_t oversize_used_ = 0;
+
+    // Opt-in shared-arena support (see set_concurrent / allocate). concurrent_
+    // is set once before any sharing thread runs and cleared after they join,
+    // so it needs no atomicity itself; alloc_lock_ serializes the bump.
+    bool concurrent_ = false;
+    std::atomic_flag alloc_lock_{};   // C++20: value-init is the clear state
 };
 static_assert(kArenaMaxBlocks <= 32, "oversize_used_ bitmask is 32 bits");
 

@@ -1490,3 +1490,16 @@ add_executable(test_bolt_json_path test_bolt_json_path.cpp)
 target_link_libraries(test_bolt_json_path PRIVATE bolt::bolt)
 bolt_apply_hardening(test_bolt_json_path)
 add_test(NAME test_bolt_json_path COMMAND test_bolt_json_path)
+
+# Shared-arena concurrency lane — bolt::Arena::set_concurrent. An Arena is
+# single-thread by design ("Arena per Slot"); chukonu's parallel driver shares
+# ONE fragment arena across operators that run concurrently, so its allocate()
+# bump raced and handed out overlapping blocks (the intermittent Q6 SF10 SIGSEGV
+# at 12/18 workers). This pins the opt-in spinlock: 8 threads x 40k allocs on
+# one shared arena return disjoint regions (0 corruption); the same stress
+# lock-free corrupts ~250k blocks (discriminating power).
+add_executable(test_bolt_arena_concurrent test_bolt_arena_concurrent.cpp)
+target_link_libraries(test_bolt_arena_concurrent
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_concurrent)
+add_test(NAME test_bolt_arena_concurrent COMMAND test_bolt_arena_concurrent)
