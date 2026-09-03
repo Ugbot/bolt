@@ -203,9 +203,12 @@ BOLT_FORCE_INLINE bool sv_like(
                       sv_bytes(p, p_base), p.length);
 }
 
-// memmem byte search (naive; small needles dominate SQL workloads).
+// memmem byte search, scalar reference. First-byte memchr scan + memcmp on a
+// hit. Kept as its own function because it is (a) the tail/fallback of the
+// vector kernel below and (b) the ORACLE the differential test compares
+// against, so a vector bug cannot hide behind a shared implementation.
 // Returns 0-based byte index or -1.
-BOLT_FORCE_INLINE int32_t bytes_find(
+BOLT_FORCE_INLINE int32_t bytes_find_scalar(
         const char* BOLT_RESTRICT hay, uint32_t hlen,
         const char* BOLT_RESTRICT ndl, uint32_t nlen) noexcept {
     if (nlen == 0) return 0;
@@ -226,6 +229,187 @@ BOLT_FORCE_INLINE int32_t bytes_find(
         ++k;
     }
     return -1;
+}
+
+// Interior equality for a candidate whose first AND last bytes already match.
+// A short run is an inline byte loop (no libc call); long needles keep memcmp.
+// Every byte read is inside the candidate window, so no caller needs slack.
+BOLT_FORCE_INLINE bool bytes_eq_mid(
+        const char* BOLT_RESTRICT a, const char* BOLT_RESTRICT b,
+        uint32_t n) noexcept {
+    if (n <= 16u) {
+        for (uint32_t t = 0; t < n; ++t) {
+            if (a[t] != b[t]) return false;
+        }
+        return true;
+    }
+    return memcmp(a, b, n) == 0;
+}
+
+// memmem byte search. Returns 0-based byte index or -1.
+//
+// WHY THIS IS VECTORISED (measured, 2026-09-03, ClickBench Q21
+// `SELECT COUNT(*) FROM hits WHERE url LIKE '%google%'`, real 99,997,497-row
+// athena/hits.parquet, macOS arm64, serial): a `sample` leaf profile puts
+// `_platform_memchr` at 25.7% of the whole query and `_platform_memcmp` at
+// 1.9%, with another 1.4% in their dyld PLT stubs — ~29% of Q21 inside this
+// one function. The scalar loop above RESTARTS memchr after every first-byte
+// hit, so a haystack containing the needle's first byte k times pays k+1
+// libc calls; ClickBench's `url` averages 88 bytes and 'g' is a common URL
+// byte, so the per-call setup, not the scanning, is the cost.
+//
+// The fix is the standard first+last-byte filter (Muła): compare 16 haystack
+// bytes against a broadcast of the needle's FIRST byte and the 16 bytes
+// `nlen-1` further on against a broadcast of its LAST byte, AND the two
+// masks, and run the interior compare only on surviving lanes. Two anchors
+// instead of one cuts candidates by roughly the product of the two byte
+// frequencies, and the whole 88-byte haystack is ~6 branch-free iterations
+// with zero calls.
+//
+// BOUNDS: the loop only runs while both 16-byte loads lie fully inside
+// [hay, hay+hlen) — `i + 16 <= span` where `span = hlen - nlen + 1` bounds
+// the second load at `i + nlen - 1 + 16 <= hlen`. The final partial region is
+// covered by ONE overlapping block at `i = span - 16`; re-testing already
+// scanned positions is harmless because blocks are visited in increasing
+// order, so any earlier match has already been returned. No read ever goes
+// past `hay + hlen`, so callers need no slack bytes.
+//
+// NOT force-inlined: the vector body is ~10x the object code of the old
+// memchr loop, and `bytes_find` inlines into `utf8_like_match_one` into the
+// filter lambda into `scalar_filter_dense_t` at ~19 sites. Force-inlining it
+// MEASURED as a 7% REGRESSION on ClickBench Q23 (two LIKE predicates feeding
+// a GROUP BY + COUNT(DISTINCT), i.e. an already I-cache-hungry pipeline)
+// while Q21 gained — reproducible across 3 interleaved passes, not noise.
+// One direct call per row is far cheaper than the k+1 PLT-thunked libc calls
+// it replaces, so the call is bought back many times over.
+#if BOLT_SIMD_NEON || BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42
+inline int32_t bytes_find_simd(
+        const char* BOLT_RESTRICT hay, uint32_t hlen,
+        const char* BOLT_RESTRICT ndl, uint32_t nlen) noexcept {
+    assert(nlen >= 2u);
+    assert(hlen >= nlen);
+    {
+        const uint32_t span = hlen - nlen + 1u;   // count of candidate starts
+        assert(span >= 16u);
+        const unsigned char nf = static_cast<unsigned char>(ndl[0]);
+        const unsigned char nl = static_cast<unsigned char>(ndl[nlen - 1u]);
+        const uint32_t      mid = nlen - 2u;   // interior length (may be 0)
+        const char* BOLT_RESTRICT tail = hay + (nlen - 1u);
+#if BOLT_SIMD_NEON
+        const uint8x16_t vf = vdupq_n_u8(nf);
+        const uint8x16_t vl = vdupq_n_u8(nl);
+#else
+        const __m128i vf = _mm_set1_epi8(static_cast<char>(nf));
+        const __m128i vl = _mm_set1_epi8(static_cast<char>(nl));
+#endif
+        uint32_t i = 0;
+        for (;;) {
+            assert(i + 16u <= span);
+            assert(i + nlen - 1u + 16u <= hlen);
+#if BOLT_SIMD_NEON
+            const uint8x16_t eq = vandq_u8(
+                vceqq_u8(vld1q_u8(reinterpret_cast<const uint8_t*>(hay + i)),
+                         vf),
+                vceqq_u8(vld1q_u8(reinterpret_cast<const uint8_t*>(tail + i)),
+                         vl));
+            // 4 bits per byte lane -> one 64-bit word (no NEON movemask).
+            uint64_t m = vget_lane_u64(
+                vreinterpret_u64_u8(
+                    vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)),
+                0);
+            while (m != 0u) {
+                const uint32_t j =
+                    static_cast<uint32_t>(__builtin_ctzll(m)) >> 2;
+                if (mid == 0u ||
+                    bytes_eq_mid(hay + i + j + 1u, ndl + 1, mid)) {
+                    return static_cast<int32_t>(i + j);
+                }
+                m &= ~(static_cast<uint64_t>(0xFu) << (j << 2));
+            }
+#else
+            const __m128i eq = _mm_and_si128(
+                _mm_cmpeq_epi8(
+                    _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(hay + i)), vf),
+                _mm_cmpeq_epi8(
+                    _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(tail + i)), vl));
+            uint32_t m = static_cast<uint32_t>(_mm_movemask_epi8(eq));
+            while (m != 0u) {
+                const uint32_t j = static_cast<uint32_t>(__builtin_ctz(m));
+                if (mid == 0u ||
+                    bytes_eq_mid(hay + i + j + 1u, ndl + 1, mid)) {
+                    return static_cast<int32_t>(i + j);
+                }
+                m &= m - 1u;
+            }
+#endif
+            if (i + 16u >= span) break;
+            i += 16u;
+            if (i + 16u > span) i = span - 16u;   // one overlapping tail block
+        }
+        return -1;
+    }
+}
+#endif  // BOLT_SIMD_NEON || AVX2 || SSE42
+
+// memmem byte search. Returns 0-based byte index or -1.
+//
+// SHAPE, and why it is a HYBRID rather than "SIMD replaces memchr" (measured
+// 2026-09-03, ClickBench 100M, macOS arm64, 6 workers, interleaved min-of-3):
+// the two lanes win on opposite inputs, and each LOSES on the other's.
+//
+//   * needle's first byte is COMMON in the data. The pure-memchr loop
+//     restarts memchr after every first-byte hit, so it pays k+1 libc calls
+//     per value. `url NOT LIKE '%.google.%'` ('.' occurs several times in
+//     every URL): 3.096 s -> 1.521 s = 2.04x for the vector loop.
+//   * needle's first byte is RARE. memchr then answers the whole value in
+//     ONE call, and libc's memchr is a wider, better-tuned sweep than a
+//     16-byte-per-iteration portable loop. `title LIKE '%Google%'` ('G' is
+//     rare in this mostly-Cyrillic column): the pure vector loop MEASURED
+//     1.018 s -> 1.209 s, i.e. 0.84x — a real 18% REGRESSION.
+//
+// So: use memchr for the FIRST anchor — one tuned sweep that answers "does
+// this value contain the needle's first byte at a legal start position at
+// all?", which is the whole query for the rare-byte case — and hand only the
+// REMAINDER after that first hit to the vector loop, which is where the
+// restart cost lived. The rare case costs exactly what it cost before; the
+// common case keeps the vector win. Searching the suffix from `k+1` is exact:
+// position `k` is tested here and every position before it was proven to have
+// the wrong first byte by memchr.
+BOLT_FORCE_INLINE int32_t bytes_find(
+        const char* BOLT_RESTRICT hay, uint32_t hlen,
+        const char* BOLT_RESTRICT ndl, uint32_t nlen) noexcept {
+    if (nlen == 0) return 0;
+    if (nlen > hlen) return -1;
+    const uint32_t span = hlen - nlen + 1u;   // count of legal start positions
+    if (nlen == 1) {   // libc memchr is already the best single-byte scan
+        const void* h1 = memchr(hay, static_cast<unsigned char>(ndl[0]),
+                                static_cast<size_t>(span));
+        return h1 == nullptr
+                   ? -1
+                   : static_cast<int32_t>(static_cast<const char*>(h1) - hay);
+    }
+#if BOLT_SIMD_NEON || BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42
+    const void* hit = memchr(hay, static_cast<unsigned char>(ndl[0]),
+                             static_cast<size_t>(span));
+    if (hit == nullptr) return -1;
+    const uint32_t k =
+        static_cast<uint32_t>(static_cast<const char*>(hit) - hay);
+    assert(k < span);
+    if (hay[k + nlen - 1u] == ndl[nlen - 1u] &&
+        (nlen <= 2u || bytes_eq_mid(hay + k + 1u, ndl + 1, nlen - 2u))) {
+        return static_cast<int32_t>(k);
+    }
+    const uint32_t rest = hlen - (k + 1u);          // bytes left after `k`
+    if (rest < nlen) return -1;
+    const int32_t sub = (rest - nlen + 1u >= 16u)
+                            ? bytes_find_simd(hay + k + 1u, rest, ndl, nlen)
+                            : bytes_find_scalar(hay + k + 1u, rest, ndl, nlen);
+    return (sub < 0) ? -1 : static_cast<int32_t>(k + 1u) + sub;
+#else
+    return bytes_find_scalar(hay, hlen, ndl, nlen);
+#endif
 }
 
 // ===========================================================================

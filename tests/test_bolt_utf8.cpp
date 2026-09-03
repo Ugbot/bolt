@@ -814,4 +814,177 @@ TEST_F(Utf8Test, BytesFindMemchrScanMatchesNaive) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// bytes_find SIMD (first+last byte filter) differential gate.
+//
+// The vector lane only engages when the candidate-start span
+// (hlen - nlen + 1) is >= 16, so the pre-existing small-literal tests above
+// CANNOT reach one line of it. These three cases do: an exhaustive short
+// sweep (scalar lane + the boundary into the vector lane), an exhaustive
+// needle sweep over long haystacks (vector lane, every mask shape), and a
+// randomized high-match-density sweep at every load alignment.
+//
+// The oracle is a plain byte loop + memcmp written here, independent of both
+// bolt lanes; each case also asserts vector == scalar so a shared bug in the
+// two bolt paths still shows as an oracle mismatch.
+// ---------------------------------------------------------------------------
+namespace {
+
+int32_t bf_naive(const char* h, uint32_t hl, const char* n, uint32_t nl) {
+    if (nl == 0) return 0;
+    if (nl > hl) return -1;
+    for (uint32_t k = 0; k + nl <= hl; ++k) {
+        if (std::memcmp(h + k, n, nl) == 0) return static_cast<int32_t>(k);
+    }
+    return -1;
+}
+
+// Deterministic strings over an alphabet, indexed like a base-|A| numeral so
+// a sweep is exhaustive by construction rather than sampled.
+std::string bf_word(uint64_t idx, uint32_t len, const char* alpha,
+                    uint32_t asz) {
+    std::string s(len, alpha[0]);
+    for (uint32_t i = 0; i < len; ++i) {
+        s[i] = alpha[idx % asz];
+        idx /= asz;
+    }
+    return s;
+}
+
+}  // namespace
+
+TEST_F(Utf8Test, BytesFindExhaustiveShortVsNaive) {
+    const char* A = "ab";
+    std::size_t checked = 0, mism = 0;
+    for (uint32_t hl = 0; hl <= 12; ++hl) {
+        const uint64_t hn = 1ull << hl;
+        for (uint64_t hi = 0; hi < hn; ++hi) {
+            const std::string h = bf_word(hi, hl, A, 2);
+            for (uint32_t nl = 0; nl <= 4; ++nl) {
+                const uint64_t nn = 1ull << nl;
+                for (uint64_t ni = 0; ni < nn; ++ni) {
+                    const std::string n = bf_word(ni, nl, A, 2);
+                    const int32_t want = bf_naive(h.data(), hl, n.data(), nl);
+                    const int32_t got = ku::bytes_find(h.data(), hl,
+                                                       n.data(), nl);
+                    const int32_t sc = ku::bytes_find_scalar(h.data(), hl,
+                                                             n.data(), nl);
+                    ++checked;
+                    if (got != want || sc != want) {
+                        ++mism;
+                        if (mism < 4) {
+                            ADD_FAILURE() << "h='" << h << "' n='" << n
+                                          << "' want=" << want
+                                          << " simd=" << got
+                                          << " scalar=" << sc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mism, 0u);
+    EXPECT_GT(checked, 200000u);   // proves the sweep was not vacuous
+}
+
+TEST_F(Utf8Test, BytesFindVectorLaneExhaustiveNeedlesVsNaive) {
+    // Haystacks long enough that span >= 16 for every needle tested, so the
+    // SIMD lane runs on EVERY case here (asserted below via `reached`).
+    const char* A = "abc";
+    std::size_t checked = 0, mism = 0, reached = 0;
+    // hl >= 19 so that even the longest needle here (4) leaves
+    // span = hl - 4 + 1 >= 16 and therefore takes the vector lane.
+    for (uint32_t hl = 19; hl <= 80; ++hl) {
+        // Two deterministic haystacks per length: a dense {a,b} one (many
+        // first/last-byte hits -> hammers the mask drain loop) and a sparser
+        // {a,b,c} one.
+        const std::string hays[2] = {
+            bf_word(0x9E3779B97F4A7C15ull * (hl + 1), hl, "ab", 2),
+            bf_word(0xD1B54A32D192ED03ull * (hl + 7), hl, A, 3)};
+        for (const std::string& h : hays) {
+            for (uint32_t nl = 2; nl <= 4; ++nl) {
+                uint64_t nn = 1;
+                for (uint32_t t = 0; t < nl; ++t) nn *= 3;
+                for (uint64_t ni = 0; ni < nn; ++ni) {
+                    const std::string n = bf_word(ni, nl, A, 3);
+                    ASSERT_GE(hl - nl + 1u, 16u);
+                    ++reached;
+#if BOLT_SIMD_NEON || BOLT_SIMD_AVX2 || BOLT_SIMD_SSE42
+                    // Drive the vector loop DIRECTLY as well: bytes_find is a
+                    // hybrid (memchr anchor, then the vector loop on the
+                    // remainder), so calling only bytes_find would leave the
+                    // vector lane's own first block under-tested.
+                    EXPECT_EQ(ku::bytes_find_simd(h.data(), hl, n.data(), nl),
+                              bf_naive(h.data(), hl, n.data(), nl));
+#endif
+                    const int32_t want = bf_naive(h.data(), hl, n.data(), nl);
+                    const int32_t got = ku::bytes_find(h.data(), hl,
+                                                       n.data(), nl);
+                    ++checked;
+                    if (got != want) {
+                        ++mism;
+                        if (mism < 4) {
+                            ADD_FAILURE() << "hl=" << hl << " h='" << h
+                                          << "' n='" << n << "' want=" << want
+                                          << " got=" << got;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mism, 0u);
+    EXPECT_GT(reached, 10000u);
+    EXPECT_EQ(checked, reached);   // every case had a vector-eligible span
+}
+
+TEST_F(Utf8Test, BytesFindRandomizedAlignmentsAndPlantedMatches) {
+    // Randomized, every load alignment 0..31, planted matches at the first,
+    // middle and LAST legal start position (the overlapping tail block), plus
+    // near-misses that match the first byte OR the last byte but not both --
+    // the exact shape the first+last filter must reject.
+    std::mt19937_64 rng(0xB017F19Du);
+    std::vector<char> buf(1024);
+    std::size_t checked = 0, mism = 0, hits = 0;
+    for (int iter = 0; iter < 40000; ++iter) {
+        const uint32_t hl = 16u + static_cast<uint32_t>(rng() % 240u);
+        const uint32_t nl = 2u + static_cast<uint32_t>(rng() % 9u);
+        const uint32_t off = static_cast<uint32_t>(rng() % 32u);
+        const uint32_t asz = 2u + static_cast<uint32_t>(rng() % 3u);  // 2..4
+        char* h = buf.data() + off;
+        for (uint32_t i = 0; i < hl; ++i) {
+            h[i] = static_cast<char>('a' + (rng() % asz));
+        }
+        std::string n(nl, 'a');
+        for (uint32_t i = 0; i < nl; ++i) {
+            n[i] = static_cast<char>('a' + (rng() % asz));
+        }
+        if (nl <= hl && (rng() & 3u) == 0u) {   // plant a real match
+            const uint32_t span = hl - nl + 1u;
+            const uint32_t where = (rng() % 3u) == 0u ? 0u
+                                 : (rng() % 2u) == 0u ? span - 1u
+                                                      : (rng() % span);
+            std::memcpy(h + where, n.data(), nl);
+        }
+        const int32_t want = bf_naive(h, hl, n.data(), nl);
+        const int32_t got = ku::bytes_find(h, hl, n.data(), nl);
+        const int32_t sc = ku::bytes_find_scalar(h, hl, n.data(), nl);
+        ++checked;
+        if (want >= 0) ++hits;
+        if (got != want || sc != want) {
+            ++mism;
+            if (mism < 4) {
+                ADD_FAILURE() << "iter=" << iter << " hl=" << hl
+                              << " nl=" << nl << " off=" << off
+                              << " want=" << want << " simd=" << got
+                              << " scalar=" << sc;
+            }
+        }
+    }
+    EXPECT_EQ(mism, 0u);
+    EXPECT_EQ(checked, 40000u);
+    EXPECT_GT(hits, 5000u);   // a sweep with no matches proves nothing
+}
+
 }  // namespace
