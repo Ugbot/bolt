@@ -27,7 +27,16 @@ struct Snapshot {
     int64_t     timestamp_ms;
     int64_t     sequence_number;
     SnapshotOp  op;
-    uint8_t     _pad[7];
+    uint8_t     _pad0[3];
+    // G2ICE-50 — the schema the snapshot was COMMITTED under. pyiceberg's own
+    // golden metadata carries it on every snapshot and bolt emitted none, so a
+    // time-travel read of a pre-evolution snapshot had nothing to bind its
+    // columns by except the CURRENT schema. Carried per snapshot rather than
+    // derived from `Metadata::current_schema_id` at emit time for exactly that
+    // reason: deriving it would silently relabel every historical snapshot
+    // with the newest schema the moment a column was added. Takes 4 of the 7
+    // pad bytes, so the struct's size and layout are unchanged.
+    int32_t     schema_id;
     char        manifest_list[kIcebergMaxManifestPath];
 };
 

@@ -409,11 +409,49 @@ inline RowVal row_val_fixed(const BoltColumn& col, std::size_t elem,
                   static_cast<std::uint32_t>(elem)};
 }
 
-// BYTE_ARRAY row view: StringView, inline for <= 12 bytes else spilled.
-// Returns n == UINT32_MAX when the value is spilled but no spill base exists
-// (a malformed column), which callers treat as a hard error.
+// BYTE_ARRAY row view. A Utf8/Binary column legitimately occurs in TWO
+// physical layouts and this writer must read both (G2ICE-87):
+//
+//   * `ColumnFormat::Flat`/`View` -- a StringView array, inline for <= 12
+//     bytes else spilled into `str_overflow_base`. What the parquet READER
+//     and every compute operator produce.
+//   * `ColumnFormat::VarBinary`  -- `dict_child` int32 offsets over a packed
+//     byte pool in `data`. What connectors and MarbleDB produce: `txn_batch`
+//     serializes Utf8 as VarBinary and `bolt_wire_parse` rebuilds that same
+//     format, so EVERY Utf8 column read out of a sealed MarbleDB SST block
+//     arrives here as VarBinary.
+//
+// Reading the second as the first is a silent garbage read, not a crash
+// (the hazard `BoltColumn::utf8_at` was added for) -- an int32 offset pair
+// reinterpreted as a StringView yields whatever length the offsets happen to
+// spell. That is what broke Iceberg tiering: the offsets spelled a >12-byte
+// length, the spill base was the packed pool, the dictionary builder bailed,
+// PLAIN encoding then refused, and the row group failed AFTER the fixed-width
+// columns' pages were already on disk -- leaving a footerless file that
+// pyarrow diagnoses as "Parquet magic bytes not found in footer".
+//
+// Returns n == UINT32_MAX for a malformed column (spilled with no spill base,
+// or a format that cannot carry bytes at all), which callers treat as a hard
+// error. Never guesses.
 inline RowVal row_val_bytes(const BoltColumn& col, std::int64_t r) noexcept {
-    assert(col.data != nullptr);
+    assert(r >= 0);
+    assert(col.data != nullptr || col.format == ColumnFormat::VarBinary);
+    if (col.format == ColumnFormat::VarBinary) {
+        if (col.dict_child == nullptr || col.dict_child->data == nullptr) {
+            return RowVal{nullptr, 0xFFFFFFFFu};
+        }
+        const auto* offs = static_cast<const std::int32_t*>(col.dict_child->data);
+        const std::int32_t start = offs[r];
+        const std::int32_t end   = offs[r + 1];
+        if (end < start) return RowVal{nullptr, 0xFFFFFFFFu};
+        const std::uint32_t len = static_cast<std::uint32_t>(end - start);
+        if (len == 0u) return RowVal{nullptr, 0u};
+        if (col.data == nullptr) return RowVal{nullptr, 0xFFFFFFFFu};
+        return RowVal{static_cast<const std::uint8_t*>(col.data) + start, len};
+    }
+    if (col.format != ColumnFormat::Flat && col.format != ColumnFormat::View) {
+        return RowVal{nullptr, 0xFFFFFFFFu};
+    }
     const auto* sv = static_cast<const StringView*>(col.data);
     const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
     const std::uint32_t len = sv[r].length;

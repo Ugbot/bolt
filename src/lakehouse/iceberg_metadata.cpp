@@ -99,6 +99,7 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
     out->parent_snapshot_id = -1;
     out->sequence_number = 0;
     out->op = SnapshotOp::kUnknown;
+    out->schema_id = 0;   // spec default when a snapshot omits it
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
@@ -115,6 +116,12 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
             read_int64(it, &out->timestamp_ms);
         } else if (tok_eq(idx, key, "sequence-number")) {
             read_int64(it, &out->sequence_number);
+        } else if (tok_eq(idx, key, "schema-id")) {
+            // Read back so an open->modify->persist cycle preserves the schema
+            // each historical snapshot was committed under, instead of
+            // rewriting them all as the current one (G2ICE-50).
+            int64_t v = 0; read_int64(it, &v);
+            out->schema_id = static_cast<int32_t>(v);
         } else if (tok_eq(idx, key, "manifest-list")) {
             read_str(idx, it, out->manifest_list, kIcebergMaxManifestPath);
         } else if (tok_eq(idx, key, "summary")) {

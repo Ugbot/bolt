@@ -201,6 +201,45 @@ bool path_join(const char* a, const char* b, char* out, uint32_t cap) noexcept {
     return true;
 }
 
+// G2ICE-84 — every location Iceberg RECORDS is absolute; every key the
+// ObjectStore is ADDRESSED with is relative to its root. Those are two
+// different strings for the same byte range and this writer used to emit the
+// store key in both places.
+//
+// The spec says a data file's `file_path`, a manifest-list's `manifest_path`
+// and a snapshot's `manifest-list` are "full URI"s, and every real catalog
+// writes them that way. bolt's own reader hid the bug: `iceberg_scan.cpp`'s
+// `read_ref` tries three rebasings in turn (location-relative, strip-root,
+// join-table-rel), so it resolved `metadata/snap-1.avro` perfectly well.
+// pyiceberg resolves the string LITERALLY and opened it under the READER's
+// working directory -- `/private/tmp/metadata/snap-...avro` for a table that
+// lives in `/tmp/ice84_fix` -- so the table scanned from exactly one
+// directory on earth and failed everywhere else.
+//
+// `th->root` is `meta.location`, set from the same argument at table_create,
+// so joining against it produces a location consistent with what the metadata
+// declares. Overflow is a hard failure: a TRUNCATED location names the wrong
+// file, which is worse than not committing.
+bool abs_location(const char* root, const char* rel, char* out,
+                  uint32_t cap) noexcept {
+    assert(root != nullptr && rel != nullptr);
+    assert(out != nullptr && cap > 0u);
+    return path_join(root, rel, out, cap);
+}
+
+// The inverse: the ObjectStore key for a location this writer recorded.
+// Absolute since G2ICE-84, relative in anything written before it, so both
+// shapes must resolve or a table stops being readable across the change.
+const char* store_key_for(const char* root, const char* loc) noexcept {
+    assert(root != nullptr && loc != nullptr);
+    const size_t rl = std::strlen(root);
+    if (rl > 0u && std::strncmp(loc, root, rl) == 0 &&
+        (loc[rl] == '/' || loc[rl] == '\\')) {
+        return loc + rl + 1u;
+    }
+    return loc;
+}
+
 int64_t now_ms() noexcept {
     using namespace std::chrono;
     return duration_cast<milliseconds>(
@@ -327,6 +366,62 @@ void table_uuid_from_location(const char* loc, char* dst,
     assert(o == 36u);
 }
 
+namespace {
+
+// G2ICE-84 — the body of the `schema.name-mapping.default` table property,
+// returned NUL-terminated so the caller can hand it to `buf_kv_str` and get
+// the outer JSON-string escaping for free (the mapping is itself JSON stored
+// INSIDE a string, so it has to be escaped twice; doing that by hand is how
+// a stray quote in a column name corrupts the metadata).
+//
+// WHY A NAME MAPPING AND NOT FIELD IDS. Iceberg binds a data file's columns
+// to schema fields by FIELD ID, read from the parquet `field_id` on each
+// SchemaElement. bolt's parquet writer emits none — `ParquetWriteColumn` has
+// no field_id member — so pyiceberg refuses the scan outright:
+//
+//     ValueError: Parquet file does not have field-ids and the Iceberg table
+//     does not have 'schema.name-mapping.default' defined
+//
+// The spec defines exactly one remedy for field-id-less data files and this
+// is it: a table property carrying a name→id mapping the reader applies while
+// projecting. It is what every engine uses for tables imported from plain
+// parquet, and it needs no change to the parquet writer.
+//
+// Stamping real field ids into the parquet is the better long-term answer —
+// ids travel with the file, so it stays bindable when read outside its table,
+// and a rename cannot break it — and it is the recorded follow-up. It is not
+// done here because it means adding a member to `ParquetWriteColumn` and a
+// SchemaElement field to the parquet writer, which is another lane's file.
+//
+// DERIVED from the schema on every emit rather than stored on Metadata, for
+// the same reason `last-column-id` is: a mapping that can drift from the
+// schema it describes projects the WRONG COLUMN, silently.
+bool emit_name_mapping_json(Arena* a, const Schema* s,
+                            const char** out) noexcept {
+    assert(a != nullptr && out != nullptr);
+    if (s == nullptr) return false;
+    if (s->n_fields > kIcebergMaxFieldsPerSchema) return false;
+    Buf b;
+    // One extra byte is reserved below for the NUL, so cap is never reached
+    // exactly by buf_put; a full buffer fails the emit rather than truncating.
+    if (!buf_init(&b, a, 64u * 1024u)) return false;
+    if (!buf_put(&b, "[")) return false;
+    for (uint32_t i = 0; i < s->n_fields; ++i) {          // bounded
+        if (i > 0 && !buf_put(&b, ",")) return false;
+        if (!buf_fmt(&b, "{\"field-id\":%d,\"names\":[\"",
+                     s->fields[i].id)) return false;
+        if (!buf_put_jstr(&b, s->fields[i].name)) return false;
+        if (!buf_put(&b, "\"]}")) return false;
+    }
+    if (!buf_put(&b, "]")) return false;
+    if (b.len + 1u > b.cap) return false;
+    b.data[b.len] = 0;
+    *out = reinterpret_cast<const char*>(b.data);
+    return true;
+}
+
+}  // namespace
+
 bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         bool is_view, const char* view_dialect,
                         const char* view_sql, int64_t view_version_id,
@@ -350,6 +445,22 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
         }
     }
     if (!buf_fmt(&b, "\"last-column-id\":%d,", last_col_id)) return false;
+
+    // `last-partition-id` is likewise REQUIRED by v2 and was likewise missing.
+    // Derived, not stored, for the same reason: it is exactly the largest
+    // partition field id assigned so far, and the spec starts that numbering
+    // at 1000, so an unpartitioned table reports 999 ("none assigned yet")
+    // rather than 0 — which would claim id 0 had been handed out.
+    int32_t last_part_id = 999;
+    for (uint32_t i = 0; i < m->n_specs; ++i) {            // bounded
+        const PartitionSpec& sp = m->specs[i];
+        for (uint32_t j = 0; j < sp.n_fields; ++j) {       // bounded
+            if (sp.fields[j].field_id > last_part_id) {
+                last_part_id = sp.fields[j].field_id;
+            }
+        }
+    }
+    if (!buf_fmt(&b, "\"last-partition-id\":%d,", last_part_id)) return false;
     if (!buf_fmt(&b, "\"last-updated-ms\":%lld,",
                  static_cast<long long>(m->last_updated_ms))) return false;
     if (!buf_fmt(&b, "\"last-sequence-number\":%lld,",
@@ -368,11 +479,30 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
     for (uint32_t i = 0; i < m->n_schemas; ++i) {
         if (i > 0 && !buf_put(&b, ",")) return false;
         const Schema& s = m->schemas[i];
-        if (!buf_fmt(&b, "{\"schema-id\":%d,\"fields\":[",
+        // An Iceberg schema IS a struct type, so it carries "type":"struct"
+        // beside its fields. This was omitted here while `emit_schema_json`
+        // (the manifest's copy of the very same structure) always had it —
+        // two emitters of one thing, one of them wrong. bolt's own PARSER
+        // never reads "type", so the round trip stayed green while DuckDB
+        // 1.4.5 refused the table outright: "StructType required property
+        // 'type' is missing".
+        if (!buf_fmt(&b, "{\"type\":\"struct\",\"schema-id\":%d,\"fields\":[",
                      s.schema_id)) return false;
         for (uint32_t j = 0; j < s.n_fields; ++j) {
             if (j > 0 && !buf_put(&b, ",")) return false;
             const SchemaField& f = s.fields[j];
+            // `SchemaField::type` is a primitive type NAME. A nested field's
+            // type is a JSON OBJECT, which this flat POD cannot hold — the
+            // parser collapses one to the literal string "struct" (see
+            // parse_field). Re-emitting that as `"type":"struct"` would
+            // describe a struct with no fields and silently drop every nested
+            // column, so it fails the emit instead, exactly as an
+            // unrepresentable partition transform does below.
+            if (std::strcmp(f.type, "struct") == 0 ||
+                std::strcmp(f.type, "list") == 0 ||
+                std::strcmp(f.type, "map") == 0) {
+                return false;
+            }
             if (!buf_fmt(&b, "{\"id\":%d,", f.id)) return false;
             if (!buf_kv_str(&b, "name", f.name, true)) return false;
             if (!buf_kv_str(&b, "type", f.type, true)) return false;
@@ -421,6 +551,20 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
     }
     if (!buf_put(&b, "],")) return false;
 
+    // properties — carries `schema.name-mapping.default` so a reader can bind
+    // bolt's field-id-less parquet to this schema (G2ICE-84).
+    if (!buf_put(&b, "\"properties\":{")) return false;
+    {
+        const Schema* cur = metadata_current_schema(m);
+        if (cur != nullptr) {
+            const char* nm = nullptr;
+            if (!emit_name_mapping_json(a, cur, &nm)) return false;
+            if (!buf_kv_str(&b, "schema.name-mapping.default", nm,
+                            false)) return false;
+        }
+    }
+    if (!buf_put(&b, "},")) return false;
+
     // snapshots
     if (!buf_put(&b, "\"snapshots\":[")) return false;
     for (uint32_t i = 0; i < m->n_snapshots; ++i) {
@@ -440,6 +584,7 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                      static_cast<long long>(s.timestamp_ms),
                      static_cast<long long>(s.sequence_number))) return false;
         if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
+        if (!buf_fmt(&b, "\"schema-id\":%d,", s.schema_id)) return false;
         if (!buf_fmt(&b, "\"summary\":{\"operation\":\"%s\"}}", op)) return false;
     }
     if (!buf_put(&b, "],")) return false;
@@ -777,6 +922,44 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                   static_cast<long long>(snap_id));
     if (!commit_object(th->os, mrel, manifest_body, manifest_len)) return false;
 
+    // A snapshot's manifest list names EVERY manifest live at that snapshot,
+    // not just the one the commit added. This wrote a one-entry list, so each
+    // append REPLACED the table's contents: after two 6-row commits both
+    // pyiceberg and bolt saw 6 rows, and nothing noticed because the write
+    // tests assert snapshot COUNTS and bolt's reader, following the same
+    // one-entry list, agreed with the writer perfectly. pyiceberg reading the
+    // fixture is what surfaced it (G2ICE-84).
+    //
+    // Carried forward for APPEND only. Overwrite/replace/delete deliberately
+    // start a fresh list: their predicate semantics are still deferred (see
+    // table_overwrite/table_delete), and carrying files forward under an
+    // operation named "overwrite" would assert a table state the writer has
+    // not actually computed.
+    ManifestListEntry* mlist =
+        th->arena->allocate_array<ManifestListEntry>(kIcebergMaxManifestsPerList);
+    if (mlist == nullptr) return false;
+    uint32_t n_mlist = 0;
+    if (op == SnapshotOp::kAppend && parent > 0) {
+        const Snapshot* ps = nullptr;
+        for (uint32_t i = 0; i < th->meta.n_snapshots; ++i) {   // bounded
+            if (th->meta.snapshots[i].snapshot_id == parent) {
+                ps = &th->meta.snapshots[i];
+                break;
+            }
+        }
+        if (ps != nullptr && ps->manifest_list[0] != '\0') {
+            const uint8_t* pb = nullptr; uint64_t pl = 0;
+            const char* pkey = store_key_for(th->root, ps->manifest_list);
+            // A parent list the store cannot produce means manifests we would
+            // silently drop — fail the commit instead.
+            if (os_get(th->os, pkey, th->arena, &pb, &pl) != kOsOk) return false;
+            if (!manifest_list_parse_avro(pb, pl, th->arena, mlist,
+                                          kIcebergMaxManifestsPerList - 1u,
+                                          &n_mlist)) return false;
+        }
+    }
+    if (n_mlist >= kIcebergMaxManifestsPerList) return false;
+
     // Manifest-list body — Avro OCF likewise.
     ManifestListEntry mle{};
     mle.partition_spec_id = th->meta.current_spec_id;
@@ -784,13 +967,22 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     mle.manifest_length   = static_cast<int64_t>(manifest_len);
     mle.added_snapshot_id = snap_id;
     mle.added_files_count = nf;
-    std::strncpy(mle.manifest_path, mrel, sizeof(mle.manifest_path) - 1u);
+    // Recorded absolute (G2ICE-84); the store is still keyed by `mrel`.
+    if (!abs_location(th->root, mrel, mle.manifest_path,
+                      sizeof(mle.manifest_path))) return false;
+    mlist[n_mlist++] = mle;
     const uint8_t* mlb = nullptr; uint64_t mll = 0;
-    if (!manifest_list_write_avro(&mle, 1, snap_id, seq, th->arena, &mlb, &mll))
+    if (!manifest_list_write_avro(mlist, n_mlist, snap_id, seq, th->arena,
+                                  &mlb, &mll))
         return false;
     char mlrel[128];
     std::snprintf(mlrel, sizeof(mlrel), "metadata/snap-%lld.avro",
                   static_cast<long long>(snap_id));
+    // Resolved BEFORE the snapshot record is opened below: past that point
+    // `n_snapshots` has already been incremented, so a late failure would
+    // leave a half-written snapshot in the metadata.
+    char mlabs[kIcebergMaxManifestPath];
+    if (!abs_location(th->root, mlrel, mlabs, sizeof(mlabs))) return false;
     if (!commit_object(th->os, mlrel, mlb, mll)) return false;
 
     // Record the snapshot.
@@ -802,7 +994,10 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     s.sequence_number    = ++th->meta.last_sequence_number;
     assert(s.sequence_number == seq);   // what the manifests were written with
     s.op                 = op;
-    std::strncpy(s.manifest_list, mlrel, sizeof(s.manifest_list) - 1u);
+    // The schema this snapshot is committed under, recorded now so a later
+    // schema evolution cannot retroactively relabel it (G2ICE-50).
+    s.schema_id          = th->meta.current_schema_id;
+    std::strncpy(s.manifest_list, mlabs, sizeof(s.manifest_list) - 1u);
     th->meta.current_snapshot_id = snap_id;
     return persist_metadata(th);
 }
@@ -822,7 +1017,9 @@ bool append_commit(AppendHandle* ah) noexcept {
     df.content           = FileContent::kData;
     df.partition_spec_id = ah->th->meta.current_spec_id;
     df.snapshot_id       = snap_id;
-    std::strncpy(df.file_path, rel, sizeof(df.file_path) - 1u);
+    // Absolute (G2ICE-84) — `rel` remains the ObjectStore key.
+    if (!abs_location(ah->th->root, rel, df.file_path,
+                      sizeof(df.file_path))) return false;
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
@@ -920,7 +1117,8 @@ bool table_overwrite(TableHandle* th, const Predicate* /*pred*/,
     df.content           = FileContent::kData;
     df.partition_spec_id = th->meta.current_spec_id;
     df.snapshot_id       = snap_id;
-    std::strncpy(df.file_path, rel, sizeof(df.file_path) - 1u);
+    if (!abs_location(th->root, rel, df.file_path,
+                      sizeof(df.file_path))) return false;
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
     return publish_snapshot(th, &df, 1, SnapshotOp::kOverwrite, snap_id);

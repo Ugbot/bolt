@@ -1023,6 +1023,16 @@ target_link_libraries(test_bolt_parquet_write
 bolt_apply_hardening(test_bolt_parquet_write)
 add_test(NAME test_bolt_parquet_write COMMAND test_bolt_parquet_write)
 
+# G2ICE-87 — the writer must read BOTH physical Utf8 layouts (StringView +
+# spill, and VarBinary offsets + packed pool: the shape every MarbleDB SST
+# block carries), and must never leave a footerless file behind. Fixtures are
+# re-read by scripts/parquet_varbinary_interop.py with pyarrow.
+add_executable(test_bolt_parquet_write_varbinary test_bolt_parquet_write_varbinary.cpp)
+target_link_libraries(test_bolt_parquet_write_varbinary
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_varbinary)
+add_test(NAME test_bolt_parquet_write_varbinary COMMAND test_bolt_parquet_write_varbinary)
+
 # Phase 2 — the parquet MEMORY sink. Asserts byte-EQUALITY with the file sink
 # (a "does it parse" test cannot catch a sink that reorders or drops a region,
 # since parquet is read through its footer offsets).
@@ -1395,6 +1405,17 @@ target_link_libraries(test_bolt_iceberg_manifest_write
 bolt_apply_hardening(test_bolt_iceberg_manifest_write)
 add_test(NAME test_bolt_iceberg_manifest_write COMMAND test_bolt_iceberg_manifest_write)
 
+# G2ICE-50 — is bolt's metadata.json a table OTHER implementations will open?
+# Writes a real table for scripts/iceberg_metadata_interop.py (pyiceberg +
+# DuckDB) and asserts the spec's required-property set on the emitted bytes.
+add_executable(test_bolt_iceberg_metadata_interop
+    test_bolt_iceberg_metadata_interop.cpp)
+target_link_libraries(test_bolt_iceberg_metadata_interop
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_metadata_interop)
+add_test(NAME test_bolt_iceberg_metadata_interop
+         COMMAND test_bolt_iceberg_metadata_interop)
+
 # G2FEAT-125 — SCAN a real Iceberg table end to end (metadata -> manifests ->
 # Parquet -> rows) over the complete pyiceberg warehouse in
 # data/golden_iceberg_table. The test above only decodes manifests.
@@ -1412,6 +1433,18 @@ target_link_libraries(test_bolt_lakehouse_iceberg_write
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_iceberg_write)
 add_test(NAME test_bolt_lakehouse_iceberg_write COMMAND test_bolt_lakehouse_iceberg_write)
+
+# G2ICE-84 — write a table for pyiceberg to read. This executable only WRITES
+# the fixture (and checks what it honestly can in-process); the value-level
+# verdict is scripts/iceberg_pyiceberg_interop.py, because bolt's own reader
+# rebases every recorded path and so cannot see a wrong one.
+add_executable(test_bolt_iceberg_pyiceberg_interop
+    test_bolt_iceberg_pyiceberg_interop.cpp)
+target_link_libraries(test_bolt_iceberg_pyiceberg_interop
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_pyiceberg_interop)
+add_test(NAME test_bolt_iceberg_pyiceberg_interop
+         COMMAND test_bolt_iceberg_pyiceberg_interop)
 
 # W2 — Delta read path.
 add_executable(test_bolt_lakehouse_delta_read test_bolt_lakehouse_delta_read.cpp)

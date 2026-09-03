@@ -63,6 +63,29 @@ void make_batch(bolt::Arena* a, bolt::BoltBatch* out, int64_t base,
     cols[0].data = idata;
 }
 
+// G2ICE-84 — a location Iceberg RECORDS and the key its ObjectStore is
+// ADDRESSED with are two different strings. Every recorded location is now an
+// absolute URI (which is what the spec says and what pyiceberg resolves
+// literally); the store is still keyed relative to its root. These assertions
+// used to feed a recorded location straight to `os_get`, which only worked
+// while the writer conflated the two.
+std::string store_key(const std::string& root, const char* loc) {
+    if (loc == nullptr) return std::string();
+    const std::string s(loc);
+    if (s.size() > root.size() && s.compare(0, root.size(), root) == 0 &&
+        (s[root.size()] == '/' || s[root.size()] == '\\')) {
+        return s.substr(root.size() + 1u);
+    }
+    return s;
+}
+
+bool location_is_absolute(const char* p) {
+    if (p == nullptr || p[0] == '\0') return false;
+    if (p[0] == '/') return true;
+    if (std::strstr(p, "://") != nullptr) return true;
+    return (p[1] == ':' && (p[2] == '/' || p[2] == '\\'));
+}
+
 }  // namespace
 
 TEST(IcebergWrite, CreateOpen) {
@@ -257,7 +280,10 @@ TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
 
     // 1. The manifest LIST the snapshot points at is a real OCF.
     const uint8_t* mlb = nullptr; uint64_t mll = 0;
-    ASSERT_EQ(os_get(&os, snap.manifest_list, &arena, &mlb, &mll), kOsOk);
+    EXPECT_TRUE(location_is_absolute(snap.manifest_list))
+        << "manifest-list must be an absolute URI: " << snap.manifest_list;
+    ASSERT_EQ(os_get(&os, store_key(root, snap.manifest_list).c_str(), &arena,
+                     &mlb, &mll), kOsOk);
     ASSERT_GE(mll, 4u);
     EXPECT_EQ(std::memcmp(mlb, "Obj\x01", 4), 0) << "manifest list is not Avro";
 
@@ -273,7 +299,10 @@ TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
     //    the append just wrote — including the two fields readers trust
     //    without verifying: record_count and file_size_in_bytes.
     const uint8_t* mb = nullptr; uint64_t mbl = 0;
-    ASSERT_EQ(os_get(&os, mle[0].manifest_path, &arena, &mb, &mbl), kOsOk);
+    EXPECT_TRUE(location_is_absolute(mle[0].manifest_path))
+        << "manifest_path must be an absolute URI: " << mle[0].manifest_path;
+    ASSERT_EQ(os_get(&os, store_key(root, mle[0].manifest_path).c_str(), &arena,
+                     &mb, &mbl), kOsOk);
     ASSERT_GE(mbl, 4u);
     EXPECT_EQ(std::memcmp(mb, "Obj\x01", 4), 0) << "manifest is not Avro";
     // The length the list advertises must be the manifest's real length, or a
@@ -294,7 +323,10 @@ TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
 
     // The data file the manifest names must exist at the size it claims.
     ObjectMeta dm{};
-    ASSERT_EQ(os_head(&os, df[0].file_path, &dm), kOsOk);
+    EXPECT_TRUE(location_is_absolute(df[0].file_path))
+        << "file_path must be an absolute URI: " << df[0].file_path;
+    ASSERT_EQ(os_head(&os, store_key(root, df[0].file_path).c_str(), &dm),
+              kOsOk);
     EXPECT_TRUE(dm.exists);
     EXPECT_EQ(df[0].stats.file_size_in_bytes, static_cast<int64_t>(dm.size));
 

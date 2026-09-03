@@ -361,8 +361,18 @@ struct RowGroupRec {
 }  // namespace
 
 // Fully-defined writer state (opaque to callers).
+// Longest path `parquet_write_open` accepts. Every supported platform's own
+// limit is at or below this (1024 on macOS, 4096 on Linux, ~32k only via the
+// \\?\ prefix on Windows). Bounded because the writer must be able to DELETE
+// its own file when close fails -- see parquet_write_close.
+constexpr std::size_t kPwMaxPathLen = 4096u;
+
 struct ParquetWriter {
     std::ofstream     fout;
+    // The file this writer streams to, kept so a failed close can remove the
+    // partial file rather than leave a footerless one behind. Empty for the
+    // memory sink.
+    char              path[kPwMaxPathLen];
     ParquetWriteOpts  opts;
     std::int64_t      file_pos;        // bytes written
     bool              failed;
@@ -562,12 +572,17 @@ bool encode_plain_byte_array(const BoltColumn& col, std::int64_t r_begin,
     assert(dst != nullptr);
     assert(r_begin <= r_end);
     assert(col.data != nullptr || r_begin == r_end);
-    const auto* sv = static_cast<const StringView*>(col.data);
-    const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
+    // Both physical Utf8/Binary layouts (StringView+spill and VarBinary
+    // offsets+pool) resolve through row_val_bytes -- see its comment. This
+    // used to open-code the StringView case, which is why a VarBinary column
+    // (every MarbleDB SST block's Utf8) took the "spilled with no base" exit
+    // and failed the row group. G2ICE-87.
     for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
-        const std::uint32_t len = sv[r].length;
+        const RowVal v = row_val_bytes(col, r);
+        if (v.n == 0xFFFFFFFFu) return false;
+        const std::uint32_t len = v.n;
         const std::uint8_t lb[4] = {
             static_cast<std::uint8_t>(len & 0xFFu),
             static_cast<std::uint8_t>((len >> 8) & 0xFFu),
@@ -576,16 +591,7 @@ bool encode_plain_byte_array(const BoltColumn& col, std::int64_t r_begin,
         };
         dst->insert(dst->end(), lb, lb + 4);
         if (len == 0u) continue;
-        if (len <= 12u) {
-            // Inline payload — prefix[4] + inline_data[8] are contiguous.
-            const std::uint8_t* p =
-                reinterpret_cast<const std::uint8_t*>(&sv[r].prefix[0]);
-            dst->insert(dst->end(), p, p + len);
-        } else {
-            if (spill == nullptr) return false;
-            const std::uint8_t* p = spill + sv[r].ref.offset;
-            dst->insert(dst->end(), p, p + len);
-        }
+        dst->insert(dst->end(), v.p, v.p + len);
     }
     return true;
 }
@@ -641,24 +647,21 @@ bool compute_stats_utf8(const BoltColumn& col, std::int64_t r_begin,
     assert(rec != nullptr);
     assert(r_begin <= r_end);
     assert(col.data != nullptr || r_begin == r_end);
-    const auto* sv    = static_cast<const StringView*>(col.data);
-    const auto* spill = static_cast<const std::uint8_t*>(col.str_overflow_base);
+    // Layout-agnostic byte access (StringView+spill OR VarBinary
+    // offsets+pool) -- see row_val_bytes. G2ICE-87.
     const std::uint8_t* mn_p = nullptr; std::uint32_t mn_n = 0;
     const std::uint8_t* mx_p = nullptr; std::uint32_t mx_n = 0;
     for (std::int64_t r = r_begin; r < r_end; ++r) {
         const bool valid = (!nullable) || def_bits[r] != 0;
         if (!valid) continue;
-        const std::uint32_t len = sv[r].length;
+        const RowVal v = row_val_bytes(col, r);
+        if (v.n == 0xFFFFFFFFu) return true;           // can't read: omit
+        const std::uint32_t len = v.n;
         if (len > sizeof(rec->min_buf)) return true;   // omit stats (see above)
-        const std::uint8_t* p;
-        if (len <= 12u) {
-            // Inline payload — prefix[4] + inline_data[8] are contiguous
-            // (same layout contract encode_plain_byte_array relies on).
-            p = reinterpret_cast<const std::uint8_t*>(&sv[r].prefix[0]);
-        } else {
-            if (spill == nullptr) return true;         // can't read: omit
-            p = spill + sv[r].ref.offset;
-        }
+        // An empty value has no bytes; keep a non-null pointer so memcpy of
+        // length 0 below stays defined.
+        static const std::uint8_t kEmpty[1] = {0};
+        const std::uint8_t* p = (v.p != nullptr) ? v.p : kEmpty;
         if (mn_p == nullptr || stat_lex_cmp(p, len, mn_p, mn_n) < 0) {
             mn_p = p; mn_n = len;
         }
@@ -2176,6 +2179,10 @@ ParquetWriter* parquet_write_open(const char* path,
             }
         }
     }
+    // Bounded, and rejected rather than truncated: a truncated path would name
+    // a DIFFERENT file for the failure-cleanup unlink.
+    const std::size_t path_len = std::strlen(path);
+    if (path_len == 0u || path_len >= kPwMaxPathLen) return nullptr;
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
     w->opts = *opts;
@@ -2187,6 +2194,8 @@ ParquetWriter* parquet_write_open(const char* path,
     w->failed = false;
     w->total_rows = 0;
     w->to_mem = false;
+    std::memcpy(w->path, path, path_len + 1u);
+    assert(w->path[path_len] == '\0');
     w->fout.open(path, std::ios::binary | std::ios::trunc);
     if (!w->fout.is_open()) {
         delete w;
@@ -2253,6 +2262,7 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     w->failed = false;
     w->total_rows = 0;
     w->to_mem = true;
+    w->path[0] = '\0';   // no file to unlink on failure
     // One allocation up front instead of a growth curve. Capped so a bad
     // estimate cannot commit an unbounded reservation.
     constexpr std::uint64_t kMaxReserve = 1ull << 31;   // 2 GiB
@@ -2319,6 +2329,23 @@ BoltColumn slice_column(const BoltColumn& c, BoltType t,
     if (start == 0) return s;
     if (c.format == ColumnFormat::Nested) {
         // Offsets live in dict_child as a Flat Int32 column of length+1.
+        if (off_scratch == nullptr) return s;          // cannot slice safely
+        if (c.dict_child == nullptr || c.dict_child->data == nullptr) return s;
+        *off_scratch = *c.dict_child;
+        off_scratch->data = static_cast<std::int32_t*>(c.dict_child->data) + start;
+        off_scratch->length = rows + 1;
+        s.dict_child = off_scratch;
+        s.validity_offset = c.validity_offset + start;
+        return s;
+    }
+    // A VARBINARY column cannot be advanced the flat way either: `data` is a
+    // packed byte POOL, not a row-indexed buffer, and the row -> byte mapping
+    // lives in the dict_child offsets. Advance the OFFSETS (they are absolute
+    // into the pool, so leaving `data` alone keeps every row resolvable with
+    // no copy) exactly as the Nested branch above does. Without this, a
+    // multi-row-group VarBinary Utf8 column would silently emit row group 1's
+    // strings from row 0 onwards. G2ICE-87.
+    if (c.format == ColumnFormat::VarBinary) {
         if (off_scratch == nullptr) return s;          // cannot slice safely
         if (c.dict_child == nullptr || c.dict_child->data == nullptr) return s;
         *off_scratch = *c.dict_child;
@@ -2510,11 +2537,38 @@ bool parquet_write_row_group(ParquetWriter* w,
     assert(w != nullptr);
     assert(batch != nullptr);
     if (w == nullptr || batch == nullptr || w->failed) return false;
-    if (batch->num_cols != w->opts.n_columns) return false;
+    // A REJECTED row group is a failed write, not a no-op: its rows never
+    // land, so finishing the file would silently produce one missing them.
+    // Latch `failed` on every rejection below (write_one_row_group's own
+    // failure already did) so close cannot hand back a short file to a caller
+    // that ignored this return value.
+    if (batch->num_cols != w->opts.n_columns) { w->failed = true; return false; }
     const std::int64_t n_rows = batch->num_rows;
-    if (n_rows < 0) return false;
+    if (n_rows < 0) { w->failed = true; return false; }
 
     const BoltColumn* cols = batch->columns[batch->read_epoch];
+    // Reject a BYTE_ARRAY column in a layout this writer cannot read BEFORE
+    // any bytes go to the sink. The encoders resolve Flat/View (StringView +
+    // spill) and VarBinary (offsets + packed pool); anything else would be
+    // reinterpreted as a StringView array -- a silent garbage read, which is
+    // strictly worse than a refusal. Failing here also means the file never
+    // gains a half-written row group. G2ICE-87.
+    for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
+        const BoltType t = w->opts.columns[c].type;
+        if (t != BoltType::Utf8 && t != BoltType::Binary) continue;
+        const ColumnFormat f = cols[c].format;
+        if (f == ColumnFormat::VarBinary) {
+            if (cols[c].dict_child == nullptr && n_rows > 0) {
+                w->failed = true;
+                return false;
+            }
+            continue;
+        }
+        if (f != ColumnFormat::Flat && f != ColumnFormat::View) {
+            w->failed = true;
+            return false;
+        }
+    }
     // G2FEAT-24: 0 keeps the legacy one-call-one-rowgroup contract; > 0
     // splits into consecutive row groups of at most that many rows.
     const std::int64_t cap =
@@ -2569,6 +2623,18 @@ bool parquet_write_close(ParquetWriter* w) noexcept {
     bool ok = !w->failed && sink_ok(w);
     if (ok) ok = finish_footer(w);
     w->fout.close();
+    // A file WITHOUT a footer is not a parquet file, and leaving one on disk
+    // is worse than leaving nothing: it has the right name and the right
+    // extension, an Iceberg/Delta manifest can end up pointing at it, and the
+    // only tool that says so is whatever tries to read it much later
+    // ("Parquet magic bytes not found in footer"). Every failure exit above
+    // leaves exactly that -- the leading "PAR1" plus however many pages the
+    // row groups managed -- so the partial file is removed here. The caller
+    // still sees false; this only makes the failure LOOK like a failure on
+    // disk too. G2ICE-87.
+    if (!ok && w->path[0] != '\0') {
+        (void)std::remove(w->path);
+    }
     delete w;
     return ok;
 }
@@ -2586,8 +2652,11 @@ bool parquet_write_close_mem(ParquetWriter* w, Arena* arena,
     }
     // A writer opened on a PATH has already streamed its bytes to disk; there
     // is nothing in `mem` to hand back, and returning an empty buffer would
-    // look like a valid zero-row file.
+    // look like a valid zero-row file. Its partial, footerless file is
+    // removed for the same reason parquet_write_close removes one.
     if (!w->to_mem) {
+        w->fout.close();
+        if (w->path[0] != '\0') (void)std::remove(w->path);
         delete w;
         return false;
     }
