@@ -937,6 +937,16 @@ target_link_libraries(test_bolt_groupby_radix_hash
 bolt_apply_hardening(test_bolt_groupby_radix_hash)
 add_test(NAME test_bolt_groupby_radix_hash COMMAND test_bolt_groupby_radix_hash)
 
+# G2GRAPH-27 — WRITE-bound contract for the join probe kernels, compiled with
+# -DNDEBUG so it exercises the assert-free configuration consumers ship. Every
+# emit bound here used to be an `assert`, i.e. absent from a stock Release.
+add_executable(test_bolt_join_bounds test_bolt_join_bounds.cpp)
+target_link_libraries(test_bolt_join_bounds
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_join_bounds PRIVATE NDEBUG)
+bolt_apply_hardening(test_bolt_join_bounds)
+add_test(NAME test_bolt_join_bounds COMMAND test_bolt_join_bounds)
+
 # Typed all-shapes SwissTable join kernel (bolt/join/bolt_joinkernel.h).
 add_executable(test_bolt_joinkernel test_bolt_joinkernel.cpp)
 target_link_libraries(test_bolt_joinkernel

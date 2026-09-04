@@ -263,6 +263,11 @@ inline constexpr uint8_t  kHJMaxKeys                = 8;
 inline constexpr uint32_t kHJDefaultExpectedDupFact = 4;
 inline constexpr uint32_t kHJMaxChainLen            = 4096;
 
+// Sentinel returned by every multi-match probe that would otherwise write past
+// its caller's `pairs_cap`. SIZE_MAX is not a reachable pair count (the buffer
+// it indexes could not exist), so no in-band value is stolen.
+inline constexpr size_t kHJProbeOverflow = static_cast<size_t>(-1);
+
 struct HashJoinChainNode {
     uint32_t build_idx;   // build-side row id
     int32_t  next;        // index into chain_nodes[], or -1 = end
@@ -355,7 +360,12 @@ inline bool hash_join_build_chained(
         const uint32_t p = hj_partition_of(h);
         const int32_t prev_head = out->partitions[p].find(h);
         const uint32_t node_idx = out->chain_size++;
-        assert(node_idx < out->chain_cap);
+        // G2GRAPH-27: was `assert(node_idx < out->chain_cap)` -- an assert
+        // standing directly in front of a write into chain_nodes[], i.e. absent
+        // from any -DNDEBUG build. The arena is sized build_rows x dup_factor
+        // so this cannot trip for a well-formed cfg; over-cap returns false
+        // ("no silent growth", this header's own contract) rather than writing.
+        if (node_idx >= out->chain_cap) return false;
         out->chain_nodes[node_idx].build_idx = static_cast<uint32_t>(i);
         out->chain_nodes[node_idx].next      = prev_head;
         if (!out->partitions[p].insert(h, node_idx)) return false;
@@ -364,8 +374,13 @@ inline bool hash_join_build_chained(
 }
 
 // Multi-match probe: walk each probe row's chain and emit ALL matching
-// (build_idx, probe_idx) pairs. Returns total pairs written. Over-cap is a
-// hard assert — caller pre-sizes `pairs_cap` (default: probe_rows × 8).
+// (build_idx, probe_idx) pairs. Returns total pairs written, or
+// kHJProbeOverflow if the emit would pass `pairs_cap` / the chain walk exceeds
+// the build's structural node count (one node per build row, so a longer walk
+// means a corrupt `next` link). Nothing is written past the cap; the caller
+// pre-sizes `pairs_cap` (default: probe_rows × 8) and MUST test the sentinel.
+// G2GRAPH-27: both bounds were `assert`s, i.e. absent from any -DNDEBUG build,
+// which left an out-of-bounds write on a skewed build side.
 inline size_t hash_join_probe_multi_match(
         const HashJoinBuildChained* build_side,
         const uint64_t* const* BOLT_RESTRICT lkeys,
@@ -378,22 +393,24 @@ inline size_t hash_join_probe_multi_match(
     assert(lkeys != nullptr && rkeys != nullptr);
     assert(pairs_out_build != nullptr && pairs_out_probe != nullptr);
     const uint8_t nk = build_side->n_keys;
+    // One chain node per build row: a longer walk is a corrupt `next` link.
+    const uint64_t walk_limit = build_side->build_rows;
     size_t out = 0;
     for (size_t r = 0; r < n_probe_rows; ++r) {
         const uint64_t h = hj_composite_hash_int64(rkeys, nk,
                                                    static_cast<int64_t>(r));
         const uint32_t p = hj_partition_of(h);
         int32_t node = build_side->partitions[p].find(h);
-        uint32_t chain_len = 0;
+        uint64_t chain_len = 0;
         while (node >= 0) {
-            assert(chain_len < kHJMaxChainLen);
+            if (chain_len >= walk_limit) return kHJProbeOverflow;
             const HashJoinChainNode& nd =
                 build_side->chain_nodes[static_cast<uint32_t>(node)];
             const uint32_t bi = nd.build_idx;
             if (hj_keys_equal_int64(lkeys, rkeys, nk,
                                     static_cast<int64_t>(bi),
                                     static_cast<int64_t>(r))) {
-                assert(out < pairs_cap);
+                if (out >= pairs_cap) return kHJProbeOverflow;
                 pairs_out_build[out] = bi;
                 pairs_out_probe[out] = static_cast<uint32_t>(r);
                 ++out;

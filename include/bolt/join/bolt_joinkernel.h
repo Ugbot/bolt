@@ -65,6 +65,18 @@ namespace bolt {
 // "No match -> emit NULL for this side." Used as a build_idx / probe_idx value.
 inline constexpr int32_t kJoinNullIndex = -1;
 
+// Over-cap sentinel for every probe entry point in this header. A probe that
+// would write past `pairs_cap`, or that walks a chain longer than the build
+// side structurally allows (a corrupt `next` link), returns this instead of
+// writing. Callers MUST test it: `pairs_cap` used to be enforced only by an
+// `assert`, which is absent from any -DNDEBUG build.
+inline constexpr size_t kJkProbeOverflow = kHJProbeOverflow;
+
+// True iff a probe entry point reported over-cap / structural failure.
+BOLT_FORCE_INLINE bool jk_probe_failed(size_t n) noexcept {
+    return n == kJkProbeOverflow;
+}
+
 // True iff any of row `r`'s composite key columns is NULL (Arrow validity).
 BOLT_FORCE_INLINE bool join_row_has_null(const BoltColumn* keys, uint8_t n_keys,
                                          int64_t r) noexcept {
@@ -701,12 +713,34 @@ inline bool jk_build_partition_range(const BoltColumn* key_cols, uint8_t n_keys,
 // Exact (== 1) for the case that dominates analytical joins: a unique / primary
 // key build side, where every insert found an empty chain so distinct == rows.
 // With duplicates present, all of them could in principle sit on one chain, so
-// the safe bound is (rows - distinct + 1) — still far tighter than `rows`, and
-// additionally capped by kHJMaxChainLen, which the probe loops already assert
-// no chain can exceed.
+// the safe bound is (rows - distinct + 1) — still far tighter than `rows`.
+//
+// G2GRAPH-27: this used to end with `if (fan > kHJMaxChainLen) fan = 4096;`.
+// That was a SILENT CLAMP on the only number a caller has to size its pair
+// buffer from, justified by the probe loops' `assert(walk < kHJMaxChainLen)` —
+// but an assert is absent from any -DNDEBUG build and the BUILD path imposes
+// no per-chain limit at all, so nothing enforced it. A build side with >4096
+// rows on one key (chukonu's TAQ `trade JOIN quote ON sym`, already documented
+// as a hard abort in python/tests/native/test_golden_taq.py) then made the
+// sizing path budget 4096 matches per probe row while the walking path emitted
+// every one of them: measured 12,000 pairs into an 8,192-slot buffer, an
+// out-of-bounds WRITE reachable from a user query. The bound and the walk must
+// agree, so the bound is now the true one and the walk is checked at runtime
+// (see jk_chain_walk_limit / kJkProbeOverflow).
 //
 // Never returns 0 (a caller dividing by this must not trip), and never returns
 // more than build_rows.
+// Structural upper bound on how many nodes one chain walk may visit. The build
+// allocates exactly ONE chain node per build row, so a chain cannot legally be
+// longer than build_rows; anything past that means a corrupt / cyclic `next`
+// link, and the walk must terminate rather than run forever. This is the honest
+// bound — it is a property of the data structure, unlike the fixed
+// kHJMaxChainLen that nothing ever enforced.
+BOLT_FORCE_INLINE uint64_t jk_chain_walk_limit(const JoinBuildTyped* build) noexcept {
+    assert(build != nullptr);
+    return build->build_rows;
+}
+
 BOLT_FORCE_INLINE uint64_t jk_max_fanout(const JoinBuildTyped* build) noexcept {
     assert(build != nullptr);
     if (build->build_rows == 0) return 1;
@@ -717,7 +751,6 @@ BOLT_FORCE_INLINE uint64_t jk_max_fanout(const JoinBuildTyped* build) noexcept {
     assert(distinct <= build->build_rows);
     if (distinct >= build->build_rows) return 1;          // all keys unique
     uint64_t fan = build->build_rows - distinct + 1;
-    if (fan > kHJMaxChainLen) fan = kHJMaxChainLen;
     if (fan > build->build_rows) fan = build->build_rows;
     assert(fan >= 1 && fan <= build->build_rows);
     return fan;
@@ -763,8 +796,8 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
     assert(build != nullptr && probe_keys != nullptr);
     assert(jk_is_int64_shape_type(probe_keys[0].type));
     assert(!UseBloom || build->has_bloom != 0);
-    (void)pairs_cap;
     const BoltColumn& pk = probe_keys[0];
+    const uint64_t walk_limit = jk_chain_walk_limit(build);
     size_t out = 0;
     for (int64_t r = 0; r < n_probe; ++r) {
         if (!gb_detail::cell_valid(pk, r)) continue;  // NULL != NULL
@@ -785,7 +818,7 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
             // touched. (DaMoN'24 unchained-layout reading applied to this
             // probe: fewer dependent lines per probe, same output.)
             if (node >= 0) {
-                assert(out < pairs_cap);
+                if (out >= pairs_cap) return kJkProbeOverflow;
                 assert(build->chain_nodes[static_cast<uint32_t>(node)].next < 0);
                 out_build[out] = node;
                 out_probe[out] = static_cast<int32_t>(r);
@@ -793,13 +826,13 @@ BOLT_FORCE_INLINE size_t jk_probe_one_int64(const JoinBuildTyped* build,
             }
             continue;
         }
-        uint32_t walk = 0;
+        uint64_t walk = 0;
         while (node >= 0) {
-            assert(walk < kHJMaxChainLen);
+            if (walk >= walk_limit) return kJkProbeOverflow;  // corrupt chain
             const uint32_t slot = static_cast<uint32_t>(node);
             // Build stored the raw value as the table key, so a find() hit on
             // `key` is already an exact key match — no per-row cell compare.
-            assert(out < pairs_cap);
+            if (out >= pairs_cap) return kJkProbeOverflow;
             out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
             out_probe[out] = static_cast<int32_t>(r);
             ++out;
@@ -917,13 +950,13 @@ BOLT_FORCE_INLINE size_t jk_window_resolve(const JoinBuildTyped* build,
                                            size_t out, size_t pairs_cap) noexcept {
     assert(build != nullptr);
     assert(n <= kJkProbeWindowMax);
-    (void)pairs_cap;
+    const uint64_t walk_limit = jk_chain_walk_limit(build);
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t p = hj_partition_of(w_mix[i]);
         int32_t node = build->partitions[p].find_mixed(w_key[i], w_mix[i]);
         if constexpr (Unique) {
             if (node >= 0) {
-                assert(out < pairs_cap);
+                if (out >= pairs_cap) return kJkProbeOverflow;
                 assert(build->chain_nodes[static_cast<uint32_t>(node)].next < 0);
                 out_build[out] = node;
                 out_probe[out] = w_row[i];
@@ -931,11 +964,11 @@ BOLT_FORCE_INLINE size_t jk_window_resolve(const JoinBuildTyped* build,
             }
             continue;
         }
-        uint32_t walk = 0;
+        uint64_t walk = 0;
         while (node >= 0) {
-            assert(walk < kHJMaxChainLen);
+            if (walk >= walk_limit) return kJkProbeOverflow;  // corrupt chain
             const uint32_t slot = static_cast<uint32_t>(node);
-            assert(out < pairs_cap);
+            if (out >= pairs_cap) return kJkProbeOverflow;
             out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
             out_probe[out] = w_row[i];
             ++out;
@@ -978,6 +1011,7 @@ inline size_t jk_probe_one_int64_mlp(const JoinBuildTyped* build,
         jk_window_prefetch(build, n, w_mix);
         out = jk_window_resolve<Unique>(build, n, w_key, w_mix, w_row,
                                         out_build, out_probe, out, pairs_cap);
+        if (jk_probe_failed(out)) return out;  // fail closed, never wrap
     }
     return out;
 }
@@ -1129,8 +1163,8 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
     assert(build != nullptr);
     assert(out_build != nullptr && out_probe != nullptr);
     assert(!UseBloom || build->has_bloom != 0);
-    (void)pairs_cap;
     const uint8_t nk = build->n_keys;
+    const uint64_t walk_limit = jk_chain_walk_limit(build);
     size_t out = 0;
     for (int64_t r = 0; r < n_probe; ++r) {
         if (join_row_has_null(probe_keys, nk, r)) continue;  // NULL != NULL
@@ -1140,14 +1174,14 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
         }
         const uint32_t p = hj_partition_of(h);
         int32_t  node = build->partitions[p].find(h);
-        uint32_t walk = 0;
+        uint64_t walk = 0;
         while (node >= 0) {
-            assert(walk < kHJMaxChainLen);
+            if (walk >= walk_limit) return kJkProbeOverflow;  // corrupt chain
             const uint32_t slot = static_cast<uint32_t>(node);
             if (jk_detail::keys_equal_typed(probe_keys, nk, r, build->keys_flat,
                                             slot, build->key_types,
                                             build->key_str_base)) {
-                assert(out < pairs_cap);
+                if (out >= pairs_cap) return kJkProbeOverflow;
                 out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
                 out_probe[out] = static_cast<int32_t>(r);
                 ++out;
@@ -1162,8 +1196,15 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
 // INNER multi-match probe: for each probe row walk its chain and emit every
 // key-equal (build_idx, probe_idx) pair. Does NOT touch matched[] — the caller
 // sets matched[build_idx] only for pairs that also pass its residual, so the
-// OUTER/SEMI/ANTI drain is residual-correct. Over-cap is a hard assert; the
-// caller pre-sizes pairs_cap and chunks the probe morsel stream.
+// OUTER/SEMI/ANTI drain is residual-correct.
+//
+// RETURNS kJkProbeOverflow (test it with jk_probe_failed) when the emit would
+// pass `pairs_cap`, or when a chain walk exceeds the build's structural limit.
+// Nothing is written past the cap in either case, and the output written so
+// far must be discarded — it is a prefix, not a result. A caller that sizes a
+// block as `pairs_cap / jk_max_fanout(build)` cannot hit the cap arm; the check
+// is what makes that guarantee load-bearing instead of aspirational, in every
+// build configuration rather than only where asserts survive (G2GRAPH-27).
 //
 // Dispatches once on the build's cached key shape: a single integer key takes
 // the raw-value fast path (jk_probe_one_int64); everything else takes the typed
