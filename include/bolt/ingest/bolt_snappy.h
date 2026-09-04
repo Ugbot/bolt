@@ -52,6 +52,53 @@ inline void snappy_copy8(uint8_t* dst, const uint8_t* src) noexcept {
     std::memcpy(dst, &w, 8);
 }
 
+// Move `size` bytes (1..64 — the format's entire copy range) as a fixed number
+// of 16-byte units, overcopying to 32 or 64 rather than branching on the exact
+// length.
+//
+// WHY 16-BYTE UNITS AND NOT ONE WIDE memcpy: the source may OVERLAP the
+// destination, because `src` is usually `dst - off` for a back-reference. Unit i
+// reads [d-off+16i, d-off+16i+16) and the units run in program order, so unit
+// i's read is entirely inside bytes that units 0..i-1 have already made final
+// exactly when `off >= 16`. A single `memcpy(d, s, 32)` would carry no such
+// guarantee (it may move bytes in any internal order), which is why the width
+// is spelled out in units the caller's `off >= 16` precondition can cover.
+// Each unit is a constant-size memcpy, so it lowers to one ldr q / str q on
+// arm64 and one movups pair on x86-64, and the compiler may not reorder them
+// past each other because both pointers are uint8_t* and therefore may alias.
+//
+// `size` is therefore an ASSERTION, not a trip count: the write is always a
+// flat 64 bytes. Overcopies to 64, so the caller must have proven room.
+//
+// MEASURED, and it contradicted the obvious reasoning. 75-87% of real
+// back-references are <= 16 bytes (census of ClickBench URL and Title page
+// bodies below), so writing 64 bytes for 8 bytes of payload looks like 8x of
+// wasted store traffic, and the first version of this function duly branched:
+// 32 bytes always, the second 32 only `if (size > 32u)`. Removing that branch
+// is FASTER — 1.03x on both URL and Title, interleaved A/B/B/A, min-of-40 on a
+// loaded box. A three-tier 16/32/64 ladder is worse still (1.22x SLOWER than
+// flat 64 on URL), which is the same result read from the other end.
+//
+// So the cost here is branches, not bytes: at 3-4 GB/s these stores are ~4% of
+// L1 write bandwidth and free, while a branch whose condition is a length
+// distribution is not predictable enough to be. Recorded because the intuition
+// that store traffic must dominate is wrong on this machine, and the earlier
+// draft of this comment asserted the opposite on no evidence.
+//
+// REQUIRES: size <= 64, and either the regions do not overlap or off >= 16.
+// size == 0 is permitted: it is what the first deferred flush of a block does,
+// before any tag is owed, and it writes 64 bytes of pure overcopy.
+inline void snappy_copy_wide(uint8_t* dst, const uint8_t* src,
+                             uint64_t size) noexcept {
+    assert(size <= 64);
+    assert(dst != nullptr && src != nullptr);
+    (void)size;
+    std::memcpy(dst, src, 16);
+    std::memcpy(dst + 16, src + 16, 16);
+    std::memcpy(dst + 32, src + 32, 16);
+    std::memcpy(dst + 48, src + 48, 16);
+}
+
 // Copy `len` bytes to dst+op from dst+op-off, where `off` may be SMALLER
 // than `len` (a repeating pattern — snappy's overlapping copy).
 //
@@ -170,16 +217,17 @@ inline constexpr uint32_t kSnappyOffMask[4] = {0u, 0xFFu, 0xFFFFu, 0xFFFFFFFFu};
 // bounds check is needed inside it.
 //
 // Worst case is set by the DEFERRED copy: the loop guard tests `op`, but the
-// tag being decoded actually lands at `op + deferred_length`, up to 16 bytes
-// further on. Writing from there:
-//     copy element    op + 16 + 64 + 7   (format max length, plus overcopy)
-//     long literal    op + 16 + 60
-//     deferred flush  op + 16 + 16
-// so 87 is the true bound and 96 is the round number above it. Reading:
+// tag being decoded actually lands at `op + deferred_length`, and the deferred
+// length is now the format's full copy range (64) rather than 16. Writing:
+//     deferred flush  op + 64            (snappy_copy_wide, always <= 64 B)
+//     copy element    op + 64 + 64 + 8   (slow lane: settle, then copy_match
+//                                         at op+def_len with 8 B of overcopy)
+//     long literal    guarded explicitly against dst_len, see the loop
+// so 136 is the true bound and 192 is the round number above it. Reading:
 //     next tag        ip + 65            (tag + 60-byte literal payload + 1)
-//     literal payload ip + 1 + 60
+//     literal payload ip + 1 + 64        (wide flush reads 64 from src)
 //     offset word     ip + 5
-// 96 covers those with room to spare.
+// 192 covers those with room to spare.
 //
 // Getting this wrong is a heap overflow rather than a wrong answer, so it is
 // derived here rather than tuned: the previous value of 80 was correct for the
@@ -194,7 +242,7 @@ inline constexpr uint32_t kSnappyOffMask[4] = {0u, 0xFFu, 0xFFFFu, 0xFFFFFFFFu};
 // a slop-requiring decoder would be a heap overflow in each. Stopping the fast
 // loop 80 bytes early and letting the pre-existing careful loop finish the
 // tail buys the same freedom from bounds checks with no contract change.
-inline constexpr uint64_t kSnappyFastSlop = 96u;
+inline constexpr uint64_t kSnappyFastSlop = 192u;
 
 // Decompress one snappy block into dst (exactly dst_len bytes — the
 // caller sizes dst from snappy_uncompressed_len). False on any corrupt
@@ -296,7 +344,7 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
         //
         // Worth re-testing on a narrower core (and on x86), where the guard is a
         // larger share of the loop. Not here.
-        uint8_t safe_src[16] = {0};
+        uint8_t safe_src[64] = {0};
         const uint8_t* def_src = safe_src;
         uint64_t def_len = 0;
         uint32_t tag = src[ip];
@@ -333,13 +381,29 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
 
             const bool is_lit = (type == 0u);
             // One branch for everything the straight-line lane cannot do:
-            // a long literal (len sentinel 0), anything over 16 bytes, copy-4,
-            // an overlapping back-reference, or a corrupt one. False for ~99%
-            // of tags.
-            if (len == 0u || len > 16u ||
-                (!is_lit && (off < 8u || off > cur_op))) {
-                snappy_copy8(dst + op, def_src);          // settle the debt
-                snappy_copy8(dst + op + 8u, def_src + 8u);
+            // a long literal (len sentinel 0), a back-reference closer than the
+            // 16-byte copy unit, or a corrupt one.
+            //
+            // The length cap that used to sit here is GONE, and that is the
+            // whole change. It read `len > 16u`, which excluded every match
+            // longer than one 8-byte pair — and a census of the real ClickBench
+            // page bodies says those are 24.7% of URL's back-references and
+            // carry 66.4% of its copied BYTES (50.3% in matches of 33..64
+            // alone). So two thirds of the copy payload was leaving the
+            // straight-line lane for `snappy_copy_match`'s data-dependent loop,
+            // and the deficit against Google's decoder duly grew with the
+            // compression ratio: 1.02x on an all-literal column, 2.19x on URL.
+            // snappy_copy_wide covers the format's full 1..64 range, so the cap
+            // is not needed; `len` cannot exceed 64 for a copy or 60 for a
+            // short literal.
+            //
+            // `off < 16` replaces `off < 8` because the copy unit widened from
+            // 8 bytes to 16 — see snappy_copy_wide for why the unit width IS
+            // the minimum safe offset. It costs almost nothing: offsets in
+            // [8,16) are 0.82% of URL's copies and 0.42% of Title's, and they
+            // are not wrong here, just served by the careful path instead.
+            if (len == 0u || (!is_lit && (off < 16u || off > cur_op))) {
+                snappy_copy_wide(dst + op, def_src, def_len);   // settle the debt
                 op = cur_op;
                 def_src = safe_src;
                 def_len = 0;
@@ -400,15 +464,16 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
             // literal and a copy, so select it and defer; the two fixed stores
             // below are settling the PREVIOUS tag, not this one.
             //
-            // Safe for a copy because off >= 8 and the stores are sequential:
-            // by the time the second reads at cur_op + 8 - off, the first has
-            // already made cur_op .. cur_op+7 final. And the bytes this reads
-            // were written by the flush of the tag before it, which happened in
-            // the previous iteration — so they are final by program order.
+            // Safe for a copy because off >= 16 and the 16-byte units run in
+            // program order: unit i reads at cur_op + 16i - off, whose top is
+            // at or below cur_op + 16i, and units 0..i-1 have already made
+            // everything below that final. The bytes at and below cur_op were
+            // made final by the flush of the tag before it, in the previous
+            // iteration. Overcopy above the payload is meaningless but in
+            // bounds, and the next flush rewrites it at the same address.
             const uint8_t* from = is_lit ? (src + ip + 1u)
                                          : (dst + cur_op - off);
-            snappy_copy8(dst + op, def_src);
-            snappy_copy8(dst + op + 8u, def_src + 8u);
+            snappy_copy_wide(dst + op, def_src, def_len);
             op      = cur_op;
             def_src = from;
             def_len = len;
@@ -417,8 +482,7 @@ inline bool snappy_decompress(const uint8_t* src, uint64_t src_len,
         }
         // Settle whatever the loop still owes before the careful loop resumes.
         if (def_len != 0u) {
-            snappy_copy8(dst + op, def_src);
-            snappy_copy8(dst + op + 8u, def_src + 8u);
+            snappy_copy_wide(dst + op, def_src, def_len);
             op += def_len;
         }
     }

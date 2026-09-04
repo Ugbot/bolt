@@ -16,6 +16,7 @@
 
 #include "bolt/ingest/bolt_parquet_read.h"
 
+#include <bit>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -535,24 +536,102 @@ inline void sv_copy_small(uint8_t* d, const uint8_t* s, uint32_t n) noexcept {
     }
 }
 
-// Copy n >= 8 bytes with 8-byte moves and an overlapping tail. Used for the
-// spilled (>12 byte) string body, which on real data averages a few tens of
-// bytes -- far too few to amortise a libc call, and there is one per ROW.
+inline void sv_copy16(uint8_t* d, const uint8_t* s) noexcept {
+    uint64_t a, b;
+    std::memcpy(&a, s, 8);
+    std::memcpy(&b, s + 8, 8);
+    std::memcpy(d, &a, 8);
+    std::memcpy(d + 8, &b, 8);
+}
+inline void sv_copy32(uint8_t* d, const uint8_t* s) noexcept {
+    sv_copy16(d, s);
+    sv_copy16(d + 16, s + 16);
+}
+
+// Copy n >= 8 bytes for the spilled (>12 byte) string body. There is one of
+// these per ROW, so the per-call instruction count is the whole cost.
+//
+// WIDTH IS THE LEVER, NOT THE CALL. An 8-byte loop was already the fix for the
+// libc-call problem (recorded in PROJECT_MAP as the sv_from_bytes rewrite), but
+// it costs one iteration per 8 bytes, and the real string lengths this runs on
+// are much longer than the l_comment case that fix was measured against:
+// ClickBench `URL` spills average ~89 bytes, i.e. twelve iterations of
+// load/store/increment/compare/branch. Two adjacent 8-byte moves lower to one
+// arm64 ldp/stp pair (and one x86 16-byte pair), so a 32-byte step is four
+// instructions where the 8-byte loop needed roughly twenty.
+//
+// Bounds discipline is unchanged and is load-bearing: the caller has proven
+// exactly n readable source bytes and exactly n writable destination bytes
+// (`pos + blen <= vlen` and `cur + len <= overflow_cap`), so this must never
+// read past s+n nor write past d+n. Every step below is either fully inside
+// [0,n) or is the overlapping final block anchored at n - W, which is legal
+// precisely because the branch that selects it has already established n >= W.
 inline void sv_copy_bulk(uint8_t* d, const uint8_t* s, uint64_t n) noexcept {
     assert(n >= 8u);
-    uint64_t k = 0;
-    for (; k + 8u <= n; k += 8u) sv_copy8(d + k, s + k);   // bounded by n
-    if (k < n) sv_copy8(d + n - 8u, s + n - 8u);           // exact tail
+    if (n >= 32u) {
+        // 64-byte and libc-memcpy variants were both built and measured here:
+        // indistinguishable from this loop on real data (sf10 l_comment 1673 /
+        // 1761 / 1728 ms at box load 28). memcpy is NOT the answer at this
+        // length -- it was the problem the 8-byte loop originally fixed, and
+        // widening the step is what actually paid.
+        uint64_t k = 0;
+        for (; k + 32u <= n; k += 32u) sv_copy32(d + k, s + k);  // bounded by n
+        if (k < n) sv_copy32(d + n - 32u, s + n - 32u);          // overlaps back
+        return;
+    }
+    if (n >= 16u) {                      // 16..31: two 16-byte moves, overlapping
+        sv_copy16(d, s);
+        sv_copy16(d + n - 16u, s + n - 16u);
+        return;
+    }
+    sv_copy8(d, s);                      // 8..15:  two 8-byte moves, overlapping
+    sv_copy8(d + n - 8u, s + n - 8u);
+}
+
+// Write the whole 16-byte spilled StringView -- {length, prefix[4], buf_idx=0,
+// offset} -- as two 8-byte stores.
+//
+// The field-at-a-time form costs SIX stores to one 16-byte object: a 16-byte
+// zeroing memset, then length, then the 4-byte prefix, then buf_idx, then
+// offset. Every byte of a spilled view is overwritten, so the memset is pure
+// waste, and the three tail fields are three narrow stores into one word.
+//
+// The fused form is exact only where the object's byte image and the composed
+// word agree, so it is guarded on native endianness rather than assumed: the
+// prefix half is read out of `p` as a u32 and written back in the same order,
+// which reproduces p[0..3] verbatim on a little-endian target and would
+// byte-swap on a big-endian one. `if constexpr` means the guard costs nothing
+// and the portable path stays compiled and correct.
+inline void sv_store_ref(StringView* out, uint32_t len, const uint8_t* p,
+                         uint32_t off) noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+        uint32_t pre = 0;
+        std::memcpy(&pre, p, 4);                      // len > 12, so 4 are readable
+        const uint64_t w0 = static_cast<uint64_t>(len) |
+                            (static_cast<uint64_t>(pre) << 32);
+        const uint64_t w1 = static_cast<uint64_t>(off) << 32;   // buf_idx = 0
+        auto* d = reinterpret_cast<uint8_t*>(out);
+        std::memcpy(d, &w0, 8);
+        std::memcpy(d + 8, &w1, 8);
+    } else {
+        out->length = len;
+        sv_copy4(reinterpret_cast<uint8_t*>(out->prefix), p);
+        out->ref.buf_idx = 0;
+        out->ref.offset  = off;
+    }
 }
 
 bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
                    StringView* out) noexcept {
     assert(cx != nullptr && out != nullptr);
     assert(p != nullptr || len == 0);
-    std::memset(out, 0, sizeof(*out));
-    out->length = len;
-    if (len == 0) return true;
     if (len <= 12u) {
+        // The inline tail must be zeroed: consumers compare and hash the whole
+        // 16-byte word, so bytes past `length` are observable. Only the inline
+        // form needs it -- a spilled view writes all sixteen.
+        std::memset(out, 0, sizeof(*out));
+        out->length = len;
+        if (len == 0) return true;
         // prefix[4] and inline_data[8] are contiguous by StringView's layout,
         // so the inline form is one 12-byte region starting at prefix.
         sv_copy_small(reinterpret_cast<uint8_t*>(out->prefix), p, len);
@@ -579,10 +658,8 @@ bool sv_from_bytes(ColCtx* cx, const uint8_t* p, uint32_t len,
                 "cursor %llu past 4 GB\n", (unsigned long long)cur);
         return false;
     }
-    sv_copy4(reinterpret_cast<uint8_t*>(out->prefix), p);
     sv_copy_bulk(reinterpret_cast<uint8_t*>(cx->overflow) + cur, p, len);
-    out->ref.buf_idx = 0;
-    out->ref.offset  = static_cast<uint32_t>(cur);
+    sv_store_ref(out, len, p, static_cast<uint32_t>(cur));
     cx->overflow_cursor = cur + len;
     return true;
 }
@@ -787,6 +864,35 @@ bool plain_flba(ColCtx* cx, const uint8_t* v, uint64_t vlen,
 }
 
 // BYTE_ARRAY (u32 LE length prefix per value) -> Utf8 StringViews.
+//
+// MEASURED CEILING, for whoever takes this next. Stubbing sv_copy_bulk to a
+// no-op (wrong results, ceiling probe only) on the real ClickBench
+// `hits.parquet` `URL` column, all 226 row groups, 99,997,497 rows:
+// 3216 ms -> 2296 ms. The spilled-body copy alone is therefore ~921 ms, i.e.
+// 28.6% of that column's whole decode, and eliminating it entirely would be
+// ~1.40x on the column. It moves ~8.1 GB, so it is running at ~8.8 GB/s
+// against a measured 68.3 GB/s single-thread memcpy ceiling on this box.
+// Widening the step (this change) recovered part of it; the rest is not a
+// copy-width problem and will not yield to another loop rewrite.
+//
+// The structural fix is to STOP COPYING: decompress a PLAIN BYTE_ARRAY data
+// page directly into the column's overflow buffer at the current cursor, then
+// let each view's ref.offset point at the body already sitting there. The
+// lifetime contract is UNCHANGED -- the bytes still live in the arena-owned
+// overflow buffer for the column's life, so this is not the dangling-view
+// hazard that G2FEAT-283/-295/-307 were (a view into a recycled page buffer
+// would be). Two preconditions have already been checked and hold:
+//   - overflow_cap is sized from the chunk's UNCOMPRESSED page bytes, so a
+//     page's full decompressed image fits by construction (see
+//     ensure_overflow_room). Budget the dictionary page's own spill too --
+//     today both draw on the same unc_sum.
+//   - the values must be contiguous in the page, i.e. PLAIN encoding and no
+//     level prefix. All 105 ClickBench columns are REQUIRED (max_def == 0),
+//     and only ~6% of `URL` values survive as dictionary-encoded, so the
+//     PLAIN path is where essentially all of the time is.
+// Inline (<=12 byte) values still materialise into the view itself; they just
+// leave their copy in the overflow buffer unreferenced, which the cap already
+// accounts for.
 bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
                 const uint32_t* def, int64_t row0, uint32_t nrows,
                 uint32_t nvalid) noexcept {
