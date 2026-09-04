@@ -1193,6 +1193,206 @@ BOLT_FORCE_INLINE size_t jk_probe_general(const JoinBuildTyped* build,
     return out;
 }
 
+// ===========================================================================
+// RESUMABLE probe (G2GRAPH-96) — a legitimately large join answers, bounded.
+//
+// The non-resumable kernels above bound one call to `pairs_cap` by refusing
+// (kJkProbeOverflow) the moment the emit would pass it. The caller sizes its
+// block as `pairs_cap / jk_max_fanout(build)` so that arm is normally
+// unreachable — but that division FLOORS TO ZERO once a single key's fan-out
+// exceeds `pairs_cap`, and one probe row is the smallest block there is. A
+// build side with more than `pairs_cap` rows on one key therefore has NO legal
+// block size: the join is refused rather than answered, for a result that is
+// perfectly well defined and merely larger than one buffer.
+//
+// The fix is not a bigger buffer (fan-out is unbounded, so any constant is the
+// same bug at a larger scale) — it is to make ONE PROBE ROW resumable, so an
+// arbitrarily long chain is delivered across as many bounded calls as it takes.
+// `JkProbeCursor` is that resume point: which probe row, which chain node
+// within it, and how far the walk had already gone (the corrupt-chain guard
+// must not restart at zero on resume, or a cyclic `next` would loop forever
+// one bounded call at a time).
+//
+// Forward progress is guaranteed: the cursor is only parked when `out` has
+// reached `pairs_cap >= 1`, so every call that parks emitted at least one pair.
+//
+// The corrupt-chain arm stays LOUD: a walk past the structural limit still
+// returns kJkProbeOverflow, and a resumable caller must fail on it exactly as
+// the non-resumable one does. Capacity is now a schedule; corruption is not.
+struct JkProbeCursor {
+    int64_t  row;     // next probe row to process (0..n_probe)
+    int32_t  node;    // chain node to resume at for `row`; -1 == fresh row
+    uint64_t walk;    // chain steps already spent on `row` (guard continuity)
+    uint8_t  active;  // 1 == parked mid-row at (row, node, walk)
+};
+
+BOLT_FORCE_INLINE void jk_cursor_reset(JkProbeCursor* c) noexcept {
+    assert(c != nullptr);
+    c->row = 0; c->node = -1; c->walk = 0; c->active = 0;
+    assert(c->active == 0 && c->row == 0);
+}
+
+// True once the cursor has delivered every pair for a probe block of n rows.
+BOLT_FORCE_INLINE bool jk_cursor_done(const JkProbeCursor* c,
+                                      int64_t n) noexcept {
+    assert(c != nullptr && n >= 0);
+    return c->active == 0 && c->row >= n;
+}
+
+// Resumable OneInt64 probe. Emits the SAME pair sequence as
+// jk_probe_one_int64<UseBloom,false> would, split across however many calls
+// `pairs_cap` forces. Deliberately scalar: the windowed (MLP) schedule buffers
+// a whole window before resolving, so a mid-window park would need a second
+// cursor over the window itself for no benefit — the resume path is the rare
+// path by construction (it only runs when one key's fan-out exceeds the cap).
+//
+// The Unique fast lane is not replicated here either: a unique build side has
+// fan-out 1 and can never park, and the generic walk emits the identical slot
+// for a one-node chain (every build init site stores build_idx == slot).
+template <bool UseBloom>
+inline size_t jk_probe_one_int64_resume(const JoinBuildTyped* build,
+                                        const BoltColumn* probe_keys,
+                                        int64_t n_probe,
+                                        int32_t* BOLT_RESTRICT out_build,
+                                        int32_t* BOLT_RESTRICT out_probe,
+                                        size_t pairs_cap,
+                                        JkProbeCursor* cur) noexcept {
+    assert(build != nullptr && probe_keys != nullptr && cur != nullptr);
+    assert(jk_is_int64_shape_type(probe_keys[0].type));
+    assert(pairs_cap >= 1 && "a cap of 0 could park without progress");
+    assert(cur->row >= 0 && cur->row <= n_probe);
+    const BoltColumn& pk = probe_keys[0];
+    const uint64_t walk_limit = jk_chain_walk_limit(build);
+    size_t out = 0;
+    for (int64_t r = cur->row; r < n_probe; ++r) {
+        int32_t  node;
+        uint64_t walk;
+        if (cur->active != 0) {                 // resume THIS row mid-chain
+            assert(r == cur->row);
+            node = cur->node; walk = cur->walk; cur->active = 0;
+        } else {
+            if (!gb_detail::cell_valid(pk, r)) continue;  // NULL != NULL
+            const uint64_t key   = jk_read_int64_key(pk, r);
+            const uint64_t mixed = swiss_mix(key);
+            if constexpr (UseBloom) {
+                if (!sbbf_test(build->bloom, mixed)) continue;
+            }
+            node = build->partitions[hj_partition_of(mixed)].find(key);
+            walk = 0;
+        }
+        while (node >= 0) {
+            if (walk >= walk_limit) return kJkProbeOverflow;  // corrupt chain
+            if (out >= pairs_cap) {             // park: capacity, not failure
+                cur->row = r; cur->node = node; cur->walk = walk;
+                cur->active = 1;
+                assert(out >= 1 && "parking without progress would spin");
+                return out;
+            }
+            const uint32_t slot = static_cast<uint32_t>(node);
+            out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
+            out_probe[out] = static_cast<int32_t>(r);
+            ++out;
+            node = build->chain_nodes[slot].next;
+            ++walk;
+        }
+    }
+    cur->row = n_probe; cur->node = -1; cur->walk = 0; cur->active = 0;
+    assert(out <= pairs_cap);
+    return out;
+}
+
+// Resumable general typed probe — same contract as the int64 arm above, over
+// the composite-hash / typed-equality walk.
+template <bool UseBloom>
+inline size_t jk_probe_general_resume(const JoinBuildTyped* build,
+                                      const BoltColumn* probe_keys,
+                                      int64_t n_probe,
+                                      int32_t* BOLT_RESTRICT out_build,
+                                      int32_t* BOLT_RESTRICT out_probe,
+                                      size_t pairs_cap,
+                                      JkProbeCursor* cur) noexcept {
+    assert(build != nullptr && out_build != nullptr && out_probe != nullptr);
+    assert(cur != nullptr && pairs_cap >= 1);
+    assert(cur->row >= 0 && cur->row <= n_probe);
+    const uint8_t  nk         = build->n_keys;
+    const uint64_t walk_limit = jk_chain_walk_limit(build);
+    size_t out = 0;
+    for (int64_t r = cur->row; r < n_probe; ++r) {
+        int32_t  node;
+        uint64_t walk;
+        if (cur->active != 0) {
+            assert(r == cur->row);
+            node = cur->node; walk = cur->walk; cur->active = 0;
+        } else {
+            if (join_row_has_null(probe_keys, nk, r)) continue;  // NULL != NULL
+            const uint64_t h = jk_detail::hash_keys_typed(probe_keys, nk, r);
+            if constexpr (UseBloom) {
+                if (!sbbf_test(build->bloom, h)) continue;
+            }
+            node = build->partitions[hj_partition_of(h)].find(h);
+            walk = 0;
+        }
+        while (node >= 0) {
+            if (walk >= walk_limit) return kJkProbeOverflow;  // corrupt chain
+            const uint32_t slot = static_cast<uint32_t>(node);
+            if (jk_detail::keys_equal_typed(probe_keys, nk, r, build->keys_flat,
+                                            slot, build->key_types,
+                                            build->key_str_base)) {
+                if (out >= pairs_cap) {         // park BEFORE consuming the hit
+                    cur->row = r; cur->node = node; cur->walk = walk;
+                    cur->active = 1;
+                    assert(out >= 1 && "parking without progress would spin");
+                    return out;
+                }
+                out_build[out] = static_cast<int32_t>(build->chain_nodes[slot].build_idx);
+                out_probe[out] = static_cast<int32_t>(r);
+                ++out;
+            }
+            node = build->chain_nodes[slot].next;
+            ++walk;
+        }
+    }
+    cur->row = n_probe; cur->node = -1; cur->walk = 0; cur->active = 0;
+    assert(out <= pairs_cap);
+    return out;
+}
+
+// Resumable sibling of join_probe_typed. Same dispatch, same pair sequence,
+// but `pairs_cap` bounds ONE CALL rather than the whole probe: drive it until
+// jk_cursor_done(cur, n_probe). The cursor MUST be jk_cursor_reset() before
+// the first call for a given (build, probe block) pair, and the block must be
+// presented identically on every resume — `cur->row` indexes into it.
+//
+// STILL returns kJkProbeOverflow (jk_probe_failed) for a corrupt / cyclic
+// chain. That is the one condition the caller cannot schedule around, and it
+// must stay a loud failure rather than becoming an empty result.
+inline size_t join_probe_typed_resume(const JoinBuildTyped* build,
+                                      const BoltColumn* probe_keys,
+                                      int64_t n_probe,
+                                      int32_t* BOLT_RESTRICT out_build,
+                                      int32_t* BOLT_RESTRICT out_probe,
+                                      size_t pairs_cap, bool use_bloom,
+                                      JkProbeCursor* cur) noexcept {
+    assert(build != nullptr && cur != nullptr);
+    assert(out_build != nullptr && out_probe != nullptr);
+    assert(join_decimal_scales_match(build, probe_keys));
+    const bool bloom = use_bloom && build->has_bloom != 0;
+    if (build->key_shape == static_cast<uint8_t>(JoinKeyShape::OneInt64)) {
+        return bloom
+            ? jk_probe_one_int64_resume<true>(build, probe_keys, n_probe,
+                                              out_build, out_probe, pairs_cap,
+                                              cur)
+            : jk_probe_one_int64_resume<false>(build, probe_keys, n_probe,
+                                               out_build, out_probe, pairs_cap,
+                                               cur);
+    }
+    return bloom
+        ? jk_probe_general_resume<true>(build, probe_keys, n_probe, out_build,
+                                        out_probe, pairs_cap, cur)
+        : jk_probe_general_resume<false>(build, probe_keys, n_probe, out_build,
+                                         out_probe, pairs_cap, cur);
+}
+
 // INNER multi-match probe: for each probe row walk its chain and emit every
 // key-equal (build_idx, probe_idx) pair. Does NOT touch matched[] — the caller
 // sets matched[build_idx] only for pairs that also pass its residual, so the
