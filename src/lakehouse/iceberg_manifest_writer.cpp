@@ -170,6 +170,18 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
             static_cast<uint64_t>(n_files) * kEntryFields + 1u);
     if (rows == nullptr) return false;
 
+    // A manifest is homogeneous by spec: it holds data files or delete files,
+    // never both, and its OCF `content` metadata says which. Deriving it from
+    // the files (rather than taking it as a parameter) makes the two
+    // impossible to disagree; a mixed set is refused rather than mislabelled,
+    // because a reader trusts the label and would apply a delete file as data.
+    const bool deletes_manifest =
+        (n_files != 0 && files[0].content != FileContent::kData);
+    for (uint32_t r = 1; r < n_files; ++r) {          // bounded by n_files
+        const bool d = (files[r].content != FileContent::kData);
+        if (d != deletes_manifest) return false;
+    }
+
     uint64_t value_bytes = 0;
     for (uint32_t r = 0; r < n_files; ++r) {          // bounded by n_files
         const DataFileRef* d = &files[r];
@@ -222,7 +234,10 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         {"partition-spec-id", reinterpret_cast<const uint8_t*>(spec_id_buf),
          static_cast<uint32_t>(spec_id_len), 0u},
         {"format-version", reinterpret_cast<const uint8_t*>("2"), 1u, 0u},
-        {"content", reinterpret_cast<const uint8_t*>("data"), 4u, 0u},
+        {"content",
+         reinterpret_cast<const uint8_t*>(deletes_manifest ? "deletes"
+                                                           : "data"),
+         deletes_manifest ? 7u : 4u, 0u},
     };
     constexpr uint32_t kNMeta = sizeof(meta) / sizeof(meta[0]);
 
@@ -275,8 +290,18 @@ bool manifest_list_write_avro(const ManifestListEntry* entries,
         put_long(&v[i++], e->manifest_length);
         put_long(&v[i++], static_cast<int64_t>(e->partition_spec_id));
         put_long(&v[i++], static_cast<int64_t>(e->content));
-        put_long(&v[i++], sequence_number);
-        put_long(&v[i++], sequence_number);
+        // A carried-forward manifest keeps the sequence number it was
+        // COMMITTED at; only a manifest this commit adds takes the current
+        // one. Stamping every entry with `sequence_number` silently disarms
+        // positional deletes — see ManifestListEntry::sequence_number.
+        {
+            const int64_t seq =
+                e->sequence_number != 0 ? e->sequence_number : sequence_number;
+            const int64_t mseq =
+                e->min_sequence_number != 0 ? e->min_sequence_number : seq;
+            put_long(&v[i++], seq);
+            put_long(&v[i++], mseq);
+        }
         put_long(&v[i++], e->added_snapshot_id != 0 ? e->added_snapshot_id
                                                     : snapshot_id);
         put_long(&v[i++], e->added_files_count);

@@ -95,7 +95,7 @@ TEST(IcebergManifestWrite, ManifestListRoundTrip) {
     ice::ManifestListEntry in[2]{};
     for (int i = 0; i < 2; ++i) {
         in[i].partition_spec_id = 0;
-        in[i].content           = ice::FileContent::kData;
+        in[i].content           = ice::ManifestContent::kDataManifest;
         in[i].manifest_length   = 4096 + i;
         in[i].added_snapshot_id = 777;
         in[i].added_files_count = 2 + i;

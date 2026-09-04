@@ -1446,6 +1446,28 @@ bolt_apply_hardening(test_bolt_iceberg_pyiceberg_interop)
 add_test(NAME test_bolt_iceberg_pyiceberg_interop
          COMMAND test_bolt_iceberg_pyiceberg_interop)
 
+# G2ICE-82 — the ORACLE half, registered so it actually runs. The C++ half only
+# writes the fixture; the verdict that the positionally-deleted row is absent
+# can only come from a reader that is not bolt. Exit 2 (pyiceberg not
+# installed) is reported as SKIPPED rather than passed, so a missing oracle can
+# never be mistaken for a green one.
+# Deliberately PATH's python3 rather than find_package(Python3): the oracle
+# needs the interpreter that has pyiceberg installed, and CMake's search
+# routinely picks a different one, which would report SKIP forever.
+set(BOLT_ORACLE_PYTHON python3)
+add_test(NAME test_bolt_iceberg_pyiceberg_oracle
+         COMMAND ${CMAKE_COMMAND} -E env
+                 BOLT_ICEBERG_INTEROP_DIR=${CMAKE_CURRENT_BINARY_DIR}/pyice_fixture
+                 ${BOLT_ORACLE_PYTHON}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_pyiceberg_interop.py
+                 ${CMAKE_CURRENT_BINARY_DIR}/pyice_fixture)
+set_tests_properties(test_bolt_iceberg_pyiceberg_oracle PROPERTIES
+    SKIP_RETURN_CODE 2
+    FIXTURES_REQUIRED pyiceberg_fixture)
+set_tests_properties(test_bolt_iceberg_pyiceberg_interop PROPERTIES
+    FIXTURES_SETUP pyiceberg_fixture
+    ENVIRONMENT BOLT_ICEBERG_INTEROP_DIR=${CMAKE_CURRENT_BINARY_DIR}/pyice_fixture)
+
 # W2 — Delta read path.
 add_executable(test_bolt_lakehouse_delta_read test_bolt_lakehouse_delta_read.cpp)
 target_link_libraries(test_bolt_lakehouse_delta_read

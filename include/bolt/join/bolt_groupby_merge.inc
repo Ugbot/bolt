@@ -165,6 +165,11 @@ inline bool groupby_agg_multi_key_typed_merge_class(
     assert(!dst->any_distinct && !src->any_distinct &&
            "DISTINCT partials are not mergeable (v1)");
     if (dst->oom || src->oom) return false;
+    // G2COV-30: a partial fold (ingest stopped at a NULL group key) must
+    // never be merged INTO a clean destination, and must poison one it is
+    // merged into, or the refusal is lost at the merge boundary.
+    if (src->null_key) { dst->null_key = true; return false; }
+    if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
 #ifndef NDEBUG
     for (uint32_t k = 0; k < dst->n_keys; ++k) {
@@ -226,6 +231,11 @@ inline bool groupby_agg_multi_key_typed_merge_list(
     assert(!dst->any_distinct && !src->any_distinct &&
            "DISTINCT partials are not mergeable (v1)");
     if (dst->oom || src->oom) return false;
+    // G2COV-30: a partial fold (ingest stopped at a NULL group key) must
+    // never be merged INTO a clean destination, and must poison one it is
+    // merged into, or the refusal is lost at the merge boundary.
+    if (src->null_key) { dst->null_key = true; return false; }
+    if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t g = gids[i];
@@ -283,6 +293,11 @@ inline bool groupby_typed_merge_dense_range(
     assert(!dst->any_distinct && !src->any_distinct &&
            "DISTINCT partials are not mergeable (v1)");
     if (dst->oom || src->oom) return false;
+    // G2COV-30: a partial fold (ingest stopped at a NULL group key) must
+    // never be merged INTO a clean destination, and must poison one it is
+    // merged into, or the refusal is lost at the merge boundary.
+    if (src->null_key) { dst->null_key = true; return false; }
+    if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     const int64_t src_lo = src->dense_min;
     const int64_t src_hi = src_lo + static_cast<int64_t>(src->dense_range);

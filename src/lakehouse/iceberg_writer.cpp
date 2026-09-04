@@ -939,7 +939,13 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
         th->arena->allocate_array<ManifestListEntry>(kIcebergMaxManifestsPerList);
     if (mlist == nullptr) return false;
     uint32_t n_mlist = 0;
-    if (op == SnapshotOp::kAppend && parent > 0) {
+    // kDelete joins kAppend here. A delete snapshot that started a fresh list
+    // would drop every data manifest and empty the table -- the delete would
+    // "work" by deleting everything. A positional-delete commit adds a delete
+    // manifest ON TOP of the state it inherits, which is exactly the append
+    // carry-forward, so the same code serves both.
+    if ((op == SnapshotOp::kAppend || op == SnapshotOp::kDelete) &&
+        parent > 0) {
         const Snapshot* ps = nullptr;
         for (uint32_t i = 0; i < th->meta.n_snapshots; ++i) {   // bounded
             if (th->meta.snapshots[i].snapshot_id == parent) {
@@ -963,10 +969,18 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // Manifest-list body — Avro OCF likewise.
     ManifestListEntry mle{};
     mle.partition_spec_id = th->meta.current_spec_id;
-    mle.content           = FileContent::kData;
+    // ManifestFile.content is 0=data, 1=deletes -- it does NOT distinguish
+    // positional from equality, which is a per-entry property. Anything that
+    // is not a data file makes this a deletes manifest.
+    mle.content           = (nf != 0 && files[0].content != FileContent::kData)
+                                ? ManifestContent::kDeleteManifest
+                                : ManifestContent::kDataManifest;
     mle.manifest_length   = static_cast<int64_t>(manifest_len);
     mle.added_snapshot_id = snap_id;
     mle.added_files_count = nf;
+    // Added by THIS commit, so it takes this commit's sequence number.
+    mle.sequence_number     = seq;
+    mle.min_sequence_number = seq;
     // Recorded absolute (G2ICE-84); the store is still keyed by `mrel`.
     if (!abs_location(th->root, mrel, mle.manifest_path,
                       sizeof(mle.manifest_path))) return false;
@@ -1004,7 +1018,8 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
 
 }  // namespace
 
-bool append_commit(AppendHandle* ah) noexcept {
+bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
+                      int64_t* out_rows) noexcept {
     assert(ah != nullptr && ah->th != nullptr);
     if (ah->n_pending == 0) return true;
     const int64_t snap_id = mint_snapshot_id(ah->th);
@@ -1026,10 +1041,159 @@ bool append_commit(AppendHandle* ah) noexcept {
         return false;
     }
     ah->n_pending = 0;
+    if (out_path != nullptr && out_path_cap != 0) {
+        std::strncpy(out_path, df.file_path, out_path_cap - 1u);
+        out_path[out_path_cap - 1u] = '\0';
+    }
+    if (out_rows != nullptr) *out_rows = rows;
     return true;
 }
 
+bool append_commit(AppendHandle* ah) noexcept {
+    return append_commit_ex(ah, nullptr, 0, nullptr);
+}
+
 void append_close(AppendHandle* /*ah*/) noexcept {}
+
+// ---------------------------------------------------------------------------
+// Positional deletes (Iceberg v2 merge-on-read)
+// ---------------------------------------------------------------------------
+//
+// WHY POSITIONAL AND NOT EQUALITY. Equality deletes are the natural shape for
+// a key-value tombstone -- you know the key, you do not know where the row
+// landed -- and `delete_file.h` already models them. They are nonetheless the
+// wrong choice HERE, for one decisive reason: pyiceberg, the external oracle
+// this table is verified against, reads positional deletes and refuses
+// equality deletes. A delete file no available reader applies is a delete that
+// silently does not happen, which is the bug class this work exists to close.
+//
+// THE ORDERING HAZARD, AND HOW THIS SHAPE ANSWERS IT. A row may be deleted
+// long after the file holding it was committed. A positional delete needs
+// (file_path, pos), so a late delete must LOCATE the row in the already
+// committed data -- it cannot be derived from the tombstone alone. That
+// lookup is the caller's job and is deliberately not hidden in here: this
+// function takes positions and commits them, and it makes no distinction
+// between a position computed while the file was being written and one found
+// by scanning it back a week later. Both produce the same delete file, in a
+// snapshot whose sequence number is strictly greater than the data file's,
+// which is precisely the condition a reader uses to decide the delete applies.
+
+namespace {
+
+// The Iceberg-defined schema of a positional delete file, spec section
+// "Position Delete Files": field 2147483546 file_path, 2147483545 pos.
+Schema position_delete_schema() noexcept {
+    Schema s{};
+    s.schema_id = 0;
+    s.n_fields  = 2;
+    s.fields[0].id = 2147483546;
+    s.fields[0].required = true;
+    std::strncpy(s.fields[0].name, "file_path", sizeof(s.fields[0].name) - 1u);
+    std::strncpy(s.fields[0].type, "string",    sizeof(s.fields[0].type) - 1u);
+    s.fields[1].id = 2147483545;
+    s.fields[1].required = true;
+    std::strncpy(s.fields[1].name, "pos",  sizeof(s.fields[1].name) - 1u);
+    std::strncpy(s.fields[1].type, "long", sizeof(s.fields[1].type) - 1u);
+    return s;
+}
+
+}  // namespace
+
+bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
+                            uint32_t n) noexcept {
+    assert(th != nullptr);
+    assert(dels != nullptr || n == 0);
+    if (th == nullptr || th->arena == nullptr || th->os == nullptr) return false;
+    if (dels == nullptr || n == 0) return false;
+    if (n > kIcebergMaxManifestEntries) return false;
+
+    const int64_t snap_id = mint_snapshot_id(th);
+
+    // Build the two delete columns. The file_path column is Utf8; bolt's
+    // StringView carries an inline prefix plus a spill buffer, so the paths
+    // are copied into arena storage that outlives this frame.
+    Arena* a = th->arena;
+    auto* pos = a->allocate_array<int64_t>(n);
+    auto* svs = a->allocate_array<StringView>(n);
+    if (pos == nullptr || svs == nullptr) return false;
+    uint64_t spill_bytes = 0;
+    for (uint32_t i = 0; i < n; ++i) spill_bytes += std::strlen(dels[i].file_path);
+    auto* spill = a->allocate_array<uint8_t>(spill_bytes + 1u);
+    if (spill == nullptr) return false;
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        // A position delete is only meaningful against a real file, and a
+        // negative position names no row -- refuse rather than emit a delete
+        // file a reader will silently ignore.
+        if (dels[i].file_path[0] == '\0' || dels[i].pos < 0) return false;
+        pos[i] = dels[i].pos;
+        const uint32_t len =
+            static_cast<uint32_t>(std::strlen(dels[i].file_path));
+        std::memcpy(spill + off, dels[i].file_path, len);
+        svs[i] = StringView::from_cstr(dels[i].file_path);
+        if (len > 12u) {                       // spilled: anchor the reference
+            svs[i].ref.buf_idx = 0;
+            svs[i].ref.offset  = off;
+        }
+        off += len;
+    }
+
+    BoltBatch b{};
+    BoltBatch::init_empty(&b);
+    b.arena    = a;
+    b.num_rows = static_cast<int64_t>(n);
+    b.num_cols = 2;
+    if (!BoltBatch::alloc_columns(&b, a, 2)) return false;
+    b.schema.add_field("file_path", BoltType::Utf8,  false);
+    b.schema.add_field("pos",       BoltType::Int64, false);
+    BoltColumn* cols = b.columns[b.read_epoch];
+    cols[0].type = BoltType::Utf8;
+    cols[0].length = static_cast<int64_t>(n);
+    cols[0].data = svs;
+    cols[0].str_overflow_base = spill;
+    cols[1].type = BoltType::Int64;
+    cols[1].length = static_cast<int64_t>(n);
+    cols[1].data = pos;
+
+    char rel[128];
+    const int rn = std::snprintf(rel, sizeof(rel),
+                                 "data/%lld-deletes.parquet",
+                                 static_cast<long long>(snap_id));
+    if (rn <= 0 || static_cast<uint32_t>(rn) >= sizeof(rel)) return false;
+    char full[kMaxPathLen];
+    if (!path_join(th->root, rel, full, sizeof(full))) return false;
+    {
+        std::error_code ec;
+        std::filesystem::path p(full);
+        if (p.has_parent_path()) {
+            std::filesystem::create_directories(p.parent_path(), ec);
+        }
+    }
+    const Schema dsch = position_delete_schema();
+    ingest::parquet::ParquetWriteOpts po = make_pq_opts(&dsch, nullptr);
+    auto* w = ingest::parquet::parquet_write_open(full, &po);
+    if (w == nullptr) return false;
+    if (!ingest::parquet::parquet_write_row_group(w, &b)) {
+        (void)ingest::parquet::parquet_write_close(w);
+        return false;
+    }
+    if (!ingest::parquet::parquet_write_close(w)) return false;
+
+    ObjectMeta om{};
+    (void)os_head(th->os, rel, &om);
+
+    DataFileRef df{};
+    df.status            = ManifestStatus::kAdded;
+    df.content           = FileContent::kPositionDeletes;
+    df.partition_spec_id = th->meta.current_spec_id;
+    df.snapshot_id       = snap_id;
+    if (!abs_location(th->root, rel, df.file_path, sizeof(df.file_path))) {
+        return false;
+    }
+    df.stats.record_count       = static_cast<int64_t>(n);
+    df.stats.file_size_in_bytes = static_cast<int64_t>(om.size);
+    return publish_snapshot(th, &df, 1, SnapshotOp::kDelete, snap_id);
+}
 
 // ---------------------------------------------------------------------------
 // Schema evolution

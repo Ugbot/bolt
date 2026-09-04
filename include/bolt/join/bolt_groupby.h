@@ -928,6 +928,52 @@ BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept {
     return ((c.validity[bit >> 3] >> (bit & 7)) & 1) != 0;
 }
 
+// G2COV-30: does any row of the window [start, start+count) carry a NULL in
+// ANY group-key column?
+//
+// The key cells are read by `read_cell16` and compared by `hash_keys` /
+// `keys_equal`, none of which can see validity — and a null slot's payload
+// bytes are UNDEFINED (bolt's own parquet decode says so), so folding one
+// groups by garbage: two NULL rows with different garbage split into different
+// groups, one whose garbage matches a real key merges into it, and for a Utf8
+// key the garbage is reinterpreted as a StringView length+offset. The kernel
+// therefore refuses the window rather than answering from it.
+//
+// Cost: a column with no validity bitmap is skipped entirely (that is every
+// column bolt's parquet reader decodes with null_count == 0, i.e. all of TPC-H
+// and ClickBench), and a dense window over a column that HAS one is scanned 64
+// rows per word.
+inline bool window_has_null_key(const BoltColumn* keys, uint32_t n_keys,
+                                const uint32_t* sel,
+                                int64_t start, int64_t count) noexcept {
+    assert(keys != nullptr);
+    assert(count >= 0);
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        const BoltColumn& c = keys[k];
+        if (c.validity == nullptr) continue;
+        if (sel != nullptr) {
+            for (int64_t i = 0; i < count; ++i) {
+                if (!cell_valid(c, static_cast<int64_t>(sel[start + i])))
+                    return true;
+            }
+            continue;
+        }
+        // Dense: walk the bitmap a byte at a time, masking the partial ends.
+        const int64_t first = c.validity_offset + start;
+        const int64_t last  = first + count;              // exclusive
+        for (int64_t b = first >> 3; b <= ((last - 1) >> 3) && count > 0; ++b) {
+            const int64_t lo = (b << 3) > first ? (b << 3) : first;
+            const int64_t hi = ((b + 1) << 3) < last ? ((b + 1) << 3) : last;
+            if (hi <= lo) continue;
+            const uint32_t want =
+                (0xFFu >> (8 - (hi - lo))) << (lo - (b << 3));
+            if ((static_cast<uint32_t>(c.validity[b]) & want) != want)
+                return true;
+        }
+    }
+    return false;
+}
+
 // Decide output BoltType for one agg given its input type.
 BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     if (k == AggKind::CountStar || k == AggKind::Count) return BoltType::Int64;
@@ -1068,7 +1114,13 @@ struct GroupbyTypedState {
     // the range-sliced dense merge is sound; when true, that merge would drop
     // the unpublished group and callers must use the hash/serial fold.
     bool            dense_overflow;
-    uint8_t         _pad[1];
+    // G2COV-30: set true if any ingested row carried a NULL in a GROUP BY key.
+    // Key cells are read through gb_detail::read_cell16 / hash_keys /
+    // keys_equal, none of which can see validity, and a null slot's payload
+    // bytes are UNDEFINED — so folding one would group by garbage. The kernel
+    // stops ingesting and refuses to finalize; the caller decides what to
+    // report. See `gb_window_has_null_key`.
+    bool            null_key;
 };
 
 // G2FEAT-13: caller-owned scratch shared across MANY GroupbyTypedStates
@@ -1224,6 +1276,7 @@ inline bool gb_begin_with_scratch(
     state->grow_cap         = (grow_cap > kGbEntryCap)
         ? kGbEntryCap : static_cast<uint32_t>(grow_cap);
     state->oom              = false;
+    state->null_key         = false;              // G2COV-30
     for (uint8_t k = 0; k < n_keys; ++k) {        // Card S: spilled-key buffers
         state->key_str_buf[k]  = nullptr;
         state->key_str_used[k] = 0;
@@ -1765,7 +1818,7 @@ inline void groupby_agg_multi_key_typed_ingest(
         int64_t            n_rows) noexcept {
     assert(state != nullptr);
     assert(state->table != nullptr);
-    if (state->oom) return;
+    if (state->oom || state->null_key) return;
     assert(state->n_keys >= 1 && state->n_keys <= kGbMaxKeys);
     assert(state->n_aggs >= 1 && state->n_aggs <= kGbMaxAggs);
 
@@ -1785,6 +1838,15 @@ inline void groupby_agg_multi_key_typed_ingest(
         // at-cap trigger ran Q18's 1.5M-group agg at ~97% load between
         // growths, +40% wall). Legacy tight tables carry 1.5x headroom
         // (~66% max load) — 3/4 keeps growth-mode probe costs comparable.
+        // G2COV-30: refuse the window if any group key is NULL in it. Checked
+        // BEFORE growth/dispatch so neither sub-path (two-pass gid
+        // materialisation or the per-row fallback) can hash a garbage key.
+        if (gb_detail::window_has_null_key(keys, state->n_keys,
+                                           sparse ? sel : nullptr,
+                                           start, count)) {
+            state->null_key = true;
+            return;
+        }
         // grow failure falls through to legacy oom-at-cap in the window.
         while (state->grow_cap > state->cap &&
                static_cast<int64_t>(state->entry_count) + count >
@@ -1822,7 +1884,9 @@ inline bool groupby_agg_multi_key_typed_finalize(
         uint32_t*          ngroups_out) noexcept {
     assert(state != nullptr);
     assert(ngroups_out != nullptr);
-    if (state->oom) return false;
+    // G2COV-30: a state that met a NULL group key holds a PARTIAL fold (ingest
+    // stopped at that window), so emitting it would be a silently short answer.
+    if (state->oom || state->null_key) return false;
     const uint8_t  n_keys = state->n_keys;
     const uint8_t  n_aggs = state->n_aggs;
     const uint32_t cap    = state->cap;
@@ -2073,6 +2137,14 @@ inline bool groupby_agg_multi_key_typed(
     char* in_bases[kGbMaxKeys];
     for (uint8_t k = 0; k < n_keys; ++k)
         in_bases[k] = static_cast<char*>(keys[k].str_overflow_base);
+    // G2COV-30: refuse up front if any group key is NULL anywhere in the input.
+    // Same contract as the stateful `_ingest` path — a null key's bytes are
+    // undefined, so hashing them groups by garbage. Costs nothing for a key
+    // column with no validity bitmap.
+    if (gb_detail::window_has_null_key(keys, static_cast<uint32_t>(n_keys),
+                                       nullptr, 0, n_rows)) {
+        return false;
+    }
     for (int64_t r = 0; r < n_rows; ++r) {
         const uint64_t h = gb_detail::hash_keys(keys, static_cast<uint32_t>(n_keys), r);
         int32_t found = ht->find(h);

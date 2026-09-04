@@ -44,13 +44,19 @@ import re
 import sys
 
 N_ROWS = 12
+# G2ICE-82: after the two appends the fixture commits an Iceberg v2 POSITIONAL
+# delete for this 0-based row. It must be absent from what pyiceberg reads.
+# Re-derived here from the same rule the C++ side states, never read back out
+# of anything bolt emitted.
+DELETED_ROW = 7
 
 
 def model():
     """The expected table, from the generating rules alone."""
+    live = [i for i in range(N_ROWS) if i != DELETED_ROW]
     return {
-        "id": [1000 + i for i in range(N_ROWS)],
-        "score": [i * 0.5 - 3.0 for i in range(N_ROWS)],
+        "id": [1000 + i for i in live],
+        "score": [i * 0.5 - 3.0 for i in live],
     }
 
 
@@ -83,6 +89,12 @@ def check(root, mutate=None):
             errs.append("manifest-list is relative: %s" % snap.manifest_list)
 
     got = table.scan().to_arrow().to_pydict()
+    # The deleted row must be gone, and gone because the DELETE was applied --
+    # not because the whole file it lived in vanished. Checked explicitly, and
+    # ahead of the multiset comparison, so a failure names the real cause.
+    if (1000 + DELETED_ROW) in (got.get("id") or []):
+        errs.append("RESURRECTION: id=%d was positionally deleted but "
+                    "pyiceberg still returns it" % (1000 + DELETED_ROW))
     if mutate is not None:
         got = mutate(got)
     want = model()
@@ -128,14 +140,20 @@ def main():
          lambda d: {"id": d["score"], "score": d["id"]}),
         ("perturbed one value",
          lambda d: {k: ([v[0] + 1] + list(v[1:])) for k, v in d.items()}),
+        # G2ICE-82: the delete must be what removes the row. If the reader
+        # silently ignored the delete file, the deleted id comes back and the
+        # row count is 12 -- both caught here.
+        ("resurrected the deleted row (delete file ignored)",
+         lambda d: {"id": list(d["id"]) + [1000 + DELETED_ROW],
+                    "score": list(d["score"]) + [DELETED_ROW * 0.5 - 3.0]}),
     ]
     for name, mut in injections:
         if not check(root, mutate=mut):
             print("FAIL: injection not caught -- %s" % name)
             return 1
 
-    print("PASS: pyiceberg read %d rows value-for-value from %s" % (N_ROWS, root))
-    print("      (3 injections caught)")
+    print("PASS: pyiceberg read %d rows value-for-value from %s" % (N_ROWS - 1, root))
+    print("      (deleted row %d absent; 4 injections caught)" % (1000 + DELETED_ROW))
     return 0
 
 

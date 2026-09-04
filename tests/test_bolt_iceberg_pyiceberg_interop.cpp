@@ -63,6 +63,10 @@ using namespace bolt::lakehouse::iceberg;
 //       score = i * 0.5 - 3.0
 constexpr int32_t kRowsPerCommit = 6;
 constexpr int32_t kCommits       = 2;
+// The 0-based row deleted by an Iceberg v2 positional delete after both
+// commits. Chosen in the SECOND file so the delete has to coexist with a
+// carried-forward manifest from the first.
+constexpr int32_t kDeletedRow    = 7;
 
 std::string fixture_root() {
     const char* env = std::getenv("BOLT_ICEBERG_INTEROP_DIR");
@@ -137,16 +141,33 @@ TEST(IcebergPyIcebergInterop, WriteFixture) {
 
     AppendHandle* ah = nullptr;
     ASSERT_TRUE(append_open(&ah, th));
+    char commit_file[kIcebergMaxPath][kCommits];
     for (int32_t c = 0; c < kCommits; ++c) {
         bolt::BoltBatch b{};
         make_batch(&arena, &b, c * kRowsPerCommit, kRowsPerCommit);
         ASSERT_TRUE(append_write(ah, &b));
-        ASSERT_TRUE(append_commit(ah));
+        int64_t rows = 0;
+        ASSERT_TRUE(append_commit_ex(ah, commit_file[c], kIcebergMaxPath,
+                                     &rows));
+        EXPECT_EQ(rows, kRowsPerCommit);
+        EXPECT_TRUE(is_absolute_path(commit_file[c]));
     }
     append_close(ah);
 
+    // G2ICE-82 — the delete-resurrection property. A row whose only copy lives
+    // in the cold table must be REMOVED from that table, not merely tombstoned
+    // in the hot tier it no longer occupies. Commit a positional delete for
+    // kDeletedRow, which lands in the SECOND commit's data file so the delete
+    // must also survive the manifest carry-forward that keeps the first
+    // commit's file live.
+    PositionDeleteEntry pd{};
+    std::strncpy(pd.file_path, commit_file[kDeletedRow / kRowsPerCommit],
+                 sizeof(pd.file_path) - 1u);
+    pd.pos = kDeletedRow % kRowsPerCommit;
+    ASSERT_TRUE(table_delete_positions(th, &pd, 1));
+
     const Metadata* m = table_metadata(th);
-    ASSERT_EQ(m->n_snapshots, static_cast<uint32_t>(kCommits));
+    ASSERT_EQ(m->n_snapshots, static_cast<uint32_t>(kCommits) + 1u);
 
     // What this test CAN check in-process: every recorded manifest-list is an
     // absolute location that actually names a file. A relative one resolves

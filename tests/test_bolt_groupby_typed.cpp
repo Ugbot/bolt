@@ -777,3 +777,82 @@ TEST(BoltGroupbyTyped, SpilledUtf8KeySlicedColumnResolvesCorrectly) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// G2COV-30 — a NULL in a GROUP BY KEY is refused, not folded.
+//
+// The value side above has been null-aware since K-AGG-A.2. The KEY side was
+// not: read_cell16 / hash_keys / keys_equal never look at validity, so a null
+// key was hashed as the undefined bytes underneath it. Measured through
+// chukonu on a real parquet file, a NULL Utf8 key decoded as a ZERO-LENGTH
+// StringView and silently MERGED with the empty-string group — 6 groups where
+// DuckDB gives 7, with the "" group gone from the output.
+//
+// The kernel emits key columns with no validity bitmap, so it has nowhere to
+// put SQL's NULL group and no sentinel is safe. It therefore refuses.
+// ---------------------------------------------------------------------------
+
+TEST(BoltGroupbyTyped, NullGroupKeyIsRefusedOneShot) {
+    Arena a;
+    int64_t ks[] = {1, 1, 2, 2};
+    int64_t vs[] = {10, 20, 30, 40};
+    uint8_t kvalid[1] = {0b00001011};        // row 2's KEY is NULL
+    BoltColumn key = BoltColumn::make_flat(ks, kvalid, 4, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 4, BoltType::Int64);
+    AggSpec specs[1] = { make_spec(AggKind::Sum, 0) };
+    BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 4,
+                                             ok, oa, &ng, &a, /*hint=*/4));
+    // ... and the SAME data with every key bit set folds normally: the refusal
+    // keys off validity, not off the mere presence of a bitmap. Every parquet
+    // column DuckDB writes is nullable, so refusing on presence would break
+    // TPC-H outright.
+    uint8_t all_valid[1] = {0b00001111};
+    BoltColumn key2 = BoltColumn::make_flat(ks, all_valid, 4, BoltType::Int64);
+    ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key2, 1, &val, 1, specs, 1, 4,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    EXPECT_EQ(ng, 2u);
+}
+
+// The scan is byte-at-a-time with masked partial ends, so the arithmetic is
+// exercised directly at every offset/length inside a byte and across byte
+// boundaries. One null is planted at each row in turn; the scan must find it
+// from every window origin that contains it and from none that does not.
+TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
+    constexpr int64_t kN = 40;                 // 5 bytes of bitmap
+    int64_t ks[kN];
+    for (int64_t i = 0; i < kN; ++i) ks[i] = i;
+    for (int64_t null_row = 0; null_row < kN; ++null_row) {
+        uint8_t bits[8];
+        for (int b = 0; b < 8; ++b) bits[b] = 0xFF;
+        bits[null_row >> 3] = static_cast<uint8_t>(
+            bits[null_row >> 3] & ~(1u << (null_row & 7)));
+        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Int64);
+        for (int64_t start = 0; start < kN; ++start) {
+            for (int64_t count = 0; start + count <= kN; ++count) {
+                const bool want = (null_row >= start && null_row < start + count);
+                EXPECT_EQ(gb_detail::window_has_null_key(&key, 1, nullptr,
+                                                         start, count), want)
+                    << "null_row=" << null_row << " start=" << start
+                    << " count=" << count;
+            }
+        }
+    }
+}
+
+// Sparse (selection-vector) windows take the other branch: a null row that the
+// selection SKIPS must not trip the refusal, and one it INCLUDES must.
+TEST(BoltGroupbyTyped, WindowHasNullKeyHonoursSelection) {
+    int64_t ks[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint8_t bits[1] = {0b11110111};            // row 3 is NULL
+    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Int64);
+    const uint32_t skips[4] = {0, 1, 2, 4};
+    const uint32_t hits[4]  = {0, 3, 5, 7};
+    EXPECT_FALSE(gb_detail::window_has_null_key(&key, 1, skips, 0, 4));
+    EXPECT_TRUE(gb_detail::window_has_null_key(&key, 1, hits, 0, 4));
+    // A key column with no bitmap is skipped outright (the common case).
+    BoltColumn plain = BoltColumn::make_flat(ks, nullptr, 8, BoltType::Int64);
+    EXPECT_FALSE(gb_detail::window_has_null_key(&plain, 1, nullptr, 0, 8));
+}

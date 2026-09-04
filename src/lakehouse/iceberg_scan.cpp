@@ -500,7 +500,7 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
             if (e.status == ManifestStatus::kDeleted) continue;
             // Delete files are not applied yet, and skipping one would
             // over-report rows. Decline the scan instead. TODO(W5-delete-load)
-            if (mle.content == FileContent::kEqualityDeletes ||
+            if (mle.content == ManifestContent::kDeleteManifest ||
                 e.content == FileContent::kEqualityDeletes ||
                 e.content == FileContent::kPositionDeletes) {
                 return false;

@@ -17,6 +17,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
 #include "bolt/lakehouse/format.h"
+#include "bolt/lakehouse/iceberg/delete_file.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/partition.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
@@ -91,7 +92,31 @@ void table_close(TableHandle* h) noexcept;
 bool append_open  (AppendHandle** out, TableHandle* th) noexcept;
 bool append_write (AppendHandle* ah, const BoltBatch* batch) noexcept;
 bool append_commit(AppendHandle* ah) noexcept;
+// As append_commit, and additionally reports the ABSOLUTE path of the data
+// file the commit wrote and its row count. A caller that wants to delete rows
+// from what it just appended needs both: an Iceberg positional delete names a
+// (file_path, pos) pair, and the path is otherwise only recoverable by parsing
+// the manifest back. `out_path` may be null; `out_rows` may be null.
+bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
+                      int64_t* out_rows) noexcept;
 void append_close (AppendHandle* ah) noexcept;
+
+// Commit `n` Iceberg v2 POSITIONAL deletes as a new delete manifest on top of
+// the current snapshot. Each entry names a data file (the absolute path a
+// commit recorded) and a 0-based row position within it; a reader drops those
+// rows. Entries need not be sorted and need not target one file.
+//
+// Positional rather than equality deletes deliberately -- see the note in
+// iceberg_writer.cpp. Late deletes are supported by construction: the delete
+// commits at a strictly higher sequence number than any data already in the
+// table, so it applies to that data. The caller owns finding the position of a
+// row it did not just write.
+//
+// Returns false on: a null/empty entry list, an empty path, a negative
+// position, more than kIcebergMaxManifestEntries entries, or a failed commit.
+// It never partially applies: either the snapshot publishes or nothing changes.
+bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
+                            uint32_t n) noexcept;
 
 // Overwrite: drop files matching the predicate and append new data.
 bool table_overwrite(TableHandle* th, const Predicate* pred,

@@ -20,10 +20,26 @@ namespace iceberg {
 static constexpr uint32_t kIcebergMaxPath = 1024u;
 static constexpr uint32_t kIcebergMaxDeleteFiles = 256u;
 
+// Iceberg v2 `data_file.content`. THE ORDER IS THE SPEC'S, NOT ALPHABETICAL:
+// 0 = data, 1 = POSITION deletes, 2 = EQUALITY deletes. bolt had 1 and 2
+// swapped, which is a mislabelling no in-tree test could see because the read
+// path declined BOTH kinds identically -- a position-delete file bolt wrote
+// was read by pyiceberg as an equality delete and rejected outright
+// ("PyIceberg does not yet support equality deletes"), i.e. the delete was
+// silently not applied. Only an external reader can catch a wrong constant.
 enum class FileContent : uint8_t {
-    kData = 0,
-    kEqualityDeletes = 1,
-    kPositionDeletes = 2,
+    kData            = 0,
+    kPositionDeletes = 1,
+    kEqualityDeletes = 2,
+};
+
+// `manifest_file.content` is a DIFFERENT, two-valued enum: 0 = a manifest of
+// data files, 1 = a manifest of delete files (of either kind). Spelled out
+// here so it is never confused with FileContent, which is what happens when
+// the two share names.
+enum class ManifestContent : uint8_t {
+    kDataManifest   = 0,
+    kDeleteManifest = 1,
 };
 
 struct DeleteFileRef {

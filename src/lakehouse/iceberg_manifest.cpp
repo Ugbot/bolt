@@ -380,7 +380,7 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
         ManifestListEntry* slot = &out[*out_n];
         std::memset(slot, 0, sizeof(*slot));
         slot->partition_spec_id = -1;
-        slot->content = FileContent::kData;
+        slot->content = ManifestContent::kDataManifest;
         bj::iter_advance(&it);
         uint32_t g2 = 0;
         while (bj::iter_peek(&it) == bj::TokenType::Key && g2++ < kIterGuard) {
@@ -399,8 +399,8 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
                 slot->partition_spec_id = static_cast<int32_t>(v);
             } else if (tok_eq(&idx, key, "content")) {
                 int64_t v = 0; read_int64(&it, &v);
-                slot->content = (v == 1) ? FileContent::kEqualityDeletes
-                                          : FileContent::kData;
+                slot->content = (v == 1) ? ManifestContent::kDeleteManifest
+                                         : ManifestContent::kDataManifest;
             } else if (tok_eq(&idx, key, "added_snapshot_id") ||
                        tok_eq(&idx, key, "added-snapshot-id")) {
                 read_int64(&it, &slot->added_snapshot_id);

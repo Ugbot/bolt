@@ -93,12 +93,27 @@ enum class ManifestStatus : uint8_t {
 };
 
 struct ManifestListEntry {
-    int32_t      partition_spec_id;
-    FileContent  content;
+    int32_t         partition_spec_id;
+    // manifest_file.content: 0 = data manifest, 1 = delete manifest. This used
+    // to be typed FileContent, whose "deletes" values are 1 AND 2 -- a type
+    // that cannot represent this field without inviting the confusion.
+    ManifestContent content;
     uint8_t      _pad[3];
     int64_t      manifest_length;
     int64_t      added_snapshot_id;
     int64_t      added_files_count;
+    // The sequence number the manifest was COMMITTED at, not the sequence
+    // number of the snapshot whose list happens to name it. A snapshot's list
+    // names every manifest still live, so most entries in it were written by
+    // an ANCESTOR and carry an older sequence number. Stamping them all with
+    // the current one is not cosmetic: a positional delete applies to data
+    // files whose sequence number is strictly LOWER than the delete's, so
+    // relabelling a carried-forward data manifest up to the delete's own
+    // sequence number makes the delete stop applying — the row silently comes
+    // back. 0 means "not recorded", and the writer then stamps the current
+    // sequence number (the correct value for a manifest this commit added).
+    int64_t      sequence_number;
+    int64_t      min_sequence_number;
     char         manifest_path[kIcebergMaxManifestPath];
 };
 

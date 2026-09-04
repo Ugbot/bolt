@@ -87,6 +87,7 @@ struct MlCtx {
     uint32_t           cap;
     uint32_t           n;
     int32_t f_path, f_len, f_spec, f_content, f_snap, f_added;
+    int32_t f_seq, f_minseq;
 };
 
 bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
@@ -107,8 +108,12 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     e->added_snapshot_id = i64_or(at(s->f_snap), 0);
     e->added_files_count = i64_or(at(s->f_added), 0);
     e->partition_spec_id = static_cast<int32_t>(i64_or(at(s->f_spec), 0));
+    // Carried through so a later commit that re-lists this manifest preserves
+    // the sequence number it was committed at (see ManifestListEntry).
+    e->sequence_number     = i64_or(at(s->f_seq), 0);
+    e->min_sequence_number = i64_or(at(s->f_minseq), 0);
     // `content` is v2-only (0 = data, 1 = deletes); v1 manifests are all data.
-    e->content = static_cast<FileContent>(i64_or(at(s->f_content), 0));
+    e->content = static_cast<ManifestContent>(i64_or(at(s->f_content), 0));
     ++s->n;
     return true;
 }
@@ -292,6 +297,8 @@ bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     s.f_content = find_field(h, "content");
     s.f_snap    = find_field(h, "added_snapshot_id");
     s.f_added   = find_field(h, "added_files_count");
+    s.f_seq     = find_field(h, "sequence_number");
+    s.f_minseq  = find_field(h, "min_sequence_number");
     // Without a path there is nothing to point a scan at — that is not a
     // manifest list, so fail rather than emit path-less entries.
     if (s.f_path < 0) return false;
