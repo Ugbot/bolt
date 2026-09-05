@@ -335,6 +335,12 @@ inline bool hash_join_build_chained(
     assert(arena != nullptr && out != nullptr);
     assert(cfg.n_keys >= 1 && cfg.n_keys <= kHJMaxKeys);
     const uint64_t n = cfg.build_rows;
+    // `next` is an int32 index into chain_nodes[] and SwissTable::find()
+    // returns int32 with -1 == absent, so a row id >= 2^31 aliases the
+    // end-of-chain sentinel and loses matches silently. Refuse past the
+    // structural limit (bolt_joinkernel.h, kJkMaxBuildRows) rather than
+    // build a table that answers confidently and wrongly.
+    if (n > 0x7FFFFFFFull) return false;
     out->chain_cap = static_cast<uint32_t>(n);  // exactly one node per row
     out->chain_nodes = static_cast<HashJoinChainNode*>(
         arena->allocate(sizeof(HashJoinChainNode) *

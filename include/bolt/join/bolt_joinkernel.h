@@ -65,6 +65,23 @@ namespace bolt {
 // "No match -> emit NULL for this side." Used as a build_idx / probe_idx value.
 inline constexpr int32_t kJoinNullIndex = -1;
 
+// STRUCTURAL LIMIT ON THE BUILD SIDE. A build row id is carried as a SIGNED
+// 32-bit value everywhere it travels in this header and in bolt_hashjoin.h:
+//   * HashJoinChainNode::next   (int32_t, -1 == end of chain)
+//   * SwissTable::find()        returns int32_t, -1 == absent
+//   * JoinBuildScatterCtx::row_ids (int32_t[])
+// A row id of 2^31 or more therefore reads back NEGATIVE and is
+// INDISTINGUISHABLE from the -1 end-of-chain / absent sentinel. The failure
+// mode is not a crash: the chain walk stops early and the probe silently
+// LOSES matches. That makes this a wrong-answer boundary, not a capacity
+// preference, so the build entry points REFUSE past it (return false) rather
+// than truncate — "no silent growth" applied to the index width itself.
+//
+// Found by LSQB SF1 Q3 (G2GRAPH-27 family): a 2.1-billion-row join build had
+// been admitted by a caller ceiling of 0xFFFFFFFE — what a uint32 index can
+// address, i.e. TWICE what these int32 carriers actually hold.
+inline constexpr uint64_t kJkMaxBuildRows = 0x7FFFFFFFull;   // INT32_MAX
+
 // Over-cap sentinel for every probe entry point in this header. A probe that
 // would write past `pairs_cap`, or that walks a chain longer than the build
 // side structurally allows (a corrupt `next` link), returns this instead of
@@ -305,6 +322,9 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
     assert(arena != nullptr && out != nullptr);
     assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
     const uint64_t n = build_rows;
+    // Past kJkMaxBuildRows the int32 chain/scatter carriers alias the -1
+    // sentinel and the probe loses matches SILENTLY. Refuse, never truncate.
+    if (n > kJkMaxBuildRows) return false;
     const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
     out->build_rows = n;
     out->n_keys     = n_keys;
@@ -440,6 +460,7 @@ inline bool jk_build_scatter_and_alloc(const BoltColumn* key_cols,
     assert(arena != nullptr && out != nullptr && scat != nullptr);
     assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
     const uint64_t n = build_rows;
+    if (n > kJkMaxBuildRows) return false;     // see kJkMaxBuildRows
     const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
     out->build_rows = n;
     out->n_keys     = n_keys;
@@ -555,6 +576,7 @@ inline bool jk_build_phase1_prepare(const BoltColumn* key_cols, uint8_t n_keys,
     assert(c != nullptr && n_keys >= 1 && n_keys <= kHJMaxKeys);
     const uint64_t n = build_rows;
     if (n < kJkP1MinChunkRows * 2u) return false;      // not worth chunking
+    if (n > kJkMaxBuildRows) return false;             // see kJkMaxBuildRows
     const size_t n_alloc = static_cast<size_t>(n);
     out->build_rows = n;
     out->n_keys     = n_keys;
