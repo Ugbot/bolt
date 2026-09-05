@@ -59,6 +59,12 @@ or plan prose. New topic → new file + add an entry below.
   `bolt_topology.h` reads (Windows
   `GetLogicalProcessorInformationEx`, Linux sysfs, macOS
   `hw.perflevel*`, Intel hybrid spec).
+- [scheduler-ring-exactly-once.md](scheduler-ring-exactly-once.md) — the
+  SPMC `TaskRing` lost and duplicated tasks in exactly equal numbers on a
+  saturated ring (claim-then-read vs copy-then-claim), so no scheduler
+  counter could detect it; the downstream symptom was a nondeterministic
+  wrong answer from a parallel anti-join. Includes why the first
+  regression test was green on the broken ring.
 
 ### Ingest / parsing
 

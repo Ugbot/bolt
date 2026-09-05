@@ -263,20 +263,47 @@ struct alignas(64) TaskRing {
 
     /// Claim and execute one task (consumer/worker side).
     /// Returns true if a task was executed.
+    ///
+    /// COPY-THEN-CLAIM (the ordering is load-bearing; do not "simplify" it
+    /// back to claim-then-read). `submit()`'s only backpressure is
+    /// `seq - tail >= kTaskRingSize`, and `tail` advances at CLAIM time — so
+    /// the instant a worker bumps tail from t to t+1, the producer is free to
+    /// overwrite `ring[t & kTaskRingMask]` with sequence t + kTaskRingSize.
+    /// Reading the slot AFTER the claim therefore races the producer for one
+    /// full lap of the ring, and on a saturated ring (producer faster than the
+    /// workers, which is the normal state for a long-running fan-out) that
+    /// window is open on essentially every claim: the worker runs the
+    /// producer's NEW task and the task it actually claimed is never run at
+    /// all. The failure is silent — exactly one duplicate execution per lost
+    /// one, so task-count bookkeeping still balances and `wait_all()` is
+    /// satisfied. Measured on this ring at 26,364 tasks / grain 1 / 6 workers:
+    /// up to 19,710 of 26,364 tasks NOT RUN with an exactly equal number of
+    /// duplicate executions (see test_bolt_scheduler_ring_exactly_once).
+    ///
+    /// Copying first closes it with no extra synchronization: the producer may
+    /// only overwrite slot `t` once tail > t, and a SUCCESSFUL
+    /// compare_exchange with expected == t proves tail was still t at claim
+    /// time — hence the copy, sequenced before the release CAS, read the slot
+    /// while it was still ours. A FAILED CAS means some other worker owns t;
+    /// our copy is simply discarded unused. The release CAS also forbids
+    /// sinking the copy below it.
     bool try_claim_and_execute() noexcept {
         uint64_t t = tail.load(std::memory_order_acquire);
-        uint64_t h = head.load(std::memory_order_acquire);
+        const uint64_t h = head.load(std::memory_order_acquire);
         if (t >= h) return false;  // Empty
+        // NOTE: do NOT assert (h - t <= kTaskRingSize) here. `t` and `h` are
+        // loaded at different instants; another consumer can advance tail
+        // between the two loads, so a stale `t` legitimately trails `h` by more
+        // than one ring. Measured: that assert fires within a second under a
+        // saturated multi-consumer ring.
 
-        // CAS claim
-        uint64_t next = t + 1;
-        if (!tail.compare_exchange_weak(t, next,
+        // Copy BEFORE claiming — see the contract above.
+        const Task task = ring[t & kTaskRingMask];
+
+        if (!tail.compare_exchange_weak(t, t + 1,
                 std::memory_order_release, std::memory_order_relaxed))
-            return false;  // Another worker claimed it
+            return false;  // Another worker claimed it; discard the copy.
 
-        // Read the slot at the claimed sequence (t), not t+1.
-        Task task = ring[t & kTaskRingMask];
-        (void)next;
         if (task.fn) task.fn(task.arg);
         return true;
     }
@@ -575,7 +602,15 @@ inline void scheduler_range_trampoline(void* arg) noexcept {
     TaskPool* pool = p->owning_pool;
     pool->release(p);
     if (sched) {
-        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
+        // RELEASE, not relaxed: wait_all() acquire-loads this counter and then
+        // reads what the task WROTE. A relaxed increment publishes the count
+        // without publishing the task's stores, so the barrier would let the
+        // waiter observe a completed task's memory as it was before the task
+        // ran. Release here + acquire there is the only synchronizes-with edge
+        // between a worker finishing and the submitter proceeding (the ring's
+        // tail CAS happens at CLAIM time, before the body, so it publishes
+        // nothing about the result). Cost is one release RMW per task.
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -591,7 +626,15 @@ inline void scheduler_column_trampoline(void* arg) noexcept {
     TaskPool* pool = p->owning_pool;
     pool->release(p);
     if (sched) {
-        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
+        // RELEASE, not relaxed: wait_all() acquire-loads this counter and then
+        // reads what the task WROTE. A relaxed increment publishes the count
+        // without publishing the task's stores, so the barrier would let the
+        // waiter observe a completed task's memory as it was before the task
+        // ran. Release here + acquire there is the only synchronizes-with edge
+        // between a worker finishing and the submitter proceeding (the ring's
+        // tail CAS happens at CLAIM time, before the body, so it publishes
+        // nothing about the result). Cost is one release RMW per task.
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_release);
     }
 }
 

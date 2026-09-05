@@ -204,6 +204,26 @@ bolt_apply_hardening(test_bolt_scheduler)
 
 add_test(NAME test_bolt_scheduler COMMAND test_bolt_scheduler)
 
+# SPMC TaskRing exactly-once delivery (W4-L1). Kept separate from
+# test_bolt_scheduler because it needs a SATURATED ring and therefore
+# RUN_SERIAL — a shared-box parallel ctest can make it vacuously green.
+add_executable(test_bolt_scheduler_ring_exactly_once
+    test_bolt_scheduler_ring_exactly_once.cpp)
+
+target_link_libraries(test_bolt_scheduler_ring_exactly_once
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_scheduler_ring_exactly_once)
+
+add_test(NAME test_bolt_scheduler_ring_exactly_once
+         COMMAND test_bolt_scheduler_ring_exactly_once)
+set_tests_properties(test_bolt_scheduler_ring_exactly_once
+                     PROPERTIES RUN_SERIAL TRUE)
+
 add_executable(test_bolt_strtemp test_bolt_strtemp.cpp)
 
 target_link_libraries(test_bolt_strtemp
