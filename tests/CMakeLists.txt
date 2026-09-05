@@ -690,6 +690,27 @@ target_link_libraries(test_bolt_csr
 bolt_apply_hardening(test_bolt_csr)
 add_test(NAME test_bolt_csr COMMAND test_bolt_csr)
 
+# Variable-length CSR traversal (bolt_csr_bfs.h): WALK/TRAIL/SIMPLE expansion
+# and the aggregate-pushdown count twin. Expected values come from
+# tests/csr_bfs_enumerate.py and (for the randomized graph) networkx.
+add_executable(test_bolt_csr_bfs test_bolt_csr_bfs.cpp)
+target_link_libraries(test_bolt_csr_bfs
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_csr_bfs PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_csr_bfs)
+add_test(NAME test_bolt_csr_bfs COMMAND test_bolt_csr_bfs)
+
+# Bidirectional unweighted shortest path (bolt_csr_shortest.h) — the kernel
+# PhysicalShortestPathBidir has been costed for since Stage 4.
+add_executable(test_bolt_csr_shortest test_bolt_csr_shortest.cpp)
+target_link_libraries(test_bolt_csr_shortest
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_csr_shortest PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_csr_shortest)
+add_test(NAME test_bolt_csr_shortest COMMAND test_bolt_csr_shortest)
+
 # Variable-width payload column — Layer 1.1 of the parse / JSON / doc work.
 add_executable(test_bolt_var_column test_bolt_var_column.cpp)
 target_link_libraries(test_bolt_var_column
