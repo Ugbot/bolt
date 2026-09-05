@@ -42,7 +42,10 @@ inline double promql_quantile(double* BOLT_RESTRICT vals, int64_t n,
                               double q) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
-    if (n <= 0 || std::isnan(q)) return promql_nan();
+    if (n <= 0) return promql_no_sample();
+    // A NaN quantile is an invalid ARGUMENT: Prometheus annotates and still
+    // emits a sample whose value is NaN, so this is a value, not an absence.
+    if (std::isnan(q)) return promql_nan();
     if (q < 0.0) return -std::numeric_limits<double>::infinity();
     if (q > 1.0) return  std::numeric_limits<double>::infinity();
     promql_sort_values(vals, n);
@@ -60,7 +63,7 @@ inline double promql_quantile(double* BOLT_RESTRICT vals, int64_t n,
 inline double promql_stdvar(const double* BOLT_RESTRICT vals, int64_t n) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
-    if (n <= 0) return promql_nan();
+    if (n <= 0) return promql_no_sample();
     double mean = 0.0, m2 = 0.0;
     for (int64_t i = 0; i < n; ++i) {
         const double v = vals[i];
@@ -81,9 +84,9 @@ inline double promql_stddev(const double* BOLT_RESTRICT vals, int64_t n) noexcep
 inline double promql_mad(double* BOLT_RESTRICT vals, int64_t n) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
-    if (n <= 0) return promql_nan();
+    if (n <= 0) return promql_no_sample();
     for (int64_t i = 0; i < n; ++i)
-        if (std::isnan(vals[i])) return promql_nan();
+        if (std::isnan(vals[i])) return promql_nan();  // a NaN VALUE, emitted
     const double med = promql_quantile(vals, n, 0.5);
     for (int64_t i = 0; i < n; ++i)
         vals[i] = std::fabs(vals[i] - med);

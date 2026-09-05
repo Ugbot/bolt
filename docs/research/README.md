@@ -65,6 +65,15 @@ or plan prose. New topic → new file + add an entry below.
   counter could detect it; the downstream symptom was a nondeterministic
   wrong answer from a parallel anti-join. Includes why the first
   regression test was green on the broken ring.
+- [deterministic-scheduler-simulation.md](deterministic-scheduler-simulation.md)
+  — the TigerBeetle VOPR model scoped to the task ring: one participant runs
+  at a time and the interleaving is drawn from a seed, so a schedule is a pure
+  function of (seed, commit) and a failing seed replays exactly. The ring runs
+  AS WRITTEN via a compile-time policy parameter (production codegen proven
+  byte-identical at `-O3 -DNDEBUG`). Fails on the injected pre-fix ring for 11
+  of 12 seeds, in 0.63 s, with identical values at load average 77 — replacing
+  a probe that needed a busy box. Also records two harness bugs its own
+  non-vacuity assertions caught.
 
 ### Ingest / parsing
 

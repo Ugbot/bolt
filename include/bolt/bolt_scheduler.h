@@ -227,6 +227,43 @@ private:
 static constexpr uint32_t kTaskRingSize = config::kTaskRingSize;
 static constexpr uint32_t kTaskRingMask = kTaskRingSize - 1;
 
+// ---------------------------------------------------------------------------
+// Interleaving points — the seam the deterministic simulator schedules on.
+// ---------------------------------------------------------------------------
+//
+// The ring's failure modes live BETWEEN two adjacent instructions of submit()
+// and try_claim_and_execute() (the W4-L1 defect was exactly one such gap), so a
+// simulator that can only preempt between whole calls cannot reach them. These
+// ids name every gap that a second thread can be observed in.
+//
+// The policy is a COMPILE-TIME template parameter, never a runtime branch, and
+// production instantiates `SchedSimNoop` whose `point()` is an empty static
+// function: it inlines away to nothing — no branch, no load, no call. The
+// simulator instantiates the SAME function bodies with a different policy, so
+// what runs under simulation is the code that SHIPS rather than a re-write of
+// it. (A macro would have been simpler and was rejected: two translation units
+// including this header with different macro definitions is an ODR violation,
+// and the linker would silently keep one body — a vacuously green simulator.)
+namespace sched_point {
+enum : unsigned {
+    kSubmitEnter = 0,       // head loaded; before the backpressure tail load
+    kSubmitSpaceOk,         // space confirmed; BEFORE the slot store
+    kSubmitSlotWritten,     // slot stored; before head is published
+    kSubmitPublished,       // head published; submit is done
+    kClaimTailLoaded,       // tail loaded; before the head load
+    kClaimNonEmpty,         // non-empty proven; before the slot copy
+    kClaimCopied,           // slot copied; before the claiming CAS
+    kClaimWon,              // CAS won; before running the body
+    kClaimLost,             // CAS lost; the copy is discarded
+    kPointCount
+};
+}  // namespace sched_point
+
+/// Production interleaving policy: no points, no cost.
+struct SchedSimNoop {
+    BOLT_FORCE_INLINE static void point(unsigned) noexcept {}
+};
+
 struct alignas(64) TaskRing {
     Task ring[kTaskRingSize];
 
@@ -240,17 +277,32 @@ struct alignas(64) TaskRing {
     }
 
     /// Submit a task (producer side). Returns false if ring is full.
-    bool submit(TaskFn fn, void* arg) noexcept {
+    ///
+    /// `Sim` is the interleaving policy (see SchedSimNoop). It is a template
+    /// parameter so that the deterministic simulator drives THIS body rather
+    /// than a copy of it; with the default policy every `Sim::point()` is an
+    /// empty static function and the emitted code is byte-identical to the
+    /// un-instrumented version.
+    template <class Sim>
+    BOLT_FORCE_INLINE bool submit_sim(TaskFn fn, void* arg) noexcept {
         uint64_t seq = head.load(std::memory_order_relaxed);
+        Sim::point(sched_point::kSubmitEnter);
 
         // Backpressure: check if ring is full
         if (seq - tail.load(std::memory_order_acquire) >= kTaskRingSize)
             return false;
+        Sim::point(sched_point::kSubmitSpaceOk);
 
         ring[seq & kTaskRingMask] = Task{fn, arg};
+        Sim::point(sched_point::kSubmitSlotWritten);
         std::atomic_thread_fence(std::memory_order_release);
         head.store(seq + 1, std::memory_order_release);
+        Sim::point(sched_point::kSubmitPublished);
         return true;
+    }
+
+    bool submit(TaskFn fn, void* arg) noexcept {
+        return submit_sim<SchedSimNoop>(fn, arg);
     }
 
     /// Submit with backpressure wait (spins until space available).
@@ -287,25 +339,41 @@ struct alignas(64) TaskRing {
     /// while it was still ours. A FAILED CAS means some other worker owns t;
     /// our copy is simply discarded unused. The release CAS also forbids
     /// sinking the copy below it.
-    bool try_claim_and_execute() noexcept {
+    ///
+    /// `Sim` is the interleaving policy — see submit_sim().
+    template <class Sim>
+    BOLT_FORCE_INLINE bool try_claim_and_execute_sim() noexcept {
         uint64_t t = tail.load(std::memory_order_acquire);
+        Sim::point(sched_point::kClaimTailLoaded);
         const uint64_t h = head.load(std::memory_order_acquire);
         if (t >= h) return false;  // Empty
+        Sim::point(sched_point::kClaimNonEmpty);
         // NOTE: do NOT assert (h - t <= kTaskRingSize) here. `t` and `h` are
         // loaded at different instants; another consumer can advance tail
         // between the two loads, so a stale `t` legitimately trails `h` by more
         // than one ring. Measured: that assert fires within a second under a
-        // saturated multi-consumer ring.
+        // saturated multi-consumer ring. (Under the deterministic simulator the
+        // two loads ARE a consistent snapshot, because exactly one participant
+        // runs at a time, and there the bound IS checked — see
+        // tests/sim/bolt_sim_sched.h.)
 
         // Copy BEFORE claiming — see the contract above.
         const Task task = ring[t & kTaskRingMask];
+        Sim::point(sched_point::kClaimCopied);
 
         if (!tail.compare_exchange_weak(t, t + 1,
-                std::memory_order_release, std::memory_order_relaxed))
+                std::memory_order_release, std::memory_order_relaxed)) {
+            Sim::point(sched_point::kClaimLost);
             return false;  // Another worker claimed it; discard the copy.
+        }
+        Sim::point(sched_point::kClaimWon);
 
         if (task.fn) task.fn(task.arg);
         return true;
+    }
+
+    bool try_claim_and_execute() noexcept {
+        return try_claim_and_execute_sim<SchedSimNoop>();
     }
 
     /// Wait until all submitted tasks have been claimed.

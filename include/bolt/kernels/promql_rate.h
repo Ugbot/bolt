@@ -42,14 +42,59 @@
 #include <cassert>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace bolt {
 namespace promql {
 
-// NaN sentinel used for "no result".
+// An ordinary quiet NaN: a real PromQL sample whose VALUE is NaN.
 BOLT_FORCE_INLINE double promql_nan() noexcept {
     return std::numeric_limits<double>::quiet_NaN();
+}
+
+// ---------------------------------------------------------------------------
+// "No sample" versus "a sample whose value is NaN"
+//
+// PromQL distinguishes these and a range function needs both:
+//
+//   * NO SAMPLE — the structural precondition failed (fewer than two samples
+//     in the window, a zero sampling interval, an empty window). Prometheus
+//     emits NOTHING for the series at that step.
+//   * A NaN VALUE — the arithmetic legitimately produced NaN, e.g.
+//     `irate(http_requests_nan[15m1s])` over `1 NaN NaN 5 11`, which
+//     Prometheus asserts as `_ NaN NaN NaN 0.02`
+//     (functions.test:241 / :324). The sample EXISTS and its value is NaN.
+//
+// Returning a plain quiet NaN for the first case makes the two indis-
+// tinguishable, and every caller that compacts on `isnan` then silently DROPS
+// legitimately-NaN results — an `Ok` reply with an empty series where a value
+// is due.
+//
+// The distinction is carried in the NaN PAYLOAD, which is exactly how
+// Prometheus itself carries its own stale marker (payload 2). `no_sample` is
+// still a quiet NaN, so `std::isnan` remains true for it and every existing
+// caller keeps its current behaviour until it opts in to the finer test —
+// this addition changes no result on its own.
+constexpr uint64_t k_promql_no_sample_bits = 0x7ff0000000000003ULL;
+constexpr uint64_t k_promql_stale_bits     = 0x7ff0000000000002ULL;
+static_assert(k_promql_no_sample_bits != k_promql_stale_bits,
+              "the no-sample payload must not collide with Prometheus's stale marker");
+
+BOLT_FORCE_INLINE double promql_no_sample() noexcept {
+    // Not a reinterpret_cast: type punning through a union or a pointer cast is
+    // UB. memcpy is the sanctioned spelling and compiles to a register move.
+    double v;
+    const uint64_t bits = k_promql_no_sample_bits;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+// True only for the sentinel above — never for an ordinary NaN result.
+BOLT_FORCE_INLINE bool promql_is_no_sample(double v) noexcept {
+    uint64_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return bits == k_promql_no_sample_bits;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +117,7 @@ inline double promql_extrapolated_rate(const int64_t* BOLT_RESTRICT ts,
     assert(val != nullptr || n == 0);
     assert(range_end_ms >= range_start_ms);
     assert(n >= 0);
-    if (n < 2) return promql_nan();
+    if (n < 2) return promql_no_sample();
 
     // Counter-reset correction: every time the series drops, the pre-drop
     // value is re-added (Prometheus assumes the counter restarted at 0).
@@ -90,7 +135,7 @@ inline double promql_extrapolated_rate(const int64_t* BOLT_RESTRICT ts,
     const int64_t first_t = ts[0];
     const int64_t last_t = ts[n - 1];
     const double sampled_interval = static_cast<double>(last_t - first_t) / 1000.0;
-    if (sampled_interval <= 0.0) return promql_nan();
+    if (sampled_interval <= 0.0) return promql_no_sample();
     const double avg_interval = sampled_interval / static_cast<double>(n - 1);
     const double threshold = avg_interval * 1.1;
 
@@ -166,13 +211,13 @@ inline double promql_instant_value(const int64_t* BOLT_RESTRICT ts,
     assert(ts != nullptr || n == 0);
     assert(val != nullptr || n == 0);
     assert(n >= 0);
-    if (n < 2) return promql_nan();
+    if (n < 2) return promql_no_sample();
     const double last_v = val[n - 1];
     const double prev_v = val[n - 2];
     // Counter-reset aware: on a drop, the delta is the last value itself.
     double result = (is_rate && last_v < prev_v) ? last_v : (last_v - prev_v);
     const int64_t dt_ms = ts[n - 1] - ts[n - 2];
-    if (dt_ms == 0) return promql_nan();
+    if (dt_ms == 0) return promql_no_sample();
     if (is_rate) result /= static_cast<double>(dt_ms) / 1000.0;
     assert(dt_ms > 0);
     return result;
@@ -307,7 +352,7 @@ inline double promql_anchored_rate(const int64_t* BOLT_RESTRICT ts,
     assert(range_end_ms >= range_start_ms);
     int64_t b = 0, c = 0;
     if (!promql_anchored_span(ts, n, range_start_ms, range_end_ms,
-                              lookback_ms, &b, &c)) return promql_nan();
+                              lookback_ms, &b, &c)) return promql_no_sample();
     // Unlike the extrapolating kernels, ONE sample is a result, not a
     // degenerate case: an anchored window holding a single sample and no
     // anchor has provably not increased, and upstream asserts exactly that
@@ -325,7 +370,7 @@ inline double promql_anchored_rate(const int64_t* BOLT_RESTRICT ts,
     if (is_rate) {
         const double range_seconds =
             static_cast<double>(range_end_ms - range_start_ms) / 1000.0;
-        if (range_seconds <= 0.0) return promql_nan();
+        if (range_seconds <= 0.0) return promql_no_sample();
         result /= range_seconds;
     }
     assert(!(range_end_ms < range_start_ms));
@@ -344,7 +389,7 @@ inline double promql_interpolated_value_at(const int64_t* BOLT_RESTRICT ts,
     assert(ts != nullptr || n == 0);
     assert(val != nullptr || n == 0);
     assert(n >= 0);
-    if (n <= 0) return promql_nan();
+    if (n <= 0) return promql_no_sample();
     const int64_t j = promql_last_at_or_before(ts, n, t);
     if (j < 0) return val[0];                        // before the first sample
     // Correction accumulated up to j (a constant offset across both boundary
@@ -381,19 +426,21 @@ inline double promql_smoothed_rate(const int64_t* BOLT_RESTRICT ts,
     assert(ts != nullptr || n == 0);
     assert(val != nullptr || n == 0);
     assert(range_end_ms >= range_start_ms);
-    if (n <= 0) return promql_nan();
-    if (ts[0] > range_end_ms) return promql_nan();       // data only after
-    if (ts[n - 1] <= range_start_ms) return promql_nan(); // data only before
+    if (n <= 0) return promql_no_sample();
+    if (ts[0] > range_end_ms) return promql_no_sample();       // data only after
+    if (ts[n - 1] <= range_start_ms) return promql_no_sample(); // data only before
     const double hi =
         promql_interpolated_value_at(ts, val, n, range_end_ms, is_counter);
     const double lo =
         promql_interpolated_value_at(ts, val, n, range_start_ms, is_counter);
-    if (std::isnan(hi) || std::isnan(lo)) return promql_nan();
+    // A boundary that is itself absent (empty array) is absence; a boundary
+    // whose VALUE is NaN yields a NaN result, which Prometheus emits.
+    if (promql_is_no_sample(hi) || promql_is_no_sample(lo)) return promql_no_sample();
     double result = hi - lo;
     if (is_rate) {
         const double range_seconds =
             static_cast<double>(range_end_ms - range_start_ms) / 1000.0;
-        if (range_seconds <= 0.0) return promql_nan();
+        if (range_seconds <= 0.0) return promql_no_sample();
         result /= range_seconds;
     }
     assert(n > 0);

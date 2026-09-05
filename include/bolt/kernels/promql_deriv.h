@@ -30,6 +30,7 @@
 #pragma once
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/promql_rate.h"   // promql_no_sample()
 
 #include <cassert>
 #include <cstdint>
@@ -100,8 +101,11 @@ inline double promql_deriv(const int64_t* BOLT_RESTRICT ts,
     assert(n >= 0);
     double slope = 0.0, intercept = 0.0;
     const int64_t itime = (n > 0) ? ts[0] : 0;
+    // The regression is only reported undefined for fewer than two samples,
+    // which is ABSENCE. An Inf-only constant series returns true with a NaN
+    // slope, which is a NaN VALUE and flows through unchanged.
     if (!promql_linear_regression(ts, val, n, itime, &slope, &intercept)) {
-        return std::numeric_limits<double>::quiet_NaN();
+        return promql_no_sample();
     }
     return slope;
 }
@@ -118,7 +122,7 @@ inline double promql_predict_linear(const int64_t* BOLT_RESTRICT ts,
     assert(n >= 0);
     double slope = 0.0, intercept = 0.0;
     if (!promql_linear_regression(ts, val, n, eval_ts_ms, &slope, &intercept)) {
-        return std::numeric_limits<double>::quiet_NaN();
+        return promql_no_sample();
     }
     return slope * predict_seconds + intercept;
 }

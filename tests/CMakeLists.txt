@@ -224,6 +224,23 @@ add_test(NAME test_bolt_scheduler_ring_exactly_once
 set_tests_properties(test_bolt_scheduler_ring_exactly_once
                      PROPERTIES RUN_SERIAL TRUE)
 
+# Deterministic simulation of the same ring (T1-L5). The complement of the
+# stress pin above: exactly one participant runs at a time and the interleaving
+# is drawn from a seed, so the result does NOT depend on the box or its load.
+# Deliberately NOT RUN_SERIAL — that is the whole point.
+add_executable(test_bolt_sched_sim test_bolt_sched_sim.cpp)
+
+target_link_libraries(test_bolt_sched_sim
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_sched_sim)
+
+add_test(NAME test_bolt_sched_sim COMMAND test_bolt_sched_sim)
+
 add_executable(test_bolt_strtemp test_bolt_strtemp.cpp)
 
 target_link_libraries(test_bolt_strtemp
