@@ -244,7 +244,19 @@ enum class CsrBfsStep : int32_t {
 // lives in `cursor` + `sc`, so any exit is resumable by calling again.
 // out_src / out_dst / out_hops may each be null (csr_bfs_count passes all
 // three null and an out_cap of INT64_MAX).
-inline CsrBfsStep csr_bfs_run_source(
+//
+// FORCE_INLINE, like every other kernel in this family, and it is load-bearing
+// rather than stylistic. Left as a plain `inline` the compiler emits it
+// out-of-line: ten pointer parameters, so `w`, `budget` and every `cursor`
+// field stay in MEMORY across the innermost loop and the caller's constant
+// `out_hops == nullptr` cannot fold away its per-row branch and store.
+// Measured through chukonu's PhysicalBFSExpand on LSQB SF1
+// (`MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN count(*)`, 11,806,176
+// emitted rows, min-of-5, order-alternated): out-of-line 36.3-42.9 ms vs
+// 30.3-30.5 ms inlined, against a 30.5-31.2 ms hand-rolled baseline — i.e.
+// out-of-line is a 1.2-1.4x LOSS and inlined is parity. Two copies of the
+// body (csr_bfs_expand + csr_bfs_count) is the price.
+BOLT_FORCE_INLINE CsrBfsStep csr_bfs_run_source(
         const CsrBfsGraph* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
         const CsrBfsParams* BOLT_RESTRICT p, CsrBfsCursor* BOLT_RESTRICT cursor,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_dst,
