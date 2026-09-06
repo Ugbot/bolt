@@ -9,10 +9,17 @@
 //                       resets / changes  (range-vector functions)
 //   promql_deriv.h      deriv / predict_linear + linear_regression
 //   promql_histogram.h  histogram_quantile (classic le-bucket interpolation)
+//   promql_native_histogram.h
+//                       NATIVE histograms (Prometheus 2.40+): the sparse
+//                       schema/zero-bucket/positive/negative sample type and
+//                       histogram_quantile / _fraction / _stdvar / _stddev /
+//                       _avg over it, including the custom-buckets (NHCB)
+//                       schema -53 that a classic histogram converts into.
 
 #pragma once
 
 #include "bolt/kernels/promql_rate.h"
 #include "bolt/kernels/promql_deriv.h"
 #include "bolt/kernels/promql_histogram.h"
+#include "bolt/kernels/promql_native_histogram.h"
 #include "bolt/kernels/promql_over_time.h"
