@@ -440,49 +440,157 @@ inline bool nh_widen_side(double* BOLT_RESTRICT buf, int32_t* offset, int32_t* n
 
 }  // namespace detail
 
-// dst += src, for two histograms of the SAME schema (and, for custom buckets,
-// the same custom_values) and the same zero threshold. Returns false — leaving
-// `dst` untouched — for any other pair: mixing schemas needs a resolution
-// reduction that changes bucket boundaries, and silently adding across
-// incompatible boundaries would produce a confident wrong distribution.
-inline bool nh_add(NativeHistogram* BOLT_RESTRICT dst,
-                   const NativeHistogram* BOLT_RESTRICT src) noexcept {
+// h *= factor. prometheus/model/histogram/float_histogram.go :: Mul — every
+// count (zero bucket, positives, negatives) and the sum scale by the same
+// factor; the bucket LADDER (schema, offsets, custom values) is untouched
+// because scaling does not move a boundary. A factor of 0 keeps the buckets
+// present with a count of 0, which is what upstream's Mul does and what
+// `histogram_mul_div*0` in native_histograms.test pins.
+inline void nh_mul(NativeHistogram* h, double factor) noexcept {
+    assert(h != nullptr);
+    assert(h->n_pos >= 0 && h->n_neg >= 0);
+    h->zero_count *= factor;
+    h->count *= factor;
+    h->sum *= factor;
+    for (int32_t i = 0; i < h->n_pos; ++i) h->pos[i] *= factor;   // bounded
+    for (int32_t i = 0; i < h->n_neg; ++i) h->neg[i] *= factor;   // bounded
+    assert(h->n_pos <= k_nh_max_side && h->n_neg <= k_nh_max_side);
+}
+
+// h /= scalar. prometheus/model/histogram/float_histogram.go :: Div — NOT
+// `nh_mul(h, 1/scalar)`: upstream special-cases a divisor of zero by REMOVING
+// every bucket (a bucket count of ±Inf is meaningless) while still dividing
+// the zero bucket, count and sum, so the result carries only ±Inf/NaN
+// aggregates. `histogram_mul_div/0` and `histogram_mul_div*0/0` pin exactly
+// that shape, buckets absent.
+inline void nh_div(NativeHistogram* h, double scalar) noexcept {
+    assert(h != nullptr);
+    assert(h->n_pos >= 0 && h->n_neg >= 0);
+    h->zero_count /= scalar;
+    h->count /= scalar;
+    h->sum /= scalar;
+    if (scalar == 0.0) { h->n_pos = 0; h->n_neg = 0; h->pos_offset = 0; h->neg_offset = 0; return; }
+    for (int32_t i = 0; i < h->n_pos; ++i) h->pos[i] /= scalar;   // bounded
+    for (int32_t i = 0; i < h->n_neg; ++i) h->neg[i] /= scalar;   // bounded
+    assert(h->n_pos <= k_nh_max_side && h->n_neg <= k_nh_max_side);
+}
+
+namespace detail {
+
+// prometheus/model/histogram/generic.go :: targetIdx — the bucket index in the
+// coarser `target` schema that the `origin`-schema bucket `idx` falls into.
+// The `-1`/`+1` is not cosmetic: bucket idx 0 has UPPER bound 1, so the runs
+// group around the boundary at 1, not around index 0. Verified against
+// native_histograms.test's own answer key: reducing schema 1 `[0 2 1]` to
+// schema 0 gives `{0:0, 1:3}`, which is exactly what
+// `histogram_sub_2{idx="0"} - ignoring(idx) histogram_sub_2{idx="1"}` requires.
+inline int32_t nh_target_idx(int32_t idx, int32_t shift) noexcept {
+    assert(shift >= 0 && shift < 31);
+    return ((idx - 1) >> shift) + 1;   // C++20: >> on signed is arithmetic
+}
+
+// Collapse one dense side onto the coarser ladder `shift` levels down.
+// Returns false — leaving the side untouched — when the reduced run would
+// exceed k_nh_max_side; never a partial reduction.
+inline bool nh_reduce_side(double* BOLT_RESTRICT buf, int32_t* offset,
+                           int32_t* n, int32_t shift) noexcept {
+    assert(buf != nullptr && offset != nullptr && n != nullptr);
+    if (*n == 0) return true;
+    const int32_t t_lo = nh_target_idx(*offset, shift);
+    const int32_t t_hi = nh_target_idx(*offset + *n - 1, shift);
+    assert(t_hi >= t_lo);
+    const int32_t width = t_hi - t_lo + 1;
+    if (width > k_nh_max_side) return false;
+    double tmp[k_nh_max_side];
+    for (int32_t i = 0; i < width; ++i) tmp[i] = 0.0;   // bounded by width
+    for (int32_t i = 0; i < *n; ++i) {                  // bounded by n
+        const int32_t at = nh_target_idx(*offset + i, shift) - t_lo;
+        assert(at >= 0 && at < width);
+        tmp[at] += buf[i];
+    }
+    for (int32_t i = 0; i < width; ++i) buf[i] = tmp[i];
+    *offset = t_lo;
+    *n = width;
+    return true;
+}
+
+}  // namespace detail
+
+// Reduce `h` to the coarser exponential schema `target`, in place.
+// prometheus/model/histogram/generic.go :: reduceResolution. Refuses (false,
+// h untouched) for a custom-bucket histogram — an NHCB ladder has no coarser
+// form — and for a target finer than the current schema.
+inline bool nh_reduce_resolution(NativeHistogram* h, int32_t target) noexcept {
+    assert(h != nullptr);
+    assert(h->n_pos >= 0 && h->n_neg >= 0);
+    if (nh_uses_custom(h)) return false;
+    if (target < k_nh_schema_min || target > k_nh_schema_max) return false;
+    if (target > h->schema) return false;
+    if (target == h->schema) return true;
+    const int32_t shift = h->schema - target;
+    NativeHistogram out = *h;
+    if (!detail::nh_reduce_side(out.pos, &out.pos_offset, &out.n_pos, shift)) return false;
+    if (!detail::nh_reduce_side(out.neg, &out.neg_offset, &out.n_neg, shift)) return false;
+    out.schema = target;
+    *h = out;
+    assert(h->schema == target);
+    return true;
+}
+
+// dst = dst + src (subtract == false) or dst - src (subtract == true).
+// prometheus/model/histogram/float_histogram.go :: Add / Sub — both operands
+// are first brought onto the COARSER of the two schemas, then combined bucket
+// for bucket. Returns false, leaving `dst` untouched, for any pair this
+// cannot represent exactly:
+//   * one custom-bucket and one exponential, or two NHCBs with different
+//     custom bounds — the ladders are not comparable;
+//   * different zero thresholds — upstream widens the zero bucket by absorbing
+//     adjacent buckets until the thresholds meet, which MOVES counts between
+//     buckets; refusing is honest, guessing is a confident wrong distribution;
+//   * a union or reduction wider than k_nh_max_side.
+inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
+                       const NativeHistogram* BOLT_RESTRICT src,
+                       bool subtract) noexcept {
     assert(dst != nullptr && src != nullptr);
     assert(dst != src);
-    if (dst->schema != src->schema) return false;
-    if (dst->zero_threshold != src->zero_threshold) return false;
-    if (nh_uses_custom(dst)) {
+    const bool cd = nh_uses_custom(dst), cs = nh_uses_custom(src);
+    if (cd != cs) return false;
+    if (cd) {
         if (dst->n_custom != src->n_custom) return false;
         for (int32_t i = 0; i < dst->n_custom; ++i)   // bounded by n_custom
             if (dst->custom[i] != src->custom[i]) return false;
     }
-    NativeHistogram out = *dst;
-    if (src->n_pos > 0) {
-        const int32_t lo = (out.n_pos == 0) ? src->pos_offset
-            : (out.pos_offset < src->pos_offset ? out.pos_offset : src->pos_offset);
-        const int32_t a_hi = out.pos_offset + out.n_pos;
-        const int32_t b_hi = src->pos_offset + src->n_pos;
-        const int32_t hi = (out.n_pos == 0) ? b_hi : (a_hi > b_hi ? a_hi : b_hi);
-        if (!detail::nh_widen_side(out.pos, &out.pos_offset, &out.n_pos, lo, hi))
-            return false;
-        for (int32_t i = 0; i < src->n_pos; ++i)      // bounded by src n_pos
-            out.pos[(src->pos_offset + i) - out.pos_offset] += src->pos[i];
+    if (dst->zero_threshold != src->zero_threshold) return false;
+    NativeHistogram a = *dst;
+    NativeHistogram b = *src;
+    if (!cd && a.schema != b.schema) {
+        if (a.schema > b.schema) { if (!nh_reduce_resolution(&a, b.schema)) return false; }
+        else                     { if (!nh_reduce_resolution(&b, a.schema)) return false; }
     }
-    if (src->n_neg > 0) {
-        const int32_t lo = (out.n_neg == 0) ? src->neg_offset
-            : (out.neg_offset < src->neg_offset ? out.neg_offset : src->neg_offset);
-        const int32_t a_hi = out.neg_offset + out.n_neg;
-        const int32_t b_hi = src->neg_offset + src->n_neg;
-        const int32_t hi = (out.n_neg == 0) ? b_hi : (a_hi > b_hi ? a_hi : b_hi);
-        if (!detail::nh_widen_side(out.neg, &out.neg_offset, &out.n_neg, lo, hi))
-            return false;
-        for (int32_t i = 0; i < src->n_neg; ++i)      // bounded by src n_neg
-            out.neg[(src->neg_offset + i) - out.neg_offset] += src->neg[i];
+    assert(a.schema == b.schema);
+    const double sgn = subtract ? -1.0 : 1.0;
+    if (b.n_pos > 0) {
+        const int32_t lo = (a.n_pos == 0) ? b.pos_offset
+            : (a.pos_offset < b.pos_offset ? a.pos_offset : b.pos_offset);
+        const int32_t a_hi = a.pos_offset + a.n_pos, b_hi = b.pos_offset + b.n_pos;
+        const int32_t hi = (a.n_pos == 0) ? b_hi : (a_hi > b_hi ? a_hi : b_hi);
+        if (!detail::nh_widen_side(a.pos, &a.pos_offset, &a.n_pos, lo, hi)) return false;
+        for (int32_t i = 0; i < b.n_pos; ++i)         // bounded by b.n_pos
+            a.pos[(b.pos_offset + i) - a.pos_offset] += sgn * b.pos[i];
     }
-    out.count += src->count;
-    out.sum += src->sum;
-    out.zero_count += src->zero_count;
-    *dst = out;
+    if (b.n_neg > 0) {
+        const int32_t lo = (a.n_neg == 0) ? b.neg_offset
+            : (a.neg_offset < b.neg_offset ? a.neg_offset : b.neg_offset);
+        const int32_t a_hi = a.neg_offset + a.n_neg, b_hi = b.neg_offset + b.n_neg;
+        const int32_t hi = (a.n_neg == 0) ? b_hi : (a_hi > b_hi ? a_hi : b_hi);
+        if (!detail::nh_widen_side(a.neg, &a.neg_offset, &a.n_neg, lo, hi)) return false;
+        for (int32_t i = 0; i < b.n_neg; ++i)         // bounded by b.n_neg
+            a.neg[(b.neg_offset + i) - a.neg_offset] += sgn * b.neg[i];
+    }
+    a.count += sgn * b.count;
+    a.sum += sgn * b.sum;
+    a.zero_count += sgn * b.zero_count;
+    *dst = a;
     assert(dst->n_pos <= k_nh_max_side && dst->n_neg <= k_nh_max_side);
     return true;
 }
@@ -492,6 +600,177 @@ inline double nh_avg(const NativeHistogram* h) noexcept {
     assert(h != nullptr);
     assert(!(h->count < 0.0));
     return h->sum / h->count;
+}
+
+// ---- trim operators (`h </ x`, `h >/ x`) -------------------------------
+//
+// PromQL's native-histogram bucket-slice operators. `h </ x` keeps the part
+// of the distribution at or below `x`; `h >/ x` keeps the part above it. The
+// result is a HISTOGRAM, not a float, and satisfies the identity
+// native_histograms.test states for itself:
+//
+//     histogram_count(h </ x) == histogram_fraction(-Inf, x, h) * histogram_count(h)
+//     histogram_count(h >/ x) == histogram_fraction(x, +Inf, h) * histogram_count(h)
+//
+// `count` is the retained mass. `sum` cannot be sliced — the original sum is
+// a scalar over observations we no longer have — so it is RE-ESTIMATED from
+// the retained buckets using the same representative Prometheus uses for
+// histogram_stdvar: the geometric mean of an exponential bucket's bounds, the
+// arithmetic midpoint of a custom bucket's, and the midpoint of the retained
+// slice when a bucket is cut. That re-estimate differs from the recorded sum
+// even for a full histogram, which is why a trim that removes NOTHING returns
+// the input untouched rather than a recomputed near-miss.
+namespace detail {
+
+// The representative value of the interval (lo, hi]: arithmetic midpoint for
+// a linear (custom-bucket / zero-bucket) interval, geometric mean for an
+// exponential one. Mirrors promql/functions.go :: histogramVariance's choice.
+inline double nh_trim_rep(double lo, double hi, bool linear) noexcept {
+    assert(!(hi < lo));
+    if (linear) return (lo + hi) / 2.0;
+    double v = std::sqrt(lo * hi);
+    if (hi < 0.0) v = -v;
+    return v;
+}
+
+// One bucket's fate under a trim. `lo`/`hi` are its bounds (an infinity is a
+// real possibility for the first and last CUSTOM buckets), `n` its count.
+// Writes the retained count and, when that is non-zero, its representative.
+//
+// An UNBOUNDED bucket cannot be split — there is no interpolation across an
+// infinite span — so upstream counts the whole of it on the unbounded side
+// (nh_fraction has the same rule, `linear && b.lower == -inf -> b.count`).
+// Kept whole, its retained slice is (-inf, min(hi,cut)] or (max(lo,cut), +inf],
+// whose only finite end is the representative.
+inline void nh_trim_bucket(double lo, double hi, double n, double cut,
+                           bool keep_above, bool linear,
+                           double* BOLT_RESTRICT kept,
+                           double* BOLT_RESTRICT rep) noexcept {
+    assert(kept != nullptr && rep != nullptr);
+    assert(!std::isnan(cut));
+    const double inf = std::numeric_limits<double>::infinity();
+    *kept = 0.0; *rep = 0.0;
+    if (keep_above) {
+        if (lo == -inf) return;                          // all of it is below
+        if (hi == inf) { *kept = n; *rep = (cut > lo) ? cut : lo; return; }
+        if (cut <= lo) { *kept = n; *rep = nh_trim_rep(lo, hi, linear); return; }
+        if (cut >= hi) return;
+        NhBucket b; b.lower = lo; b.upper = hi; b.count = n;
+        *kept = n * (1.0 - nh_fraction_below(&b, cut, linear));
+        *rep  = nh_trim_rep(cut, hi, linear);
+        return;
+    }
+    if (hi == inf) return;                               // all of it is above
+    if (lo == -inf) { *kept = n; *rep = (cut < hi) ? cut : hi; return; }
+    if (cut >= hi) { *kept = n; *rep = nh_trim_rep(lo, hi, linear); return; }
+    if (cut <= lo) return;
+    NhBucket b; b.lower = lo; b.upper = hi; b.count = n;
+    *kept = n * nh_fraction_below(&b, cut, linear);
+    *rep  = nh_trim_rep(lo, cut, linear);
+}
+
+// The zero bucket's interval. It is uniform (linear) over [-zt, zt], closed at
+// zero on whichever side the histogram carries no buckets at all — the same
+// bias rule nh_close_zero_bucket applies to quantile and fraction.
+inline void nh_zero_span(const NativeHistogram* h, double* lo, double* hi) noexcept {
+    assert(h != nullptr && lo != nullptr && hi != nullptr);
+    *lo = -h->zero_threshold; *hi = h->zero_threshold;
+    if (h->n_neg == 0 && h->n_pos > 0)      *lo = 0.0;
+    else if (h->n_pos == 0 && h->n_neg > 0) *hi = 0.0;
+}
+
+}  // namespace detail
+
+// `h </ cutoff` (keep_above == false) or `h >/ cutoff` (keep_above == true),
+// applied in place. Returns false — leaving `h` untouched — for a NaN cutoff,
+// which upstream has no case for and which no ordering can answer.
+inline bool nh_trim(NativeHistogram* h, double cutoff, bool keep_above) noexcept {
+    assert(h != nullptr);
+    assert(h->n_pos <= k_nh_max_side && h->n_neg <= k_nh_max_side);
+    if (std::isnan(cutoff)) return false;
+    const double inf = std::numeric_limits<double>::infinity();
+    // Nothing is on the far side of an infinity in the keeping direction.
+    if (keep_above ? (cutoff == -inf) : (cutoff == inf)) return true;
+    const bool custom = nh_uses_custom(h);
+    const double* cv  = custom ? h->custom : nullptr;
+    const int32_t ncv = custom ? h->n_custom : 0;
+    const double  zt  = h->zero_threshold;
+
+    NativeHistogram out = *h;
+    double total = 0.0, sum = 0.0, c_sum = 0.0;
+    bool removed = false;
+    // Everything is trimmed away by an infinity in the discarding direction.
+    const bool drop_all = keep_above ? (cutoff == inf) : (cutoff == -inf);
+
+    for (int32_t j = 0; j < h->n_pos; ++j) {             // bounded by n_pos
+        const int32_t idx = h->pos_offset + j;
+        double lo = detail::nh_bound(idx - 1, h->schema, cv, ncv);
+        double hi = detail::nh_bound(idx, h->schema, cv, ncv);
+        if (lo > 0.0 && lo < zt) lo = zt;
+        else if (hi < 0.0 && hi > -zt) hi = -zt;
+        // A custom bucket unbounded BELOW but reaching above zero is closed at
+        // zero, exactly as nh_close_zero_bucket closes a zero-straddling
+        // bucket: the histogram records no negative observations, so its first
+        // bucket really starts at 0. That is what makes `cbh </ 15` estimate
+        // its lowest bucket at 2.5 (the midpoint of [0,5]) rather than at its
+        // upper bound, and `cbh >/ 0` a no-op rather than a drop.
+        //
+        // The closure only asserts where the mass sits AT OR ABOVE zero, so it
+        // cannot answer `>/ c` for a NEGATIVE c: that asks how much lies above
+        // a point the closure says nothing about, inside a span nothing can
+        // split. Upstream falls back to the unbounded rule there and the
+        // bucket contributes nothing — `cbh_two_buckets_split_at_positive
+        // >/ -10.0` keeps 100 of 101, dropping the whole [0,5] bucket, while
+        // the same histogram `>/ 0.0` keeps all 101. Both are in
+        // native_histograms.test; the pair is what fixes this asymmetry.
+        if (lo == -inf && hi < inf && hi > 0.0 && (!keep_above || cutoff >= 0.0))
+            lo = 0.0;
+        double kept = 0.0, rep = 0.0;
+        if (!drop_all)
+            detail::nh_trim_bucket(lo, hi, h->pos[j], cutoff, keep_above,
+                                   custom, &kept, &rep);
+        if (kept != h->pos[j]) removed = true;
+        out.pos[j] = kept;
+        total += kept;
+        detail::nh_kahan_inc(kept * rep, &sum, &c_sum);
+    }
+    for (int32_t j = 0; j < h->n_neg; ++j) {             // bounded by n_neg
+        const int32_t idx = h->neg_offset + j;
+        double lo = -detail::nh_bound(idx, h->schema, cv, ncv);
+        double hi = -detail::nh_bound(idx - 1, h->schema, cv, ncv);
+        if (hi < 0.0 && hi > -zt) hi = -zt;
+        else if (lo > 0.0 && lo < zt) lo = zt;
+        double kept = 0.0, rep = 0.0;
+        if (!drop_all)
+            detail::nh_trim_bucket(lo, hi, h->neg[j], cutoff, keep_above,
+                                   custom, &kept, &rep);
+        if (kept != h->neg[j]) removed = true;
+        out.neg[j] = kept;
+        total += kept;
+        detail::nh_kahan_inc(kept * rep, &sum, &c_sum);
+    }
+    if (h->zero_count != 0.0) {
+        double lo = 0.0, hi = 0.0;
+        detail::nh_zero_span(h, &lo, &hi);
+        double kept = 0.0, rep = 0.0;
+        if (!drop_all)
+            detail::nh_trim_bucket(lo, hi, h->zero_count, cutoff, keep_above,
+                                   /*linear=*/true, &kept, &rep);
+        if (kept != h->zero_count) removed = true;
+        out.zero_count = kept;
+        total += kept;
+        detail::nh_kahan_inc(kept * rep, &sum, &c_sum);
+    }
+    // A trim that removed nothing is the identity, not a re-estimate: the
+    // recorded sum is exact and the bucket-representative sum is not.
+    if (!removed) return true;
+    if (std::isfinite(sum)) sum += c_sum;
+    out.count = total;
+    out.sum   = sum;
+    *h = out;
+    assert(h->n_pos <= k_nh_max_side && h->n_neg <= k_nh_max_side);
+    assert(!(h->count < 0.0));
+    return true;
 }
 
 }  // namespace promql
