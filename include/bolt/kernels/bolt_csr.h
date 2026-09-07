@@ -7,6 +7,11 @@
 //   - csr_expand : 1-hop neighbour walk with a branch-free relationship-type
 //                  (label) mask, emitting (src, edge, dst) rows into a
 //                  bounded output buffer, RESUMABLE across calls.
+//   - csr_expand_excluding : the same walk with a second branch-free mask that
+//                  drops any edge whose relationship id an EARLIER HOP of the
+//                  same pattern already traversed — openCypher's relationship
+//                  ISOMORPHISM, applied AT EXPANSION TIME. `csr_expand` is the
+//                  n_excl == 0 case of it, so there is one walk, not two.
 //
 // These mirror chukonu's hand-rolled loops (src/graph/csr_adjacency.cpp
 // degree->scan->scatter, and src/operators/impl/csr_expand_op.cpp neighbour
@@ -159,6 +164,39 @@ BOLT_FORCE_INLINE int64_t csr_edge_label_keep(
     return static_cast<int64_t>(wildcard | (have == want_label));
 }
 
+// Upper bound on the relationship ids ONE hop of a fixed-length pattern can be
+// required to differ from. A hop of an n-edge chain can be paired with at most
+// n-1 earlier hops; 8 covers every chain the consumer can express and keeps the
+// per-edge scan a fixed, tiny loop rather than an argued-about bound.
+constexpr int32_t k_csr_expand_max_excluded = 8;
+
+// Branch-free "this relationship is already used by an earlier hop of the same
+// pattern" mask for CSR edge index `j`. Returns 1 (excluded) or 0 (admissible).
+//
+// This is the fixed-length-chain twin of bolt_csr_bfs.h's
+// `csr_bfs_step_forbidden` TRAIL arm: openCypher matches a pattern under
+// RELATIONSHIP ISOMORPHISM, so a hop may not traverse a relationship an
+// earlier hop of the same pattern already traversed. TRAIL scans the path's
+// own `epath[0..depth)`; here the earlier hops' ids arrive from the caller
+// because a fixed chain carries them in its input row rather than on a stack.
+//
+// Written branch-free (accumulate into `hit`, never early-return) so the cost
+// is n_excl compares with no data-dependent branch, matching the label mask
+// directly above it. n_excl is 0 for every homomorphic-equivalent pattern, so
+// the loop vanishes entirely there.
+BOLT_FORCE_INLINE int64_t csr_edge_excluded(
+        const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
+        int64_t edge_id) noexcept {
+    assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
+    assert(n_excl == 0 || excluded != nullptr);
+    int64_t hit = 0;
+    for (int32_t k = 0; k < n_excl; ++k) {          // bounded by the cap above
+        hit |= static_cast<int64_t>(excluded[k] == edge_id);
+    }
+    assert(hit == 0 || hit == 1);
+    return hit;
+}
+
 // Cursor for resumable expansion. Two fields cover the exact resume point:
 //   src_index   : next index into src_ids[] to process (outer loop bound)
 //   neighbor_j  : the CSR edge index to resume at within the current source's
@@ -189,17 +227,29 @@ struct CsrExpandCursor {
 //     it just calls again.) out_cap == 0 is a valid no-op poll (returns 0).
 //
 // Branch-free inner loop: append at slot `w`, advance w += keep. <=70 lines.
-BOLT_FORCE_INLINE int64_t csr_expand(
+//
+// `excluded[0..n_excl)` are relationship ids EARLIER HOPS of the same pattern
+// already traversed; an edge whose id is among them is dropped by exactly the
+// same keep-advance the label mask uses, so an isomorphically-excluded edge is
+// indistinguishable from a label-rejected one and never reaches the output.
+// n_excl == 0 (the `csr_expand` overload below) is the exact pre-change walk.
+//
+// This is the ONE walk: `csr_expand` forwards here rather than duplicating the
+// loop, because a second copy of the neighbour walk is precisely the drift the
+// count-mode path already refuses to risk.
+BOLT_FORCE_INLINE int64_t csr_expand_excluding(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
         const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+        const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
     assert(n == 0 || (src_ids != nullptr && csr_off != nullptr));
+    assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
 
     int64_t w = 0;                              // rows written this call
     while (cursor->src_index < n && w < out_cap) {
@@ -211,10 +261,12 @@ BOLT_FORCE_INLINE int64_t csr_expand(
         int64_t j = (cursor->neighbor_j > 0) ? cursor->neighbor_j : begin;
         assert(j >= begin && j <= end);
         for (; j < end && w < out_cap; ++j) {
+            const int64_t eid  = csr_edge_ids[j];
             const int64_t keep =
-                csr_edge_label_keep(edge_labels, want_label, j);
+                csr_edge_label_keep(edge_labels, want_label, j) &
+                (1 - csr_edge_excluded(excluded, n_excl, eid));
             out_src[w]  = s;                    // speculative write at slot w
-            out_edge[w] = csr_edge_ids[j];
+            out_edge[w] = eid;
             out_dst[w]  = csr_neighbors[j];
             w += keep;                          // advance only on a match
         }
@@ -227,6 +279,26 @@ BOLT_FORCE_INLINE int64_t csr_expand(
     }
     assert(w <= out_cap);
     return w;
+}
+
+// Unconstrained expansion (homomorphic 1-hop walk) — the pre-existing entry
+// point, unchanged in behaviour and now a thin forward so there is exactly one
+// implementation of the neighbour walk.
+BOLT_FORCE_INLINE int64_t csr_expand(
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const int64_t* BOLT_RESTRICT csr_off,
+        const int64_t* BOLT_RESTRICT csr_neighbors,
+        const int64_t* BOLT_RESTRICT csr_edge_ids,
+        const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+        int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
+        int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
+        CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
+    assert(cursor != nullptr && n >= 0);
+    assert(out_cap >= 0);
+    return csr_expand_excluding(src_ids, n, csr_off, csr_neighbors,
+                                csr_edge_ids, edge_labels, want_label,
+                                /*excluded=*/nullptr, /*n_excl=*/0,
+                                out_src, out_edge, out_dst, out_cap, cursor);
 }
 
 }  // namespace kernels

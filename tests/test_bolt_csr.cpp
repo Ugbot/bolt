@@ -193,9 +193,20 @@ TEST(CsrBuild, ZeroEdges) {
 }
 
 TEST(CsrBuild, RejectsBadArgs) {
+    // REPAIRED W16-L1, and stated rather than quietly dropped. This file had
+    // never been registered in the house suite (see tests/CMakeLists.txt), and
+    // registering it showed that this case ABORTS in an asserts-live build:
+    // `n_nodes <= 0` is a PROGRAMMER ERROR, so csr_build asserts it (Tiger
+    // Style) and the `return false` beneath is only the release-build net. A
+    // case that can only ever abort is not a check, so it is compiled where it
+    // is executable and named where it is not. The coverage is not weakened —
+    // the null-scratch arm below runs in every configuration and is the one
+    // that exercises the `return false` path with the assert satisfied.
+#ifdef NDEBUG
     int64_t off[2] = {0}, scratch[1] = {0};
     EXPECT_FALSE(csr_build(nullptr, nullptr, nullptr, 0, 0, off, nullptr,
                            nullptr, scratch));            // n_nodes <= 0
+#endif
     int64_t off2[2] = {0};
     EXPECT_FALSE(csr_build(nullptr, nullptr, nullptr, 0, 1, off2, nullptr,
                            nullptr, nullptr));            // null scratch
@@ -324,4 +335,121 @@ TEST(CsrExpand, NoSources) {
                            o_src, o_edge, o_dst, 2, &cur);
     EXPECT_EQ(w, 0);
     EXPECT_EQ(cur.src_index, 0);
+}
+
+// ============================================================================
+// csr_expand_excluding — relationship ISOMORPHISM at expansion time (W16-L1)
+// ============================================================================
+//
+// The exclusion list carries relationship ids EARLIER HOPS of the same pattern
+// already traversed. An excluded edge must be dropped by exactly the same
+// keep-advance the label mask uses: it must not appear in the output, must not
+// consume an output slot, and must not disturb the resume cursor.
+//
+// The 4-node fixture's node 0 has TWO out-edges (100 -> 1, 101 -> 2), which is
+// what makes "the right one was dropped" distinguishable from "a row was
+// dropped": excluding 100 must leave 101 and excluding 101 must leave 100. A
+// test that only counted rows could not tell those apart.
+
+TEST(CsrExpandExcluding, DropsExactlyTheNamedEdge) {
+    KnownCsr g;
+    const int64_t src_ids[1] = {0};
+    int64_t o_src[8] = {0}, o_edge[8] = {0}, o_dst[8] = {0};
+
+    // Exclude 100 => only 101 (to node 2) survives.
+    const int64_t ex_a[1] = {100};
+    CsrExpandCursor c1{};
+    int64_t w1 = bolt::kernels::csr_expand_excluding(
+        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_a, 1,
+        o_src, o_edge, o_dst, 8, &c1);
+    ASSERT_EQ(w1, 1);
+    EXPECT_EQ(o_edge[0], 101);
+    EXPECT_EQ(o_dst[0], 2);
+    EXPECT_EQ(c1.src_index, 1);
+
+    // Exclude 101 => only 100 (to node 1) survives. The mirror image, so a
+    // kernel that dropped "the first edge" rather than "the named edge" fails.
+    const int64_t ex_b[1] = {101};
+    CsrExpandCursor c2{};
+    int64_t w2 = bolt::kernels::csr_expand_excluding(
+        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_b, 1,
+        o_src, o_edge, o_dst, 8, &c2);
+    ASSERT_EQ(w2, 1);
+    EXPECT_EQ(o_edge[0], 100);
+    EXPECT_EQ(o_dst[0], 1);
+
+    // Both excluded => 0 rows, still fully drained (not a stall).
+    const int64_t ex_both[2] = {101, 100};
+    CsrExpandCursor c3{};
+    int64_t w3 = bolt::kernels::csr_expand_excluding(
+        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_both, 2,
+        o_src, o_edge, o_dst, 8, &c3);
+    EXPECT_EQ(w3, 0);
+    EXPECT_EQ(c3.src_index, 1);
+
+    // An id that names no edge of this block excludes nothing.
+    const int64_t ex_none[1] = {999};
+    CsrExpandCursor c4{};
+    int64_t w4 = bolt::kernels::csr_expand_excluding(
+        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_none, 1,
+        o_src, o_edge, o_dst, 8, &c4);
+    EXPECT_EQ(w4, 2);
+}
+
+// n_excl == 0 must be BYTE-IDENTICAL to csr_expand. This is the contract that
+// lets csr_expand forward here instead of keeping a second copy of the walk,
+// so it is asserted rather than assumed.
+TEST(CsrExpandExcluding, ZeroExclusionsEqualsPlainExpand) {
+    KnownCsr g;
+    const int64_t src_ids[3] = {0, 1, 3};
+    int64_t a_src[16] = {0}, a_edge[16] = {0}, a_dst[16] = {0};
+    int64_t b_src[16] = {0}, b_edge[16] = {0}, b_dst[16] = {0};
+    CsrExpandCursor ca{}, cb{};
+    const int64_t wa = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, g.lbl, 7,
+                                  a_src, a_edge, a_dst, 16, &ca);
+    const int64_t wb = bolt::kernels::csr_expand_excluding(
+        src_ids, 3, g.off, g.nbr, g.eid, g.lbl, 7, nullptr, 0,
+        b_src, b_edge, b_dst, 16, &cb);
+    ASSERT_EQ(wa, wb);
+    EXPECT_EQ(ca.src_index, cb.src_index);
+    EXPECT_EQ(ca.neighbor_j, cb.neighbor_j);
+    for (int64_t i = 0; i < wa; ++i) {
+        EXPECT_EQ(a_src[i], b_src[i]);
+        EXPECT_EQ(a_edge[i], b_edge[i]);
+        EXPECT_EQ(a_dst[i], b_dst[i]);
+    }
+}
+
+// The exclusion must compose with the LABEL mask and survive an out_cap
+// resume. Node 0's block is walked one row per call with edge 100 excluded, so
+// the resume point has to be parked past a DROPPED edge — the case where a
+// keep-advance kernel most easily loses or repeats a row.
+TEST(CsrExpandExcluding, ComposesWithLabelAndResumes) {
+    KnownCsr g;
+    const int64_t src_ids[2] = {0, 3};
+    const int64_t ex[1] = {100};
+    int64_t o_src[8] = {0}, o_edge[8] = {0}, o_dst[8] = {0};
+    CsrExpandCursor cur{};
+    int64_t total = 0;
+    // out_cap == 1 forces a resume after every emitted row; bounded by the
+    // number of CSR edges plus one poll per source.
+    for (int guard = 0; guard < 16 && cur.src_index < 2; ++guard) {
+        const int64_t w = bolt::kernels::csr_expand_excluding(
+            src_ids, 2, g.off, g.nbr, g.eid, nullptr, -1, ex, 1,
+            o_src + total, o_edge + total, o_dst + total, 1, &cur);
+        total += w;
+    }
+    // node 0: 100 excluded, 101 kept; node 3: 103 kept.
+    ASSERT_EQ(total, 2);
+    EXPECT_EQ(o_edge[0], 101);
+    EXPECT_EQ(o_edge[1], 103);
+    EXPECT_EQ(cur.src_index, 2);
+
+    // Same, but the surviving edge is also label-rejected => nothing at all.
+    CsrExpandCursor cur2{};
+    int64_t w2 = bolt::kernels::csr_expand_excluding(
+        src_ids, 1, g.off, g.nbr, g.eid, g.lbl, /*want=*/7, ex, 1,
+        o_src, o_edge, o_dst, 8, &cur2);
+    EXPECT_EQ(w2, 0);          // edge 100 is label 7 but excluded; 101 is label 9
+    EXPECT_EQ(cur2.src_index, 1);
 }
