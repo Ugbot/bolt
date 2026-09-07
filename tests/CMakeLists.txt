@@ -384,6 +384,19 @@ bolt_apply_hardening(test_promql_native_histogram)
 
 add_test(NAME test_promql_native_histogram COMMAND test_promql_native_histogram)
 
+add_executable(test_promql_nh_rate test_promql_nh_rate.cpp)
+
+target_link_libraries(test_promql_nh_rate
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_promql_nh_rate)
+
+add_test(NAME test_promql_nh_rate COMMAND test_promql_nh_rate)
+
 add_executable(test_bolt_fintech_phase5e test_bolt_fintech_phase5e.cpp)
 
 target_link_libraries(test_bolt_fintech_phase5e

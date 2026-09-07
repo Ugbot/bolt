@@ -53,6 +53,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace bolt {
@@ -592,6 +593,233 @@ inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
     a.zero_count += sgn * b.zero_count;
     *dst = a;
     assert(dst->n_pos <= k_nh_max_side && dst->n_neg <= k_nh_max_side);
+    return true;
+}
+
+// ---- counter-reset detection ------------------------------------------
+//
+// prometheus/model/histogram/float_histogram.go :: DetectReset + detectReset,
+// as of v3.12.0 — the version whose `native_histograms.test` this tree vendors
+// (that file differs from ours by ONE comment typo; v3.7.3's is 842 lines
+// shorter, so the docker oracle is materially behind the answer key).
+//
+// A reset is NOT "the count went down". Upstream's rule is a conjunction over
+// FOUR independent things — the explicit CounterResetHint on the sample, the
+// observation count, the zero bucket under a possibly-different threshold, and
+// EVERY bucket compared on a COMMON schema — and getting any of them wrong is a
+// silent wrong rate on every histogram latency panel, never an error. That is
+// why this returns a THREE-valued answer: a shape whose reset cannot be decided
+// exactly (upstream reconciles mismatched NHCB bounds; this kernel does not)
+// answers `Undecidable`, and the caller must refuse the query.
+enum class NhReset : uint8_t { No = 0, Yes = 1, Undecidable = 2 };
+
+namespace detail {
+
+// One side of a histogram as prometheus's `floatBucketIterator(positive,
+// absoluteStartValue = zt, targetSchema)` yields it: merged onto `target` and
+// with the LEADING buckets whose upper bound is <= `zt` dropped. Dense, so an
+// index outside [offset, offset+n) is an absent bucket, exactly as a gap in
+// upstream's spans is.
+struct NhSideView {
+    double  buf[k_nh_max_side];
+    int32_t offset;
+    int32_t n;
+};
+
+// Build the view. Returns false when the merge would exceed k_nh_max_side —
+// never a partial view, because a truncated side answers confidently and
+// wrongly (a dropped bucket reads as a missing bucket, i.e. a fabricated reset).
+inline bool nh_side_view(const double* BOLT_RESTRICT src, int32_t off, int32_t n,
+                         int32_t schema, int32_t target, double zt,
+                         NhSideView* BOLT_RESTRICT out) noexcept {
+    assert(src != nullptr && out != nullptr);
+    assert(n >= 0 && n <= k_nh_max_side);
+    out->offset = off;
+    out->n = n;
+    for (int32_t i = 0; i < n; ++i) out->buf[i] = src[i];   // bounded by n
+    if (schema != target) {
+        if (target > schema) return false;
+        if (!nh_reduce_side(out->buf, &out->offset, &out->n, schema - target))
+            return false;
+    }
+    // `boundReachedStartValue` starts true when zt == 0, so a zero threshold
+    // skips nothing. Bounds rise with the index, so the skipped set is a
+    // prefix; custom-bucket ladders are never skipped (upstream ignores
+    // absoluteStartValue for them).
+    if (zt != 0.0 && target != k_nh_schema_custom) {
+        int32_t k = 0;
+        while (k < out->n &&
+               nh_bound_exponential(out->offset + k, target) <= zt) ++k;
+        if (k > 0) {
+            for (int32_t i = k; i < out->n; ++i) out->buf[i - k] = out->buf[i];
+            out->offset += k;
+            out->n -= k;
+        }
+    }
+    assert(out->n >= 0 && out->n <= k_nh_max_side);
+    return true;
+}
+
+// prometheus's `detectReset(currIt, prevIt)` over two dense views. Walking
+// prev's indices and treating an index outside curr's run as ABSENT reproduces
+// upstream's three branches exactly — including the one that differs from a
+// plain `curr < prev`: a bucket prev HAS and curr LACKS is a reset whenever its
+// count is non-zero, which is not the same test when that count is negative.
+inline bool nh_side_reset(const NhSideView* curr, const NhSideView* prev) noexcept {
+    assert(curr != nullptr && prev != nullptr);
+    assert(curr->n >= 0 && curr->n <= k_nh_max_side);
+    assert(prev->n >= 0 && prev->n <= k_nh_max_side);
+    for (int32_t i = 0; i < prev->n; ++i) {          // bounded by prev->n
+        const int32_t idx = prev->offset + i;
+        const double  p   = prev->buf[i];
+        if (idx >= curr->offset && idx < curr->offset + curr->n) {
+            if (curr->buf[idx - curr->offset] < p) return true;
+        } else if (p != 0.0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace detail
+
+// prometheus's `zeroCountForLargerThreshold`: what `h`'s zero count would be if
+// its zero threshold were the larger `*threshold`. If that threshold lands
+// INSIDE a populated bucket it is raised to that bucket's outer bound and
+// written back — the caller compares the returned threshold against the one it
+// asked for, and a change means "reset" (upstream's own reading).
+// Returns false when the fixpoint does not settle within the bucket bound.
+inline bool nh_zero_count_for_larger_threshold(const NativeHistogram* h,
+                                               double* BOLT_RESTRICT threshold,
+                                               double* BOLT_RESTRICT out) noexcept {
+    assert(h != nullptr && threshold != nullptr && out != nullptr);
+    assert(!(*threshold < h->zero_threshold));
+    if (*threshold == h->zero_threshold) { *out = h->zero_count; return true; }
+    if (nh_uses_custom(h)) return false;     // no exponential ladder to walk
+    double lt = *threshold;
+    // The negative side can raise `lt` once per bucket, and each raise redoes
+    // the walk; k_nh_max_side + 1 passes is therefore a real bound.
+    for (int32_t pass = 0; pass <= k_nh_max_side; ++pass) {
+        double zc = h->zero_count;
+        bool restart = false;
+        for (int32_t j = 0; j < h->n_pos; ++j) {          // bounded by n_pos
+            const int32_t idx = h->pos_offset + j;
+            if (detail::nh_bound_exponential(idx - 1, h->schema) >= lt) break;
+            zc += h->pos[j];
+            const double upper = detail::nh_bound_exponential(idx, h->schema);
+            if (upper > lt) { if (h->pos[j] != 0.0) lt = upper; break; }
+        }
+        for (int32_t j = 0; j < h->n_neg; ++j) {          // bounded by n_neg
+            const int32_t idx = h->neg_offset + j;
+            if (-detail::nh_bound_exponential(idx - 1, h->schema) <= -lt) break;
+            zc += h->neg[j];
+            const double lower = -detail::nh_bound_exponential(idx, h->schema);
+            if (lower < -lt) {
+                if (h->neg[j] != 0.0) { lt = -lower; restart = true; }
+                break;
+            }
+        }
+        if (!restart) { *threshold = lt; *out = zc; return true; }
+    }
+    return false;
+}
+
+// True when two NHCB ladders are the same. Upstream compares the bound lists
+// outright; a differing ladder is not a differently-spelled same histogram.
+inline bool nh_custom_bounds_match(const NativeHistogram* a,
+                                   const NativeHistogram* b) noexcept {
+    assert(a != nullptr && b != nullptr);
+    assert(a->n_custom >= 0 && a->n_custom <= k_nh_max_custom);
+    assert(b->n_custom >= 0 && b->n_custom <= k_nh_max_custom);
+    if (a->n_custom != b->n_custom) return false;
+    for (int32_t i = 0; i < a->n_custom; ++i)      // bounded by n_custom
+        if (a->custom[i] != b->custom[i]) return false;
+    return true;
+}
+
+// Does `h` come after a counter reset relative to `prev`?
+inline NhReset nh_detect_reset(const NativeHistogram* h,
+                               const NativeHistogram* prev) noexcept {
+    assert(h != nullptr && prev != nullptr);
+    assert(h->n_pos <= k_nh_max_side && prev->n_pos <= k_nh_max_side);
+    if (h->reset_hint == static_cast<uint8_t>(NhResetHint::CounterReset))
+        return NhReset::Yes;
+    if (h->reset_hint == static_cast<uint8_t>(NhResetHint::NotReset))
+        return NhReset::No;
+    // Unknown and Gauge both fall through: PromQL still lets a counter
+    // function run over a gauge histogram, and warns rather than refusing.
+    if (h->count < prev->count) return NhReset::Yes;
+    if (nh_uses_custom(h)) {
+        if (!nh_uses_custom(prev)) return NhReset::Yes;
+        // Upstream reconciles mismatched ladders bucket by bucket
+        // (detectResetWithMismatchedCustomBounds). This kernel does not, and a
+        // guessed answer here is a wrong rate, so it declines.
+        if (!nh_custom_bounds_match(h, prev)) return NhReset::Undecidable;
+    }
+    if (h->schema > prev->schema) return NhReset::Yes;
+    if (h->zero_threshold < prev->zero_threshold) return NhReset::Yes;
+    double thr = h->zero_threshold, pzc = 0.0;
+    if (!nh_zero_count_for_larger_threshold(prev, &thr, &pzc))
+        return NhReset::Undecidable;
+    if (thr != h->zero_threshold) return NhReset::Yes;   // inside a live bucket
+    if (h->zero_count < pzc) return NhReset::Yes;
+    detail::NhSideView cv{}, pv{};
+    for (int side = 0; side < 2; ++side) {                // positives, negatives
+        const bool pos = (side == 0);
+        const double* cs = pos ? h->pos : h->neg;
+        const double* ps = pos ? prev->pos : prev->neg;
+        const int32_t co = pos ? h->pos_offset : h->neg_offset;
+        const int32_t po = pos ? prev->pos_offset : prev->neg_offset;
+        const int32_t cn = pos ? h->n_pos : h->n_neg;
+        const int32_t pn = pos ? prev->n_pos : prev->n_neg;
+        if (!detail::nh_side_view(cs, co, cn, h->schema, h->schema,
+                                  h->zero_threshold, &cv) ||
+            !detail::nh_side_view(ps, po, pn, prev->schema, h->schema,
+                                  h->zero_threshold, &pv))
+            return NhReset::Undecidable;
+        if (detail::nh_side_reset(&cv, &pv)) return NhReset::Yes;
+    }
+    return NhReset::No;
+}
+
+// `dst = src` brought onto the coarser exponential schema `target`
+// (prometheus's CopyToSchema). Refuses rather than truncating.
+inline bool nh_copy_to_schema(NativeHistogram* BOLT_RESTRICT dst,
+                              const NativeHistogram* BOLT_RESTRICT src,
+                              int32_t target) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(dst != src);
+    *dst = *src;
+    if (target == src->schema) return true;
+    return nh_reduce_resolution(dst, target);
+}
+
+// prometheus's `FloatHistogram.Equals` — DATA equality, not mathematical
+// equality: count/sum/zero_count are compared by BIT PATTERN (so NaN == NaN and
+// +0 != -0), and the bucket LAYOUT must match, not merely the distribution.
+// This tree's dense (offset, n) run is the direct analogue of upstream's single
+// span, which is what `changes()` compares: its inputs are always samples as
+// they were written, never a histogram this engine computed.
+inline bool nh_equals(const NativeHistogram* a, const NativeHistogram* b) noexcept {
+    assert(a != nullptr && b != nullptr);
+    assert(a->n_pos <= k_nh_max_side && a->n_neg <= k_nh_max_side);
+    assert(b->n_pos <= k_nh_max_side && b->n_neg <= k_nh_max_side);
+    auto bits = [](double v) noexcept {
+        uint64_t u = 0; std::memcpy(&u, &v, sizeof(u)); return u;
+    };
+    if (a->schema != b->schema) return false;
+    if (bits(a->count) != bits(b->count)) return false;
+    if (bits(a->sum) != bits(b->sum)) return false;
+    if (nh_uses_custom(a) && !nh_custom_bounds_match(a, b)) return false;
+    if (a->zero_threshold != b->zero_threshold) return false;
+    if (bits(a->zero_count) != bits(b->zero_count)) return false;
+    if (a->n_pos != b->n_pos || a->n_neg != b->n_neg) return false;
+    if (a->n_pos != 0 && a->pos_offset != b->pos_offset) return false;
+    if (a->n_neg != 0 && a->neg_offset != b->neg_offset) return false;
+    for (int32_t i = 0; i < a->n_pos; ++i)              // bounded by n_pos
+        if (bits(a->pos[i]) != bits(b->pos[i])) return false;
+    for (int32_t i = 0; i < a->n_neg; ++i)              // bounded by n_neg
+        if (bits(a->neg[i]) != bits(b->neg[i])) return false;
     return true;
 }
 
