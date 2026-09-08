@@ -197,6 +197,28 @@ BOLT_FORCE_INLINE int64_t csr_edge_excluded(
     return hit;
 }
 
+// Branch-free "this candidate destination is the one the caller REQUIRES" mask
+// for a candidate neighbour. Returns 1 (keep) or 0 (drop).
+//
+// This is the mirror of `csr_edge_excluded` directly above: that one is a
+// must-NOT-equal on relationship ids, this is a must-EQUAL on the destination
+// NODE id. It exists because a pattern that closes a cycle — the last hop of
+// `(a)-[]-(b)-[]-(c)-[]-(a)` — does not want a neighbour LIST at all; it wants
+// to know whether one specific neighbour is present. Expressed above the walk
+// that is `expand` then `filter dst == a`, which materialises every
+// non-matching neighbour first; expressed here it is the same predicate with
+// the same result and nothing but the matches written.
+//
+// `dst_bounds == nullptr` is the unconstrained walk, and `src_index` indexes
+// the SAME array `src_ids` is indexed by, so the bound is per input row.
+BOLT_FORCE_INLINE int64_t csr_edge_dst_keep(
+        const int64_t* BOLT_RESTRICT dst_bounds, int64_t src_index,
+        int64_t dst) noexcept {
+    assert(src_index >= 0);
+    if (dst_bounds == nullptr) return 1;            // loop-invariant; hoisted
+    return static_cast<int64_t>(dst_bounds[src_index] == dst);
+}
+
 // Cursor for resumable expansion. Two fields cover the exact resume point:
 //   src_index   : next index into src_ids[] to process (outer loop bound)
 //   neighbor_j  : the CSR edge index to resume at within the current source's
@@ -234,16 +256,27 @@ struct CsrExpandCursor {
 // indistinguishable from a label-rejected one and never reaches the output.
 // n_excl == 0 (the `csr_expand` overload below) is the exact pre-change walk.
 //
-// This is the ONE walk: `csr_expand` forwards here rather than duplicating the
-// loop, because a second copy of the neighbour walk is precisely the drift the
-// count-mode path already refuses to risk.
-BOLT_FORCE_INLINE int64_t csr_expand_excluding(
+// `dst_bounds` (W19-L3) is the THIRD keep term and the only one that can turn
+// the expansion into a test: non-null means row i's destination is already
+// determined, so only the edges from `src_ids[i]` to `dst_bounds[i]` may be
+// emitted. It changes no other behaviour — the surviving rows, their order, and
+// their multiplicity (one row per matching PARALLEL edge, not one per pair) are
+// exactly what `csr_expand_excluding` + a `dst == bound` filter above it would
+// have produced, which is what makes fusing that filter in here a pure
+// materialisation saving rather than a new matching rule. nullptr is the
+// pre-change walk.
+//
+// This is the ONE walk: `csr_expand` and `csr_expand_excluding` forward here
+// rather than duplicating the loop, because a second copy of the neighbour walk
+// is precisely the drift the count-mode path already refuses to risk.
+BOLT_FORCE_INLINE int64_t csr_expand_bounded(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
         const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
         const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
+        const int64_t* BOLT_RESTRICT dst_bounds,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
@@ -262,12 +295,14 @@ BOLT_FORCE_INLINE int64_t csr_expand_excluding(
         assert(j >= begin && j <= end);
         for (; j < end && w < out_cap; ++j) {
             const int64_t eid  = csr_edge_ids[j];
+            const int64_t dst  = csr_neighbors[j];
             const int64_t keep =
                 csr_edge_label_keep(edge_labels, want_label, j) &
-                (1 - csr_edge_excluded(excluded, n_excl, eid));
+                (1 - csr_edge_excluded(excluded, n_excl, eid)) &
+                csr_edge_dst_keep(dst_bounds, cursor->src_index, dst);
             out_src[w]  = s;                    // speculative write at slot w
             out_edge[w] = eid;
-            out_dst[w]  = csr_neighbors[j];
+            out_dst[w]  = dst;
             w += keep;                          // advance only on a match
         }
         if (j < end) {                          // out_cap hit mid-block: resume
@@ -279,6 +314,25 @@ BOLT_FORCE_INLINE int64_t csr_expand_excluding(
     }
     assert(w <= out_cap);
     return w;
+}
+
+// Isomorphic expansion with no bound destination — the W16-L1 entry point,
+// unchanged in behaviour and now a thin forward.
+BOLT_FORCE_INLINE int64_t csr_expand_excluding(
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const int64_t* BOLT_RESTRICT csr_off,
+        const int64_t* BOLT_RESTRICT csr_neighbors,
+        const int64_t* BOLT_RESTRICT csr_edge_ids,
+        const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+        const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
+        int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
+        int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
+        CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
+    assert(cursor != nullptr && n >= 0 && out_cap >= 0);
+    return csr_expand_bounded(src_ids, n, csr_off, csr_neighbors, csr_edge_ids,
+                              edge_labels, want_label, excluded, n_excl,
+                              /*dst_bounds=*/nullptr, out_src, out_edge,
+                              out_dst, out_cap, cursor);
 }
 
 // Unconstrained expansion (homomorphic 1-hop walk) — the pre-existing entry
