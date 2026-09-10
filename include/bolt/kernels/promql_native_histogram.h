@@ -515,6 +515,66 @@ inline bool nh_reduce_side(double* BOLT_RESTRICT buf, int32_t* offset,
     return true;
 }
 
+// prometheus/model/histogram/float_histogram.go :: intersectCustomBucketBounds.
+// Both ladders ascend, so the intersection is one merge walk. Upstream compares
+// with `==` here (its CustomBucketBoundsMatch uses the bit pattern; this does
+// not) and returns nil — length 0 — when either side is empty.
+inline int32_t nh_intersect_custom(const double* BOLT_RESTRICT a, int32_t na,
+                                   const double* BOLT_RESTRICT b, int32_t nb,
+                                   double* BOLT_RESTRICT out) noexcept {
+    assert((a != nullptr || na == 0) && (b != nullptr || nb == 0));
+    assert(na >= 0 && na <= k_nh_max_custom && nb >= 0 && nb <= k_nh_max_custom);
+    assert(out != nullptr);
+    if (na == 0 || nb == 0) return 0;
+    int32_t i = 0, j = 0, n = 0;
+    while (i < na && j < nb) {                       // bounded by na + nb
+        if      (a[i] == b[j]) { out[n++] = a[i]; ++i; ++j; }
+        else if (a[i] <  b[j]) { ++i; }
+        else                   { ++j; }
+    }
+    assert(n <= na && n <= nb);
+    return n;
+}
+
+// Fold one NHCB's dense positive buckets onto the INTERSECTED ladder,
+// accumulating into `target[0 .. n_int]` with sign `sgn`. `target` has n_int+1
+// slots: one per intersected bound plus the trailing +Inf bucket.
+//
+// Mirrors the `mapBuckets` closure inside upstream's
+// addCustomBucketsWithMismatches: a source bucket whose upper bound is
+// `bounds[idx]` lands in the FIRST intersected bucket whose bound is >= that,
+// and in the +Inf bucket when there is none. `k` is monotone because both
+// ladders ascend and `inter` is a subsequence of `bounds`.
+//
+// Upstream folds with Kahan. Its compensation term is DISCARDED by both Add and
+// Sub (each takes `_` for it) and Kahan's running total is `sum + inc` — the
+// same value a plain `+=` writes — so this is bit-identical to upstream for
+// those two callers. It is NOT identical to KahanAdd, which keeps the term;
+// that path is not what this kernel implements (see nh_combine).
+inline void nh_map_custom_onto(const double* BOLT_RESTRICT src, int32_t off,
+                               int32_t n, const double* BOLT_RESTRICT bounds,
+                               int32_t n_bounds,
+                               const double* BOLT_RESTRICT inter, int32_t n_int,
+                               double sgn, double* BOLT_RESTRICT target) noexcept {
+    assert((src != nullptr && bounds != nullptr) || n == 0);
+    assert(n >= 0 && n <= k_nh_max_side);
+    assert(target != nullptr && n_int >= 0 && n_int <= k_nh_max_custom);
+    int32_t k = 0;
+    for (int32_t j = 0; j < n; ++j) {                // bounded by n
+        const int32_t idx = off + j;
+        assert(idx >= 0);
+        int32_t t = n_int;                           // the +Inf bucket
+        if (idx >= 0 && idx < n_bounds) {
+            const double b = bounds[idx];
+            while (k < n_int) {                      // bounded by n_int
+                if (inter[k] >= b) { t = k; break; }
+                ++k;
+            }
+        }
+        target[t] += sgn * src[j];
+    }
+}
+
 }  // namespace detail
 
 // Reduce `h` to the coarser exponential schema `target`, in place.
@@ -538,13 +598,64 @@ inline bool nh_reduce_resolution(NativeHistogram* h, int32_t target) noexcept {
     return true;
 }
 
+// dst = dst (+/-) src for two NHCBs whose custom ladders DIFFER.
+//
+// Upstream does NOT refuse this pair. Since v3.6 (Add/Sub in
+// float_histogram.go, via addCustomBucketsWithMismatches) it RECONCILES the two
+// ladders onto the INTERSECTION of their bound sets and folds every bucket of
+// each operand into the intersected bucket that contains it. Refusing was this
+// kernel's behaviour through W25 and it is what made 22 corpus cells RED.
+//
+// Note what the intersection is NOT: it is not a union, and it is not the finer
+// ladder. Dropping a bound merges the two buckets it separated, so mass is only
+// ever coarsened — never split, never interpolated. That is why the answer is
+// exact rather than estimated, and why an empty intersection is legal: the
+// result is then a single (-Inf, +Inf] bucket, which is exactly what upstream's
+// `nil` CustomValues plus one bucket means.
+inline bool nh_combine_custom_mismatch(NativeHistogram* BOLT_RESTRICT dst,
+                                       const NativeHistogram* BOLT_RESTRICT src,
+                                       bool subtract) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(nh_uses_custom(dst) && nh_uses_custom(src));
+    double inter[k_nh_max_custom];
+    const int32_t n_int = detail::nh_intersect_custom(
+        dst->custom, dst->n_custom, src->custom, src->n_custom, inter);
+    double target[k_nh_max_custom + 1];
+    for (int32_t i = 0; i <= n_int; ++i) target[i] = 0.0;  // bounded by n_int
+    const double sgn = subtract ? -1.0 : 1.0;
+    detail::nh_map_custom_onto(dst->pos, dst->pos_offset, dst->n_pos,
+                               dst->custom, dst->n_custom, inter, n_int, 1.0, target);
+    detail::nh_map_custom_onto(src->pos, src->pos_offset, src->n_pos,
+                               src->custom, src->n_custom, inter, n_int, sgn, target);
+    // Upstream drops every zero-population bucket when it rebuilds the spans. A
+    // dense run cannot express an interior gap, so the equivalent here is to
+    // trim the zero prefix and suffix; a surviving interior zero reads as a
+    // zero-count bucket, which every consumer in this tree already treats as an
+    // absent one (nh_quantile skips it, nh_all_buckets emits it with count 0).
+    int32_t lo = 0, hi = n_int + 1;
+    while (lo < hi && target[lo] == 0.0) ++lo;              // bounded by n_int+1
+    while (hi > lo && target[hi - 1] == 0.0) --hi;          // bounded by n_int+1
+    if (hi - lo > k_nh_max_side) return false;
+    for (int32_t i = lo; i < hi; ++i) dst->pos[i - lo] = target[i];
+    dst->pos_offset = lo;
+    dst->n_pos = hi - lo;
+    for (int32_t i = 0; i < n_int; ++i) dst->custom[i] = inter[i];
+    dst->n_custom = n_int;
+    dst->count += sgn * src->count;
+    dst->sum   += sgn * src->sum;
+    assert(dst->n_pos >= 0 && dst->n_pos <= k_nh_max_side);
+    assert(dst->n_custom >= 0 && dst->n_custom <= k_nh_max_custom);
+    return true;
+}
+
 // dst = dst + src (subtract == false) or dst - src (subtract == true).
 // prometheus/model/histogram/float_histogram.go :: Add / Sub — both operands
 // are first brought onto the COARSER of the two schemas, then combined bucket
-// for bucket. Returns false, leaving `dst` untouched, for any pair this
-// cannot represent exactly:
-//   * one custom-bucket and one exponential, or two NHCBs with different
-//     custom bounds — the ladders are not comparable;
+// for bucket. Two NHCBs with different custom bounds are reconciled onto the
+// intersection of those bounds (nh_combine_custom_mismatch). Returns false,
+// leaving `dst` untouched, for any pair this cannot represent exactly:
+//   * one custom-bucket and one exponential — the ladders are not comparable,
+//     and upstream errors here too (checkSchemaAndBounds);
 //   * different zero thresholds — upstream widens the zero bucket by absorbing
 //     adjacent buckets until the thresholds meet, which MOVES counts between
 //     buckets; refusing is honest, guessing is a confident wrong distribution;
@@ -557,9 +668,10 @@ inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
     const bool cd = nh_uses_custom(dst), cs = nh_uses_custom(src);
     if (cd != cs) return false;
     if (cd) {
-        if (dst->n_custom != src->n_custom) return false;
-        for (int32_t i = 0; i < dst->n_custom; ++i)   // bounded by n_custom
-            if (dst->custom[i] != src->custom[i]) return false;
+        bool same = dst->n_custom == src->n_custom;
+        for (int32_t i = 0; same && i < dst->n_custom; ++i)  // bounded by n_custom
+            if (dst->custom[i] != src->custom[i]) same = false;
+        if (!same) return nh_combine_custom_mismatch(dst, src, subtract);
     }
     if (dst->zero_threshold != src->zero_threshold) return false;
     NativeHistogram a = *dst;
@@ -681,6 +793,37 @@ inline bool nh_side_reset(const NhSideView* curr, const NhSideView* prev) noexce
     return false;
 }
 
+// prometheus's `detectResetWithMismatchedCustomBounds` over two NHCBs.
+//
+// Upstream walks both ladders with two bucket iterators, and at every bound the
+// two ladders SHARE it rolls up the mass each has accumulated since the last
+// shared bound, then compares those two roll-ups. The set of shared bounds is
+// by definition nh_intersect_custom's output, and "the mass since the previous
+// shared bound" is by definition the intersected bucket — so mapping both onto
+// the intersected ladder and comparing element-wise is the same partition and
+// the same comparison, with the same trailing +Inf slot that upstream reaches
+// when both bound indices run off their ends.
+//
+// It must NOT fall through to nh_side_reset: that compares by ABSOLUTE bucket
+// index, and two different ladders give the same index different bounds.
+inline bool nh_reset_mismatched_custom(const NativeHistogram* curr,
+                                       const NativeHistogram* prev) noexcept {
+    assert(curr != nullptr && prev != nullptr);
+    assert(curr->schema == k_nh_schema_custom && prev->schema == k_nh_schema_custom);
+    double inter[k_nh_max_custom];
+    const int32_t n_int = nh_intersect_custom(curr->custom, curr->n_custom,
+                                              prev->custom, prev->n_custom, inter);
+    double c[k_nh_max_custom + 1], p[k_nh_max_custom + 1];
+    for (int32_t i = 0; i <= n_int; ++i) { c[i] = 0.0; p[i] = 0.0; }
+    nh_map_custom_onto(curr->pos, curr->pos_offset, curr->n_pos,
+                       curr->custom, curr->n_custom, inter, n_int, 1.0, c);
+    nh_map_custom_onto(prev->pos, prev->pos_offset, prev->n_pos,
+                       prev->custom, prev->n_custom, inter, n_int, 1.0, p);
+    for (int32_t i = 0; i <= n_int; ++i)             // bounded by n_int + 1
+        if (c[i] < p[i]) return true;
+    return false;
+}
+
 }  // namespace detail
 
 // prometheus's `zeroCountForLargerThreshold`: what `h`'s zero count would be if
@@ -751,10 +894,13 @@ inline NhReset nh_detect_reset(const NativeHistogram* h,
     if (h->count < prev->count) return NhReset::Yes;
     if (nh_uses_custom(h)) {
         if (!nh_uses_custom(prev)) return NhReset::Yes;
-        // Upstream reconciles mismatched ladders bucket by bucket
-        // (detectResetWithMismatchedCustomBounds). This kernel does not, and a
-        // guessed answer here is a wrong rate, so it declines.
-        if (!nh_custom_bounds_match(h, prev)) return NhReset::Undecidable;
+        // Mismatched ladders are reconciled bucket by bucket and the answer
+        // RETURNS here — upstream's DetectReset returns from this branch too,
+        // and the checks below it (schema, zero threshold, per-index bucket
+        // walk) all assume a shared ladder.
+        if (!nh_custom_bounds_match(h, prev))
+            return detail::nh_reset_mismatched_custom(h, prev) ? NhReset::Yes
+                                                               : NhReset::No;
     }
     if (h->schema > prev->schema) return NhReset::Yes;
     if (h->zero_threshold < prev->zero_threshold) return NhReset::Yes;

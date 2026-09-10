@@ -537,9 +537,26 @@ TEST(NativeHistogram, CombineRefusesIncompatiblePairs) {
     EXPECT_FALSE(bolt::promql::nh_combine(&a, &cbh, false));
     EXPECT_TRUE(SameHistogram(a, exp0));           // untouched
 
+    // W26-L3: two NHCBs whose bound ladders DIFFER are NOT in this class. This
+    // file demanded a refusal for them until W25, which is what made 22 corpus
+    // cells RED — a pin asserting a refusal for a shape upstream answers is a
+    // pin that blocks the fix, so it is re-derived here rather than relaxed.
+    // Upstream reconciles onto the INTERSECTION of the two ladders
+    // ({5,10} n {5,11} = {5}), and both source buckets then land in the single
+    // bounded bucket. Oracle: promtool 3.12.0 (revision 9f27dffc), read by
+    // planting a wrong 987654 expectation so it prints what it computed:
+    //   sum(m)                        -> {{schema:-53 count:2 sum:2
+    //   m{k="a"} + ignoring(k) m{k="b"}   custom_values:[5] buckets:[2]}}
+    // for m{k="a"} = {{count:1 sum:1 custom_values:[5 10] buckets:[1]}} and
+    // m{k="b"} = {{... custom_values:[5 11] ...}}. The aggregation and the
+    // binary-operator spellings agree, and the value is asserted BUCKET-wise:
+    // the right total in the wrong bucket preserves count, sum and cardinality
+    // and is still a wrong distribution.
     NativeHistogram b = cbh;
-    EXPECT_FALSE(bolt::promql::nh_combine(&b, &cbh2, false));
-    EXPECT_TRUE(SameHistogram(b, cbh));
+    EXPECT_TRUE(bolt::promql::nh_combine(&b, &cbh2, false));
+    const NativeHistogram reconciled =
+        mk(k_nh_schema_custom, 2.0, 2.0, {2}, {}, 0.0, 0.0, 0, 0, {5});
+    EXPECT_TRUE(SameHistogram(b, reconciled));
 
     // Different zero thresholds need upstream's widen-until-they-meet loop,
     // which MOVES counts between buckets. Refused rather than guessed.

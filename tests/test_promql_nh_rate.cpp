@@ -186,11 +186,27 @@ TEST(PromqlNhReset, CustomBucketLadders) {
     const NativeHistogram same = mk(k_nh_schema_custom, 1, 1, {1}, {}, 0, 0, {5});
     EXPECT_EQ(nh_detect_reset(&same, &same), NhReset::No);
     // MISMATCHED ladders: upstream reconciles them bucket by bucket
-    // (detectResetWithMismatchedCustomBounds). This kernel does not, and
-    // guessing would be a silent wrong rate, so it declines. functions.test:228
-    // (`/g`) and native_histograms.test:1291's third sample are this shape.
+    // (detectResetWithMismatchedCustomBounds) and RETURNS an answer. This pin
+    // demanded `Undecidable` until W25 — a refusal is honest only while the
+    // kernel really cannot decide, and asserting one for a shape upstream
+    // decides is what kept 22 corpus cells RED.
+    //
+    // Re-derived from Prometheus's OWN expectation rather than from this
+    // kernel: native_histograms.test:1334 loads exactly these three samples
+    // ([5], [5], [5 10], all sum 1 count 1 buckets [1]) and asserts
+    // `resets(nhcb_metric[13m])` -> **0**. On the intersected ladder {5} both
+    // histograms hold their whole mass in the one bounded bucket, so nothing
+    // decreased. promtool 3.12.0 agrees; 3.7.3 answers 1 here and is a
+    // characterised divergence (see nhcb_reconcile_oracle.py).
     const NativeHistogram other = mk(k_nh_schema_custom, 1, 1, {1}, {}, 0, 0, {5, 10});
-    EXPECT_EQ(nh_detect_reset(&other, &same), NhReset::Undecidable);
+    EXPECT_EQ(nh_detect_reset(&other, &same), NhReset::No);
+    // The negative control, and the one this cell CANNOT supply: the corpus's
+    // only `resets` over mismatched ladders expects 0, so "never a reset"
+    // scores full marks there. Drop the mass that survives reconciliation and
+    // the same pair must answer Yes — otherwise a missed reset is a silently
+    // wrong `rate` on every panel.
+    const NativeHistogram drained = mk(k_nh_schema_custom, 1, 1, {0.5}, {}, 0, 0, {5, 10});
+    EXPECT_EQ(nh_detect_reset(&drained, &same), NhReset::Yes);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,19 +312,29 @@ TEST(PromqlNhRate, MixedExponentialAndCustomBuckets) {
     }
 }
 
-TEST(PromqlNhRate, MismatchedCustomBoundsAreRefusedNotGuessed) {
+TEST(PromqlNhRate, MismatchedCustomBoundsAreReconciledNotRefused) {
     // native_histograms.test:1291 + :1326 — nhcb_metric's third sample carries
-    // custom_values [5 10] where the first two carry [5]. Upstream reconciles
-    // the ladders during Sub; this kernel cannot, so it must REFUSE. A refusal
-    // is a named gap; a guessed subtraction would be a wrong rate that no row
-    // count could see.
+    // custom_values [5 10] where the first two carry [5]. Upstream RECONCILES
+    // the ladders during Sub, onto their intersection {5}; this pin demanded a
+    // refusal until W25 and that refusal was the defect.
+    //
+    // The expectation is Prometheus's own, not this kernel's:
+    // native_histograms.test:1326 asserts `rate(nhcb_metric[13m])` ->
+    // `{{schema:-53 custom_values:[5] }}` — schema custom, ladder {5}, and
+    // count/sum/buckets all ZERO, because on the intersected ladder every
+    // sample holds mass 1 in the one bounded bucket and the delta is exactly
+    // nothing. :1321 and :1324 assert the same value for `delta` and
+    // `increase`. Asserting the LADDER as well as the zeros matters: a kernel
+    // that returned an exponential zero histogram, or an empty ladder, would
+    // also be "all zeros".
     const NativeHistogram a = mk(k_nh_schema_custom, 1, 1, {1}, {}, 0, 0, {5});
     const NativeHistogram c = mk(k_nh_schema_custom, 1, 1, {1}, {}, 0, 0, {5, 10});
     const NativeHistogram* pts[3] = { &a, &a, &c };
     const int64_t ts[3] = { 0, 360000, 720000 };
     NativeHistogram out;
-    EXPECT_EQ(nh_extrapolated_rate(ts, pts, 3, -60000, 720000, true, true, &out),
-              NhRangeStatus::Refused);
+    ASSERT_EQ(nh_extrapolated_rate(ts, pts, 3, -60000, 720000, true, true, &out),
+              NhRangeStatus::Ok);
+    ExpectHistogram(out, k_nh_schema_custom, 0.0, 0.0, {}, {5});
 }
 
 // ---------------------------------------------------------------------------
@@ -343,11 +369,18 @@ TEST(PromqlNhInstant, IrateOverTheLastTwoSamples) {
         ASSERT_EQ(nh_instant_value(ts, &a, &b, true, &out), NhRangeStatus::Ok);
         ExpectHistogram(out, k_nh_schema_custom, 0.01, 0.01, {0.01}, {5, 10});
     }
-    // :271 `/g` — two NHCBs with DIFFERENT ladders. Refused, see above.
+    // :271 `/g` — two NHCBs with DIFFERENT ladders, and the intersection of
+    // {1} and {5 10} is EMPTY. functions.test:273 expects
+    // `{{schema:-53 counter_reset_hint:gauge}}`: no custom_values at all, no
+    // buckets, count and sum zero. That is the empty-intersection result —
+    // one implicit (-Inf, +Inf] bucket into which BOTH samples' mass folds, so
+    // the subtraction cancels. Reconciled, not refused; the ladder being EMPTY
+    // rather than {1} or {5 10} is the part a count-only assertion would miss.
     {
         const NativeHistogram a = mk(k_nh_schema_custom, 3, 3, {3}, {}, 0, 0, {1});
         const NativeHistogram b = mk(k_nh_schema_custom, 3, 3, {3}, {}, 0, 0, {5, 10});
-        EXPECT_EQ(nh_instant_value(ts, &a, &b, true, &out), NhRangeStatus::Refused);
+        ASSERT_EQ(nh_instant_value(ts, &a, &b, true, &out), NhRangeStatus::Ok);
+        ExpectHistogram(out, k_nh_schema_custom, 0.0, 0.0, {}, {});
     }
     // idelta always subtracts — it is the gauge form and never reset-corrects.
     {
@@ -397,9 +430,15 @@ TEST(PromqlNhResetsChanges, NhcbLadderChangeIsAChangeButNotACountedReset) {
     int64_t n = 0;
     ASSERT_EQ(nh_changes(val, hist, 3, &n), NhRangeStatus::Ok);
     EXPECT_EQ(n, 1);
-    // ... while `resets` needs the reconciliation this kernel refuses, so it
-    // declines rather than reporting 0 by luck or 1 by guess.
-    EXPECT_EQ(nh_resets(val, hist, 3, &n), NhRangeStatus::Refused);
+    // ... while `resets` now performs that reconciliation and answers 0, which
+    // is native_histograms.test:1334's own expectation. It used to decline.
+    //
+    // 0 is also what "never a reset" answers, so this assertion alone proves
+    // nothing — the discriminating case is in
+    // PromqlNhReset.CustomBucketLadders, where the same mismatched pair with
+    // mass actually removed must answer Yes.
+    ASSERT_EQ(nh_resets(val, hist, 3, &n), NhRangeStatus::Ok);
+    EXPECT_EQ(n, 0);
 }
 
 TEST(PromqlNhResetsChanges, EqualityIsDataEqualityNotDistributionEquality) {
