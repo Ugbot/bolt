@@ -679,6 +679,12 @@ inline bool nh_zero_widen_is_identity(const NativeHistogram* h, double T) noexce
     assert(h != nullptr);
     assert(h->n_pos >= 0 && h->n_neg >= 0);
     if (nh_uses_custom(h)) return false;
+    // A NaN threshold compares unequal to ITSELF, so the caller's
+    // `dst->zero_threshold != src->zero_threshold` admits a malformed pair that
+    // the old flat refusal rejected. Every comparison below would then be
+    // false and the pair would COMBINE. Refuse non-finite thresholds outright
+    // so widening can only ever narrow what nh_combine accepts, never widen it.
+    if (!std::isfinite(T) || !std::isfinite(h->zero_threshold)) return false;
     if (T < h->zero_threshold) return false;
     if (T == h->zero_threshold) return true;
     // The bucket nearest zero on each side is the run's first index; its

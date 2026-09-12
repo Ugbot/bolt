@@ -1167,3 +1167,34 @@ TEST(PromqlNativeHistogram, ZeroThresholdReconciliation) {
     ExpectClose(a.count, 66.0);
     ExpectClose(a.zero_count, 9.0);
 }
+
+// W31-L5x — a NaN zero threshold must not become COMBINABLE.
+//
+// nh_combine's reconciliation is entered on `dst->zero_threshold !=
+// src->zero_threshold`, and NaN compares unequal to ITSELF — so without an
+// explicit non-finite guard a malformed pair that the old flat refusal
+// rejected would fall through every comparison and combine. Widening what
+// nh_combine accepts is only ever allowed where the answer is exact; this is
+// the boundary where it would not have been.
+TEST(PromqlNativeHistogram, NonFiniteZeroThresholdStillRefused) {
+    const double nan_v = std::nan("");
+    NativeHistogram a = mk(0, 1.0, 1.0, {1}, {}, 1.0, nan_v);
+    const NativeHistogram b = mk(0, 1.0, 1.0, {1}, {}, 1.0, nan_v);
+    EXPECT_FALSE(bolt::promql::nh_combine(&a, &b, false));
+    // `a` is untouched, asserted field-wise rather than with SameHistogram:
+    // that helper compares every field with ==, and a NaN threshold is not
+    // equal to itself, so it would report a difference the engine never made.
+    ExpectClose(a.count, 1.0);
+    ExpectClose(a.sum, 1.0);
+    ExpectClose(a.pos[0], 1.0);
+    ExpectClose(a.zero_count, 1.0);
+    EXPECT_TRUE(std::isnan(a.zero_threshold));
+
+    // One side finite, one NaN — likewise refused, in both directions.
+    NativeHistogram c = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.001);
+    const NativeHistogram d = mk(0, 1.0, 1.0, {1}, {}, 1.0, nan_v);
+    EXPECT_FALSE(bolt::promql::nh_combine(&c, &d, false));
+    NativeHistogram e = mk(0, 1.0, 1.0, {1}, {}, 1.0, nan_v);
+    const NativeHistogram f = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.001);
+    EXPECT_FALSE(bolt::promql::nh_combine(&e, &f, false));
+}
