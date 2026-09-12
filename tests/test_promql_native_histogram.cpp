@@ -558,13 +558,33 @@ TEST(NativeHistogram, CombineRefusesIncompatiblePairs) {
         mk(k_nh_schema_custom, 2.0, 2.0, {2}, {}, 0.0, 0.0, 0, 0, {5});
     EXPECT_TRUE(SameHistogram(b, reconciled));
 
-    // Different zero thresholds need upstream's widen-until-they-meet loop,
-    // which MOVES counts between buckets. Refused rather than guessed.
+    // W31-L5x: differing zero thresholds are NOT all in this class either, and
+    // this pin demanded a refusal for the half that is exact — the same shape
+    // as the NHCB paragraph above, one field over. Re-derived rather than
+    // relaxed. Neither histogram here has a bucket inside the wider threshold
+    // (schema-0 bucket 0 is (0.5, 1], and 0.5 > 0.01), so upstream's
+    // widen-until-they-meet loop absorbs nothing, adjusts no boundary and
+    // simply agrees on the wider threshold. Asserted by VALUE — a refusal
+    // reinstated here would block the fix, and a count that MOVED would be a
+    // wrong distribution wearing the right total.
     const NativeHistogram zt1 = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.001);
     const NativeHistogram zt2 = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.01);
     NativeHistogram c = zt1;
-    EXPECT_FALSE(bolt::promql::nh_combine(&c, &zt2, false));
-    EXPECT_TRUE(SameHistogram(c, zt1));
+    EXPECT_TRUE(bolt::promql::nh_combine(&c, &zt2, false));
+    EXPECT_EQ(c.zero_threshold, 0.01);          // the WIDER of the two
+    ExpectClose(c.count, 2.0);
+    ExpectClose(c.zero_count, 2.0);             // nothing absorbed into it
+    ExpectClose(c.pos[0], 2.0);                 // and nothing moved out of it
+
+    // What REMAINS in this class, and what the paragraph above used to stand
+    // for: a pair where the widening genuinely has work to do. Bucket -20 of
+    // schema 0 covers (2^-11, 2^-10], entirely below 0.01, so upstream folds
+    // it into the zero bucket and re-raises the threshold. Still refused.
+    const NativeHistogram zt3 = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.01);
+    const NativeHistogram low = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.001, -20);
+    NativeHistogram d = zt3;
+    EXPECT_FALSE(bolt::promql::nh_combine(&d, &low, false));
+    EXPECT_TRUE(SameHistogram(d, zt3));
 }
 
 // Discriminating power: each assertion above fails under a plausible WRONG
@@ -1076,4 +1096,74 @@ TEST(NativeHistogram, TrimDiscriminatingPower) {
     const double frac = nh_fraction(&nan_case, -kInf, 2.0, sc.p(), Scratch::cap);
     EXPECT_GT(frac, 0.0);
     EXPECT_LT(frac, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// W31-L5x — COMBINING TWO HISTOGRAMS WHOSE ZERO THRESHOLDS DIFFER.
+//
+// `nh_combine` used to refuse any such pair outright. Prometheus's
+// reconcileZeroBuckets widens the narrower zero bucket until the thresholds
+// meet, absorbing every bucket that falls inside the wider one and re-raising
+// the threshold when it lands mid-bucket. That loop MOVES COUNTS, so only the
+// case where it does ZERO iterations is performed here; everything else stays
+// refused.
+//
+// THE CORPUS CANNOT GRADE THE REFUSAL HALF, which is the whole reason this
+// test exists. `native_histograms.test`'s only differing-threshold pair is
+// `sum_over_time(histogram_sum_over_time[4m:1m])`, whose narrow side is the
+// EMPTY `{{schema:1 count:0}}` sample — it has no bucket to absorb, so an
+// implementation that simply overwrote the threshold and ignored absorbed
+// buckets scores the identical GREEN. Measured, not assumed: that injection
+// leaves the corpus at GREEN 2137 / RED 31 / FAIL 0 / VALUE-DIFF 0.
+TEST(PromqlNativeHistogram, ZeroThresholdReconciliation) {
+    // The corpus's own pair, transcribed: three samples at z_bucket_w 0.001
+    // already folded, plus `{{schema:1 count:0}}` which carries no width.
+    NativeHistogram acc = mk(0, 4691.2, 107, {3, 8, 2, 5, 3, 2, 2}, {}, 14.0, 0.001);
+    const NativeHistogram empty = mk(1, 0.0, 0, {}, {}, 0.0, 0.0);
+    ASSERT_TRUE(bolt::promql::nh_combine(&acc, &empty, false));
+    EXPECT_EQ(acc.zero_threshold, 0.001);   // the WIDER of the two
+    ExpectClose(acc.count, 107.0);          // absorbed nothing
+    ExpectClose(acc.zero_count, 14.0);
+
+    // REFUSAL: the narrow side has a populated bucket INSIDE the wider
+    // threshold. Schema-0 bucket -20 covers (2^-11, 2^-10] ~ (4.9e-4, 9.8e-4],
+    // entirely below 0.001, so upstream would absorb it into the zero bucket
+    // and this kernel must decline rather than claim the counts stayed put.
+    NativeHistogram wide = mk(0, 1.0, 107, {1}, {}, 14.0, 0.001);
+    const NativeHistogram low = mk(0, 1.0, 3, {3}, {}, 0.0, 0.0, -20);
+    const NativeHistogram wide_before = wide;
+    EXPECT_FALSE(bolt::promql::nh_combine(&wide, &low, false));
+    EXPECT_TRUE(SameHistogram(wide, wide_before));   // and left untouched
+
+    // The same shape on the NEGATIVE side — a bucket's distance from zero is
+    // what matters, not its sign. Without the negative test a histogram whose
+    // mass is all below zero would be reconciled as if it were empty.
+    NativeHistogram wide2 = mk(0, 1.0, 107, {1}, {}, 14.0, 0.001);
+    const NativeHistogram low_neg = mk(0, -1.0, 3, {}, {3}, 0.0, 0.0, 0, -20);
+    EXPECT_FALSE(bolt::promql::nh_combine(&wide2, &low_neg, false));
+
+    // CONTROL: the same bucket count moved ABOVE the wider threshold is the
+    // identity again, so the refusal above is about the BOUND and not merely
+    // about having buckets at all.
+    NativeHistogram wide3 = mk(0, 1.0, 107, {1}, {}, 14.0, 0.001);
+    const NativeHistogram high = mk(0, 1.0, 3, {3}, {}, 0.0, 0.0, 1);
+    ASSERT_TRUE(bolt::promql::nh_combine(&wide3, &high, false));
+    ExpectClose(wide3.count, 110.0);
+    EXPECT_EQ(wide3.zero_threshold, 0.001);
+
+    // CONTROL: widening works when the RECEIVER is the narrow side too. `dst`
+    // is the mutable one, so a version that only ever widened `src` would pass
+    // every case above and fail here.
+    NativeHistogram narrow = mk(0, 1.0, 3, {3}, {}, 0.0, 0.0, 1);
+    const NativeHistogram wider = mk(0, 4691.2, 107, {1}, {}, 14.0, 0.001);
+    ASSERT_TRUE(bolt::promql::nh_combine(&narrow, &wider, false));
+    EXPECT_EQ(narrow.zero_threshold, 0.001);
+    ExpectClose(narrow.count, 110.0);
+
+    // CONTROL: equal thresholds still take the untouched path.
+    NativeHistogram a = mk(0, 1234.5, 25, {1, 2}, {}, 4.0, 0.001);
+    const NativeHistogram b = mk(0, 2345.6, 41, {1, 3}, {}, 5.0, 0.001);
+    ASSERT_TRUE(bolt::promql::nh_combine(&a, &b, false));
+    ExpectClose(a.count, 66.0);
+    ExpectClose(a.zero_count, 9.0);
 }

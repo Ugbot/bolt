@@ -648,6 +648,50 @@ inline bool nh_combine_custom_mismatch(NativeHistogram* BOLT_RESTRICT dst,
     return true;
 }
 
+
+// Would raising `h`'s zero threshold to `T` be the IDENTITY? Const, so the
+// caller can decide before paying for a copy; the caller performs the (single
+// field) widening itself.
+//
+// prometheus/model/histogram/float_histogram.go :: reconcileZeroBuckets widens
+// the narrower zero bucket until the two thresholds meet, ABSORBING every
+// bucket that falls inside the wider threshold into the zero count — and, when
+// the new threshold lands strictly inside a populated bucket, raising it again
+// to that bucket's upper bound and restarting. That restart loop MOVES COUNTS
+// BETWEEN BUCKETS, and reconstructing it from memory rather than from the
+// source is exactly how a confident wrong distribution gets planted.
+//
+// So this implements the case where the loop does ZERO iterations and the
+// outcome is therefore not a reconstruction at all: if no populated bucket of
+// `h` reaches below `T`, nothing is absorbed, no boundary is adjusted, and the
+// reconciled threshold is exactly `T` with every count unmoved. Returns false
+// — leaving `h` untouched — for every other pair, so the wider case stays the
+// honest refusal it has always been rather than becoming a guess.
+//
+// The test is over EVERY index in the dense run, not only the populated ones:
+// upstream's iterator yields a zero-count bucket too, and a zero-count bucket
+// below `T` would still push the threshold up to its upper bound. Counting it
+// refuses slightly more than upstream would; it can never answer differently.
+//
+// Exponential schemas only. An NHCB's zero bucket is not a power-of-two ladder
+// and its threshold is not meaningful in the same way.
+inline bool nh_zero_widen_is_identity(const NativeHistogram* h, double T) noexcept {
+    assert(h != nullptr);
+    assert(h->n_pos >= 0 && h->n_neg >= 0);
+    if (nh_uses_custom(h)) return false;
+    if (T < h->zero_threshold) return false;
+    if (T == h->zero_threshold) return true;
+    // The bucket nearest zero on each side is the run's first index; its
+    // near edge is the bound one index below it.
+    if (h->n_pos > 0 &&
+        detail::nh_bound_exponential(h->pos_offset - 1, h->schema) < T)
+        return false;
+    if (h->n_neg > 0 &&
+        detail::nh_bound_exponential(h->neg_offset - 1, h->schema) < T)
+        return false;
+    return true;
+}
+
 // dst = dst + src (subtract == false) or dst - src (subtract == true).
 // prometheus/model/histogram/float_histogram.go :: Add / Sub — both operands
 // are first brought onto the COARSER of the two schemas, then combined bucket
@@ -656,9 +700,10 @@ inline bool nh_combine_custom_mismatch(NativeHistogram* BOLT_RESTRICT dst,
 // leaving `dst` untouched, for any pair this cannot represent exactly:
 //   * one custom-bucket and one exponential — the ladders are not comparable,
 //     and upstream errors here too (checkSchemaAndBounds);
-//   * different zero thresholds — upstream widens the zero bucket by absorbing
-//     adjacent buckets until the thresholds meet, which MOVES counts between
-//     buckets; refusing is honest, guessing is a confident wrong distribution;
+//   * different zero thresholds THAT CANNOT BE RECONCILED WITHOUT MOVING
+//     COUNTS — see nh_zero_widen_is_identity. When the narrower side has no
+//     bucket inside the wider threshold the reconciliation absorbs nothing and
+//     is performed exactly; anything wider is still refused rather than guessed;
 //   * a union or reduction wider than k_nh_max_side.
 inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
                        const NativeHistogram* BOLT_RESTRICT src,
@@ -673,9 +718,21 @@ inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
             if (dst->custom[i] != src->custom[i]) same = false;
         if (!same) return nh_combine_custom_mismatch(dst, src, subtract);
     }
-    if (dst->zero_threshold != src->zero_threshold) return false;
+    // Reconcile the zero buckets onto the WIDER threshold. Decided BEFORE the
+    // two ~2.6 KB copies below, so a refusal costs what it always did; the
+    // widening itself is then a single field, because the test above is
+    // precisely the proof that nothing else has to move (W31-L5x).
+    if (dst->zero_threshold != src->zero_threshold) {
+        const bool dst_narrow = dst->zero_threshold < src->zero_threshold;
+        const NativeHistogram* narrow = dst_narrow ? dst : src;
+        const double wider = dst_narrow ? src->zero_threshold : dst->zero_threshold;
+        if (!nh_zero_widen_is_identity(narrow, wider)) return false;
+    }
     NativeHistogram a = *dst;
     NativeHistogram b = *src;
+    if (a.zero_threshold < b.zero_threshold) a.zero_threshold = b.zero_threshold;
+    else                                     b.zero_threshold = a.zero_threshold;
+    assert(a.zero_threshold == b.zero_threshold);
     if (!cd && a.schema != b.schema) {
         if (a.schema > b.schema) { if (!nh_reduce_resolution(&a, b.schema)) return false; }
         else                     { if (!nh_reduce_resolution(&b, a.schema)) return false; }
