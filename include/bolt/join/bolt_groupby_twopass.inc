@@ -99,6 +99,14 @@ inline GbShape gb_classify(const GroupbyTypedState* st,
         if (keys[k].format != ColumnFormat::Flat || keys[k].data == nullptr) {
             return GbShape::Fallback;
         }
+        // W31-L5z: a NULLABLE key takes the general path. `gb_pack_row` below
+        // is a byte-for-byte replica of `read_cell16`'s int lane and hardcodes
+        // `b[k] = 0`, so it would read a null slot's UNDEFINED payload as the
+        // key and lose the tag `read_key_cell16` puts there. Declining here
+        // removes this replica from the null-key problem entirely rather than
+        // teaching it the tag -- one fewer place for the four copies of that
+        // formula to disagree.
+        if (keys[k].validity != nullptr) return GbShape::Fallback;
         if (t != BoltType::Int64 && t != BoltType::Int32 &&
             t != BoltType::Date32) all_int = false;
         if (t != BoltType::Utf8) all_sv = false;

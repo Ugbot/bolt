@@ -702,6 +702,74 @@ BOLT_FORCE_INLINE uint64_t hash_utf8_content(const StringView& sv,
 // Composite-key hash. Utf8 keys hash by content bytes (Card S) so spilled
 // (>12-char) keys group by value; other types hash the 16-byte cell halves.
 // Order-sensitive mix over key columns.
+
+// Defined below (with the Arrow validity convention written out); declared
+// here because the KEY readers above it need it.
+BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept;
+
+// ---------------------------------------------------------------------------
+// W31-L5z — A NULL GROUP KEY.
+//
+// SQL and SPARQL agree: all rows whose key is NULL form ONE group. This kernel
+// refused them outright, because `read_cell16` cannot see validity and a null
+// slot's payload bytes are UNDEFINED -- two NULL rows with different garbage
+// split, and one whose garbage matches a real key merges into it.
+//
+// The fix is NOT a sentinel VALUE. The old refusal's own comment gives the
+// reason and it still stands: any value chosen as "the NULL group" is a value
+// the column may legitimately hold. What is used instead is a slot the CELL
+// has but the VALUE does not: `read_cell16` leaves `cell.b == 0` for every
+// type below, so a reserved `b` tag is a key identity no real key of those
+// types can produce. That is exact rather than probable.
+//
+// TYPES WITH NO FREE SLOT STAY REFUSED BY NAME. Decimal128 and Utf8 use BOTH
+// halves (a StringView's length+prefix+inline bytes; a d128's two limbs) and
+// Decimal64 puts its SIGN EXTENSION in `b` -- so for those three a tag would
+// be indistinguishable from data, and `window_has_null_key` still declines
+// them. For Utf8 it would be worse than ambiguous: `keys_equal` compares
+// lengths and then memcmps, so a fabricated length would read that many bytes.
+//
+// WHY THIS IS NOT IN `read_cell16` ITSELF, which is the obvious place: that
+// function is SHARED with AGGREGATE INPUT reads (`payload[spec.in_col]`), and
+// tagging there would silently change what SUM/MIN/MAX see for a NULL input --
+// a different question, and a wrong answer rather than a refusal. Only the KEY
+// path may tag.
+//
+// EVERY KEY READER MUST USE THIS ONE. The composite-hash formula has four
+// byte-for-byte replicas here (`hash_keys`, `gb_merge_hash_stored`,
+// `gb_route_fold_cells`, and the two-pass `gb_pack_row`), and a tag applied to
+// some but not all SPLITS one null group across paths with err=Ok.
+// `gb_merge_hash_stored` needs no change because it hashes the STORED a/b and
+// the tag is already in them; `gb_pack_row` is removed from the problem
+// entirely by `gb_classify` routing any nullable key to the Fallback shape.
+inline constexpr int64_t kGbNullKeyTag = static_cast<int64_t>(0x4E554C4C4B45593FULL);
+
+// Does `t` leave cell.b free, so the tag above is unambiguous?
+BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
+    return t == BoltType::Int64 || t == BoltType::Int32 ||
+           t == BoltType::Date32 || t == BoltType::Float64 ||
+           t == BoltType::Float32;
+}
+
+// Read one KEY cell, mapping a NULL slot onto the reserved tag. The `a` half
+// is forced to 0 so the stored bytes are DEFINED -- a consumer that reads the
+// cell without consulting validity gets a fixed value rather than arena
+// residue (the G2FEAT-350 shape).
+BOLT_FORCE_INLINE GbCell16 read_key_cell16(const BoltColumn& c,
+                                           int64_t r) noexcept {
+    if (c.validity != nullptr && !cell_valid(c, r)) {
+        GbCell16 out{0, kGbNullKeyTag};
+        return out;
+    }
+    return read_cell16(c, r);
+}
+
+// Is the stored group cell for a key column of type `t` the NULL group?
+BOLT_FORCE_INLINE bool gb_cell_is_null_key(const GbCell16& c,
+                                           BoltType t) noexcept {
+    return gb_key_type_can_tag_null(t) && c.a == 0 && c.b == kGbNullKeyTag;
+}
+
 BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
                                       int64_t r) noexcept {
     assert(keys != nullptr || n_keys == 0);
@@ -715,7 +783,7 @@ BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
                 sv, static_cast<const char*>(keys[k].str_overflow_base)));
             continue;
         }
-        const GbCell16 c = read_cell16(keys[k], r);
+        const GbCell16 c = read_key_cell16(keys[k], r);
         h ^= swiss_mix_wyhash3(static_cast<uint64_t>(c.a));
         h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(c.b));
     }
@@ -748,7 +816,7 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
             if (std::memcmp(ib, sb, in_sv.length) != 0) return false;
             continue;
         }
-        const GbCell16 c = read_cell16(keys[k], r);
+        const GbCell16 c = read_key_cell16(keys[k], r);
         if (c.a != row[k].a || c.b != row[k].b) return false;
     }
     return true;
@@ -951,6 +1019,12 @@ inline bool window_has_null_key(const BoltColumn* keys, uint32_t n_keys,
     for (uint32_t k = 0; k < n_keys; ++k) {
         const BoltColumn& c = keys[k];
         if (c.validity == nullptr) continue;
+        // W31-L5z: a NULL is no longer refused for the types whose cell.b is
+        // free -- `read_key_cell16` gives them an exact identity. Only the
+        // types with no free slot remain refused here (Decimal128 and Utf8 use
+        // both halves; Decimal64's b is its sign extension), which is why this
+        // scan now asks the TYPE first.
+        if (gb_key_type_can_tag_null(c.type)) continue;
         if (sel != nullptr) {
             for (int64_t i = 0; i < count; ++i) {
                 if (!cell_valid(c, static_cast<int64_t>(sel[start + i])))
@@ -1511,7 +1585,7 @@ inline void gb_ingest_fallback(
             if (!state->table->insert(h, slot)) { state->oom = true; return; }
             GbCell16* krow = state->keys_flat + static_cast<size_t>(slot) * n_keys;
             for (uint32_t k = 0; k < n_keys; ++k) {
-                krow[k] = gb_detail::read_cell16(keys[k], r);
+                krow[k] = gb_detail::read_key_cell16(keys[k], r);
                 // Card S: deep-copy a spilled (>12-char) Utf8 key so the stored
                 // group representative owns its bytes — the input overflow
                 // buffer is freed after this morsel. hash/equal + finalize then
@@ -1682,7 +1756,7 @@ inline void gb_route_fold_cells(const BoltColumn& key, const uint32_t* sel,
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = (sel != nullptr)
             ? static_cast<int64_t>(sel[start + i]) : (start + i);
-        const GbCell16 c = read_cell16(key, r);
+        const GbCell16 c = read_key_cell16(key, r);
         uint64_t h = out[i];
         h ^= swiss_mix_wyhash3(static_cast<uint64_t>(c.a));
         h  = swiss_mix_wyhash3(h ^ static_cast<uint64_t>(c.b));
@@ -1920,6 +1994,40 @@ inline bool groupby_agg_multi_key_typed_finalize(
             out_aggs[j].str_overflow_base = state->agg_str_buf[j];
         }
         if (out_n > 0 && out_aggs[j].data == nullptr) return false;
+    }
+    // W31-L5z — PUBLISH THE NULL GROUP.
+    //
+    // A group whose stored key cell carries the reserved tag IS the NULL
+    // group, and the only way to say so on a BoltColumn is a validity bitmap.
+    // Allocated per key column and only when that column actually has one, so
+    // a null-free aggregate emits byte-identical output to before (and its
+    // consumers keep the `validity == nullptr` fast path they had).
+    //
+    // The DATA slot is still written below with the cell's `a`, which
+    // `read_key_cell16` forced to 0 for a null -- a consumer that ignores
+    // validity therefore reads a defined value rather than arena residue.
+    for (uint8_t k = 0; k < n_keys; ++k) {
+        bool any_null = false;
+        for (int64_t r = 0; r < out_n && !any_null; ++r) {
+            const GbCell16* krow =
+                state->keys_flat + static_cast<size_t>(r) * n_keys;
+            any_null = gb_detail::gb_cell_is_null_key(krow[k], state->key_types[k]);
+        }
+        if (!any_null) continue;
+        const int64_t nbytes = (out_n + 7) / 8;
+        auto* vb = static_cast<uint8_t*>(arena->allocate(
+            static_cast<size_t>(nbytes)));
+        if (vb == nullptr) return false;
+        for (int64_t b = 0; b < nbytes; ++b) vb[b] = 0xFFu;   // valid by default
+        for (int64_t r = 0; r < out_n; ++r) {
+            const GbCell16* krow =
+                state->keys_flat + static_cast<size_t>(r) * n_keys;
+            if (gb_detail::gb_cell_is_null_key(krow[k], state->key_types[k]))
+                vb[r >> 3] &= static_cast<uint8_t>(~(1u << (r & 7)));
+        }
+        out_keys[k].validity = vb;
+        out_keys[k].validity_offset = 0;
+        out_keys[k].stats.all_valid = false;
     }
     for (int64_t r = 0; r < out_n; ++r) {
         const GbCell16* krow = state->keys_flat + static_cast<size_t>(r) * n_keys;
@@ -2163,7 +2271,7 @@ inline bool groupby_agg_multi_key_typed(
             if (!ht->insert(h, slot)) return false;
             GbCell16* krow = keys_flat + static_cast<size_t>(slot) * n_keys;
             for (uint32_t k = 0; k < n_keys; ++k)
-                krow[k] = gb_detail::read_cell16(keys[k], r);
+                krow[k] = gb_detail::read_key_cell16(keys[k], r);
             for (uint32_t j = 0; j < n_aggs; ++j) {
                 const size_t off = static_cast<size_t>(j) * cap + slot;
                 accums[off] = gb_detail::agg_identity(aggs[j].kind, agg_in_types[j]);
@@ -2225,6 +2333,37 @@ inline bool groupby_agg_multi_key_typed(
                 : agg_in_scales[j];
         }
         if (out_n > 0 && out_aggs[j].data == nullptr) return false;
+    }
+
+    // ---- Publish the NULL group (W31-L5z) ----
+    //
+    // The SECOND of this file's two finalize paths. The first cut of W31-L5z
+    // taught the key READERS the null tag and gave only the streaming finalize
+    // a validity bitmap, so a one-shot aggregate emitted the NULL group as a
+    // real key 0 with NO validity — a silent wrong answer, and exactly the
+    // "four byte-for-byte replicas" hazard that change's own comment warns
+    // about, landing on its author. Caught by NullGroupKeyFoldsAsOneGroup,
+    // which asserts the BIT and not just the group count.
+    for (uint32_t k = 0; k < n_keys; ++k) {
+        bool any_null = false;
+        for (int64_t r = 0; r < out_n && !any_null; ++r) {
+            const GbCell16* krow = keys_flat + static_cast<size_t>(r) * n_keys;
+            any_null = gb_detail::gb_cell_is_null_key(krow[k], key_types[k]);
+        }
+        if (!any_null) continue;
+        const int64_t nbytes = (out_n + 7) / 8;
+        auto* vb = static_cast<uint8_t*>(arena->allocate(
+            static_cast<size_t>(nbytes)));
+        if (vb == nullptr) return false;
+        for (int64_t b = 0; b < nbytes; ++b) vb[b] = 0xFFu;
+        for (int64_t r = 0; r < out_n; ++r) {
+            const GbCell16* krow = keys_flat + static_cast<size_t>(r) * n_keys;
+            if (gb_detail::gb_cell_is_null_key(krow[k], key_types[k]))
+                vb[r >> 3] &= static_cast<uint8_t>(~(1u << (r & 7)));
+        }
+        out_keys[k].validity = vb;
+        out_keys[k].validity_offset = 0;
+        out_keys[k].stats.all_valid = false;
     }
 
     // ---- Scatter keys ----

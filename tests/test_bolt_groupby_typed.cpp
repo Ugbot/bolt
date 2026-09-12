@@ -779,7 +779,7 @@ TEST(BoltGroupbyTyped, SpilledUtf8KeySlicedColumnResolvesCorrectly) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// G2COV-30 — a NULL in a GROUP BY KEY is refused, not folded.
+// G2COV-30 / W31-L5z — a NULL in a GROUP BY KEY.
 //
 // The value side above has been null-aware since K-AGG-A.2. The KEY side was
 // not: read_cell16 / hash_keys / keys_equal never look at validity, so a null
@@ -788,11 +788,22 @@ TEST(BoltGroupbyTyped, SpilledUtf8KeySlicedColumnResolvesCorrectly) {
 // StringView and silently MERGED with the empty-string group — 6 groups where
 // DuckDB gives 7, with the "" group gone from the output.
 //
-// The kernel emits key columns with no validity bitmap, so it has nowhere to
-// put SQL's NULL group and no sentinel is safe. It therefore refuses.
+// W31-L5z: the kernel now ANSWERS this for every key type whose cell.b is
+// free (`read_key_cell16` tags a null with a reserved b, which no real key of
+// those types can produce, and finalize publishes a validity bitmap). The
+// paragraph above still stands WHOLE for Utf8 — that measured defect is a
+// StringView reinterpretation, and Utf8 uses both cell halves, so it has no
+// free slot and is still REFUSED. Both halves are pinned below.
+//
+// This file demanded a REFUSAL for the int case until W31-L5z, and a pin
+// asserting a refusal for a shape the engine gets right is a pin that blocks
+// the fix (W19-L2, W24-L2). Re-derived against an ORACLE rather than relaxed:
+// DuckDB 1.4.5 on the identical rows answers (1, 30), (2, 40), (NULL, 30) —
+// SQL puts every NULL in ONE group, which is also SPARQL's rule (W3C
+// `group03`).
 // ---------------------------------------------------------------------------
 
-TEST(BoltGroupbyTyped, NullGroupKeyIsRefusedOneShot) {
+TEST(BoltGroupbyTyped, NullGroupKeyFoldsAsOneGroup) {
     Arena a;
     int64_t ks[] = {1, 1, 2, 2};
     int64_t vs[] = {10, 20, 30, 40};
@@ -802,24 +813,88 @@ TEST(BoltGroupbyTyped, NullGroupKeyIsRefusedOneShot) {
     AggSpec specs[1] = { make_spec(AggKind::Sum, 0) };
     BoltColumn ok[1], oa[1];
     uint32_t ng = 0;
-    EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 4,
-                                             ok, oa, &ng, &a, /*hint=*/4));
-    // ... and the SAME data with every key bit set folds normally: the refusal
-    // keys off validity, not off the mere presence of a bitmap. Every parquet
-    // column DuckDB writes is nullable, so refusing on presence would break
-    // TPC-H outright.
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 4,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    // THREE groups, not two: the NULL row is its own, exactly as DuckDB says.
+    ASSERT_EQ(ng, 3u);
+    // Asserted by (key, validity, sum) triples rather than by group COUNT: a
+    // kernel that produced three groups by SPLITTING the two NULL-free ones
+    // would pass a count check and be a wrong distribution.
+    const auto* kb = static_cast<const int64_t*>(ok[0].data);
+    const auto* sb = static_cast<const int64_t*>(oa[0].data);
+    ASSERT_NE(ok[0].validity, nullptr) << "the NULL group needs a validity bit";
+    int64_t sum_k1 = -1, sum_k2 = -1, sum_null = -1;
+    int n_null = 0;
+    for (uint32_t g = 0; g < ng; ++g) {
+        const bool valid =
+            ((ok[0].validity[g >> 3] >> (g & 7)) & 1) != 0;
+        if (!valid) { ++n_null; sum_null = sb[g]; continue; }
+        if (kb[g] == 1) sum_k1 = sb[g];
+        if (kb[g] == 2) sum_k2 = sb[g];
+    }
+    EXPECT_EQ(n_null, 1) << "every NULL row belongs to exactly ONE group";
+    EXPECT_EQ(sum_k1, 30);     // rows 0,1
+    EXPECT_EQ(sum_k2, 40);     // row 3
+    EXPECT_EQ(sum_null, 30);   // row 2 alone
+    // ... and the SAME data with every key bit set folds to TWO groups: the
+    // null group keys off validity, not off the mere presence of a bitmap.
+    // Every parquet column DuckDB writes is nullable, so reacting to presence
+    // would change TPC-H outright.
     uint8_t all_valid[1] = {0b00001111};
     BoltColumn key2 = BoltColumn::make_flat(ks, all_valid, 4, BoltType::Int64);
     ng = 0;
     ASSERT_TRUE(groupby_agg_multi_key_typed(&key2, 1, &val, 1, specs, 1, 4,
                                             ok, oa, &ng, &a, /*hint=*/4));
     EXPECT_EQ(ng, 2u);
+    EXPECT_EQ(ok[0].validity, nullptr)
+        << "a null-free aggregate must emit the SAME column shape as before";
+}
+
+// The half that is still REFUSED, and why it must stay so. A Utf8 key uses
+// BOTH cell halves (length + prefix + inline bytes), so the reserved b-tag
+// would be indistinguishable from data — and worse than ambiguous, since
+// keys_equal compares lengths and then memcmps, so a fabricated length would
+// read that many bytes. This is the exact shape the header paragraph measured
+// against DuckDB (6 groups where DuckDB gives 7).
+TEST(BoltGroupbyTyped, NullUtf8GroupKeyIsStillRefused) {
+    Arena a;
+    // Built with this file's own sv_inline: a 1-char string's byte lives in
+    // `prefix`, not `inline_data`. Writing inline_data[0] made all three keys
+    // compare EQUAL (one group, not three) and the control was vacuous.
+    const char* txt[3] = {"a", "b", "c"};
+    StringView ks[3];
+    for (int i = 0; i < 3; ++i) ks[i] = sv_inline(txt[i], 1);
+    int64_t vs[] = {10, 20, 30};
+    uint8_t kvalid[1] = {0b00000101};        // row 1's KEY is NULL
+    BoltColumn key = BoltColumn::make_flat(ks, kvalid, 3, BoltType::Utf8);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 3, BoltType::Int64);
+    AggSpec specs[1] = { make_spec(AggKind::Sum, 0) };
+    BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 3,
+                                             ok, oa, &ng, &a, /*hint=*/4));
+    // CONTROL: the same Utf8 keys with no NULL fold normally, so the refusal
+    // is about the null and not about Utf8 keys as such.
+    uint8_t all_valid[1] = {0b00000111};
+    BoltColumn key2 = BoltColumn::make_flat(ks, all_valid, 3, BoltType::Utf8);
+    ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key2, 1, &val, 1, specs, 1, 3,
+                                            ok, oa, &ng, &a, /*hint=*/4));
+    EXPECT_EQ(ng, 3u);
 }
 
 // The scan is byte-at-a-time with masked partial ends, so the arithmetic is
 // exercised directly at every offset/length inside a byte and across byte
 // boundaries. One null is planted at each row in turn; the scan must find it
 // from every window origin that contains it and from none that does not.
+//
+// W31-L5z — THE KEY TYPE HERE IS LOAD-BEARING AND IT CHANGED. `window_has_null
+// _key` no longer scans a type the kernel can now ANSWER, so over an Int64 key
+// it correctly returns false everywhere and this sweep would assert NOTHING
+// while still printing green. Re-pointed to Decimal64, whose cell.b carries a
+// SIGN EXTENSION and therefore has no free slot for the null tag — it is still
+// refused, so the bit arithmetic is still under test. The data is the same
+// int64 mantissa buffer; only the type tag moves.
 TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
     constexpr int64_t kN = 40;                 // 5 bytes of bitmap
     int64_t ks[kN];
@@ -829,7 +904,7 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
         for (int b = 0; b < 8; ++b) bits[b] = 0xFF;
         bits[null_row >> 3] = static_cast<uint8_t>(
             bits[null_row >> 3] & ~(1u << (null_row & 7)));
-        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Int64);
+        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Decimal64);
         for (int64_t start = 0; start < kN; ++start) {
             for (int64_t count = 0; start + count <= kN; ++count) {
                 const bool want = (null_row >= start && null_row < start + count);
@@ -847,7 +922,10 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
 TEST(BoltGroupbyTyped, WindowHasNullKeyHonoursSelection) {
     int64_t ks[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t bits[1] = {0b11110111};            // row 3 is NULL
-    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Int64);
+    // W31-L5z: Decimal64 for the same reason as the sweep above —
+    // an Int64 key is no longer scanned at all, so this would pass
+    // vacuously.
+    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Decimal64);
     const uint32_t skips[4] = {0, 1, 2, 4};
     const uint32_t hits[4]  = {0, 3, 5, 7};
     EXPECT_FALSE(gb_detail::window_has_null_key(&key, 1, skips, 0, 4));
