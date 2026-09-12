@@ -1198,3 +1198,73 @@ TEST(PromqlNativeHistogram, NonFiniteZeroThresholdStillRefused) {
     const NativeHistogram f = mk(0, 1.0, 1.0, {1}, {}, 1.0, 0.001);
     EXPECT_FALSE(bolt::promql::nh_combine(&e, &f, false));
 }
+
+// ---------------------------------------------------------------------------
+// W31-L6d — `nh_format`, and the fence around what the oracle could not say.
+//
+// The corpus contains exactly ONE rendering of a native histogram, repeated
+// across the five `count_values` cells, and no second oracle is reachable on
+// this box (no promtool; the Docker daemon does not answer). So the ORACLE CASE
+// below is transcribed from `aggregators.test` and everything the single
+// example cannot ground is REFUSED rather than guessed.
+//
+// The corpus can only ever exercise the one shape, so every refusal here is
+// invisible to it — which is exactly why they are pinned in this file.
+TEST(PromqlNativeHistogram, FormatMatchesTheCorpusRendering) {
+    // {{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2
+    //   buckets:[1 2] n_buckets:[1 2]}}
+    NativeHistogram h = mk(0, 10.0, 20.0, {1, 2}, {1, 2}, 2.0, 0.001);
+    char buf[512];
+    const int32_t n = bolt::promql::nh_format(&h, buf, sizeof(buf));
+    ASSERT_GT(n, 0);
+    EXPECT_STREQ(buf,
+        "{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, "
+        "(0.5,1]:1, (1,2]:2}");
+    EXPECT_EQ(n, static_cast<int32_t>(std::strlen(buf)));
+
+    // The BRACKETS differ per side and are the easiest thing to get subtly
+    // wrong: negative half-open low, zero CLOSED both ends, positive half-open
+    // high. Asserted as substrings so a change to one side is named.
+    EXPECT_NE(std::strstr(buf, "[-2,-1):2"), nullptr);
+    EXPECT_NE(std::strstr(buf, "[-0.001,0.001]:2"), nullptr);
+    EXPECT_NE(std::strstr(buf, "(1,2]:2"), nullptr);
+}
+
+TEST(PromqlNativeHistogram, FormatRefusesWhatTheOracleCannotGround) {
+    char buf[512];
+    // (1) An NHCB. Its bounds are a user-supplied ladder and the corpus has no
+    // example of how upstream prints one.
+    NativeHistogram cbh = mk(k_nh_schema_custom, 1.0, 1.0, {1}, {}, 0.0, 0.0,
+                             0, 0, {5, 10});
+    EXPECT_LT(bolt::promql::nh_format(&cbh, buf, sizeof(buf)), 0);
+
+    // (2) A ZERO-COUNT bucket inside a populated run. Upstream may well skip
+    // empty buckets, but the corpus's own histogram has none, so whether to
+    // print it is precisely what one example cannot say.
+    NativeHistogram gap = mk(0, 3.0, 3.0, {1, 0, 2}, {}, 0.0, 0.0);
+    EXPECT_LT(bolt::promql::nh_format(&gap, buf, sizeof(buf)), 0);
+
+    // (3) A value needing EXPONENT notation. The oracle's exponents run -3 to
+    // 1; outside that the spelling (`1e+06` vs `1000000`) is a guess.
+    NativeHistogram big = mk(0, 1e30, 1.0, {1}, {}, 0.0, 0.0);
+    EXPECT_LT(bolt::promql::nh_format(&big, buf, sizeof(buf)), 0);
+
+    // (4) A NaN sum — no example, and NaN has more than one spelling.
+    NativeHistogram nan_sum = mk(0, std::nan(""), 1.0, {1}, {}, 0.0, 0.0);
+    EXPECT_LT(bolt::promql::nh_format(&nan_sum, buf, sizeof(buf)), 0);
+
+    // CONTROL: the refusals above are about the SHAPE, not about nh_format
+    // declining everything. A histogram with no zero bucket and no negative
+    // side still renders — the zero bucket is omitted, which is
+    // `nh_all_buckets`' existing tested behaviour rather than a new rule.
+    NativeHistogram pos_only = mk(0, 3.0, 3.0, {1, 2}, {}, 0.0, 0.0);
+    const int32_t m = bolt::promql::nh_format(&pos_only, buf, sizeof(buf));
+    ASSERT_GT(m, 0);
+    EXPECT_STREQ(buf, "{count:3, sum:3, (0.5,1]:1, (1,2]:2}");
+
+    // CONTROL: a buffer too small must REFUSE, never truncate — a truncated
+    // histogram rendering would be a plausible-looking wrong label value.
+    NativeHistogram h = mk(0, 10.0, 20.0, {1, 2}, {1, 2}, 2.0, 0.001);
+    char tiny[16];
+    EXPECT_LT(bolt::promql::nh_format(&h, tiny, sizeof(tiny)), 0);
+}

@@ -47,6 +47,8 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstdio>
 #include "bolt/bolt_port.h"
 
 #include <cassert>
@@ -769,6 +771,142 @@ inline bool nh_combine(NativeHistogram* BOLT_RESTRICT dst,
     *dst = a;
     assert(dst->n_pos <= k_nh_max_side && dst->n_neg <= k_nh_max_side);
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// W31-L6d — RENDER A NATIVE HISTOGRAM THE WAY PROMETHEUS PRINTS IT.
+//
+// `count_values("v", <histogram>)` puts this string in a LABEL VALUE, so the
+// rendering is part of the ANSWER rather than a display detail. chukonu's
+// count_values has been complete for floats for waves and refused the moment a
+// histogram appeared, with `// the formatter above` at the refusal -- this is
+// that formatter.
+//
+// THE ORACLE IS THIN AND THE FENCE IS SIZED TO IT. Prometheus's vendored corpus
+// contains exactly ONE rendering, repeated across the five count_values cells:
+//
+//   {{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2
+//     buckets:[1 2] n_buckets:[1 2]}}
+//        -> {count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2,
+//            (0.5,1]:1, (1,2]:2}
+//
+// and no second oracle is reachable on this box (no promtool; the Docker daemon
+// does not answer `docker info`). One example cannot ground a general
+// formatter, so everything it does not pin is REFUSED rather than guessed --
+// the same fence W31-L5x put around the zero-bucket widening, for the same
+// reason: a shape rendered on a hunch becomes a WRONG LABEL VALUE, and a wrong
+// label is a wrong series.
+//
+// WHAT THE ONE EXAMPLE DOES PIN, and all of it is used:
+//   * `{count:<c>, sum:<s>` then one `, <bucket>` each, then `}`;
+//   * bucket ORDER -- negatives most-negative-first, then the zero bucket, then
+//     positives ascending. That is exactly what `nh_all_buckets` already
+//     emits, including omitting the zero bucket when its count is 0, so the
+//     order here is existing tested behaviour rather than a second opinion;
+//   * the BRACKETS, which differ per side: `[-2,-1)` negative, `[-0.001,0.001]`
+//     zero (closed BOTH ends), `(0.5,1]` positive.
+//
+// WHAT IT DOES NOT PIN, and is therefore refused BY NAME:
+//   * a CUSTOM-BUCKET (NHCB) histogram -- its bounds are a user-supplied ladder
+//     and no example of its rendering exists here at all;
+//   * a bucket whose COUNT IS ZERO. Upstream may well skip empty buckets, but
+//     the corpus's own histogram has none, so whether to print it is exactly
+//     the thing one example cannot say. Refusing keeps every string this
+//     function returns grounded in the oracle.
+//
+// Numbers use SHORTEST ROUND-TRIP, not `%g`'s default 6 significant digits:
+// the corpus elsewhere carries values like 0.0033333333333333335, which `%g`
+// would silently truncate to 0.00333333. Written as an ascending precision
+// search because that is what "shortest form that reads back identical" means.
+inline int32_t nh_fmt_double(double v, char* out, int32_t cap) noexcept {
+    assert(out != nullptr && cap > 0);
+    if (!std::isfinite(v)) return -1;          // no ±Inf/NaN in the oracle
+    // The SHORTEST digit count that reads back identical. `%g`'s default 6
+    // significant digits is not enough: the corpus carries values such as
+    // 0.0033333333333333335, which it would silently truncate.
+    int32_t p = 0;
+    char probe[64];
+    for (int32_t prec = 1; prec <= 17 && p == 0; ++prec) {   // bounded
+        if (std::snprintf(probe, sizeof(probe), "%.*e", prec - 1, v) < 0)
+            return -1;
+        double back = 0.0;
+        if (std::sscanf(probe, "%lf", &back) == 1 && back == v) p = prec;
+    }
+    if (p == 0) return -1;
+    // The decimal exponent, read off the %e form just produced.
+    const char* ep = std::strchr(probe, 'e');
+    if (ep == nullptr) return -1;
+    const int exp10 = std::atoi(ep + 1);
+    // FIXED-POINT ONLY, and the fence is the honest part. The single oracle
+    // rendering carries exponents from -3 (0.001) to 1 (20), all fixed-point.
+    // The range below is the C standard's own `%g` switch at precision 6 --
+    // `%e` when exp < -4 or exp >= P -- which is also what Go's shortest `%g`
+    // does, so a value inside it renders the same either way. Outside it the
+    // exponent FORM would be a guess about upstream's spelling (`1e+06` vs
+    // `1000000`), and this function refuses rather than guess, exactly as
+    // nh_format refuses an NHCB.
+    if (exp10 < -4 || exp10 >= 6) return -1;
+    const int32_t frac = (p - 1 - exp10) > 0 ? (p - 1 - exp10) : 0;
+    const int32_t n = std::snprintf(out, static_cast<size_t>(cap), "%.*f",
+                                    frac, v);
+    if (n < 0 || n >= cap) return -1;
+    // Trim a trailing fraction that the precision above over-produced, so
+    // 0.5 does not read 0.50 and 20 does not read 20. (`%.*f` with frac 0
+    // already emits no point.)
+    int32_t len = n;
+    if (std::strchr(out, '.') != nullptr) {
+        while (len > 0 && out[len - 1] == '0') --len;       // bounded by n
+        if (len > 0 && out[len - 1] == '.') --len;
+        out[len] = '\0';
+    }
+    return len;
+}
+
+// Returns the length written, or -1 if the shape is refused or `cap` is too
+// small. `out` is left unspecified on -1; callers must not publish it.
+inline int32_t nh_format(const NativeHistogram* h, char* out,
+                         int32_t cap) noexcept {
+    assert(h != nullptr);
+    assert(out != nullptr && cap > 0);
+    if (nh_uses_custom(h)) return -1;              // NHCB: unoracled here
+    NhBucket bk[k_nh_max_all_buckets];
+    const int32_t nb = nh_all_buckets(h, bk, k_nh_max_all_buckets);
+    if (nb < 0) return -1;
+    int32_t pos = 0;
+    auto put = [&](const char* sv) noexcept -> bool {
+        for (const char* p = sv; *p != '\0'; ++p) {
+            if (pos + 1 >= cap) return false;
+            out[pos++] = *p;
+        }
+        return true;
+    };
+    auto put_num = [&](double v) noexcept -> bool {
+        const int32_t n = nh_fmt_double(v, out + pos, cap - pos);
+        if (n < 0) return false;
+        pos += n;
+        return true;
+    };
+    if (!put("{count:") || !put_num(h->count)) return -1;
+    if (!put(", sum:") || !put_num(h->sum)) return -1;
+    for (int32_t i = 0; i < nb; ++i) {             // bounded by nb
+        // A zero-count bucket is the one shape the single oracle cannot
+        // settle; see the header. Refuse rather than choose.
+        if (bk[i].count == 0.0) return -1;
+        const bool is_zero = (bk[i].lower == -h->zero_threshold &&
+                              bk[i].upper == h->zero_threshold &&
+                              h->zero_count > 0.0);
+        const bool is_neg = !is_zero && bk[i].upper <= 0.0;
+        if (!put(", ")) return -1;
+        if (!put(is_neg ? "[" : (is_zero ? "[" : "("))) return -1;
+        if (!put_num(bk[i].lower) || !put(",") || !put_num(bk[i].upper))
+            return -1;
+        if (!put(is_neg ? ")" : "]")) return -1;
+        if (!put(":") || !put_num(bk[i].count)) return -1;
+    }
+    if (!put("}")) return -1;
+    out[pos] = '\0';
+    return pos;
 }
 
 // ---- counter-reset detection ------------------------------------------
