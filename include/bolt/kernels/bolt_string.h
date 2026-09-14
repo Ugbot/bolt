@@ -201,7 +201,7 @@ BOLT_FORCE_INLINE void utf8_substr_const(
         // the prefix — the country-code/fixed-field case). &s.prefix[0] is the
         // canonical inline byte pointer.
         const char* p;
-        if (s.length <= 12u || start + t <= 12u) {
+        if (s.length <= 12u || start + t <= 4u) {
             p = s.prefix + start;
         } else {
             assert(spilled_base != nullptr);

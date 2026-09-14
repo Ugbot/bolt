@@ -505,6 +505,64 @@ TEST_F(Utf8Test, SubstrConst_MidWindowAndClamp) {
     EXPECT_EQ(memcmp(o2[2].prefix, "gh", 2), 0);
 }
 
+// W31-L18q -- THE GAP THE THREE CASES ABOVE LEAVE OPEN.
+//
+// `SubstrConst_SpilledSourcePrefixWindow` below uses start1=1 take=2, i.e.
+// start+take = 3, which is INSIDE the real 4-byte prefix -- and its own
+// comment says so ("prefix[] holds the first 4 bytes"). So the test was
+// written to the CORRECT model while the kernel's guard read
+// `start + t <= 12u`, and nothing probed the window BETWEEN them: bytes 5..12
+// of a SPILLED view, which are not string data at all but the
+// `{buf_idx, offset}` ref, because `inline_data` and `ref` share a union.
+//
+// Measured through the SQL surface before the fix: `substring(v,1,10)` over a
+// 20-byte value answered 'abcd' where DuckDB answers 'abcdefghij' -- the four
+// real prefix bytes followed by the ref's zero bytes, which renders as a
+// plausible SHORT STRING rather than as visible garbage. TPC-H Q22's
+// `substring(c_phone,1,2)` -- the case this kernel was written for -- is
+// start+take = 3 and is correct either way, which is why no board saw it.
+TEST_F(Utf8Test, SubstrConst_SpilledSourceWindowPastPrefix) {
+    const char* big = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";   // 26 bytes, spilled
+    StringView sp = make_spilled(big, 26, 0);
+    StringView out[1];
+
+    // Window 1..10 crosses byte 4, so it MUST consult the base. Reading the
+    // view's own bytes gives "ABCD" + six bytes of ref.
+    bolt::kernels::utf8_substr_const(&sp, 1, big, 1, 10, out);
+    EXPECT_EQ(out[0].length, 10u);
+    EXPECT_EQ(memcmp(out[0].prefix, "ABCDEFGHIJ", 10), 0);
+
+    // A window that STARTS past the prefix -- nothing correct can come from
+    // the view alone.
+    bolt::kernels::utf8_substr_const(&sp, 1, big, 5, 4, out);
+    EXPECT_EQ(out[0].length, 4u);
+    EXPECT_EQ(memcmp(out[0].prefix, "EFGH", 4), 0);
+
+    // Exactly the boundary: start+take == 4 is the last window that may skip
+    // the chase, and start+take == 5 is the first that may not.
+    bolt::kernels::utf8_substr_const(&sp, 1, big, 1, 4, out);
+    EXPECT_EQ(out[0].length, 4u);
+    EXPECT_EQ(memcmp(out[0].prefix, "ABCD", 4), 0);
+    bolt::kernels::utf8_substr_const(&sp, 1, big, 1, 5, out);
+    EXPECT_EQ(out[0].length, 5u);
+    EXPECT_EQ(memcmp(out[0].prefix, "ABCDE", 5), 0);
+
+    // A NON-ZERO spill offset, so a fix that ignored `offset` and simply read
+    // `base` from 0 still fails. The view describes bytes 4.. of `big`.
+    StringView sp2 = make_spilled(big + 4, 22, 4);
+    bolt::kernels::utf8_substr_const(&sp2, 1, big, 1, 8, out);
+    EXPECT_EQ(out[0].length, 8u);
+    EXPECT_EQ(memcmp(out[0].prefix, "EFGHIJKL", 8), 0);
+
+    // CONTROL: an INLINE source keeps reading straight from the view for a
+    // window up to 12 -- the two disjuncts are not the same bound, and
+    // narrowing the inline one to 4 would break this.
+    StringView in = make_inline("abcdefghijkl");     // 12 bytes
+    bolt::kernels::utf8_substr_const(&in, 1, nullptr, 1, 12, out);
+    EXPECT_EQ(out[0].length, 12u);
+    EXPECT_EQ(memcmp(out[0].prefix, "abcdefghijkl", 12), 0);
+}
+
 TEST_F(Utf8Test, SubstrConst_SpilledSourcePrefixWindow) {
     // A spilled (>12B) source: a window inside the first 12 bytes must read
     // the inline prefix WITHOUT consulting the spill base (the inline-fast
