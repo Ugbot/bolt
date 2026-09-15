@@ -37,11 +37,63 @@ TEST(GroupStats, MedianEvenCount) {
 }
 
 TEST(GroupStats, MedianNegativesAndSingle) {
+    // CONTROL, and the reason this file needs the MIXED-SIGN case below.
+    //
+    // This case is named for negatives and CANNOT FAIL on the negatives bug:
+    // `f64_sortable_key` used to emit the UNSIGNED-comparable key while the
+    // argsort compares SIGNED, which swapped the POSITIVE and NEGATIVE BLOCKS
+    // wholesale and left the order WITHIN each block correct. An all-negative
+    // input is one block, so it sorted right throughout. Kept as the control
+    // that states that.
     const double v[] = {-3.0, -1.0, -2.0};           // sorted: -3,-2,-1
     EXPECT_DOUBLE_EQ(median(v, 3), -2.0);
     const double one[] = {42.5};
     EXPECT_DOUBLE_EQ(median(one, 1), 42.5);
     EXPECT_DOUBLE_EQ(median(one, 0), 0.0);
+}
+
+// THE DISCRIMINATING CASE: both signs present. Under the old key every
+// non-negative sorted BEFORE every negative, so this returned 3.0 -- a value
+// from the set, plausible, and wrong. Every other case in this file (all
+// positive, or all negative) passes either way.
+TEST(GroupStats, MedianMixedSignsIsTheDiscriminator) {
+    const double v[] = {-10.0, -5.0, 1.0, 2.0, 3.0};  // sorted: -10,-5,1,2,3
+    EXPECT_DOUBLE_EQ(median(v, 5), 1.0);              // old key gave 3.0
+
+    const double w[] = {1.5, 2.5, -1.0, 0.25};        // sorted: -1,.25,1.5,2.5
+    EXPECT_DOUBLE_EQ(median(w, 4), 0.875);            // old key gave 2.0
+
+    // Quantile shares the sort, so it moves with it.
+    EXPECT_DOUBLE_EQ(quantile(v, 5, 0.0), -10.0);
+    EXPECT_DOUBLE_EQ(quantile(v, 5, 1.0), 3.0);
+    EXPECT_DOUBLE_EQ(quantile(v, 5, 0.25), -5.0);
+}
+
+// The key itself, asserted directly over the shapes a value test reaches
+// only indirectly: mixed signs, both zeroes, subnormals and the extremes.
+// The contract is that ASCENDING SIGNED int64 order of the keys equals
+// ascending order of the doubles.
+TEST(GroupStats, SortableKeyIsSignedComparable) {
+    // Ascending by value. -0.0 and 0.0 compare equal as doubles; the key is
+    // allowed to order them either way, so they are adjacent here and the
+    // assertion below is non-strict across that one pair.
+    const double asc[] = {-1e308, -1.0, -5e-324, -0.0, 0.0, 5e-324, 1.0, 1e308};
+    const int n = static_cast<int>(sizeof(asc) / sizeof(asc[0]));
+    for (int i = 1; i < n; ++i) {
+        const std::int64_t a = f64_sortable_key(asc[i - 1]);
+        const std::int64_t b = f64_sortable_key(asc[i]);
+        EXPECT_LE(a, b) << "key order broke between " << asc[i - 1]
+                        << " and " << asc[i];
+    }
+    // And strictly, everywhere the doubles are strictly ordered.
+    for (int i = 1; i < n; ++i) {
+        if (asc[i - 1] == asc[i]) continue;           // the +/-0 pair
+        EXPECT_LT(f64_sortable_key(asc[i - 1]), f64_sortable_key(asc[i]));
+    }
+    // A negative key must sort below a non-negative one -- the exact
+    // relation the old unsigned-comparable key inverted.
+    EXPECT_LT(f64_sortable_key(-1.0), f64_sortable_key(0.0));
+    EXPECT_LT(f64_sortable_key(-1e-300), f64_sortable_key(1e-300));
 }
 
 TEST(GroupStats, QuantileType7Interpolation) {

@@ -31,18 +31,41 @@ namespace bolt {
 namespace kernels {
 namespace group_stats {
 
-// IEEE-754 double -> monotonic-ordered int64 key. Ascending integer order of
-// the transformed keys equals ascending order of the doubles (NaN excluded):
-// flip the sign bit for non-negatives, flip all bits for negatives. Lets us
-// reuse the tested integer argsort instead of a separate float sort.
+// IEEE-754 double -> monotonic-ordered int64 key. Ascending SIGNED int64 order
+// of the transformed keys equals ascending order of the doubles (NaN excluded).
+// Lets us reuse the tested integer argsort instead of a separate float sort.
+//
+// THE KEY MUST BE COMPARABLE AS **SIGNED**, because that is what the argsort
+// does: `argsort_insertion_i64` / `argsort_mergesort_i64` compare
+// `const int64_t ki = keys[...]` with `kp > ki`.
+//
+// This transform previously produced the UNSIGNED-comparable key instead --
+// sign bit SET for non-negatives, all bits flipped for negatives -- so under
+// the signed compare every non-negative double's key was NEGATIVE and every
+// negative double's key was POSITIVE, and the two blocks sorted in the wrong
+// order wholesale. Order WITHIN each block was right, which is why it stayed
+// hidden: `median({-3,-1,-2})` is correct, and so is any all-positive set.
+// Only a MIXED-SIGN input can see it, and it is a silent wrong answer --
+// `median({-10,-5,1,2,3})` returned 3 where the median is 1.
+//
+//   negative      (top bit 1): flip every bit EXCEPT the sign bit. The key
+//                              stays signed-negative, and a larger magnitude
+//                              (larger low bits) becomes a smaller key, so
+//                              more-negative doubles sort first.
+//   non-negative  (top bit 0): leave it alone. The bit pattern of a
+//                              non-negative double is already monotonic and
+//                              signed-positive, so it sorts after every
+//                              negative and ascends with the value.
+//
+// Verified over mixed signs, +/-0, subnormals and +/-1e308.
 BOLT_FORCE_INLINE int64_t f64_sortable_key(double v) noexcept {
     std::uint64_t u = 0;
     static_assert(sizeof(u) == sizeof(v), "ieee754 double is 8 bytes");
     std::memcpy(&u, &v, sizeof(u));
-    // mask = all-ones for negatives (top bit set), else just the sign bit.
+    // mask = all-ones-BUT-THE-SIGN-BIT for negatives, zero for non-negatives.
     const std::uint64_t mask =
-        (static_cast<std::uint64_t>(-static_cast<std::int64_t>(u >> 63))) |
-        0x8000000000000000ULL;
+        (static_cast<std::uint64_t>(-static_cast<std::int64_t>(u >> 63))) &
+        0x7FFFFFFFFFFFFFFFULL;
     return static_cast<std::int64_t>(u ^ mask);
 }
 
