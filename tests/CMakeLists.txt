@@ -670,6 +670,27 @@ bolt_apply_hardening(test_bolt_arrow)
 
 add_test(NAME test_bolt_arrow COMMAND test_bolt_arrow)
 
+# The C Data Interface export contract (bolt::arrow::export_column) --
+# release()-per-spec, per-export state (no thread_local aliasing), real
+# Arrow-shaped buffers for Utf8/Bool/Decimal, null_count from the bitmap,
+# and fail-closed on unsupported formats. No external Arrow dependency.
+add_executable(test_bolt_arrow_export test_bolt_arrow_export.cpp)
+target_link_libraries(test_bolt_arrow_export
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arrow_export)
+add_test(NAME test_bolt_arrow_export COMMAND test_bolt_arrow_export)
+
+# G2ARROW-6: export -> import round-trip entirely within bolt (no external
+# Arrow library on either side) -- proves bolt::arrow::export_column and
+# bolt::arrow::import_column are mutually consistent, including nulls,
+# empty strings, the 12/13-byte Utf8 inline/spill boundary, both bolt Utf8
+# physical layouts, and the release()/copy-not-alias contract.
+add_executable(test_bolt_arrow_roundtrip test_bolt_arrow_roundtrip.cpp)
+target_link_libraries(test_bolt_arrow_roundtrip
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arrow_roundtrip)
+add_test(NAME test_bolt_arrow_roundtrip COMMAND test_bolt_arrow_roundtrip)
+
 # G2ARROW-17: bolt + a real Arrow C ABI header must compile in BOTH include
 # orders (two TUs, one per order, one binary). tests/arrow_abi_mimic.h is the
 # spec-verbatim global-scope block every real ABI header ships.

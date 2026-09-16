@@ -230,7 +230,195 @@ inline bool format_for(const BoltColumn& col, char* out,
     return true;
 }
 
+/// Reverse of format_for(): parse an Arrow format string back to a BoltType
+/// (+ decimal scale, when applicable). Only recognizes formats export_column
+/// itself can produce -- an unrecognized format fails closed rather than
+/// being guessed at, same philosophy as the export side.
+///
+/// NOTE: "I" is ambiguous on export (both UInt32 and IPv4 map to it via
+/// arrow_format_string) -- a pre-existing export collision, not introduced
+/// here. Import resolves it to UInt32; an IPv4 column round-trips as UInt32,
+/// which is exactly what export already does to it (same physical 4-byte
+/// layout), so nothing is lost that wasn't already lost by the export side.
+inline bool type_for_format(const char* fmt, BoltType* out_type,
+                            uint8_t* out_scale) noexcept {
+    if (fmt == nullptr || out_type == nullptr || out_scale == nullptr) return false;
+    *out_scale = 0;
+    if (fmt[0] == 'd' && fmt[1] == ':') {
+        unsigned prec = 0, scale = 0;
+        if (std::sscanf(fmt, "d:%u,%u", &prec, &scale) != 2) return false;
+        if (prec == 0 || prec > 38 || scale > 38) return false;  // Decimal128 only
+        *out_type = BoltType::Decimal128;
+        *out_scale = static_cast<uint8_t>(scale);
+        return true;
+    }
+    if (std::strncmp(fmt, "tsu:", 4) == 0) { *out_type = BoltType::Timestamp; return true; }
+    if (std::strcmp(fmt, "tdD") == 0) { *out_type = BoltType::Date32; return true; }
+    if (std::strcmp(fmt, "tdm") == 0) { *out_type = BoltType::Date64; return true; }
+    if (std::strcmp(fmt, "tDu") == 0) { *out_type = BoltType::Duration; return true; }
+    if (std::strcmp(fmt, "w:16") == 0) { *out_type = BoltType::UUID; return true; }
+    if (fmt[0] != '\0' && fmt[1] == '\0') {
+        switch (fmt[0]) {
+            case 'b': *out_type = BoltType::Bool;    return true;
+            case 'c': *out_type = BoltType::Int8;    return true;
+            case 's': *out_type = BoltType::Int16;   return true;
+            case 'i': *out_type = BoltType::Int32;   return true;
+            case 'l': *out_type = BoltType::Int64;   return true;
+            case 'C': *out_type = BoltType::UInt8;   return true;
+            case 'S': *out_type = BoltType::UInt16;  return true;
+            case 'I': *out_type = BoltType::UInt32;  return true;
+            case 'L': *out_type = BoltType::UInt64;  return true;
+            case 'e': *out_type = BoltType::Float16; return true;
+            case 'f': *out_type = BoltType::Float32; return true;
+            case 'g': *out_type = BoltType::Float64; return true;
+            case 'u': *out_type = BoltType::Utf8;    return true;
+            case 'z': *out_type = BoltType::Binary;  return true;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+/// Bit-unpack Arrow "b" (LSB-first bit-packed) into bolt's byte-packed Bool.
+/// Reverse of pack_bool(). Returns nullptr on OOM; length==0 is handled by
+/// the caller (never invoked with length<=0).
+inline void* unpack_bool(Arena* arena, const uint8_t* bits,
+                         int64_t length) noexcept {
+    auto* dst = static_cast<uint8_t*>(
+        arena->allocate(static_cast<std::size_t>(length)));
+    if (dst == nullptr) return nullptr;
+    for (int64_t i = 0; i < length; ++i) {
+        dst[i] = static_cast<uint8_t>((bits[i >> 3] >> (i & 7)) & 1u);
+    }
+    return dst;
+}
+
+/// Copy the validity buffer verbatim (Arrow and bolt agree: LSB-first, bit
+/// set = valid) into arena storage. Present iff the producer supplied a
+/// buffer at all -- not merely when there happen to be no nulls, since a
+/// spec-conformant producer may legally ship an all-1s validity buffer.
+inline bool import_validity(Arena* arena, const ArrowArray& array,
+                            int64_t length, uint8_t** out_validity) noexcept {
+    *out_validity = nullptr;
+    if (array.n_buffers < 1 || array.buffers[0] == nullptr) return true;
+    const std::size_t nbytes = static_cast<std::size_t>((length + 7) / 8);
+    void* dst = arena->copy_into(array.buffers[0], (nbytes > 0) ? nbytes : 1);
+    if (dst == nullptr) return false;
+    *out_validity = static_cast<uint8_t*>(dst);
+    return true;
+}
+
+/// Import Utf8/Binary ("u"/"z": validity, int32 offsets, packed bytes) into a
+/// fresh arena-owned column. Utf8 materializes as the Flat/View StringView
+/// layout (`make_utf8_from_packed`) -- the layout every compute/filter/sort/
+/// join/hash-agg operator in the engine actually reads -- while Binary uses
+/// `make_var_binary` (no StringView equivalent exists for raw bytes). Every
+/// byte is copied: the offsets and payload arena allocations are distinct
+/// from the source ArrowArray's buffers, never the same pointer handed back.
+inline bool import_varlen(Arena* arena, const ArrowArray& array,
+                          BoltType type, int64_t length, uint8_t* validity,
+                          BoltColumn* out) noexcept {
+    if (array.n_buffers != 3) return false;
+    if (length > 0 && array.buffers[1] == nullptr) return false;
+    const auto* src_offs = static_cast<const int32_t*>(array.buffers[1]);
+    int64_t total = 0;
+    if (length > 0) {
+        total = src_offs[length];
+        if (total < 0 || src_offs[0] != 0) return false;
+    }
+    if (total > 0 && array.buffers[2] == nullptr) return false;
+
+    auto* offs = static_cast<int32_t*>(arena->copy_into(
+        src_offs, static_cast<std::size_t>(length + 1) * sizeof(int32_t)));
+    if (offs == nullptr) return false;
+    auto* bytes = static_cast<char*>(
+        arena->copy_into(array.buffers[2], (total > 0) ? static_cast<std::size_t>(total) : 1));
+    if (bytes == nullptr) return false;
+
+    *out = (type == BoltType::Utf8)
+               ? BoltColumn::make_utf8_from_packed(bytes, validity, offs, length, arena)
+               : BoltColumn::make_var_binary(bytes, validity, offs, length,
+                                             BoltType::Binary, arena);
+    if (length > 0 && out->data == nullptr) return false;
+    out->arena = arena;
+    return true;
+}
+
 }  // namespace detail
+
+/// Import a self-contained (ArrowSchema, ArrowArray) pair -- as produced by
+/// `export_column`, or any spec-conformant producer emitting a format this
+/// function recognizes -- into a fresh, arena-owned BoltColumn.
+///
+/// OWNERSHIP: THIS IMPORT COPIES, mirroring export_column's "owns its
+/// buffers" stance from the other direction. Every buffer is copied into
+/// `arena`-owned storage; the imported column never aliases `array`'s
+/// buffers. The caller is therefore free to invoke the producer's
+/// `array.release(&array)` / `schema.release(&schema)` immediately after this
+/// call returns -- as the C Data Interface consumer contract expects them to
+/// -- and the imported column remains fully valid afterward. This function
+/// does not itself call release on either struct: reading the data and
+/// releasing the struct are the two independent halves of the consumer's
+/// side of the contract, and a caller that wants to inspect the struct again
+/// (or hand it to a second consumer) must not have it released out from
+/// under them as a side effect of importing.
+///
+/// Fails closed (returns false, leaves *out zeroed) on: null arguments, an
+/// already-released struct (release == nullptr -- nothing left to read), a
+/// sliced array (offset != 0 -- unsupported, matching export which never
+/// produces one), a format this function does not recognize, an n_buffers
+/// count inconsistent with the resolved type, or a malformed offsets array.
+inline bool import_column(const ArrowSchema& schema, const ArrowArray& array,
+                          Arena* arena, BoltColumn* out) noexcept {
+    if (arena == nullptr || out == nullptr) return false;
+    *out = BoltColumn::make_empty();
+    if (schema.release == nullptr || array.release == nullptr) return false;
+    if (array.length < 0 || array.offset != 0) return false;
+    if (array.n_buffers > 0 && array.buffers == nullptr) return false;
+
+    BoltType type;
+    uint8_t decimal_scale = 0;
+    if (!detail::type_for_format(schema.format, &type, &decimal_scale)) return false;
+
+    const int64_t length = array.length;
+    uint8_t* validity = nullptr;
+    if (!detail::import_validity(arena, array, length, &validity)) return false;
+
+    if (type == BoltType::Utf8 || type == BoltType::Binary) {
+        return detail::import_varlen(arena, array, type, length, validity, out);
+    }
+    if (type == BoltType::Bool) {
+        if (array.n_buffers != 2) return false;
+        if (length > 0 && array.buffers[1] == nullptr) return false;
+        void* dst = (length > 0)
+            ? detail::unpack_bool(arena, static_cast<const uint8_t*>(array.buffers[1]), length)
+            : arena->allocate(1);
+        if (dst == nullptr) return false;
+        *out = BoltColumn::make_flat(dst, validity, length, BoltType::Bool);
+        out->arena = arena;
+        return true;
+    }
+
+    // Fixed-width primitive lane (Int*/UInt*/Float*/Date*/Timestamp/Duration/
+    // Decimal128/UUID).
+    if (array.n_buffers != 2) return false;
+    const std::size_t w = (type == BoltType::Decimal128)
+                              ? 16u : static_cast<std::size_t>(kTypeSize[
+                                    static_cast<int>(type)]);
+    if (w == 0) return false;
+    void* dst = nullptr;
+    if (length > 0) {
+        if (array.buffers[1] == nullptr) return false;
+        dst = arena->copy_into(array.buffers[1], static_cast<std::size_t>(length) * w);
+    } else {
+        dst = arena->allocate(1);
+    }
+    if (dst == nullptr) return false;
+    *out = BoltColumn::make_flat(dst, validity, length, type);
+    out->arena = arena;
+    if (type == BoltType::Decimal128) out->decimal_scale = decimal_scale;
+    return true;
+}
 
 /// Export one column as a self-contained (ArrowSchema, ArrowArray) pair.
 ///
