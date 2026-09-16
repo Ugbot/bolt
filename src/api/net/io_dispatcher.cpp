@@ -297,10 +297,14 @@ void IODispatcher::start() {
         // skips pinning, runtime degrades to OS scheduling (still correct).
     }
 
-    // Start I/O threads
+    // Start I/O threads. Explicit stack size (see stacked_thread.h) — with
+    // inline_resume (the default), these threads resume request-handling
+    // coroutines directly and run arbitrary handler code, so they must not
+    // inherit the platform pthread default (512 KiB on macOS).
     io_threads_.reserve(config_.num_io_threads);
     for (size_t i = 0; i < config_.num_io_threads; ++i) {
-        io_threads_.emplace_back(&IODispatcher::io_thread_loop, this, i);
+        io_threads_.emplace_back(config_.stack_size_bytes,
+                                  &IODispatcher::io_thread_loop, this, i);
     }
 
     std::cout << "IODispatcher started with " << config_.num_io_threads

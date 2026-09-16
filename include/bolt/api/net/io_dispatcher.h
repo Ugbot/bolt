@@ -14,6 +14,7 @@
 
 #include "bolt/api/core/async_io.h"
 #include "bolt/api/core/coro_task.h"
+#include "bolt/api/core/stacked_thread.h"
 #include "bolt/api/core/worker_pool.h"
 #include <atomic>
 #include <coroutine>
@@ -195,6 +196,16 @@ struct IODispatcherConfig {
     // Intel, Apple Silicon). Best for trivial-handler latency on a P-core; for
     // mostly background workloads set false to free P-cores for the app.
     bool prefer_p_cores = true;
+
+    // Stack size for each I/O thread. With inline_resume (the default above),
+    // I/O threads resume request-handling coroutines DIRECTLY — they run
+    // arbitrary handler code (SQL/PromQL compilation, deeply recursive plan
+    // building) up to the next co_await, not just I/O bookkeeping. That makes
+    // this the single highest-leverage stack-size knob in the whole server:
+    // with inline_resume on and num_io_threads small (default 1), this is
+    // where most handler code actually executes. See stacked_thread.h.
+    // G2ICE-111/G2ICE-112.
+    size_t stack_size_bytes = core::kDefaultStackBytes;
 };
 
 /// I/O Dispatcher - bridges async I/O to coroutines
@@ -394,7 +405,7 @@ private:
     core::WorkerThreadPool* worker_pool_;
     bool owns_worker_pool_ = false;  // Did we create the pool?
 
-    std::vector<std::thread> io_threads_;
+    std::vector<core::StackedThread> io_threads_;
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};
 

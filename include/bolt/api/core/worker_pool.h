@@ -16,6 +16,7 @@
 // NOTE: core/coro_pool.h was cut from the fork (unused by the engine — no
 // CoroPool/PooledPromise symbols are referenced here). Include severed.
 #include "bolt/api/core/coro_task.h"
+#include "bolt/api/core/stacked_thread.h"
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
@@ -146,6 +147,12 @@ struct WorkerPoolConfig {
     size_t task_queue_size = 4096;    // Bounded queue capacity
     size_t blocking_workers = 2;      // Threads for blocking operations
     bool enable_work_stealing = false; // Future: work stealing between workers
+    // Stack size for every spawned worker (main + blocking) thread. These
+    // threads resume request-handling coroutines and therefore run arbitrary
+    // handler code (SQL/PromQL/etc. compilation, deeply recursive plan
+    // building) — see stacked_thread.h for why this must not be the platform
+    // pthread default. G2ICE-111/G2ICE-112.
+    size_t stack_size_bytes = kDefaultStackBytes;
 };
 
 /// Thread pool that executes coroutine handles
@@ -206,8 +213,8 @@ private:
     void blocking_worker_loop(size_t worker_id);
 
     WorkerPoolConfig config_;
-    std::vector<std::thread> workers_;
-    std::vector<std::thread> blocking_workers_;
+    std::vector<StackedThread> workers_;
+    std::vector<StackedThread> blocking_workers_;
 
     MPMCQueue<std::coroutine_handle<>, 4096> task_queue_;
 
@@ -253,16 +260,21 @@ inline void WorkerThreadPool::start() {
 
     shutdown_requested_.store(false, std::memory_order_relaxed);
 
-    // Start main workers
+    // Start main workers. Explicit stack size (see stacked_thread.h) — these
+    // threads resume request-handling coroutines and run arbitrary handler
+    // code, so they must not inherit the platform pthread default.
     workers_.reserve(config_.num_workers);
     for (size_t i = 0; i < config_.num_workers; ++i) {
-        workers_.emplace_back(&WorkerThreadPool::worker_loop, this, i);
+        workers_.emplace_back(config_.stack_size_bytes,
+                               &WorkerThreadPool::worker_loop, this, i);
     }
 
-    // Start blocking workers
+    // Start blocking workers (same stack-size requirement — offloaded
+    // blocking work runs arbitrary handler code too).
     blocking_workers_.reserve(config_.blocking_workers);
     for (size_t i = 0; i < config_.blocking_workers; ++i) {
-        blocking_workers_.emplace_back(&WorkerThreadPool::blocking_worker_loop, this, i);
+        blocking_workers_.emplace_back(config_.stack_size_bytes,
+                                        &WorkerThreadPool::blocking_worker_loop, this, i);
     }
 }
 
