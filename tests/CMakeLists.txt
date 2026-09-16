@@ -1727,3 +1727,17 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     bolt_apply_hardening(test_bolt_event_loop)
     add_test(NAME test_bolt_event_loop COMMAND test_bolt_event_loop)
 endif()
+
+# timer_queue — backend-agnostic reactor timer facility (STATION-82). Was not
+# wired into the test build at all (found while doing the G2CHK-85 Part 4
+# broader sweep); the file is self-contained (plain assert-based main(), no
+# gtest) per its own top comment, so it only needs bolt::reactor for
+# timer_queue.cpp's definitions. Also the regression gate for Part 4's swap of
+# live_ids_ (std::unordered_set -> SwissTableGrowable), matching the fd
+# registries' hot-path fix.
+if(TARGET bolt_reactor)
+    add_executable(test_timer_queue test_timer_queue.cpp)
+    target_link_libraries(test_timer_queue PRIVATE bolt::reactor)
+    bolt_apply_hardening(test_timer_queue)
+    add_test(NAME test_timer_queue COMMAND test_timer_queue)
+endif()

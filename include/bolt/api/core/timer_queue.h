@@ -21,13 +21,22 @@
 // Not thread-safe: like the rest of the reactor's per-loop state, a
 // timer_queue is owned and driven by a single loop thread. Cross-thread
 // scheduling goes through async_io::wake() + the loop's own queue.
+//
+// G2CHK-85 (Part 4): `live_ids_` used to be a std::unordered_map sibling
+// (std::unordered_set<timer_id>) — the same hot-path shape the fd-registry
+// audit fixed in event_loop_epoll.cpp/event_loop_kqueue.cpp, and owned by a
+// per-loop object with an identical lifetime. It is now a
+// bolt::SwissTableGrowable used purely as a membership set (value always 1);
+// see bolt_swiss_growable.h and docs/research/growable-swiss-table.md.
 
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <functional>
-#include <unordered_set>
 #include <vector>
+
+#include "bolt/bolt_arena.h"
+#include "bolt/join/bolt_swiss_growable.h"
 
 namespace bolt {
 namespace api {
@@ -45,8 +54,12 @@ public:
     static constexpr uint64_t NO_TIMEOUT = UINT64_MAX;
     // A timer_id that never denotes a live timer (add() never returns it).
     static constexpr timer_id INVALID_ID = 0;
+    // Hard ceiling on concurrently-armed timers (bounded growth, Tiger Style
+    // — SwissTableGrowable requires an explicit cap). Far above any realistic
+    // reactor-loop timer count; add() asserts if it is ever actually hit.
+    static constexpr uint32_t kMaxLiveTimers = 1u << 20;
 
-    timer_queue() = default;
+    timer_queue() noexcept;
     timer_queue(const timer_queue&)            = delete;
     timer_queue& operator=(const timer_queue&) = delete;
 
@@ -68,8 +81,8 @@ public:
     // timers re-entrantly.
     void fire_expired(time_point now);
 
-    size_t size() const noexcept { return live_ids_.size(); }
-    bool   empty() const noexcept { return live_ids_.empty(); }
+    size_t size() const noexcept { return live_ids_.size; }
+    bool   empty() const noexcept { return live_ids_.size == 0; }
 
 private:
     struct entry {
@@ -89,9 +102,10 @@ private:
 
     void drop_dead_top() noexcept;  // pop entries whose id is no longer live
 
-    std::vector<entry>            heap_;
-    std::unordered_set<timer_id>  live_ids_;  // ids currently armed
-    timer_id                      next_id_ = 1;
+    std::vector<entry>       heap_;
+    bolt::Arena              live_ids_arena_;  // backs live_ids_'s bounded growth
+    bolt::SwissTableGrowable live_ids_;        // armed ids; a SET (value unused, always 1)
+    timer_id                 next_id_ = 1;
 };
 
 // co_await sleep_for(tq, 50ms) — suspends the coroutine and resumes it once the

@@ -11,6 +11,26 @@ namespace bolt {
 namespace api {
 namespace core {
 
+namespace {
+// Timer registries are per-reactor-loop (one instance, not per-connection),
+// so a small initial block is enough; growth headroom mirrors FdRegistry's.
+bolt::ArenaConfig timer_ids_arena_config() noexcept {
+    bolt::ArenaConfig cfg;
+    cfg.initial_block_size = 16u * 1024;
+    cfg.max_block_size = 16u * 1024 * 1024;
+    return cfg;
+}
+}  // namespace
+
+timer_queue::timer_queue() noexcept
+    : live_ids_arena_(timer_ids_arena_config()) {
+    const bool ok = bolt::SwissTableGrowable::create(
+        &live_ids_, 64, &live_ids_arena_, kMaxLiveTimers);
+    assert(ok && "timer_queue live-id table creation cannot fail at 64 slots");
+    assert(live_ids_.size == 0);
+    (void)ok;
+}
+
 timer_queue::timer_id timer_queue::add(duration timeout, timer_callback cb,
                                        bool repeating) noexcept {
     assert(cb && "timer_queue::add requires a callback");
@@ -20,7 +40,14 @@ timer_queue::timer_id timer_queue::add(duration timeout, timer_callback cb,
 
     const timer_id id = next_id_++;
     if (next_id_ == INVALID_ID) ++next_id_;  // never hand out INVALID_ID on wrap
-    live_ids_.insert(id);
+    // Value is unused (set-only usage); a failed insert only happens at the
+    // kMaxLiveTimers hard ceiling, in which case the id is simply never
+    // "live" — drop_dead_top()/fire_expired() already treat that as an
+    // already-cancelled timer, so this degrades exactly like a lazy cancel.
+    const bool inserted = live_ids_.insert(id, 1u);
+    assert((inserted || live_ids_.size >= kMaxLiveTimers) &&
+           "unexpected timer_queue insert failure below the ceiling");
+    (void)inserted;
     heap_.push_back(entry{deadline, interval, id, std::move(cb), repeating});
     std::push_heap(heap_.begin(), heap_.end(), later_first{});
     assert(!heap_.empty());
@@ -29,11 +56,11 @@ timer_queue::timer_id timer_queue::add(duration timeout, timer_callback cb,
 
 bool timer_queue::cancel(timer_id id) noexcept {
     // Lazy: forget the id now; the stale heap entry is dropped when it surfaces.
-    return live_ids_.erase(id) > 0;
+    return live_ids_.erase(id);
 }
 
 void timer_queue::drop_dead_top() noexcept {
-    while (!heap_.empty() && live_ids_.find(heap_.front().id) == live_ids_.end()) {
+    while (!heap_.empty() && live_ids_.find(heap_.front().id) < 0) {
         std::pop_heap(heap_.begin(), heap_.end(), later_first{});
         heap_.pop_back();
     }
@@ -62,7 +89,7 @@ void timer_queue::fire_expired(time_point now) {
         heap_.pop_back();
 
         // Re-check liveness: a prior callback in this pass may have cancelled it.
-        if (live_ids_.find(due.id) == live_ids_.end()) continue;
+        if (live_ids_.find(due.id) < 0) continue;
 
         if (due.repeating) {
             // Re-arm relative to the intended deadline; if we've fallen behind

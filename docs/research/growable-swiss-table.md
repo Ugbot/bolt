@@ -103,3 +103,28 @@ Tiger-Style compliance on the dispatch path.
 - `async_io_epoll.cpp`'s `<unordered_map>` include was DEAD (zero uses) —
   removed in this pass. `async_io_iocp.cpp`'s real map (`associated`, the
   per-op IOCP association check) goes with the Windows follow-up.
+
+## Part 4 — broader sweep (`grep` over the rest of `src/`+`include/`)
+
+`event_loop_{epoll,kqueue}.cpp` and `fd_registry.h` (Parts 1–3) were a
+targeted fix, not a repo-wide one. This pass grepped the *entire* remaining
+`src/`+`include/` tree — `std::unordered_map`/`unordered_set`/`map`/
+`multimap`/`set`/`multiset`, both `std::x` and bare `x<` spellings — outside
+`src/api/{net,core}` and bolt's kernels/containers (already swept clean).
+`src/lakehouse/`, `src/crypto/`, `src/net/`, `src/ingest/`, `src/parse/`,
+`src/io/`, `src/compute/` and their `include/bolt/` mirrors: **zero hits** —
+these subsystems build catalogs/manifests/schemas at open/parse time (cold)
+or already use bolt's own POD containers.
+
+Real hits, triaged:
+
+| Site | Verdict | Why |
+|---|---|---|
+| `include/bolt/api/core/timer_queue.h` `live_ids_` (`std::unordered_set<timer_id>`) | **FIXED** | Same shape as the fd registries: one instance per reactor loop, add()/cancel() called at arbitrary rates, `find()` on the hot `drop_dead_top()`/`fire_expired()` path walked on every loop iteration. Pure membership (a set, not a map) — trivially fits `{u64 key -> u32 value}` with the value unused (always 1). No stable-pool wrapper needed (no payload beyond the key). Swapped for `bolt::SwissTableGrowable` + a small dedicated `bolt::Arena`; `size()`/`empty()` read the table's `size` field directly; `find()==end()` became `find()<0`. Bounded via a new `kMaxLiveTimers` (1<<20) ceiling — `add()` degrades a ceiling-blocked insert to "never live", which `drop_dead_top()` already treats identically to an already-cancelled timer, so failure is silent-but-safe rather than a crash. **Found along the way:** `tests/test_timer_queue.cpp` existed (self-contained, 7 asserts-based cases) but was never wired into `tests/CMakeLists.txt` — added as `test_timer_queue` (links `bolt::reactor`, no gtest needed) so this fix (and the class generally) now has a regression gate. |
+| `event_loop_iocp.cpp` (`std::unordered_map<int, IOCPHandlerData>`), `async_io_iocp.cpp` (`std::unordered_map<SOCKET, char> associated`) | **LEAVE (carried forward, not re-triaged)** | Already identified as the Part 1–3 Windows follow-up (same doc, above) — not new findings from this pass, and still not buildable/testable on this box (macOS, no MSVC). Confirmed still true; no change. |
+| `include/bolt/bolt_compute.h`, `bolt_node_pool.h`, `bolt_sharded_mpsc.h`, `include/bolt/join/bolt_groupby_distinct.h`, `include/bolt/kernels/fintech/sorted_ring.h` | **LEAVE — not applicable** | Every hit is a *comment* explaining why the file does NOT use `std::unordered_map`/`std::map`/`std::multiset` (design rationale prose citing the Tiger Style ban). Zero actual container declarations. |
+| `src/ingest/bolt_avro.cpp`, `bolt_parquet_read.cpp`, `include/bolt/ingest/bolt_parquet_read.h`, `bolt_protobuf.h`, `bolt_avro.h` | **LEAVE — not applicable** | `map<K,V>` here names the **Avro/Parquet logical type**, in prose describing the wire format being decoded — not a C++ `std::map`. |
+
+Net: one genuine fix this pass (`timer_queue`), the rest of the tree outside
+the already-covered `src/api/net`/`src/api/core`/kernels/containers was
+already clean or the matches were prose, not code.
