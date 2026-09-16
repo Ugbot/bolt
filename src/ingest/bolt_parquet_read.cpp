@@ -769,6 +769,23 @@ bool plain_int96(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         int32_t  julian = 0;
         std::memcpy(&nanos_of_day, s, 8);
         std::memcpy(&julian, s + 8, 4);
+        // G2PQ-35: legacy INT96 timestamps carry NANOSECOND-of-day, and
+        // BoltType::Timestamp is microseconds-only -- the same capability
+        // gap as an explicit TIMESTAMP(NANOS) column (see the ts_rescale==2
+        // check in decode_chunk). Refuse rather than silently round away a
+        // real sub-microsecond digit; a file whose nanos happen to already
+        // be exact microseconds keeps reading byte-identically.
+        if ((nanos_of_day % 1000ull) != 0ull) {
+            std::fprintf(stderr,
+                "bolt parquet: column '%s' is legacy INT96 TIMESTAMP and "
+                "row %lld carries sub-microsecond precision (nanos_of_day="
+                "%llu) -- this reader's Timestamp type is microseconds-only "
+                "and cannot represent it, so the read is REFUSED rather "
+                "than silently rounding the value away\n",
+                cx->pc->name, static_cast<long long>(row0 + i),
+                static_cast<unsigned long long>(nanos_of_day));
+            return false;
+        }
         const int64_t days = static_cast<int64_t>(julian) - 2440588;  // epoch
         dst[i] = days * 86400000000LL +
                  static_cast<int64_t>(nanos_of_day / 1000ull);
@@ -1740,6 +1757,41 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
     // Invalid rows keep garbage but their validity bit is already cleared.
     if (cx->ts_rescale != 0 && rows_done == rows) {
         int64_t* d = reinterpret_cast<int64_t*>(cx->out) + row0;
+        // G2PQ-35: BoltType::Timestamp/Duration ARE microseconds by
+        // definition (type_name "timestamp[us]", schema tag "tsu:"), so a
+        // NANOS-unit source column that carries a real sub-microsecond
+        // digit cannot be represented here. `d[i] /= 1000` would silently
+        // discard that digit and return a rounded value with no error --
+        // exactly the "silent data loss" this codebase's CLAUDE.md forbids.
+        // Refuse the read instead of guessing: scan every VALID row first
+        // (a null row's bytes are garbage, not a real value, so it can't
+        // "lose" precision) and fail loudly the moment one actually needs
+        // more than microsecond resolution. A file whose nanos happen to be
+        // exact multiples of 1000 (e.g. a microsecond source re-typed to
+        // NANOS) keeps working byte-identically -- only genuine precision
+        // loss is refused, never the unit label alone.
+        if (cx->ts_rescale == 2) {
+            for (int64_t i = 0; i < rows; ++i) {   // bounded: chunk rows
+                if (cx->validity != nullptr) {
+                    const int64_t row = row0 + i;
+                    const uint8_t valid =
+                        (cx->validity[row >> 3] >> (row & 7)) & 1u;
+                    if (valid == 0) continue;      // null: no value to lose
+                }
+                if ((d[i] % 1000) != 0) {
+                    std::fprintf(stderr,
+                        "bolt parquet: column '%s' is TIMESTAMP/DURATION "
+                        "with unit NANOS and row %lld carries sub-"
+                        "microsecond precision (%lld ns) -- this reader's "
+                        "Timestamp type is microseconds-only and cannot "
+                        "represent it, so the read is REFUSED rather than "
+                        "silently rounding the value away\n",
+                        cx->pc->name, static_cast<long long>(row0 + i),
+                        static_cast<long long>(d[i]));
+                    return false;
+                }
+            }
+        }
         for (int64_t i = 0; i < rows; ++i) {       // bounded: chunk rows
             if (cx->ts_rescale == 1) d[i] *= 1000;   // millis -> us
             else                     d[i] /= 1000;   // nanos  -> us
