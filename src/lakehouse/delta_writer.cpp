@@ -202,7 +202,49 @@ int64_t file_size_on_disk(const char* abs_path) noexcept {
     return sz < 0 ? -1 : static_cast<int64_t>(sz);
 }
 
-// Compose a min/max/null stats JSON from BoltBatch columns. Bounded.
+// G2ICE-135 helper: count non-valid rows in a column's validity bitmap over
+// `n_rows`. `validity == nullptr` is BoltColumn's own convention for "no
+// nulls in these rows" (see bolt_column.h's `make_flat`/`make_var_binary`
+// constructors, which all set `stats.all_valid = (validity == nullptr)`).
+int64_t count_nulls(const BoltColumn& col, int64_t n_rows) noexcept {
+    assert(n_rows >= 0);
+    if (col.validity == nullptr) return 0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < n_rows; ++i) {          // bounded: n_rows
+        if ((col.validity[i >> 3] & (1u << (i & 7))) == 0u) ++n;
+    }
+    return n;
+}
+
+// Whether `col`'s row `i` is valid (present, not null).
+inline bool row_valid(const BoltColumn& col, int64_t i) noexcept {
+    return col.validity == nullptr ||
+          (col.validity[i >> 3] & (1u << (i & 7))) != 0u;
+}
+
+// Compose a min/max/nullCount stats JSON from BoltBatch columns. Bounded.
+//
+// G2ICE-135 — this used to silently emit min/max for Int64 columns only
+// (Float64/UInt64/Utf8 got no bound at all, not even a wrong one) and never
+// emitted `nullCount` at all -- any Delta reader relying on that field
+// (partition/file pruning, or a null-safety gate like G2FEAT-356's) got
+// nothing to trust for ANY column, on ANY commit. Fixed: nullCount is real
+// and present for every column (0 is a genuine measured value, not absent);
+// min/max now also cover UInt64 and Float64 (the other two fixed-width
+// numeric types this pipeline's schema mapping produces). Utf8 bounds are
+// still not computed -- Delta wants the actual string VALUE, which needs a
+// variable-width column walk this function does not do -- so a Utf8 column
+// gets a real nullCount and simply no entry in minValues/maxValues, which a
+// reader (see delta_snapshot.cpp's `parse_stats_object`) already treats as
+// "unknown", never as a fabricated bound.
+//
+// Also fixes a real pre-existing bug while touching this loop: the original
+// `c == 0 ? "" : ","` comma logic keyed off the COLUMN INDEX, not whether an
+// entry had actually been written yet -- if column 0 was ever skipped (e.g.
+// a leading Utf8 primary-key column, an extremely common layout), the first
+// written entry still got a comma right after the object's opening `{`,
+// producing malformed JSON (`{"minValues":{,"value":5}...}`) that no JSON
+// parser accepts. Now tracked with an explicit `wrote_any` flag per section.
 uint32_t build_stats_json(const BoltBatch* b, char* dst,
                           uint32_t cap) noexcept {
     assert(b != nullptr && dst != nullptr);
@@ -211,36 +253,121 @@ uint32_t build_stats_json(const BoltBatch* b, char* dst,
                           static_cast<long long>(b->num_rows));
     if (w < 0) return 0;
     uint32_t off = static_cast<uint32_t>(w);
+    bool wrote_any = false;
     for (uint32_t c = 0; c < b->num_cols && off + 64u < cap; ++c) {
         const auto& f = b->schema.field(static_cast<int>(c));
-        if (f.type != BoltType::Int64) continue;
-        const int64_t* p = static_cast<const int64_t*>(
-            b->columns[b->read_epoch][c].data);
-        if (p == nullptr || b->num_rows == 0) continue;
-        int64_t mn = p[0];
-        for (int64_t i = 1; i < b->num_rows; ++i) if (p[i] < mn) mn = p[i];
-        int wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%lld",
-                               c == 0 ? "" : ",", f.name,
+        const BoltColumn& col = b->columns[b->read_epoch][c];
+        if (col.data == nullptr || b->num_rows == 0) continue;
+        int wn = -1;
+        if (f.type == BoltType::Int64) {
+            const int64_t* p = static_cast<const int64_t*>(col.data);
+            int64_t mn = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] < mn) mn = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%lld",
+                               wrote_any ? "," : "", f.name,
                                static_cast<long long>(mn));
+        } else if (f.type == BoltType::UInt64) {
+            const uint64_t* p = static_cast<const uint64_t*>(col.data);
+            uint64_t mn = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] < mn) mn = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%llu",
+                               wrote_any ? "," : "", f.name,
+                               static_cast<unsigned long long>(mn));
+        } else if (f.type == BoltType::Float64) {
+            const double* p = static_cast<const double*>(col.data);
+            double mn = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] < mn) mn = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%.17g",
+                               wrote_any ? "," : "", f.name, mn);
+        } else {
+            continue;   // Utf8 / other: no bound, see function comment
+        }
         if (wn < 0) break;
         off += static_cast<uint32_t>(wn);
+        wrote_any = true;
     }
     int wn = std::snprintf(dst + off, cap - off, "},\"maxValues\":{");
     if (wn < 0) return off;
     off += static_cast<uint32_t>(wn);
+    wrote_any = false;
     for (uint32_t c = 0; c < b->num_cols && off + 64u < cap; ++c) {
         const auto& f = b->schema.field(static_cast<int>(c));
-        if (f.type != BoltType::Int64) continue;
-        const int64_t* p = static_cast<const int64_t*>(
-            b->columns[b->read_epoch][c].data);
-        if (p == nullptr || b->num_rows == 0) continue;
-        int64_t mx = p[0];
-        for (int64_t i = 1; i < b->num_rows; ++i) if (p[i] > mx) mx = p[i];
-        wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%lld",
-                           c == 0 ? "" : ",", f.name,
-                           static_cast<long long>(mx));
+        const BoltColumn& col = b->columns[b->read_epoch][c];
+        if (col.data == nullptr || b->num_rows == 0) continue;
+        wn = -1;
+        if (f.type == BoltType::Int64) {
+            const int64_t* p = static_cast<const int64_t*>(col.data);
+            int64_t mx = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] > mx) mx = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%lld",
+                               wrote_any ? "," : "", f.name,
+                               static_cast<long long>(mx));
+        } else if (f.type == BoltType::UInt64) {
+            const uint64_t* p = static_cast<const uint64_t*>(col.data);
+            uint64_t mx = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] > mx) mx = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%llu",
+                               wrote_any ? "," : "", f.name,
+                               static_cast<unsigned long long>(mx));
+        } else if (f.type == BoltType::Float64) {
+            const double* p = static_cast<const double*>(col.data);
+            double mx = 0; bool have = false;
+            for (int64_t i = 0; i < b->num_rows; ++i) {
+                if (!row_valid(col, i)) continue;
+                if (!have || p[i] > mx) mx = p[i];
+                have = true;
+            }
+            if (!have) continue;
+            wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%.17g",
+                               wrote_any ? "," : "", f.name, mx);
+        } else {
+            continue;
+        }
         if (wn < 0) break;
         off += static_cast<uint32_t>(wn);
+        wrote_any = true;
+    }
+    wn = std::snprintf(dst + off, cap - off, "},\"nullCount\":{");
+    if (wn < 0) return off;
+    off += static_cast<uint32_t>(wn);
+    wrote_any = false;
+    for (uint32_t c = 0; c < b->num_cols && off + 64u < cap; ++c) {
+        const auto& f = b->schema.field(static_cast<int>(c));
+        const BoltColumn& col = b->columns[b->read_epoch][c];
+        // nullCount is real (and always emitted) regardless of type: it is
+        // a validity-bitmap walk, not a per-type value decode.
+        const int64_t nulls = count_nulls(col, b->num_rows);
+        wn = std::snprintf(dst + off, cap - off, "%s\"%s\":%lld",
+                           wrote_any ? "," : "", f.name,
+                           static_cast<long long>(nulls));
+        if (wn < 0) break;
+        off += static_cast<uint32_t>(wn);
+        wrote_any = true;
     }
     wn = std::snprintf(dst + off, cap - off, "}}");
     if (wn > 0) off += static_cast<uint32_t>(wn);

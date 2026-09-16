@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -90,6 +91,105 @@ TEST(BoltLakehouseDeltaWrite, AppendThreeBatchesRoundTrip) {
                                           &snap));
     EXPECT_EQ(snap.n_files, 3u);
     EXPECT_GE(snap.version, 1);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// G2ICE-135 — real nullCount + min/max, read back through
+// delta_snapshot_build's OWN stats parser (parse_stats_object in
+// delta_snapshot.cpp) -- a genuinely separate code path from the writer, so
+// this is a real round trip, not a self-consistency check. Before this fix,
+// `build_stats_json` never emitted `nullCount` at all (the reader already
+// parsed it, defaulting to -1 "unknown" on absence) and only ever bounded
+// Int64 columns, silently skipping Float64 -- so a Delta reader had nothing
+// trustworthy for null-safety gates or for Float64 file pruning, on any
+// commit. `id` (Int64, nulls at rows 1 and 3) and `score` (Float64, nulls at
+// row 2 only -- deliberately a DIFFERENT set, so a bug that shares one
+// column's null_count with another cannot pass by accident) exercise both.
+TEST(BoltLakehouseDeltaWrite, RealNullCountAndFloat64BoundsRoundTrip) {
+    const std::string root = unique_root("stats");
+    FilesystemCatalog fc; Catalog cat;
+    ASSERT_TRUE(filesystem_catalog_init(&fc, root.c_str(), &cat));
+
+    bolt::Arena arena;
+    bolt::BoltSchema schema;
+    schema.add_field("id",    bolt::BoltType::Int64,   true);
+    schema.add_field("score", bolt::BoltType::Float64, true);
+
+    dl::WriteOptions wopts;
+    dl::write_options_init(&wopts);
+    wopts.compression = Compression::kNone;
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(dl::delta_table_create(&th, &arena, &cat, "sales", "nulls",
+                                       &schema, &wopts));
+
+    constexpr int64_t kN = 6;
+    bolt::BoltBatch b{};
+    b.arena    = &arena;
+    b.num_rows = kN;
+    b.num_cols = 2;
+    bolt::BoltBatch::alloc_columns(&b, &arena, 2);
+    b.schema.add_field("id",    bolt::BoltType::Int64,   true);
+    b.schema.add_field("score", bolt::BoltType::Float64, true);
+    auto* cols = b.columns[b.read_epoch];
+
+    auto* idata = arena.allocate_array<int64_t>(kN);
+    auto* ivalid = arena.allocate_array<uint8_t>(1);
+    ivalid[0] = 0xFFu;
+    for (int64_t i = 0; i < kN; ++i) idata[i] = 100 + i;
+    ivalid[0] = static_cast<uint8_t>(ivalid[0] & ~(1u << 1));   // row 1 null
+    ivalid[0] = static_cast<uint8_t>(ivalid[0] & ~(1u << 3));   // row 3 null
+    cols[0].type = bolt::BoltType::Int64; cols[0].length = kN;
+    cols[0].data = idata; cols[0].validity = ivalid;
+
+    auto* sdata = arena.allocate_array<double>(kN);
+    auto* svalid = arena.allocate_array<uint8_t>(1);
+    svalid[0] = 0xFFu;
+    for (int64_t i = 0; i < kN; ++i) sdata[i] = static_cast<double>(i) * 1.5;
+    svalid[0] = static_cast<uint8_t>(svalid[0] & ~(1u << 2));   // row 2 null
+    cols[1].type = bolt::BoltType::Float64; cols[1].length = kN;
+    cols[1].data = sdata; cols[1].validity = svalid;
+
+    dl::AppendHandle* ah = nullptr;
+    ASSERT_TRUE(dl::delta_append_open(&ah, th));
+    ASSERT_TRUE(dl::delta_append_write(ah, &b));
+    ASSERT_TRUE(dl::delta_append_commit(ah));
+    dl::delta_append_close(ah);
+
+    FilesystemObjectStore fs; ObjectStore os;
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    bolt::Arena s_ar;
+    dl::Snapshot snap{};
+    ASSERT_TRUE(dl::delta_snapshot_build(&os, "sales/nulls", -1, &s_ar, &snap));
+    ASSERT_EQ(snap.n_files, 1u);
+    const dl::FileStats& st = snap.files[0].stats;
+    ASSERT_TRUE(st.has_num_records);
+    EXPECT_EQ(st.num_records, kN);
+    ASSERT_GE(st.n_cols, 2u);
+
+    int id_slot = -1, score_slot = -1;
+    for (uint32_t i = 0; i < st.n_cols; ++i) {
+        if (std::strcmp(st.col_names[i], "id") == 0) id_slot = static_cast<int>(i);
+        if (std::strcmp(st.col_names[i], "score") == 0) score_slot = static_cast<int>(i);
+    }
+    ASSERT_GE(id_slot, 0);
+    ASSERT_GE(score_slot, 0);
+
+    // Real, distinct null counts -- not defaulted, not swapped.
+    EXPECT_EQ(st.null_counts[id_slot], 2);
+    EXPECT_EQ(st.null_counts[score_slot], 1);
+
+    // id bounds: min/max over the 4 non-null rows (100,102,104,105) -> [100,105].
+    EXPECT_STREQ(st.min_str[id_slot], "100");
+    EXPECT_STREQ(st.max_str[id_slot], "105");
+
+    // score bounds (Float64 -- the type this writer used to silently skip):
+    // rows 0..5 give 0, 1.5, 3.0, 4.5, 6.0, 7.5; row 2 (3.0) is null and
+    // excluded -> non-null set {0, 1.5, 4.5, 6.0, 7.5}, min 0, max 7.5.
+    EXPECT_DOUBLE_EQ(std::strtod(st.min_str[score_slot], nullptr), 0.0);
+    EXPECT_DOUBLE_EQ(std::strtod(st.max_str[score_slot], nullptr), 7.5);
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);

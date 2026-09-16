@@ -141,10 +141,131 @@ void put_null(ing::AvroValue* v) noexcept {
     v->is_null = true;
 }
 
+// G2ICE-135 — a non-null kArray/kMap field: `bytes`/`bytes_len` carry the
+// caller's pre-encoded Avro array body (see bolt_avro.h's updated contract
+// for `avro_write_ex`). Mirrors put_null's zero-then-set shape so no stale
+// field (the `num` union, `_pad*`) survives from the arena allocation.
+void put_raw_container(ing::AvroValue* v, const uint8_t* bytes,
+                       uint32_t bytes_len) noexcept {
+    assert(v != nullptr);
+    assert(bytes != nullptr || bytes_len == 0u);
+    std::memset(v, 0, sizeof(*v));
+    v->type      = ing::AvroType::kArray;
+    v->is_null   = false;
+    v->bytes     = bytes;
+    v->bytes_len = bytes_len;
+}
+
 // Every data file this writer emits is parquet. MarbleDB-derived files are
 // synthesized as parquet by construction; a caller with another format needs
 // this to become a parameter rather than silently mislabelling the file.
 constexpr const char* kFileFormat = "PARQUET";
+
+// ---------------------------------------------------------------------------
+// G2ICE-135 — hand-encode the three per-column stats maps this writer now has
+// REAL data for (null_value_counts, lower_bounds, upper_bounds) as the raw
+// Avro bytes `avro_write_ex` splices verbatim for a non-null container field
+// (see bolt_avro.h's updated contract). Iceberg encodes an int-keyed map as
+// `array<record<key:int, value:T>>` because Avro maps may only key on string
+// (see the header comment at the top of this file), so this is exactly one
+// count-prefixed block of (key, value) pairs followed by the zero-count
+// terminator every array in this format ends with — mirroring
+// bolt_avro.cpp's own write_long/enc_bytes primitives byte-for-byte, since
+// that TU does not export them for reuse across the library boundary.
+// ---------------------------------------------------------------------------
+
+// Encode an Avro long (zig-zag varint). Returns bytes written (<= 10).
+// Identical algorithm to bolt_avro.cpp's private `write_long` — the two
+// cannot drift in a way that matters because both implement the same fixed
+// Avro spec, and this file's own gtest round-trips through the real reader.
+uint32_t enc_long_stat(int64_t v, uint8_t* dst) noexcept {
+    assert(dst != nullptr);
+    uint64_t u = (static_cast<uint64_t>(v) << 1) ^
+                 static_cast<uint64_t>(v >> 63);
+    uint32_t n = 0;
+    do {                                            // bounded: <= 10 iters
+        uint8_t b = static_cast<uint8_t>(u & 0x7Fu);
+        u >>= 7;
+        if (u != 0u) b |= 0x80u;
+        dst[n++] = b;
+    } while (u != 0u && n < 10u);
+    return n;
+}
+
+// Length-prefixed Avro bytes.
+uint32_t enc_bytes_stat(uint8_t* dst, const uint8_t* b, uint32_t len) noexcept {
+    assert(dst != nullptr);
+    uint32_t n = enc_long_stat(static_cast<int64_t>(len), dst);
+    if (len > 0) std::memcpy(dst + n, b, len);
+    return n + len;
+}
+
+// Bound on one encoded stat-map: count varint (<=10) + up to kIcebergMaxStatCols
+// entries of (key varint <=5 + widest value <=10 for a long, or <=10+kLakeMaxValBytes
+// for a bytes bound) + terminator varint (<=10). Generous, fixed, Tiger-Style.
+constexpr uint32_t kStatMapBufCap = 16u +
+    kIcebergMaxStatCols * (16u + 10u + kLakeMaxValBytes);
+
+// null_value_counts (or value_counts, if ever needed): one entry per column
+// this writer has a null_count for -- always present, because 0 is itself a
+// real measured value a caller (e.g. G2FEAT-356's null-safety gate) must be
+// able to trust as "certified zero nulls", not "unknown". Returns bytes
+// written into `dst`, or 0 when there is nothing to encode (st->n_cols == 0),
+// which the caller treats as "write null instead" — an empty map and an
+// absent map are both spec-legal but an absent one costs fewer bytes and
+// matches this writer's existing all-or-nothing null convention.
+uint32_t encode_null_count_map(const FileStats* st, uint8_t* dst,
+                               uint32_t cap) noexcept {
+    assert(st != nullptr && dst != nullptr);
+    if (st->n_cols == 0u) return 0u;
+    assert(st->n_cols <= kIcebergMaxStatCols);
+    uint32_t o = 0;
+    if (o + 10u > cap) return 0u;
+    o += enc_long_stat(static_cast<int64_t>(st->n_cols), dst + o);
+    for (uint32_t i = 0; i < st->n_cols; ++i) {      // bounded: n_cols
+        if (o + 20u > cap) return 0u;
+        o += enc_long_stat(st->cols[i].field_id, dst + o);
+        o += enc_long_stat(st->cols[i].null_count, dst + o);
+    }
+    if (o + 1u > cap) return 0u;
+    o += enc_long_stat(0, dst + o);                  // terminator block
+    return o;
+}
+
+// lower_bounds / upper_bounds: one entry per column that HAS that bound
+// (has_lower / has_upper) -- a column with none is simply absent from the
+// map, exactly what the reader's `find_stat` treats as "no information",
+// never a fabricated value.
+uint32_t encode_bound_map(const FileStats* st, bool want_lower, uint8_t* dst,
+                          uint32_t cap) noexcept {
+    assert(st != nullptr && dst != nullptr);
+    if (st->n_cols == 0u) return 0u;
+    assert(st->n_cols <= kIcebergMaxStatCols);
+    uint32_t n_present = 0;
+    for (uint32_t i = 0; i < st->n_cols; ++i) {
+        if (want_lower ? st->cols[i].has_lower : st->cols[i].has_upper) {
+            ++n_present;
+        }
+    }
+    if (n_present == 0u) return 0u;
+    uint32_t o = 0;
+    if (o + 10u > cap) return 0u;
+    o += enc_long_stat(static_cast<int64_t>(n_present), dst + o);
+    for (uint32_t i = 0; i < st->n_cols; ++i) {      // bounded: n_cols
+        const ColumnStatEntry& c = st->cols[i];
+        const bool present = want_lower ? c.has_lower : c.has_upper;
+        if (!present) continue;
+        const char* bytes = want_lower ? c.lower : c.upper;
+        const uint32_t blen = want_lower ? c.lower_len : c.upper_len;
+        if (o + 15u + blen > cap) return 0u;
+        o += enc_long_stat(c.field_id, dst + o);
+        o += enc_bytes_stat(dst + o, reinterpret_cast<const uint8_t*>(bytes),
+                            blen);
+    }
+    if (o + 1u > cap) return 0u;
+    o += enc_long_stat(0, dst + o);                  // terminator block
+    return o;
+}
 
 }  // namespace
 
@@ -200,26 +321,55 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         put_str(&v[i++], kFileFormat);
         put_long(&v[i++], d->stats.record_count);
         put_long(&v[i++], d->stats.file_size_in_bytes);
-        // SEVEN, not nine: column_sizes, value_counts, null_value_counts,
-        // nan_value_counts, lower_bounds, upper_bounds, key_metadata — the
-        // six stats maps plus key_metadata, exactly as build_entry_fields
-        // declares them. Writing nine put 21 values into a 19-wide row: each
-        // row spilled two values into the next row's slot (masked, because the
-        // next row promptly overwrote them) and the LAST row wrote one element
-        // past `rows`, whose `+ 1u` slack was hiding a real heap overflow.
+        // SEVEN fields here (was a flat put_null loop before G2ICE-135):
+        // column_sizes, value_counts, null_value_counts, nan_value_counts,
+        // lower_bounds, upper_bounds, key_metadata — exactly the six stats
+        // maps plus key_metadata, matching build_entry_fields's declared
+        // order. column_sizes/value_counts/nan_value_counts/key_metadata stay
+        // null (this writer has no per-column compressed-byte-size or NaN
+        // tracking, and value_counts has no downstream reader — see
+        // compute_file_stats's header comment in iceberg_writer.cpp for the
+        // scope decision). null_value_counts/lower_bounds/upper_bounds now
+        // carry REAL data when `d->stats.n_cols > 0` (populated by
+        // append_commit_ex / table_overwrite's compute_file_stats call).
         //
-        // Invisible in a stock CMake Release, which defines NDEBUG and
-        // compiles the assert below away. THIS repo's Release does not
-        // (`CMAKE_CXX_FLAGS_RELEASE=-O3 -g`), so the assert is live code and
-        // fires — which is how registering these tests here (G2ICE-4) surfaced
-        // it. The bytes on the wire were always correct, because the encoder
-        // walks the 19 SCHEMA fields and never read the two extra values.
-        for (uint32_t k = 0; k < 7; ++k) put_null(&v[i++]);  // 6 stats + key_md
+        // Historical note on the count (kept: still true and still the bug
+        // this session's predecessor found): writing nine values into a
+        // 19-wide row silently misaligned every following field and wrote one
+        // element past `rows`'s `+ 1u` slack — only visible because this
+        // repo's Release build keeps asserts live (G2ICE-4). The assert below
+        // is the same tripwire.
+        put_null(&v[i++]);                                   // column_sizes
+        put_null(&v[i++]);                                   // value_counts
+        {
+            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
+            const uint32_t n = (buf == nullptr)
+                ? 0u : encode_null_count_map(&d->stats, buf, kStatMapBufCap);
+            if (n == 0u) put_null(&v[i++]);
+            else         put_raw_container(&v[i++], buf, n);
+        }
+        put_null(&v[i++]);                                   // nan_value_counts
+        {
+            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
+            const uint32_t n = (buf == nullptr)
+                ? 0u : encode_bound_map(&d->stats, true, buf, kStatMapBufCap);
+            if (n == 0u) put_null(&v[i++]);
+            else         put_raw_container(&v[i++], buf, n);
+        }
+        {
+            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
+            const uint32_t n = (buf == nullptr)
+                ? 0u : encode_bound_map(&d->stats, false, buf, kStatMapBufCap);
+            if (n == 0u) put_null(&v[i++]);
+            else         put_raw_container(&v[i++], buf, n);
+        }
+        put_null(&v[i++]);                                   // key_metadata
         put_null(&v[i++]);                                   // split_offsets
         put_null(&v[i++]);                                   // equality_ids
         put_null(&v[i++]);                                   // sort_order_id
         assert(i == kEntryFields);
-        value_bytes += v[5].bytes_len + v[6].bytes_len;
+        value_bytes += v[5].bytes_len + v[6].bytes_len +
+                       v[11].bytes_len + v[13].bytes_len + v[14].bytes_len;
     }
 
     char spec_id_buf[16];

@@ -815,6 +815,164 @@ bool append_write(AppendHandle* ah, const BoltBatch* batch) noexcept {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// G2ICE-135 — REAL per-column data-file stats (null_count + numeric bounds),
+// computed from the exact batches this commit is about to serialize to
+// Parquet -- not estimated, and not copied from whatever the upstream
+// producer (e.g. a MarbleDB SST scan) claimed before this writer ever saw
+// the rows. Before this, `DataFileRef::stats` carried only `record_count` /
+// `file_size_in_bytes`; `manifest_write_avro` hard-`put_null()`ed every
+// per-column stats map (column_sizes/value_counts/null_value_counts/
+// lower_bounds/upper_bounds), so no Iceberg manifest this writer produced
+// ever carried a usable min/max/null_count for ANY column, on ANY commit --
+// file-pruning was completely inert for every reader, internal or external.
+//
+// Scope, deliberately narrow and honest rather than silently wrong:
+//   - null_count: computed for EVERY column, any type, by walking the
+//     validity bitmap (format-agnostic: Flat and VarBinary both expose a
+//     per-row bitmap the same way). `validity == nullptr` means "no nulls in
+//     this batch's rows for this column" (BoltColumn's own convention).
+//   - lower/upper bounds: computed ONLY for the fixed-width numeric types
+//     this writer's schema mapping actually emits (Int64/UInt64 -> Iceberg
+//     "long", Float64 -> "double"; Int32/Float32 handled too since a future
+//     caller may use them). Iceberg's binary single-value encoding for these
+//     types IS the native little-endian in-memory representation on every
+//     platform this builds for, so a bound is a straight memcpy -- no
+//     separate encoder, no risk of an encoding mismatch with `decode_bound`
+//     on the read side (see iceberg_statistics.cpp). A Utf8/string column
+//     gets a real null_count but NO bounds: Iceberg's string bound is the
+//     raw variable-width UTF-8 bytes with no fixed width, this writer does
+//     not walk a VarBinary payload for it, and "no bound" is spec-legal
+//     ("unknown") -- a wrong guess would prune away live rows, which is the
+//     one failure mode worse than no pruning at all.
+//   - Bounds reflect only NON-NULL values, per the Iceberg spec.
+struct NumBoundAcc {
+    bool    is_float;
+    uint32_t width;      // 4 or 8; 0 = not a bounded numeric type
+    bool    have;
+    int64_t lo_i, hi_i;
+    double  lo_f, hi_f;
+};
+
+void num_bound_kind(BoltType t, NumBoundAcc* a) noexcept {
+    assert(a != nullptr);
+    a->is_float = false;
+    switch (t) {
+        case BoltType::Int64:
+        case BoltType::UInt64:  a->width = 8u; break;
+        case BoltType::Int32:   a->width = 4u; break;
+        case BoltType::Float64: a->width = 8u; a->is_float = true; break;
+        case BoltType::Float32: a->width = 4u; a->is_float = true; break;
+        default:                a->width = 0u; break;
+    }
+}
+
+// Fold one column's contribution (one batch) into `acc`'s null_count and
+// numeric bounds. `col_idx` is validated by the caller.
+void accumulate_column_stats(const BoltColumn& col, int64_t n_rows,
+                             int64_t* null_count, NumBoundAcc* acc) noexcept {
+    assert(null_count != nullptr && acc != nullptr);
+    assert(n_rows >= 0);
+    if (col.validity != nullptr) {
+        for (int64_t r = 0; r < n_rows; ++r) {
+            const bool valid =
+                (col.validity[r >> 3] & (1u << (r & 7))) != 0u;
+            if (!valid) ++(*null_count);
+        }
+    }
+    if (acc->width == 0u || col.format != ColumnFormat::Flat ||
+        col.data == nullptr) {
+        return;   // not a bounded numeric type, or not walkable in place
+    }
+    for (int64_t r = 0; r < n_rows; ++r) {
+        if (col.validity != nullptr &&
+            (col.validity[r >> 3] & (1u << (r & 7))) == 0u) {
+            continue;   // bounds exclude nulls (Iceberg spec)
+        }
+        if (acc->is_float) {
+            double v = (acc->width == 8u)
+                ? static_cast<const double*>(col.data)[r]
+                : static_cast<double>(static_cast<const float*>(col.data)[r]);
+            if (!acc->have || v < acc->lo_f) acc->lo_f = v;
+            if (!acc->have || v > acc->hi_f) acc->hi_f = v;
+        } else {
+            int64_t v = (acc->width == 8u)
+                ? static_cast<const int64_t*>(col.data)[r]
+                : static_cast<int64_t>(static_cast<const int32_t*>(col.data)[r]);
+            if (!acc->have || v < acc->lo_i) acc->lo_i = v;
+            if (!acc->have || v > acc->hi_i) acc->hi_i = v;
+        }
+        acc->have = true;
+    }
+}
+
+bool compute_file_stats(const BoltBatch* const* batches, uint32_t n_batches,
+                        const Schema* sch, FileStats* out) noexcept {
+    assert(batches != nullptr && sch != nullptr && out != nullptr);
+    assert(n_batches > 0 && sch->n_fields > 0);
+    if (n_batches == 0 || sch->n_fields == 0) return false;
+    out->n_cols = 0;
+    const BoltBatch* b0 = batches[0];
+    for (uint32_t sf = 0; sf < sch->n_fields && out->n_cols < kIcebergMaxStatCols;
+        ++sf) {
+        const SchemaField& field = sch->fields[sf];
+        int32_t col_idx = -1;
+        for (uint32_t c = 0; c < b0->num_cols; ++c) {   // bounded: num_cols
+            if (std::strcmp(b0->schema.field(static_cast<int>(c)).name,
+                            field.name) == 0) {
+                col_idx = static_cast<int32_t>(c);
+                break;
+            }
+        }
+        if (col_idx < 0) continue;   // schema field absent from the batch
+        NumBoundAcc acc{};
+        {
+            const BoltColumn& c0 = b0->columns[b0->read_epoch][col_idx];
+            num_bound_kind(c0.type, &acc);
+        }
+        int64_t null_count = 0;
+        for (uint32_t bi = 0; bi < n_batches; ++bi) {   // bounded: n_batches
+            const BoltBatch* b = batches[bi];
+            if (static_cast<uint32_t>(col_idx) >= b->num_cols) continue;
+            const BoltColumn& col = b->columns[b->read_epoch][col_idx];
+            accumulate_column_stats(col, b->num_rows, &null_count, &acc);
+        }
+        ColumnStatEntry& e = out->cols[out->n_cols++];
+        std::memset(&e, 0, sizeof(e));
+        e.field_id   = field.id;
+        e.null_count = null_count;
+        if (acc.have && acc.width > 0u) {
+            e.lower_len = static_cast<uint8_t>(acc.width);
+            e.upper_len = static_cast<uint8_t>(acc.width);
+            if (acc.is_float) {
+                if (acc.width == 8u) {
+                    std::memcpy(e.lower, &acc.lo_f, 8u);
+                    std::memcpy(e.upper, &acc.hi_f, 8u);
+                } else {
+                    const float lo = static_cast<float>(acc.lo_f);
+                    const float hi = static_cast<float>(acc.hi_f);
+                    std::memcpy(e.lower, &lo, 4u);
+                    std::memcpy(e.upper, &hi, 4u);
+                }
+            } else {
+                if (acc.width == 8u) {
+                    std::memcpy(e.lower, &acc.lo_i, 8u);
+                    std::memcpy(e.upper, &acc.hi_i, 8u);
+                } else {
+                    const int32_t lo = static_cast<int32_t>(acc.lo_i);
+                    const int32_t hi = static_cast<int32_t>(acc.hi_i);
+                    std::memcpy(e.lower, &lo, 4u);
+                    std::memcpy(e.upper, &hi, 4u);
+                }
+            }
+            e.has_lower = true;
+            e.has_upper = true;
+        }
+    }
+    assert(out->n_cols <= kIcebergMaxStatCols);
+    return true;
+}
+
 // Internal: write one Parquet data file from a list of batches and return the
 // rel path + file size + total rows.
 bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
@@ -1037,6 +1195,13 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
                       sizeof(df.file_path))) return false;
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
+    // G2ICE-135 — real per-column null_count + numeric bounds from the exact
+    // batches just serialized above. Best-effort: a schema lookup miss or an
+    // unmapped column still commits the file (record_count/size stay real
+    // either way); it just carries no column-level stats, same as before.
+    if (const Schema* cur = metadata_current_schema(&ah->th->meta)) {
+        compute_file_stats(ah->pending, ah->n_pending, cur, &df.stats);
+    }
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
         return false;
     }
@@ -1298,6 +1463,10 @@ bool table_overwrite(TableHandle* th, const Predicate* /*pred*/,
                       sizeof(df.file_path))) return false;
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
+    // G2ICE-135 — same real per-column stats append_commit_ex computes.
+    if (const Schema* cur = metadata_current_schema(&th->meta)) {
+        compute_file_stats(arr, 1u, cur, &df.stats);
+    }
     return publish_snapshot(th, &df, 1, SnapshotOp::kOverwrite, snap_id);
 }
 

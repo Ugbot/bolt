@@ -286,10 +286,18 @@ struct AvroMetaKV {
 //     `format-version` and `content` alongside `avro.schema` / `avro.codec`.
 //
 // `schema_json` == nullptr falls back to the generated schema. Container-typed
-// fields (kArray / kMap) are writable ONLY as a null union branch: the encoder
-// emits the branch index and skips the value, which is exactly how Iceberg's
-// optional repeated fields (`lower_bounds`, `split_offsets`, ...) are omitted.
-// A non-null container value is rejected rather than mis-encoded.
+// fields (kArray / kMap) write as a null union branch when `AvroValue::is_null`
+// is true -- the encoder emits the branch index and skips the value, which is
+// how Iceberg's optional repeated fields (`split_offsets`, an absent
+// `lower_bounds`, ...) are omitted. A NON-null container value (G2ICE-135) is
+// carried as the caller's PRE-ENCODED Avro bytes in `bytes`/`bytes_len` --
+// the full block-count-prefixed element sequence plus its own terminating
+// zero-count block -- and is spliced in verbatim after the union branch. This
+// flat row model has no way to synthesize that from structured input, so the
+// caller (see iceberg_manifest_writer.cpp's encode_stat_map) must hand-encode
+// it with the same `write_long`/`enc_bytes`-shaped primitives this file uses.
+// A `bytes == nullptr` non-null container still fails the write rather than
+// silently truncating.
 bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
                    const AvroValue* rows, int64_t n_rows,
                    const char* schema_json, uint32_t schema_len,

@@ -1290,14 +1290,28 @@ bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
                 if (v->is_null) continue;
             }
             switch (fd->type) {
-                // A container carries no value in this flat model. Null is the
-                // only legal encoding, and the branch above already emitted it.
-                // Falling through the switch instead would write NOTHING,
-                // silently truncating the row and misaligning every field
-                // after it -- so a non-null container fails the write.
+                // A container has no per-field scalar in this flat model, so a
+                // non-null container value is carried as PRE-ENCODED Avro bytes
+                // in v->bytes[0..v->bytes_len) -- the caller hand-assembles the
+                // block-count-prefixed element sequence (and its own zero-count
+                // terminator block) using the same primitives this file uses
+                // (write_long / enc_bytes), then hands it here to be spliced in
+                // verbatim after the union branch already written above. This
+                // is what G2ICE-135 needed: Iceberg's per-file column stats
+                // (null_value_counts, lower_bounds, upper_bounds) are
+                // array<record<key,value>>, which is exactly this shape
+                // (see iceberg_manifest_writer.cpp's encode_stat_map). A null
+                // `bytes` pointer (caller forgot to build the payload) still
+                // fails the write rather than silently truncating.
                 case AvroType::kArray:
                 case AvroType::kMap:
-                    return false;
+                    if (v->bytes == nullptr) return false;
+                    if (b + v->bytes_len > cap) return false;
+                    if (v->bytes_len > 0) {
+                        std::memcpy(dst + b, v->bytes, v->bytes_len);
+                    }
+                    b += v->bytes_len;
+                    break;
                 case AvroType::kNull: break;
                 case AvroType::kBoolean:
                     if (b + 1u > cap) return false;

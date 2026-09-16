@@ -1520,6 +1520,19 @@ target_link_libraries(test_bolt_iceberg_manifest_write
 bolt_apply_hardening(test_bolt_iceberg_manifest_write)
 add_test(NAME test_bolt_iceberg_manifest_write COMMAND test_bolt_iceberg_manifest_write)
 
+# G2ICE-135 — end-to-end: a real BoltBatch WITH nulls through append_commit_ex
+# (the exact TieringManager::upload_iceberg call), manifest bytes read back
+# OFF DISK and decoded by the pyiceberg-verified reader above. Proves
+# compute_file_stats (iceberg_writer.cpp) computes from the real data being
+# written, not from an estimate or an upstream producer's claim.
+add_executable(test_bolt_iceberg_column_stats_e2e
+    test_bolt_iceberg_column_stats_e2e.cpp)
+target_link_libraries(test_bolt_iceberg_column_stats_e2e
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_column_stats_e2e)
+add_test(NAME test_bolt_iceberg_column_stats_e2e
+         COMMAND test_bolt_iceberg_column_stats_e2e)
+
 # G2ICE-50 — is bolt's metadata.json a table OTHER implementations will open?
 # Writes a real table for scripts/iceberg_metadata_interop.py (pyiceberg +
 # DuckDB) and asserts the spec's required-property set on the emitted bytes.
