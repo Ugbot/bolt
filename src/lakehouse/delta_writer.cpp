@@ -329,9 +329,23 @@ bool delta_table_create(TableHandle** out, Arena* arena, Catalog* cat,
     }
 
     const uint64_t ms = now_unix_ms();
+    // G2ICE-81-adjacent finding (verification session): the Delta protocol
+    // REQUIRES metaData.format (a struct with a non-nullable `provider` and
+    // a non-nullable `options` map) -- every reader built on delta-kernel-rs
+    // (DuckDB's `delta` extension, and Python `deltalake` at any version,
+    // old rust-engine or new kernel-engine alike) refuses to open a table
+    // whose metaData omits it: "Encountered unmasked nulls in non-nullable
+    // StructArray child: Field { \"format\" ... }". This was missing from
+    // day one, so no bolt-authored Delta table was externally readable by
+    // any mainstream reader -- verified by hand against both tools before
+    // and after this one-line addition. Orthogonal to G2ICE-81's row-level
+    // delete-rewrite logic, but it directly blocked verifying that fix's
+    // claimed external-reader check, so it is fixed here rather than filed
+    // and left for later.
     const int blen = std::snprintf(body, kDeltaMaxSchemaBytes + 4096u,
         "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n"
-        "{\"metaData\":{\"id\":\"%s-%s\",\"name\":\"%s\",\"schemaString\":\"%s\","
+        "{\"metaData\":{\"id\":\"%s-%s\",\"name\":\"%s\",\"format\":{\"provider\":"
+        "\"parquet\",\"options\":{}},\"schemaString\":\"%s\","
         "\"partitionColumns\":[%s],\"configuration\":{},\"createdTime\":%llu}}\n"
         "{\"commitInfo\":{\"timestamp\":%llu,\"operation\":\"CREATE TABLE\"}}\n",
         ns, name, name, escaped, parts,
