@@ -106,6 +106,23 @@ BOLT_FORCE_INLINE size_t align_up(size_t x, size_t a) noexcept {
     return (x + a - 1) & ~(a - 1);
 }
 
+// G2ICE-141: zero [buf+off+written, buf+off+aligned) — the 64-byte alignment
+// pad after a data span's real payload and, when `written == 0` but the span
+// has nonzero length, the whole span whose source pointer was absent (e.g. a
+// zero-row VarBinary column with no dict_child: its 4-byte offsets span is
+// never memcpy'd, and the old whole-buffer memset silently supplied
+// offsets[0] == 0). Together with the metadata-region memset in
+// bolt_wire_serialize this reproduces byte-for-byte what the old
+// `memset(buf, 0, total)` guaranteed — deterministic, non-leaking wire
+// bytes — without re-zeroing the multi-MB payload the memcpys fully
+// overwrite (measured ~29% of the synchronous ingest hot path).
+BOLT_FORCE_INLINE void zero_wire_gap(uint8_t* buf, size_t off,
+                                     size_t written, size_t aligned) noexcept {
+    assert(buf != nullptr);
+    assert(written <= aligned);
+    if (aligned > written) memset(buf + off + written, 0, aligned - written);
+}
+
 BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
     if (t == BoltType::Bool)         return true;
     if (t == BoltType::Utf8)         return true;
@@ -387,7 +404,25 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     if (total == 0 || total > buf_capacity) return 0;
 
     uint8_t* buf = static_cast<uint8_t*>(out_buf);
-    memset(buf, 0, total);
+
+    const uint32_t schema_off = static_cast<uint32_t>(kWireHeaderSize);
+    const uint32_t desc_off   = schema_off +
+        static_cast<uint32_t>(b->num_cols) * kWireSchemaEntrySize;
+    const uint32_t data_off_u = static_cast<uint32_t>(
+        detail::align_up(desc_off + b->num_cols * kWireDescSize, kWireAlign));
+
+    // G2ICE-141: zero ONLY the metadata region (header + schema entries +
+    // descriptor table + the alignment gap up to data_off) — a few hundred
+    // bytes — instead of the entire wire image. The old `memset(buf, 0,
+    // total)` also zeroed the multi-MB data region whose every byte is
+    // either memcpy'd below or explicitly zeroed via zero_wire_gap
+    // (alignment pads + skipped-source spans), and was measured at ~29% of
+    // the synchronous ingest hot path (dtrace, G2ICE-141). Mirrors the
+    // streaming serializer's proven discipline (bolt_wire_stream.h: memset
+    // to data_off, then per-buffer pad zeroing only). Header bytes [0,32)
+    // and each 72-byte schema entry are fully written below; the memset
+    // covers descriptor tail bytes [49,56) and the desc→data gap.
+    memset(buf, 0, data_off_u);
 
     // --- Header ---
     memcpy(buf + 0, "BOLT", 4);
@@ -395,11 +430,6 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     detail::write_u32_le(buf + 8,  kWireFlagLE | kWireFlagAln);
     detail::write_i64_le(buf + 12, b->num_rows);
     detail::write_u32_le(buf + 20, b->num_cols);
-    const uint32_t schema_off = static_cast<uint32_t>(kWireHeaderSize);
-    const uint32_t desc_off   = schema_off +
-        static_cast<uint32_t>(b->num_cols) * kWireSchemaEntrySize;
-    const uint32_t data_off_u = static_cast<uint32_t>(
-        detail::align_up(desc_off + b->num_cols * kWireDescSize, kWireAlign));
     detail::write_u32_le(buf + 24, schema_off);
     detail::write_u32_le(buf + 28, data_off_u);
 
@@ -425,9 +455,12 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         uint8_t* d = buf + desc_off + i * kWireDescSize;
         const BoltColumn& c = b->col(i);
 
-        const size_t off0 = cursor;                      cursor += detail::align_up(b0[i], kWireAlign);
-        const size_t off1 = cursor;                      cursor += detail::align_up(b1[i], kWireAlign);
-        const size_t off2 = cursor;                      cursor += detail::align_up(b2[i], kWireAlign);
+        const size_t aln0 = detail::align_up(b0[i], kWireAlign);
+        const size_t aln1 = detail::align_up(b1[i], kWireAlign);
+        const size_t aln2 = detail::align_up(b2[i], kWireAlign);
+        const size_t off0 = cursor;                      cursor += aln0;
+        const size_t off1 = cursor;                      cursor += aln1;
+        const size_t off2 = cursor;                      cursor += aln2;
         assert(cursor <= total);
 
         detail::write_u64_le(d +  0, off0); detail::write_u64_le(d +  8, b0[i]);
@@ -435,15 +468,22 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         detail::write_u64_le(d + 32, off2); detail::write_u64_le(d + 40, b2[i]);
         d[48] = static_cast<uint8_t>(c.format);
 
-        if (b0[i] && c.validity) memcpy(buf + off0, c.validity, b0[i]);
+        // G2ICE-141: `wr{0,1,2}` = bytes actually copied into each span; the
+        // uncovered remainder (alignment pad, or a whole span whose source
+        // pointer was absent) is zeroed by zero_wire_gap below, keeping the
+        // wire image byte-identical to the old whole-buffer memset.
+        size_t wr0 = 0, wr1 = 0, wr2 = 0;
+        if (b0[i] && c.validity) { memcpy(buf + off0, c.validity, b0[i]); wr0 = b0[i]; }
         if (c.format == ColumnFormat::VarBinary) {
             // b1 = offsets array; b2 = payload bytes.
             if (b1[i] > 0 && c.dict_child != nullptr &&
                 c.dict_child->data != nullptr) {
                 memcpy(buf + off1, c.dict_child->data, b1[i]);
+                wr1 = b1[i];
             }
             if (b2[i] > 0 && c.data != nullptr) {
                 memcpy(buf + off2, c.data, b2[i]);
+                wr2 = b2[i];
             }
         } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
             // b1 = StringView row array; b2 = spilled bytes. G2FEAT-308/311:
@@ -468,15 +508,22 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
                     }
                     dst_rows[r] = v;
                 }
+                wr1 = b1[i];
             }
             if (b2[i] && c.str_overflow_base) {
                 memcpy(buf + off2,
                       static_cast<const uint8_t*>(c.str_overflow_base) + utf8_min_off[i],
                       b2[i]);
+                wr2 = b2[i];
             }
         } else {
-            if (b1[i] && c.data) memcpy(buf + off1, c.data, b1[i]);
+            if (b1[i] && c.data) { memcpy(buf + off1, c.data, b1[i]); wr1 = b1[i]; }
         }
+
+        // G2ICE-141: zero the unwritten remainder of every span.
+        detail::zero_wire_gap(buf, off0, wr0, aln0);
+        detail::zero_wire_gap(buf, off1, wr1, aln1);
+        detail::zero_wire_gap(buf, off2, wr2, aln2);
     }
 
     return total;
