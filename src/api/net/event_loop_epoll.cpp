@@ -18,7 +18,7 @@
 #include <netinet/tcp.h>
 #include <errno.h>
 #include <cstring>
-#include <unordered_map>
+#include "fd_registry.h"
 #include <atomic>
 #include <iostream>
 #include <cstdlib>   // std::abort (no exceptions in this build)
@@ -69,34 +69,36 @@ public:
             return -1;
         }
 
-        // Store handler
-        EventHandlerData data;
-        data.handler = std::move(handler);
-        data.user_data = user_data;
-        data.events = events;
-        handlers_[fd] = std::move(data);
+        // Store handler (insert-or-overwrite; slot addresses are stable)
+        EventHandlerData* data = handlers_.insert(static_cast<uint64_t>(fd));
+        if (!data) {
+            errno = ENOMEM;  // registry hard cap — honest fail, never silent
+            return -1;
+        }
+        data->handler = std::move(handler);
+        data->user_data = user_data;
+        data->events = events;
 
         // Register with epoll
         return update_epoll_events(fd, events, false);
     }
 
     int modify_fd(int fd, IOEvent events) override {
-        auto it = handlers_.find(fd);
-        if (it == handlers_.end()) {
+        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        if (!data) {
             errno = ENOENT;
             return -1;
         }
 
         // Update stored events
-        it->second.events = events;
+        data->events = events;
 
         // Re-register with epoll
         return update_epoll_events(fd, events, true);
     }
 
     int remove_fd(int fd) override {
-        auto it = handlers_.find(fd);
-        if (it == handlers_.end()) {
+        if (!handlers_.find(static_cast<uint64_t>(fd))) {
             errno = ENOENT;
             return -1;
         }
@@ -111,7 +113,7 @@ public:
         }
 
         // Remove handler
-        handlers_.erase(it);
+        handlers_.erase(static_cast<uint64_t>(fd));
         return 0;
     }
 
@@ -136,9 +138,10 @@ public:
             struct epoll_event& ev = events_[i];
             int fd = ev.data.fd;
 
-            // Look up handler
-            auto it = handlers_.find(fd);
-            if (it == handlers_.end()) {
+            // Look up handler (SIMD-probed SwissTableGrowable — the old
+            // std::unordered_map here was the G2CHK-85 hot-path violation)
+            EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+            if (!data) {
                 continue;  // Handler was removed
             }
 
@@ -160,7 +163,11 @@ public:
 
             // Invoke handler directly — handlers are noexcept in this
             // exception-free (-fno-exceptions) build.
-            it->second.handler(fd, event_type, it->second.user_data);
+            // `data` points into the registry's segmented pool — STABLE
+            // even if the handler itself calls add_fd() and grows the table
+            // (the unordered_map version could rehash here and dangle the
+            // iterator mid-dispatch).
+            data->handler(fd, event_type, data->user_data);
         }
 
         // Grow event array if needed
@@ -225,7 +232,7 @@ private:
     }
 
     int epoll_fd_;                                       // epoll file descriptor
-    std::unordered_map<int, EventHandlerData> handlers_; // fd → handler mapping
+    FdRegistry<EventHandlerData> handlers_;          // fd → handler registry
     std::vector<struct epoll_event> events_;             // Event array for epoll_wait()
     std::atomic<bool> running_;                          // Running flag
 };

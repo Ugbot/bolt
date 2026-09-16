@@ -18,7 +18,6 @@
 #include <errno.h>
 
 #include <vector>
-#include <unordered_map>
 #include <memory>
 #include <atomic>
 #include <mutex>

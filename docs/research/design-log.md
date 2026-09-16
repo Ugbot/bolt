@@ -2204,3 +2204,42 @@ the wrapper cost swamped the probe win. That integration risk is real and
 belongs to a dedicated chukonu-side session with its own measure-first gate
 (`extern/chukonu/docs/research/53-aggregation-engine-synthesis.md`, "Inc 1"),
 not bundled into this primitive-level change.
+
+## SwissTableGrowable — growable/erasable sibling of SwissTable (G2CHK-85, 2026-09-16)
+
+**Decision:** grow the SwissTable family by one member rather than adopting a
+different growable-hash-table design. `bolt::SwissTableGrowable`
+(`include/bolt/join/bolt_swiss_growable.h`) keeps `SwissTable`'s exact layout
+(ctrl bytes, 7-bit `swiss_tag`, 16-slot SIMD group scan, mirrored tail group,
+{u64 key → u32 value-as-index} slots) and adds the two capabilities the fixed
+table deliberately lacks: real erase (Abseil-style tombstones, 0xFE, with the
+was-never-full revert-to-Empty early-out so low-load churn accumulates zero
+tombstones) and a real bounded grow/rehash path (7/8 occupancy trigger; ×2 when
+live-dominated, same-size tombstone purge when churn-dominated; hard
+`max_capacity` ceiling past which insert fails cleanly; new arrays from the
+same captured Arena, superseded ones become arena garbage). Alternatives
+weighed and rejected — folly F14 (chunk overflow counters: different layout
+family), Robin Hood backward-shift (O(cluster) erase + breaks the group-scan
+early-exit), hopscotch (displacement cascades): full rationale in
+`docs/research/growable-swiss-table.md`.
+
+**Why it exists:** the 2026-09 audit found the epoll/kqueue/IOCP event loops'
+fd→handler registries — probed on every dispatched I/O event, mutated on every
+socket open/close — sitting on `std::unordered_map`. Those two POSIX loops now
+ride `FdRegistry<Data>` (`src/api/net/fd_registry.h`: SwissTableGrowable +
+stable segmented slot pool for the non-trivially-copyable `std::function`
+payload), which also fixes the latent rehash-under-the-dispatcher iterator
+hazard the map had. Measured (M4, min-of-7): churn (erase+insert at steady
+size) 27–28 ns/op vs unordered_map's 71–96; find-miss ~4× faster; small
+fully-cached registry mix is parity (~4.2 vs ~4.1) — the win there is bounded
+memory + zero per-insert heap allocation, reported honestly.
+
+**Default:** `SwissTable` (fixed) remains the default for build-once workloads
+— its pre-sized insert is ~2.6× faster than growable's grow-as-you-go insert
+and its struct is smaller. Reach for `SwissTableGrowable` only when the
+lifetime includes erase or unknown growth. What would flip the choice back:
+none foreseen — the two contracts are disjoint by workload shape.
+
+**Follow-up:** Windows IOCP (`event_loop_iocp.cpp`, `async_io_iocp.cpp`
+`associated` map) takes the same registry when a Windows build box is in the
+loop; `async_io_epoll.cpp`'s dead `<unordered_map>` include was removed.

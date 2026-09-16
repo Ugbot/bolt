@@ -19,7 +19,7 @@
 #include <netinet/tcp.h>
 #include <errno.h>
 #include <cstring>
-#include <unordered_map>
+#include "fd_registry.h"
 #include <atomic>
 #include <iostream>
 
@@ -73,12 +73,15 @@ public:
 
         LOG_DEBUG("KQUEUE", "add_fd fd=%d events=%d kq_fd=%d", fd, static_cast<int>(events), kq_fd_);
 
-        // Store handler
-        EventHandlerData data;
-        data.handler = std::move(handler);
-        data.user_data = user_data;
-        data.events = events;
-        handlers_[fd] = std::move(data);
+        // Store handler (insert-or-overwrite; slot addresses are stable)
+        EventHandlerData* data = handlers_.insert(static_cast<uint64_t>(fd));
+        if (!data) {
+            errno = ENOMEM;  // registry hard cap — honest fail, never silent
+            return -1;
+        }
+        data->handler = std::move(handler);
+        data->user_data = user_data;
+        data->events = events;
 
         // Register with kqueue
         int result = update_kqueue_events(fd, events, false);
@@ -87,22 +90,22 @@ public:
     }
 
     int modify_fd(int fd, IOEvent events) override {
-        auto it = handlers_.find(fd);
-        if (it == handlers_.end()) {
+        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        if (!data) {
             errno = ENOENT;
             return -1;
         }
 
         // Update stored events
-        it->second.events = events;
+        data->events = events;
 
         // Re-register with kqueue
         return update_kqueue_events(fd, events, true);
     }
 
     int remove_fd(int fd) override {
-        auto it = handlers_.find(fd);
-        if (it == handlers_.end()) {
+        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        if (!data) {
             errno = ENOENT;
             return -1;
         }
@@ -112,12 +115,12 @@ public:
         int n_changes = 0;
 
         // Remove READ filter if present
-        if (it->second.events & IOEvent::READ) {
+        if (data->events & IOEvent::READ) {
             EV_SET(&changes[n_changes++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
         }
 
         // Remove WRITE filter if present
-        if (it->second.events & IOEvent::WRITE) {
+        if (data->events & IOEvent::WRITE) {
             EV_SET(&changes[n_changes++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         }
 
@@ -131,7 +134,7 @@ public:
         }
 
         // Remove handler
-        handlers_.erase(it);
+        handlers_.erase(static_cast<uint64_t>(fd));
         return 0;
     }
 
@@ -172,9 +175,10 @@ public:
 
             LOG_DEBUG("KQUEUE", "event fd=%d filter=%d flags=%d", fd, ev.filter, ev.flags);
 
-            // Look up handler
-            auto it = handlers_.find(fd);
-            if (it == handlers_.end()) {
+            // Look up handler (SIMD-probed SwissTableGrowable — the old
+            // std::unordered_map here was the G2CHK-85 hot-path violation)
+            EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+            if (!data) {
                 LOG_DEBUG("KQUEUE", "no handler for fd=%d", fd);
                 continue;  // Handler was removed
             }
@@ -200,8 +204,11 @@ public:
 
             LOG_DEBUG("KQUEUE", "dispatching to handler fd=%d event_type=%d", fd, static_cast<int>(event_type));
 
-            // Invoke handler
-            it->second.handler(fd, event_type, it->second.user_data);
+            // Invoke handler. `data` points into the registry's segmented
+            // pool — STABLE even if the handler itself calls add_fd() and
+            // grows the table (the unordered_map version could rehash here
+            // and dangle the iterator mid-dispatch).
+            data->handler(fd, event_type, data->user_data);
         }
 
         // Grow event array if needed
@@ -291,7 +298,7 @@ private:
     }
 
     int kq_fd_;                                      // kqueue file descriptor
-    std::unordered_map<int, EventHandlerData> handlers_;  // fd → handler mapping
+    FdRegistry<EventHandlerData> handlers_;          // fd → handler registry
     std::vector<struct kevent> events_;              // Event array for kevent()
     std::atomic<bool> running_;                      // Running flag
 };

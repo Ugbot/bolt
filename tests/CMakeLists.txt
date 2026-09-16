@@ -1699,3 +1699,31 @@ target_link_libraries(test_bolt_arena_concurrent
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_arena_concurrent)
 add_test(NAME test_bolt_arena_concurrent COMMAND test_bolt_arena_concurrent)
+
+# SwissTableGrowable — growable/erasable SwissTable sibling (G2CHK-85 audit:
+# the fd→handler registries in src/api/net event loops needed a live
+# insert/erase table; std::unordered_map is banned on hot paths).
+add_executable(test_bolt_swiss_growable test_bolt_swiss_growable.cpp)
+target_link_libraries(test_bolt_swiss_growable
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_swiss_growable)
+add_test(NAME test_bolt_swiss_growable COMMAND test_bolt_swiss_growable)
+
+# bolt::reactor event loop over REAL sockets — first direct coverage of the
+# kqueue/epoll loops; regression gate for the G2CHK-85 fd-registry swap
+# (std::unordered_map → SwissTableGrowable FdRegistry). POSIX only.
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_event_loop test_bolt_event_loop.cpp)
+    target_link_libraries(test_bolt_event_loop
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_event_loop)
+    add_test(NAME test_bolt_event_loop COMMAND test_bolt_event_loop)
+endif()
