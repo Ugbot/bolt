@@ -141,7 +141,20 @@ TEST(IcebergPyIcebergInterop, WriteFixture) {
 
     AppendHandle* ah = nullptr;
     ASSERT_TRUE(append_open(&ah, th));
-    char commit_file[kIcebergMaxPath][kCommits];
+    // NOTE: dimensions are [kCommits][kIcebergMaxPath] -- kCommits buffers,
+    // each kIcebergMaxPath bytes wide, matching the size passed to
+    // append_commit_ex below. Transposed (kIcebergMaxPath outer, kCommits
+    // inner) silently aliases adjacent rows: append_commit_ex is told the
+    // buffer is kIcebergMaxPath bytes but each row is only kCommits(=2)
+    // bytes, so writing commit_file[1] after commit_file[0] overwrites
+    // commit_file[0]'s tail in place (both rows are one contiguous object,
+    // so this is silent corruption, not a crash). Currently latent here
+    // because only commit_file[kCommits - 1] (the last-written, so never
+    // subsequently overwritten) is ever read back -- found via an
+    // independent differently-shaped repro that referenced an EARLIER
+    // commit_file[] slot from a batched, multi-entry table_delete_positions
+    // call and observed the corrupted path in the physical delete file.
+    char commit_file[kCommits][kIcebergMaxPath];
     for (int32_t c = 0; c < kCommits; ++c) {
         bolt::BoltBatch b{};
         make_batch(&arena, &b, c * kRowsPerCommit, kRowsPerCommit);
