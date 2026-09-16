@@ -1558,7 +1558,26 @@ bool decode_values_by_encoding(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         return rle_bool(cx, v, vlen, def, row0, nvals, nvalid, arena);
     }
     if (h->enc == kEncPlainDict || h->enc == kEncRleDict) {
-        if (nvalid == 0) return true;               // all-null page
+        if (nvalid == 0) {
+            // Every one of this page's `nvals` rows is NULL -- there is no
+            // dictionary index to decode, so `dict_gather` below never runs
+            // for this page. Bailing out here without clearing the validity
+            // bits left the caller's all-valid-initialized bitmap (see
+            // init_col_ctx_any) untouched, so an all-NULL dictionary-encoded
+            // page reported every row as VALID (G2CHK-41). `nvalid == 0` with
+            // `nvals > 0` only arises on an OPTIONAL column whose def levels
+            // were actually decoded (not elided as all-present), so `def` is
+            // guaranteed non-null here and `cx->validity` is guaranteed
+            // non-null by the caller's own precondition (decode_data_page's
+            // "chunk stats said no nulls" check above it).
+            assert(def != nullptr);
+            assert(cx->validity != nullptr);
+            for (uint32_t i = 0; i < nvals; ++i) {
+                bit_clear(cx->validity, row0 + i);
+                if (cx->codes != nullptr) cx->codes[row0 + i] = -1;
+            }
+            return true;
+        }
         if (vlen < 1) return false;
         const uint32_t bw = v[0];
         if (bw > 32u) return false;
