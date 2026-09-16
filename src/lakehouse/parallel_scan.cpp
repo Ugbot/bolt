@@ -24,9 +24,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <mutex>
+#include <optional>
 #include <thread>
 
+#include "bolt/api/core/worker_pool.h"  // bolt::api::core::MPMCQueue — G2CHK-85
 #include "bolt/lakehouse/object_store/prefetch.h"
 
 namespace bolt {
@@ -55,61 +56,53 @@ namespace {
 constexpr uint32_t kReqRingCap = 64u;   // ≤ kScanMaxInflight
 constexpr uint32_t kResRingCap = 64u;
 
-// Simple bounded MPSC for tasks. Producer = scan driver; consumers =
-// worker threads. One mutex for simplicity (workers spend the bulk of
-// their time on I/O + decode, not contending on this ring).
+// Bounded MPMC ring for tasks. Producer = scan driver; consumers = worker
+// threads (genuinely multi-consumer — kScanMaxParallelism workers all pop
+// from the same ring). This used to be a hand-rolled array guarded by a
+// std::mutex ("one mutex for simplicity"); G2CHK-85 swapped it for the
+// same lock-free Vyukov-sequence MPMC bolt already ships
+// (bolt::api::core::MPMCQueue, worker_pool.h — used today for HTTP
+// coroutine-handle submission) instead of re-deriving a second bounded
+// lock-free ring next to an already-proven one. Kept as a thin
+// pointer-in/pointer-out adapter so every call site below is unchanged.
 struct TaskRing {
-    RowGroupTask  buf[kReqRingCap];
-    uint32_t      head;
-    uint32_t      tail;
-    std::mutex    m;
+    bolt::api::core::MPMCQueue<RowGroupTask, kReqRingCap> q;
 
-    void init() noexcept { head = 0; tail = 0; }
+    void init() noexcept {}  // MPMCQueue self-initializes on construction.
 
     bool try_push(const RowGroupTask* t) noexcept {
         assert(t != nullptr);
-        std::lock_guard<std::mutex> lk(m);
-        const uint32_t next = (head + 1u) % kReqRingCap;
-        if (next == tail) return false;
-        buf[head] = *t;
-        head = next;
-        return true;
+        if (t == nullptr) return false;
+        return q.try_push(*t);
     }
 
     bool try_pop(RowGroupTask* out) noexcept {
         assert(out != nullptr);
-        std::lock_guard<std::mutex> lk(m);
-        if (head == tail) return false;
-        *out = buf[tail];
-        tail = (tail + 1u) % kReqRingCap;
+        if (out == nullptr) return false;
+        std::optional<RowGroupTask> v = q.try_pop();
+        if (!v.has_value()) return false;
+        *out = *v;
         return true;
     }
 };
 
 struct ResultRing {
-    Morsel        buf[kResRingCap];
-    uint32_t      head;
-    uint32_t      tail;
-    std::mutex    m;
+    bolt::api::core::MPMCQueue<Morsel, kResRingCap> q;
 
-    void init() noexcept { head = 0; tail = 0; }
+    void init() noexcept {}  // MPMCQueue self-initializes on construction.
 
     bool try_push(const Morsel* m_in) noexcept {
         assert(m_in != nullptr);
-        std::lock_guard<std::mutex> lk(m);
-        const uint32_t next = (head + 1u) % kResRingCap;
-        if (next == tail) return false;
-        buf[head] = *m_in;
-        head = next;
-        return true;
+        if (m_in == nullptr) return false;
+        return q.try_push(*m_in);
     }
 
     bool try_pop(Morsel* out) noexcept {
         assert(out != nullptr);
-        std::lock_guard<std::mutex> lk(m);
-        if (head == tail) return false;
-        *out = buf[tail];
-        tail = (tail + 1u) % kResRingCap;
+        if (out == nullptr) return false;
+        std::optional<Morsel> v = q.try_pop();
+        if (!v.has_value()) return false;
+        *out = *v;
         return true;
     }
 };
@@ -257,8 +250,11 @@ void parallel_scan_close(ParallelScanPool* pool) noexcept {
         prefetch::prefetcher_close(pool->prefetcher);
         pool->prefetcher = nullptr;
     }
-    pool->reqs.m.~mutex();
-    pool->results.m.~mutex();
+    // reqs/results are now MPMCQueue-backed (G2CHK-85): every member is a
+    // trivially-destructible atomic or POD cell, same as the pool's other
+    // atomics above (finishing/stopped/etc.) which also go undestructed —
+    // no manual dtor call needed (there was one here only because the old
+    // std::mutex member was not trivially destructible).
     // Arena owns the storage; we don't free.
 }
 
