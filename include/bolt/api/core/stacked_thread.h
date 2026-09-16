@@ -52,12 +52,37 @@
 
 namespace bolt::api::core {
 
-/// Default stack size for boltapi request-handling threads: 8 MiB. Matches
-/// the typical Linux pthread default and gives real headroom over the
-/// post-cap-raise chukonu canonical-plan structures (see file header). At
-/// the default thread counts (1 IO thread + 8 workers + up to 8 blocking
-/// workers), 17 * 8 MiB = 136 MiB total — trivial for any real deployment.
-inline constexpr std::size_t kDefaultStackBytes = 8u * 1024u * 1024u;
+/// Default stack size for boltapi request-handling threads: 32 MiB.
+///
+/// G2CHK-81 (2026-09-16): was 8 MiB. A binary that links chukonu with
+/// CHUKONU_WITH_GRAPH_FRONTENDS=ON (the vendored ANTLR4 C++ runtime for
+/// the openCypher/SPARQL frontends — default-on since G2GRAPH-1, the
+/// same day this was found) carries a STATIC thread-local-storage block
+/// of ~14.5 MiB (measured: gestaltd's `.tbss` section is 0xe82aac =
+/// 15,225,004 bytes). glibc's NPTL reserves that static-TLS block out of
+/// every new thread's stack allocation before a single byte is available
+/// for real call frames — for a thread with NO explicit stacksize this
+/// silently grows the default allocation to fit (observed: ~13.8 MiB
+/// threads under an 8 MiB RLIMIT_STACK), but for a thread created with an
+/// EXPLICIT `pthread_attr_setstacksize` smaller than the required TLS
+/// floor, `pthread_create` flatly refuses with EINVAL — proven live via
+/// gdb: `pthread_attr_setstacksize(&attr, 8*1024*1024)` succeeds (glibc
+/// doesn't validate against the running process's actual TLS need at
+/// that call), but the following `pthread_create` returns errno 22
+/// (EINVAL) every time, and manually forcing 32 MiB via gdb made the
+/// identical call succeed. So the *previous* 8 MiB comment ("matches the
+/// typical Linux pthread default... trivial for any real deployment")
+/// stopped being true the moment ANTLR4 got linked into this binary by
+/// default — it wasn't a documentation error when written, it was
+/// invalidated by a build-graph change elsewhere. 32 MiB clears the
+/// current ~14.5 MiB floor with ~17 MiB of real headroom to spare, and
+/// stays trivial in absolute terms: at the default thread counts (1 IO
+/// thread + 8 workers + up to 8 blocking workers), 17 * 32 MiB = 544 MiB
+/// total — still negligible for any real deployment, and every other
+/// StackedThread call site (marbledb's compaction/commit/ttl-reaper
+/// background threads, see marbledb G2CHK-81) rides this same constant so
+/// a future TLS-floor increase only needs fixing in one place.
+inline constexpr std::size_t kDefaultStackBytes = 32u * 1024u * 1024u;
 
 class StackedThread {
 public:
