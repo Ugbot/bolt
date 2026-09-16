@@ -1171,6 +1171,19 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     }
     const Schema dsch = position_delete_schema();
     ingest::parquet::ParquetWriteOpts po = make_pq_opts(&dsch, nullptr);
+    // G2ICE-117 — stamp the spec-RESERVED field ids into the physical
+    // parquet footer, not only into `dsch` (which only ever reached the
+    // Iceberg-level manifest/metadata, never the file bolt's own writer
+    // produced). `make_pq_opts` does not do this generically (see its own
+    // comment) — narrowly fixed here rather than there so the already-proven
+    // regular data-file write path is untouched. Column order is fixed by
+    // `position_delete_schema()` immediately above: [0]=file_path,
+    // [1]=pos.
+    assert(po.n_columns == 2u && "position_delete_schema shape changed");
+    po.columns[0].has_field_id = true;
+    po.columns[0].field_id     = dsch.fields[0].id;   // 2147483546 file_path
+    po.columns[1].has_field_id = true;
+    po.columns[1].field_id     = dsch.fields[1].id;   // 2147483545 pos
     auto* w = ingest::parquet::parquet_write_open(full, &po);
     if (w == nullptr) return false;
     if (!ingest::parquet::parquet_write_row_group(w, &b)) {

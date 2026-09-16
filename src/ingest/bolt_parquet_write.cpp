@@ -1885,6 +1885,13 @@ void write_schema_element_col(TcOut* o,
         tc_put_stop(o);                      // empty JsonType / BsonType
         tc_put_stop(o);                      // end LogicalType union
     }
+    // 9 field_id — see ParquetWriteColumn::has_field_id's doc comment
+    // (G2ICE-117). Omitted entirely unless a caller explicitly set it, so
+    // every existing writer output is byte-identical.
+    if (c.has_field_id) {
+        tc_put_field(o, 9, kFI32);
+        tc_put_zigzag(o, c.field_id);
+    }
     tc_put_stop(o);
 }
 

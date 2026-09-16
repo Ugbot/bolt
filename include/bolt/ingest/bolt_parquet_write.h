@@ -139,7 +139,27 @@ struct ParquetWriteColumn {
     // "<name>.list.element".
     BoltType     element_type;
     bool         element_nullable;
-    std::uint8_t _pad[2];       // explicit alignment / future use
+    // G2ICE-117 — the parquet SchemaElement's Thrift field 9 (`field_id`).
+    // Unset (has_field_id=false, the zero-init default) writes no field 9 at
+    // all, matching every existing caller's on-disk output exactly. A caller
+    // that DOES set it (today: bolt's own Iceberg position-delete writer,
+    // whose two columns must carry the spec-reserved ids 2147483546/
+    // 2147483545 — see delete_file.h) gets those ids stamped into the
+    // physical parquet footer, not just the logical Iceberg Schema JSON.
+    //
+    // Root cause this closes: the Iceberg *metadata* schema (metadata.json,
+    // written from `iceberg::Schema::fields[i].id`) always carried field
+    // ids, but the physical parquet file's own footer never did — bolt's own
+    // reader binds columns by name/position and was never bothered, but a
+    // spec-compliant external reader (pyiceberg) resolves a POSITION DELETE
+    // file's `file_path`/`pos` columns by their RESERVED FIELD IDS, not by
+    // name. Without this, bolt correctly wrote a delete file whose row
+    // content, manifest entry, and Iceberg-level schema were all individually
+    // correct, and pyiceberg silently applied ZERO deletions from it anyway —
+    // found by cross-checking G2ICE-117's own delete-forwarding test against
+    // pyiceberg rather than trusting bolt's own reader alone.
+    bool         has_field_id;
+    std::int32_t field_id;
 };
 
 // Writer options. POD; copied into the writer at open.
