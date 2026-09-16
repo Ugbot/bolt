@@ -323,8 +323,21 @@ inline bool import_varlen(Arena* arena, const ArrowArray& array,
     const auto* src_offs = static_cast<const int32_t*>(array.buffers[1]);
     int64_t total = 0;
     if (length > 0) {
+        if (src_offs[0] != 0) return false;
+        // Every offset must be non-decreasing, not merely offs[0] and
+        // offs[length]: a producer (malicious, or simply buggy -- this
+        // consumer must not assume export_column is the only caller) that
+        // supplies a dip in the middle, e.g. [0, 20, 5, 30], passes an
+        // endpoints-only check with total=30 yet make_utf8_from_packed()
+        // computes row 1's length as `end - start` = 5 - 20 = -15, which
+        // becomes a ~4-billion-byte uint32_t length on the very next read
+        // of that row -- a heap-buffer-overflow reachable from untrusted
+        // input, verified live under ASan before this check existed.
+        for (int64_t i = 0; i < length; ++i) {
+            if (src_offs[i + 1] < src_offs[i]) return false;
+        }
         total = src_offs[length];
-        if (total < 0 || src_offs[0] != 0) return false;
+        if (total < 0) return false;
     }
     if (total > 0 && array.buffers[2] == nullptr) return false;
 

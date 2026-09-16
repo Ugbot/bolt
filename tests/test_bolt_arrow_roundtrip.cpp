@@ -568,3 +568,40 @@ TEST(ArrowRoundTrip, ImportFailsClosedOnUnrecognizedFormat) {
     s.release(&s);
     arr.release(&arr);
 }
+
+// import_column must not trust a producer's offsets array further than the
+// endpoints it happens to check. A non-monotonic dip in the MIDDLE of the
+// array (endpoints still well-formed: offs[0]==0, offs[length]==total>=0)
+// used to slip past validation entirely and reach
+// BoltColumn::make_utf8_from_packed(), where `end - start` for the dipped
+// row underflows to a ~4-billion uint32_t length -- a heap-buffer-overflow
+// on the very next read of that row (reproduced live under ASan before the
+// fix). This is exactly the shape a buggy or adversarial external Arrow
+// producer can hand to import_column, which per its own doc comment accepts
+// "any spec-conformant producer", not only bolt's own export_column.
+TEST(ArrowRoundTrip, ImportFailsClosedOnNonMonotonicOffsetsMidArray) {
+    Arena a;
+    ArrowSchema s; ArrowArray arr;
+    std::memset(&s, 0, sizeof(s));
+    std::memset(&arr, 0, sizeof(arr));
+    s.format = "u";
+    s.release = [](ArrowSchema* x) { x->release = nullptr; };
+
+    // offs[0]==0 and offs[3]==30 both look fine in isolation; row 1 dips
+    // from 20 back down to 5.
+    static int32_t offs[4] = {0, 20, 5, 30};
+    static char bytes[64];
+    std::memset(bytes, 'A', sizeof(bytes));
+    static const void* bufs[3] = {nullptr, offs, bytes};
+
+    arr.length = 3;
+    arr.n_buffers = 3;
+    arr.buffers = bufs;
+    arr.release = [](ArrowArray* x) { x->release = nullptr; };
+
+    BoltColumn out;
+    EXPECT_FALSE(bolt::arrow::import_column(s, arr, &a, &out));
+    EXPECT_EQ(out.data, nullptr);
+    s.release(&s);
+    arr.release(&arr);
+}
