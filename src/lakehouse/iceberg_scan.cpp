@@ -333,6 +333,12 @@ struct ScanHandle {
     uint32_t      cur_row_group;
     bool          cur_file_open;
     uint8_t       _pad[3];
+    // Rows already emitted from the CURRENT live file, across prior row
+    // groups. Iceberg positional deletes name (file_path, pos) where `pos`
+    // is the 0-based row index WITHIN THE DATA FILE, not within a row
+    // group -- this is what turns a row-group-local index into that
+    // absolute position. Reset to 0 by open_next_file.
+    uint64_t      cur_file_row_base;
     PositionDeleteSet    pos_dels;
     EqualityDeleteSetI64 eq_dels;
 };
@@ -419,6 +425,180 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
     s->cur_body_len = blen;
     s->cur_row_group = 0;
     s->cur_file_open = true;
+    s->cur_file_row_base = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Position-delete loading + application (G2ICE-82).
+//
+// bolt's Iceberg WRITER (table_delete_positions) produces a real v2
+// POSITIONAL delete file: a 2-column parquet ("file_path" Utf8, "pos"
+// Int64) referenced from a delete manifest. Until this landed, this reader
+// DECLINED every table that carried one (see the file banner) rather than
+// silently over-reporting rows. This loads those files into `s->pos_dels`
+// at scan_open and `iceberg_scan_next_batch` filters matching rows out of
+// every row group it decodes -- so a table with real positional deletes
+// (written by bolt itself, or by any other v2-conformant writer) reads
+// correctly through bolt's own scan, not only through pyiceberg/DuckDB.
+//
+// Equality deletes remain declined: `equality_delete_set_contains` exists
+// but nothing loads one, and no writer in this tree emits one either
+// (table_delete_positions is POSITIONAL-only, deliberately -- see its
+// banner). Declining is still the honest answer for that case.
+
+// Read one delete file's rows into `s->pos_dels`. `df` must have
+// content == kPositionDeletes. Returns false on any I/O/decode failure or
+// on overflowing kMaxPosDels -- a delete file bolt cannot fully load must
+// fail the scan, not load a PARTIAL delete set that would then under-delete.
+bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
+    assert(s != nullptr);
+    assert(df.content == FileContent::kPositionDeletes);
+
+    const uint8_t* body = nullptr; uint64_t blen = 0;
+    if (!read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
+                  s->table->table_rel, df.file_path, s->scratch,
+                  &body, &blen)) {
+        return false;
+    }
+    pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
+    if (meta == nullptr) return false;
+    std::memset(meta, 0, sizeof(*meta));
+    meta->chunks = s->scratch->allocate_array<pq::PqChunk>(pq::kPqMaxColumns * 16u);
+    meta->chunks_cap = pq::kPqMaxColumns * 16u;
+    if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) return false;
+
+    BoltColumn* cols = s->scratch->allocate_array<BoltColumn>(pq::kPqMaxColumns);
+    if (cols == nullptr) return false;
+    for (uint32_t rg = 0; rg < meta->n_row_groups && rg < kLakeMaxRowGroups; ++rg) {
+        std::memset(cols, 0, sizeof(BoltColumn) * pq::kPqMaxColumns);
+        int64_t rows = 0;
+        if (!pq::parquet_read_row_group(body, blen, meta, rg, s->scratch,
+                                        cols, &rows)) {
+            return false;
+        }
+        int32_t path_ci = -1, pos_ci = -1;
+        for (uint32_t c = 0; c < meta->n_columns && c < pq::kPqMaxColumns; ++c) {
+            if (std::strcmp(meta->columns[c].name, "file_path") == 0) path_ci = static_cast<int32_t>(c);
+            else if (std::strcmp(meta->columns[c].name, "pos") == 0) pos_ci = static_cast<int32_t>(c);
+        }
+        // A delete file without both well-known columns is not a delete
+        // file bolt understands -- decline rather than skip it silently.
+        if (path_ci < 0 || pos_ci < 0) return false;
+        const BoltColumn& path_col = cols[path_ci];
+        const BoltColumn& pos_col  = cols[pos_ci];
+        if (pos_col.format != ColumnFormat::Flat ||
+            pos_col.type_size_bytes != sizeof(int64_t)) {
+            return false;
+        }
+        const int64_t* pos_vals = static_cast<const int64_t*>(pos_col.data);
+        for (int64_t r = 0; r < rows; ++r) {
+            if (s->pos_dels.n >= s->pos_dels.cap) return false;  // overflow: fail closed
+            const uint8_t* pdata = nullptr; int32_t plen = 0;
+            path_col.utf8_at(r, &pdata, &plen);
+            if (plen <= 0 || static_cast<uint32_t>(plen) >= kIcebergMaxPath) return false;
+            PositionDeleteEntry& e = s->pos_dels.entries[s->pos_dels.n];
+            std::memcpy(e.file_path, pdata, static_cast<size_t>(plen));
+            e.file_path[plen] = '\0';
+            e.pos = pos_vals[r];
+            ++s->pos_dels.n;
+        }
+    }
+    return true;
+}
+
+// Insertion sort by (file_path, pos) -- position_delete_set_contains'
+// binary-search branch (n > 32) requires this ordering. One-time cost at
+// scan_open, bounded by kMaxPosDels; a real Iceberg delete file for a
+// single seal/tier eviction is tiny (hundreds to low thousands of rows),
+// so O(n^2) here is not the risk kMaxPosDels' size might suggest -- but
+// bound the outer loop defensively anyway.
+void sort_position_deletes(PositionDeleteSet* s) noexcept {
+    assert(s != nullptr);
+    for (uint32_t i = 1; i < s->n; ++i) {
+        PositionDeleteEntry key = s->entries[i];
+        uint32_t j = i;
+        while (j > 0) {
+            const PositionDeleteEntry& prev = s->entries[j - 1];
+            const int c = std::strcmp(prev.file_path, key.file_path);
+            const bool after = (c > 0) || (c == 0 && prev.pos > key.pos);
+            if (!after) break;
+            s->entries[j] = s->entries[j - 1];
+            --j;
+        }
+        s->entries[j] = key;
+    }
+}
+
+// Filter deleted rows out of one just-decoded row group, in place. `cols`
+// holds `*rows` rows for `n_cols` columns, all ColumnFormat::Flat (what
+// parquet_read_row_group always produces -- true for Utf8 too, which
+// decodes as a 16-byte StringView "Flat" array referencing an unmoving
+// spill buffer, per bolt/bolt_column.h's utf8_at banner). `base_row` is
+// this row group's first row's position within the data FILE (Iceberg
+// positions are file-relative, not row-group-relative).
+//
+// Returns false only when filtering was actually NEEDED (>=1 row in this
+// group matched a delete) and at least one column's format/width this
+// function cannot safely compact -- never a silent under-delete. A group
+// with nothing to delete is untouched regardless of column shape, so a
+// table's odd column types cost nothing unless a real delete lands in it.
+bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
+                                     const char* file_path, uint64_t base_row,
+                                     BoltColumn* cols, uint32_t n_cols,
+                                     int64_t* rows, Arena* scratch) noexcept {
+    assert(pos_dels != nullptr && file_path != nullptr);
+    assert(cols != nullptr && rows != nullptr && scratch != nullptr);
+    if (pos_dels->n == 0 || *rows == 0) return true;  // nothing declared, or nothing to check
+
+    auto* sel = scratch->allocate_array<uint32_t>(static_cast<uint64_t>(*rows));
+    if (sel == nullptr) return false;
+    uint32_t kept = 0;
+    for (int64_t r = 0; r < *rows; ++r) {
+        const int64_t file_pos = static_cast<int64_t>(base_row) + r;
+        if (!position_delete_set_contains(pos_dels, file_path, file_pos)) {
+            sel[kept++] = static_cast<uint32_t>(r);
+        }
+    }
+    if (kept == static_cast<uint32_t>(*rows)) return true;  // nothing in THIS group matched
+
+    for (uint32_t c = 0; c < n_cols; ++c) {
+        BoltColumn& col = cols[c];
+        if (col.format != ColumnFormat::Flat || col.type_size_bytes == 0) {
+            std::fprintf(stderr,
+                "[iceberg_scan] REFUSED: a positional delete matched a row in "
+                "'%s', but column %u (format=%d, width=%u) cannot be safely "
+                "compacted -- refusing rather than risk under-deleting.\n",
+                file_path, c, static_cast<int>(col.format),
+                static_cast<unsigned>(col.type_size_bytes));
+            return false;
+        }
+        const size_t tsz = col.type_size_bytes;
+        uint8_t* buf = static_cast<uint8_t*>(col.data);
+        for (uint32_t i = 0; i < kept; ++i) {
+            const uint32_t src = sel[i];
+            if (src != i) std::memmove(buf + i * tsz, buf + static_cast<size_t>(src) * tsz, tsz);
+        }
+        if (col.validity != nullptr && !col.stats.all_valid) {
+            uint8_t* nval = static_cast<uint8_t*>(
+                scratch->allocate_zeroed((static_cast<size_t>(kept) + 7u) / 8u));
+            if (nval == nullptr) return false;
+            uint32_t null_count = 0;
+            for (uint32_t i = 0; i < kept; ++i) {
+                const int64_t srcbit = col.validity_offset + sel[i];
+                const uint8_t bit =
+                    (col.validity[srcbit >> 3] >> (srcbit & 7)) & 1u;
+                nval[i >> 3] |= static_cast<uint8_t>(bit << (i & 7));
+                null_count += (1u - static_cast<uint32_t>(bit));
+            }
+            col.validity = nval;
+            col.validity_offset = 0;
+            col.stats.null_count = null_count;
+            col.stats.all_valid = (null_count == 0);
+        }
+        col.length = static_cast<int64_t>(kept);
+    }
+    *rows = static_cast<int64_t>(kept);
     return true;
 }
 
@@ -498,12 +678,20 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
         for (uint32_t ei = 0; ei < n_entries; ++ei) {
             DataFileRef& e = entries[ei];
             if (e.status == ManifestStatus::kDeleted) continue;
-            // Delete files are not applied yet, and skipping one would
-            // over-report rows. Decline the scan instead. TODO(W5-delete-load)
-            if (mle.content == ManifestContent::kDeleteManifest ||
-                e.content == FileContent::kEqualityDeletes ||
-                e.content == FileContent::kPositionDeletes) {
+            // G2ICE-82/W5-delete-load: POSITION deletes are now loaded and
+            // applied against every row group they cover (see
+            // apply_position_deletes_to_group below) -- bolt's own
+            // table_delete_positions() writes exactly this shape. EQUALITY
+            // deletes still have no loader and no writer anywhere in this
+            // tree, so skipping one would over-report rows: decline the
+            // scan rather than silently under-delete.
+            if (e.content == FileContent::kEqualityDeletes) {
                 return false;
+            }
+            if (mle.content == ManifestContent::kDeleteManifest ||
+                e.content == FileContent::kPositionDeletes) {
+                if (!load_position_delete_file(s, e)) return false;
+                continue;  // a delete file is never itself a live data file
             }
             if (!partition_passes(&e, spec, sch,
                                   s->opts.predicates, s->opts.n_predicates))
@@ -516,6 +704,10 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
         }
         if (s->n_live >= kMaxLiveFiles) break;
     }
+    // position_delete_set_contains binary-searches once n > 32; entries were
+    // appended file-by-file, not (file_path, pos)-ordered, across possibly
+    // several delete files -- sort once, here, rather than per lookup.
+    sort_position_deletes(&s->pos_dels);
     s->cur_file_idx = 0;
     s->cur_file_open = false;
     *out = s;
@@ -559,12 +751,26 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         }
         ++s->cur_row_group;
+        // Positions are counted against the FULL data file (deleted rows
+        // included), so the next group's base must advance by the
+        // pre-filter row count -- capture it before the filter can shrink
+        // `rows`.
+        const int64_t decoded_rows = rows;
+        const DataFileRef& live_file = s->live_files[s->cur_file_idx];
+        if (!apply_position_deletes_to_group(&s->pos_dels, live_file.file_path,
+                                             s->cur_file_row_base, cols,
+                                             s->cur_meta->n_columns, &rows,
+                                             s->scratch)) {
+            return false;
+        }
+        s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         out->num_rows = rows;
         out->num_cols = s->cur_meta->n_columns;
         for (uint32_t c = 0; c < s->cur_meta->n_columns; ++c) {
             const char* phys = s->cur_meta->columns[c].name;
             out->schema.add_field(phys, cols[c].type, true);
         }
+        if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
     }
     // Unreachable: each iteration either returns or retires one live file, so

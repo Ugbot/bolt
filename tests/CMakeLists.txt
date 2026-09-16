@@ -1583,6 +1583,19 @@ set_tests_properties(test_bolt_iceberg_pyiceberg_interop PROPERTIES
     FIXTURES_SETUP pyiceberg_fixture
     ENVIRONMENT BOLT_ICEBERG_INTEROP_DIR=${CMAKE_CURRENT_BINARY_DIR}/pyice_fixture)
 
+# G2ICE-82 — the IN-PROCESS half of the delete-resurrection fix: bolt's own
+# iceberg_scan.cpp now loads + applies the positional delete file
+# table_delete_positions writes, rather than declining the whole scan
+# (TODO(W5-delete-load)). Independent of the pyiceberg oracle above (which
+# proves the file is spec-conformant, not that bolt's own reader honours it).
+add_executable(test_bolt_iceberg_position_delete_read
+    test_bolt_iceberg_position_delete_read.cpp)
+target_link_libraries(test_bolt_iceberg_position_delete_read
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_position_delete_read)
+add_test(NAME test_bolt_iceberg_position_delete_read
+         COMMAND test_bolt_iceberg_position_delete_read)
+
 # W2 — Delta read path.
 add_executable(test_bolt_lakehouse_delta_read test_bolt_lakehouse_delta_read.cpp)
 target_link_libraries(test_bolt_lakehouse_delta_read
