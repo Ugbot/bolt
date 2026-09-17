@@ -680,6 +680,28 @@ target_link_libraries(test_bolt_arrow_export
 bolt_apply_hardening(test_bolt_arrow_export)
 add_test(NAME test_bolt_arrow_export COMMAND test_bolt_arrow_export)
 
+# G2ARROW-8 (Tier 4) -- property/fuzz export against REAL pyarrow. Companion
+# to arrow_probe.cpp's fixed-case Tier 3 in the Gestalt2 superproject, but
+# self-contained in bolt: arrow_fuzz_probe is a MODULE lib exposing
+# bolt::arrow::export_column over randomized batches (type x nullability x
+# length x string-length distribution, explicitly including the 0/12/13/large
+# StringView inline/spill boundary); scripts/arrow_fuzz_check.py is the ORACLE
+# half (validate(full=True) + independent value recomputation), following the
+# exact test_bolt_iceberg_pyiceberg_oracle pattern below: python3 is PATH'd
+# (not find_package'd) so the interpreter with pyarrow installed is used, and
+# SKIP_RETURN_CODE 2 means a missing pyarrow reports SKIPPED, never a silent
+# pass.
+add_library(arrow_fuzz_probe MODULE arrow_fuzz_probe.cpp)
+target_link_libraries(arrow_fuzz_probe PRIVATE bolt::bolt)
+set_target_properties(arrow_fuzz_probe PROPERTIES PREFIX "lib")
+set(BOLT_ORACLE_PYTHON python3)
+add_test(NAME test_bolt_arrow_fuzz_pyarrow
+         COMMAND ${CMAKE_COMMAND} -E env
+                 ARROW_FUZZ_PROBE_LIB=$<TARGET_FILE:arrow_fuzz_probe>
+                 ${BOLT_ORACLE_PYTHON}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/arrow_fuzz_check.py)
+set_tests_properties(test_bolt_arrow_fuzz_pyarrow PROPERTIES SKIP_RETURN_CODE 2)
+
 # G2ARROW-6: export -> import round-trip entirely within bolt (no external
 # Arrow library on either side) -- proves bolt::arrow::export_column and
 # bolt::arrow::import_column are mutually consistent, including nulls,
