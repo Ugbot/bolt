@@ -37,7 +37,7 @@ namespace parquet {
 
 namespace {
 
-constexpr uint32_t kPqMaxPagesPerChunk = 1u << 16;
+constexpr uint32_t kPqReadPageLoopBound = 1u << 16;  // generic bounded-loop cap, distinct from bolt_parquet_pageindex.h's kPqMaxPagesPerChunk (ColumnIndex array-sizing contract)
 constexpr uint32_t kPqMaxDictEntries   = 1u << 24;
 constexpr int64_t  kPqMaxPageBytes     = int64_t{1} << 30;
 constexpr uint32_t kPqMetaChunksFirst  = 4096;
@@ -1823,7 +1823,7 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
     void* zscratch = nullptr;                 // lazily allocated, chunk-scoped
     cx->dict = nullptr;                       // dictionary is chunk-scoped
     cx->dict_n = 0;
-    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {  // bounded
+    for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {  // bounded
         if (rows_done >= rows) break;
         if (p >= end) return false;           // ran out of pages
         TcCursor c{buf + p, buf + end};
@@ -2343,7 +2343,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         cx.dict = nullptr;
         cx.dict_n = 0;
         const int64_t want = b.n_slots + ch->num_values;
-        for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+        for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {
             if (b.n_slots >= want) break;
             if (p >= end) return false;
             TcCursor c{buf + p, buf + end};
@@ -2829,7 +2829,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     uint64_t unc_sum = 0;
     uint64_t p_after = p_start;
     bool reached_end = false;
-    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+    for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {
         if (rows_sum >= max_rows) break;
         if (p >= end) { reached_end = true; break; }
         TcCursor c{buf + p, buf + end};
@@ -2924,7 +2924,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     // ---- Pass 2: decode the same pages (reuses the whole-chunk page path) ----
     p = p_start;
     int64_t rows_done = 0;
-    for (uint32_t page = 0; page < kPqMaxPagesPerChunk; ++page) {
+    for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {
         if (rows_done >= rows_sum) break;
         if (p >= end) break;
         TcCursor c{buf + p, buf + end};
@@ -2953,6 +2953,119 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     if (rows_done != rows_sum) return false;
     *out_rows = rows_sum;
     *next_off = reached_end ? 0 : p_after;
+    return true;
+}
+
+// G2PQ-31: see the doc comment in bolt_parquet_read.h. Prune, coalesce,
+// decode -- each surviving RANGE (not page) becomes one
+// parquet_read_col_chunk_pages call, so a dictionary is re-decoded per run of
+// adjacent surviving pages rather than per page.
+bool parquet_read_col_chunk_pruned_i64(const uint8_t* buf, uint64_t len,
+                                       const PqMeta* meta, uint32_t row_group,
+                                       uint16_t col, int64_t q_lo,
+                                       int64_t q_hi, Arena* arena,
+                                       BoltColumn* out_col,
+                                       PqRowRange* row_ranges,
+                                       uint32_t row_ranges_cap,
+                                       PqPrunedDecodeResult* out) noexcept {
+    assert(meta != nullptr && out_col != nullptr && out != nullptr);
+    assert(row_ranges != nullptr || row_ranges_cap == 0);
+    std::memset(out, 0, sizeof(*out));
+    *out_col = BoltColumn::make_empty();
+    if (buf == nullptr || arena == nullptr) return false;
+    if (q_lo > q_hi) return false;
+    if (row_group >= meta->n_row_groups || col >= meta->n_columns) return false;
+    const PqRowGroup& rg = meta->row_groups[row_group];
+    if (rg.num_rows <= 0) return false;
+    const uint32_t chunk_idx = rg.chunk_off + col;
+    if (chunk_idx >= meta->n_chunks) return false;
+    const PqChunk& ch = meta->chunks[chunk_idx];
+    const PqColumn& pc = meta->columns[col];
+    // v1 scope: flat, required, fixed-width-int columns only (the exact
+    // shape pq_page_range_i64 already trusts) -- see the header doc comment.
+    if (pc.optional != 0 || pc.max_rep != 0) return false;
+    if (pc.physical != PqType::Int64 && pc.physical != PqType::Int32) return false;
+
+    Arena scratch;
+    PqColumnIndex ci{};
+    ci.pages = scratch.allocate_array<PqPageStat>(kPqMaxPagesPerChunk);
+    ci.pages_cap = kPqMaxPagesPerChunk;
+    if (ci.pages == nullptr) return false;
+    if (!pq_read_column_index(buf, len, ch, &ci)) return false;
+    PqOffsetIndex oi{};
+    oi.pages = scratch.allocate_array<PqPageLocation>(kPqMaxPagesPerChunk);
+    oi.pages_cap = kPqMaxPagesPerChunk;
+    if (oi.pages == nullptr) return false;
+    if (!pq_read_offset_index(buf, len, ch, &oi)) return false;
+    if (ci.n_pages != oi.n_pages || ci.n_pages == 0) return false;
+
+    PqPageSet pset{};
+    pq_prune_pages_i64(pc, ci, q_lo, q_hi, &pset);
+    out->pages_total = pset.n_pages;
+    out->pages_decoded = pset.n_survivors;
+    if (row_ranges_cap < (pset.n_pages + 1u) / 2u) return false;  // under-sized
+
+    const uint32_t n_ranges = pq_surviving_row_ranges(
+        oi, pset, rg.num_rows, row_ranges, row_ranges_cap);
+    out->n_ranges = n_ranges;
+    if (n_ranges == 0) return true;   // predicate proves every page excluded
+
+    // pq_surviving_row_ranges reports rowgroup-relative ROW indices; map each
+    // range's first row back to the page byte offset that starts it. Both
+    // arrays are strictly increasing by construction (parse-time validated),
+    // so one linear merge finds every range's page in O(n_pages + n_ranges).
+    uint64_t* range_off = scratch.allocate_array<uint64_t>(n_ranges);
+    if (range_off == nullptr) return false;
+    uint32_t ri = 0, pg = 0;
+    while (ri < n_ranges && pg < oi.n_pages) {
+        if (oi.pages[pg].first_row_index == row_ranges[ri].first_row) {
+            range_off[ri] = static_cast<uint64_t>(oi.pages[pg].offset);
+            ++ri;
+        }
+        ++pg;
+    }
+    if (ri != n_ranges) return false;   // index/range mismatch: bail, never guess
+
+    int64_t total_rows = 0;
+    for (uint32_t i = 0; i < n_ranges; ++i) total_rows += row_ranges[i].row_count;
+    if (total_rows <= 0 || total_rows > rg.num_rows) return false;
+
+    BoltType elem_type = BoltType::Int64;
+    uint16_t elem_bytes = 0;
+    int64_t written = 0;
+    for (uint32_t i = 0; i < n_ranges; ++i) {
+        Arena range_arena;
+        BoltColumn rc{};
+        int64_t got = 0;
+        uint64_t next = 0;
+        if (!parquet_read_col_chunk_pages(buf, len, meta, row_group, col,
+                                          range_off[i],
+                                          row_ranges[i].row_count,
+                                          &range_arena, &rc, &got, &next)) {
+            return false;
+        }
+        // Page-aligned by construction (ranges are built from page row
+        // boundaries), so this must be exact -- never an overshoot to trim.
+        if (got != row_ranges[i].row_count) return false;
+        if (rc.format != ColumnFormat::Flat || rc.type_size_bytes == 0) {
+            return false;
+        }
+        if (i == 0) {
+            elem_type = rc.type;
+            elem_bytes = rc.type_size_bytes;
+            *out_col = BoltColumn::make_flat_alloc(total_rows, elem_type, arena);
+            if (out_col->data == nullptr) return false;
+            out_col->decimal_scale = rc.decimal_scale;
+        } else if (rc.type != elem_type || rc.type_size_bytes != elem_bytes) {
+            return false;   // one chunk decodes one type; disagreement is corrupt
+        }
+        std::memcpy(static_cast<uint8_t*>(out_col->data) +
+                        static_cast<size_t>(written) * elem_bytes,
+                    rc.data, static_cast<size_t>(got) * elem_bytes);
+        written += got;
+    }
+    assert(written == total_rows);
+    out->total_rows = total_rows;
     return true;
 }
 

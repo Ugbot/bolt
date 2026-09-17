@@ -59,6 +59,7 @@
 
 #include "bolt/bolt_types.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
+#include "bolt/ingest/bolt_parquet_pageindex.h"
 
 namespace bolt {
 
@@ -190,6 +191,52 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
                                   int64_t max_rows, Arena* arena,
                                   BoltColumn* out_col, int64_t* out_rows,
                                   uint64_t* next_off) noexcept;
+
+// G2PQ-31: outcome of a pruned decode -- how much of the chunk's page index
+// was consulted and how much of it was actually decoded, so a caller (and a
+// test) can tell "skipped bytes" from "read then discarded".
+struct PqPrunedDecodeResult {
+    int64_t  total_rows;      // rows across every surviving range, concatenated
+    uint32_t pages_total;     // pages in the chunk's ColumnIndex
+    uint32_t pages_decoded;   // pages that survived pruning (the ones read)
+    uint32_t n_ranges;        // entries written into the caller's row_ranges
+};
+
+// G2PQ-31: predicate-pruned single-column decode -- the reusable form of the
+// prune-then-jump loop test_bolt_parquet_page_skip.cpp proved by hand before
+// this existed. Reads the chunk's ColumnIndex + OffsetIndex
+// (bolt_parquet_pageindex.h), prunes pages whose declared [min,max] cannot
+// contain a value in [q_lo, q_hi], then decodes ONLY the coalesced surviving
+// row-ranges via parquet_read_col_chunk_pages -- so a page the index proves
+// excluded is never read, let alone decoded, and (unlike a naive page-by-page
+// walk) a dictionary page is re-decoded once per surviving RUN of pages, not
+// once per surviving page.
+//
+// `out_col` receives every surviving range's rows concatenated in row order:
+// rows the predicate provably cannot match are ABSENT, not merely masked.
+// `row_ranges`/`row_ranges_cap` (caller storage, cap >= kPqMaxPagesPerChunk/2,
+// matching pq_surviving_row_ranges's own contract) optionally receive the
+// same ranges in rowgroup-relative row-index terms, so a caller can
+// reconstruct provenance for OTHER columns of the same row group -- bolt does
+// not itself decide how those are fetched; multi-column predicate pushdown /
+// late materialization is a compute-plane concern (chukonu's
+// PhysicalLateFetch, G2FEAT-364, already does this pattern for a different
+// narrow-row-set case, and is the natural place to drive THIS function from).
+//
+// v1 scope, stated honestly and bounded by pq_page_range_i64's own contract
+// (the range-predicate primitive this composes): physical INT64 or INT32
+// columns only, non-nullable (`optional == 0`), not inside a repeated group
+// (`max_rep == 0`). Any of those, or a chunk with no page index, or a
+// malformed index, makes this return false -- the caller falls back to a
+// full decode, never a silently-wrong pruned one.
+bool parquet_read_col_chunk_pruned_i64(const uint8_t* buf, uint64_t len,
+                                       const PqMeta* meta, uint32_t row_group,
+                                       uint16_t col, int64_t q_lo,
+                                       int64_t q_hi, Arena* arena,
+                                       BoltColumn* out_col,
+                                       PqRowRange* row_ranges,
+                                       uint32_t row_ranges_cap,
+                                       PqPrunedDecodeResult* out) noexcept;
 
 // Decode ONE repeated (LIST / MAP-leaf) column of a row group into a
 // ColumnFormat::Nested BoltColumn of BoltType::List. This is the path a leaf

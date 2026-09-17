@@ -1274,6 +1274,14 @@ target_link_libraries(test_bolt_parquet_page_skip
 bolt_apply_hardening(test_bolt_parquet_page_skip)
 add_test(NAME test_bolt_parquet_page_skip COMMAND test_bolt_parquet_page_skip)
 
+# G2PQ-31: the library-level pruned-decode API (parquet_read_col_chunk_pruned_i64)
+# that promotes the hand-rolled loop above into something a real caller can use.
+add_executable(test_bolt_parquet_page_prune_api test_bolt_parquet_page_prune_api.cpp)
+target_link_libraries(test_bolt_parquet_page_prune_api
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_page_prune_api)
+add_test(NAME test_bolt_parquet_page_prune_api COMMAND test_bolt_parquet_page_prune_api)
+
 # Reading LIST / MAP columns (Dremel record assembly). Fixtures written by
 # pyarrow; the four cases that matter are a present element, a NULL element,
 # an EMPTY list and a NULL list -- the last two differ only in a validity bit.
