@@ -1242,6 +1242,17 @@ target_compile_definitions(test_bolt_parquet_list_legacy PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_list_legacy)
 add_test(NAME test_bolt_parquet_list_legacy COMMAND test_bolt_parquet_list_legacy)
+
+# G2PQ-19: PageHeader.crc verification. Fixtures hand-constructed the same
+# way (scripts/make_page_crc_fixture.py -- pyarrow has no way to opt into
+# writing page CRCs either).
+add_executable(test_bolt_parquet_page_crc test_bolt_parquet_page_crc.cpp)
+target_link_libraries(test_bolt_parquet_page_crc
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_page_crc PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_page_crc)
+add_test(NAME test_bolt_parquet_page_crc COMMAND test_bolt_parquet_page_crc)
 # Emits test_bolt_parquet_list_written_{er,en}.parquet for
 # scripts/parquet_list_interop.py, which reads them with pyarrow. bolt's own
 # reader cannot establish that bolt's LIST WRITER emits correct Dremel

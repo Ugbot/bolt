@@ -24,6 +24,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/ingest/bolt_deflate.h"
 #include "bolt/ingest/bolt_snappy.h"
 #include "bolt/ingest/bolt_zstd_dec.h"
 #include "bolt/ingest/bolt_inflate.h"
@@ -312,6 +313,10 @@ struct PageHdr {
     int32_t rep_len;    // repetition_levels_byte_length
     uint8_t v2;         // 1 => DATA_PAGE_V2 layout
     uint8_t compressed; // v2's is_compressed (thrift default is TRUE)
+    int32_t crc;         // PageHeader field 4, CRC32 of the COMPRESSED page
+                          // bytes (G2PQ-19). Only meaningful when crc_present.
+    uint8_t crc_present;  // 1 => the writer emitted field 4 (optional in the
+                          // thrift schema; most writers omit it)
 };
 
 // DataPageHeader {1 num_values, 2 encoding, 3 def_enc, 4 rep_enc, 5 stats}
@@ -382,13 +387,14 @@ bool parse_dict_hdr(TcCursor* c, PageHdr* h) noexcept {
     return true;
 }
 
-// PageHeader {1 type, 2 unc, 3 cmp, 5 data_page_header,
-//             7 dictionary_page_header, 8 data_page_header_v2} (4 crc skipped).
+// PageHeader {1 type, 2 unc, 3 cmp, 4 crc, 5 data_page_header,
+//             7 dictionary_page_header, 8 data_page_header_v2}
 bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
     assert(c != nullptr && h != nullptr);
     h->type = -1; h->unc = -1; h->cmp = -1;
     h->nvals = -1; h->enc = -1; h->def_enc = -1;
     h->def_len = 0; h->rep_len = 0; h->v2 = 0; h->compressed = 1;
+    h->crc = 0; h->crc_present = 0;
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {
@@ -400,6 +406,10 @@ bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
                     h->unc = static_cast<int32_t>(v); break;
             case 3: if (!tc_zigzag(c, &v)) return false;
                     h->cmp = static_cast<int32_t>(v); break;
+            case 4: if (!tc_zigzag(c, &v)) return false;
+                    h->crc = static_cast<int32_t>(v);
+                    h->crc_present = 1;
+                    break;
             case 5:
                 if (ft != kTcStruct) return false;
                 if (!parse_data_hdr(c, h)) return false;
@@ -418,6 +428,26 @@ bool parse_page_header(TcCursor* c, PageHdr* h) noexcept {
     if (h->type < 0 || h->unc < 0 || h->cmp < 0) return false;
     if (h->unc > kPqMaxPageBytes || h->cmp > kPqMaxPageBytes) return false;
     return true;
+}
+
+// G2PQ-19: PageHeader.crc (field 4) is an OPTIONAL integrity check the spec
+// defines as "calculated on the COMPRESSED page data ... used to indicate
+// the corruption of the page." Most writers omit it (parquet-mr's default
+// writer does not emit it; bolt's own writer doesn't either), so absence is
+// not an error -- but when a writer DID emit it, a mismatch means real data
+// corruption (bit rot, a truncated copy, a bad transfer) and this reader
+// must refuse loudly rather than silently decode -- and possibly
+// misinterpret -- corrupted bytes. `pd`/`pd_len` must be the RAW compressed
+// page bytes as read from the file, checked before any decompression step
+// (decompression of corrupted input is itself unsafe to trust).
+bool verify_page_crc(const PageHdr& h, const uint8_t* pd,
+                     uint64_t pd_len) noexcept {
+    assert(pd != nullptr || pd_len == 0);
+    if (h.crc_present == 0) return true;   // nothing to check, not an error
+    const uint32_t want = static_cast<uint32_t>(h.crc);
+    const uint32_t got = crc32_ieee(pd, pd_len, 0);
+    assert(pd_len <= kPqMaxPageBytes);     // parse_page_header already bounds this
+    return got == want;
 }
 
 // ---- column decode context --------------------------------------------------
@@ -1728,6 +1758,7 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
         if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
         const uint8_t* pd = buf + pay;
         uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+        if (!verify_page_crc(h, pd, pd_len)) return false;   // G2PQ-19
         if (h.type == kPageDataV2) {
             if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena, &zscratch,
                                   &pd, &pd_len)) {
@@ -2240,6 +2271,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
             if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
             const uint8_t* pd = buf + pay;
             uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+            if (!verify_page_crc(h, pd, pd_len)) return false;   // G2PQ-19
             if (h.type == kPageDataV2) {
                 if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena,
                                       &zscratch, &pd, &pd_len)) {
@@ -2760,6 +2792,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     if (has_dict) {
         const uint8_t* dd = buf + dict_pay;
         uint64_t dd_len = static_cast<uint64_t>(dict_hdr.cmp);
+        if (!verify_page_crc(dict_hdr, dd, dd_len)) return false;   // G2PQ-19
         if (!decompress_page(ch->codec, dd, dd_len, dict_hdr.unc, arena,
                              &zscratch, &dd, &dd_len)) {
             return false;
@@ -2782,6 +2815,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
         if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
         const uint8_t* pd = buf + pay;
         uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+        if (!verify_page_crc(h, pd, pd_len)) return false;   // G2PQ-19
         if (h.type == kPageData) {
             if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
                                  &zscratch, &pd, &pd_len)) {
