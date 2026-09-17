@@ -1328,6 +1328,19 @@ target_compile_definitions(test_bolt_parquet_enum_unknown PRIVATE
 bolt_apply_hardening(test_bolt_parquet_enum_unknown)
 add_test(NAME test_bolt_parquet_enum_unknown COMMAND test_bolt_parquet_enum_unknown)
 
+# FLBA beyond DECIMAL (G2PQ-16): UUID, FLOAT16, the deprecated
+# ConvertedType.INTERVAL, and raw/unannotated fixed-width binary. Fixtures
+# written by DuckDB (UUID, INTERVAL -- pyarrow cannot write either) and
+# pyarrow (FLOAT16, unannotated FixedSizeBinary) via
+# scripts/make_flba_logical_fixtures.py.
+add_executable(test_bolt_parquet_flba_logical test_bolt_parquet_flba_logical.cpp)
+target_link_libraries(test_bolt_parquet_flba_logical
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_flba_logical PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_flba_logical)
+add_test(NAME test_bolt_parquet_flba_logical COMMAND test_bolt_parquet_flba_logical)
+
 # Self-contained LZ4 block codec. bolt could not OPEN an LZ4_RAW parquet file
 # on a default build (bolt_lz4.h is behind find_package(lz4)), so this closes
 # a read gap as well as a write one. Checked against a naive reference decoder

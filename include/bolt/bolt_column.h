@@ -213,7 +213,13 @@ struct BoltColumn {
                                   // for an ordinary column, so a zeroed
                                   // BoltColumn keeps its previous meaning.
                                   // Occupies a byte that was already padding.
-    uint8_t      _scale_pad[2];   // keep stats alignment explicit
+    // FixedSizeBinary: true byte width (1..16; e.g. 12 for a parquet
+    // INTERVAL, <16 for a narrow raw FLBA). 0 for every other type -- the
+    // row still occupies a full type_size_bytes(16) slot, trailing bytes
+    // zeroed, so this is metadata for a caller that wants to strip padding,
+    // not something decode correctness depends on (G2PQ-16).
+    uint8_t      fixed_width;
+    uint8_t      _scale_pad1;     // keep stats alignment explicit
 
     // --- Inline stats (always present) ---
     ColumnStats stats;

@@ -153,11 +153,22 @@ TEST(BoltParquetTypes, FlbaDecimalWidthChoosesRepresentation) {
               bolt::BoltType::Decimal128);
 }
 
-TEST(BoltParquetTypes, NonDecimalFlbaRejected) {
+// Was NonDecimalFlbaRejected / "documented reject" -- G2PQ-16 turned that
+// documented gap into documented support: UUID (FIXED[16]), FLOAT16
+// (FIXED[2]), the deprecated ConvertedType.INTERVAL (FIXED[12]), and any
+// other raw/unannotated FLBA up to 16 bytes all map now (see
+// test_bolt_parquet_flba_logical.cpp for the byte-exact fixture-backed
+// cases). This one pins the plain-unannotated-FLBA(16) shape.
+TEST(BoltParquetTypes, NonDecimalFlbaAcceptedAsFixedSizeBinary) {
     PqColumn c = mk(PqType::FixedLenByteArray, PqLogical::None, 0, 0, 1, 0, 0, 16);
     BoltType t = bolt::BoltType::NA;
     uint8_t s = 0;
-    EXPECT_FALSE(parquet_map_type(&c, &t, &s));   // documented reject
+    ASSERT_TRUE(parquet_map_type(&c, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::FixedSizeBinary);
+    // Over the one-storage-slot ceiling (mirrors DECIMAL's existing cap) is
+    // still a documented, loud reject -- never a silent truncation.
+    PqColumn wide = mk(PqType::FixedLenByteArray, PqLogical::None, 0, 0, 1, 0, 0, 17);
+    EXPECT_FALSE(parquet_map_type(&wide, &t, &s));
 }
 
 // End-to-end: writer emits INT64 + ConvertedType TIMESTAMP_MICROS; the reader

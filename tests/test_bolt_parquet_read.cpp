@@ -255,10 +255,18 @@ TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
     c.physical = PqType::Int96;
     ASSERT_TRUE(parquet_map_type(&c, &t, &s));
     EXPECT_EQ(t, bolt::BoltType::Timestamp);
-    c.physical = PqType::FixedLenByteArray;        // FLBA without DECIMAL
+    // Non-DECIMAL FLBA used to be OUTSIDE the supported subset and was
+    // asserted rejected here too. G2PQ-16 added UUID/FLOAT16/INTERVAL/raw
+    // FLBA support (<=16 bytes -> BoltType::FixedSizeBinary unless a
+    // logical annotation picks a narrower native type); see
+    // test_bolt_parquet_flba_logical.cpp for the full positive/negative
+    // matrix against real DuckDB/pyarrow fixtures. A plain unannotated
+    // FLBA(16) is exactly the case this line now pins as ACCEPTED.
+    c.physical = PqType::FixedLenByteArray;
     c.converted = -1;
     c.type_length = 16;
-    EXPECT_FALSE(parquet_map_type(&c, &t, &s));
+    ASSERT_TRUE(parquet_map_type(&c, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::FixedSizeBinary);
     c.converted = 5;                               // DECIMAL p>18 -> Dec128
     c.precision = 38;
     c.scale = 4;

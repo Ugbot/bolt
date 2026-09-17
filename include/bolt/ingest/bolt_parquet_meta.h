@@ -197,6 +197,12 @@ enum class PqLogical : int32_t {
     // VARIANT parsing (parquet-format 2.11's binary variant encoding) is
     // deliberately out of scope; see G2PQ-17's tracker note.
     Enum = 10, Unknown = 11,
+    // G2PQ-16: the remaining FIXED_LEN_BYTE_ARRAY-backed annotations.
+    Uuid = 12,       // LogicalType.UUID, FIXED[16], no ConvertedType twin
+    Float16 = 13,    // LogicalType.FLOAT16, FIXED[2], no ConvertedType twin
+    Interval = 14,   // DEPRECATED ConvertedType.INTERVAL (=21), FIXED[12];
+                      // no LogicalType union member exists for it (thrift
+                      // reserves union id 9 for it and never fills it in).
 };
 
 // parquet::CompressionCodec.

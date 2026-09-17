@@ -68,7 +68,13 @@ enum class BoltLogical : uint8_t {
     None    = 0,
     Json    = 1,   // Utf8 storage; parquet JSON / Arrow arrow.json
     Bson    = 2,   // Binary storage; parquet BSON
-    Uuid    = 3,   // FixedSizeBinary(16) storage
+    // NOT used by the parquet reader (G2PQ-16): a parquet UUID surfaces as
+    // the dedicated BoltType::UUID (kTypeSize 16, same lane Arrow "w:16"
+    // already imports to), which is self-describing -- tagging it with a
+    // second, redundant annotation on top would be two ways to say one
+    // thing. Left declared (unused elsewhere either) rather than renumbered,
+    // since removing a public enumerator is a needless break for zero gain.
+    Uuid    = 3,
     // parquet's VARIANT logical type / Spark's variant binary encoding:
     // a ColumnFormat::Nested STRUCT of {metadata: Binary, value: Binary}.
     //
@@ -86,6 +92,13 @@ enum class BoltLogical : uint8_t {
     // storage; every value is null. Spec: "the physical type was guessed
     // from all-null values" -- there is no compatible ConvertedType.
     Unknown = 6,
+    // G2PQ-16: parquet's deprecated ConvertedType.INTERVAL (=21):
+    // FixedSizeBinary(12) storage, three little-endian uint32 fields
+    // (months, days, millis). No dedicated BoltType exists (unlike UUID)
+    // because there is nothing else in bolt that shape means -- opaque
+    // bytes plus this annotation is the whole representation. Sort order
+    // is spec-UNDEFINED; never used for pruning.
+    Interval = 7,
 };
 
 inline constexpr uint8_t kTypeSize[64] = {
@@ -101,7 +114,13 @@ inline constexpr uint8_t kTypeSize[64] = {
     0, 0, 0,                 // 27-29 reserved
     0, 0, 0,                 // List, Struct, Map
     0, 0, 0, 0, 0, 0, 0,   // 33-39 reserved
-    0, 0, 16, 32,           // Dictionary, FixedSizeBinary, Decimal128, Decimal256
+    // FixedSizeBinary was 0 (the "variable width" sentinel) until G2PQ-16:
+    // nothing in the tree constructed one (grep-confirmed), so it had never
+    // actually been usable as the fixed-width type its name promises. Given
+    // a real use (parquet INTERVAL / raw FLBA, <=16 bytes, G2PQ-16), it takes
+    // the same 16-byte slot Decimal128/UUID already use -- true width for a
+    // narrower value lives in BoltColumn::fixed_width, trailing bytes zeroed.
+    0, 16, 16, 32,          // Dictionary, FixedSizeBinary, Decimal128, Decimal256
     8,                       // Decimal64 (int64 mantissa; scale on the column)
     0, 0, 0, 0, 0,          // 45-49 reserved
     16, 4, 0, 0,             // UUID, IPv4, Embedding, Symbol

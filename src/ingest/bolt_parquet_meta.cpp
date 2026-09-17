@@ -114,6 +114,7 @@ constexpr int32_t kCtDecimal = 5, kCtDate = 6, kCtTimeMillis = 7,
                   kCtUint8 = 11, kCtUint16 = 12, kCtUint32 = 13,
                   kCtUint64 = 14, kCtInt8 = 15, kCtInt16 = 16,
                   kCtInt32 = 17, kCtInt64 = 18;
+constexpr int32_t kCtInterval = 21;  // deprecated, FLBA(12) months/days/millis
 
 // TimeUnit union (parquet.thrift): field id 1 MILLIS / 2 MICROS / 3 NANOS,
 // each an empty struct. Returns 0 (none) when unrecognized/absent.
@@ -177,7 +178,8 @@ void parse_decimal_type(TcCursor* c, int32_t* scale, int32_t* prec) noexcept {
 }
 
 // LogicalType union (SchemaElement field 10). The set field id selects the
-// member: 5 DECIMAL, 6 DATE, 7 TIME, 8 TIMESTAMP, 10 INTEGER, 1 STRING.
+// member: 5 DECIMAL, 6 DATE, 7 TIME, 8 TIMESTAMP, 10 INTEGER, 1 STRING,
+// 12 JSON, 13 BSON, 14 UUID, 15 FLOAT16, 16 VARIANT (G2PQ-16).
 void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
     assert(c != nullptr && col != nullptr);
     int16_t fid = 0;
@@ -207,10 +209,16 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
             case 4: col->logical = static_cast<int32_t>(PqLogical::Enum);
                     (void)tc_skip(c, ft, 0); break;
             // parquet.thrift LogicalType union ids: 12 JSON, 13 BSON,
-            // 14 UUID, 16 VARIANT. All carry an empty struct.
+            // 14 UUID, 15 FLOAT16, 16 VARIANT. All carry an empty struct
+            // (UUIDType/Float16Type have no fields -- the union id alone
+            // is the whole annotation).
             case 12: col->logical = static_cast<int32_t>(PqLogical::Json);
                      (void)tc_skip(c, ft, 0); break;
             case 13: col->logical = static_cast<int32_t>(PqLogical::Bson);
+                     (void)tc_skip(c, ft, 0); break;
+            case 14: col->logical = static_cast<int32_t>(PqLogical::Uuid);
+                     (void)tc_skip(c, ft, 0); break;
+            case 15: col->logical = static_cast<int32_t>(PqLogical::Float16);
                      (void)tc_skip(c, ft, 0); break;
             case 16: col->logical = static_cast<int32_t>(PqLogical::Variant);
                      (void)tc_skip(c, ft, 0); break;
@@ -248,6 +256,7 @@ void derive_logical_from_converted(PqColumn* col) noexcept {
         case kCtInt64:  col->logical = static_cast<int32_t>(PqLogical::Int); col->int_bits = 64; col->int_signed = 1; break;
         case kCtDecimal: col->logical = static_cast<int32_t>(PqLogical::Decimal); break;
         case kCtDate:    col->logical = static_cast<int32_t>(PqLogical::Date); break;
+        case kCtInterval: col->logical = static_cast<int32_t>(PqLogical::Interval); break;
         default: break;
     }
 }

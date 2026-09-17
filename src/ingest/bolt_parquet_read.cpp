@@ -51,6 +51,16 @@ constexpr int32_t kEncPlain = 0, kEncPlainDict = 2, kEncRle = 3,
                   kEncDeltaByteArray = 7;
 constexpr int32_t kConvDecimal = 5, kConvDate = 6;
 
+// True iff an FLBA column is DECIMAL-annotated (either encoding) -- the only
+// FLBA shape whose bytes get NUMERIC (big-endian two's-complement) decode.
+// Every other FLBA shape (UUID/FLOAT16/INTERVAL/raw, G2PQ-16) is an OPAQUE
+// byte copy, decoded by plain_flba_raw instead of plain_flba.
+inline bool flba_is_decimal(const PqColumn* pc) noexcept {
+    assert(pc != nullptr);
+    return (pc->converted == kConvDecimal) ||
+           (pc->logical == static_cast<int32_t>(PqLogical::Decimal));
+}
+
 inline void bit_clear(uint8_t* bm, int64_t i) noexcept {
     assert(bm != nullptr);
     assert(i >= 0);
@@ -910,6 +920,36 @@ bool plain_flba(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     return src == nvalid;
 }
 
+// FLBA UUID/FLOAT16/INTERVAL/raw (G2PQ-16) -> opaque bytes, copied verbatim
+// into a `cx->elem`-byte slot with trailing bytes zeroed when the physical
+// width is narrower than the slot (INTERVAL 12 < 16, a raw FLBA < 16 bytes).
+// UUID and FLOAT16 always have fw == cx->elem (16 / 2) by construction of
+// parquet_map_type's width check, so the pad is a no-op for them. Unlike
+// plain_flba this is NOT a numeric decode -- no byte-order change, no
+// two's-complement widen; the file's bytes are the value.
+bool plain_flba_raw(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                    const uint32_t* def, int64_t row0, uint32_t nrows,
+                    uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem > 0u && cx->elem <= 16u);
+    const uint32_t fw = static_cast<uint32_t>(cx->pc->type_length);
+    if (fw == 0u || fw > cx->elem) return false;
+    if (static_cast<uint64_t>(nvalid) * fw > vlen) return false;
+    uint64_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {
+        if (def != nullptr && def[i] != cx->pc->max_def) {
+            bit_clear(cx->validity, row0 + i);
+            continue;
+        }
+        uint8_t* dst =
+            cx->out + (static_cast<uint64_t>(row0) + i) * cx->elem;
+        std::memcpy(dst, v + src * fw, fw);
+        if (fw < cx->elem) std::memset(dst + fw, 0, cx->elem - fw);
+        ++src;
+    }
+    return src == nvalid;
+}
+
 // BYTE_ARRAY (u32 LE length prefix per value) -> Utf8 StringViews.
 //
 // MEASURED CEILING, for whoever takes this next. Stubbing sv_copy_bulk to a
@@ -1141,7 +1181,9 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
             ok = plain_f32_widen(&tmp, v, vlen, nullptr, 0, n, n);
             break;
         case PqType::FixedLenByteArray:
-            ok = plain_flba(&tmp, v, vlen, nullptr, 0, n, n);
+            ok = flba_is_decimal(cx->pc)
+                     ? plain_flba(&tmp, v, vlen, nullptr, 0, n, n)
+                     : plain_flba_raw(&tmp, v, vlen, nullptr, 0, n, n);
             break;
         case PqType::ByteArray:
             ok = plain_utf8(&tmp, v, vlen, nullptr, 0, n, n);
@@ -1430,7 +1472,9 @@ bool decode_plain_values(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::Boolean:
             return plain_bool(cx, v, vlen, def, row0, nvals, nvalid);
         case PqType::FixedLenByteArray:
-            return plain_flba(cx, v, vlen, def, row0, nvals, nvalid);
+            return flba_is_decimal(cx->pc)
+                       ? plain_flba(cx, v, vlen, def, row0, nvals, nvalid)
+                       : plain_flba_raw(cx, v, vlen, def, row0, nvals, nvalid);
         case PqType::ByteArray:
             return plain_utf8(cx, v, vlen, def, row0, nvals, nvalid);
         default:
@@ -1990,6 +2034,13 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
         col->type_size_bytes = static_cast<uint16_t>(bolt::type_size(t));
     }
     col->decimal_scale = scale;
+    // G2PQ-16: FixedSizeBinary always allocates a full 16-byte slot
+    // (kTypeSize) -- record the true parquet width for a caller that wants
+    // to strip the zero padding (INTERVAL is always 12 of 16; a raw FLBA
+    // may be narrower still).
+    if (t == BoltType::FixedSizeBinary) {
+        col->fixed_width = static_cast<uint8_t>(pc->type_length);
+    }
     bool needs_validity = false;
     uint64_t ovf = 0;
     for (uint32_t g = g0; g < g1; ++g) {       // bounded: n_row_groups
@@ -2376,14 +2427,19 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
 BoltLogical parquet_map_logical(const PqColumn* col) noexcept {
     if (col == nullptr) return BoltLogical::None;
     switch (static_cast<PqLogical>(col->logical)) {
-        case PqLogical::Json:    return BoltLogical::Json;
-        case PqLogical::Bson:    return BoltLogical::Bson;
-        case PqLogical::Variant: return BoltLogical::Variant;
+        case PqLogical::Json:     return BoltLogical::Json;
+        case PqLogical::Bson:     return BoltLogical::Bson;
+        case PqLogical::Variant:  return BoltLogical::Variant;
         // G2PQ-17: ENUM / UNKNOWN pass through as annotations over the
         // existing Utf8/whatever-physical storage -- no new BoltType.
-        case PqLogical::Enum:    return BoltLogical::Enum;
-        case PqLogical::Unknown: return BoltLogical::Unknown;
-        default:                 return BoltLogical::None;
+        case PqLogical::Enum:     return BoltLogical::Enum;
+        case PqLogical::Unknown:  return BoltLogical::Unknown;
+        // G2PQ-16: UUID and FLOAT16 are NOT tagged here -- they surface as
+        // the dedicated BoltType::UUID / BoltType::Float16 (self-describing;
+        // see the BoltLogical::Uuid comment in bolt_types.h). INTERVAL has
+        // no native BoltType, so it IS the annotation over FixedSizeBinary.
+        case PqLogical::Interval: return BoltLogical::Interval;
+        default:                  return BoltLogical::None;
     }
 }
 
@@ -2496,15 +2552,40 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             *out_type = BoltType::Utf8;
             return true;
         case PqType::FixedLenByteArray:
-            if (!is_dec) return false;         // non-DECIMAL FLBA: reject (v1)
-            if (col->type_length <= 0 || col->type_length > 16) return false;
-            if (col->scale < 0 || col->scale > 38) return false;
-            if (col->precision <= 18) {                 // W-DEC representation
-                *out_type = BoltType::Decimal64;
-            } else {
-                *out_type = BoltType::Decimal128;
+            if (is_dec) {
+                if (col->type_length <= 0 || col->type_length > 16) return false;
+                if (col->scale < 0 || col->scale > 38) return false;
+                if (col->precision <= 18) {                 // W-DEC representation
+                    *out_type = BoltType::Decimal64;
+                } else {
+                    *out_type = BoltType::Decimal128;
+                }
+                *out_scale = static_cast<uint8_t>(col->scale);
+                return true;
             }
-            *out_scale = static_cast<uint8_t>(col->scale);
+            // G2PQ-16: the remaining FLBA shapes, none of them numeric --
+            // decoded by plain_flba_raw as opaque bytes, not by plain_flba.
+            if (col->logical == static_cast<int32_t>(PqLogical::Uuid)) {
+                if (col->type_length != 16) return false;   // spec: FIXED[16]
+                *out_type = BoltType::UUID;
+                return true;
+            }
+            if (col->logical == static_cast<int32_t>(PqLogical::Float16)) {
+                if (col->type_length != 2) return false;    // spec: FIXED[2]
+                *out_type = BoltType::Float16;
+                return true;
+            }
+            // DEPRECATED ConvertedType.INTERVAL (always FIXED[12]) and any
+            // raw/unannotated FLBA share one representation: opaque bytes in
+            // a FixedSizeBinary slot. v1 ceiling mirrors the DECIMAL case
+            // above -- widths over 16 bytes don't fit the one storage slot
+            // bolt's fixed-width lanes offer and are refused, not misread.
+            if (col->logical == static_cast<int32_t>(PqLogical::Interval) &&
+                col->type_length != 12) {
+                return false;                                // malformed writer
+            }
+            if (col->type_length <= 0 || col->type_length > 16) return false;
+            *out_type = BoltType::FixedSizeBinary;
             return true;
         default:
             return false;
@@ -2798,6 +2879,9 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     *out_col = BoltColumn::make_flat_alloc(rows_sum, t, arena);
     if (out_col->data == nullptr) return false;
     out_col->decimal_scale = scale;
+    if (t == BoltType::FixedSizeBinary) {   // G2PQ-16, see init_col_ctx_any
+        out_col->fixed_width = static_cast<uint8_t>(pc->type_length);
+    }
     ColCtx cx;
     std::memset(&cx, 0, sizeof(cx));
     cx.pc = pc;

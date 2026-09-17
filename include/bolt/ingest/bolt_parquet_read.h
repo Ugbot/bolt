@@ -30,11 +30,18 @@
 //                FIXED_LEN_BYTE_ARRAY DECIMAL(p<=18) -> Decimal64 (W-DEC:
 //                  big-endian two's-complement mantissa -> int64,
 //                  decimal_scale stamped on the column); p>18 -> Decimal128.
+//                FIXED_LEN_BYTE_ARRAY UUID (FIXED[16]) -> BoltType::UUID;
+//                  FLOAT16 (FIXED[2]) -> BoltType::Float16; deprecated
+//                  ConvertedType.INTERVAL (FIXED[12]) and any raw/
+//                  unannotated FLBA (<=16 bytes) -> BoltType::FixedSizeBinary
+//                  (true width in BoltColumn::fixed_width; the file's bytes
+//                  copied verbatim, zero-padded to the 16-byte slot — no
+//                  numeric interpretation, unlike DECIMAL — G2PQ-16).
 //     LogicalType (SchemaElement field 10) is honored over ConvertedType,
 //     so nanosecond timestamps/times and un/signed IntType round-trip even
 //     when the writer omitted the legacy ConvertedType.
-//     Still unsupported (parquet_map_type returns false): non-DECIMAL FLBA,
-//     FLBA wider than 16 bytes, and nested LIST/MAP/STRUCT.
+//     Still unsupported (parquet_map_type returns false): FLBA wider than
+//     16 bytes (any annotation), and nested LIST/MAP/STRUCT.
 //   - OPTIONAL columns: validity bitmap built from definition levels.
 //     All-valid shortcut: when every chunk of a column reports
 //     statistics null_count == 0 the bitmap is not allocated at all.
@@ -65,18 +72,21 @@ namespace parquet {
 // Map one parquet leaf column to its Bolt materialization (FLOAT widens to
 // Float64, BOOLEAN lands as Int64 0/1, TIMESTAMP/INT96 -> Timestamp[us],
 // TIME -> Duration[us], INT32-DECIMAL -> Decimal64, un/signed IntType ->
-// the matching Int*/UInt* width — G2FEAT-46). Returns false only for the
-// still-unsupported shapes: non-DECIMAL FLBA, FLBA wider than 16 bytes, and
-// nested types. `*out_scale` carries the DECIMAL scale for Decimal columns.
+// the matching Int*/UInt* width, FLBA UUID/FLOAT16/INTERVAL/raw -> UUID /
+// Float16 / FixedSizeBinary — G2FEAT-46, G2PQ-16). Returns false only for
+// the still-unsupported shapes: FLBA wider than 16 bytes, and nested types.
+// `*out_scale` carries the DECIMAL scale for Decimal columns.
 bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                       uint8_t* out_scale) noexcept;
 
 // The logical refinement a leaf carries, independent of its storage type:
-// parquet JSON / BSON / UUID / VARIANT -> BoltLogical. Decoded columns get
-// this set on BoltColumn::logical, so a JSON column arrives as an ordinary
-// Utf8 column that also says it is JSON -- which is Arrow's own model
-// (`extension<arrow.json>` over string storage) and means a consumer that
-// does not care is unaffected.
+// parquet JSON / BSON / VARIANT / (deprecated) INTERVAL -> BoltLogical.
+// UUID and FLOAT16 are NOT included -- they already surface as the
+// dedicated BoltType::UUID / BoltType::Float16, which is self-describing
+// (G2PQ-16). Decoded columns get this set on BoltColumn::logical, so a
+// JSON column arrives as an ordinary Utf8 column that also says it is
+// JSON -- which is Arrow's own model (`extension<arrow.json>` over string
+// storage) and means a consumer that does not care is unaffected.
 BoltLogical parquet_map_logical(const PqColumn* col) noexcept;
 
 // Derive a COMPLETE BoltSchema straight from a parsed footer. The parquet
