@@ -162,6 +162,23 @@ struct ParquetWriteColumn {
     std::int32_t field_id;
 };
 
+// One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
+// parquet.thrift field 4). The writer VERIFIES this claim against each row
+// group's OWN data before trusting it -- see ParquetWriteOpts::sorting_columns
+// and parquet_write_row_group. `column_idx` indexes
+// ParquetWriteOpts::columns, same as ParquetWriteColumn's position.
+struct ParquetSortingColumn {
+    std::uint32_t column_idx;
+    bool          descending;    // false = ascending (the common case)
+    bool          nulls_first;   // false = nulls last (parquet's own default)
+};
+
+// Bounded cap on ParquetWriteOpts::sorting_columns, following
+// ParquetWriteColumn's fixed-array convention -- no std::vector in the
+// option struct. parquet.thrift itself puts no limit on the list, but PODs
+// at the API edge is the rule this writer otherwise holds to everywhere else.
+inline constexpr std::uint32_t kPwMaxSortingColumns = 16;
+
 // Writer options. POD; copied into the writer at open.
 struct ParquetWriteOpts {
     // G2FEAT-47: kMaxFixedColumns (256), decoupled from the raised in-memory
@@ -276,6 +293,17 @@ struct ParquetWriteOpts {
     // Dictionary pages are unaffected -- there is no v2 dictionary page.
     bool               data_page_v2;
     std::uint8_t       _pad4[7];
+
+    // ---- sorting metadata (B6) -------------------------------------------
+    // Caller-declared claim that these columns are sorted. VERIFIED per row
+    // group before being trusted (see parquet_write_row_group): a claim that
+    // doesn't hold against a given row group's actual data fails that
+    // parquet_write_row_group call rather than being silently dropped and
+    // written on -- the same "quietly writing the wrong thing would hide a
+    // bug" policy PqWriteEncoding validation applies above. n_sorting_columns
+    // == 0 (the zero-init default) emits no RowGroup.sorting_columns at all.
+    ParquetSortingColumn sorting_columns[kPwMaxSortingColumns];
+    std::uint32_t         n_sorting_columns;
 };
 
 // Defaults referenced by the option comments above.

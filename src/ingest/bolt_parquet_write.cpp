@@ -29,8 +29,12 @@
 //                          3 repetition, 4 name, 5 num_children=0,
 //                          6 converted_type, 7 scale, 8 precision}
 //   RowGroup              {1 columns list<ColumnChunk>, 2 total_byte_size,
-//                          3 num_rows, 5 file_offset, 6 total_compressed_size,
+//                          3 num_rows, 4 sorting_columns list<SortingColumn>
+//                          (B6, verified -- see ParquetWriteOpts::sorting_
+//                          columns), 5 file_offset, 6 total_compressed_size,
 //                          7 ordinal}
+//   SortingColumn          {1 column_idx i32, 2 descending bool,
+//                           3 nulls_first bool}
 //   ColumnChunk           {3 meta_data}
 //   ColumnMetaData        {1 type, 2 encodings list<i32>, 3 path_in_schema
 //                          list<binary>, 4 codec, 5 num_values,
@@ -47,6 +51,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <type_traits>
 #include <vector>
 
 #include "bolt/bolt_arena.h"
@@ -366,6 +371,10 @@ struct RowGroupRec {
     std::int64_t  file_offset;
     std::int64_t  total_compressed_size;
     std::int16_t  ordinal;
+    // RowGroup field 4 (B6): sort claims that VERIFIED true against this row
+    // group's own data -- see write_one_row_group. n==0 emits no field 4.
+    ParquetSortingColumn sorting_columns[kPwMaxSortingColumns];
+    std::uint32_t         n_sorting_columns;
 };
 
 }  // namespace
@@ -2124,6 +2133,22 @@ void write_row_group(TcOut* o, const ParquetWriter* w,
     tc_put_zigzag(o, rg.total_byte_size);
     tc_put_field(o, 3, kFI64);
     tc_put_zigzag(o, rg.num_rows);
+    // 4 sorting_columns (B6): list<SortingColumn>, present only for claims
+    // write_one_row_group already verified true against this row group.
+    if (rg.n_sorting_columns > 0) {
+        tc_put_field(o, 4, kFList);
+        tc_put_list_hdr(o, kFStruct, rg.n_sorting_columns);
+        for (std::uint32_t i = 0; i < rg.n_sorting_columns; ++i) {
+            const ParquetSortingColumn& sc = rg.sorting_columns[i];
+            tc_put_field(o, 1, kFI32);
+            tc_put_zigzag(o, static_cast<std::int64_t>(sc.column_idx));
+            // compact bools carry their value in the field type -- no
+            // separate value byte, same as is_compressed/is_sorted above.
+            tc_put_field(o, 2, sc.descending ? kFTrue : kFFalse);
+            tc_put_field(o, 3, sc.nulls_first ? kFTrue : kFFalse);
+            tc_put_stop(o);
+        }
+    }
     // 5/6/7 (G2PQ-19/B8): file_offset, total_compressed_size, ordinal --
     // all optional in the spec, all unconditionally populated here (unlike
     // the sparse fields on ColumnChunk above, there's no "nothing to say"
@@ -2193,6 +2218,37 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     tc_put_stop(&o);
 }
 
+// B6: every declared sorting_columns entry must name a real column whose
+// type verify_sort_claim actually knows how to check, or open refuses the
+// whole options struct -- the same "reject the caller's bug at open" policy
+// PqWriteEncoding validation applies just above (as opposed to catching it
+// only when the caller finally appends a row group). Duplicate column_idx
+// entries are legal (parquet.thrift allows more than one SortingColumn), so
+// nothing here requires distinct keys.
+bool sorting_columns_valid(const ParquetWriteOpts* opts) noexcept {
+    assert(opts != nullptr);
+    if (opts->n_sorting_columns > kPwMaxSortingColumns) return false;
+    for (std::uint32_t i = 0; i < opts->n_sorting_columns; ++i) {
+        const ParquetSortingColumn& sc = opts->sorting_columns[i];
+        if (sc.column_idx >= opts->n_columns) return false;
+        switch (opts->columns[sc.column_idx].type) {
+            case BoltType::Int32:
+            case BoltType::Int64:
+            case BoltType::Float32:
+            case BoltType::Float64:
+            case BoltType::Bool:
+            case BoltType::Date32:
+            case BoltType::Timestamp:
+            case BoltType::Utf8:
+            case BoltType::Binary:
+                break;
+            default:
+                return false;   // Decimal128/List/...: no verifier for it yet
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 // ===== public API =========================================================
@@ -2240,6 +2296,9 @@ ParquetWriter* parquet_write_open(const char* path,
             }
         }
     }
+    // B6: refuse an unverifiable sort claim up-front (bad column_idx, or a
+    // type with no sortedness verifier) rather than at the first row group.
+    if (!sorting_columns_valid(opts)) return nullptr;
     // Bounded, and rejected rather than truncated: a truncated path would name
     // a DIFFERENT file for the failure-cleanup unlink.
     const std::size_t path_len = std::strlen(path);
@@ -2312,6 +2371,8 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
             }
         }
     }
+    // B6: same up-front refusal as parquet_write_open.
+    if (!sorting_columns_valid(opts)) return nullptr;
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
     w->opts = *opts;
@@ -2513,13 +2574,178 @@ bool place_chunk(ParquetWriter* w, ChunkOut* out) noexcept {
     return true;
 }
 
+// ===== B6: sort-claim verification =========================================
+//
+// "Only legal to write when actually sorted" (the spec's own words on
+// sorting_columns) -- these are the bounded passes that make a claim legal.
+// A pass runs over exactly the rows this row group is about to write
+// ([start, start+rows) of the ORIGINAL unsliced column, same window
+// write_one_row_group hands to slice_column below) and returns false the
+// moment the claim is disproved. Ties are fine (a sorted column may repeat
+// a value); nulls are fine too, but only in the declared zone -- a prefix
+// when nulls_first, a suffix otherwise, per the spec's null-placement rule.
+//
+// Fixed-width numeric compare, shared by every type compute_stats also
+// handles as raw little-endian words. A NaN disproves the claim outright
+// (there is no IEEE754TotalOrder request here, so NaN has no defined
+// position in a "sorted" run) rather than being silently skipped the way
+// compute_stats skips it for min/max purposes -- omitting it from the check
+// would let a NaN-containing column pass a claim about an order NaN cannot
+// participate in.
+template <typename T>
+bool sort_claim_holds_fixed(const T* p, const std::uint8_t* validity,
+                            std::int64_t voff, std::int64_t start,
+                            std::int64_t rows, bool descending,
+                            bool nulls_first) noexcept {
+    assert(p != nullptr);
+    assert(rows > 1);
+    bool have_prev = false, seen_non_null = false, seen_null = false;
+    T prev{};
+    for (std::int64_t i = 0; i < rows; ++i) {
+        const std::int64_t r = start + i;
+        if (read_valid(validity, voff, r) == 0u) {
+            if (nulls_first && seen_non_null) return false;
+            seen_null = true;
+            continue;
+        }
+        if (!nulls_first && seen_null) return false;
+        seen_non_null = true;
+        const T v = p[r];
+        if constexpr (std::is_floating_point_v<T>) {
+            if (v != v) return false;   // NaN: undefined order, refuse
+        }
+        if (have_prev && (descending ? (prev < v) : (v < prev))) return false;
+        prev = v;
+        have_prev = true;
+    }
+    return true;
+}
+
+// BOOLEAN is stored one byte per row but its two-valued domain is {0,1}, not
+// raw byte identity -- normalize before comparing so e.g. a stray 2-vs-1
+// "true" encoding can't manufacture a false rejection.
+bool sort_claim_holds_bool(const BoltColumn& col, std::int64_t start,
+                           std::int64_t rows, bool descending,
+                           bool nulls_first) noexcept {
+    assert(col.data != nullptr);
+    assert(rows > 1);
+    const auto* p = static_cast<const std::uint8_t*>(col.data);
+    bool have_prev = false, seen_non_null = false, seen_null = false;
+    std::uint8_t prev = 0u;
+    for (std::int64_t i = 0; i < rows; ++i) {
+        const std::int64_t r = start + i;
+        if (read_valid(col.validity, col.validity_offset, r) == 0u) {
+            if (nulls_first && seen_non_null) return false;
+            seen_null = true;
+            continue;
+        }
+        if (!nulls_first && seen_null) return false;
+        seen_non_null = true;
+        const std::uint8_t v = (p[r] != 0u) ? 1u : 0u;
+        if (have_prev && (descending ? (prev < v) : (v < prev))) return false;
+        prev = v;
+        have_prev = true;
+    }
+    return true;
+}
+
+// Utf8/Binary lexicographic compare via the same layout-agnostic
+// row_val_bytes + stat_lex_cmp compute_stats_utf8 already uses.
+bool sort_claim_holds_bytes(const BoltColumn& col, std::int64_t start,
+                            std::int64_t rows, bool descending,
+                            bool nulls_first) noexcept {
+    assert(rows > 1);
+    bool have_prev = false, seen_non_null = false, seen_null = false;
+    const std::uint8_t* prev_p = nullptr;
+    std::uint32_t prev_n = 0;
+    static const std::uint8_t kEmpty[1] = {0};
+    for (std::int64_t i = 0; i < rows; ++i) {
+        const std::int64_t r = start + i;
+        if (read_valid(col.validity, col.validity_offset, r) == 0u) {
+            if (nulls_first && seen_non_null) return false;
+            seen_null = true;
+            continue;
+        }
+        if (!nulls_first && seen_null) return false;
+        seen_non_null = true;
+        const RowVal v = row_val_bytes(col, r);
+        if (v.n == 0xFFFFFFFFu) return false;   // malformed column: can't verify
+        const std::uint8_t* p = (v.p != nullptr) ? v.p : kEmpty;
+        if (have_prev) {
+            const int c = stat_lex_cmp(p, v.n, prev_p, prev_n);
+            if (descending ? (c > 0) : (c < 0)) return false;
+        }
+        prev_p = p;
+        prev_n = v.n;
+        have_prev = true;
+    }
+    return true;
+}
+
+// Dispatches on the column's declared type. Types with no case here
+// (Decimal128, List, ...) are rejected up-front at parquet_write_open (see
+// sorting_columns_valid) so every claim reaching this function has a type
+// this function knows how to check -- the default arm is unreachable, not a
+// silent pass.
+bool verify_sort_claim(const BoltColumn& col, BoltType type,
+                       std::int64_t start, std::int64_t rows,
+                       bool descending, bool nulls_first) noexcept {
+    assert(rows >= 0);
+    if (rows <= 1) return true;   // 0 or 1 row is trivially sorted
+    switch (type) {
+        case BoltType::Int32:
+        case BoltType::Date32:
+            return sort_claim_holds_fixed<std::int32_t>(
+                static_cast<const std::int32_t*>(col.data), col.validity,
+                col.validity_offset, start, rows, descending, nulls_first);
+        case BoltType::Int64:
+        case BoltType::Timestamp:
+            return sort_claim_holds_fixed<std::int64_t>(
+                static_cast<const std::int64_t*>(col.data), col.validity,
+                col.validity_offset, start, rows, descending, nulls_first);
+        case BoltType::Float32:
+            return sort_claim_holds_fixed<float>(
+                static_cast<const float*>(col.data), col.validity,
+                col.validity_offset, start, rows, descending, nulls_first);
+        case BoltType::Float64:
+            return sort_claim_holds_fixed<double>(
+                static_cast<const double*>(col.data), col.validity,
+                col.validity_offset, start, rows, descending, nulls_first);
+        case BoltType::Bool:
+            return sort_claim_holds_bool(col, start, rows, descending,
+                                         nulls_first);
+        case BoltType::Utf8:
+        case BoltType::Binary:
+            return sort_claim_holds_bytes(col, start, rows, descending,
+                                          nulls_first);
+        default:
+            return false;
+    }
+}
+
 bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
                          std::int64_t start, std::int64_t rows) noexcept {
     assert(w != nullptr && cols != nullptr);
     assert(rows >= 0);
     if (w->row_groups.size() >= kPwMaxRowGroups) return false;
-    const std::int64_t rg_start = w->file_pos;
+
+    // B6: verify every caller-declared sort claim against THIS row group's
+    // actual data BEFORE writing a single byte of it. A claim that doesn't
+    // hold fails the whole call -- see ParquetWriteOpts::sorting_columns --
+    // rather than being silently dropped and the row group written anyway.
     RowGroupRec rg{};
+    for (std::uint32_t i = 0; i < w->opts.n_sorting_columns; ++i) {
+        const ParquetSortingColumn& sc = w->opts.sorting_columns[i];
+        assert(sc.column_idx < w->opts.n_columns);   // enforced at open
+        const BoltType t = w->opts.columns[sc.column_idx].type;
+        if (!verify_sort_claim(cols[sc.column_idx], t, start, rows,
+                               sc.descending, sc.nulls_first)) {
+            return false;
+        }
+        rg.sorting_columns[rg.n_sorting_columns++] = sc;
+    }
+
+    const std::int64_t rg_start = w->file_pos;
     rg.num_rows = rows;
     rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
     rg.chunk_count = w->opts.n_columns;

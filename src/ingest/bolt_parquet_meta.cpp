@@ -467,8 +467,40 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
     return true;
 }
 
+// ---- SortingColumn (B6) ------------------------------------------------------
+// fields: 1 column_idx(i32) 2 descending(bool) 3 nulls_first(bool). A compact
+// bool field carries its value in the field-header type nibble, same as the
+// isAdjustedToUTC/isSigned bools parsed above -- no separate value byte.
+bool parse_sorting_column(TcCursor* c, PqSortingColumn* sc) noexcept {
+    assert(c != nullptr && sc != nullptr);
+    std::memset(sc, 0, sizeof(*sc));
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {
+        switch (fid) {
+            case 1: {
+                int64_t v;
+                if (!tc_zigzag(c, &v)) return false;
+                sc->column_idx = static_cast<int32_t>(v);
+                break;
+            }
+            case 2:
+                sc->descending = (ft == kTcTrue);
+                break;
+            case 3:
+                sc->nulls_first = (ft == kTcTrue);
+                break;
+            default:
+                if (!tc_skip(c, ft, 0)) return false;
+                break;
+        }
+    }
+    return true;
+}
+
 // ---- RowGroup ---------------------------------------------------------------
 // fields: 1 columns(list<ColumnChunk>) 2 total_byte_size 3 num_rows
+//         4 sorting_columns(list<SortingColumn>, B6)
 //         5 file_offset 6 total_compressed_size 7 ordinal (all optional --
 //         G2PQ-19-style: absent means "writer didn't emit it", not an error)
 bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
@@ -503,6 +535,19 @@ bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
                 if (!tc_zigzag(c, &v)) return false;
                 rg->num_rows = v;
                 break;
+            case 4: {   // sorting_columns: list<SortingColumn> (B6, optional)
+                uint8_t et; uint32_t n;
+                if (!tc_list(c, &et, &n)) return false;
+                if (et != kTcStruct) return false;
+                for (uint32_t i = 0; i < n; ++i) {
+                    PqSortingColumn tmp;
+                    if (!parse_sorting_column(c, &tmp)) return false;
+                    if (rg->n_sorting_columns < kPqMaxSortingColumns) {
+                        rg->sorting_columns[rg->n_sorting_columns++] = tmp;
+                    }
+                }
+                break;
+            }
             case 5:
                 if (!tc_zigzag(c, &v)) return false;
                 rg->file_offset = v;

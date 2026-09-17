@@ -1183,6 +1183,14 @@ target_link_libraries(test_bolt_parquet_write_rowgroup_meta
 bolt_apply_hardening(test_bolt_parquet_write_rowgroup_meta)
 add_test(NAME test_bolt_parquet_write_rowgroup_meta COMMAND test_bolt_parquet_write_rowgroup_meta)
 
+# G2PQ-26: RowGroup.sorting_columns (field 4, B6). scripts/parquet_sorting_columns_check.py
+# is the pyarrow-oracle sibling check over the fixtures this test writes.
+add_executable(test_bolt_parquet_write_sorting_columns test_bolt_parquet_write_sorting_columns.cpp)
+target_link_libraries(test_bolt_parquet_write_sorting_columns
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_sorting_columns)
+add_test(NAME test_bolt_parquet_write_sorting_columns COMMAND test_bolt_parquet_write_sorting_columns)
+
 # G2PQ-24: ColumnMetaData.encoding_stats (field 13). scripts/parquet_encoding_stats_check.py holds the assertions.
 add_executable(test_bolt_parquet_write_encoding_stats test_bolt_parquet_write_encoding_stats.cpp)
 target_link_libraries(test_bolt_parquet_write_encoding_stats

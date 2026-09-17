@@ -136,6 +136,7 @@ inline constexpr uint32_t kPqMaxColumns   = 128;   // flat leaf columns
 inline constexpr uint32_t kPqMaxRowGroups = 4096;
 inline constexpr uint32_t kPqMaxNameBytes = 64;
 inline constexpr uint32_t kPqMaxStatBytes = 64;    // min/max value bytes kept
+inline constexpr uint32_t kPqMaxSortingColumns = 16;  // matches the writer's cap
 
 // parquet::Type (physical).
 enum class PqType : int32_t {
@@ -250,6 +251,17 @@ struct PqChunk {
     int32_t  _pad2;
 };
 
+// One SortingColumn entry (RowGroup field 4, B6): declares this row group is
+// sorted on `column_idx` (index into PqMeta::columns), ascending unless
+// `descending`, with nulls placed first when `nulls_first`. Verified against
+// bolt's OWN suite (see ParquetWriteOpts::sorting_columns) but read
+// structurally from any file, like every other field here.
+struct PqSortingColumn {
+    int32_t column_idx;
+    bool    descending;
+    bool    nulls_first;
+};
+
 struct PqRowGroup {
     int64_t  num_rows;
     int64_t  total_byte_size;
@@ -263,6 +275,14 @@ struct PqRowGroup {
     int64_t  total_compressed_size;   // sum of every chunk's compressed bytes
     int16_t  ordinal;                 // this row group's 0-based index in the file
     int16_t  _pad;
+    // RowGroup field 4 (B6): optional list<SortingColumn>. Only legal to be
+    // present when the writer actually verified sortedness -- n==0 means "no
+    // claim", never "verified unsorted". A file carrying more than
+    // kPqMaxSortingColumns entries has the excess parsed-and-dropped, not
+    // treated as an error (this field is advisory, unlike e.g. the column
+    // list a row group's schema actually depends on).
+    PqSortingColumn sorting_columns[kPqMaxSortingColumns];
+    uint32_t         n_sorting_columns;
 };
 
 struct PqMeta {
