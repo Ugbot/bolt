@@ -369,9 +369,76 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
     return true;
 }
 
+// ---- KeyValue / key_value_metadata (G2PQ-23) --------------------------------
+// KeyValue struct: field 1 key (binary, required), field 2 value (binary,
+// optional). Always fully consumes the struct so the cursor stays in sync
+// even when the pair is dropped for being oversized or keyless.
+bool parse_one_kv(TcCursor* c, char* key_out, uint32_t key_cap,
+                  char* val_out, uint32_t val_cap, bool* kept) noexcept {
+    assert(c != nullptr && key_out != nullptr && val_out != nullptr);
+    assert(val_cap > 0);
+    *kept = false;
+    key_out[0] = '\0';
+    val_out[0] = '\0';
+    bool have_key = false;
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {
+        const uint8_t* p; uint32_t n;
+        switch (fid) {
+            case 1:
+                if (!tc_binary(c, &p, &n)) return false;
+                if (n > 0 && n < key_cap) {
+                    std::memcpy(key_out, p, n);
+                    key_out[n] = '\0';
+                    have_key = true;
+                }
+                break;
+            case 2:
+                if (!tc_binary(c, &p, &n)) return false;
+                if (n < val_cap) {
+                    std::memcpy(val_out, p, n);
+                    val_out[n] = '\0';
+                }
+                break;
+            default:
+                if (!tc_skip(c, ft, 0)) return false;
+                break;
+        }
+    }
+    *kept = have_key;
+    return true;
+}
+
+// list<KeyValue> -> a bounded array of KV (PqFileKeyValue / PqColKeyValue).
+// A pair whose key/value overflowed its cap is dropped, never truncated;
+// dropping still consumes its struct bytes above, so later pairs parse fine.
+template <typename KV>
+bool parse_kv_list(TcCursor* c, KV* out, uint32_t out_cap,
+                   uint32_t* n_out) noexcept {
+    assert(c != nullptr && out != nullptr && n_out != nullptr);
+    uint8_t et; uint32_t n;
+    if (!tc_list(c, &et, &n)) return false;
+    if (n > kPqMaxKvListLen) return false;   // hostile/corrupt count claim
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (et != kTcStruct) { if (!tc_skip(c, et, 0)) return false; continue; }
+        KV tmp{};
+        bool ok = false;
+        if (!parse_one_kv(c, tmp.key, static_cast<uint32_t>(sizeof(tmp.key)),
+                          tmp.value, static_cast<uint32_t>(sizeof(tmp.value)),
+                          &ok)) {
+            return false;
+        }
+        if (ok && kept < out_cap) out[kept++] = tmp;
+    }
+    *n_out = kept;
+    return true;
+}
+
 // ---- ColumnMetaData ---------------------------------------------------------
 // fields: 1 type 2 encodings 3 path_in_schema 4 codec 5 num_values
-//         6 total_uncompressed_size 7 total_compressed_size
+//         6 total_uncompressed_size 7 total_compressed_size 8 key_value_metadata
 //         9 data_page_offset 10 index_page_offset 11 dictionary_page_offset
 //         12 statistics 14 bloom_filter_offset 15 bloom_filter_length
 bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
@@ -396,6 +463,12 @@ bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
             case 7:
                 if (!tc_zigzag(c, &v)) return false;
                 ch->total_compressed_size = v;
+                break;
+            case 8:
+                if (ft != kTcList) { if (!tc_skip(c, ft, 0)) return false; break; }
+                if (!parse_kv_list(c, ch->col_kv, kPqMaxColKv, &ch->n_col_kv)) {
+                    return false;
+                }
                 break;
             case 9:
                 if (!tc_zigzag(c, &v)) return false;
@@ -605,6 +678,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
     out->n_row_groups = 0;
     out->n_chunks = 0;
     out->version = 0;
+    out->n_file_kv = 0;
 
     TcCursor c{meta, meta + meta_len};
     int16_t fid = 0;
@@ -727,6 +801,13 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
             case 3:
                 if (!tc_zigzag(&c, &v)) return false;
                 out->num_rows = v;
+                break;
+            case 5:
+                if (ft != kTcList) { if (!tc_skip(&c, ft, 0)) return false; break; }
+                if (!parse_kv_list(&c, out->file_kv, kPqMaxFileKv,
+                                   &out->n_file_kv)) {
+                    return false;
+                }
                 break;
             case 4: {   // row_groups: list<RowGroup>
                 uint8_t et; uint32_t n;

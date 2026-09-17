@@ -138,6 +138,37 @@ inline constexpr uint32_t kPqMaxNameBytes = 64;
 inline constexpr uint32_t kPqMaxStatBytes = 64;    // min/max value bytes kept
 inline constexpr uint32_t kPqMaxSortingColumns = 16;  // matches the writer's cap
 
+// key_value_metadata (G2PQ-23): FileMetaData field 5 and ColumnMetaData
+// field 8 (thrift KeyValue: required key, optional value). Real uses:
+// Arrow's "ARROW:schema" (file-level) and small per-column annotations in
+// the Iceberg/Delta family. Caps match ParquetFileKeyValue/
+// ParquetColumnKeyValue in bolt_parquet_write.h exactly, so a round trip
+// through bolt never loses a pair (see that header's sizing note re: a
+// 512 KiB non-main-thread stack on macOS, since PqMeta is routinely a stack
+// local too); a pair read from another writer whose key or value overflows
+// the cap is skipped, not truncated -- same "absent, never self-truncated"
+// policy as min/max statistics below.
+inline constexpr uint32_t kPqMaxFileKv         = 4;
+inline constexpr uint32_t kPqMaxFileKvKeyBytes = 64;
+inline constexpr uint32_t kPqMaxFileKvValBytes = 4096;
+inline constexpr uint32_t kPqMaxColKv          = 2;
+inline constexpr uint32_t kPqMaxColKvKeyBytes  = 32;
+inline constexpr uint32_t kPqMaxColKvValBytes  = 64;
+// Hard reject threshold for the list<KeyValue> element COUNT itself (not the
+// number kept) -- bounds parse time against a hostile/corrupt count claim
+// regardless of how many pairs the caps above actually retain.
+inline constexpr uint32_t kPqMaxKvListLen = 1u << 16;
+
+struct PqFileKeyValue {
+    char key[kPqMaxFileKvKeyBytes];
+    char value[kPqMaxFileKvValBytes];
+};
+
+struct PqColKeyValue {
+    char key[kPqMaxColKvKeyBytes];
+    char value[kPqMaxColKvValBytes];
+};
+
 // parquet::Type (physical).
 enum class PqType : int32_t {
     Boolean = 0, Int32 = 1, Int64 = 2, Int96 = 3, Float = 4, Double = 5,
@@ -255,6 +286,10 @@ struct PqChunk {
                                       // (pre-2.9 writers omit the length —
                                       // the bloom reader then bounds by EOF)
     int32_t  _pad2;
+    // ColumnMetaData field 8 (G2PQ-23). n_col_kv = 0 when absent or when
+    // every pair present overflowed the cap (see kPqMaxColKv* above).
+    PqColKeyValue col_kv[kPqMaxColKv];
+    uint32_t n_col_kv;
 };
 
 // One SortingColumn entry (RowGroup field 4, B6): declares this row group is
@@ -303,6 +338,10 @@ struct PqMeta {
     // would be ~100 MB inline): the caller supplies the array.
     PqChunk*    chunks;
     uint32_t    chunks_cap;
+    // FileMetaData field 5 (G2PQ-23). n_file_kv = 0 when absent or when
+    // every pair present overflowed the cap (see kPqMaxFileKv* above).
+    PqFileKeyValue file_kv[kPqMaxFileKv];
+    uint32_t       n_file_kv;
 };
 
 // Locate + verify the footer in a whole-file buffer. On success *meta_off /

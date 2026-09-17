@@ -1210,6 +1210,15 @@ target_link_libraries(test_bolt_parquet_write_encoding_stats
 bolt_apply_hardening(test_bolt_parquet_write_encoding_stats)
 add_test(NAME test_bolt_parquet_write_encoding_stats COMMAND test_bolt_parquet_write_encoding_stats)
 
+# G2PQ-23: FileMetaData/ColumnMetaData key_value_metadata (fields 5/8).
+# scripts/parquet_kv_metadata_check.py cross-checks the file-level fixture
+# via a real pyarrow.parquet.read_metadata().
+add_executable(test_bolt_parquet_write_kv_metadata test_bolt_parquet_write_kv_metadata.cpp)
+target_link_libraries(test_bolt_parquet_write_kv_metadata
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_kv_metadata)
+add_test(NAME test_bolt_parquet_write_kv_metadata COMMAND test_bolt_parquet_write_kv_metadata)
+
 # Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
 # decoded all four; these close the asymmetry and sweep block/miniblock
 # boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.

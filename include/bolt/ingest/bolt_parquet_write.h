@@ -64,6 +64,10 @@
 //                  ParquetWriteOpts::row_group_max_rows > 0 splits each
 //                  call's batch into consecutive row groups of at most
 //                  that many rows (scan-skip granularity control).
+//   - key/value metadata (G2PQ-23): FileMetaData field 5
+//                  (ParquetWriteOpts::file_kv) and ColumnMetaData field 8
+//                  (ParquetWriteColumn::column_kv) -- e.g. Arrow's
+//                  ARROW:schema or an Iceberg-style small column annotation.
 //
 // Out of scope (open returns false, or the option is silently a no-op):
 //   - MAP / STRUCT columns (LIST is supported; see below)
@@ -119,6 +123,46 @@ enum class PqWriteEncoding : std::uint8_t {
     ByteStreamSplit      = 6,
 };
 
+// Bounded key/value pair for parquet's key_value_metadata (thrift KeyValue:
+// field 1 required key, field 2 optional value), written at two levels --
+// see ParquetWriteOpts::file_kv (FileMetaData field 5) and
+// ParquetWriteColumn::column_kv (ColumnMetaData field 8). The two real-world
+// uses are Arrow's "ARROW:schema" (file-level, a base64 IPC schema) and
+// small per-column annotations in the Iceberg/Delta family; Iceberg's
+// PRIMARY field-id mechanism is SchemaElement.field_id (thrift field 9 --
+// see has_field_id/field_id below), so column_kv is not a second way to
+// write that id, just the general per-column KeyValue plumbing.
+//
+// Key and value are NUL-terminated; parquet_write_open REFUSES (returns
+// nullptr) a pair whose key or value would not fit, rather than silently
+// truncating one -- an ARROW:schema payload cut short is a corrupt schema,
+// not a smaller one.
+//
+// Sizing note: column_kv lives inside ParquetWriteColumn, which is itself an
+// array member of ParquetWriteOpts (kMaxFixedColumns=256 slots) -- several
+// existing callers declare a whole ParquetWriteOpts as a plain stack local
+// (e.g. bolt/lakehouse/delta_writer.cpp), and macOS defaults a non-main
+// pthread to a 512 KiB stack. These caps are kept deliberately small (a few
+// tens of KB total across all 256 columns) rather than large enough for a
+// full wide-schema ARROW:schema, which is why that payload belongs at the
+// FILE level (one instance) and not per column.
+inline constexpr std::uint32_t kPwFileKvMaxPairs = 4;
+inline constexpr std::uint32_t kPwFileKvKeyBytes = 64;
+inline constexpr std::uint32_t kPwFileKvValBytes = 4096;
+inline constexpr std::uint32_t kPwColKvMaxPairs  = 2;
+inline constexpr std::uint32_t kPwColKvKeyBytes  = 32;
+inline constexpr std::uint32_t kPwColKvValBytes  = 64;
+
+struct ParquetFileKeyValue {
+    char key[kPwFileKvKeyBytes];
+    char value[kPwFileKvValBytes];
+};
+
+struct ParquetColumnKeyValue {
+    char key[kPwColKvKeyBytes];
+    char value[kPwColKvValBytes];
+};
+
 // One column's worth of writer-side schema. Fixed-size POD.
 struct ParquetWriteColumn {
     char         name[64];      // NUL-terminated; truncated past 63 chars.
@@ -160,6 +204,14 @@ struct ParquetWriteColumn {
     // pyiceberg rather than trusting bolt's own reader alone.
     bool         has_field_id;
     std::int32_t field_id;
+    // ColumnMetaData thrift field 8 (key_value_metadata). See
+    // ParquetColumnKeyValue above. n_column_kv=0 (the zero-init default)
+    // writes no field 8 at all, matching every existing caller's output.
+    // The same declared set is written into every row group's chunk for
+    // this column -- KeyValue is per-chunk in the spec, but a schema-level
+    // annotation like this is conventionally identical across row groups.
+    ParquetColumnKeyValue column_kv[kPwColKvMaxPairs];
+    std::uint32_t         n_column_kv;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
@@ -304,6 +356,12 @@ struct ParquetWriteOpts {
     // == 0 (the zero-init default) emits no RowGroup.sorting_columns at all.
     ParquetSortingColumn sorting_columns[kPwMaxSortingColumns];
     std::uint32_t         n_sorting_columns;
+
+    // ---- key_value_metadata ----------------------------------------------
+    // FileMetaData thrift field 5. See ParquetFileKeyValue above. n_file_kv=0
+    // (the zero-init default) writes no field 5 at all.
+    ParquetFileKeyValue file_kv[kPwFileKvMaxPairs];
+    std::uint32_t       n_file_kv;
 };
 
 // Defaults referenced by the option comments above.

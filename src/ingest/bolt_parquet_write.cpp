@@ -542,6 +542,32 @@ bool has_converted(BoltType t) noexcept {
     return bolt_to_pq_converted(t) >= 0;
 }
 
+// key_value_metadata validation (G2PQ-23): every key/value must actually fit
+// its NUL-terminated buffer and a key must be non-empty (thrift KeyValue.key
+// is `required`). Called from both open paths before anything is written, so
+// a bad pair fails loudly at open rather than silently truncating on write.
+bool file_kv_valid(const ParquetWriteOpts& o) noexcept {
+    if (o.n_file_kv > kPwFileKvMaxPairs) return false;
+    for (std::uint32_t i = 0; i < o.n_file_kv; ++i) {
+        const std::size_t klen = strnlen(o.file_kv[i].key, kPwFileKvKeyBytes);
+        const std::size_t vlen = strnlen(o.file_kv[i].value, kPwFileKvValBytes);
+        if (klen == 0u || klen >= kPwFileKvKeyBytes) return false;
+        if (vlen >= kPwFileKvValBytes) return false;
+    }
+    return true;
+}
+
+bool column_kv_valid(const ParquetWriteColumn& c) noexcept {
+    if (c.n_column_kv > kPwColKvMaxPairs) return false;
+    for (std::uint32_t i = 0; i < c.n_column_kv; ++i) {
+        const std::size_t klen = strnlen(c.column_kv[i].key, kPwColKvKeyBytes);
+        const std::size_t vlen = strnlen(c.column_kv[i].value, kPwColKvValBytes);
+        if (klen == 0u || klen >= kPwColKvKeyBytes) return false;
+        if (vlen >= kPwColKvValBytes) return false;
+    }
+    return true;
+}
+
 // ===== PLAIN value encoders ===============================================
 
 bool encode_plain_fixed(const BoltColumn& col, std::size_t elem,
@@ -1982,6 +2008,22 @@ std::uint32_t schema_element_count(const ParquetWriteColumn& c) noexcept {
     return (c.type == BoltType::List) ? 3u : 1u;
 }
 
+// list<KeyValue>: KV::key/value must be NUL-terminated char arrays --
+// satisfied by both ParquetFileKeyValue and ParquetColumnKeyValue. Value is
+// thrift-optional but always written here (bolt never records a key without
+// a value once past kv_valid).
+template <typename KV>
+void write_kv_list(TcOut* o, const KV* kvs, std::uint32_t n) noexcept {
+    tc_put_list_hdr(o, kFStruct, n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        tc_put_field(o, 1, kFBinary);
+        tc_put_string(o, kvs[i].key);
+        tc_put_field(o, 2, kFBinary);
+        tc_put_string(o, kvs[i].value);
+        tc_put_stop(o);
+    }
+}
+
 void write_statistics(TcOut* o, const ChunkRec& rec) noexcept {
     if (rec.null_count_known) {
         tc_put_field(o, 3, kFI64);
@@ -2043,6 +2085,12 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     tc_put_zigzag(o, rec.total_unc);
     tc_put_field(o, 7, kFI64);
     tc_put_zigzag(o, rec.total_cmp);
+    // 8 key_value_metadata (G2PQ-23). Same declared set on every row group's
+    // chunk for this column -- see ParquetWriteColumn::column_kv.
+    if (sch.n_column_kv > 0) {
+        tc_put_field(o, 8, kFList);
+        write_kv_list(o, sch.column_kv, sch.n_column_kv);
+    }
     tc_put_field(o, 9, kFI64);
     tc_put_zigzag(o, rec.data_page_offset);
     // 11 dictionary_page_offset. Readers (bolt's own included) take the
@@ -2211,6 +2259,11 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     for (std::uint32_t i = 0; i < g; ++i) {
         write_row_group(&o, w, w->row_groups[i]);
     }
+    // 5 key_value_metadata (G2PQ-23), e.g. Arrow's ARROW:schema.
+    if (w->opts.n_file_kv > 0) {
+        tc_put_field(&o, 5, kFList);
+        write_kv_list(&o, w->opts.file_kv, w->opts.n_file_kv);
+    }
     // 6 created_by
     tc_put_field(&o, 6, kFBinary);
     tc_put_string(&o, "bolt-parquet-writer v1");
@@ -2277,8 +2330,10 @@ ParquetWriter* parquet_write_open(const char* path,
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
     // Reject unsupported codecs up-front.
     if (!pw_codec_supported(opts->compression)) return nullptr;
+    if (!file_kv_valid(*opts)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
+        if (!column_kv_valid(opts->columns[i])) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly
         // writing PLAIN instead would hide the caller's bug in a file that
         // reads back fine.
@@ -2359,8 +2414,10 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     if (opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
     if (!pw_codec_supported(opts->compression)) return nullptr;
+    if (!file_kv_valid(*opts)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
         if (!type_supported(opts->columns[i])) return nullptr;
+        if (!column_kv_valid(opts->columns[i])) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly
         // writing PLAIN instead would hide the caller's bug in a file that
         // reads back fine.
