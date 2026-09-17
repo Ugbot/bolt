@@ -304,6 +304,7 @@ struct ChunkRec {
     bool         null_count_known;
     bool         dictionary;         // RLE_DICTIONARY data pages
     std::int32_t encoding;           // parquet Encoding code of the data pages
+    std::int32_t data_page_written_count;   // G2PQ-24: unlike page_count, not gated on emit_page_index
     StatBuf      st;
     // Page index: [page_off, page_off + page_count) into ParquetWriter::pages,
     // and where the two index structs landed in the file (filled at close).
@@ -1261,6 +1262,7 @@ void note_page(ParquetWriter* w, ChunkOut* out, ChunkRec* rec,
                const StatBuf& st) noexcept {
     assert(w != nullptr && rec != nullptr && out != nullptr);
     assert(nulls >= 0 && n_vals >= 0);
+    ++rec->data_page_written_count;   // G2PQ-24: correct even with page index off
     if (!w->opts.emit_page_index) return;
     PageRec pr;
     std::memset(&pr, 0, sizeof(pr));
@@ -2030,6 +2032,39 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     if (w->opts.emit_statistics && (rec.st.have_stats || rec.null_count_known)) {
         tc_put_field(o, 12, kFStruct);
         write_statistics(o, rec);
+    }
+    // 13 = encoding_stats (G2PQ-24): a chunk's data pages share one encoding
+    // by construction, so this is derivable from already-tracked state.
+    if (rec.data_page_written_count > 0) {
+        const std::int32_t data_page_type =
+            w->opts.data_page_v2 ? kPageDataV2 : kPageData;
+        tc_put_field(o, 13, kFList);
+        if (rec.dictionary) {
+            tc_put_list_hdr(o, kFStruct, 2);
+            tc_put_field(o, 1, kFI32);
+            tc_put_zigzag(o, kPageDict);
+            tc_put_field(o, 2, kFI32);
+            tc_put_zigzag(o, kEncPlain);
+            tc_put_field(o, 3, kFI32);
+            tc_put_zigzag(o, 1);
+            tc_put_stop(o);
+            tc_put_field(o, 1, kFI32);
+            tc_put_zigzag(o, data_page_type);
+            tc_put_field(o, 2, kFI32);
+            tc_put_zigzag(o, kEncRleDict);
+            tc_put_field(o, 3, kFI32);
+            tc_put_zigzag(o, rec.data_page_written_count);
+            tc_put_stop(o);
+        } else {
+            tc_put_list_hdr(o, kFStruct, 1);
+            tc_put_field(o, 1, kFI32);
+            tc_put_zigzag(o, data_page_type);
+            tc_put_field(o, 2, kFI32);
+            tc_put_zigzag(o, rec.encoding);
+            tc_put_field(o, 3, kFI32);
+            tc_put_zigzag(o, rec.data_page_written_count);
+            tc_put_stop(o);
+        }
     }
     // 14/15 = bloom_filter_offset / bloom_filter_length. Length is the
     // header PLUS the bitset, which is what bolt's pq_read_bloom and

@@ -1183,6 +1183,13 @@ target_link_libraries(test_bolt_parquet_write_rowgroup_meta
 bolt_apply_hardening(test_bolt_parquet_write_rowgroup_meta)
 add_test(NAME test_bolt_parquet_write_rowgroup_meta COMMAND test_bolt_parquet_write_rowgroup_meta)
 
+# G2PQ-24: ColumnMetaData.encoding_stats (field 13). scripts/parquet_encoding_stats_check.py holds the assertions.
+add_executable(test_bolt_parquet_write_encoding_stats test_bolt_parquet_write_encoding_stats.cpp)
+target_link_libraries(test_bolt_parquet_write_encoding_stats
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_encoding_stats)
+add_test(NAME test_bolt_parquet_write_encoding_stats COMMAND test_bolt_parquet_write_encoding_stats)
+
 # Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
 # decoded all four; these close the asymmetry and sweep block/miniblock
 # boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.
