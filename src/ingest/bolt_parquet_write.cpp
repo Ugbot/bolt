@@ -29,7 +29,8 @@
 //                          3 repetition, 4 name, 5 num_children=0,
 //                          6 converted_type, 7 scale, 8 precision}
 //   RowGroup              {1 columns list<ColumnChunk>, 2 total_byte_size,
-//                          3 num_rows}
+//                          3 num_rows, 5 file_offset, 6 total_compressed_size,
+//                          7 ordinal}
 //   ColumnChunk           {3 meta_data}
 //   ColumnMetaData        {1 type, 2 encodings list<i32>, 3 path_in_schema
 //                          list<binary>, 4 codec, 5 num_values,
@@ -192,8 +193,8 @@ inline void tc_put_string(TcOut* o, const char* s) noexcept {
 }
 
 // Thrift compact element types we use.
-constexpr std::uint8_t kFI32 = 5, kFI64 = 6, kFBinary = 8, kFList = 9,
-                      kFStruct = 12, kFTrue = 1, kFFalse = 2;
+constexpr std::uint8_t kFI16 = 4, kFI32 = 5, kFI64 = 6, kFBinary = 8,
+                      kFList = 9, kFStruct = 12, kFTrue = 1, kFFalse = 2;
 
 // ===== bit / def-level encoding ===========================================
 //
@@ -356,6 +357,14 @@ struct RowGroupRec {
     std::int64_t  total_byte_size;
     std::uint32_t chunk_off;     // index into ParquetWriter::chunks
     std::uint32_t chunk_count;
+    // RowGroup fields 5/6/7 (G2PQ-19/B8: declared-but-unpopulated fields a
+    // reader may use for planning -- file_offset lets it seek straight to
+    // this row group's first page, total_compressed_size lets it budget an
+    // I/O read without walking every ColumnChunk, ordinal is this row
+    // group's 0-based position in the file).
+    std::int64_t  file_offset;
+    std::int64_t  total_compressed_size;
+    std::int16_t  ordinal;
 };
 
 }  // namespace
@@ -2080,6 +2089,16 @@ void write_row_group(TcOut* o, const ParquetWriter* w,
     tc_put_zigzag(o, rg.total_byte_size);
     tc_put_field(o, 3, kFI64);
     tc_put_zigzag(o, rg.num_rows);
+    // 5/6/7 (G2PQ-19/B8): file_offset, total_compressed_size, ordinal --
+    // all optional in the spec, all unconditionally populated here (unlike
+    // the sparse fields on ColumnChunk above, there's no "nothing to say"
+    // case for a row group that was actually written).
+    tc_put_field(o, 5, kFI64);
+    tc_put_zigzag(o, rg.file_offset);
+    tc_put_field(o, 6, kFI64);
+    tc_put_zigzag(o, rg.total_compressed_size);
+    tc_put_field(o, 7, kFI16);
+    tc_put_zigzag(o, rg.ordinal);
     tc_put_stop(o);
 }
 
@@ -2469,6 +2488,14 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     rg.num_rows = rows;
     rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
     rg.chunk_count = w->opts.n_columns;
+    // RowGroup.file_offset (field 5): byte offset to this row group's first
+    // page. rg_start is exactly that -- nothing has been written for this
+    // row group yet.
+    rg.file_offset = rg_start;
+    // RowGroup.ordinal (field 7): 0-based position in the file. row_groups
+    // hasn't had this one appended yet, so its current size IS the index.
+    assert(w->row_groups.size() <= 0x7FFF);   // i16 field; kPwMaxRowGroups enforces this
+    rg.ordinal = static_cast<std::int16_t>(w->row_groups.size());
 
     const std::uint32_t width = encode_wave_width(w);
     if (w->ws.size() < width) w->ws.resize(width);
@@ -2513,6 +2540,18 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     }
 
     rg.total_byte_size = w->file_pos - rg_start;
+    // RowGroup.total_compressed_size (field 6): sum of every chunk's own
+    // ColumnMetaData.total_compressed_size (field 7 there) -- same number a
+    // reader would get by walking the chunks and adding them up itself.
+    {
+        std::int64_t total_cmp = 0;
+        for (std::uint32_t i = 0; i < rg.chunk_count; ++i) {
+            const std::uint32_t ci = rg.chunk_off + i;
+            assert(ci < w->chunks.size());
+            total_cmp += w->chunks[ci].total_cmp;
+        }
+        rg.total_compressed_size = total_cmp;
+    }
     // Flush this row group's bloom filters now (parquet-mr's AFTER_ROWGROUP
     // placement). Doing it here rather than at close is what keeps live
     // filter memory to one row group; at 256 columns the difference is real.

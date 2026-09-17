@@ -1172,6 +1172,17 @@ target_link_libraries(test_bolt_parquet_write_stats
 bolt_apply_hardening(test_bolt_parquet_write_stats)
 add_test(NAME test_bolt_parquet_write_stats COMMAND test_bolt_parquet_write_stats)
 
+# G2PQ-19/B8: RowGroup.file_offset / total_compressed_size / ordinal (fields
+# 5/6/7, all optional in the spec but never populated before this) -- checked
+# by cross-validating against the independently-parsed per-chunk
+# ColumnMetaData.total_compressed_size field, since pyarrow's Python binding
+# does not expose any of these three fields at all.
+add_executable(test_bolt_parquet_write_rowgroup_meta test_bolt_parquet_write_rowgroup_meta.cpp)
+target_link_libraries(test_bolt_parquet_write_rowgroup_meta
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_rowgroup_meta)
+add_test(NAME test_bolt_parquet_write_rowgroup_meta COMMAND test_bolt_parquet_write_rowgroup_meta)
+
 # Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
 # decoded all four; these close the asymmetry and sweep block/miniblock
 # boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.

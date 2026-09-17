@@ -469,6 +469,8 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
 
 // ---- RowGroup ---------------------------------------------------------------
 // fields: 1 columns(list<ColumnChunk>) 2 total_byte_size 3 num_rows
+//         5 file_offset 6 total_compressed_size 7 ordinal (all optional --
+//         G2PQ-19-style: absent means "writer didn't emit it", not an error)
 bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
     assert(c != nullptr && m != nullptr && rg != nullptr);
     std::memset(rg, 0, sizeof(*rg));
@@ -500,6 +502,18 @@ bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
             case 3:
                 if (!tc_zigzag(c, &v)) return false;
                 rg->num_rows = v;
+                break;
+            case 5:
+                if (!tc_zigzag(c, &v)) return false;
+                rg->file_offset = v;
+                break;
+            case 6:
+                if (!tc_zigzag(c, &v)) return false;
+                rg->total_compressed_size = v;
+                break;
+            case 7:
+                if (!tc_zigzag(c, &v)) return false;
+                rg->ordinal = static_cast<int16_t>(v);
                 break;
             default:
                 if (!tc_skip(c, ft, 0)) return false;

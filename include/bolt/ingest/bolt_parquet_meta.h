@@ -255,6 +255,14 @@ struct PqRowGroup {
     int64_t  total_byte_size;
     uint32_t chunk_off;               // index into PqMeta::chunks
     uint32_t chunk_count;             // == column count for flat schemas
+    // RowGroup fields 5/6/7 (all optional in the spec; G2PQ-19-style
+    // absence-is-not-an-error -- 0 when a writer omitted them, which is
+    // legal, so callers must not treat 0 as a hard "empty row group" signal
+    // on files not written by bolt itself).
+    int64_t  file_offset;             // byte offset to this row group's first page
+    int64_t  total_compressed_size;   // sum of every chunk's compressed bytes
+    int16_t  ordinal;                 // this row group's 0-based index in the file
+    int16_t  _pad;
 };
 
 struct PqMeta {
