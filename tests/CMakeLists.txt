@@ -1118,6 +1118,18 @@ target_compile_definitions(test_bolt_parquet_read PRIVATE
 bolt_apply_hardening(test_bolt_parquet_read)
 add_test(NAME test_bolt_parquet_read COMMAND test_bolt_parquet_read)
 
+# G2PQ-18 — legacy Hadoop-framed LZ4 (parquet CompressionCodec.LZ4 = 5)
+# reader support: single- and multi-sub-block fixtures hand-built by
+# scripts/make_lz4_hadoop_fixture.py (no local tool emits codec 5), plus a
+# truncated-frame refusal case.
+add_executable(test_bolt_parquet_lz4_hadoop test_bolt_parquet_lz4_hadoop.cpp)
+target_link_libraries(test_bolt_parquet_lz4_hadoop
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_lz4_hadoop PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_lz4_hadoop)
+add_test(NAME test_bolt_parquet_lz4_hadoop COMMAND test_bolt_parquet_lz4_hadoop)
+
 # G2FEAT-23 — Parquet page index (ColumnIndex/OffsetIndex) + split-block
 # bloom filter reader vs pyarrow/duckdb goldens: analytic page-bound ground
 # truth, prune-property tests, XXH64 vectors, bloom membership from two

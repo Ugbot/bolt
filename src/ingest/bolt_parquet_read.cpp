@@ -1697,15 +1697,46 @@ bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
         }
         if (got != unc_len) return false;        // page header size must match
     } else if (codec == PqCodec::Lz4Raw) {
-        // LZ4_RAW is a bare LZ4 block. The legacy LZ4 codec (5) is the
-        // Hadoop-framed variant and is deliberately NOT accepted here: it would
-        // need the frame stripped too, and no writer in this tree emits it.
-        // bolt's OWN block decoder, not bolt_lz4.h's liblz4 shim: that shim
-        // is behind find_package(lz4) and absent from a default build, so an
-        // LZ4_RAW file simply did not open. Same reasoning as inflate_raw
-        // above and the self-contained zstd decoder -- a reader that needs a
-        // find_package to open a real table is not a reader.
+        // LZ4_RAW is a bare LZ4 block. bolt's OWN block decoder, not
+        // bolt_lz4.h's liblz4 shim: that shim is behind find_package(lz4) and
+        // absent from a default build, so an LZ4_RAW file simply did not
+        // open. Same reasoning as inflate_raw above and the self-contained
+        // zstd decoder -- a reader that needs a find_package to open a real
+        // table is not a reader.
         if (!lz4_raw_decompress(src, src_len, dst, unc_len)) return false;
+    } else if (codec == PqCodec::Lz4) {
+        // Legacy LZ4 codec (5), DEPRECATED in the spec in favor of LZ4_RAW
+        // (7) but still legal to read. parquet-mr's Hadoop Lz4Codec chunks
+        // the page into one or more sub-blocks, each framed as
+        // [4B BE decompressedSize][4B BE compressedSize][raw LZ4 block] --
+        // NOT the LZ4 frame format. Every sub-block's payload is a bare LZ4
+        // block, so the same lz4_raw_decompress used for LZ4_RAW above does
+        // the actual decompression; this branch only strips the framing.
+        constexpr uint64_t kHadoopPrefix = 8u;
+        uint64_t ip = 0, op = 0;
+        while (ip < src_len) {                    // bounded: ip strictly grows
+            if (src_len - ip < kHadoopPrefix) return false;
+            const uint32_t declared_unc =
+                (static_cast<uint32_t>(src[ip]) << 24) |
+                (static_cast<uint32_t>(src[ip + 1]) << 16) |
+                (static_cast<uint32_t>(src[ip + 2]) << 8) |
+                static_cast<uint32_t>(src[ip + 3]);
+            const uint32_t declared_comp =
+                (static_cast<uint32_t>(src[ip + 4]) << 24) |
+                (static_cast<uint32_t>(src[ip + 5]) << 16) |
+                (static_cast<uint32_t>(src[ip + 6]) << 8) |
+                static_cast<uint32_t>(src[ip + 7]);
+            ip += kHadoopPrefix;
+            if (declared_comp > src_len - ip) return false;
+            if (declared_unc > unc_len - op) return false;
+            if (!lz4_raw_decompress(src + ip, declared_comp, dst + op,
+                                    declared_unc)) {
+                return false;
+            }
+            ip += declared_comp;
+            op += declared_unc;
+        }
+        if (op != unc_len) return false;   // page header size must match
     } else if (codec == PqCodec::Zstd) {
         if (*zscratch == nullptr) {
             *zscratch = arena->allocate(zstd_scratch_size(), 8);
