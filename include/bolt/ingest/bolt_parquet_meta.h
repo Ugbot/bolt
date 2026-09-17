@@ -160,6 +160,12 @@ enum class PqLogical : int32_t {
     Json = 7, Bson = 8,
     // VARIANT annotates a GROUP of {metadata, value} binaries.
     Variant = 9,
+    // G2PQ-17: ENUM (BYTE_ARRAY, ConvertedType 4 or LogicalType union field 4
+    // -- an empty EnumType struct) and UNKNOWN (LogicalType union field 11 --
+    // an empty NullType struct, any physical type, every value null). Full
+    // VARIANT parsing (parquet-format 2.11's binary variant encoding) is
+    // deliberately out of scope; see G2PQ-17's tracker note.
+    Enum = 10, Unknown = 11,
 };
 
 // parquet::CompressionCodec.

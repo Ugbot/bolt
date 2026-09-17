@@ -108,6 +108,7 @@ struct SchemaElem {
 
 // ConvertedType numeric values (parquet.thrift ConvertedType enum).
 constexpr int32_t kCtJson = 24, kCtBson = 25;
+constexpr int32_t kCtEnum = 4;   // G2PQ-17: legacy ConvertedType.ENUM
 constexpr int32_t kCtDecimal = 5, kCtDate = 6, kCtTimeMillis = 7,
                   kCtTimeMicros = 8, kCtTsMillis = 9, kCtTsMicros = 10,
                   kCtUint8 = 11, kCtUint16 = 12, kCtUint32 = 13,
@@ -202,6 +203,9 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
                 col->int_signed = sgn;
                 break;
             }
+            // G2PQ-17: union id 4 EnumType (BYTE_ARRAY, closed string set).
+            case 4: col->logical = static_cast<int32_t>(PqLogical::Enum);
+                    (void)tc_skip(c, ft, 0); break;
             // parquet.thrift LogicalType union ids: 12 JSON, 13 BSON,
             // 14 UUID, 16 VARIANT. All carry an empty struct.
             case 12: col->logical = static_cast<int32_t>(PqLogical::Json);
@@ -209,6 +213,10 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
             case 13: col->logical = static_cast<int32_t>(PqLogical::Bson);
                      (void)tc_skip(c, ft, 0); break;
             case 16: col->logical = static_cast<int32_t>(PqLogical::Variant);
+                     (void)tc_skip(c, ft, 0); break;
+            // G2PQ-17: union id 11 NullType (UNKNOWN) -- every value null,
+            // no compatible ConvertedType exists for it.
+            case 11: col->logical = static_cast<int32_t>(PqLogical::Unknown);
                      (void)tc_skip(c, ft, 0); break;
             default: (void)tc_skip(c, ft, 0); break;
         }
@@ -223,6 +231,9 @@ void derive_logical_from_converted(PqColumn* col) noexcept {
     switch (col->converted) {
         case kCtJson:       col->logical = static_cast<int32_t>(PqLogical::Json); break;
         case kCtBson:       col->logical = static_cast<int32_t>(PqLogical::Bson); break;
+        // G2PQ-17: legacy-only writers (pre-parquet-1.9) set ConvertedType
+        // ENUM with no LogicalType union at all.
+        case kCtEnum:       col->logical = static_cast<int32_t>(PqLogical::Enum); break;
         case kCtTsMillis:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 1; break;
         case kCtTsMicros:   col->logical = static_cast<int32_t>(PqLogical::Timestamp); col->time_unit = 2; break;
         case kCtTimeMillis: col->logical = static_cast<int32_t>(PqLogical::Time);      col->time_unit = 1; break;

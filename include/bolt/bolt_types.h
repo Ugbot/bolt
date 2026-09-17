@@ -79,6 +79,13 @@ enum class BoltLogical : uint8_t {
     // trap, and a parquet variant genuinely IS a struct of two binaries, so
     // the annotation alone identifies it and no new type is needed.
     Variant = 4,
+    // G2PQ-17: ConvertedType.ENUM / LogicalType.ENUM. Utf8 storage -- a small
+    // closed set of string values, same bytes as String, different intent.
+    Enum    = 5,
+    // G2PQ-17: LogicalType.UNKNOWN (parquet's NullType). Any physical
+    // storage; every value is null. Spec: "the physical type was guessed
+    // from all-null values" -- there is no compatible ConvertedType.
+    Unknown = 6,
 };
 
 inline constexpr uint8_t kTypeSize[64] = {

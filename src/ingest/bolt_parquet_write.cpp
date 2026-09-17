@@ -115,6 +115,7 @@ constexpr std::int32_t kCodecZstd         = 6;
 constexpr std::int32_t kConvUtf8    = 0;
 constexpr std::int32_t kConvJson    = 24;
 constexpr std::int32_t kConvBson    = 25;
+constexpr std::int32_t kConvEnum    = 4;   // G2PQ-17: ConvertedType.ENUM
 constexpr std::int32_t kConvDate    = 6;
 constexpr std::int32_t kConvTsMicro = 10;
 constexpr std::int32_t kConvDecimal = 5;
@@ -1883,9 +1884,18 @@ void write_schema_element_col(TcOut* o,
     // (a JSON column is not additionally UTF8-annotated -- parquet allows one
     // ConvertedType, and JSON already implies the bytes are a string).
     const BoltLogical lg = static_cast<BoltLogical>(c.logical);
-    if (lg == BoltLogical::Json || lg == BoltLogical::Bson) {
+    // G2PQ-17: ENUM also replaces the default (it's a BYTE_ARRAY annotation,
+    // same slot as JSON/BSON). UNKNOWN has no ConvertedType at all -- the
+    // spec's LogicalType table lists it as "no compatible ConvertedType" --
+    // so it deliberately falls to the has_converted branch below, which is a
+    // no-op for the physical types UNKNOWN annotates.
+    if (lg == BoltLogical::Json || lg == BoltLogical::Bson ||
+        lg == BoltLogical::Enum) {
         tc_put_field(o, 6, kFI32);
-        tc_put_zigzag(o, (lg == BoltLogical::Json) ? kConvJson : kConvBson);
+        tc_put_zigzag(o, (lg == BoltLogical::Json)
+                             ? kConvJson
+                             : (lg == BoltLogical::Bson) ? kConvBson
+                                                          : kConvEnum);
     } else if (has_converted(c.type)) {
         tc_put_field(o, 6, kFI32);
         tc_put_zigzag(o, bolt_to_pq_converted(c.type));
@@ -1898,11 +1908,17 @@ void write_schema_element_col(TcOut* o,
     }
     // 10 logicalType. Modern readers prefer this over the legacy
     // ConvertedType; both are written so old and new readers agree. The union
-    // arm is an empty struct -- JSON is 12, BSON is 13 in parquet.thrift.
+    // arm is an empty struct -- JSON is 12, BSON is 13, ENUM is 4, UNKNOWN
+    // (NullType) is 11 in parquet.thrift.
     if (lg == BoltLogical::Json || lg == BoltLogical::Bson) {
         tc_put_field(o, 10, kFStruct);
         tc_put_field(o, (lg == BoltLogical::Json) ? 12 : 13, kFStruct);
         tc_put_stop(o);                      // empty JsonType / BsonType
+        tc_put_stop(o);                      // end LogicalType union
+    } else if (lg == BoltLogical::Enum || lg == BoltLogical::Unknown) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, (lg == BoltLogical::Enum) ? 4 : 11, kFStruct);
+        tc_put_stop(o);                      // empty EnumType / NullType
         tc_put_stop(o);                      // end LogicalType union
     }
     // 9 field_id — see ParquetWriteColumn::has_field_id's doc comment
@@ -2281,8 +2297,15 @@ ParquetWriter* parquet_write_open(const char* path,
                 ct != BoltType::Utf8) {
                 return nullptr;
             }
-            if (opts->columns[i].logical > 
-                static_cast<std::uint8_t>(BoltLogical::Variant)) {
+            // G2PQ-17: ENUM is a BYTE_ARRAY annotation, same requirement as
+            // String. UNKNOWN's whole point is "every value is null", which
+            // a REQUIRED (non-nullable) column can never satisfy.
+            if (lg == BoltLogical::Enum && ct != BoltType::Utf8) return nullptr;
+            if (lg == BoltLogical::Unknown && !opts->columns[i].nullable) {
+                return nullptr;
+            }
+            if (opts->columns[i].logical >
+                static_cast<std::uint8_t>(BoltLogical::Unknown)) {
                 return nullptr;
             }
         }
@@ -2356,8 +2379,15 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
                 ct != BoltType::Utf8) {
                 return nullptr;
             }
-            if (opts->columns[i].logical > 
-                static_cast<std::uint8_t>(BoltLogical::Variant)) {
+            // G2PQ-17: ENUM is a BYTE_ARRAY annotation, same requirement as
+            // String. UNKNOWN's whole point is "every value is null", which
+            // a REQUIRED (non-nullable) column can never satisfy.
+            if (lg == BoltLogical::Enum && ct != BoltType::Utf8) return nullptr;
+            if (lg == BoltLogical::Unknown && !opts->columns[i].nullable) {
+                return nullptr;
+            }
+            if (opts->columns[i].logical >
+                static_cast<std::uint8_t>(BoltLogical::Unknown)) {
                 return nullptr;
             }
         }

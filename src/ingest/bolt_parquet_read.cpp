@@ -2379,6 +2379,10 @@ BoltLogical parquet_map_logical(const PqColumn* col) noexcept {
         case PqLogical::Json:    return BoltLogical::Json;
         case PqLogical::Bson:    return BoltLogical::Bson;
         case PqLogical::Variant: return BoltLogical::Variant;
+        // G2PQ-17: ENUM / UNKNOWN pass through as annotations over the
+        // existing Utf8/whatever-physical storage -- no new BoltType.
+        case PqLogical::Enum:    return BoltLogical::Enum;
+        case PqLogical::Unknown: return BoltLogical::Unknown;
         default:                 return BoltLogical::None;
     }
 }
