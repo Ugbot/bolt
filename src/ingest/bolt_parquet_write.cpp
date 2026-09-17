@@ -297,6 +297,13 @@ struct PageRec {
     StatBuf       st;
 };
 
+// G2PQ-25: SizeStatistics histogram bucket caps for what bolt's OWN writer
+// ever emits (flat columns never get a histogram; a LIST leaf's max_def is 2
+// or 3 and max_rep is 1 -- see chunk_write_list). Not a general reader-side
+// bound; that lives in bolt_parquet_meta.h as kPqMaxLevelHistBuckets.
+constexpr std::size_t kPqWMaxDefBuckets = 4;
+constexpr std::size_t kPqWMaxRepBuckets = 2;
+
 struct ChunkRec {
     std::int64_t num_values;
     std::int64_t total_unc;
@@ -324,6 +331,16 @@ struct ChunkRec {
     // patched in after the chunk itself.
     std::int64_t  bloom_off;
     std::int32_t  bloom_len;
+    // G2PQ-25: SizeStatistics (ColumnMetaData field 16). See the
+    // emit_size_statistics comment in bolt_parquet_write.h for what is and
+    // isn't populated.
+    bool          byte_array_bytes_known;
+    std::int64_t  byte_array_bytes;
+    bool          level_hist_known;
+    std::uint8_t  max_def;    // valid only when level_hist_known
+    std::uint8_t  max_rep;
+    std::int64_t  def_hist[kPqWMaxDefBuckets];
+    std::int64_t  rep_hist[kPqWMaxRepBuckets];
 };
 
 // One column chunk, encoded but not yet placed in the file. Every offset in
@@ -842,6 +859,35 @@ bool compute_stats(const BoltColumn& col, std::int64_t r_begin,
             // Decimal128: min/max skipped (v1 gap, documented in the header).
             return true;
     }
+}
+
+// G2PQ-25: SizeStatistics.unencoded_byte_array_data_bytes -- sum of each
+// LOGICAL value's raw byte length (col/row_val_bytes resolves both the
+// StringView+spill and VarBinary layouts, so this is correct whether or not
+// the chunk ends up dictionary-encoded: it counts every row's value once,
+// not once per distinct dictionary entry). Caller must only call this for a
+// BYTE_ARRAY physical column (Utf8/Binary) -- the spec is explicit this
+// field is not for FIXED_LEN_BYTE_ARRAY (Decimal128) or anything else.
+// Returns false (byte count unusable) only when a value's bytes cannot be
+// resolved at all -- same "omit rather than fail the chunk" stance as
+// compute_stats_utf8's oversized-value skip.
+bool sum_byte_array_data_bytes(const BoltColumn& col, std::int64_t r_begin,
+                               std::int64_t r_end,
+                               const std::uint8_t* def_bits, bool nullable,
+                               std::int64_t* out) noexcept {
+    assert(out != nullptr);
+    assert(r_begin <= r_end);
+    assert(col.data != nullptr || r_begin == r_end);
+    std::int64_t total = 0;
+    for (std::int64_t r = r_begin; r < r_end; ++r) {
+        const bool valid = (!nullable) || def_bits[r] != 0;
+        if (!valid) continue;
+        const RowVal v = row_val_bytes(col, r);
+        if (v.n == 0xFFFFFFFFu) return false;
+        total += static_cast<std::int64_t>(v.n);
+    }
+    *out = total;
+    return true;
 }
 
 // ===== compression =========================================================
@@ -1745,6 +1791,35 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
                             enullable ? ebits.data() : nullptr, enullable,
                             &rec->st);
     }
+    // G2PQ-25: a LIST leaf's max_def (2 or 3, unlike a flat column's 0/1) and
+    // max_rep (1) are both outside the spec's "may omit without loss of
+    // information" carve-out, so the histograms carry real information here
+    // -- lv.rep/lv.def are already fully materialized by build_list_levels,
+    // so this is one cheap counting pass, not a second levels computation.
+    if (w->opts.emit_size_statistics) {
+        assert(max_def < kPqWMaxDefBuckets);
+        rec->level_hist_known = true;
+        rec->max_def = max_def;
+        rec->max_rep = 1u;
+        std::memset(rec->def_hist, 0, sizeof(rec->def_hist));
+        std::memset(rec->rep_hist, 0, sizeof(rec->rep_hist));
+        for (std::size_t i = 0; i < lv.def.size(); ++i) {
+            assert(lv.def[i] < kPqWMaxDefBuckets);
+            assert(lv.rep[i] < kPqWMaxRepBuckets);
+            rec->def_hist[lv.def[i]] += 1;
+            rec->rep_hist[lv.rep[i]] += 1;
+        }
+        if (sch.element_type == BoltType::Utf8 ||
+            sch.element_type == BoltType::Binary) {
+            std::int64_t bytes = 0;
+            if (sum_byte_array_data_bytes(*elem, 0, lv.n_elems,
+                                          enullable ? ebits.data() : nullptr,
+                                          enullable, &bytes)) {
+                rec->byte_array_bytes_known = true;
+                rec->byte_array_bytes = bytes;
+            }
+        }
+    }
 
     const std::uint64_t budget = page_budget_bytes(w->opts);
     ParquetWriteColumn eschema = sch;
@@ -1851,6 +1926,17 @@ bool write_column_chunk(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     if (w->opts.emit_statistics &&
         !compute_stats(col, 0, n_rows, db, nullable, &rec->st)) {
         return false;
+    }
+    // G2PQ-25: byte_array_data_bytes only -- a flat column's level histogram
+    // is legal to omit per spec (see ChunkRec's comment) and is never set
+    // here. LIST-of-BYTE_ARRAY is handled separately in chunk_write_list.
+    if (w->opts.emit_size_statistics &&
+        (sch.type == BoltType::Utf8 || sch.type == BoltType::Binary)) {
+        std::int64_t bytes = 0;
+        if (sum_byte_array_data_bytes(col, 0, n_rows, db, nullable, &bytes)) {
+            rec->byte_array_bytes_known = true;
+            rec->byte_array_bytes = bytes;
+        }
     }
 
     const PqWriteEncoding enc = resolve_encoding(sch, w->opts);
@@ -2038,6 +2124,31 @@ void write_statistics(TcOut* o, const ChunkRec& rec) noexcept {
     tc_put_stop(o);
 }
 
+// G2PQ-25: SizeStatistics (ColumnMetaData field 16). Sub-fields are omitted
+// individually when not populated -- e.g. a flat BYTE_ARRAY column carries
+// byte_array_bytes_known but never level_hist_known, and only sets field 1.
+void write_size_statistics(TcOut* o, const ChunkRec& rec) noexcept {
+    if (rec.byte_array_bytes_known) {
+        tc_put_field(o, 1, kFI64);
+        tc_put_zigzag(o, rec.byte_array_bytes);
+    }
+    if (rec.level_hist_known) {
+        assert(rec.max_rep + 1u <= kPqWMaxRepBuckets);
+        tc_put_field(o, 2, kFList);
+        tc_put_list_hdr(o, kFI64, rec.max_rep + 1u);
+        for (std::uint8_t i = 0; i <= rec.max_rep; ++i) {
+            tc_put_zigzag(o, rec.rep_hist[i]);
+        }
+        assert(rec.max_def + 1u <= kPqWMaxDefBuckets);
+        tc_put_field(o, 3, kFList);
+        tc_put_list_hdr(o, kFI64, rec.max_def + 1u);
+        for (std::uint8_t i = 0; i <= rec.max_def; ++i) {
+            tc_put_zigzag(o, rec.def_hist[i]);
+        }
+    }
+    tc_put_stop(o);
+}
+
 void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ParquetWriteColumn& sch,
                        const ChunkRec& rec) noexcept {
@@ -2147,6 +2258,10 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
         tc_put_zigzag(o, rec.bloom_off);
         tc_put_field(o, 15, kFI32);
         tc_put_zigzag(o, rec.bloom_len);
+    }
+    if (rec.byte_array_bytes_known || rec.level_hist_known) {
+        tc_put_field(o, 16, kFStruct);
+        write_size_statistics(o, rec);
     }
     tc_put_stop(o);
 }

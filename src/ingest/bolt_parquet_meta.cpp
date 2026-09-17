@@ -445,11 +445,81 @@ bool parse_kv_list(TcCursor* c, KV* out, uint32_t out_cap,
     return true;
 }
 
+// Read a list<i64> into buf[0..kPqMaxLevelHistBuckets). *out_len is the
+// bucket count when it fits; 0 (absent) when the list is empty, oversized, or
+// the wrong element type -- exotic/corrupt histogram metadata never fails
+// the whole chunk parse, same convention as copy_stat's oversized-stat drop.
+// The element loop is bounded by `n`, which is itself capped below: every
+// tc_zigzag/tc_skip call bounds-checks against the cursor, so a truncated
+// buffer with a bogus huge n fails immediately rather than spinning.
+bool parse_i64_hist(TcCursor* c, int64_t* buf, uint8_t* out_len) noexcept {
+    assert(c != nullptr && buf != nullptr && out_len != nullptr);
+    *out_len = 0;
+    uint8_t et; uint32_t n;
+    if (!tc_list(c, &et, &n)) return false;
+    if (n > (1u << 16)) return false;   // no legal histogram is this long
+    if (et != kTcI64) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!tc_skip(c, et, 0)) return false;
+        }
+        return true;
+    }
+    const bool fits = (n <= kPqMaxLevelHistBuckets);
+    for (uint32_t i = 0; i < n; ++i) {
+        int64_t v = 0;
+        if (!tc_zigzag(c, &v)) return false;
+        if (fits) buf[i] = v;
+    }
+    if (fits) *out_len = static_cast<uint8_t>(n);
+    return true;
+}
+
+// ---- SizeStatistics (G2PQ-25) ----------------------------------------------
+// fields: 1 unencoded_byte_array_data_bytes 2 repetition_level_histogram
+//         3 definition_level_histogram
+// Verified against apache/parquet-format's parquet.thrift directly (field
+// numbers below), not against prose: ColumnIndex does NOT nest a
+// SizeStatistics struct -- it carries its OWN flattened, per-page
+// repetition_level_histograms/definition_level_histograms (fields 6/7,
+// concatenated across pages) plus OffsetIndex's own per-page
+// unencoded_byte_array_data_bytes (field 2). Neither of those page-level
+// echoes is populated by this change (bolt's writer already marks both
+// "(skipped)" in bolt_parquet_pageindex.h) -- only the chunk-level
+// ColumnMetaData.size_statistics (field 16) below is in scope.
+bool parse_size_statistics(TcCursor* c, PqChunk* ch) noexcept {
+    assert(c != nullptr && ch != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {
+        switch (fid) {
+            case 1: {
+                int64_t v = 0;
+                if (!tc_zigzag(c, &v)) return false;
+                if (v >= 0) ch->byte_array_data_bytes = v;
+                break;
+            }
+            case 2:
+                if (ft != kTcList) { if (!tc_skip(c, ft, 0)) return false; break; }
+                if (!parse_i64_hist(c, ch->rep_hist, &ch->rep_hist_len)) return false;
+                break;
+            case 3:
+                if (ft != kTcList) { if (!tc_skip(c, ft, 0)) return false; break; }
+                if (!parse_i64_hist(c, ch->def_hist, &ch->def_hist_len)) return false;
+                break;
+            default:
+                if (!tc_skip(c, ft, 0)) return false;
+                break;
+        }
+    }
+    return true;
+}
+
 // ---- ColumnMetaData ---------------------------------------------------------
 // fields: 1 type 2 encodings 3 path_in_schema 4 codec 5 num_values
 //         6 total_uncompressed_size 7 total_compressed_size 8 key_value_metadata
 //         9 data_page_offset 10 index_page_offset 11 dictionary_page_offset
 //         12 statistics 14 bloom_filter_offset 15 bloom_filter_length
+//         16 size_statistics
 bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
     assert(c != nullptr && ch != nullptr);
     int16_t fid = 0;
@@ -501,6 +571,10 @@ bool parse_column_meta(TcCursor* c, PqChunk* ch) noexcept {
                     ch->bloom_filter_length = static_cast<int32_t>(v);
                 }
                 break;
+            case 16:
+                if (ft != kTcStruct) { if (!tc_skip(c, ft, 0)) return false; break; }
+                if (!parse_size_statistics(c, ch)) return false;
+                break;
             default:
                 if (!tc_skip(c, ft, 0)) return false;
                 break;
@@ -517,6 +591,7 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
     assert(c != nullptr && ch != nullptr);
     std::memset(ch, 0, sizeof(*ch));
     ch->null_count = -1;
+    ch->byte_array_data_bytes = -1;
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {

@@ -344,7 +344,17 @@ struct ParquetWriteOpts {
     // because the levels do not have to be decompressed to be counted.
     // Dictionary pages are unaffected -- there is no v2 dictionary page.
     bool               data_page_v2;
-    std::uint8_t       _pad4[7];
+
+    // Emit ColumnMetaData.size_statistics (field 16, G2PQ-25): a BYTE_ARRAY
+    // chunk's unencoded_byte_array_data_bytes (logical value bytes, before
+    // any encoding -- correct whether or not the chunk is dictionary
+    // encoded), plus repetition/definition level histograms for a LIST-leaf
+    // chunk. Flat REQUIRED/OPTIONAL columns never get a histogram: the spec
+    // says a max_def<=1 histogram may be omitted "without loss of
+    // information" (Statistics.null_count already says everything it could),
+    // so bolt omits it rather than write a field with no reader-facing value.
+    bool               emit_size_statistics;
+    std::uint8_t       _pad4[6];
 
     // ---- sorting metadata (B6) -------------------------------------------
     // Caller-declared claim that these columns are sorted. VERIFIED per row

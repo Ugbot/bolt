@@ -137,6 +137,10 @@ inline constexpr uint32_t kPqMaxRowGroups = 4096;
 inline constexpr uint32_t kPqMaxNameBytes = 64;
 inline constexpr uint32_t kPqMaxStatBytes = 64;    // min/max value bytes kept
 inline constexpr uint32_t kPqMaxSortingColumns = 16;  // matches the writer's cap
+// SizeStatistics rep/def level histogram bucket cap (G2PQ-25). Bounds any
+// legal file's histogram (bolt's own writer never needs more than 4), same
+// absent-on-overflow convention as kPqMaxStatBytes.
+inline constexpr uint32_t kPqMaxLevelHistBuckets = 32;
 
 // key_value_metadata (G2PQ-23): FileMetaData field 5 and ColumnMetaData
 // field 8 (thrift KeyValue: required key, optional value). Real uses:
@@ -296,6 +300,18 @@ struct PqChunk {
     // every pair present overflowed the cap (see kPqMaxColKv* above).
     PqColKeyValue col_kv[kPqMaxColKv];
     uint32_t n_col_kv;
+    // SizeStatistics (G2PQ-25, ColumnMetaData field 16). byte_array_data_bytes
+    // is only meaningful for BYTE_ARRAY physical type; the histograms are only
+    // meaningful when max_def > 1 or max_rep > 0 (a flat column's max_def<=1,
+    // max_rep==0 histogram is legal to omit per spec -- null_count in
+    // Statistics already carries everything it could say). A histogram longer
+    // than kPqMaxLevelHistBuckets is treated as absent, same convention as an
+    // oversized min/max stat.
+    int64_t  byte_array_data_bytes;              // -1 = absent
+    uint8_t  def_hist_len;                        // 0 = absent, else bucket count
+    uint8_t  rep_hist_len;                        // 0 = absent, else bucket count
+    int64_t  def_hist[kPqMaxLevelHistBuckets];
+    int64_t  rep_hist[kPqMaxLevelHistBuckets];
 };
 
 // One SortingColumn entry (RowGroup field 4, B6): declares this row group is

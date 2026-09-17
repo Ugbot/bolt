@@ -1219,6 +1219,13 @@ target_link_libraries(test_bolt_parquet_write_kv_metadata
 bolt_apply_hardening(test_bolt_parquet_write_kv_metadata)
 add_test(NAME test_bolt_parquet_write_kv_metadata COMMAND test_bolt_parquet_write_kv_metadata)
 
+# G2PQ-25: ColumnMetaData.size_statistics (field 16). scripts/parquet_size_statistics_check.py holds the assertions.
+add_executable(test_bolt_parquet_write_size_statistics test_bolt_parquet_write_size_statistics.cpp)
+target_link_libraries(test_bolt_parquet_write_size_statistics
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_size_statistics)
+add_test(NAME test_bolt_parquet_write_size_statistics COMMAND test_bolt_parquet_write_size_statistics)
+
 # Writer: BYTE_STREAM_SPLIT + the three DELTA encodings. bolt's reader already
 # decoded all four; these close the asymmetry and sweep block/miniblock
 # boundaries, bit widths, int64 delta wraparound and front-coding edge shapes.
