@@ -298,11 +298,14 @@ struct PageRec {
 };
 
 // G2PQ-25: SizeStatistics histogram bucket caps for what bolt's OWN writer
-// ever emits (flat columns never get a histogram; a LIST leaf's max_def is 2
-// or 3 and max_rep is 1 -- see chunk_write_list). Not a general reader-side
-// bound; that lives in bolt_parquet_meta.h as kPqMaxLevelHistBuckets.
-constexpr std::size_t kPqWMaxDefBuckets = 4;
-constexpr std::size_t kPqWMaxRepBuckets = 2;
+// ever emits (flat columns never get a histogram). G2PQ-27 widened this from
+// a single LIST level (max_def 2 or 3, max_rep 1) to a chain of up to
+// kPwMaxListDepth nested LIST levels: worst case (every level AND the leaf
+// nullable) is max_def == 2*kPwMaxListDepth + 1, max_rep == kPwMaxListDepth.
+// Not a general reader-side bound; that lives in bolt_parquet_meta.h as
+// kPqMaxLevelHistBuckets.
+constexpr std::size_t kPqWMaxDefBuckets = 2u * kPwMaxListDepth + 2u;
+constexpr std::size_t kPqWMaxRepBuckets = kPwMaxListDepth + 1u;
 
 struct ChunkRec {
     std::int64_t num_values;
@@ -472,6 +475,26 @@ bool sink_ok(const ParquetWriter* w) noexcept {
 
 bool type_supported_flat(const ParquetWriteColumn& c) noexcept;
 
+// G2PQ-27: normalizes a LIST column's nesting chain to `out[0..depth)`.
+// list_depth == 0 (every pre-G2PQ-27 caller) yields depth 1 built from the
+// legacy element_type/element_nullable pair -- byte-for-byte the same chain
+// this column always described, so centralizing the read here changes no
+// existing caller's behavior. list_depth >= 1 uses list_levels verbatim.
+// Returns 0 (invalid) if list_depth exceeds kPwMaxListDepth.
+std::uint32_t list_chain(const ParquetWriteColumn& sch,
+                         ParquetListLevel out[kPwMaxListDepth]) noexcept {
+    assert(sch.type == BoltType::List);
+    assert(out != nullptr);
+    if (sch.list_depth == 0u) {
+        out[0].type = sch.element_type;
+        out[0].nullable = sch.element_nullable;
+        return 1u;
+    }
+    if (sch.list_depth > kPwMaxListDepth) return 0u;
+    for (std::uint32_t i = 0; i < sch.list_depth; ++i) out[i] = sch.list_levels[i];
+    return sch.list_depth;
+}
+
 bool type_supported(const ParquetWriteColumn& c) noexcept {
     switch (c.type) {
         case BoltType::Bool:
@@ -488,17 +511,24 @@ bool type_supported(const ParquetWriteColumn& c) noexcept {
             // Tolerate p=0 (no statistics use scale) but require scale < 38.
             return c.scale <= 38u && c.precision <= 38u;
         case BoltType::List: {
-            // A LIST is only as writable as its ELEMENT, and the element must
-            // itself be a flat type -- one level of nesting, mirroring what
-            // the reader assembles. A list of lists is refused here rather
-            // than producing a schema the reader would then decline.
-            if (c.element_type == BoltType::List ||
-                c.element_type == BoltType::Struct ||
-                c.element_type == BoltType::Map) {
+            // G2PQ-27: every non-terminal chain level must continue as List;
+            // the terminal level must be a flat leaf type -- STRUCT/MAP are
+            // still refused (see the header's "out of scope" note), and a
+            // list of lists is now WRITABLE up to kPwMaxListDepth rather
+            // than refused outright.
+            ParquetListLevel chain[kPwMaxListDepth];
+            const std::uint32_t depth = list_chain(c, chain);
+            if (depth == 0u) return false;
+            for (std::uint32_t i = 0; i + 1u < depth; ++i) {
+                if (chain[i].type != BoltType::List) return false;
+            }
+            const ParquetListLevel& leaf = chain[depth - 1u];
+            if (leaf.type == BoltType::List || leaf.type == BoltType::Struct ||
+                leaf.type == BoltType::Map) {
                 return false;
             }
             ParquetWriteColumn e{};
-            e.type = c.element_type;
+            e.type = leaf.type;
             e.scale = c.scale;
             e.precision = c.precision;
             return type_supported_flat(e);
@@ -1646,67 +1676,161 @@ bool chunk_build_bloom(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
 // An empty list and a null list are different values that both occupy one
 // leaf slot and carry no element; only the definition level separates them,
 // which is why they are spelled out here rather than derived.
-struct ListLevels {
+// G2PQ-27: rep/def levels for a chain of `depth` nested LIST levels
+// (depth == 1 is the original single-level shape). One leaf slot per row for
+// a NULL/EMPTY list at ANY level (the point where the path stops), or per
+// LEAF value once the chain bottoms out -- generalizing the depth==1
+// three-way NULL/EMPTY/value split to every level independently.
+struct NestedListLevels {
     std::vector<std::uint8_t> rep;      // one per leaf slot
     std::vector<std::uint8_t> def;
     std::vector<std::int64_t> row_slot; // row -> first leaf slot (rows+1)
-    std::int64_t n_elems;
-    // Index of this slice's FIRST element in the (unsliced) element column.
-    // Non-zero for every row group after the first: a list column is sliced
-    // by advancing its OFFSETS, and the values in those offsets stay absolute
-    // indices into one shared element array. Ignoring this wrote every row
-    // group's elements starting from element 0 of the whole column -- wrong
-    // values, and a count disagreeing with the levels beside them, which
-    // pyarrow rejects outright as "Unexpected end of stream".
+    std::int64_t n_leaves;              // slots that reached the terminal level
+    // Absolute index of this slice's FIRST terminal-level (leaf) row in the
+    // (unsliced) leaf column -- see build_nested_list_levels. Same role as
+    // the depth==1 writer's old `elem_base`, generalized via chain_leaf_index
+    // rather than a single offs[0] read.
     std::int64_t elem_base;
+    std::uint8_t max_def;
+    std::uint8_t max_rep;               // == depth
+    std::uint32_t depth;
 };
 
-bool build_list_levels(const BoltColumn& col, const ParquetWriteColumn& sch,
-                       std::int64_t n_rows, ListLevels* out) noexcept {
+// Per-level definition-level accounting, precomputed once from the SCHEMA
+// (never from data) so every row's walk reuses the same small table. Follows
+// the Dremel rule bolt_parquet_meta.cpp's schema walk already uses on the
+// read side: each level contributes (own OPTIONAL bit ? 1 : 0) + 1 (the
+// ALWAYS-repeated "list" group), and the terminal level additionally adds its
+// own OPTIONAL bit for the leaf value itself.
+struct ChainDefBase {
+    std::uint8_t base_def_null[kPwMaxListDepth];   // def when level k is NULL
+    std::uint8_t base_def_empty[kPwMaxListDepth];  // def when level k is EMPTY (present, 0 children)
+    std::uint8_t base_def_full[kPwMaxListDepth];   // def after fully entering level k's iteration
+    std::uint8_t max_def;
+};
+
+void compute_chain_def_base(const ParquetWriteColumn& sch,
+                            const ParquetListLevel chain[kPwMaxListDepth],
+                            std::uint32_t depth, ChainDefBase* out) noexcept {
+    assert(out != nullptr);
+    assert(depth >= 1u && depth <= kPwMaxListDepth);
+    std::uint8_t acc = 0u;
+    bool level_nullable = sch.nullable;   // level 0's own group nullability
+    for (std::uint32_t k = 0; k < depth; ++k) {
+        out->base_def_null[k] = acc;
+        out->base_def_empty[k] = static_cast<std::uint8_t>(acc + (level_nullable ? 1u : 0u));
+        acc = static_cast<std::uint8_t>(acc + (level_nullable ? 1u : 0u) + 1u);
+        out->base_def_full[k] = acc;
+        level_nullable = chain[k].nullable;   // next level's (or the leaf's) own bit
+    }
+    out->max_def = static_cast<std::uint8_t>(acc + (chain[depth - 1u].nullable ? 1u : 0u));
+}
+
+// Chases `depth` list_offsets() dereferences from `idx` (an index into
+// `start`'s own element space -- ROW space when start is the outer column)
+// down to the flattened TERMINAL level's index space. Used both to locate
+// the leaf-column slice for a row range and, generalizing the depth==1
+// writer's `elem_base`, without any per-slot counting: nested BoltColumn
+// arrays are contiguous at every level (Arrow's own flattening contract), so
+// a row-index range maps to a contiguous terminal-index range in one O(depth)
+// walk rather than an O(slots) scan.
+std::int64_t chain_leaf_index(const BoltColumn* start, std::int64_t idx,
+                              std::uint32_t depth) noexcept {
+    assert(start != nullptr);
+    assert(depth >= 1u && depth <= kPwMaxListDepth);
+    const BoltColumn* cur = start;
+    for (std::uint32_t k = 0; k < depth; ++k) {
+        const std::int32_t* offs = cur->list_offsets();
+        assert(offs != nullptr);
+        idx = static_cast<std::int64_t>(offs[idx]);
+        cur = cur->list_element();
+        assert(cur != nullptr);
+    }
+    return idx;
+}
+
+const BoltColumn* chain_leaf_column(const BoltColumn* start,
+                                    std::uint32_t depth) noexcept {
+    assert(start != nullptr);
+    const BoltColumn* cur = start;
+    for (std::uint32_t k = 0; k < depth; ++k) cur = cur->list_element();
+    return cur;
+}
+
+// Recursively emits one occurrence of level `k`'s own list value (indexed by
+// `idx` into level_col's own offsets) -- the inverse of Dremel record
+// assembly, one nesting level at a time. `rep_in` is the repetition value
+// for the FIRST slot this call produces; `rep_level` is level k's own
+// (1-indexed) repetition level, used for every slot after the first.
+void walk_nested_list_level(const BoltColumn* level_col, std::int64_t idx,
+                            std::uint8_t rep_level, std::uint8_t rep_in,
+                            std::uint32_t k, const ParquetListLevel chain[kPwMaxListDepth],
+                            const ChainDefBase& base, NestedListLevels* out) noexcept {
+    assert(level_col != nullptr && out != nullptr);
+    assert(k < kPwMaxListDepth);
+    const bool present = read_valid(level_col->validity, level_col->validity_offset, idx) != 0u;
+    if (!present) {
+        out->rep.push_back(rep_in);
+        out->def.push_back(base.base_def_null[k]);
+        return;
+    }
+    const std::int32_t* offs = level_col->list_offsets();
+    const std::int32_t lo = offs[idx];
+    const std::int32_t hi = offs[idx + 1];
+    if (hi <= lo) {
+        out->rep.push_back(rep_in);
+        out->def.push_back(base.base_def_empty[k]);
+        return;
+    }
+    const bool terminal = (chain[k].type != BoltType::List);
+    const BoltColumn* child = level_col->list_element();
+    for (std::int32_t e = lo; e < hi; ++e) {
+        const std::uint8_t r = (e == lo) ? rep_in : rep_level;
+        if (!terminal) {
+            walk_nested_list_level(child, e, static_cast<std::uint8_t>(rep_level + 1u),
+                                   r, k + 1u, chain, base, out);
+            continue;
+        }
+        bool valid = true;
+        if (chain[k].nullable) {
+            valid = read_valid(child->validity, child->validity_offset, e) != 0u;
+        }
+        out->rep.push_back(r);
+        out->def.push_back(valid ? base.max_def : base.base_def_full[k]);
+        // n_leaves counts PHYSICAL leaf-array slots (present-null included --
+        // a null element still occupies a row in the child array, only its
+        // value is unencoded), not just valid values, matching the depth==1
+        // writer's n_elems. Miscounting this undercounts whenever any leaf
+        // is null, corrupting the e0/e1 range chain_leaf_index derives below
+        // -- found via the leaf_nullable=true pyarrow fixture ("Unexpected
+        // end of stream"); the leaf_nullable=false fixture couldn't catch it
+        // because `valid` is then unconditionally true.
+        ++out->n_leaves;
+    }
+}
+
+bool build_nested_list_levels(const BoltColumn& col, const ParquetWriteColumn& sch,
+                              std::int64_t n_rows, const ParquetListLevel chain[kPwMaxListDepth],
+                              std::uint32_t depth, const ChainDefBase& base,
+                              NestedListLevels* out) noexcept {
     assert(out != nullptr);
     if (col.format != ColumnFormat::Nested) return false;
     if (col.type != BoltType::List && col.type != BoltType::Map) return false;
-    const std::int32_t* offs = col.list_offsets();
-    const BoltColumn* elem = col.list_element();
-    if (offs == nullptr || elem == nullptr) return false;
-
-    const std::uint8_t max_def =
-        static_cast<std::uint8_t>(sch.element_nullable ? 3u : 2u);
+    if (col.list_offsets() == nullptr || col.list_element() == nullptr) return false;
     out->rep.clear();
     out->def.clear();
     out->row_slot.assign(static_cast<std::size_t>(n_rows) + 1u, 0);
-    out->n_elems = 0;
-    out->elem_base = (n_rows > 0) ? static_cast<std::int64_t>(offs[0]) : 0;
+    out->n_leaves = 0;
+    out->max_def = base.max_def;
+    out->max_rep = static_cast<std::uint8_t>(depth);
+    out->depth = depth;
+    out->elem_base = (n_rows > 0)
+        ? chain_leaf_index(&col, 0, depth)
+        : 0;
     for (std::int64_t r = 0; r < n_rows; ++r) {
         out->row_slot[static_cast<std::size_t>(r)] =
             static_cast<std::int64_t>(out->rep.size());
-        const bool present = (col.validity == nullptr) ||
-            (((col.validity[(col.validity_offset + r) >> 3] >>
-               ((col.validity_offset + r) & 7)) & 1u) != 0u);
-        const std::int32_t lo = offs[r];
-        const std::int32_t hi = offs[r + 1];
-        if (hi < lo) return false;
-        if (!present) {                       // NULL list
-            out->rep.push_back(0u);
-            out->def.push_back(0u);
-            continue;
-        }
-        if (hi == lo) {                       // EMPTY list, present
-            out->rep.push_back(0u);
-            out->def.push_back(1u);
-            continue;
-        }
-        for (std::int32_t e = lo; e < hi; ++e) {
-            out->rep.push_back(static_cast<std::uint8_t>((e == lo) ? 0u : 1u));
-            bool evalid = true;
-            if (sch.element_nullable && elem->validity != nullptr) {
-                const std::int64_t bit = elem->validity_offset + e;
-                evalid = ((elem->validity[bit >> 3] >> (bit & 7)) & 1u) != 0u;
-            }
-            out->def.push_back(evalid ? max_def
-                                      : static_cast<std::uint8_t>(2u));
-            ++out->n_elems;
-        }
+        walk_nested_list_level(&col, r, 1u, 0u, 0u, chain, base, out);
     }
     out->row_slot[static_cast<std::size_t>(n_rows)] =
         static_cast<std::int64_t>(out->rep.size());
@@ -1735,20 +1859,30 @@ bool encode_level_stream(const std::uint8_t* lv, std::size_t n,
     return true;
 }
 
-// One LIST column chunk. Pages are cut on ROW boundaries -- a data page must
-// contain whole records, so a page may never start mid-list.
+// One LIST column chunk (any nesting depth -- G2PQ-27 generalizes the
+// original single-level writer in place). Pages are cut on ROW boundaries --
+// a data page must contain whole records, so a page may never start mid-list
+// at any nesting level.
 bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
                       const BoltColumn& col, const ParquetWriteColumn& sch,
                       std::int64_t n_rows, ChunkRec* rec) noexcept {
     assert(w != nullptr && rec != nullptr && out != nullptr);
-    ListLevels lv;
-    if (!build_list_levels(col, sch, n_rows, &lv)) return false;
-    // Slice the ELEMENT column to this row group's element range, once, so
+    ParquetListLevel chain[kPwMaxListDepth];
+    const std::uint32_t depth = list_chain(sch, chain);
+    if (depth == 0u) return false;
+    ChainDefBase base;
+    compute_chain_def_base(sch, chain, depth, &base);
+
+    NestedListLevels lv;
+    if (!build_nested_list_levels(col, sch, n_rows, chain, depth, base, &lv)) {
+        return false;
+    }
+    // Slice the LEAF column to this row group's element range, once, so
     // every index below stays slice-relative. The alternative -- absolute
-    // indices -- has to be applied to the value range, the element validity
+    // indices -- has to be applied to the value range, the leaf validity
     // bytes and the statistics range in step, and missing any one of them
     // writes a page whose declared value count disagrees with its payload.
-    const BoltColumn* elem_full = col.list_element();
+    const BoltColumn* elem_full = chain_leaf_column(&col, depth);
     if (elem_full == nullptr) return false;
     BoltColumn elem_sliced = *elem_full;
     if (lv.elem_base > 0) {
@@ -1760,11 +1894,12 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         elem_sliced.length = elem_full->length - lv.elem_base;
     }
     const BoltColumn* elem = &elem_sliced;
-    const std::uint8_t max_def = static_cast<std::uint8_t>(
-        sch.element_nullable ? 3u : 2u);
+    const std::uint8_t max_def = lv.max_def;
+    const BoltType leaf_type = chain[depth - 1u].type;
+    const bool leaf_nullable = chain[depth - 1u].nullable;
 
-    // The chunk describes LEAF values, so num_values counts slots and
-    // null_count counts slots carrying no present element.
+    // The chunk describes LEAF slots, so num_values counts slots and
+    // null_count counts slots carrying no present terminal value.
     rec->num_values = static_cast<std::int64_t>(lv.rep.size());
     rec->null_count = 0;
     for (std::size_t i = 0; i < lv.def.size(); ++i) {
@@ -1773,34 +1908,36 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     rec->null_count_known = true;
     rec->encoding = kEncPlain;
 
-    // Element validity as the flat encoders expect: one byte per element.
+    // Leaf validity as the flat encoders expect: one byte per leaf slot.
     std::vector<std::uint8_t> ebits;
-    const bool enullable = sch.element_nullable && elem->validity != nullptr;
+    const bool enullable = leaf_nullable && elem->validity != nullptr;
     if (enullable) {
-        ebits.resize(static_cast<std::size_t>(lv.n_elems), 1u);
-        for (std::int64_t e = 0; e < lv.n_elems; ++e) {
+        ebits.resize(static_cast<std::size_t>(lv.n_leaves), 1u);
+        for (std::int64_t e = 0; e < lv.n_leaves; ++e) {
             const std::int64_t bit = elem->validity_offset + e;
             ebits[static_cast<std::size_t>(e)] =
                 ((elem->validity[bit >> 3] >> (bit & 7)) & 1u) ? 1u : 0u;
         }
     }
+    ParquetWriteColumn eschema = sch;
+    eschema.type = leaf_type;
+    eschema.list_depth = 0;   // eschema describes the LEAF's own flat type
     if (w->opts.emit_statistics) {
-        ParquetWriteColumn eschema = sch;
-        eschema.type = sch.element_type;
-        (void)compute_stats(*elem, 0, lv.n_elems,
+        (void)compute_stats(*elem, 0, lv.n_leaves,
                             enullable ? ebits.data() : nullptr, enullable,
                             &rec->st);
     }
-    // G2PQ-25: a LIST leaf's max_def (2 or 3, unlike a flat column's 0/1) and
-    // max_rep (1) are both outside the spec's "may omit without loss of
-    // information" carve-out, so the histograms carry real information here
-    // -- lv.rep/lv.def are already fully materialized by build_list_levels,
-    // so this is one cheap counting pass, not a second levels computation.
+    // G2PQ-25: a nested LIST leaf's max_def/max_rep exceed a flat column's
+    // 0/1, so both are outside the spec's "may omit without loss of
+    // information" carve-out -- lv.rep/lv.def are already fully materialized
+    // by build_nested_list_levels, so this is one cheap counting pass, not a
+    // second levels computation.
     if (w->opts.emit_size_statistics) {
         assert(max_def < kPqWMaxDefBuckets);
+        assert(lv.max_rep < kPqWMaxRepBuckets);
         rec->level_hist_known = true;
         rec->max_def = max_def;
-        rec->max_rep = 1u;
+        rec->max_rep = lv.max_rep;
         std::memset(rec->def_hist, 0, sizeof(rec->def_hist));
         std::memset(rec->rep_hist, 0, sizeof(rec->rep_hist));
         for (std::size_t i = 0; i < lv.def.size(); ++i) {
@@ -1809,10 +1946,9 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
             rec->def_hist[lv.def[i]] += 1;
             rec->rep_hist[lv.rep[i]] += 1;
         }
-        if (sch.element_type == BoltType::Utf8 ||
-            sch.element_type == BoltType::Binary) {
+        if (leaf_type == BoltType::Utf8 || leaf_type == BoltType::Binary) {
             std::int64_t bytes = 0;
-            if (sum_byte_array_data_bytes(*elem, 0, lv.n_elems,
+            if (sum_byte_array_data_bytes(*elem, 0, lv.n_leaves,
                                           enullable ? ebits.data() : nullptr,
                                           enullable, &bytes)) {
                 rec->byte_array_bytes_known = true;
@@ -1822,8 +1958,6 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     }
 
     const std::uint64_t budget = page_budget_bytes(w->opts);
-    ParquetWriteColumn eschema = sch;
-    eschema.type = sch.element_type;
     std::vector<std::uint8_t> vals, payload;
     std::int64_t r0 = 0;
     std::uint32_t pages = 0;
@@ -1841,11 +1975,11 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         }
         const std::int64_t s0 = lv.row_slot[static_cast<std::size_t>(r0)];
         const std::int64_t s1 = lv.row_slot[static_cast<std::size_t>(r1)];
-        // Element range for these rows: count present elements before s0.
-        std::int64_t e0 = 0;
-        for (std::int64_t i = 0; i < s0; ++i) e0 += (lv.def[i] >= 2u) ? 1 : 0;
-        std::int64_t e1 = e0;
-        for (std::int64_t i = s0; i < s1; ++i) e1 += (lv.def[i] >= 2u) ? 1 : 0;
+        // Leaf-array range for these rows: chase the SAME depth dereferences
+        // used for elem_base, relative to that base -- contiguous by
+        // construction, so no per-slot counting is needed.
+        const std::int64_t e0 = chain_leaf_index(&col, r0, depth) - lv.elem_base;
+        const std::int64_t e1 = chain_leaf_index(&col, r1, depth) - lv.elem_base;
 
         vals.clear();
         if (!encode_plain_range(*elem, eschema, e0, e1,
@@ -1856,7 +1990,7 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         payload.clear();
         // v1 order: repetition levels first, then definition levels.
         if (!encode_level_stream(lv.rep.data() + s0,
-                                 static_cast<std::size_t>(s1 - s0), 1u,
+                                 static_cast<std::size_t>(s1 - s0), lv.max_rep,
                                  &payload)) {
             return false;
         }
@@ -2043,7 +2177,7 @@ void write_schema_element_col(TcOut* o,
     tc_put_stop(o);
 }
 
-// A LIST column is three SchemaElements, not one:
+// A single-level LIST column is three SchemaElements, not one:
 //
 //   optional group <name> (LIST) {        // num_children = 1
 //     repeated group list {               // num_children = 1
@@ -2051,47 +2185,82 @@ void write_schema_element_col(TcOut* o,
 //     }
 //   }
 //
-// That exact shape is what makes bolt's own reader derive list_def = 1 and
-// rep_def = 2 (and pyarrow name the leaf "<name>.list.element"). Emitting a
-// 2-level legacy list instead would still parse, but every consumer would
-// compute different levels.
+// G2PQ-27 generalizes this to a chain of `depth` nested LIST levels by
+// recursing: each level after the first is named "element" and reopens as
+// another LIST group, per the canonical convention (parquet-format
+// LogicalTypes.md "List<List<Integer>>" example) --
+//
+//   optional group <name> (LIST) {
+//     repeated group list {
+//       <optional|required> group element (LIST) {
+//         repeated group list {
+//           ...
+//         }
+//       }
+//     }
+//   }
+//
+// depth == 1 emits byte-for-byte the same three elements as before this
+// ticket. That exact shape is what makes bolt's own reader derive list_def/
+// rep_def correctly (and pyarrow name the leaf "<name>.list.element[...]").
+// Emitting a 2-level legacy list instead would still parse, but every
+// consumer would compute different levels.
 void write_schema_elements_list(TcOut* o,
                                 const ParquetWriteColumn& c) noexcept {
     assert(c.type == BoltType::List);
-    // 1. the outer LIST group
-    tc_put_field(o, 3, kFI32);
-    tc_put_zigzag(o, c.nullable ? kRepOptional : kRepRequired);
-    tc_put_field(o, 4, kFBinary);
-    tc_put_string(o, c.name);
-    tc_put_field(o, 5, kFI32);
-    tc_put_zigzag(o, 1);                       // num_children
-    tc_put_field(o, 6, kFI32);
-    tc_put_zigzag(o, kConvList);
-    tc_put_stop(o);
-    // 2. the repeated group. Named "list" because that is what parquet-mr,
-    //    Arrow and pyarrow all emit; the name is not load-bearing for
-    //    correctness but it is what tools display.
-    tc_put_field(o, 3, kFI32);
-    tc_put_zigzag(o, kRepRepeated);
-    tc_put_field(o, 4, kFBinary);
-    tc_put_string(o, "list");
-    tc_put_field(o, 5, kFI32);
-    tc_put_zigzag(o, 1);
-    tc_put_stop(o);
-    // 3. the element leaf
-    ParquetWriteColumn leaf{};
-    leaf.type = c.element_type;
-    leaf.nullable = c.element_nullable;
-    leaf.precision = c.precision;
-    leaf.scale = c.scale;
-    leaf.logical = c.logical;
-    std::strncpy(leaf.name, "element", sizeof(leaf.name) - 1);
-    write_schema_element_col(o, leaf);
+    ParquetListLevel chain[kPwMaxListDepth];
+    const std::uint32_t depth = list_chain(c, chain);
+    assert(depth >= 1u && depth <= kPwMaxListDepth);
+    bool group_nullable = c.nullable;
+    const char* group_name = c.name;
+    for (std::uint32_t k = 0; k < depth; ++k) {
+        // The outer LIST group for this level.
+        tc_put_field(o, 3, kFI32);
+        tc_put_zigzag(o, group_nullable ? kRepOptional : kRepRequired);
+        tc_put_field(o, 4, kFBinary);
+        tc_put_string(o, group_name);
+        tc_put_field(o, 5, kFI32);
+        tc_put_zigzag(o, 1);                       // num_children
+        tc_put_field(o, 6, kFI32);
+        tc_put_zigzag(o, kConvList);
+        tc_put_stop(o);
+        // The repeated group. Named "list" because that is what parquet-mr,
+        // Arrow and pyarrow all emit; the name is not load-bearing for
+        // correctness but it is what tools display.
+        tc_put_field(o, 3, kFI32);
+        tc_put_zigzag(o, kRepRepeated);
+        tc_put_field(o, 4, kFBinary);
+        tc_put_string(o, "list");
+        tc_put_field(o, 5, kFI32);
+        tc_put_zigzag(o, 1);
+        tc_put_stop(o);
+        if (chain[k].type == BoltType::List) {
+            // Continue nesting: the next level's own outer group is named
+            // "element", per the canonical convention.
+            group_nullable = chain[k].nullable;
+            group_name = "element";
+            continue;
+        }
+        // The terminal leaf.
+        ParquetWriteColumn leaf{};
+        leaf.type = chain[k].type;
+        leaf.nullable = chain[k].nullable;
+        leaf.precision = c.precision;
+        leaf.scale = c.scale;
+        leaf.logical = c.logical;
+        std::strncpy(leaf.name, "element", sizeof(leaf.name) - 1);
+        write_schema_element_col(o, leaf);
+    }
 }
 
-// How many SchemaElements a column contributes to the footer.
+// How many SchemaElements a column contributes to the footer: 1 for a flat
+// column, 2*depth + 1 for a LIST chain (each level is an outer-group
+// SchemaElement + a "list"-repeated SchemaElement, plus one terminal leaf).
 std::uint32_t schema_element_count(const ParquetWriteColumn& c) noexcept {
-    return (c.type == BoltType::List) ? 3u : 1u;
+    if (c.type != BoltType::List) return 1u;
+    ParquetListLevel chain[kPwMaxListDepth];
+    const std::uint32_t depth = list_chain(c, chain);
+    return 2u * depth + 1u;
 }
 
 // list<KeyValue>: KV::key/value must be NUL-terminated char arrays --
@@ -2152,9 +2321,13 @@ void write_size_statistics(TcOut* o, const ChunkRec& rec) noexcept {
 void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ParquetWriteColumn& sch,
                        const ChunkRec& rec) noexcept {
+    ParquetListLevel meta_chain[kPwMaxListDepth];
+    const std::uint32_t meta_depth =
+        (sch.type == BoltType::List) ? list_chain(sch, meta_chain) : 0u;
     tc_put_field(o, 1, kFI32);
     tc_put_zigzag(o, bolt_to_pq_physical(
-        (sch.type == BoltType::List) ? sch.element_type : sch.type));
+        (sch.type == BoltType::List) ? meta_chain[meta_depth - 1u].type
+                                     : sch.type));
     // encodings: the set actually used by this chunk. RLE always appears --
     // it encodes the definition levels even for a REQUIRED column's absent
     // stream, and parquet-mr lists it unconditionally. A dictionary chunk
@@ -2175,14 +2348,18 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
         tc_put_zigzag(o, kEncPlain);
         tc_put_zigzag(o, kEncRle);
     }
-    // path_in_schema. A LIST's chunk describes its LEAF, so the path is the
-    // three-segment one the schema above declares.
+    // path_in_schema. A LIST's chunk describes its LEAF, so the path walks
+    // every SchemaElement name from root to leaf -- [name, "list", "element"]
+    // repeated once per nesting level (G2PQ-27), 3 segments for depth == 1
+    // exactly as before.
     tc_put_field(o, 3, kFList);
     if (sch.type == BoltType::List) {
-        tc_put_list_hdr(o, kFBinary, 3);
+        tc_put_list_hdr(o, kFBinary, 1u + 2u * meta_depth);
         tc_put_string(o, sch.name);
-        tc_put_string(o, "list");
-        tc_put_string(o, "element");
+        for (std::uint32_t k = 0; k < meta_depth; ++k) {
+            tc_put_string(o, "list");
+            tc_put_string(o, "element");
+        }
     } else {
         tc_put_list_hdr(o, kFBinary, 1);
         tc_put_string(o, sch.name);
@@ -2481,8 +2658,17 @@ ParquetWriter* parquet_write_open(const char* path,
         }
         {
             const ParquetWriteColumn& pc = opts->columns[i];
-            const BoltType et = (pc.type == BoltType::List) ? pc.element_type
-                                                            : pc.type;
+            BoltType et = pc.type;
+            if (pc.type == BoltType::List) {
+                // G2PQ-27: validate against the CHAIN's terminal leaf type,
+                // not the (possibly List-continuing) legacy element_type
+                // field -- a nested list's requested encoding still names
+                // what the leaf physically is.
+                ParquetListLevel chain[kPwMaxListDepth];
+                const std::uint32_t depth = list_chain(pc, chain);
+                if (depth == 0u) return nullptr;
+                et = chain[depth - 1u].type;
+            }
             if (!encoding_applies(
                     static_cast<PqWriteEncoding>(pc.encoding), et)) {
                 return nullptr;
@@ -2565,8 +2751,13 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
         }
         {
             const ParquetWriteColumn& pc = opts->columns[i];
-            const BoltType et = (pc.type == BoltType::List) ? pc.element_type
-                                                            : pc.type;
+            BoltType et = pc.type;
+            if (pc.type == BoltType::List) {
+                ParquetListLevel chain[kPwMaxListDepth];
+                const std::uint32_t depth = list_chain(pc, chain);
+                if (depth == 0u) return nullptr;
+                et = chain[depth - 1u].type;
+            }
             if (!encoding_applies(
                     static_cast<PqWriteEncoding>(pc.encoding), et)) {
                 return nullptr;

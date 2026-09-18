@@ -32,7 +32,20 @@
 //                  column. An EMPTY list and a NULL list are distinct values
 //                  and both round-trip. Element type/nullability come from
 //                  ParquetWriteColumn::element_type / element_nullable.
-//                  One level of nesting only, mirroring the reader.
+//   - LIST (nested, G2PQ-27): the 3-level shape recurses when the element
+//                  is itself a List -- optional group <name> (LIST) {
+//                  repeated group list { optional group element (LIST) {
+//                  repeated group list { ... } } } } -- bounded to
+//                  kPwMaxListDepth successive levels, declared via
+//                  ParquetWriteColumn::list_depth / list_levels. Repetition
+//                  and definition levels are generated for the full chain
+//                  (max_rep == depth); NULL/EMPTY is distinct and round-trips
+//                  at every level, independently. Still ONE physical leaf
+//                  chunk (PLAIN only, matching the single-level case above --
+//                  neither gets dictionary/DELTA/BYTE_STREAM_SPLIT/bloom).
+//                  STRUCT/MAP terminal element types remain out of scope
+//                  (see below) -- a chain must still terminate in a flat
+//                  leaf type.
 //   - types:       Int32, Int64, Float32, Float64, Utf8, Binary,
 //                  Decimal128 (FLBA(16) BE two's-complement),
 //                  Date32 (INT32), Timestamp[us] (INT64 isAdjustedToUTC=true),
@@ -70,7 +83,20 @@
 //                  ARROW:schema or an Iceberg-style small column annotation.
 //
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - MAP / STRUCT columns (LIST is supported; see below)
+//   - MAP / STRUCT columns (LIST, including nested LIST-of-LIST, is
+//     supported; see below). Both need one logical schema field to expand
+//     into MULTIPLE physical column chunks (each struct field / each of a
+//     map's key and value is its own leaf ColumnChunk with its own
+//     multi-segment path_in_schema) -- this writer's row-group loop
+//     (write_one_row_group / encode_wave_task / place_chunk / the footer's
+//     schema+path_in_schema emission) currently assumes exactly one
+//     physical chunk per ParquetWriteColumn slot, which a nested LIST still
+//     satisfies (deeper repetition, not a new column) but STRUCT/MAP do
+//     not. A follow-up would separate "schema slot count" from "physical
+//     leaf chunk count" (e.g. group-marker columns + a parent-group index,
+//     so a struct's fields are declared as ordinary leaf ParquetWriteColumn
+//     entries that inherit definition levels from their enclosing group) --
+//     tracked as a distinct ticket rather than folded into G2PQ-27.
 //   - encryption
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
@@ -163,6 +189,21 @@ struct ParquetColumnKeyValue {
     char value[kPwColKvValBytes];
 };
 
+// G2PQ-27: one level of a nested LIST chain (LIST<LIST<...<T>>>). `type` is
+// BoltType::List to continue nesting one level deeper or a flat leaf type to
+// terminate; `nullable` is that level's own OPTIONAL/REQUIRED bit.
+struct ParquetListLevel {
+    BoltType type;
+    bool     nullable;
+};
+
+// Bound on LIST nesting depth (element_type counts as depth 1; list_levels
+// covers up to this many successive levels). Small and fixed, matching
+// ParquetWriteColumn's "PODs at the API edge, no std::vector" rule -- a
+// caller that genuinely needs deeper nesting is a sign this cap should grow,
+// not a reason to reach for a dynamic container here.
+inline constexpr std::uint32_t kPwMaxListDepth = 4;
+
 // One column's worth of writer-side schema. Fixed-size POD.
 struct ParquetWriteColumn {
     char         name[64];      // NUL-terminated; truncated past 63 chars.
@@ -183,6 +224,20 @@ struct ParquetWriteColumn {
     // "<name>.list.element".
     BoltType     element_type;
     bool         element_nullable;
+    // G2PQ-27 — nested LIST (LIST<LIST<...<T>>>). A deeper list is still ONE
+    // physical leaf column (repetition levels, not new columns), so it fits
+    // this same ParquetWriteColumn slot. list_depth == 0 (the zero-init
+    // default) keeps the exact v1 single-level behavior driven by
+    // element_type/element_nullable above -- list_levels is ignored, and
+    // every caller that predates this ticket is byte-for-byte unaffected.
+    // list_depth >= 1 switches to list_levels[0..list_depth): level i
+    // describes the element of nesting level i (0 = the outer column's own
+    // element); its `type` is BoltType::List to continue nesting or the LEAF
+    // scalar type to terminate, and element_type/element_nullable are then
+    // ignored. STRUCT/MAP fields are still refused (see the file's "out of
+    // scope" note) -- a terminal level's type must be a flat leaf type.
+    std::uint32_t     list_depth;
+    ParquetListLevel  list_levels[kPwMaxListDepth];
     // G2ICE-117 — the parquet SchemaElement's Thrift field 9 (`field_id`).
     // Unset (has_field_id=false, the zero-init default) writes no field 9 at
     // all, matching every existing caller's on-disk output exactly. A caller

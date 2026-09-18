@@ -1343,6 +1343,19 @@ add_test(NAME test_bolt_parquet_page_crc COMMAND test_bolt_parquet_page_crc)
 # levels -- a writer/reader pair sharing a misreading agree perfectly, and a
 # level bug preserves row counts and values while moving list contents.
 
+# G2PQ-27: NESTED LIST writing (LIST<LIST<...<T>>>) -- "B7" of the parquet
+# spec-conformance epic. Generalizes the single-level writer above to a
+# bounded chain of nesting levels. Same blind spot: bolt's own reader refuses
+# max_rep >= 2 at value assembly, so scripts/parquet_nested_list_interop.py
+# (pyarrow) is the real oracle for the fixtures this emits; this executable
+# also asserts the SCHEMA shape via parquet_read_meta, whose DFS walk is
+# depth-generic and succeeds independent of value assembly.
+add_executable(test_bolt_parquet_nested_list_write test_bolt_parquet_nested_list_write.cpp)
+target_link_libraries(test_bolt_parquet_nested_list_write
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_nested_list_write)
+add_test(NAME test_bolt_parquet_nested_list_write COMMAND test_bolt_parquet_nested_list_write)
+
 # JSON / BSON / VARIANT logical refinements. JSON is an annotation over Utf8
 # STORAGE (Arrow's own model), not a new physical type -- so the key property
 # is that a JSON column still reads as an ordinary string column.
