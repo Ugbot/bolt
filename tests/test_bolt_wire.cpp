@@ -223,7 +223,8 @@ TEST(BoltWire, VarBinaryRoundTrip) {
     }
 }
 
-TEST(BoltWire, VersionStampIsThree) {
+// G2ICE-143: bumped 3 -> 4 (Date32/Timestamp/Decimal128/Decimal64 support).
+TEST(BoltWire, VersionStampIsFour) {
     Arena arena;
     BoltBatch src;
     build_int32_batch(&src, &arena, 1, 1);
@@ -232,7 +233,7 @@ TEST(BoltWire, VersionStampIsThree) {
     ASSERT_EQ(wire::bolt_wire_serialize(&src, buf.data(), buf.size()), need);
     uint32_t version = 0;
     std::memcpy(&version, buf.data() + 4, sizeof(version));
-    EXPECT_EQ(version, 3u);
+    EXPECT_EQ(version, 4u);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,20 +614,23 @@ TEST(BoltWireZeroFill, AllNullColumnDifferential) {
     EXPECT_EQ(dst.col(0).validity[1], 0u);
 }
 
-// Bool — bit-packed b1 with trailing slack bits in the last byte.
+// Bool — byte-packed b1 (G2ICE-144: BoltColumn's real convention, matching
+// kTypeSize[Bool]==1 — 1 byte/row, NOT bit-packed), 13 rows so the trailing
+// 64-byte alignment pad has real slack to zero-fill.
 TEST(BoltWireZeroFill, BoolDifferential) {
     Arena arena_src, arena_dst;
+    constexpr int64_t kN = 13;
     BoltBatch src;
     BoltBatch::init_empty(&src);
-    src.arena = &arena_src; src.num_cols = 1; src.num_rows = 13;
+    src.arena = &arena_src; src.num_cols = 1; src.num_rows = kN;
     src.schema.num_fields = 1;
     BoltBatch::alloc_columns(&src, &arena_src, 1);
     set_field(&src, 0, "flag", BoltType::Bool, false);
-    BoltColumn col = BoltColumn::make_empty();
-    auto* bits = static_cast<uint8_t*>(arena_src.allocate(2, 1));
-    bits[0] = 0b01011010u; bits[1] = 0b00000101u;  // slack bits deliberately 0
-    col.data = bits; col.length = 13; col.format = ColumnFormat::Flat;
-    col.type = BoltType::Bool; col.type_size_bytes = 0;
+    BoltColumn col = BoltColumn::make_flat_alloc(kN, BoltType::Bool, &arena_src);
+    ASSERT_NE(col.data, nullptr);
+    auto* vals = static_cast<uint8_t*>(col.data);
+    const uint8_t pattern[kN] = { 1,0,1,1,0,0,1,0,1,0,0,1,1 };  // first+last true
+    std::memcpy(vals, pattern, kN);
     src.columns[0][0] = col; src.columns[1][0] = col;
 
     std::vector<uint8_t> img = serialize_differential(&src);
@@ -634,10 +638,138 @@ TEST(BoltWireZeroFill, BoolDifferential) {
     BoltBatch dst; BoltBatch::init_empty(&dst);
     ASSERT_TRUE(wire::bolt_wire_deserialize(img.data(), img.size(), &dst,
                                             &arena_dst));
-    const auto* dbits = static_cast<const uint8_t*>(dst.col(0).data);
-    ASSERT_NE(dbits, nullptr);
-    EXPECT_EQ(dbits[0], bits[0]);
-    EXPECT_EQ(dbits[1], bits[1]);
+    const auto* dvals = static_cast<const uint8_t*>(dst.col(0).data);
+    ASSERT_NE(dvals, nullptr);
+    for (int64_t r = 0; r < kN; ++r) EXPECT_EQ(dvals[r], pattern[r]) << "row " << r;
+}
+
+// G2ICE-144 regression pin: a Bool column's wire b1 span must be sized
+// byte-packed (N bytes for N rows), not bit-packed ((N+7)/8) — verified both
+// via the raw descriptor's b1_len field and a full round trip past the old
+// 8-row/1-byte boundary, with mixed values and both boundary rows true.
+TEST(BoltWire, BoolRoundTripBytePacked) {
+    Arena arena_src, arena_dst;
+    constexpr int64_t kN = 21;
+    BoltBatch src;
+    BoltBatch::init_empty(&src);
+    src.arena = &arena_src; src.num_cols = 1; src.num_rows = kN;
+    src.schema.num_fields = 1;
+    BoltBatch::alloc_columns(&src, &arena_src, 1);
+    set_field(&src, 0, "flag", BoltType::Bool, false);
+    BoltColumn col = BoltColumn::make_flat_alloc(kN, BoltType::Bool, &arena_src);
+    ASSERT_NE(col.data, nullptr);
+    auto* vals = static_cast<uint8_t*>(col.data);
+    const uint8_t pattern[kN] = {
+        1,0,0,1,1,0,1,0,0,1,0,1,1,1,0,0,0,1,0,1,1  // row0=1, row20=1
+    };
+    std::memcpy(vals, pattern, kN);
+    src.columns[0][0] = col; src.columns[1][0] = col;
+
+    const size_t need = wire::bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    std::vector<uint8_t> buf(need, 0);
+    const size_t written = wire::bolt_wire_serialize(&src, buf.data(), buf.size());
+    ASSERT_EQ(written, need);
+
+    // Raw descriptor check: b1_len (bytes 24..31 of the single 56-byte
+    // descriptor, which sits right after the 72-byte schema entry) must be
+    // exactly kN — the old bug computed (kN+7)/8 == 3 here instead of 21.
+    const uint32_t desc_off = 32u + 1u * 72u;
+    uint64_t b1_len = 0;
+    std::memcpy(&b1_len, buf.data() + desc_off + 24, sizeof(b1_len));
+    EXPECT_EQ(b1_len, static_cast<uint64_t>(kN));
+
+    BoltBatch dst; BoltBatch::init_empty(&dst);
+    ASSERT_TRUE(wire::bolt_wire_deserialize(buf.data(), buf.size(), &dst,
+                                            &arena_dst));
+    ASSERT_EQ(dst.num_rows, kN);
+    const auto* dvals = static_cast<const uint8_t*>(dst.col(0).data);
+    ASSERT_NE(dvals, nullptr);
+    for (int64_t r = 0; r < kN; ++r) EXPECT_EQ(dvals[r], pattern[r]) << "row " << r;
+}
+
+// G2ICE-143: Date32/Timestamp/Decimal128/Decimal64 previously fell entirely
+// outside is_supported_type's BoltType range — bolt_wire_size returned 0 for
+// any batch carrying one, so marbledb::put() refused cleanly rather than
+// writing. Round-trip all four in one batch, including nullability and
+// Decimal128/Decimal64 scale (carried in the schema entry's byte 67,
+// previously always-zero "reserved" padding).
+TEST(BoltWire, DateTimestampDecimalRoundTrip) {
+    Arena arena_src, arena_dst;
+    constexpr int64_t kN = 4;
+    BoltBatch src;
+    BoltBatch::init_empty(&src);
+    src.arena = &arena_src; src.num_cols = 4; src.num_rows = kN;
+    src.schema.num_fields = 4;
+    BoltBatch::alloc_columns(&src, &arena_src, 4);
+
+    // col0: Date32 — days since epoch, non-nullable.
+    set_field(&src, 0, "d", BoltType::Date32, false);
+    BoltColumn c0 = BoltColumn::make_flat_alloc(kN, BoltType::Date32, &arena_src);
+    ASSERT_NE(c0.data, nullptr);
+    const int32_t dates[kN] = { 0, 19723, -5, 2147483647 };
+    std::memcpy(c0.data, dates, sizeof(dates));
+    src.columns[0][0] = c0; src.columns[1][0] = c0;
+
+    // col1: Timestamp — nullable, one null row.
+    set_field(&src, 1, "ts", BoltType::Timestamp, true);
+    BoltColumn c1 = BoltColumn::make_flat_alloc(kN, BoltType::Timestamp, &arena_src);
+    ASSERT_NE(c1.data, nullptr);
+    const int64_t times[kN] = { 0, 1700000000000000LL, -1LL, 9223372036854775807LL };
+    std::memcpy(c1.data, times, sizeof(times));
+    auto* v1 = static_cast<uint8_t*>(arena_src.allocate(1, 1));
+    *v1 = 0b1101u;  // row 1 null
+    c1.validity = v1; c1.stats.all_valid = false;
+    src.columns[0][1] = c1; src.columns[1][1] = c1;
+
+    // col2: Decimal128 — 16-byte mantissa, scale 7.
+    set_field(&src, 2, "amt128", BoltType::Decimal128, false);
+    BoltColumn c2 = BoltColumn::make_flat_alloc(kN, BoltType::Decimal128, &arena_src);
+    ASSERT_NE(c2.data, nullptr);
+    std::memset(c2.data, 0, static_cast<size_t>(kN) * 16);
+    const int64_t mant128[kN] = { 12345, -98765, 0, 424242 };
+    for (int64_t r = 0; r < kN; ++r)
+        std::memcpy(static_cast<uint8_t*>(c2.data) + r * 16, &mant128[r], 8);
+    c2.decimal_scale = 7;
+    src.columns[0][2] = c2; src.columns[1][2] = c2;
+
+    // col3: Decimal64 — int64 mantissa, scale 2.
+    set_field(&src, 3, "amt64", BoltType::Decimal64, false);
+    BoltColumn c3 = BoltColumn::make_flat_alloc(kN, BoltType::Decimal64, &arena_src);
+    ASSERT_NE(c3.data, nullptr);
+    const int64_t mant64[kN] = { 100, -250, 0, 999999 };
+    std::memcpy(c3.data, mant64, sizeof(mant64));
+    c3.decimal_scale = 2;
+    src.columns[0][3] = c3; src.columns[1][3] = c3;
+
+    const size_t need = wire::bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    std::vector<uint8_t> buf(need, 0);
+    const size_t written = wire::bolt_wire_serialize(&src, buf.data(), buf.size());
+    ASSERT_EQ(written, need);
+
+    BoltBatch dst; BoltBatch::init_empty(&dst);
+    ASSERT_TRUE(wire::bolt_wire_deserialize(buf.data(), buf.size(), &dst,
+                                            &arena_dst));
+    ASSERT_EQ(dst.num_cols, 4u);
+    ASSERT_EQ(dst.num_rows, kN);
+
+    EXPECT_EQ(dst.col(0).type, BoltType::Date32);
+    EXPECT_EQ(0, std::memcmp(dst.col(0).data, dates, sizeof(dates)));
+
+    EXPECT_EQ(dst.col(1).type, BoltType::Timestamp);
+    ASSERT_NE(dst.col(1).validity, nullptr);
+    EXPECT_EQ(dst.col(1).validity[0] & 0xFu, 0b1101u);
+    EXPECT_EQ(0, std::memcmp(dst.col(1).data, times, sizeof(times)));
+
+    EXPECT_EQ(dst.col(2).type, BoltType::Decimal128);
+    EXPECT_EQ(dst.col(2).decimal_scale, 7u);
+    EXPECT_EQ(0, std::memcmp(dst.col(2).data, c2.data,
+                             static_cast<size_t>(kN) * 16));
+
+    EXPECT_EQ(dst.col(3).type, BoltType::Decimal64);
+    EXPECT_EQ(dst.col(3).decimal_scale, 2u);
+    EXPECT_EQ(0, std::memcmp(dst.col(3).data, mant64, sizeof(mant64)));
 }
 
 // Embedding — runtime stride (dim*4), odd dim so b1 lands off-alignment and
@@ -841,13 +973,12 @@ TEST(BoltWireZeroFill, MixedKitchenSinkDifferential) {
     c1.validity = v1; c1.stats.all_valid = false;
     src.columns[0][1] = c1; src.columns[1][1] = c1;
 
-    // col2: bool
+    // col2: bool — byte-packed (G2ICE-144), one byte/row.
     set_field(&src, 2, "flag", BoltType::Bool, false);
-    BoltColumn c2 = BoltColumn::make_empty();
-    auto* bits = static_cast<uint8_t*>(arena_src.allocate(1, 1));
-    *bits = 0b00010110u;
-    c2.data = bits; c2.length = kN; c2.format = ColumnFormat::Flat;
-    c2.type = BoltType::Bool; c2.type_size_bytes = 0;
+    BoltColumn c2 = BoltColumn::make_flat_alloc(kN, BoltType::Bool, &arena_src);
+    ASSERT_NE(c2.data, nullptr);
+    const uint8_t bool_vals[kN] = { 0, 1, 1, 0, 1 };  // first=false, last=true
+    std::memcpy(c2.data, bool_vals, kN);
     src.columns[0][2] = c2; src.columns[1][2] = c2;
 
     // col3: VarBinary Utf8
@@ -901,7 +1032,7 @@ TEST(BoltWireZeroFill, MixedKitchenSinkDifferential) {
     EXPECT_EQ(0, std::memcmp(dst.col(1).data, c1.data, kN * 4));
     ASSERT_NE(dst.col(1).validity, nullptr);
     EXPECT_EQ(dst.col(1).validity[0] & 0x1Fu, 0b00010101u);
-    EXPECT_EQ(static_cast<const uint8_t*>(dst.col(2).data)[0], *bits);
+    EXPECT_EQ(0, std::memcmp(dst.col(2).data, bool_vals, kN));
     for (int i = 0; i < kN; ++i) {
         const uint8_t* bp = nullptr; int32_t bl = 0;
         dst.col(3).var_binary_at(i, &bp, &bl);

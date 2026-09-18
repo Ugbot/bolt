@@ -4,7 +4,11 @@
 // All functions noexcept. Fixed caps, >=2 asserts per function, functions <=70 lines.
 //
 // Scope:
-//   - Format::Flat columns: numeric types in BOLT_NUMERIC_TYPES plus Bool.
+//   - Format::Flat columns: numeric types in BOLT_NUMERIC_TYPES plus Bool
+//     (byte-packed — 1 byte/row, matching kTypeSize[Bool] and every other
+//     fixed-width column layout; NOT bit-packed) plus, since v4,
+//     Date32/Timestamp/Decimal128/Decimal64 (fixed-width, decimal scale
+//     carried in the schema entry's byte 67).
 //   - Format::VarBinary columns: BoltType::Utf8 / Binary / Symbol — payload
 //     is `(offsets[len+1], raw bytes)`. Per-row slice = pool[off[i]..off[i+1]).
 //     Added at version 2 (Pass-Wiring 2026-05-01) to carry the unified-
@@ -31,7 +35,8 @@
 //   +------------------------------------------------+
 //   | Schema block (num_cols * kWireSchemaEntrySize) |
 //   |   per col: { name[64], type u8, format u8,     |
-//   |              nullable u8, pad -> 72 bytes }    |
+//   |              nullable u8, decimal_scale u8,    |
+//   |              fixed_size u32 -> 72 bytes }      |
 //   +------------------------------------------------+
 //   | Column descriptors (num_cols * kWireDescSize)  |
 //   |   per col: { b0_off u64, b0_len u64,           |
@@ -79,7 +84,7 @@ namespace wire {
 // ===========================================================================
 
 inline constexpr uint32_t kWireMagic    = 0x544C4F42u;  // 'BOLT' LE
-inline constexpr uint32_t kWireVersion  = 3u;            // bumped: Flat Utf8 support
+inline constexpr uint32_t kWireVersion  = 4u;  // bumped: Date32/Timestamp/Decimal128/Decimal64
 inline constexpr uint32_t kWireFlagLE   = 1u << 0;
 inline constexpr uint32_t kWireFlagAln  = 1u << 1;
 
@@ -132,6 +137,12 @@ BOLT_FORCE_INLINE bool is_supported_type(BoltType t) noexcept {
     if (t == BoltType::EmbeddingF16) return true;
     if (t == BoltType::EmbeddingU8)  return true;
     if (t == BoltType::EmbeddingI8)  return true;
+    // G2ICE-143: fixed-width (real kTypeSize entries) but outside the
+    // contiguous Int8..Float64 numeric range checked below.
+    if (t == BoltType::Date32)       return true;
+    if (t == BoltType::Timestamp)    return true;
+    if (t == BoltType::Decimal128)   return true;
+    if (t == BoltType::Decimal64)    return true;
     auto v = static_cast<uint8_t>(t);
     return v >= static_cast<uint8_t>(BoltType::Int8)
         && v <= static_cast<uint8_t>(BoltType::Float64);
@@ -172,7 +183,14 @@ BOLT_FORCE_INLINE bool is_supported_format_pair(BoltType t,
 // form returns 0 for Embedding.
 BOLT_FORCE_INLINE size_t data_buffer_size(BoltType t, int64_t n) noexcept {
     assert(n >= 0);
-    if (t == BoltType::Bool) return static_cast<size_t>((n + 7) / 8);
+    // G2ICE-144: Bool is BYTE-packed everywhere else that stores/consumes
+    // it -- kTypeSize[Bool]==1 ("byte-packed for SIMD, not bit-packed"),
+    // BoltColumn::make_flat_alloc, marbledb's own storage, and bolt's own
+    // Arrow export/import (which explicitly pack_bool/unpack_bool AT the
+    // Arrow boundary because Arrow itself is bit-packed and BoltColumn is
+    // not). Bit-packing here was a local-only bug, not a second convention
+    // any other consumer relied on: falls through to the generic
+    // type_size(t)*n path, same as every other fixed-width type.
     size_t tsz = type_size(t);
     return tsz * static_cast<size_t>(n);
 }
@@ -441,7 +459,12 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         e[64] = static_cast<uint8_t>(f.type);
         e[65] = static_cast<uint8_t>(b->col(i).format);
         e[66] = f.nullable ? 1u : 0u;
-        e[67] = 0u;                                // reserved
+        // G2ICE-143: byte 67 was always-zero "reserved" -- repurposed to
+        // carry Decimal128/Decimal64 scale (BoltColumn::decimal_scale is
+        // the value that travels with the data, so it's the source here,
+        // not BoltField's copy). 0 for every non-decimal column, so old
+        // payloads stay byte-identical.
+        e[67] = b->col(i).decimal_scale;
         // bytes 68..71: fixed_size (Embedding dim or FixedSizeBinary
         // width). Zero for all other types — old readers see zeroes
         // and ignore the field; new readers consult it for vector
@@ -564,14 +587,18 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
     // --- Header validation ---
     if (memcmp(p, "BOLT", 4) != 0) return false;
     const uint32_t version = detail::read_u32_le(p + 4);
-    // v1/v2/v3 are wire-compatible at the header / descriptor level; each
-    // bump only widens which (type, format) pairs are legal, never the
-    // on-disk shape. v2 added VarBinary; v3 adds Flat Utf8 (StringView
-    // row array in b1 + spilled overflow in b2). Readers accept all three
-    // — an old reader compiled against a lower kWireVersion simply fails
-    // `is_supported_format_pair` for the newer pair it doesn't know about,
-    // which is the intentional break for that column's writer.
-    if (version != 1u && version != 2u && version != 3u) return false;
+    // v1/v2/v3/v4 are wire-compatible at the header / descriptor level;
+    // each bump only widens which (type, format) pairs are legal, never
+    // the on-disk shape. v2 added VarBinary; v3 added Flat Utf8 (StringView
+    // row array in b1 + spilled overflow in b2); v4 adds Date32/Timestamp/
+    // Decimal128/Decimal64 (repurposing the always-zero schema-entry byte
+    // 67 as decimal_scale — 0, i.e. unchanged, for every other type).
+    // Readers accept all four — an old reader compiled against a lower
+    // kWireVersion simply fails `is_supported_format_pair` for the newer
+    // pair it doesn't know about, which is the intentional break for that
+    // column's writer.
+    if (version != 1u && version != 2u && version != 3u && version != 4u)
+        return false;
     const uint32_t flags = detail::read_u32_le(p + 8);
     if (!(flags & kWireFlagLE)) return false;
     const int64_t  num_rows     = detail::read_i64_le(p + 12);
@@ -604,6 +631,10 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
         f.name[kMaxFieldName] = '\0';
         f.type     = static_cast<BoltType>(e[64]);
         f.nullable = (e[66] != 0);
+        // G2ICE-143: byte 67 is decimal_scale (Decimal128/Decimal64); 0 for
+        // every other type, matching the always-zero "reserved" byte old
+        // (pre-v4) payloads wrote there.
+        f.decimal_scale = e[67];
         // bytes 68..71 carry fixed_size (Embedding dim / FixedSizeBinary
         // width). Old writers wrote zero into the trailing pad, so
         // pre-vector schemas decode as fixed_size = 0 — matches the
@@ -661,6 +692,8 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
             c.arena   = arena;   // nullptr for a view (non-owning, read-only)
             c.validity = validity;
             c.stats.all_valid = all_valid;
+            // G2ICE-143: 0 for every non-decimal type (matches make_empty).
+            c.decimal_scale = f.decimal_scale;
             if (l1) {
                 c.data = detail::wire_span<kView>(p, o1, l1, arena);
                 if (!c.data) return false;
