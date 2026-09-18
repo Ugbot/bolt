@@ -17,10 +17,15 @@
 //   12  lsn:u64         PRIMARY WAL lsn (honored on apply → idempotent replay)
 //   20  table_id:u32    marbledb tid (1..0xFFFF)
 //   24  schema_fp:u64   schema fingerprint
-//   32  kind:u8         marbledb::wal::EntryKind value
-//   33  payload_len:u32
-//   37  payload:bytes   bolt-wire EntryView payload
-//   Header = 4+8+8+4+8+1+4 = 37 bytes (kFrameHeaderBytes).
+//   32  trace_id:u64    G2CHK-90: gateway request correlation id; 0 = none.
+//                       Opaque to marbledb/apply — carried purely so a
+//                       receiving process can log "this frame came from
+//                       gateway request X" without inventing a second
+//                       out-of-band channel.
+//   40  kind:u8         marbledb::wal::EntryKind value
+//   41  payload_len:u32
+//   45  payload:bytes   bolt-wire EntryView payload
+//   Header = 4+8+8+4+8+8+1+4 = 45 bytes (kFrameHeaderBytes).
 //
 // ACK (little-endian):
 //   0  magic:u32 = 0xACE2ACE2
@@ -39,7 +44,7 @@
 namespace bolt::net {
 
 // ── wire constants ─────────────────────────────────────────────────────────
-static constexpr uint32_t kFrameHeaderBytes    = 37u;              // see layout
+static constexpr uint32_t kFrameHeaderBytes    = 45u;              // see layout
 static constexpr uint32_t kAckMagic            = 0xACE2ACE2u;
 static constexpr uint32_t kAckFrameBytes       = 16u;              // 4+8+1+3
 static constexpr uint32_t kRecvMaxPayloadBytes = 64u * 1024u * 1024u;  // 64 MiB
@@ -58,8 +63,9 @@ static constexpr uint32_t kOffChecksum   = 4u;
 static constexpr uint32_t kOffLsn        = 12u;
 static constexpr uint32_t kOffTableId    = 20u;
 static constexpr uint32_t kOffSchemaFp   = 24u;
-static constexpr uint32_t kOffKind       = 32u;
-static constexpr uint32_t kOffPayloadLen = 33u;
+static constexpr uint32_t kOffTraceId    = 32u;   // G2CHK-90
+static constexpr uint32_t kOffKind       = 40u;
+static constexpr uint32_t kOffPayloadLen = 41u;
 static constexpr uint32_t kChecksumCoverStart = kOffLsn;  // checksum covers [12, frame_len)
 
 // ── ParsedFrame — result of frame_parse(); payload borrows the caller buffer ─
@@ -68,6 +74,7 @@ struct ParsedFrame {
     uint64_t    lsn;
     uint32_t    table_id;
     uint64_t    schema_fp;
+    uint64_t    trace_id;     // G2CHK-90: 0 = no correlation id attached
     uint8_t     kind;
     uint32_t    payload_len;
     const void* payload;      // points into the caller's buffer; not owned
@@ -95,10 +102,12 @@ inline uint64_t frame_checksum(const uint8_t* data, uint32_t n) noexcept {
 }
 
 // ── frame_serialize — write a frame into out[0..out_cap). Returns the frame
-// length, or 0 if out is null / too small. ──────────────────────────────────
+// length, or 0 if out is null / too small. `trace_id` is optional
+// (G2CHK-90); pass 0 when the caller has no correlation id to attach. ───────
 inline uint32_t frame_serialize(uint64_t lsn, uint32_t table_id, uint64_t schema_fp,
                                 uint8_t kind, const void* payload, uint32_t payload_len,
-                                uint8_t* out, uint32_t out_cap) noexcept {
+                                uint8_t* out, uint32_t out_cap,
+                                uint64_t trace_id = 0u) noexcept {
     assert(payload != nullptr || payload_len == 0u);
     const uint32_t frame_len = kFrameHeaderBytes + payload_len;
     if (out == nullptr || frame_len < kFrameHeaderBytes || frame_len > out_cap) return 0u;
@@ -108,6 +117,7 @@ inline uint32_t frame_serialize(uint64_t lsn, uint32_t table_id, uint64_t schema
     wf_detail::wr64(out + kOffLsn,        lsn);
     wf_detail::wr32(out + kOffTableId,    table_id);
     wf_detail::wr64(out + kOffSchemaFp,   schema_fp);
+    wf_detail::wr64(out + kOffTraceId,    trace_id);
     out[kOffKind] = kind;
     wf_detail::wr32(out + kOffPayloadLen, payload_len);
     if (payload_len > 0u && payload != nullptr) {
@@ -130,6 +140,7 @@ inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noex
     const uint64_t lsn         = wf_detail::rd64(buf + kOffLsn);
     const uint32_t table_id    = wf_detail::rd32(buf + kOffTableId);
     const uint64_t schema_fp   = wf_detail::rd64(buf + kOffSchemaFp);
+    const uint64_t trace_id    = wf_detail::rd64(buf + kOffTraceId);
     const uint8_t  kind        = buf[kOffKind];
     const uint32_t payload_len = wf_detail::rd32(buf + kOffPayloadLen);
 
@@ -144,6 +155,7 @@ inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noex
     out.lsn         = lsn;
     out.table_id    = table_id;
     out.schema_fp   = schema_fp;
+    out.trace_id    = trace_id;
     out.kind        = kind;
     out.payload_len = payload_len;
     out.payload     = (payload_len > 0u) ? (buf + kFrameHeaderBytes) : nullptr;
