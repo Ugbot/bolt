@@ -249,10 +249,16 @@ bool parquet_read_col_chunk_pruned_i64(const uint8_t* buf, uint64_t len,
 // list is a valid row whose offsets are equal; a NULL list is marked in
 // `col.validity`. Those are different values and both are represented.
 //
-// Scope: max_rep == 1 -- one level of repetition, which is `list<T>` and each
-// leaf of a `map<K,V>`. A list OF lists (max_rep >= 2) returns false rather
-// than being guessed at. Every value encoding and both page formats the flat
-// path supports work here, because the two share one encoding dispatch.
+// Scope (G2PQ-15): 1..kPqMaxRepLevels levels of repetition -- `list<T>` and
+// each leaf of a `map<K,V>` (max_rep == 1), and arbitrarily nested repetition
+// past that -- `list<list<T>>`, `map<K, list<V>>`, a list of structs
+// containing a list, and so on. For max_rep >= 2, `col.list_element()`
+// returns the NEXT level's List column, not the ultimate leaf -- recurse via
+// `list_element()`/`list_offsets()` max_rep times to reach it, exactly as any
+// other nested BoltColumn (STRUCT, MAP) is walked. A leaf past
+// kPqMaxRepLevels returns false rather than being guessed at or truncated.
+// Every value encoding and both page formats the flat path supports work
+// here, because the two share one encoding dispatch.
 bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
                               const PqMeta* meta, uint32_t row_group,
                               uint16_t col, Arena* arena,

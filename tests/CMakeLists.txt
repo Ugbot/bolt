@@ -1315,6 +1315,17 @@ target_compile_definitions(test_bolt_parquet_list PRIVATE
 bolt_apply_hardening(test_bolt_parquet_list)
 add_test(NAME test_bolt_parquet_list COMMAND test_bolt_parquet_list)
 
+# G2PQ-15: nested repetition, max_rep >= 2 (list<list<T>>, map<K,list<V>>,
+# three levels of nesting). Fixtures written by pyarrow via
+# scripts/make_list_nested_fixtures.py.
+add_executable(test_bolt_parquet_list_nested test_bolt_parquet_list_nested.cpp)
+target_link_libraries(test_bolt_parquet_list_nested
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_list_nested PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_list_nested)
+add_test(NAME test_bolt_parquet_list_nested COMMAND test_bolt_parquet_list_nested)
+
 # Legacy 2-level LIST shapes (G2PQ-14): backward-compat rules from
 # LogicalTypes.md. Fixtures are hand-constructed from the spec by
 # scripts/make_legacy_list_fixtures.py (pyarrow cannot write them) and

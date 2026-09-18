@@ -142,6 +142,12 @@ inline constexpr uint32_t kPqMaxSortingColumns = 16;  // matches the writer's ca
 // absent-on-overflow convention as kPqMaxStatBytes.
 inline constexpr uint32_t kPqMaxLevelHistBuckets = 32;
 
+// G2PQ-15: deepest nested repetition a leaf may carry (list<list<...T>>,
+// map<K, list<V>>, ...). 8 levels of nested repetition is already far beyond
+// any real schema; a leaf past this depth is refused at schema-walk time
+// rather than truncated or misassembled -- see PqColumn::list_defs below.
+inline constexpr uint32_t kPqMaxRepLevels = 8;
+
 // key_value_metadata (G2PQ-23): FileMetaData field 5 and ColumnMetaData
 // field 8 (thrift KeyValue: required key, optional value). Real uses:
 // Arrow's "ARROW:schema" (file-level) and small per-column annotations in
@@ -248,9 +254,28 @@ struct PqColumn {
     //   def >= rep_def             -> one element (NULL iff def < max_def)
     // An empty list and a null list are different values, and a null bitmap
     // alone cannot tell them apart -- which is why both levels are recorded
-    // rather than deriving one from max_def. Zero when max_rep == 0.
+    // rather than deriving one from max_def. Zero when max_rep == 0. Equal to
+    // list_defs[max_rep-1] / rep_defs[max_rep-1] below (the INNERMOST level;
+    // for max_rep <= 1 that is also the only level) -- kept as scalars
+    // because they were the whole story before G2PQ-15 and every existing
+    // read site (the flat-list assembler, tests) only ever wanted that one.
     uint8_t  list_def;   // def accumulated at the repeated node's PARENT
     uint8_t  rep_def;    // def accumulated AT the repeated node
+    // G2PQ-15: the SAME two thresholds, one pair per nesting level, for
+    // max_rep >= 2 (list<list<T>>, map<K, list<V>>, a list of structs
+    // containing a list, ...). Level k (1-indexed, array index k-1) is the
+    // k-th repeated ancestor counting from the schema root:
+    //   def <  list_defs[k-1]              -> level k's list is NULL
+    //   list_defs[k-1] <= def < rep_defs[k-1] -> level k's list is EMPTY
+    //   def >= rep_defs[k-1]               -> level k has (at least) this
+    //                                          element; keep checking deeper
+    // Thresholds are non-decreasing in k (list_defs[0] <= rep_defs[0] <=
+    // list_defs[1] <= ...) because each level's def is accumulated from the
+    // one before it. Only indices [0, max_rep) are meaningful; max_rep == 0
+    // leaves the whole array zeroed. list_defs[max_rep-1]/rep_defs[max_rep-1]
+    // duplicate list_def/rep_def above.
+    uint8_t  list_defs[kPqMaxRepLevels];
+    uint8_t  rep_defs[kPqMaxRepLevels];
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

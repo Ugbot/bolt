@@ -800,6 +800,17 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                                        // parent (0 if none seen yet)
                     uint8_t  rdef;     // def AT the innermost REPEATED node
                     uint16_t plen;     // dotted-path length so far
+                    // G2PQ-15: one (ldef,rdef) pair per repeated ancestor seen
+                    // so far, index k-1 for level k. ldef/rdef above track
+                    // only the INNERMOST (most recent) repeated ancestor, same
+                    // as pre-G2PQ-15 -- ldefs[rep-1]/rdefs[rep-1] below always
+                    // agree with them. A level past kPqMaxRepLevels is simply
+                    // never written into the array -- the leaf's true max_rep
+                    // still records the real depth, so build_list_column
+                    // refuses that ONE column explicitly instead of this walk
+                    // failing the whole file over it.
+                    uint8_t  ldefs[kPqMaxRepLevels];
+                    uint8_t  rdefs[kPqMaxRepLevels];
                 };
                 Frame stk[16];
                 int32_t sp = 0;
@@ -811,6 +822,9 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[0].left = se.num_children;
                         stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
                         stk[0].ldef = 0; stk[0].rdef = 0;
+                        for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
+                            stk[0].ldefs[z] = 0; stk[0].rdefs[z] = 0;
+                        }
                         sp = 1;
                         continue;
                     }
@@ -842,6 +856,14 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[sp].ldef = se.repeated ? stk[sp - 1].def
                                                    : stk[sp - 1].ldef;
                         stk[sp].rdef = se.repeated ? def : stk[sp - 1].rdef;
+                        for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
+                            stk[sp].ldefs[z] = stk[sp - 1].ldefs[z];
+                            stk[sp].rdefs[z] = stk[sp - 1].rdefs[z];
+                        }
+                        if (se.repeated && rep >= 1u && rep <= kPqMaxRepLevels) {
+                            stk[sp].ldefs[rep - 1u] = stk[sp - 1].def;
+                            stk[sp].rdefs[rep - 1u] = def;
+                        }
                         stk[sp].plen = plen;
                         ++sp;
                         continue;
@@ -855,7 +877,10 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     // ColumnChunks are indexed by leaf position -- dropping it
                     // would silently misalign every column after it. Decode
                     // refuses it individually instead, so a projection that
-                    // does not ask for the list reads normally.
+                    // does not ask for the list reads normally. The same
+                    // applies to a leaf past kPqMaxRepLevels (G2PQ-15): its
+                    // max_rep records the real depth so the assembler refuses
+                    // it by name, but sibling columns still open.
                     if (out->n_columns >= kPqMaxColumns) return false;
                     PqColumn col = se.col;
                     col.max_def = def;
@@ -866,6 +891,14 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     col.list_def = se.repeated ? stk[sp - 1].def
                                                : stk[sp - 1].ldef;
                     col.rep_def  = se.repeated ? def : stk[sp - 1].rdef;
+                    for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
+                        col.list_defs[z] = stk[sp - 1].ldefs[z];
+                        col.rep_defs[z] = stk[sp - 1].rdefs[z];
+                    }
+                    if (se.repeated && rep >= 1u && rep <= kPqMaxRepLevels) {
+                        col.list_defs[rep - 1u] = stk[sp - 1].def;
+                        col.rep_defs[rep - 1u] = def;
+                    }
                     // `optional` drives the def-level path; a leaf below an
                     // optional ancestor has levels even if it is itself
                     // REQUIRED.

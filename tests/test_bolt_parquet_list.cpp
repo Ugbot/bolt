@@ -715,17 +715,69 @@ TEST(BoltParquetList, ReadFileAssemblesListsAcrossRowGroups) {
     }
 }
 
-// max_rep >= 2 must still be REFUSED through this path. build_list_column is
-// reached directly from parquet_read_file, so it does not inherit
-// parquet_read_list_column's guard; without an explicit check a list of lists
-// assembles as a flat list, silently reshaping the data.
-TEST(BoltParquetList, ReadFileRefusesNestedRepetition) {
+// G2PQ-15: max_rep >= 2 is ASSEMBLED, not refused, through parquet_read_file
+// (which reaches build_list_column directly, so it needed its own generalized
+// assembly and not just parquet_read_list_column's). golden_list_nested.parquet
+// is the minimal hand-checkable fixture: c = [[[1,2],[3]], [[4]], None] --
+// row 0 has a two-element outer list whose elements are inner lists of
+// different lengths, row 1 a single-element outer list, row 2 a NULL outer
+// list. Thorough value coverage over 500 rows and every null/empty
+// combination lives in test_bolt_parquet_list_nested.cpp; this is the
+// smallest possible positive case through the WHOLE-FILE entry point
+// specifically.
+TEST(BoltParquetList, ReadFileAssemblesNestedRepetition) {
     const auto buf = slurp(data_path("golden_list_nested.parquet").c_str());
     if (buf.empty()) GTEST_SKIP() << "no nested fixture";
+    bolt::Arena ma;
+    PqMeta meta{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
+    const int ci = find_col(&meta, "c.list.element.list.element");
+    ASSERT_GE(ci, 0);
+    EXPECT_EQ(meta.columns[ci].max_rep, 2u);
+
     bolt::Arena ba;
     auto* batch = ba.allocate_array<bolt::BoltBatch>(1);
-    EXPECT_FALSE(parquet_read_file(buf.data(), buf.size(), &ba, batch))
-        << "a list of lists must be refused, not reshaped";
+    ASSERT_TRUE(parquet_read_file(buf.data(), buf.size(), &ba, batch))
+        << "a list of lists must be assembled, not refused";
+    const bolt::BoltColumn& c = batch->columns[batch->read_epoch][ci];
+    ASSERT_EQ(c.type, bolt::BoltType::List);
+    ASSERT_EQ(c.length, 3);
+    const std::int32_t* o1 = c.list_offsets();
+    const bolt::BoltColumn* lvl2 = c.list_element();
+    ASSERT_NE(o1, nullptr);
+    ASSERT_NE(lvl2, nullptr);
+    ASSERT_EQ(lvl2->type, bolt::BoltType::List);
+    const std::int32_t* o2 = lvl2->list_offsets();
+    const bolt::BoltColumn* leaf = lvl2->list_element();
+    ASSERT_NE(o2, nullptr);
+    ASSERT_NE(leaf, nullptr);
+    const auto* v = static_cast<const std::int64_t*>(leaf->data);
+    ASSERT_NE(v, nullptr);
+
+    // row 0: [[1,2],[3]] -- 2 outer elements, inner lists of length 2 then 1.
+    const bool row0_valid = (c.validity == nullptr) ||
+        (((c.validity[0] >> 0) & 1u) != 0u);
+    EXPECT_TRUE(row0_valid);
+    ASSERT_EQ(o1[1] - o1[0], 2) << "row 0 outer element count";
+    ASSERT_EQ(o2[o1[0] + 1] - o2[o1[0]], 2) << "row 0 elem 0 inner length";
+    ASSERT_EQ(o2[o1[0] + 2] - o2[o1[0] + 1], 1) << "row 0 elem 1 inner length";
+    EXPECT_EQ(v[o2[o1[0]]], 1);
+    EXPECT_EQ(v[o2[o1[0]] + 1], 2);
+    EXPECT_EQ(v[o2[o1[0] + 1]], 3);
+
+    // row 1: [[4]] -- 1 outer element, one inner value.
+    const bool row1_valid = (c.validity == nullptr) ||
+        (((c.validity[0] >> 1) & 1u) != 0u);
+    EXPECT_TRUE(row1_valid);
+    ASSERT_EQ(o1[2] - o1[1], 1) << "row 1 outer element count";
+    ASSERT_EQ(o2[o1[1] + 1] - o2[o1[1]], 1) << "row 1 inner length";
+    EXPECT_EQ(v[o2[o1[1]]], 4);
+
+    // row 2: None -- the whole outer list is NULL.
+    ASSERT_NE(c.validity, nullptr) << "a NULL row needs a validity bitmap";
+    const bool row2_valid = (((c.validity[0] >> 2) & 1u) != 0u);
+    EXPECT_FALSE(row2_valid);
+    EXPECT_EQ(o1[3] - o1[2], 0) << "a NULL list has no elements";
 }
 
 // ---- corrupt-input fuzzing for the Dremel path ---------------------------
@@ -751,7 +803,16 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
     long attempts = 0, decoded = 0;
     for (const char* fixture : {"golden_list.parquet",
                                 "golden_list_dict.parquet",
-                                "golden_map.parquet"}) {
+                                "golden_map.parquet",
+                                // G2PQ-15: the SAME truncation/byte-flip sweep
+                                // over max_rep >= 2 columns (list<list<T>>,
+                                // list<list<list<T>>>, map<K,list<V>>) --
+                                // the general cascade assembly turns
+                                // attacker-controlled levels into array
+                                // indices at EVERY nesting level, not just
+                                // one, so it needs the same fuzz coverage.
+                                "golden_list_nested2.parquet",
+                                "golden_list_nested2_dict.parquet"}) {
         const auto buf = slurp(data_path(fixture).c_str());
         if (buf.empty()) continue;               // fixture optional
         SCOPED_TRACE(fixture);

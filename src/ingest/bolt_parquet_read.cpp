@@ -2147,9 +2147,28 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
 // bitmap carries nullness, and why both levels are recorded rather than one
 // being derived from max_def.
 //
-// Scope: max_rep == 1, a single level of repetition -- `list<T>`, and the two
-// leaves of a `map<K,V>`. A list of lists (max_rep >= 2) is refused rather
-// than guessed at, exactly as before.
+// Scope (G2PQ-15): max_rep >= 1, i.e. arbitrarily nested repetition --
+// `list<T>`, the two leaves of a `map<K,V>`, `list<list<T>>`,
+// `map<K, list<V>>`, a list of structs containing a list, and so on, up to
+// kPqMaxRepLevels deep (a leaf past that is refused by name, not guessed at
+// -- see build_list_column). Each of the max_rep repeated ancestors gets its
+// own (list_def, rep_def) pair, recorded per level by the schema walk in
+// PqColumn::list_defs / rep_defs; level k (1-indexed) applies the same
+// three-way test above using list_defs[k-1] / rep_defs[k-1].
+//
+// ASSEMBLY. `rep[j]` at leaf slot j names the SHALLOWEST level getting a
+// brand-new element this slot (rep==0 means level 1, a new row). Every level
+// from there down through max_rep ALSO gets a new element on the same slot,
+// cascading one level deeper each time -- because a fresh element at level k
+// is simultaneously a fresh (as yet empty) CONTAINER for level k+1, which
+// therefore needs its own first element decided right away, unless level k's
+// own def value says its list is NULL or EMPTY, which stops the cascade
+// (there is nothing nested under an absent list). A slot with
+// rep[j] == max_rep is a pure continuation: it does not open anything new,
+// it just appends one more element to the already-open innermost list. This
+// is the same rule as the old max_rep == 1 case (rep==0 opens the row,
+// rep==1 continues it), generalized: max_rep == 1 is simply R == 1 of the
+// general algorithm below, not a separate code path.
 
 // Per-page level decode for a repeated leaf. Fills `rep` and `def` with one
 // entry per leaf slot and returns the values pointer/length that follow.
@@ -2228,7 +2247,13 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
     // markers occupy a leaf slot but no element, so passing the raw def array
     // straight through would reserve an element slot for them and leave a gap
     // no list's offset range points at.
-    const uint32_t rep_def = cx->pc->rep_def;
+    //
+    // G2PQ-15: a slot carries a LEAF value iff the DEEPEST (innermost) level
+    // has an element -- an intermediate level being null/empty already means
+    // no leaf value exists for this slot, and it is the innermost level's own
+    // rep_def, not the outermost's, that says so for max_rep >= 2.
+    assert(cx->pc->max_rep >= 1u && cx->pc->max_rep <= kPqMaxRepLevels);
+    const uint32_t rep_def = cx->pc->rep_defs[cx->pc->max_rep - 1u];
     const uint32_t max_def = cx->pc->max_def;
     uint32_t n_elem = 0, nvalid = 0;
     for (uint32_t i = 0; i < nvals; ++i) {
@@ -2280,14 +2305,24 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     *out_rows = 0;
     if (n_slots == 0) {
         // Chunks with no leaf values still have rows, every one of them an
-        // empty list. Offsets are all zero and there is no element.
-        BoltColumn elem = BoltColumn::make_flat_alloc(1, BoltType::Int64, arena);
-        elem.length = 0;
-        auto* offs = arena->allocate_array<int32_t>(n_rows_total + 1);
-        if (offs == nullptr) return false;
-        for (int64_t i = 0; i <= n_rows_total; ++i) offs[i] = 0;
-        *out_col = BoltColumn::make_list(&elem, offs, n_rows_total, nullptr,
-                                         arena);
+        // empty list AT EVERY NESTING LEVEL (G2PQ-15) -- there is no element
+        // anywhere in the range to say otherwise. R-1 of the R levels wrap a
+        // genuinely empty (0-row) list; only the outermost carries
+        // n_rows_total, since it is the one level whose container count is
+        // fixed by the footer rather than by elements we never saw.
+        BoltColumn cur = BoltColumn::make_flat_alloc(1, BoltType::Int64, arena);
+        cur.length = 0;
+        const uint32_t R0 = pc->max_rep;
+        assert(R0 >= 1u && R0 <= kPqMaxRepLevels);
+        for (uint32_t k = R0; k >= 1u; --k) {
+            const int64_t containers = (k == 1u) ? n_rows_total : 0;
+            auto* offs = arena->allocate_array<int32_t>(containers + 1);
+            if (offs == nullptr) return false;
+            for (int64_t i = 0; i <= containers; ++i) offs[i] = 0;
+            cur = BoltColumn::make_list(&cur, offs, containers, nullptr, arena);
+            if (cur.data == nullptr) return false;
+        }
+        *out_col = cur;
         *out_rows = n_rows_total;
         return true;
     }
@@ -2383,42 +2418,98 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     }
     if (b.n_slots != n_slots) return false;
 
-    // ---- assembly: rep says where rows start, def says what each slot is ---
-    int64_t rows = 0;
-    for (int64_t j = 0; j < n_slots; ++j) rows += (b.rep[j] == 0u) ? 1 : 0;
-    if (rows != n_rows_total) return false;      // levels disagree with the footer
-    auto* offs = arena->allocate_array<int32_t>(rows + 1);
-    if (offs == nullptr) return false;
-    const uint64_t vb = (static_cast<uint64_t>(rows) + 7u) / 8u;
-    auto* lval = static_cast<uint8_t*>(arena->allocate(vb, 1));
-    if (lval == nullptr) return false;
-    std::memset(lval, 0xFF, vb);
-    const uint32_t list_def = pc->list_def;
-    const uint32_t rep_def = pc->rep_def;
-    int64_t row = -1;
-    int64_t ec = 0;
-    bool any_null_list = false;
-    for (int64_t j = 0; j < n_slots; ++j) {
-        if (b.rep[j] == 0u) {
-            ++row;
-            offs[row] = static_cast<int32_t>(ec);
-            if (b.def[j] < list_def) {           // the LIST itself is null
-                lval[row >> 3] = static_cast<uint8_t>(
-                    lval[row >> 3] & ~(1u << (row & 7)));
-                any_null_list = true;
-            }
-        }
-        ec += (b.def[j] >= rep_def) ? 1 : 0;
+    // ---- assembly (G2PQ-15): cascade rep/def into R nested offset arrays --
+    //
+    // One forward pass over the flat (rep, def) arrays. `elem_count[0]` is
+    // the row counter; `elem_count[k]` (k=1..R) is how many level-k elements
+    // have been appended so far, which doubles as the next element's index.
+    // `cur_container[k-1]` is the level-(k-1) element currently "open" as
+    // level k's container -- i.e. the most recent value of
+    // `elem_count[k-1] - 1` -- so a level-k offsets entry is written exactly
+    // once, the first time a new container is seen there.
+    //
+    // Per slot j, `cascade_start = (rep[j] == 0) ? 1 : rep[j]` names the
+    // shallowest level getting a brand-new element this slot (see the
+    // section header comment for the derivation). Every level from there
+    // down to R gets one new element, UNLESS this level's own def value says
+    // its list is NULL or EMPTY, which breaks the cascade -- nothing nested
+    // exists under an absent list, so deeper levels are never touched for
+    // this slot.
+    const uint32_t R = pc->max_rep;
+    assert(R >= 1u && R <= kPqMaxRepLevels);
+    assert(n_slots > 0 && n_rows_total > 0);
+    int32_t* offs[kPqMaxRepLevels];       // offs[k-1]: level-k offsets
+    uint8_t* lval[kPqMaxRepLevels];       // level-k validity (upper-bound sized)
+    bool     any_null[kPqMaxRepLevels];
+    int64_t  cur_container[kPqMaxRepLevels];  // level-k's currently open container
+    int64_t  elem_count[kPqMaxRepLevels + 1]; // [0]=rows, [k]=level-k elements
+    for (uint32_t k = 1; k <= R; ++k) {
+        // Level 1's containers are rows (n_rows_total, known exactly from the
+        // footer); level 2..R's containers are level-(k-1) elements, upper
+        // bounded by n_slots -- every element ever created traces back to
+        // exactly one leaf slot, so there can never be more of them.
+        const int64_t cap = (k == 1u) ? n_rows_total : n_slots;
+        offs[k - 1] = arena->allocate_array<int32_t>(cap + 1);
+        if (offs[k - 1] == nullptr) return false;
+        const uint64_t vb = (static_cast<uint64_t>(cap) + 7u) / 8u;
+        lval[k - 1] = static_cast<uint8_t*>(arena->allocate(vb, 1));
+        if (lval[k - 1] == nullptr) return false;
+        std::memset(lval[k - 1], 0xFF, vb);
+        any_null[k - 1] = false;
+        cur_container[k - 1] = -1;
+        elem_count[k] = 0;
     }
-    if (row + 1 != rows) return false;
-    offs[rows] = static_cast<int32_t>(ec);
-    if (ec != elem_n) return false;              // assembly disagrees with decode
+    elem_count[0] = 0;
+    for (int64_t j = 0; j < n_slots; ++j) {
+        const uint32_t rj = b.rep[j];
+        const uint32_t dj = b.def[j];
+        if (rj == 0u) elem_count[0] += 1;         // new row
+        const uint32_t k_start = (rj == 0u) ? 1u : rj;
+        for (uint32_t k = k_start; k <= R; ++k) {
+            const int64_t cid = elem_count[k - 1] - 1;
+            // Corrupt level bytes (CorruptLevelsNeverCrash) can claim a
+            // container that was never opened, or more rows than the footer
+            // declares -- both would be an out-of-bounds array index rather
+            // than a wrong answer, so this is a checked refusal, not an
+            // assert. Every valid container index is <= its array's `cap`
+            // by construction (see the allocation loop above); a violation
+            // means the file lied.
+            if (cid < 0 || cid >= ((k == 1u) ? n_rows_total : n_slots)) {
+                return false;
+            }
+            if (cid != cur_container[k - 1]) {
+                offs[k - 1][cid] = static_cast<int32_t>(elem_count[k]);
+                cur_container[k - 1] = cid;
+            }
+            if (dj < pc->list_defs[k - 1]) {      // level k's list is NULL
+                lval[k - 1][cid >> 3] = static_cast<uint8_t>(
+                    lval[k - 1][cid >> 3] & ~(1u << (cid & 7)));
+                any_null[k - 1] = true;
+                break;
+            }
+            if (dj < pc->rep_defs[k - 1]) break;  // present but EMPTY
+            elem_count[k] += 1;                   // level k gets one element
+        }
+    }
+    if (elem_count[0] != n_rows_total) return false;  // levels disagree with the footer
+    for (uint32_t k = 1; k <= R; ++k) {
+        offs[k - 1][elem_count[k - 1]] = static_cast<int32_t>(elem_count[k]);
+    }
+    if (elem_count[R] != elem_n) return false;    // assembly disagrees with decode
     elem.length = elem_n;
 
-    *out_col = BoltColumn::make_list(&elem, offs, rows,
-                                     any_null_list ? lval : nullptr, arena);
-    if (out_col->data == nullptr) return false;
-    *out_rows = rows;
+    // Wrap level R around the decoded leaf, level R-1 around that, ...,
+    // level 1 (outermost) last -- the SAME BoltColumn::make_list shape the
+    // R == 1 case always used, just nested R times instead of once.
+    BoltColumn cur = elem;
+    for (uint32_t k = R; k >= 1u; --k) {
+        cur = BoltColumn::make_list(&cur, offs[k - 1], elem_count[k - 1],
+                                    any_null[k - 1] ? lval[k - 1] : nullptr,
+                                    arena);
+        if (cur.data == nullptr) return false;
+    }
+    *out_col = cur;
+    *out_rows = elem_count[0];
     return true;
 }
 
@@ -3079,14 +3170,16 @@ bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
     if (col >= meta->n_columns) return false;
     const PqColumn* pc = &meta->columns[col];
     if (pc->max_rep == 0u) return false;      // not repeated: use the flat path
-    if (pc->max_rep != 1u) {
-        // A list of lists needs one offset array per level and an assembly
-        // that tracks which level each rep value re-opens. Refused rather
-        // than guessed at -- a wrong nesting silently reshapes the data.
+    if (pc->max_rep > kPqMaxRepLevels) {
+        // G2PQ-15 assembles up to kPqMaxRepLevels of nested repetition; past
+        // that, refuse rather than guess -- a wrong nesting silently
+        // reshapes the data, and the schema walk never recorded thresholds
+        // this deep to assemble against in the first place.
         if (bolt_pq_diag()) {
             std::fprintf(stderr, "bolt parquet: column '%s' max_rep=%u -- "
-                         "only one level of repetition is supported\n",
-                         pc->name, static_cast<unsigned>(pc->max_rep));
+                         "deeper than the %u supported levels of repetition\n",
+                         pc->name, static_cast<unsigned>(pc->max_rep),
+                         static_cast<unsigned>(kPqMaxRepLevels));
         }
         return false;
     }
@@ -3124,17 +3217,19 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
         is_list[c] = (meta->columns[c].max_rep != 0u);
         if (is_list[c]) {
-            // ONE level of repetition only. build_list_column is reached
-            // directly here, so it does NOT get parquet_read_list_column's
-            // max_rep guard -- and without this an unsupported list-of-lists
-            // would assemble as if it were a flat list, which is a silent
-            // reshape of the data rather than a refusal.
-            if (meta->columns[c].max_rep != 1u) {
+            // Up to kPqMaxRepLevels of repetition (G2PQ-15). build_list_column
+            // is reached directly here, so it does NOT get
+            // parquet_read_list_column's max_rep guard -- and without this an
+            // over-cap list-of-lists would assemble past the levels the
+            // schema walk actually recorded thresholds for, a silent reshape
+            // of the data rather than a refusal.
+            if (meta->columns[c].max_rep > kPqMaxRepLevels) {
                 if (bolt_pq_diag()) {
                     std::fprintf(stderr, "bolt parquet: column '%s' max_rep=%u"
-                                 " -- only one level of repetition is "
-                                 "supported\n", meta->columns[c].name,
-                                 static_cast<unsigned>(meta->columns[c].max_rep));
+                                 " -- deeper than the %u supported levels of "
+                                 "repetition\n", meta->columns[c].name,
+                                 static_cast<unsigned>(meta->columns[c].max_rep),
+                                 static_cast<unsigned>(kPqMaxRepLevels));
                 }
                 return false;
             }
