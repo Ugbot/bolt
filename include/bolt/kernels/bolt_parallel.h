@@ -259,9 +259,19 @@ inline void parallel_groupby_morsel(void* user_data, uint32_t start,
         const int64_t slice_n = static_cast<int64_t>(end - start);
         int32_t*  ex = ctx->existing_buf + static_cast<size_t>(m) * ctx->grain;
         uint32_t* mq = ctx->miss_idx_buf + static_cast<size_t>(m) * ctx->grain;
-        tbl.ingest_two_pass(ctx->keys + start,
-                            ctx->values + start,
-                            slice_n, ex, mq);
+        // G2CHK-92: ingest_two_pass now reports capacity overflow instead
+        // of asserting. Every table here is sized hint=grain and every
+        // slice is <= grain, so this cannot fire from this call site today
+        // — but a morsel callback has no return channel of its own, so a
+        // failure (if the invariant is ever broken) is signalled through
+        // ctx->error_flag, the same mechanism parallel_groupby_merge_shard
+        // already uses; the aggregate driver checks it after wait_all().
+        if (!tbl.ingest_two_pass(ctx->keys + start, ctx->values + start,
+                                 slice_n, ex, mq)) {
+            if (ctx->error_flag != nullptr) {
+                ctx->error_flag->store(1, std::memory_order_relaxed);
+            }
+        }
         return;
     }
 

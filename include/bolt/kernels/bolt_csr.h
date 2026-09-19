@@ -219,6 +219,12 @@ BOLT_FORCE_INLINE int64_t csr_edge_dst_keep(
     return static_cast<int64_t>(dst_bounds[src_index] == dst);
 }
 
+// Sentinel returned by csr_expand_bounded (and its two forwarding entry
+// points) when the current source id is outside the CSR's [0, n_nodes)
+// range — see the G2CHK-92 note above csr_expand_bounded. A valid row count
+// is always >= 0, so -1 cannot be confused with a legitimate result.
+inline constexpr int64_t kCsrExpandOutOfRange = -1;
+
 // Cursor for resumable expansion. Two fields cover the exact resume point:
 //   src_index   : next index into src_ids[] to process (outer loop bound)
 //   neighbor_j  : the CSR edge index to resume at within the current source's
@@ -243,10 +249,26 @@ struct CsrExpandCursor {
 //     (a high-degree source whose fan-out exceeds out_cap resumes mid-block
 //     via cursor->neighbor_j; the next call continues from that edge).
 //   - Expansion is finished when cursor->src_index == n on return.
-//   - Returns the number of rows written this call (>=0, <= out_cap). It
-//     never returns -1: out_cap exhaustion is the normal resume path, not an
-//     error — the cursor simply isn't fully advanced. (The op slices nothing;
-//     it just calls again.) out_cap == 0 is a valid no-op poll (returns 0).
+//   - Returns the number of rows written this call (>=0, <= out_cap), OR
+//     kCsrExpandOutOfRange (-1) when the CURRENT source id (the row at
+//     cursor->src_index) is outside [0, n_nodes) — see G2CHK-92 below.
+//     out_cap exhaustion is still the normal resume path, not an error: the
+//     cursor simply isn't fully advanced, and the op slices nothing, it
+//     just calls again. out_cap == 0 is a valid no-op poll (returns 0).
+//
+// G2CHK-92: `s` (`src_ids[cursor->src_index]`) is PRIOR-OPERATOR OUTPUT —
+// on the live Cypher/SPARQL graph path this is whatever an upstream scan,
+// join, or expand emitted, not a value this kernel produced itself. Before
+// this fix the only guard on `s` was `assert(s >= 0 ...)`, with NO UPPER
+// BOUND at all: `csr_off[s]` / `csr_off[s + 1]` were read unconditionally,
+// so an `s >= n_nodes` was an out-of-bounds READ whose garbage `begin`/`end`
+// then drove the inner loop's `csr_edge_ids[j]` / `csr_neighbors[j]` reads
+// too — and the assert (both this one AND the identical assert chukonu's own
+// two call sites already carry immediately before calling this kernel) is
+// compiled out under -DNDEBUG, i.e. absent from a stock Release. `n_nodes`
+// is now a required parameter (the CSR's `offsets[]` has exactly
+// `n_nodes + 1` entries, matching csr_build's own contract above) so the
+// kernel can check the bound for real instead of trusting the caller.
 //
 // Branch-free inner loop: append at slot `w`, advance w += keep. <=70 lines.
 //
@@ -270,7 +292,7 @@ struct CsrExpandCursor {
 // rather than duplicating the loop, because a second copy of the neighbour walk
 // is precisely the drift the count-mode path already refuses to risk.
 BOLT_FORCE_INLINE int64_t csr_expand_bounded(
-        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
@@ -282,12 +304,19 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded(
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
     assert(n == 0 || (src_ids != nullptr && csr_off != nullptr));
+    assert(n_nodes >= 0);
     assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
 
     int64_t w = 0;                              // rows written this call
     while (cursor->src_index < n && w < out_cap) {
         const int64_t s = src_ids[cursor->src_index];
-        assert(s >= 0 && "csr_expand: source id out of CSR range (non-dense?)");
+        assert(s >= 0 && s < n_nodes &&
+               "csr_expand: source id out of CSR range (non-dense?)");
+        // G2CHK-92: real check, not just the assert above — `csr_off` has
+        // exactly n_nodes + 1 entries, so a `s` outside [0, n_nodes) would
+        // read past it (and the garbage begin/end would then drive further
+        // out-of-bounds reads in the inner loop below). Fail closed instead.
+        if (s < 0 || s >= n_nodes) return kCsrExpandOutOfRange;
         const int64_t begin = csr_off[s];
         const int64_t end   = csr_off[s + 1];
         assert(begin <= end);
@@ -319,7 +348,7 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded(
 // Isomorphic expansion with no bound destination — the W16-L1 entry point,
 // unchanged in behaviour and now a thin forward.
 BOLT_FORCE_INLINE int64_t csr_expand_excluding(
-        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
@@ -329,17 +358,17 @@ BOLT_FORCE_INLINE int64_t csr_expand_excluding(
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
-    return csr_expand_bounded(src_ids, n, csr_off, csr_neighbors, csr_edge_ids,
-                              edge_labels, want_label, excluded, n_excl,
-                              /*dst_bounds=*/nullptr, out_src, out_edge,
-                              out_dst, out_cap, cursor);
+    return csr_expand_bounded(src_ids, n, n_nodes, csr_off, csr_neighbors,
+                              csr_edge_ids, edge_labels, want_label, excluded,
+                              n_excl, /*dst_bounds=*/nullptr, out_src,
+                              out_edge, out_dst, out_cap, cursor);
 }
 
 // Unconstrained expansion (homomorphic 1-hop walk) — the pre-existing entry
 // point, unchanged in behaviour and now a thin forward so there is exactly one
 // implementation of the neighbour walk.
 BOLT_FORCE_INLINE int64_t csr_expand(
-        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
@@ -349,7 +378,7 @@ BOLT_FORCE_INLINE int64_t csr_expand(
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0);
     assert(out_cap >= 0);
-    return csr_expand_excluding(src_ids, n, csr_off, csr_neighbors,
+    return csr_expand_excluding(src_ids, n, n_nodes, csr_off, csr_neighbors,
                                 csr_edge_ids, edge_labels, want_label,
                                 /*excluded=*/nullptr, /*n_excl=*/0,
                                 out_src, out_edge, out_dst, out_cap, cursor);

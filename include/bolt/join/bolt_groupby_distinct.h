@@ -341,11 +341,23 @@ struct DistinctCellArray {
     std::uint32_t entry_cap; // rows per agg
     std::uint16_t n_aggs;    // number of distinct-flagged aggs
 
+    // G2CHK-92: `assert(g < entry_cap)` (and the `j < n_aggs` assert above
+    // it) used to be the ONLY guard between an out-of-range (j, g) and a
+    // pointer the caller then WRITES THROUGH — absent from any -DNDEBUG
+    // build, an out-of-bounds write. Audited: no production caller in
+    // bolt, marbledb, or chukonu calls `cell_at` today (the hash-agg
+    // operator indexes `distinct_cells[j * entry_cap + g]` directly rather
+    // than through this helper — see bolt_groupby.h), so there is nothing
+    // to break by making the contract real rather than asserted. The check
+    // is one comparison per call, not per row, so there is no perf reason
+    // to leave it assert-only. Returns nullptr on an out-of-range index;
+    // callers MUST check before dereferencing.
     BOLT_FORCE_INLINE DistinctCell* cell_at(std::uint16_t j,
                                             std::uint32_t g) noexcept {
         assert(cells != nullptr);
         assert(j < n_aggs);
         assert(g < entry_cap);
+        if (cells == nullptr || j >= n_aggs || g >= entry_cap) return nullptr;
         return &cells[static_cast<std::size_t>(j) * entry_cap + g];
     }
 };

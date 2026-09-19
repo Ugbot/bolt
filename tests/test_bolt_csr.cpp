@@ -224,6 +224,7 @@ TEST(CsrBuild, RejectsBadArgs) {
 
 namespace {
 struct KnownCsr {
+    static constexpr int64_t n_nodes = 4;
     int64_t off[5]  = {0, 2, 2, 3, 4};
     int64_t nbr[4]  = {1, 2, 3, 0};
     int64_t eid[4]  = {100, 101, 102, 103};
@@ -236,7 +237,7 @@ TEST(CsrExpand, WildcardMultiSrc) {
     const int64_t src_ids[3] = {0, 1, 3};   // node 1 is empty
     int64_t o_src[16] = {0}, o_edge[16] = {0}, o_dst[16] = {0};
     CsrExpandCursor cur{};
-    int64_t w = csr_expand(src_ids, 3, g.off, g.nbr, g.eid,
+    int64_t w = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid,
                            /*edge_labels=*/nullptr, /*want=*/-1,
                            o_src, o_edge, o_dst, 16, &cur);
     // node 0 -> (1 via 100), (2 via 101); node 1 -> none; node 3 -> (0 via 103)
@@ -253,7 +254,7 @@ TEST(CsrExpand, LabelFiltered) {
     int64_t o_src[8] = {0}, o_edge[8] = {0}, o_dst[8] = {0};
     CsrExpandCursor cur{};
     // want label 7 => only edge 100 (to node 1) survives.
-    int64_t w = csr_expand(src_ids, 1, g.off, g.nbr, g.eid, g.lbl, /*want=*/7,
+    int64_t w = csr_expand(src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, /*want=*/7,
                            o_src, o_edge, o_dst, 8, &cur);
     ASSERT_EQ(w, 1);
     EXPECT_EQ(o_edge[0], 100);
@@ -261,7 +262,7 @@ TEST(CsrExpand, LabelFiltered) {
 
     // want label 9 => only edge 101 (to node 2) survives.
     CsrExpandCursor cur2{};
-    int64_t w2 = csr_expand(src_ids, 1, g.off, g.nbr, g.eid, g.lbl, /*want=*/9,
+    int64_t w2 = csr_expand(src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, /*want=*/9,
                             o_src, o_edge, o_dst, 8, &cur2);
     ASSERT_EQ(w2, 1);
     EXPECT_EQ(o_edge[0], 101);
@@ -269,7 +270,7 @@ TEST(CsrExpand, LabelFiltered) {
 
     // want a label that matches nothing => 0 rows.
     CsrExpandCursor cur3{};
-    int64_t w3 = csr_expand(src_ids, 1, g.off, g.nbr, g.eid, g.lbl, /*want=*/42,
+    int64_t w3 = csr_expand(src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, /*want=*/42,
                             o_src, o_edge, o_dst, 8, &cur3);
     EXPECT_EQ(w3, 0);
 }
@@ -281,27 +282,27 @@ TEST(CsrExpand, OutCapResume) {
     CsrExpandCursor cur{};
 
     // First call: cap 1 => exactly 1 row, cursor parked mid-block of node 0.
-    int64_t w1 = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w1 = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                             o_src, o_edge, o_dst, /*out_cap=*/1, &cur);
     ASSERT_EQ(w1, 1);
     EXPECT_EQ(o_edge[0], 100);
     EXPECT_LT(cur.src_index, 3);   // not finished
 
     // Second call: cap 1 => the second edge of node 0.
-    int64_t w2 = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w2 = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                             o_src, o_edge, o_dst, 1, &cur);
     ASSERT_EQ(w2, 1);
     EXPECT_EQ(o_edge[0], 101);
 
     // Third call: drain the rest (node 1 empty, node 3 one edge).
-    int64_t w3 = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w3 = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                             o_src, o_edge, o_dst, 8, &cur);
     ASSERT_EQ(w3, 1);
     EXPECT_EQ(o_edge[0], 103);
     EXPECT_EQ(cur.src_index, 3);   // fully drained now
 
     // Fourth call: nothing left.
-    int64_t w4 = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w4 = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                             o_src, o_edge, o_dst, 8, &cur);
     EXPECT_EQ(w4, 0);
 }
@@ -312,7 +313,7 @@ TEST(CsrExpand, EmptyAdjacencyAndZeroCap) {
     const int64_t src_ids[1] = {1};
     int64_t o_src[4] = {0}, o_edge[4] = {0}, o_dst[4] = {0};
     CsrExpandCursor cur{};
-    int64_t w = csr_expand(src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w = csr_expand(src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                            o_src, o_edge, o_dst, 4, &cur);
     EXPECT_EQ(w, 0);
     EXPECT_EQ(cur.src_index, 1);   // drained
@@ -320,7 +321,7 @@ TEST(CsrExpand, EmptyAdjacencyAndZeroCap) {
     // out_cap == 0 is a valid no-op poll.
     CsrExpandCursor cur2{};
     const int64_t src2[1] = {0};
-    int64_t w0 = csr_expand(src2, 1, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w0 = csr_expand(src2, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                             o_src, o_edge, o_dst, /*out_cap=*/0, &cur2);
     EXPECT_EQ(w0, 0);
     EXPECT_EQ(cur2.src_index, 0);  // made no progress, resumes later
@@ -331,7 +332,7 @@ TEST(CsrExpand, NoSources) {
     KnownCsr g;
     int64_t o_src[2] = {0}, o_edge[2] = {0}, o_dst[2] = {0};
     CsrExpandCursor cur{};
-    int64_t w = csr_expand(nullptr, 0, g.off, g.nbr, g.eid, nullptr, -1,
+    int64_t w = csr_expand(nullptr, 0, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1,
                            o_src, o_edge, o_dst, 2, &cur);
     EXPECT_EQ(w, 0);
     EXPECT_EQ(cur.src_index, 0);
@@ -360,7 +361,7 @@ TEST(CsrExpandExcluding, DropsExactlyTheNamedEdge) {
     const int64_t ex_a[1] = {100};
     CsrExpandCursor c1{};
     int64_t w1 = bolt::kernels::csr_expand_excluding(
-        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_a, 1,
+        src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1, ex_a, 1,
         o_src, o_edge, o_dst, 8, &c1);
     ASSERT_EQ(w1, 1);
     EXPECT_EQ(o_edge[0], 101);
@@ -372,7 +373,7 @@ TEST(CsrExpandExcluding, DropsExactlyTheNamedEdge) {
     const int64_t ex_b[1] = {101};
     CsrExpandCursor c2{};
     int64_t w2 = bolt::kernels::csr_expand_excluding(
-        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_b, 1,
+        src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1, ex_b, 1,
         o_src, o_edge, o_dst, 8, &c2);
     ASSERT_EQ(w2, 1);
     EXPECT_EQ(o_edge[0], 100);
@@ -382,7 +383,7 @@ TEST(CsrExpandExcluding, DropsExactlyTheNamedEdge) {
     const int64_t ex_both[2] = {101, 100};
     CsrExpandCursor c3{};
     int64_t w3 = bolt::kernels::csr_expand_excluding(
-        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_both, 2,
+        src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1, ex_both, 2,
         o_src, o_edge, o_dst, 8, &c3);
     EXPECT_EQ(w3, 0);
     EXPECT_EQ(c3.src_index, 1);
@@ -391,7 +392,7 @@ TEST(CsrExpandExcluding, DropsExactlyTheNamedEdge) {
     const int64_t ex_none[1] = {999};
     CsrExpandCursor c4{};
     int64_t w4 = bolt::kernels::csr_expand_excluding(
-        src_ids, 1, g.off, g.nbr, g.eid, nullptr, -1, ex_none, 1,
+        src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1, ex_none, 1,
         o_src, o_edge, o_dst, 8, &c4);
     EXPECT_EQ(w4, 2);
 }
@@ -405,10 +406,10 @@ TEST(CsrExpandExcluding, ZeroExclusionsEqualsPlainExpand) {
     int64_t a_src[16] = {0}, a_edge[16] = {0}, a_dst[16] = {0};
     int64_t b_src[16] = {0}, b_edge[16] = {0}, b_dst[16] = {0};
     CsrExpandCursor ca{}, cb{};
-    const int64_t wa = csr_expand(src_ids, 3, g.off, g.nbr, g.eid, g.lbl, 7,
+    const int64_t wa = csr_expand(src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, 7,
                                   a_src, a_edge, a_dst, 16, &ca);
     const int64_t wb = bolt::kernels::csr_expand_excluding(
-        src_ids, 3, g.off, g.nbr, g.eid, g.lbl, 7, nullptr, 0,
+        src_ids, 3, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, 7, nullptr, 0,
         b_src, b_edge, b_dst, 16, &cb);
     ASSERT_EQ(wa, wb);
     EXPECT_EQ(ca.src_index, cb.src_index);
@@ -435,7 +436,7 @@ TEST(CsrExpandExcluding, ComposesWithLabelAndResumes) {
     // number of CSR edges plus one poll per source.
     for (int guard = 0; guard < 16 && cur.src_index < 2; ++guard) {
         const int64_t w = bolt::kernels::csr_expand_excluding(
-            src_ids, 2, g.off, g.nbr, g.eid, nullptr, -1, ex, 1,
+            src_ids, 2, g.n_nodes, g.off, g.nbr, g.eid, nullptr, -1, ex, 1,
             o_src + total, o_edge + total, o_dst + total, 1, &cur);
         total += w;
     }
@@ -448,7 +449,7 @@ TEST(CsrExpandExcluding, ComposesWithLabelAndResumes) {
     // Same, but the surviving edge is also label-rejected => nothing at all.
     CsrExpandCursor cur2{};
     int64_t w2 = bolt::kernels::csr_expand_excluding(
-        src_ids, 1, g.off, g.nbr, g.eid, g.lbl, /*want=*/7, ex, 1,
+        src_ids, 1, g.n_nodes, g.off, g.nbr, g.eid, g.lbl, /*want=*/7, ex, 1,
         o_src, o_edge, o_dst, 8, &cur2);
     EXPECT_EQ(w2, 0);          // edge 100 is label 7 but excluded; 101 is label 9
     EXPECT_EQ(cur2.src_index, 1);

@@ -101,6 +101,14 @@ TEST(BoltGroupbyDistinct, ArrayIndexingPerCellIndependent) {
     EXPECT_EQ(arr.cell_at(1, 1)->n, 0u);
 }
 
+// G2CHK-92: the out-of-bounds `cell_at` injection case (an index that would
+// have produced a past-the-end pointer pre-fix) lives in
+// test_bolt_groupby_distinct_bounds.cpp instead of here — `cell_at` KEEPS
+// its `assert(g < entry_cap)` precondition (Tiger Style: asserts are for
+// programmer errors), so exercising the out-of-range case aborts in any
+// assert-live build. That test is therefore compiled with -DNDEBUG only,
+// same shape as test_bolt_join_bounds.cpp — see tests/CMakeLists.txt.
+
 // ---- DistinctCell16 (Phase-B: inline-Utf8 keys) ----------------------------
 
 namespace {

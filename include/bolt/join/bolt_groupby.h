@@ -98,6 +98,25 @@ struct GroupByTable {
     // — different work per side) but it's one of the most-predictable
     // branches in the codebase: after the first sample of each key the
     // path is always "hit". Min/max use branchless `bmin`/`bmax`.
+    //
+    // G2CHK-92 audit: `assert(num_groups < capacity)` below IS absent from
+    // any -DNDEBUG build, same class of gap G2GRAPH-27 fixed in the join
+    // kernels — but here it is verified SAFE BY CONSTRUCTION for both real
+    // callers in this tree, not merely by convention:
+    //   - `groupby_agg_int64` (this file) creates its table with
+    //     `hint = n` (the exact row count) under `tight_sizing=true`, which
+    //     rounds `capacity` up to the smallest power-of-two >= n. Every row
+    //     ingested is at most one NEW group, so `num_groups` can never
+    //     exceed `n <= capacity`.
+    //   - `parallel_groupby_morsel` (bolt_parallel.h) creates one table per
+    //     morsel with `hint = grain`, and every morsel's row slice is
+    //     `<= grain` by how `submit_range` partitions `n`. Same argument.
+    // A caller that cannot make this guarantee has the checked twin
+    // `ingest()` below (already the Tiger Style "compile-time switch"
+    // alternative Tiger Style asks for) — returns `false` on overflow
+    // instead of writing past `payload`. Do not add a per-row branch to
+    // THIS function without measuring; it would tax the exact hot loop the
+    // unchecked contract exists for.
     void ingest_unchecked(uint64_t key, int64_t value) noexcept {
         assert(payload != nullptr);
         assert(group_keys != nullptr);
@@ -129,16 +148,31 @@ struct GroupByTable {
     // `existing_scratch` and `miss_idx_scratch` must be ≥ n entries.
     // Caller owns them; typically allocated from the morsel arena.
     //
+    // G2CHK-92: `assert(num_groups + n <= capacity)` used to be the only
+    // guard here — absent from any -DNDEBUG build, same gap class as
+    // G2GRAPH-27. Unlike `ingest_unchecked` this check is PER-CALL, not
+    // per-row (n rows amortise one comparison), so there is no measured-
+    // perf reason to keep it assert-only: it is now a real runtime check.
+    // Returns false (and writes nothing — the check runs before Pass A)
+    // when `n` would overflow `capacity`; the caller must test the return
+    // value and fail rather than assume success, mirroring the explicit
+    // overflow signal G2GRAPH-27 added to the join probe kernels.
+    //
     // See docs/research/branchless-hashing.md (two-pass hoisted probe).
-    void ingest_two_pass(const uint64_t* BOLT_RESTRICT keys,
-                         const int64_t*  BOLT_RESTRICT values,
-                         int64_t         n,
-                         int32_t* BOLT_RESTRICT existing_scratch,
-                         uint32_t* BOLT_RESTRICT miss_idx_scratch) noexcept {
+    bool ingest_two_pass(const uint64_t* BOLT_RESTRICT keys,
+                        const int64_t*  BOLT_RESTRICT values,
+                        int64_t         n,
+                        int32_t* BOLT_RESTRICT existing_scratch,
+                        uint32_t* BOLT_RESTRICT miss_idx_scratch) noexcept {
         assert(payload != nullptr);
         assert(group_keys != nullptr);
         assert(n >= 0);
-        assert(num_groups + n <= capacity);  // worst-case all distinct
+        // Worst case every row is a brand-new distinct key. Checked for
+        // real (not just asserted) — nothing is written before this test.
+        if (n < 0 || static_cast<uint64_t>(num_groups) +
+                     static_cast<uint64_t>(n) > static_cast<uint64_t>(capacity)) {
+            return false;
+        }
 
         // Pass A — probe all keys; write existing[i] = slot or -1.
         for (int64_t i = 0; i < n; ++i) {
@@ -198,6 +232,7 @@ struct GroupByTable {
         // Reset the dummy slot — it was used as a write sink in Pass B
         // and its accumulated values are noise we discard.
         payload[kDummy] = {0, 0, INT64_MAX, INT64_MIN};
+        return true;
     }
 
     // Checked ingest — kept for callers that don't pre-size or want a

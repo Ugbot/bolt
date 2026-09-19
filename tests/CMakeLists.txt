@@ -796,6 +796,17 @@ target_link_libraries(test_bolt_csr
 bolt_apply_hardening(test_bolt_csr)
 add_test(NAME test_bolt_csr COMMAND test_bolt_csr)
 
+# G2CHK-92 — source-id bounds contract for csr_expand_bounded/_excluding/
+# csr_expand, compiled with -DNDEBUG on purpose: the pre-fix `assert(s >= 0)`
+# had no upper bound at all and was absent from any -DNDEBUG build. Mirrors
+# test_bolt_join_bounds's shape (G2GRAPH-27).
+add_executable(test_bolt_csr_bounds test_bolt_csr_bounds.cpp)
+target_link_libraries(test_bolt_csr_bounds
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_csr_bounds PRIVATE NDEBUG)
+bolt_apply_hardening(test_bolt_csr_bounds)
+add_test(NAME test_bolt_csr_bounds COMMAND test_bolt_csr_bounds)
+
 # Variable-length CSR traversal (bolt_csr_bfs.h): WALK/TRAIL/SIMPLE expansion
 # and the aggregate-pushdown count twin. Expected values come from
 # tests/csr_bfs_enumerate.py and (for the randomized graph) networkx.
@@ -1041,6 +1052,17 @@ target_link_libraries(test_bolt_groupby_distinct
 bolt_apply_hardening(test_bolt_groupby_distinct)
 add_test(NAME test_bolt_groupby_distinct COMMAND test_bolt_groupby_distinct)
 
+# G2CHK-92 — out-of-bounds contract for DistinctCellArray::cell_at, compiled
+# with -DNDEBUG so it exercises the assert-free configuration consumers
+# ship (the out-of-range case would abort wherever the asserts are live —
+# see the file header comment). Same fix shape as test_bolt_join_bounds.
+add_executable(test_bolt_groupby_distinct_bounds test_bolt_groupby_distinct_bounds.cpp)
+target_link_libraries(test_bolt_groupby_distinct_bounds
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_groupby_distinct_bounds PRIVATE NDEBUG)
+bolt_apply_hardening(test_bolt_groupby_distinct_bounds)
+add_test(NAME test_bolt_groupby_distinct_bounds COMMAND test_bolt_groupby_distinct_bounds)
+
 # K-AGG-A typed multi-key GROUP BY kernel — correctness on small inputs.
 add_executable(test_bolt_groupby_typed test_bolt_groupby_typed.cpp)
 target_link_libraries(test_bolt_groupby_typed
@@ -1073,6 +1095,16 @@ target_link_libraries(test_bolt_join_bounds
 target_compile_definitions(test_bolt_join_bounds PRIVATE NDEBUG)
 bolt_apply_hardening(test_bolt_join_bounds)
 add_test(NAME test_bolt_join_bounds COMMAND test_bolt_join_bounds)
+
+# G2CHK-92 — capacity-overflow contract for GroupByTable::ingest_two_pass,
+# compiled with -DNDEBUG so it exercises the assert-free configuration
+# consumers ship. Same fix shape as test_bolt_join_bounds above.
+add_executable(test_bolt_groupby_bounds test_bolt_groupby_bounds.cpp)
+target_link_libraries(test_bolt_groupby_bounds
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_groupby_bounds PRIVATE NDEBUG)
+bolt_apply_hardening(test_bolt_groupby_bounds)
+add_test(NAME test_bolt_groupby_bounds COMMAND test_bolt_groupby_bounds)
 
 # Typed all-shapes SwissTable join kernel (bolt/join/bolt_joinkernel.h).
 add_executable(test_bolt_joinkernel test_bolt_joinkernel.cpp)
