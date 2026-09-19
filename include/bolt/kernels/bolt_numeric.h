@@ -451,6 +451,59 @@ BOLT_DEFINE_ARITH(mul, *)
 
 #undef BOLT_DEFINE_ARITH
 
+// mul<T> above is UB on integer overflow — fine for callers that have already
+// bounded their operands, but unsafe for unbounded data (e.g. SQL expressions
+// chaining multiplies over arbitrary Int64/Decimal64-mantissa columns; see
+// G2CHK-98). mul_overflow<T> is the scalar primitive (shared by the batched
+// mul_checked below AND usable directly by a per-row/scalar evaluator):
+// returns false and leaves *out untouched when the product would overflow,
+// true with the exact product otherwise — never invokes overflow UB either
+// way (the MSVC arm pre-checks via division before ever multiplying).
+template <typename T>
+inline bool mul_overflow(T a, T b, T* BOLT_RESTRICT out) noexcept {
+    static_assert(std::is_integral<T>::value,
+                 "mul_overflow is for integral T only");
+    assert(out != nullptr);
+#if defined(__clang__) || defined(__GNUC__)
+    T prod = T{0};
+    if (__builtin_mul_overflow(a, b, &prod)) return false;
+    *out = prod;
+    return true;
+#else
+    bool ovf = false;
+    if (a != T{0} && b != T{0}) {
+        constexpr T tmax = (std::numeric_limits<T>::max)();
+        constexpr T tmin = (std::numeric_limits<T>::min)();
+        ovf = (a > T{0})
+            ? ((b > T{0}) ? (a > tmax / b) : (b < tmin / a))
+            : ((b > T{0}) ? (a < tmin / b) : (b < tmax / a));
+    }
+    if (ovf) return false;
+    *out = static_cast<T>(a * b);
+    return true;
+#endif
+}
+
+// Batched form: same product as mul<T>, but returns false the moment any
+// row's product overflows T, with out[i]==0 for that (and every later) row
+// rather than a wrapped/UB value.
+template <typename T>
+inline bool mul_checked(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,
+                        int64_t n, T* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(b != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    bool ok = true;
+    for (int64_t i = 0; i < n; ++i) {
+        T prod = T{0};
+        const bool row_ok = mul_overflow(a[i], b[i], &prod);
+        out[i] = row_ok ? prod : T{0};
+        ok = ok && row_ok;
+    }
+    return ok;
+}
+
 // div is branchy for integer zero-check; floats get IEEE ±inf/NaN semantics.
 template <typename T>
 inline void div(const T* BOLT_RESTRICT a, const T* BOLT_RESTRICT b,
@@ -494,6 +547,24 @@ BOLT_DEFINE_ARITH_LIT(sub_lit, -)
 BOLT_DEFINE_ARITH_LIT(mul_lit, *)
 
 #undef BOLT_DEFINE_ARITH_LIT
+
+// mul_lit<T> checked variant — same UB-on-overflow hazard and same fix shape
+// as mul_checked above (G2CHK-98), for the column-OP-literal broadcast form.
+template <typename T>
+inline bool mul_lit_checked(const T* BOLT_RESTRICT a, int64_t n, T lit,
+                            T* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    bool ok = true;
+    for (int64_t i = 0; i < n; ++i) {
+        T prod = T{0};
+        const bool row_ok = mul_overflow(a[i], lit, &prod);
+        out[i] = row_ok ? prod : T{0};
+        ok = ok && row_ok;
+    }
+    return ok;
+}
 
 // out[i] = lit - a[i] (reversed operand order; subtraction is the only
 // non-commutative op of the three, e.g. `1 - l_discount`).
