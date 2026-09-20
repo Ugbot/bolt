@@ -1065,6 +1065,19 @@ else()
     message(STATUS "bolt: ycpp supplied by the enclosing project -- building bolt::ybolt")
 endif()
 
+# G2GRAPH-42: ybolt/CMakeLists.txt's own `install(DIRECTORY ...)` (gated on
+# BOLT_INSTALL) reads CMAKE_INSTALL_INCLUDEDIR, which GNUInstallDirs defines --
+# but that include used to happen 23 lines below, in the "Install + export"
+# section, AFTER add_subdirectory(ybolt) already ran. The variable was empty
+# for ybolt's own install() call, which CMake rejects outright: "install
+# DIRECTORY given no DESTINATION!" -- a hard configure-time error, not a
+# missing-header footgun, but only when BOLT_INSTALL=ON and ycpp is present
+# together (the "standalone bolt built for export, with ybolt" case), which is
+# exactly why it survived: no existing build exercised that combination.
+# GNUInstallDirs only sets cache variables and has no other ordering
+# dependency in this file, so it is safe to include this early.
+include(GNUInstallDirs)
+
 if(TARGET ycpp::headers OR TARGET ycpp::ycpp)
     add_subdirectory(ybolt)
 else()
@@ -1089,7 +1102,9 @@ endif()
 # inside the Python wheel. It also matters for correctness here: bolt_ybolt is
 # only exportable once ycpp is an exported package, so a superproject that
 # supplies ycpp via add_subdirectory must not try to export it.
-include(GNUInstallDirs)          # unconditional: ybolt/ reads CMAKE_INSTALL_*
+# (GNUInstallDirs is included earlier, above add_subdirectory(ybolt) -- see
+# the G2GRAPH-42 comment there. include() is idempotent, but there is nothing
+# left here that needs a second copy.)
 include(CMakePackageConfigHelpers)
 
 if(BOLT_INSTALL)
