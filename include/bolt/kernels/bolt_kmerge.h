@@ -311,8 +311,14 @@ inline int64_t kmerge_i64(KMergeInput* BOLT_RESTRICT inputs,
                           int32_t* BOLT_RESTRICT out_input_id,
                           int64_t* BOLT_RESTRICT out_key,
                           int64_t capacity) noexcept {
-    assert(capacity >= 0);
-    assert(num_inputs <= kKMergeMaxInputs);
+    // G2COV-45: num_inputs/capacity out of range are documented -1 runtime
+    // errors (see the doc comment above), not programmer-error invariants --
+    // a caller can legitimately pass a fan-in it computed from live data. The
+    // asserts these replaced fired BEFORE the `return -1` checks two lines
+    // below ever ran, aborting the process in this repo's assert-live Release
+    // build instead of returning the documented sentinel (caught by
+    // BoltKMerge.ExceedsMaxFanInRejected once bolt's own suite started
+    // running under Gestalt2's CI).
     if (inputs == nullptr && num_inputs > 0)           return -1;
     if (num_inputs == 0)                               return 0;
     if (num_inputs > kKMergeMaxInputs)                 return -1;
@@ -356,8 +362,8 @@ inline int64_t kmerge_u64(KMergeInput* BOLT_RESTRICT inputs,
                           int32_t* BOLT_RESTRICT out_input_id,
                           int64_t* BOLT_RESTRICT out_key,
                           int64_t capacity) noexcept {
-    assert(capacity >= 0);
-    assert(num_inputs <= kKMergeMaxInputs);
+    // G2COV-45: see kmerge_i64 above -- same documented -1 contract, same
+    // premature-assert bug.
     if (inputs == nullptr && num_inputs > 0)           return -1;
     if (num_inputs == 0)                               return 0;
     if (num_inputs > kKMergeMaxInputs)                 return -1;

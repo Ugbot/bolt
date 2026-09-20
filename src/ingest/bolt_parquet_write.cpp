@@ -664,7 +664,18 @@ bool encode_plain_byte_array(const BoltColumn& col, std::int64_t r_begin,
                              std::vector<std::uint8_t>* dst) noexcept {
     assert(dst != nullptr);
     assert(r_begin <= r_end);
-    assert(col.data != nullptr || r_begin == r_end);
+    // G2COV-45: this used to additionally assert col.data != nullptr (unless
+    // the range is empty), which is WRONG for ColumnFormat::VarBinary -- that
+    // layout's bytes live in col.dict_child, and row_val_bytes below already
+    // handles a null `col.data` pool for it gracefully (its own assert two
+    // lines into row_val_bytes carries the exact `|| format == VarBinary`
+    // exemption this one lacked). The stricter assert aborted the process
+    // before the graceful "can't read" path a few lines down ever ran --
+    // caught by ParquetWriteVarBinary.FailedCloseRemovesThePartialFile once
+    // bolt's own suite started running under Gestalt2's CI. col.data must
+    // still be non-null for the two other physical layouts row_val_bytes
+    // reads directly (Flat/View StringView); that is asserted inside
+    // row_val_bytes itself.
     // Both physical Utf8/Binary layouts (StringView+spill and VarBinary
     // offsets+pool) resolve through row_val_bytes -- see its comment. This
     // used to open-code the StringView case, which is why a VarBinary column
@@ -739,7 +750,8 @@ bool compute_stats_utf8(const BoltColumn& col, std::int64_t r_begin,
                         StatBuf* rec) noexcept {
     assert(rec != nullptr);
     assert(r_begin <= r_end);
-    assert(col.data != nullptr || r_begin == r_end);
+    // G2COV-45: see encode_plain_byte_array above -- the same
+    // format-unaware assert was wrong for ColumnFormat::VarBinary here too.
     // Layout-agnostic byte access (StringView+spill OR VarBinary
     // offsets+pool) -- see row_val_bytes. G2ICE-87.
     const std::uint8_t* mn_p = nullptr; std::uint32_t mn_n = 0;
