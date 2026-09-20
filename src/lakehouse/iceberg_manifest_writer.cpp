@@ -454,12 +454,18 @@ bool manifest_list_write_avro(const ManifestListEntry* entries,
         }
         put_long(&v[i++], e->added_snapshot_id != 0 ? e->added_snapshot_id
                                                     : snapshot_id);
+        // G2ICE-49 — these five were hardcoded 0 regardless of what the
+        // caller had computed: `ManifestListEntry` had no fields to hold
+        // anything else, so there was nothing else TO write. The struct now
+        // carries real per-manifest tallies (see its declaration); this
+        // writer's job is only to place them, same as `added_files_count`
+        // always did.
         put_long(&v[i++], e->added_files_count);
-        put_long(&v[i++], 0);                          // existing_files_count
-        put_long(&v[i++], 0);                          // deleted_files_count
-        put_long(&v[i++], 0);                          // added_rows_count
-        put_long(&v[i++], 0);                          // existing_rows_count
-        put_long(&v[i++], 0);                          // deleted_rows_count
+        put_long(&v[i++], e->existing_files_count);
+        put_long(&v[i++], e->deleted_files_count);
+        put_long(&v[i++], e->added_rows_count);
+        put_long(&v[i++], e->existing_rows_count);
+        put_long(&v[i++], e->deleted_rows_count);
         put_null(&v[i++]);                             // partitions
         put_null(&v[i++]);                             // key_metadata
         assert(i == kListFields);

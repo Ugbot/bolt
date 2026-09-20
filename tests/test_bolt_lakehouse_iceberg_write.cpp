@@ -328,6 +328,14 @@ TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
     ASSERT_EQ(n_mle, 1u);
     EXPECT_EQ(mle[0].added_snapshot_id, snap.snapshot_id);
     EXPECT_EQ(mle[0].added_files_count, 1);
+    // G2ICE-49 — the manifest-list's row tally, trusted by readers (pyiceberg
+    // `inspect.manifests()`, DuckDB) without opening the manifest, must match
+    // the 7 rows the append actually wrote, not the old hardcoded 0.
+    EXPECT_EQ(mle[0].added_rows_count, 7);
+    EXPECT_EQ(mle[0].existing_files_count, 0);
+    EXPECT_EQ(mle[0].deleted_files_count, 0);
+    EXPECT_EQ(mle[0].existing_rows_count, 0);
+    EXPECT_EQ(mle[0].deleted_rows_count, 0);
     EXPECT_EQ(mle[0].partition_spec_id, 0);
 
     // 2. The MANIFEST it names is a real OCF whose entry describes the file

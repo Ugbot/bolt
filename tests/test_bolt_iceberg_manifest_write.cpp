@@ -209,6 +209,47 @@ TEST(IcebergManifestWrite, ManifestListRoundTrip) {
     EXPECT_EQ(out[1].added_files_count, 3);
 }
 
+// G2ICE-49 — added_rows_count (and its four siblings: existing_files_count,
+// deleted_files_count, existing_rows_count, deleted_rows_count) used to be
+// hardcoded 0 on write regardless of what the caller set, because
+// `ManifestListEntry` had no fields to hold anything else. A reader that
+// trusts the manifest-list alone (pyiceberg's `inspect.manifests()`, DuckDB,
+// a snapshot-summary rollup) sees these WITHOUT opening the manifest, so a
+// wrong value here silently corrupts a metadata-only COUNT(*) the same way a
+// data file's own `record_count` would.
+TEST(IcebergManifestWrite, ManifestListRowAndFileCountsRoundTrip) {
+    bolt::Arena arena;
+    ice::ManifestListEntry in[1]{};
+    in[0].partition_spec_id    = 0;
+    in[0].content              = ice::ManifestContent::kDataManifest;
+    in[0].manifest_length      = 4096;
+    in[0].added_snapshot_id    = 777;
+    in[0].added_files_count    = 3;
+    in[0].existing_files_count = 5;
+    in[0].deleted_files_count  = 2;
+    in[0].added_rows_count     = 30000;
+    in[0].existing_rows_count  = 50000;
+    in[0].deleted_rows_count   = 20000;
+    std::snprintf(in[0].manifest_path, sizeof(in[0].manifest_path),
+                  "s3://wh/db/t/metadata/m-0.avro");
+
+    const uint8_t* buf = nullptr;
+    uint64_t len = 0;
+    ASSERT_TRUE(ice::manifest_list_write_avro(in, 1, 777, 3, &arena, &buf, &len));
+
+    ice::ManifestListEntry out[4]{};
+    uint32_t n = 0;
+    ASSERT_TRUE(ice::manifest_list_parse_avro(buf, len, &arena, out, 4, &n));
+    ASSERT_EQ(n, 1u);
+
+    EXPECT_EQ(out[0].added_files_count, 3);
+    EXPECT_EQ(out[0].existing_files_count, 5);
+    EXPECT_EQ(out[0].deleted_files_count, 2);
+    EXPECT_EQ(out[0].added_rows_count, 30000);
+    EXPECT_EQ(out[0].existing_rows_count, 50000);
+    EXPECT_EQ(out[0].deleted_rows_count, 20000);
+}
+
 // Synthesis is a pure function of its inputs: callers cache manifests and
 // compare them by content, so a random sync marker or any other nondeterminism
 // would break them.

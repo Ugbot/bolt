@@ -160,6 +160,13 @@ TEST(IcebergRealAvro, ManifestListParsesRealValues) {
     // to the manifest more strongly than a magic number would.
     EXPECT_EQ(ents[0].added_files_count, 2);   // append #2 -> AAPL, TSLA
     EXPECT_EQ(ents[1].added_files_count, 3);   // append #1 -> AAPL, GOOG, MSFT
+    // G2ICE-49 — added_rows_count read back from a REAL pyiceberg-written
+    // manifest list, not merely round-tripped through bolt's own writer.
+    // Before this fix the parser never bound this field at all (only
+    // added_files_count was), so this pair of values was silently 0 no
+    // matter what pyiceberg had actually written.
+    EXPECT_EQ(ents[0].added_rows_count, 3);    // append #2 -> AAPL, TSLA(x2)
+    EXPECT_EQ(ents[1].added_rows_count, 6);    // append #1 -> AAPL(x2), MSFT(x2), GOOG
     for (uint32_t i = 0; i < n; ++i) {
         EXPECT_EQ(ents[i].partition_spec_id, 0);
         EXPECT_GT(ents[i].manifest_length, 0);

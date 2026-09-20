@@ -55,9 +55,13 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
                          const uint8_t** out, uint64_t* out_len) noexcept;
 
 // Write `n_entries` manifest-list entries (the snapshot's `snap-*.avro`).
-// `partitions` and `key_metadata` are written null; the per-manifest row
-// counts a reader would use for pruning are written as 0 with the file counts
-// carried from `ManifestListEntry::added_files_count`.
+// `partitions` and `key_metadata` are written null; the six required
+// added/existing/deleted file+row counts (G2ICE-49) are written from the
+// matching `ManifestListEntry` fields, which the caller must have populated
+// with real tallies -- these are trusted by readers (pyiceberg's
+// `inspect.manifests()`, DuckDB, snapshot-summary rollups) without opening
+// the manifest or its data files, so a wrong value here is a silently wrong
+// COUNT(*), exactly like a data file's own `record_count`.
 bool manifest_list_write_avro(const ManifestListEntry* entries,
                               uint32_t n_entries, int64_t snapshot_id,
                               int64_t sequence_number, Arena* scratch,

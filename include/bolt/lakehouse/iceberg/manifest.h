@@ -101,7 +101,21 @@ struct ManifestListEntry {
     uint8_t      _pad[3];
     int64_t      manifest_length;
     int64_t      added_snapshot_id;
+    // Per-manifest file/row tallies (G2ICE-49). Iceberg's manifest_file schema
+    // splits both files and rows three ways by the ManifestStatus each entry
+    // in the manifest carries: ADDED (new to the table this commit),
+    // EXISTING (carried forward from an earlier commit, still live), DELETED
+    // (removed this commit). A reader (pyiceberg's `inspect.manifests()`,
+    // DuckDB's iceberg extension, any snapshot-summary rollup) trusts these
+    // straight off the manifest-list without opening the manifest file or the
+    // data files it names, exactly like `record_count` on a data file --
+    // wrong here is a silent wrong COUNT(*), not a crash.
     int64_t      added_files_count;
+    int64_t      existing_files_count;
+    int64_t      deleted_files_count;
+    int64_t      added_rows_count;
+    int64_t      existing_rows_count;
+    int64_t      deleted_rows_count;
     // The sequence number the manifest was COMMITTED at, not the sequence
     // number of the snapshot whose list happens to name it. A snapshot's list
     // names every manifest still live, so most entries in it were written by

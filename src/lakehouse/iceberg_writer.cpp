@@ -1129,6 +1129,41 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     }
     if (n_mlist >= kIcebergMaxManifestsPerList) return false;
 
+    // G2ICE-49 — the manifest-list must report REAL per-status file/row
+    // tallies, not just a file count. Every entry `files[]` holds for THIS
+    // manifest carries a ManifestStatus; sum `record_count` per status so a
+    // reader that trusts the manifest-list alone (pyiceberg's
+    // `inspect.manifests()`, DuckDB's iceberg extension, a snapshot-summary
+    // rollup) sees the truth without opening the manifest or its data files
+    // — exactly the class of bug `record_count` on a data file already is
+    // (see manifest_avro.h). Every current caller of publish_snapshot stamps
+    // every file it passes as kAdded (or passes nf=0), so this reduces to
+    // the old `nf`/`0` values there; it is also correct for a future caller
+    // that ever mixes statuses in one manifest.
+    int64_t files_added = 0, files_existing = 0, files_deleted = 0;
+    int64_t rows_added = 0, rows_existing = 0, rows_deleted = 0;
+    for (uint32_t r = 0; r < nf; ++r) {        // bounded: nf <= kIcebergMaxManifestEntries
+        const DataFileRef& d = files[r];
+        switch (d.status) {
+            case ManifestStatus::kAdded:
+                ++files_added;
+                rows_added += d.stats.record_count;
+                break;
+            case ManifestStatus::kExisting:
+                ++files_existing;
+                rows_existing += d.stats.record_count;
+                break;
+            case ManifestStatus::kDeleted:
+                ++files_deleted;
+                rows_deleted += d.stats.record_count;
+                break;
+            default:
+                break;   // kUnknown: uncounted, same as the old code's silence
+        }
+    }
+    assert(files_added + files_existing + files_deleted <=
+           static_cast<int64_t>(nf));
+
     // Manifest-list body — Avro OCF likewise.
     ManifestListEntry mle{};
     mle.partition_spec_id = th->meta.current_spec_id;
@@ -1140,7 +1175,12 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                                 : ManifestContent::kDataManifest;
     mle.manifest_length   = static_cast<int64_t>(manifest_len);
     mle.added_snapshot_id = snap_id;
-    mle.added_files_count = nf;
+    mle.added_files_count    = files_added;
+    mle.existing_files_count = files_existing;
+    mle.deleted_files_count  = files_deleted;
+    mle.added_rows_count     = rows_added;
+    mle.existing_rows_count  = rows_existing;
+    mle.deleted_rows_count   = rows_deleted;
     // Added by THIS commit, so it takes this commit's sequence number.
     mle.sequence_number     = seq;
     mle.min_sequence_number = seq;

@@ -88,6 +88,9 @@ struct MlCtx {
     uint32_t           n;
     int32_t f_path, f_len, f_spec, f_content, f_snap, f_added;
     int32_t f_seq, f_minseq;
+    // G2ICE-49 -- the five file/row tallies `added_files_count` always had
+    // schema siblings for, that this reader never bound.
+    int32_t f_exist_f, f_del_f, f_added_r, f_exist_r, f_del_r;
 };
 
 bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
@@ -107,6 +110,14 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     e->manifest_length   = i64_or(at(s->f_len), 0);
     e->added_snapshot_id = i64_or(at(s->f_snap), 0);
     e->added_files_count = i64_or(at(s->f_added), 0);
+    // G2ICE-49 -- read back the same way added_files_count always was, so a
+    // carried-forward manifest keeps its real tallies across a re-list
+    // instead of silently losing them at the first roundtrip.
+    e->existing_files_count = i64_or(at(s->f_exist_f), 0);
+    e->deleted_files_count  = i64_or(at(s->f_del_f), 0);
+    e->added_rows_count     = i64_or(at(s->f_added_r), 0);
+    e->existing_rows_count  = i64_or(at(s->f_exist_r), 0);
+    e->deleted_rows_count   = i64_or(at(s->f_del_r), 0);
     e->partition_spec_id = static_cast<int32_t>(i64_or(at(s->f_spec), 0));
     // Carried through so a later commit that re-lists this manifest preserves
     // the sequence number it was committed at (see ManifestListEntry).
@@ -297,6 +308,11 @@ bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     s.f_content = find_field(h, "content");
     s.f_snap    = find_field(h, "added_snapshot_id");
     s.f_added   = find_field(h, "added_files_count");
+    s.f_exist_f = find_field(h, "existing_files_count");
+    s.f_del_f   = find_field(h, "deleted_files_count");
+    s.f_added_r = find_field(h, "added_rows_count");
+    s.f_exist_r = find_field(h, "existing_rows_count");
+    s.f_del_r   = find_field(h, "deleted_rows_count");
     s.f_seq     = find_field(h, "sequence_number");
     s.f_minseq  = find_field(h, "min_sequence_number");
     // Without a path there is nothing to point a scan at — that is not a
