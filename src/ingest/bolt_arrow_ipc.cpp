@@ -29,10 +29,22 @@ namespace {
 constexpr std::int16_t kMetadataV5     = 4;   // MetadataVersion::V5
 constexpr std::uint8_t kHeaderSchema   = 1;   // MessageHeader union
 constexpr std::uint8_t kHeaderBatch    = 3;
-constexpr std::uint8_t kTypeInt        = 2;   // Type union
+// Type union member ordinals — 1-indexed by flatbuffer declaration order
+// (format/Schema.fbs: Null, Int, FloatingPoint, Binary, Utf8, Bool,
+// Decimal, Date, Time, Timestamp, Interval, List, Struct_, ...).
+constexpr std::uint8_t kTypeInt        = 2;
 constexpr std::uint8_t kTypeFloat      = 3;
+constexpr std::uint8_t kTypeBinary     = 4;
 constexpr std::uint8_t kTypeUtf8       = 5;
+constexpr std::uint8_t kTypeBool       = 6;
+constexpr std::uint8_t kTypeDecimal    = 7;
+constexpr std::uint8_t kTypeDate       = 8;
 constexpr std::int16_t kPrecisionDouble = 2;  // FloatingPoint::Precision
+constexpr std::int16_t kDateUnitDay     = 0;  // DateUnit::DAY
+constexpr std::int32_t kDecimal128BitWidth  = 128;
+constexpr std::int32_t kDecimal128Precision = 38;  // bolt tracks no
+                                                    // narrower precision;
+                                                    // matches bolt_arrow.h.
 
 constexpr std::uint32_t kContinuation  = 0xFFFFFFFFu;
 
@@ -198,8 +210,9 @@ std::uint32_t fb_finish(Fb* b, std::uint32_t root) noexcept {
 // ---- schema message ------------------------------------------------------
 
 // Build the Type union table for one BoltType. Writes the union tag to
-// *out_tag. Returns table pos, 0 for an unsupported type (fail closed).
-std::uint32_t build_type_table(Fb* b, BoltType t,
+// *out_tag. `decimal_scale` is used only for Decimal128. Returns table
+// pos, 0 for an unsupported type (fail closed).
+std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
                                std::uint8_t* out_tag) noexcept {
     assert(out_tag != nullptr);
     if (t == BoltType::Int64) {
@@ -220,14 +233,40 @@ std::uint32_t build_type_table(Fb* b, BoltType t,
         fb_start_table(b);                               // empty table
         return fb_end_table(b);
     }
+    if (t == BoltType::Binary) {
+        *out_tag = kTypeBinary;
+        fb_start_table(b);                               // empty table
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Bool) {
+        *out_tag = kTypeBool;
+        fb_start_table(b);                               // empty table
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Date32) {
+        *out_tag = kTypeDate;
+        fb_start_table(b);
+        fb_field_scalar<std::int16_t>(b, 0, kDateUnitDay);  // unit = DAY
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Decimal128) {
+        *out_tag = kTypeDecimal;
+        fb_start_table(b);
+        fb_field_scalar<std::int32_t>(b, 0, kDecimal128Precision);
+        fb_field_scalar<std::int32_t>(
+            b, 1, static_cast<std::int32_t>(decimal_scale));
+        fb_field_scalar<std::int32_t>(b, 2, kDecimal128BitWidth);
+        return fb_end_table(b);
+    }
     return 0;                                            // unsupported
 }
 
 // Field table: name / nullable / type union / empty children vector.
 std::uint32_t build_field(Fb* b, const char* name, BoltType t,
+                          std::uint8_t decimal_scale,
                           std::uint32_t empty_children) noexcept {
     std::uint8_t tag = 0;
-    const std::uint32_t type_pos = build_type_table(b, t, &tag);
+    const std::uint32_t type_pos = build_type_table(b, t, decimal_scale, &tag);
     if (type_pos == 0) return 0;
     const std::uint32_t name_pos = fb_string(b, name);
     fb_start_table(b);
@@ -279,10 +318,13 @@ std::int64_t count_nulls(const std::uint8_t* validity,
     return nulls;
 }
 
-// Total packed Utf8 bytes via the shared var_at resolution; false when
-// the offsets would overflow int32 (Arrow "u" limit — fail closed).
-bool utf8_total_bytes(const BoltColumn& col, std::int64_t n,
-                      std::int64_t* out_total) noexcept {
+// Total packed Utf8/Binary bytes via the shared var_at resolution — the
+// same physical layouts (inline/spilled StringView, or VarBinary offsets)
+// back both logical types, and var_at itself does not branch on
+// col.type, so one helper covers both. False when the offsets would
+// overflow int32 (Arrow "u"/"z" limit — fail closed).
+bool varlen_total_bytes(const BoltColumn& col, std::int64_t n,
+                        std::int64_t* out_total) noexcept {
     assert(out_total != nullptr);
     std::int64_t total = 0;
     for (std::int64_t i = 0; i < n; ++i) {
@@ -313,9 +355,11 @@ bool write_padded(std::FILE* f, const void* p, std::int64_t n) noexcept {
     return true;
 }
 
-// Stream one column's Utf8 offsets then data, both 8-padded.
-bool write_utf8_buffers(std::FILE* f, const BoltColumn& col,
-                        std::int64_t n, std::int64_t total) noexcept {
+// Stream one column's varlen (Utf8 or Binary) offsets then data, both
+// 8-padded. No UTF-8 validity assumption is made anywhere here — bytes
+// are copied verbatim via var_at, same as the Utf8 case always was.
+bool write_varlen_buffers(std::FILE* f, const BoltColumn& col,
+                          std::int64_t n, std::int64_t total) noexcept {
     std::int32_t off = 0;
     if (std::fwrite(&off, 4, 1, f) != 1) return false;
     for (std::int64_t i = 0; i < n; ++i) {
@@ -351,13 +395,48 @@ bool write_utf8_buffers(std::FILE* f, const BoltColumn& col,
     return true;
 }
 
+// Bit-pack bolt's byte-packed Bool column (one byte/row, nonzero=true)
+// into Arrow's LSB-first bit-packed "b" buffer, streamed one output byte
+// at a time so no full-column scratch buffer is needed (mirrors the
+// offsets loop above). `col.data` must be non-null when n > 0 — checked
+// by the caller (layout_batch), same precondition every other fixed-width
+// branch enforces.
+bool write_bool_bits(std::FILE* f, const BoltColumn& col,
+                     std::int64_t n) noexcept {
+    assert(f != nullptr);
+    assert(n >= 0);
+    const auto* src = static_cast<const std::uint8_t*>(col.data);
+    std::uint8_t byte = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        if (src[i] != 0) byte |= static_cast<std::uint8_t>(1u << (i & 7));
+        if ((i & 7) == 7) {
+            if (std::fwrite(&byte, 1, 1, f) != 1) return false;
+            byte = 0;
+        }
+    }
+    if ((n & 7) != 0 && std::fwrite(&byte, 1, 1, f) != 1) return false;
+    static const std::uint8_t zeros[8] = {0};
+    const std::int64_t nbytes = (n + 7) / 8;
+    const std::int64_t pad = ((nbytes + 7) & ~std::int64_t{7}) - nbytes;
+    if (pad > 0 &&
+        std::fwrite(zeros, 1, static_cast<std::size_t>(pad), f) !=
+            static_cast<std::size_t>(pad)) {
+        return false;
+    }
+    return true;
+}
+
 struct BatchLayout {
     std::int64_t nodes[kIpcMaxCols * 2];       // (length, null_count) pairs
     std::int64_t buffers[kIpcMaxCols * 3 * 2]; // (offset, length) pairs
     std::uint32_t n_buffers;
-    std::int64_t  utf8_total[kIpcMaxCols];
+    std::int64_t  varlen_total[kIpcMaxCols];   // Utf8/Binary packed-byte total
     std::int64_t  body_len;
 };
+
+bool is_varlen_type(BoltType t) noexcept {
+    return t == BoltType::Utf8 || t == BoltType::Binary;
+}
 
 // Measure the body: per-column validity/[offsets]/data buffer entries in
 // spec order, each 8-padded. Fails closed on unsupported shape.
@@ -383,18 +462,28 @@ bool layout_batch(const ArrowIpcWriter* w, const BoltBatch* batch,
         L->nodes[c * 2] = n;
         L->nodes[c * 2 + 1] = nulls;
         add_buf(nulls > 0 ? (n + 7) / 8 : 0);  // validity
-        if (col.type == BoltType::Utf8) {
-            if (!utf8_total_bytes(col, n, &L->utf8_total[c])) return false;
+        if (is_varlen_type(col.type)) {
+            if (!varlen_total_bytes(col, n, &L->varlen_total[c])) return false;
             add_buf((n + 1) * 4);              // int32 offsets
-            add_buf(L->utf8_total[c]);         // packed bytes
+            add_buf(L->varlen_total[c]);       // packed bytes
+        } else if (col.type == BoltType::Bool) {
+            if (col.format != ColumnFormat::Flat &&
+                col.format != ColumnFormat::View) {
+                return false;
+            }
+            if (col.data == nullptr && n > 0) return false;
+            L->varlen_total[c] = 0;
+            add_buf((n + 7) / 8);              // bit-packed, not byte-packed
         } else {
             if (col.format != ColumnFormat::Flat &&
                 col.format != ColumnFormat::View) {
                 return false;
             }
             if (col.data == nullptr && n > 0) return false;
-            L->utf8_total[c] = 0;
-            add_buf(n * 8);                    // Int64 / Float64 payload
+            L->varlen_total[c] = 0;
+            const std::size_t width = bolt::type_size(col.type);
+            if (width == 0) return false;      // no fixed-width mapping
+            add_buf(n * static_cast<std::int64_t>(width));
         }
     }
     L->body_len = off;
@@ -411,12 +500,18 @@ bool write_batch_body(const ArrowIpcWriter* w, const BoltBatch* batch,
             !write_padded(w->f, col.validity, (n + 7) / 8)) {
             return false;
         }
-        if (col.type == BoltType::Utf8) {
-            if (!write_utf8_buffers(w->f, col, n, L->utf8_total[c])) {
+        if (is_varlen_type(col.type)) {
+            if (!write_varlen_buffers(w->f, col, n, L->varlen_total[c])) {
                 return false;
             }
+        } else if (col.type == BoltType::Bool) {
+            if (!write_bool_bits(w->f, col, n)) return false;
         } else {
-            if (!write_padded(w->f, col.data, n * 8)) return false;
+            const std::size_t width = bolt::type_size(col.type);
+            if (!write_padded(w->f, col.data,
+                              n * static_cast<std::int64_t>(width))) {
+                return false;
+            }
         }
     }
     return true;
@@ -428,7 +523,8 @@ bool write_batch_body(const ArrowIpcWriter* w, const BoltBatch* batch,
 
 bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
                     const BoltType* types, const char* const* names,
-                    std::uint16_t n_cols) noexcept {
+                    std::uint16_t n_cols,
+                    const std::uint8_t* decimal_scales) noexcept {
     assert(w != nullptr);
     if (f == nullptr || types == nullptr) return false;
     if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
@@ -436,12 +532,26 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
     w->f = f;
     w->n_cols = n_cols;
     for (std::uint16_t c = 0; c < n_cols; ++c) {
+        const BoltType t = types[c];
         // Honest scope: reject unsupported types AT OPEN.
-        if (types[c] != BoltType::Int64 && types[c] != BoltType::Float64 &&
-            types[c] != BoltType::Utf8) {
-            return false;
+        const bool supported =
+            t == BoltType::Int64  || t == BoltType::Float64 ||
+            t == BoltType::Utf8   || t == BoltType::Bool ||
+            t == BoltType::Date32 || t == BoltType::Binary ||
+            t == BoltType::Decimal128;
+        if (!supported) return false;
+        std::uint8_t scale = 0;
+        if (t == BoltType::Decimal128) {
+            // Schema-time-only knowledge: no later call carries it, so a
+            // Decimal128 column with no scale (or an out-of-range one)
+            // fails closed here rather than defaulting to a scale that
+            // would silently misrepresent every value on read.
+            if (decimal_scales == nullptr) return false;
+            scale = decimal_scales[c];
+            if (scale > kDecimal128Precision) return false;
         }
-        w->col_types[c] = static_cast<std::uint16_t>(types[c]);
+        w->col_types[c] = static_cast<std::uint16_t>(t);
+        w->decimal_scale[c] = scale;
         const char* nm = (names != nullptr) ? names[c] : nullptr;
         if (nm != nullptr && nm[0] != '\0') {
             std::snprintf(w->names[c], kIpcNameCap, "%s", nm);
@@ -463,7 +573,7 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
     for (std::uint16_t c = 0; c < n_cols; ++c) {
         field_pos[c] = build_field(&b, w->names[c],
                                    static_cast<BoltType>(w->col_types[c]),
-                                   empty_children);
+                                   w->decimal_scale[c], empty_children);
         if (field_pos[c] == 0) return false;
     }
     const std::uint32_t fields_vec = fb_offset_vector(&b, field_pos, n_cols);
