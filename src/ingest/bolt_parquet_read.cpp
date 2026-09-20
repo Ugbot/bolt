@@ -24,6 +24,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_scheduler.h"
 #include "bolt/ingest/bolt_deflate.h"
 #include "bolt/ingest/bolt_snappy.h"
 #include "bolt/ingest/bolt_zstd_dec.h"
@@ -3188,8 +3189,47 @@ bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
                              out_rows);
 }
 
+// G2PQ-29: per-column decode task for parquet_read_file's optional
+// decode_pool. One task instance covers columns [lo, hi) of the caller's
+// range (grain=1 at the call site means hi == lo+1 in practice); each
+// column decodes its OWN row groups in order -- the exact decode_chunk()
+// calls the serial path makes, just grouped by column instead of by row
+// group, which is why the output is byte-identical either way.
+struct ParFileDecodeCtx {
+    const uint8_t*    buf;
+    uint64_t          len;
+    const PqMeta*     meta;
+    ColCtx*           cxs;
+    const int64_t*    row_offsets;
+    Arena*            arena;
+    const bool*       is_list;
+    bool*             ok;   // one slot per meta->n_columns; task c writes only ok[c]
+};
+
+void parfile_decode_task(void* user, uint32_t lo, uint32_t hi,
+                         uint32_t /*thread_id*/) noexcept {
+    ParFileDecodeCtx* ctx = static_cast<ParFileDecodeCtx*>(user);
+    assert(ctx != nullptr);
+    assert(lo <= hi);
+    for (uint32_t c = lo; c < hi; ++c) {           // bounded: hi <= n_columns <= 128
+        if (ctx->is_list[c]) { ctx->ok[c] = true; continue; }  // assembled elsewhere
+        bool good = true;
+        for (uint32_t g = 0; g < ctx->meta->n_row_groups; ++g) {  // bounded: <= 4096
+            const PqRowGroup* rg = &ctx->meta->row_groups[g];
+            const PqChunk* ch = &ctx->meta->chunks[rg->chunk_off + c];
+            if (ch->num_values != rg->num_rows) { good = false; break; }
+            if (!decode_chunk(ctx->buf, ctx->len, ch, &ctx->cxs[c],
+                              ctx->row_offsets[g], rg->num_rows, ctx->arena)) {
+                good = false;
+                break;
+            }
+        }
+        ctx->ok[c] = good;
+    }
+}
+
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
-                       BoltBatch* out_batch) noexcept {
+                       BoltBatch* out_batch, Scheduler* decode_pool) noexcept {
     assert(arena != nullptr);
     assert(out_batch != nullptr);
     if (buf == nullptr || len == 0) return false;
@@ -3249,25 +3289,46 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
         }
         (void)out_batch->schema.add_field(meta->columns[c].name, cxs[c].type);
     }
+    // Precompute each row group's starting row offset up front (single-
+    // threaded, before any fan-out) so a per-column task can walk its own
+    // row groups in order without depending on any other column's task --
+    // this replaces the incremental row_off this loop used to accumulate
+    // while also decoding, which was inherently row-group-major.
+    int64_t* row_offsets = arena->allocate_array<int64_t>(meta->n_row_groups);
+    if (row_offsets == nullptr) return false;
     int64_t row_off = 0;
     for (uint32_t g = 0; g < meta->n_row_groups; ++g) {  // bounded: <= 4096
         const PqRowGroup* rg = &meta->row_groups[g];
         if (rg->num_rows < 0 || rg->num_rows > meta->num_rows - row_off) {
             return false;
         }
-        for (uint32_t c = 0; c < meta->n_columns; ++c) {
-            if (is_list[c]) continue;    // already assembled across all groups
-            const PqChunk* ch = &meta->chunks[rg->chunk_off + c];
-            if (ch->num_values != rg->num_rows) return false;
-            if (!decode_chunk(buf, len, ch, &cxs[c], row_off, rg->num_rows,
-                              arena)) {
-                return false;
-            }
-        }
+        row_offsets[g] = row_off;
         row_off += rg->num_rows;
     }
-    assert(row_off <= meta->num_rows);
-    return row_off == meta->num_rows;
+    if (row_off != meta->num_rows) return false;
+
+    bool* ok = arena->allocate_array<bool>(meta->n_columns);
+    if (ok == nullptr) return false;
+    for (uint32_t c = 0; c < meta->n_columns; ++c) ok[c] = false;
+    ParFileDecodeCtx ctx{buf, len, meta, cxs, row_offsets, arena, is_list, ok};
+
+    // G2PQ-29: fan out per-column decode onto the borrowed pool when one was
+    // supplied and there is more than one column to spread across it;
+    // otherwise (the default) run the identical task body directly on this
+    // thread -- same decode_chunk() calls, same order, so behaviour and
+    // output do not bifurcate between the two paths.
+    if (decode_pool != nullptr && meta->n_columns > 1) {
+        arena->set_concurrent(true);
+        decode_pool->submit_range(&parfile_decode_task, &ctx, meta->n_columns, 1u);
+        decode_pool->wait_all();
+        arena->set_concurrent(false);
+    } else {
+        parfile_decode_task(&ctx, 0, meta->n_columns, 0);
+    }
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {
+        if (!ok[c]) return false;
+    }
+    return true;
 }
 
 }  // namespace parquet

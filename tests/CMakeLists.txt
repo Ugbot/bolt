@@ -1319,6 +1319,15 @@ target_link_libraries(test_bolt_parquet_write_par
 bolt_apply_hardening(test_bolt_parquet_write_par)
 add_test(NAME test_bolt_parquet_write_par COMMAND test_bolt_parquet_write_par)
 
+# G2PQ-29: reader's mirror of the above -- parquet_read_file's optional
+# decode_pool. Acceptance is VALUE-IDENTITY with a serial read at every pool
+# size, repeated.
+add_executable(test_bolt_parquet_read_par test_bolt_parquet_read_par.cpp)
+target_link_libraries(test_bolt_parquet_read_par
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_read_par)
+add_test(NAME test_bolt_parquet_read_par COMMAND test_bolt_parquet_read_par)
+
 # Page-level skipping end to end: write a page index, decode only the pages a
 # predicate can match, prove the kept rows are right AND that pages really
 # were skipped. Only possible now that bolt can write a page index.

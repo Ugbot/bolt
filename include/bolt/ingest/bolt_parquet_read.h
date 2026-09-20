@@ -66,6 +66,7 @@ namespace bolt {
 class Arena;
 struct BoltBatch;
 struct BoltColumn;
+struct Scheduler;  // borrowed, never owned -- see parquet_read_file's decode_pool
 
 namespace ingest {
 namespace parquet {
@@ -265,10 +266,44 @@ bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
                               BoltColumn* out_col, int64_t* out_rows) noexcept;
 
 // Whole file: locate + parse meta, allocate full-length columns, then
-// decode every row group into its row offset (serial v1; the row-group
-// function above is the future parallel unit).
+// decode every row group into its row offset.
+//
+// G2PQ-29: `decode_pool` is an optional BORROWED bolt::Scheduler (nullptr,
+// the default, decodes serially -- byte-identical output either way, the
+// same invariant bolt_parquet_write.h's ParquetWriteOpts::encode_pool
+// holds). When supplied, flat (non-repeated) columns are decoded in
+// parallel, one column's full cross-row-group decode per task
+// (`submit_range(..., n_columns, /*grain=*/1)`), so a slow wide column
+// never blocks the workers a query of narrow columns would otherwise keep
+// idle. This is scoped to the CALLER'S OWN parallelism budget: a caller
+// that already parallelizes at the row-group level (e.g. chukonu's scan
+// operator, which schedules independent row groups across its own worker
+// pool -- see G2PQ-34) has no headroom left for a second, competing layer
+// of parallelism here and should pass nullptr. The intended caller is a
+// single serial whole-file bulk load with no outer scheduling of its own
+// (e.g. chukonu::io::load_parquet, an embedded/CLI ingest, or a
+// benchmark's load phase) -- exactly the gap G2PQ-34 found chukonu's own
+// scan operator does NOT have.
+//
+// Per-column state (ColCtx, including the Utf8 overflow-buffer cursor)
+// already lives one-per-column and is untouched by other columns' tasks,
+// so no per-column arena is needed: the shared `arena` is switched into
+// Arena::set_concurrent(true) (a spinlock around the bump cursor) for the
+// duration of the parallel section and switched back off before return.
+// Because allocation happens a handful of times per column-chunk decode
+// (not per row), lock contention is bounded by column count, not row
+// count. Row-group order within one column's task is preserved exactly
+// (same decode_chunk() calls in the same order as the serial path), which
+// is what makes output byte-identical regardless of pool size or absence.
+//
+// List/repeated (max_rep != 0) columns are assembled via
+// build_list_column before this dispatch and are NOT included in the
+// parallel fan-out (v1 scope; they are independent per column too, but
+// narrower and rarer in real files -- a natural follow-up, not required
+// for this ticket's target workloads).
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
-                       BoltBatch* out_batch) noexcept;
+                       BoltBatch* out_batch,
+                       Scheduler* decode_pool = nullptr) noexcept;
 
 }  // namespace parquet
 }  // namespace ingest

@@ -231,6 +231,18 @@ endif()
 bolt_apply_hardening(bench_parquet_decode)
 bolt_apply_bench_tuning(bench_parquet_decode)
 
+# G2PQ-29: before/after for parquet_read_file's optional decode_pool.
+add_executable(bench_parquet_read_file_par bench_parquet_read_file_par.cpp)
+target_link_libraries(bench_parquet_read_file_par PRIVATE bolt::bolt)
+if(NOT MSVC)
+    if(NOT TARGET Threads::Threads)
+        find_package(Threads REQUIRED)
+    endif()
+    target_link_libraries(bench_parquet_read_file_par PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_parquet_read_file_par)
+bolt_apply_bench_tuning(bench_parquet_read_file_par)
+
 # -----------------------------------------------------------------------
 # SwissTableGrowable vs fixed SwissTable vs std::unordered_map — the
 # G2CHK-85 fd-registry swap, quantified (insert / find / churn / registry).
