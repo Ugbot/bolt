@@ -998,9 +998,14 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
         }
     }
 
-    // Use ParquetWriter directly (filesystem-only).
-    ingest::parquet::ParquetWriteOpts po = make_pq_opts(&th->meta.schemas[0],
-                                                         nullptr);
+    // Use ParquetWriter directly (filesystem-only). Data is always written
+    // under the CURRENT schema (G2ICE-89) -- `schemas[0]` is only "current"
+    // before the table's first evolution; hardcoding it here made an append
+    // committed after `table_add_column` serialize against the table's
+    // original field layout instead of the one just evolved to.
+    const Schema* write_sch = metadata_current_schema(&th->meta);
+    if (write_sch == nullptr) return false;
+    ingest::parquet::ParquetWriteOpts po = make_pq_opts(write_sch, nullptr);
     auto* w = ingest::parquet::parquet_write_open(full, &po);
     if (w == nullptr) return false;
     int64_t total_rows = 0;
@@ -1376,46 +1381,104 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
 // ---------------------------------------------------------------------------
 // Schema evolution
 // ---------------------------------------------------------------------------
+//
+// G2ICE-89. The Iceberg spec makes schema evolution ADDITIVE: a schema is
+// immutable once published, and add/drop/rename append a NEW Schema object
+// with its own schema-id to metadata.schemas[], moving current-schema-id to
+// it. This is precisely so a snapshot committed before the change keeps
+// pointing at the schema-id its data files were actually written under
+// (`publish_snapshot` records `s.schema_id = current_schema_id` at commit
+// time -- correct already, and unchanged by this fix) -- so a time-travel
+// read of that old snapshot still resolves the shape its files really have,
+// not the shape the table grew into later.
+//
+// This used to mutate `th->meta.schemas[0]` IN PLACE: every existing
+// schema-id (including ones old snapshots point at) instantly reflected
+// whatever the table's CURRENT shape happened to be, and `n_schemas` never
+// left 1. Confirmed against pyiceberg (StaticTable): a snapshot written
+// under a 2-field schema, then evolved with `table_add_column`, resolved via
+// pyiceberg's own `schemas()[snapshot.schema_id]` to the 3-field shape --
+// binding a column to rows written before that column existed.
+
+// Begins an evolution: returns a pointer to a NEW schema slot
+// (`th->meta.schemas[th->meta.n_schemas]`) seeded with a copy of the current
+// schema, for the caller to mutate in place. Returns nullptr -- leaving `th`
+// completely untouched -- when the schema cap (kIcebergMaxSchemas) is
+// reached or there is no current schema to copy; evolution then fails
+// closed rather than reusing or clobbering an existing entry.
+Schema* begin_schema_evolution(TableHandle* th) noexcept {
+    assert(th != nullptr);
+    Metadata& m = th->meta;
+    if (m.n_schemas == 0 || m.n_schemas >= kIcebergMaxSchemas) return nullptr;
+    const Schema* cur = metadata_current_schema(&m);
+    if (cur == nullptr) return nullptr;
+    int32_t max_id = cur->schema_id;
+    for (uint32_t i = 0; i < m.n_schemas; ++i) {          // bounded
+        if (m.schemas[i].schema_id > max_id) max_id = m.schemas[i].schema_id;
+    }
+    Schema& next = m.schemas[m.n_schemas];
+    next = *cur;                       // copy -- the caller mutates `next`,
+    next.schema_id = max_id + 1;       // `cur` (an existing published schema
+    assert(next.schema_id != cur->schema_id);  // an old snapshot may point at)
+    return &next;                              // never changes
+}
+
+// Publishes a schema `begin_schema_evolution` handed back: makes it the new
+// current schema (bumping n_schemas, so it is now immutable too) and
+// persists metadata.json. The caller must not call this after a validation
+// failure (an unknown column to drop/rename, a full schema) -- returning
+// false without calling it leaves the uncommitted copy at schemas[n_schemas]
+// simply unused; it is overwritten in place by the next evolution attempt.
+bool commit_schema_evolution(TableHandle* th, Schema* next) noexcept {
+    assert(th != nullptr && next != nullptr);
+    assert(next == &th->meta.schemas[th->meta.n_schemas]);
+    th->meta.current_schema_id = next->schema_id;
+    th->meta.n_schemas++;
+    return persist_metadata(th);
+}
 
 bool table_add_column(TableHandle* th, const char* name, BoltType type,
                       bool nullable) noexcept {
     assert(th != nullptr && name != nullptr);
-    Schema& s = th->meta.schemas[0];
-    if (s.n_fields >= kIcebergMaxFieldsPerSchema) return false;
-    SchemaField& f = s.fields[s.n_fields];
+    Schema* s = begin_schema_evolution(th);
+    if (s == nullptr) return false;
+    if (s->n_fields >= kIcebergMaxFieldsPerSchema) return false;
+    SchemaField& f = s->fields[s->n_fields];
     std::memset(&f, 0, sizeof(f));
-    f.id = static_cast<int32_t>(s.n_fields + 1);
+    f.id = static_cast<int32_t>(s->n_fields + 1);
     f.required = !nullable;
     std::strncpy(f.name, name, sizeof(f.name) - 1u);
     std::strncpy(f.type, bolt_type_iceberg_name(type), sizeof(f.type) - 1u);
-    s.n_fields++;
-    return persist_metadata(th);
+    s->n_fields++;
+    return commit_schema_evolution(th, s);
 }
 
 bool table_drop_column(TableHandle* th, const char* name) noexcept {
     assert(th != nullptr && name != nullptr);
-    Schema& s = th->meta.schemas[0];
+    Schema* s = begin_schema_evolution(th);
+    if (s == nullptr) return false;
     uint32_t out = 0;
     bool dropped = false;
-    for (uint32_t i = 0; i < s.n_fields; ++i) {
-        if (std::strcmp(s.fields[i].name, name) == 0) { dropped = true; continue; }
-        if (out != i) s.fields[out] = s.fields[i];
+    for (uint32_t i = 0; i < s->n_fields; ++i) {
+        if (std::strcmp(s->fields[i].name, name) == 0) { dropped = true; continue; }
+        if (out != i) s->fields[out] = s->fields[i];
         ++out;
     }
     if (!dropped) return false;
-    s.n_fields = out;
-    return persist_metadata(th);
+    s->n_fields = out;
+    return commit_schema_evolution(th, s);
 }
 
 bool table_rename_column(TableHandle* th, const char* from,
                          const char* to) noexcept {
     assert(th != nullptr && from != nullptr && to != nullptr);
-    Schema& s = th->meta.schemas[0];
-    for (uint32_t i = 0; i < s.n_fields; ++i) {
-        if (std::strcmp(s.fields[i].name, from) == 0) {
-            std::memset(s.fields[i].name, 0, sizeof(s.fields[i].name));
-            std::strncpy(s.fields[i].name, to, sizeof(s.fields[i].name) - 1u);
-            return persist_metadata(th);
+    Schema* s = begin_schema_evolution(th);
+    if (s == nullptr) return false;
+    for (uint32_t i = 0; i < s->n_fields; ++i) {
+        if (std::strcmp(s->fields[i].name, from) == 0) {
+            std::memset(s->fields[i].name, 0, sizeof(s->fields[i].name));
+            std::strncpy(s->fields[i].name, to, sizeof(s->fields[i].name) - 1u);
+            return commit_schema_evolution(th, s);
         }
     }
     return false;

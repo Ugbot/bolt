@@ -128,7 +128,11 @@ bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept;
 // Soft delete (snapshot kDelete) — predicate-based.
 bool table_delete(TableHandle* th, const Predicate* pred) noexcept;
 
-// Schema evolution. All update the current Schema in metadata.json.
+// Schema evolution. Each call is ADDITIVE (Iceberg spec): it appends a new,
+// immutable Schema with a new schema-id to metadata.json and moves
+// current-schema-id to it. Prior schemas -- and any snapshot committed under
+// one -- are left untouched, so a time-travel read of an old snapshot still
+// resolves its original shape (G2ICE-89).
 bool table_add_column   (TableHandle* th, const char* name, BoltType type,
                           bool nullable) noexcept;
 bool table_drop_column  (TableHandle* th, const char* name) noexcept;

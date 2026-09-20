@@ -226,33 +226,87 @@ TEST(IcebergMetadataInterop, SnapshotsRecordTheSchemaTheyWereCommittedUnder) {
     EXPECT_EQ(m->snapshots[0].schema_id, m->current_schema_id);
     EXPECT_EQ(m->snapshots[1].schema_id, m->current_schema_id);
 
-    // FOUND WHILE WRITING THIS TEST, NOT FIXED HERE, AND PINNED SO A FIX IS
-    // NOTICED: `table_add_column` mutates the CURRENT schema in place instead
-    // of appending a new one with a new schema-id (writer.h says so outright:
-    // "All update the current Schema"). The Iceberg spec makes evolution
-    // additive — a new schema object, a new id, `current-schema-id` moved —
-    // precisely so an old snapshot keeps pointing at the shape its data files
-    // actually have. As it stands, a time-travel read of snapshot 0 binds a
-    // column that did not exist when those files were written.
-    //
-    // The consequence for the property above is that the recorded-vs-derived
-    // distinction is currently UNOBSERVABLE from outside: with one schema id
-    // for the table's whole life, a wrong implementation reading
-    // `current-schema-id` at emit time produces identical bytes. The recording
-    // is still done correctly at the commit site rather than derived at emit
-    // time, because doing it the other way would have to be undone the moment
-    // evolution is fixed. When it is, this expectation flips and the
-    // discriminating assertion beneath it becomes live.
+    // G2ICE-89, FIXED: `table_add_column` used to mutate the CURRENT schema in
+    // place instead of appending a new one with a new schema-id (writer.h
+    // said so outright: "All update the current Schema"). The Iceberg spec
+    // makes evolution additive — a new schema object, a new id,
+    // `current-schema-id` moved — precisely so an old snapshot keeps
+    // pointing at the shape its data files actually have. Confirmed against
+    // pyiceberg (an independent implementation) that this used to bind a
+    // column to snapshot 0's rows that did not exist when they were written;
+    // see G2ICE-89's tracker entry for the full external-oracle repro.
+    const int32_t schema0_id = m->current_schema_id;
     ASSERT_TRUE(table_add_column(th, "qty", bolt::BoltType::Int64, true));
     m = table_metadata(th);
-    EXPECT_EQ(m->n_schemas, 1u)
-        << "table_add_column now allocates a new schema — GOOD: delete this "
-           "pin and enable the assertion below";
-    if (m->n_schemas > 1u) {
-        EXPECT_NE(m->current_schema_id, m->snapshots[0].schema_id);
-        EXPECT_EQ(m->snapshots[0].schema_id, 0)
-            << "a later schema change retroactively relabelled snapshot 0";
+    ASSERT_EQ(m->n_schemas, 2u)
+        << "table_add_column must APPEND a new schema, not mutate the one "
+           "old snapshots already point at";
+    EXPECT_NE(m->current_schema_id, m->snapshots[0].schema_id);
+    EXPECT_EQ(m->snapshots[0].schema_id, schema0_id)
+        << "a later schema change retroactively relabelled snapshot 0";
+    EXPECT_EQ(m->snapshots[1].schema_id, schema0_id)
+        << "a later schema change retroactively relabelled snapshot 1, "
+           "which was also committed before the evolution";
+    // The ORIGINAL schema (what snapshot 0/1 point at) must be BYTE-IDENTICAL
+    // to what it was before evolution -- not just "still present at some id".
+    bool found_old = false;
+    for (uint32_t i = 0; i < m->n_schemas; ++i) {
+        if (m->schemas[i].schema_id != schema0_id) continue;
+        found_old = true;
+        EXPECT_EQ(m->schemas[i].n_fields, 2u)
+            << "the pre-evolution schema gained a field in place";
     }
+    EXPECT_TRUE(found_old);
+    // The NEW current schema carries the added column, and only it.
+    const Schema* cur = metadata_current_schema(m);
+    ASSERT_NE(cur, nullptr);
+    ASSERT_EQ(cur->n_fields, 3u);
+    EXPECT_STREQ(cur->fields[2].name, "qty");
+
+    // A post-evolution append must serialize under the NEW current schema
+    // (write_data_file used to hardcode schemas[0] too, which — pre-fix —
+    // happened to be a harmless no-op alias for "current"; post-fix it is
+    // explicitly not, and an append naively re-using schemas[0] would write
+    // the OLD 2-field layout instead of the evolved one).
+    {
+        AppendHandle* ah = nullptr;
+        ASSERT_TRUE(append_open(&ah, th));
+        auto* b3 = arena.allocate_array<bolt::BoltBatch>(1);
+        ASSERT_NE(b3, nullptr);
+        bolt::BoltBatch::init_empty(b3);
+        b3->arena    = &arena;
+        b3->num_rows = 3;
+        b3->num_cols = 3;
+        bolt::BoltBatch::alloc_columns(b3, &arena, 3);
+        b3->schema.add_field("id", bolt::BoltType::Int64, false);
+        b3->schema.add_field("price", bolt::BoltType::Float64, true);
+        b3->schema.add_field("qty", bolt::BoltType::Int64, true);
+        auto* cols3 = b3->columns[b3->read_epoch];
+        cols3[0].type = bolt::BoltType::Int64;   cols3[0].length = 3;
+        cols3[1].type = bolt::BoltType::Float64; cols3[1].length = 3;
+        cols3[2].type = bolt::BoltType::Int64;   cols3[2].length = 3;
+        auto* ids3 = arena.allocate_array<int64_t>(3);
+        auto* px3  = arena.allocate_array<double>(3);
+        auto* qty3 = arena.allocate_array<int64_t>(3);
+        for (int32_t i = 0; i < 3; ++i) {
+            ids3[i] = 900 + i; px3[i] = 9.0; qty3[i] = 42 + i;
+        }
+        cols3[0].data = ids3; cols3[1].data = px3; cols3[2].data = qty3;
+        ASSERT_TRUE(append_write(ah, b3));
+        ASSERT_TRUE(append_commit(ah));
+        append_close(ah);
+    }
+    m = table_metadata(th);
+    ASSERT_EQ(m->n_snapshots, 3u);
+    EXPECT_EQ(m->snapshots[2].schema_id, m->current_schema_id)
+        << "the post-evolution append was not recorded under the new schema";
+
+    std::fprintf(stderr,
+                 "\n[interop] evolution table written to: %s\n"
+                 "[interop] now run: python3 "
+                 "scripts/iceberg_schema_evolution_interop.py %s %lld\n",
+                 root.c_str(), root.c_str(),
+                 static_cast<long long>(m->snapshots[0].snapshot_id));
     table_close(th);
 }
 

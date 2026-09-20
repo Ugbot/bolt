@@ -157,13 +157,48 @@ TEST(IcebergWrite, SchemaEvolution) {
     TableHandle* th = nullptr;
     ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, nullptr,
                               nullptr, &wo));
+    // G2ICE-89: each evolution call is additive -- it publishes a NEW,
+    // immutable schema (its own schema-id) rather than mutating the one
+    // already at schemas[0] in place, so the table's ORIGINAL schema object
+    // must be checked here, not just "the current one".
     const uint32_t base = table_metadata(th)->schemas[0].n_fields;
+    const int32_t orig_schema_id = table_metadata(th)->schemas[0].schema_id;
+
     EXPECT_TRUE(table_add_column(th, "score", bolt::BoltType::Float64, true));
-    EXPECT_EQ(table_metadata(th)->schemas[0].n_fields, base + 1u);
+    {
+        const Metadata* m = table_metadata(th);
+        EXPECT_EQ(m->n_schemas, 2u);
+        EXPECT_EQ(m->schemas[0].n_fields, base)
+            << "the original schema (schemas[0]) must stay untouched";
+        const Schema* cur = metadata_current_schema(m);
+        ASSERT_NE(cur, nullptr);
+        EXPECT_NE(cur->schema_id, orig_schema_id);
+        EXPECT_EQ(cur->n_fields, base + 1u);
+        EXPECT_STREQ(cur->fields[base].name, "score");
+    }
+
     EXPECT_TRUE(table_rename_column(th, "score", "score2"));
-    EXPECT_STREQ(table_metadata(th)->schemas[0].fields[base].name, "score2");
+    {
+        const Metadata* m = table_metadata(th);
+        EXPECT_EQ(m->n_schemas, 3u);
+        EXPECT_EQ(m->schemas[0].n_fields, base)
+            << "the original schema must still be untouched two evolutions later";
+        const Schema* cur = metadata_current_schema(m);
+        ASSERT_NE(cur, nullptr);
+        EXPECT_STREQ(cur->fields[base].name, "score2");
+    }
+
     EXPECT_TRUE(table_drop_column(th, "score2"));
-    EXPECT_EQ(table_metadata(th)->schemas[0].n_fields, base);
+    {
+        const Metadata* m = table_metadata(th);
+        EXPECT_EQ(m->n_schemas, 4u);
+        EXPECT_EQ(m->schemas[0].n_fields, base)
+            << "the original schema must still be untouched three evolutions later";
+        EXPECT_EQ(m->schemas[0].schema_id, orig_schema_id);
+        const Schema* cur = metadata_current_schema(m);
+        ASSERT_NE(cur, nullptr);
+        EXPECT_EQ(cur->n_fields, base);
+    }
 }
 
 TEST(IcebergWrite, BranchAndTagAndExpire) {
