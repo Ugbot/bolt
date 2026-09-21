@@ -7,12 +7,15 @@
 
 #include "bolt/lakehouse/delta/writer.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_port.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/lakehouse/delta/log.h"
 #include "bolt/lakehouse/delta/snapshot.h"
@@ -52,22 +55,65 @@ inline bool path_join(const char* a, const char* b, char* out,
 }
 
 inline uint64_t now_unix_ms() noexcept {
-    return static_cast<uint64_t>(std::time(nullptr)) * 1000ull;
+    // G2ICE-161: this previously truncated to SECOND resolution
+    // (std::time() * 1000, despite the name) — genuine millisecond
+    // resolution via system_clock, matching what the Delta commitInfo
+    // timestamp field is spec'd to carry and giving make_part_uuid below a
+    // finer-grained input.
+    const auto now = std::chrono::system_clock::now();
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch())
+            .count());
+}
+
+// G2ICE-161: process-wide monotonic nonce, same collision-avoidance
+// convention delta_delete.cpp's g_part_uuid_nonce / delta_deletion_vector.cpp's
+// g_dv_uuid_nonce already use for part-file / deletion-vector-file names.
+// `seq` here is the AppendHandle batch slot, which resets to 0 for every
+// freshly opened AppendHandle -- and every real tiering upload opens a
+// fresh handle and writes exactly one batch before committing, so `seq`
+// alone never disambiguates across uploads. Even genuine ms-resolution
+// wall-clock time (the now_unix_ms() fix above) can still collide: two
+// uploads dispatched in the same process within the same millisecond, or
+// a clock that doesn't advance every call. A process-lifetime atomic
+// counter makes every make_part_uuid() call from this process unique
+// regardless of clock granularity, `seq` reuse, or how many AppendHandles
+// are opened per second -- which is the normal/expected shape for a busy
+// tiered table (root CLAUDE.md: "Crypto-chain workloads run at high tick
+// rates").
+std::atomic<uint64_t> g_part_uuid_nonce{0};
+
+// Process id, mixed in so two separate PROCESSES racing to write the same
+// table (Gestalt2's multi-process tiering case, per G2ICE-161) can never
+// collide even if both nonce counters happen to start from 0 and both
+// clocks read the same millisecond at process start.
+inline uint64_t process_uuid_seed() noexcept {
+    static const uint64_t seed =
+        (static_cast<uint64_t>(static_cast<uint32_t>(bolt_getpid())) << 32) ^
+        now_unix_ms();
+    return seed;
 }
 
 // counter-based file uuid; no crypto rng dep
 inline void make_part_uuid(uint64_t seq, char out[32]) noexcept {
     assert(out != nullptr);
     static const char hex[] = "0123456789abcdef";
+    const uint64_t nonce =
+        g_part_uuid_nonce.fetch_add(1, std::memory_order_relaxed);
     const uint64_t t = now_unix_ms();
-    uint64_t mix = t ^ (seq * 0x9E3779B97F4A7C15ull);
+    const uint64_t pseed = process_uuid_seed();
+    const uint64_t mix = t ^ (seq * 0x9E3779B97F4A7C15ull) ^
+                         (nonce * 0xC2B2AE3D27D4EB4Full) ^ pseed;
     for (uint32_t i = 0; i < 16; ++i) {
         out[i] = hex[(mix >> ((i & 0xF) * 4)) & 0xFu];
     }
+    const uint64_t tail = nonce ^ seq ^ pseed;
     for (uint32_t i = 16; i < 31; ++i) {
-        out[i] = hex[(seq >> ((i - 16) & 0xF) * 4) & 0xFu];
+        out[i] = hex[(tail >> ((i - 16) & 0xF) * 4) & 0xFu];
     }
     out[31] = '\0';
+    assert(out[31] == '\0');
 }
 
 inline const char* compression_suffix(Compression c) noexcept {

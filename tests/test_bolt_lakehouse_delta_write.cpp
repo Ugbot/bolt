@@ -695,4 +695,111 @@ TEST(BoltLakehouseDeltaWrite, EnableDeletionVectorsAtCreateSkipsUpgrade) {
     std::filesystem::remove_all(root, ec);
 }
 
+// G2ICE-161 — many AppendHandles (one per real TieringManager upload) opened
+// and committed to the SAME table back-to-back, the shape that used to
+// collide: `make_part_uuid`'s only inputs were a wall-clock-SECOND
+// timestamp and the AppendHandle's own batch slot (`seq`), which resets to
+// 0 for every freshly-opened handle -- so any two uploads landing in the
+// same wall-clock second (trivially true for a tight loop like this one)
+// produced the IDENTICAL part-file name, and the second upload's write
+// silently overwrote the first bucket's physical parquet file on disk.
+// `delta_snapshot_build`'s add-action dedup then collapsed the live-file
+// list to one entry, so file-COUNT assertions (the shape every other
+// multi-bucket test here uses) never caught it -- this test instead reads
+// every row back and checks each bucket's own values independently
+// survived, which is the only way the original bug is visible.
+TEST(BoltLakehouseDeltaWrite, ManySameSecondUploadsAllBucketsSurvive) {
+    const std::string root = unique_root("manyupl");
+    FilesystemCatalog fc; Catalog cat;
+    ASSERT_TRUE(filesystem_catalog_init(&fc, root.c_str(), &cat));
+
+    bolt::Arena arena;
+    bolt::BoltSchema schema;
+    schema.add_field("id", bolt::BoltType::Int64, false);
+
+    dl::WriteOptions wopts;
+    dl::write_options_init(&wopts);
+    wopts.compression = Compression::kNone;
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(dl::delta_table_create(&th, &arena, &cat, "ns", "manyupl",
+                                       &schema, &wopts));
+
+    // 40 buckets, matching the order of magnitude of the tracker ticket's
+    // own repro (36 buckets in ~1 wall-clock second via TieringManager).
+    // Each upload is exactly one fresh AppendHandle / one batch / one
+    // commit -- the real TieringManager shape, and the shape that reset
+    // `seq` to 0 every time under the old code.
+    constexpr int kUploads = 40;
+    constexpr std::int64_t kRowsPerUpload = 4;
+    for (int i = 0; i < kUploads; ++i) {
+        dl::AppendHandle* ah = nullptr;
+        ASSERT_TRUE(dl::delta_append_open(&ah, th));
+        bolt::Arena ba;
+        bolt::BoltBatch b{};
+        fill_int_batch(&ba, &b, kRowsPerUpload,
+                       static_cast<std::int64_t>(i) * kRowsPerUpload);
+        ASSERT_TRUE(dl::delta_append_write(ah, &b));
+        ASSERT_TRUE(dl::delta_append_commit(ah));
+        dl::delta_append_close(ah);
+    }
+
+    // File-count arithmetic first (the pre-existing style of coverage) --
+    // must show all 40 distinct physical files, not 1.
+    FilesystemObjectStore fs; ObjectStore os;
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    bolt::Arena s_ar;
+    dl::Snapshot snap{};
+    ASSERT_TRUE(dl::delta_snapshot_build(&os, "ns/manyupl", -1, &s_ar, &snap));
+    EXPECT_EQ(snap.n_files, static_cast<uint32_t>(kUploads));
+
+    // The real bar: read every row back through the scan path and confirm
+    // every bucket's own rows survived independently -- a collision would
+    // either drop earlier buckets' ids entirely (overwritten file) or
+    // reintroduce a stale row after the true fix regressed, so check both
+    // "every id present" and "no id duplicated".
+    Catalog rcat;
+    FilesystemCatalog rfc;
+    ASSERT_TRUE(filesystem_catalog_init(&rfc, root.c_str(), &rcat));
+    bolt::Arena r_ar;
+    TableHandle* rth = nullptr;
+    ASSERT_TRUE(delta_table_open(&rth, &r_ar, &rcat, "ns", "manyupl"));
+    ScanHandle* sh = nullptr;
+    ASSERT_TRUE(delta_scan_open(&sh, rth, /*opts=*/nullptr));
+
+    const std::int64_t total_rows = kUploads * kRowsPerUpload;
+    std::vector<int> seen_count(static_cast<size_t>(total_rows), 0);
+    std::int64_t rows_read = 0;
+    for (;;) {
+        bolt::BoltBatch out{};
+        bool eof = false;
+        ASSERT_TRUE(delta_scan_next_batch(sh, &out, &eof));
+        if (eof) break;
+        ASSERT_EQ(out.num_cols, 1u);
+        const auto* ip =
+            static_cast<const std::int64_t*>(out.columns[out.read_epoch][0].data);
+        ASSERT_NE(ip, nullptr);
+        for (std::int64_t r = 0; r < out.num_rows; ++r) {
+            const std::int64_t id = ip[r];
+            ASSERT_GE(id, 0);
+            ASSERT_LT(id, total_rows);
+            ++seen_count[static_cast<size_t>(id)];
+            ++rows_read;
+        }
+    }
+    delta_scan_close(sh);
+    delta_table_close(rth);
+
+    EXPECT_EQ(rows_read, total_rows);
+    for (std::int64_t id = 0; id < total_rows; ++id) {
+        EXPECT_EQ(seen_count[static_cast<size_t>(id)], 1)
+            << "row id " << id << " (bucket " << (id / kRowsPerUpload)
+            << ") was not read exactly once -- a part-file collision "
+               "either dropped or duplicated its bucket";
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 }  // namespace
