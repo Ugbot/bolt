@@ -69,7 +69,7 @@ static constexpr uint32_t kHotKeyProbeDist   = 8u;
 
 template <typename K, uint32_t RowBytes, uint32_t Capacity,
           uint32_t PromotionThreshold = 3>
-struct alignas(64) HotKeyCache {
+struct alignas(bolt::config::kCacheIsolationBytes) HotKeyCache {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity power of 2");
     static_assert(RowBytes >= 8 && RowBytes <= 256, "RowBytes bound");
 
@@ -112,7 +112,7 @@ struct alignas(64) HotKeyCache {
     // on its slot would see tag2==tag1 on a torn row — the bug `Slot::seq`
     // fixes. Kept because the full-tag compare still cheaply rejects same-key
     // re-inserts in the common (non-preempted) case.
-    alignas(64) std::atomic<uint64_t> write_seq;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> write_seq;
 
     static constexpr uint32_t kMask = Capacity - 1;
     static constexpr uint64_t kKeyMask48 = 0xFFFFFFFFFFFFull;
@@ -359,7 +359,7 @@ struct alignas(64) HotKeyCache {
 // table so the caller can gate promotion on the threshold. Lock-free
 // via atomic counters.
 template <typename K, uint32_t Capacity>
-struct alignas(64) AccessTracker {
+struct alignas(bolt::config::kCacheIsolationBytes) AccessTracker {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity power of 2");
     struct Slot {
         std::atomic<uint64_t> key;

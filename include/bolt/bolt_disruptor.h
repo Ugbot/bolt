@@ -56,7 +56,7 @@ namespace bolt {
 static constexpr uint32_t kDisruptorMaxConsumers = 16;
 
 template <typename T, uint32_t Capacity>
-struct alignas(64) Disruptor {
+struct alignas(bolt::config::kCacheIsolationBytes) Disruptor {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
     static_assert(Capacity >= 16, "Capacity too small");
 
@@ -73,7 +73,7 @@ struct alignas(64) Disruptor {
     uint32_t  _pad_consumers;
     // The ring. Cache-line-padded between cursor/published and slots
     // so producer/consumer cursor traffic doesn't trash slot lines.
-    alignas(64) T slots[Capacity];
+    alignas(bolt::config::kCacheIsolationBytes) T slots[Capacity];
 
     static constexpr uint32_t kMask = Capacity - 1;
 

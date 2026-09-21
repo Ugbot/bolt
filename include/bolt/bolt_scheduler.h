@@ -264,11 +264,11 @@ struct SchedSimNoop {
     BOLT_FORCE_INLINE static void point(unsigned) noexcept {}
 };
 
-struct alignas(64) TaskRing {
+struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
     Task ring[kTaskRingSize];
 
-    alignas(64) std::atomic<uint64_t> head;   // Next slot to publish
-    alignas(64) std::atomic<uint64_t> tail;   // Last claimed slot
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> head;   // Next slot to publish
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> tail;   // Last claimed slot
 
     void init() noexcept {
         memset(ring, 0, sizeof(ring));
@@ -451,7 +451,7 @@ struct Scheduler {
     // on Linux — no std::mutex or condition_variable. `submit_seq_` is
     // bumped on every task submission (and on shutdown) so parked
     // workers observing the old value are woken.
-    alignas(64) std::atomic<uint64_t> submit_seq_;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> submit_seq_;
 
     // E2 — adaptive morsel sizing (opt-in feedback).
     //

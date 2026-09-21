@@ -26,7 +26,7 @@
 namespace bolt {
 
 template <typename T, uint32_t Capacity>
-struct alignas(64) RetireQueue {
+struct alignas(bolt::config::kCacheIsolationBytes) RetireQueue {
     struct Entry {
         T        payload;
         uint64_t retire_epoch;

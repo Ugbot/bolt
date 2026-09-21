@@ -1,3 +1,8 @@
+add_executable(test_bolt_alignment test_bolt_alignment.cpp)
+target_link_libraries(test_bolt_alignment PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_alignment)
+add_test(NAME test_bolt_alignment COMMAND test_bolt_alignment)
+
 add_executable(test_bolt_primitives test_bolt_primitives.cpp)
 
 target_link_libraries(test_bolt_primitives

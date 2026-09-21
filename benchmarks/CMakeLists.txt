@@ -263,3 +263,12 @@ add_executable(bench_wire_serialize bench_wire_serialize.cpp)
 target_link_libraries(bench_wire_serialize PRIVATE bolt::bolt)
 bolt_apply_hardening(bench_wire_serialize)
 bolt_apply_bench_tuning(bench_wire_serialize)
+
+# Shared-state versus channel-slot alignment, independently selectable.
+add_executable(bench_alignment bench_alignment.cpp)
+target_link_libraries(bench_alignment PRIVATE bolt::bolt)
+if(NOT MSVC)
+    target_link_libraries(bench_alignment PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_alignment)
+bolt_apply_bench_tuning(bench_alignment)

@@ -39,7 +39,7 @@
 namespace bolt {
 
 template <typename K, uint32_t SlotsPerShard, uint32_t Shards = 16>
-struct alignas(64) LockFreeClockLru {
+struct alignas(bolt::config::kCacheIsolationBytes) LockFreeClockLru {
     static_assert((SlotsPerShard & (SlotsPerShard - 1)) == 0, "pow2");
     static_assert((Shards & (Shards - 1)) == 0, "pow2");
 
@@ -50,7 +50,7 @@ struct alignas(64) LockFreeClockLru {
         uint8_t                _pad[3];
     };
 
-    struct alignas(64) Shard {
+    struct alignas(bolt::config::kCacheIsolationBytes) Shard {
         Slot                   slots[SlotsPerShard];
     };
 

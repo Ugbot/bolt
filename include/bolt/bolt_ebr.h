@@ -66,26 +66,26 @@ struct EbrNode {
 //   `head[]`/`tail[]` and `nodes[]` are producer-owned (written on
 //   retire, read by the collector only during drain, and drain already
 //   implies the epoch is quiesced). Keep `local_epoch` on its own
-//   64-byte cache line so the collector's scan of all shards does not
+//   configured isolation unit so the collector's scan of all shards does not
 //   bounce the producer's cursor lines.
 //
 // Ring depth per epoch is `kEbrRetirePerEpoch`; `head - tail` always fits
 // in uint32_t because we bounds-check on push.
 // ---------------------------------------------------------------------------
-struct alignas(64) EbrShard {
+struct alignas(bolt::config::kCacheIsolationBytes) EbrShard {
     // --- cache line 0: cross-thread pin slot, isolated from producer data ---
-    alignas(64) std::atomic<uint64_t> local_epoch;  // 0|1|2 or kEbrUnpinned
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> local_epoch;  // 0|1|2 or kEbrUnpinned
     // Pad the rest of this cache line so the collector's scan of
     // `local_epoch` does not fetch any producer-owned bytes.
-    char _pad_pin[64 - sizeof(std::atomic<uint64_t>)];
+    char _pad_pin[config::kCacheIsolationBytes - sizeof(std::atomic<uint64_t>)];
 
     // --- cache line 1: producer-owned cursors ---
-    alignas(64) uint32_t head[3];                   // write cursor / epoch
+    alignas(bolt::config::kCacheIsolationBytes) uint32_t head[3];                   // write cursor / epoch
     uint32_t              tail[3];                  // read cursor / epoch
     uint32_t              _pad_hdr;                 // legacy slot; keeps ABI
 
     // --- payload storage, explicit cache-line boundary ---
-    alignas(64) EbrNode nodes[kEbrRetirePerEpoch * 3];  // [epoch][slot]
+    alignas(bolt::config::kCacheIsolationBytes) EbrNode nodes[kEbrRetirePerEpoch * 3];  // [epoch][slot]
 };
 
 // ---------------------------------------------------------------------------
@@ -93,9 +93,9 @@ struct alignas(64) EbrShard {
 // `global_epoch` is monotone — only the collector increments it, and only
 // via CAS so two concurrent collectors cannot stomp each other.
 // ---------------------------------------------------------------------------
-struct alignas(64) Ebr {
-    alignas(64) std::atomic<uint64_t> global_epoch;
-    alignas(64) std::atomic<uint32_t> collector_busy;  // 0 = free, 1 = draining
+struct alignas(bolt::config::kCacheIsolationBytes) Ebr {
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> global_epoch;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint32_t> collector_busy;  // 0 = free, 1 = draining
     uint32_t                          num_shards;
     uint32_t                          _pad_hdr;
     EbrShard                          shards[kEbrMaxShards];

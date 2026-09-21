@@ -100,6 +100,7 @@ set(CMAKE_CXX_EXTENSIONS        OFF)
 # Core: types, arena, channel, column, branchless, scheduler, port.
 add_library(bolt_core INTERFACE)
 add_library(bolt::core ALIAS bolt_core)
+include(BoltAlignment)
 target_include_directories(bolt_core INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>

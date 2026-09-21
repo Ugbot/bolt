@@ -17,7 +17,7 @@
 
 namespace bolt {
 
-static constexpr size_t kCacheLine = 64;
+static constexpr size_t kCacheLine = config::kCacheIsolationBytes;
 
 inline void cpu_pause() noexcept { BOLT_PAUSE(); }
 
@@ -60,7 +60,7 @@ public:
     bool   empty()       const noexcept { return wpos_ == rpos_; }
 
 private:
-    struct alignas(kCacheLine) Slot {
+    struct alignas(config::kChannelSlotAlignmentBytes) Slot {
         std::atomic<size_t> seq;
         T data;
     };
@@ -111,7 +111,7 @@ public:
     }
 
 private:
-    struct alignas(kCacheLine) Slot {
+    struct alignas(config::kChannelSlotAlignmentBytes) Slot {
         std::atomic<size_t> seq;
         T data;
     };

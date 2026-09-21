@@ -119,6 +119,7 @@ public:
     /// Typed allocation. Returns nullptr on failure.
     template <typename T>
     T* allocate_array(size_t count) noexcept {
+        if (count > SIZE_MAX / sizeof(T)) return nullptr;
         return static_cast<T*>(allocate(count * sizeof(T), alignof(T)));
     }
 
@@ -243,10 +244,13 @@ private:
     // (concurrent_ == false) and under alloc_lock_ when shared.
     void* allocate_unlocked(size_t size, size_t alignment) noexcept {
         if (alignment == 0) alignment = config_.alignment;
+        if (alignment == 0 || (alignment & (alignment - 1u)) != 0u) return nullptr;
+        if (size > SIZE_MAX - alignment) return nullptr;
+        if (cursor_ > UINTPTR_MAX - (alignment - 1u)) return nullptr;
 
         uintptr_t aligned = (cursor_ + alignment - 1) & ~(alignment - 1);
 
-        if (aligned + size <= end_) {
+        if (aligned <= end_ && size <= end_ - aligned) {
             cursor_ = aligned + size;
             total_allocated_ += size;
             if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
@@ -276,7 +280,8 @@ private:
                 if (oversize_test(i)) continue;
                 const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
                 const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
-                if (aligned + size <= base + block_sizes_[i]) {
+                const uintptr_t block_end = base + block_sizes_[i];
+                if (aligned <= block_end && size <= block_end - aligned) {
                     oversize_set(i);
                     total_allocated_ += size;
                     if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
@@ -310,7 +315,8 @@ private:
             if (oversize_test(i)) continue;   // in use this epoch
             const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
             const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
-            if (aligned + size <= base + block_sizes_[i]) {
+            const uintptr_t block_end = base + block_sizes_[i];
+            if (aligned <= block_end && size <= block_end - aligned) {
                 current_idx_ = i;
                 end_ = base + block_sizes_[i];
                 cursor_ = aligned + size;
@@ -322,7 +328,7 @@ private:
         // Grow
         if (!grow(size + alignment)) return nullptr;
         uintptr_t aligned = (cursor_ + alignment - 1) & ~(alignment - 1);
-        if (aligned + size > end_) return nullptr;  // Shouldn't happen
+        if (aligned > end_ || size > end_ - aligned) return nullptr;
         cursor_ = aligned + size;
         total_allocated_ += size;
         if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;

@@ -31,7 +31,7 @@ namespace bolt {
 
 #ifndef BOLT_KCACHELINE_DEFINED
 #define BOLT_KCACHELINE_DEFINED
-static constexpr size_t kCacheLineSize = 64;
+static constexpr size_t kCacheLineSize = config::kCacheIsolationBytes;
 #endif
 
 template <typename T, size_t Capacity = 4096>

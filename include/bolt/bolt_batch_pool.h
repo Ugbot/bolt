@@ -50,7 +50,7 @@ namespace bolt {
 // A pool slot. `next_free_idx` is UINT32_MAX at pool-tail; the Treiber
 // stack head stores the live head index in the low 32 bits and a
 // generation counter in the high 32 bits.
-struct alignas(64) TypedBatchPoolSlot {
+struct alignas(bolt::config::kCacheIsolationBytes) TypedBatchPoolSlot {
     Arena     arena;
     BoltBatch batch;
     uint32_t  next_free_idx;     // valid when slot is on the freelist
@@ -70,13 +70,13 @@ BOLT_FORCE_INLINE uint64_t typed_batch_pool_pack(uint32_t idx, uint32_t gen) noe
 }
 
 template <uint32_t Capacity>
-struct alignas(64) TypedBatchPool {
+struct alignas(bolt::config::kCacheIsolationBytes) TypedBatchPool {
     using Slot = TypedBatchPoolSlot;
 
     // Treiber stack head (generation + slot idx) and the "how many
     // slots have we constructed" counter, cache-line padded.
-    alignas(64) std::atomic<uint64_t> free_head;
-    alignas(64) std::atomic<uint32_t> slots_used;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> free_head;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint32_t> slots_used;
 
     // Stored Arena config for lazy slot initialization.
     ArenaConfig arena_cfg;

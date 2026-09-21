@@ -21,6 +21,7 @@
 // tiny grains (16-32 KB), strict pinning, and low parallel break-even
 // thresholds. See "Streaming defaults" cookbook at the bottom.
 
+#include <cstddef>
 #include <cstdint>
 
 // Optional user-supplied overrides. Drop a file on the include path.
@@ -31,6 +32,42 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Shared-state isolation is an ABI policy, not SIMD or buffer alignment.
+// AUTO is resolved by the compiler target (including each universal-build slice).
+// Every translation unit in a binary must use the same numeric settings.
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    #define BOLT_TARGET_CACHE_ISOLATION_BYTES 128
+#else
+    #define BOLT_TARGET_CACHE_ISOLATION_BYTES 64
+#endif
+#ifndef BOLT_CACHE_ISOLATION_BYTES
+    #if defined(BOLT_CONFIGURED_CACHE_ISOLATION_BYTES) && BOLT_CONFIGURED_CACHE_ISOLATION_BYTES != 0
+        #define BOLT_CACHE_ISOLATION_BYTES BOLT_CONFIGURED_CACHE_ISOLATION_BYTES
+    #else
+        #define BOLT_CACHE_ISOLATION_BYTES BOLT_TARGET_CACHE_ISOLATION_BYTES
+    #endif
+#endif
+#ifndef BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES
+    #ifdef BOLT_CONFIGURED_CHANNEL_SLOT_ALIGNMENT_BYTES
+        #define BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES BOLT_CONFIGURED_CHANNEL_SLOT_ALIGNMENT_BYTES
+    #else
+        #define BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES 64
+    #endif
+#endif
+static_assert(BOLT_CACHE_ISOLATION_BYTES == 64 || BOLT_CACHE_ISOLATION_BYTES == 128,
+              "BOLT_CACHE_ISOLATION_BYTES must be 64 or 128");
+static_assert(BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES == 64 || BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES == 128,
+              "BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES must be 64 or 128");
+#ifdef BOLT_CONFIGURED_CACHE_ISOLATION_BYTES
+static_assert(BOLT_CACHE_ISOLATION_BYTES == (BOLT_CONFIGURED_CACHE_ISOLATION_BYTES == 0
+              ? BOLT_TARGET_CACHE_ISOLATION_BYTES : BOLT_CONFIGURED_CACHE_ISOLATION_BYTES),
+              "cache isolation conflicts with linked Bolt; configure the whole build consistently");
+#endif
+#ifdef BOLT_CONFIGURED_CHANNEL_SLOT_ALIGNMENT_BYTES
+static_assert(BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES == BOLT_CONFIGURED_CHANNEL_SLOT_ALIGNMENT_BYTES,
+              "channel slot alignment conflicts with linked Bolt");
+#endif
+
 // Infrastructure bounds (sized at init, never at hot path).
 // ---------------------------------------------------------------------------
 #ifndef BOLT_MAX_WORKERS
@@ -149,6 +186,9 @@
 // ---------------------------------------------------------------------------
 namespace bolt {
 namespace config {
+
+inline constexpr size_t kCacheIsolationBytes = BOLT_CACHE_ISOLATION_BYTES;
+inline constexpr size_t kChannelSlotAlignmentBytes = BOLT_CHANNEL_SLOT_ALIGNMENT_BYTES;
 
 inline constexpr uint32_t kMaxWorkers             = BOLT_MAX_WORKERS;
 inline constexpr uint32_t kTaskRingSize           = BOLT_TASK_RING_SIZE;

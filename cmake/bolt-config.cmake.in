@@ -12,6 +12,7 @@
 # the flags are baked in by configure_package_config_file — so a consumer of a
 # minimal bolt is not forced to have OpenSSL or Vulkan on the machine.
 include(CMakeFindDependencyMacro)
+find_dependency(Threads)
 
 set(BOLT_BUILT_WITH_CRYPTO    @BOLT_BUILD_CRYPTO@)
 set(BOLT_BUILT_WITH_NET       @BOLT_BUILD_NET@)
