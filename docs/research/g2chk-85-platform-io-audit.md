@@ -25,12 +25,31 @@ The existing map has the same lifetime hazard, but changing the container
 without defining a dispatch pin would preserve or sharpen it rather than solve
 it.
 
-This pass deliberately leaves `event_loop_iocp.cpp` unchanged. A defensible
-migration needs a bounded dispatch-pin/deferred-reclamation contract that keeps
-the active callback alive through return, followed by Windows tests for
-self-removal, callback replacement, nested registration, association failure,
-and descriptor reuse. Stable segmented slots solve growth invalidation; they do
-not solve destruction of an actively executing payload.
+This pass deliberately leaves `event_loop_iocp.cpp` unchanged. A portable
+`EventHandlerRegistry` now provides bounded callable pins for the epoll and
+kqueue readiness loops: dispatch swaps the active `std::function` into one of
+16 preconstructed pin slots, and restores it only when the fd and monotonic
+registration token still match. Self-removal, replacement, and remove/re-add
+with immediate slot reuse therefore cannot destroy or resurrect the executing
+callable. Recursive `poll()` is refused before either backend overwrites its
+shared event batch. Each backend now drains readiness in fixed batches of 256
+events and snapshots every event's registration token before invoking the
+first callback. A callback that removes and re-adds a different ready fd can
+therefore make the old dequeued entry stale, but cannot redirect that entry to
+the replacement handler. Missing and stale entries are skipped; recursive or
+over-depth dispatch remains an explicit error. Readiness beyond the fixed
+batch remains queued in the kernel for a later poll.
+
+Applying that lifetime fix to IOCP is still insufficient. Each IOCP handler has
+an outstanding overlapped `WSARecv`. If a callback removes and re-adds the same
+open socket, a new-token read can be posted while the old read remains owned by
+the kernel. The old read can consume bytes and then be discarded as stale,
+silently losing input. Disabling READ has the same ownership issue: it cannot
+withdraw a read already submitted. A correct IOCP migration therefore needs
+cancel-and-drain semantics (for example, `CancelIoEx` plus a tombstone retained
+until the cancellation completion) or an interface where removal owns socket
+close. Token checks alone solve stale callback lifetime, not kernel-operation
+ownership, so the attempted IOCP wiring was rejected and the file restored.
 
 ## IOCP async association registry
 
@@ -120,9 +139,9 @@ cmake -S /src -B /build -G Ninja \
   -DBOLT_BUILD_TESTS=ON \
   -DBOLT_BUILD_BENCHMARKS=OFF
 cmake --build /build --target test_bolt_swiss_growable test_bolt_event_loop \
-  test_associated_handle_registry -j3
+  test_associated_handle_registry test_event_handler_registry -j3
 ctest --test-dir /build --output-on-failure \
-  -R 'test_bolt_(swiss_growable|event_loop)|test_associated_handle_registry'
+  -R 'test_bolt_(swiss_growable|event_loop)|test_associated_handle_registry|test_event_handler_registry'
 
 # Source audit: async IOCP no longer owns an unordered association map;
 # event-loop IOCP intentionally remains deferred as described above.
@@ -134,11 +153,13 @@ git diff --check
 The Linux tests exercise `SwissTableGrowable`, `FdRegistry` churn and capacity,
 full-width association keys, one-time association, platform-failure rollback,
 close-failure retention, close-success removal, deterministic initial-registry
-allocation refusal, slot reuse, stable handler addresses, dispatch, modify, and
-remove behavior. They do not compile the `_WIN32` translation units or prove all
-six Windows call sites execute the propagation branch. An MSVC or clang-cl
-Windows build and the Bolt test suite remain required before claiming the IOCP
-changes are platform validated.
+allocation refusal, bounded dispatch depth, busy dispatch, self-removal,
+same-fd remove/re-add ABA, stale readiness after replacement, fixed-batch
+draining beyond 256 ready fds, slot reuse, nested-poll refusal, stable handler
+addresses, dispatch, modify, and remove behavior. They do not compile the
+`_WIN32` translation units or prove all six Windows call sites execute the
+propagation branch. An MSVC or clang-cl Windows build and the Bolt test suite
+remain required before claiming the async IOCP changes are platform validated.
 
 Observed on 2026-09-21 in `chukonu-clang:19` (Linux ARM64, Clang 19.1.7/lld),
 using the distinct `/private/tmp/g2chk85-bolt-linux-20260921-1` build directory
@@ -147,7 +168,25 @@ three targeted CTest entries passed with 0 failures in 0.11 seconds total. The
 target rebuilt without compiler warnings. This is correctness evidence only;
 no timing benchmark was run.
 
+The readiness-loop increment was rebuilt separately in
+`/private/tmp/g2chk85-event-pin-linux-20260921-1` with the same Linux ARM64
+Clang 19/lld image and `-j3`. `test_event_handler_registry` passed 5/5 cases,
+`test_bolt_event_loop` passed 9/9 cases, and their targeted CTest run passed
+2/2 entries with 0 failures in 0.07 seconds. The build emitted existing
+diagnostics in unrelated Bolt and GoogleTest sources; the touched epoll source
+compiled without a diagnostic. No timing benchmark was run.
+
 Parent verification after the final review corrections also passed the complete
 five-case association/registry executable under macOS ASan + UBSan (CTest 1/1,
 0.83 seconds). This verifies the portable transaction and allocation-failure
 logic; it does not substitute for the Windows gate above.
+
+Final parent macOS ASan + UBSan verification passed all 14 readiness-lifetime
+cases (5 registry and 9 real-backend cases), with no skips, and both targeted
+CTest entries passed in 0.65 seconds. The four new real-backend regressions had
+also been run against the archived pre-change kqueue implementation:
+self-removal and self-replacement destroyed active callables, recursive poll
+was accepted, and stale readiness reached a replacement handler. The separate
+300-fd case passes the current bounded batching contract. Logs are retained at
+`/tmp/g2-callback-verified-asan-{build,test}.log`; the before-change evidence
+is at `/tmp/g2-callback-lifetime-baseline/`.

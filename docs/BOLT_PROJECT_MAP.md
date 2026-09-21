@@ -11,6 +11,15 @@ Windows, with no package manager or prebuilt dependency.
 
 ## Directory Layout
 
+The optional compiled `bolt::reactor` also owns native event loops. Its internal
+`src/api/net/event_handler_registry.h` layers bounded callback pins and
+registration identities over the shared `FdRegistry`. The epoll/kqueue backends
+snapshot identities before dispatch and use fixed 256-event batches; callbacks
+can remove/re-register handlers without destroying an active callable. Nested
+polling returns `EBUSY`. Portable and real-socket tests cover these lifetimes.
+IOCP handler migration still needs a cancel-and-drain protocol; see the
+[platform I/O audit](research/g2chk-85-platform-io-audit.md).
+
 ```
 bolt/
 ├── include/bolt/           ← Headers (the library)

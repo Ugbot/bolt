@@ -19,21 +19,15 @@
 #include <netinet/tcp.h>
 #include <errno.h>
 #include <cstring>
-#include "fd_registry.h"
+#include "event_handler_registry.h"
+#include <array>
 #include <atomic>
+#include <cassert>
+#include <cstdint>
 #include <iostream>
 
 namespace bolt::api {
 namespace net {
-
-/**
- * Event handler storage
- */
-struct EventHandlerData {
-    EventHandler handler;
-    void* user_data;
-    IOEvent events;  // Registered events
-};
 
 /**
  * kqueue-based event loop implementation
@@ -53,9 +47,6 @@ public:
 
         // Set kqueue fd to close-on-exec
         fcntl(kq_fd_, F_SETFD, FD_CLOEXEC);
-
-        // Pre-allocate event array for poll()
-        events_.resize(256);  // Start with 256, will grow if needed
     }
 
     ~KqueueEventLoop() override {
@@ -74,7 +65,7 @@ public:
         LOG_DEBUG("KQUEUE", "add_fd fd=%d events=%d kq_fd=%d", fd, static_cast<int>(events), kq_fd_);
 
         // Store handler (insert-or-overwrite; slot addresses are stable)
-        EventHandlerData* data = handlers_.insert(static_cast<uint64_t>(fd));
+        EventHandlerData* data = handlers_.insert(fd);
         if (!data) {
             errno = ENOMEM;  // registry hard cap — honest fail, never silent
             return -1;
@@ -90,7 +81,7 @@ public:
     }
 
     int modify_fd(int fd, IOEvent events) override {
-        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        EventHandlerData* data = handlers_.find(fd);
         if (!data) {
             errno = ENOENT;
             return -1;
@@ -104,7 +95,7 @@ public:
     }
 
     int remove_fd(int fd) override {
-        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        EventHandlerData* data = handlers_.find(fd);
         if (!data) {
             errno = ENOENT;
             return -1;
@@ -134,7 +125,9 @@ public:
         }
 
         // Remove handler
-        handlers_.erase(static_cast<uint64_t>(fd));
+        const bool removed = handlers_.remove(fd);
+        assert(removed);
+        (void)removed;
         return 0;
     }
 
@@ -143,6 +136,11 @@ public:
             errno = EBADF;
             return -1;
         }
+        if (poll_active_) {
+            errno = EBUSY;
+            return -1;
+        }
+        poll_active_ = true;
 
         // Convert timeout to timespec
         struct timespec* timeout_ptr = nullptr;
@@ -154,9 +152,12 @@ public:
         }
 
         // Wait for events
-        int n_events = kevent(kq_fd_, nullptr, 0, events_.data(), events_.size(), timeout_ptr);
+        int n_events = kevent(
+            kq_fd_, nullptr, 0, events_.data(),
+            static_cast<int>(kEventBatchCapacity), timeout_ptr);
 
         if (n_events < 0) {
+            poll_active_ = false;
             if (errno == EINTR) {
                 return 0;  // Interrupted, not an error
             }
@@ -168,54 +169,31 @@ public:
             LOG_DEBUG("KQUEUE", "poll got %d events", n_events);
         }
 
-        // Dispatch events
+        snapshot_event_tokens(n_events);
+
+        HandlerDispatchResult dispatch_error = HandlerDispatchResult::dispatched;
         for (int i = 0; i < n_events; i++) {
-            struct kevent& ev = events_[i];
-            int fd = static_cast<int>(ev.ident);
-
-            LOG_DEBUG("KQUEUE", "event fd=%d filter=%d flags=%d", fd, ev.filter, ev.flags);
-
-            // Look up handler (SIMD-probed SwissTableGrowable — the old
-            // std::unordered_map here was the G2CHK-85 hot-path violation)
-            EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
-            if (!data) {
-                LOG_DEBUG("KQUEUE", "no handler for fd=%d", fd);
-                continue;  // Handler was removed
+            const HandlerDispatchResult result =
+                dispatch_event(static_cast<uint32_t>(i));
+            if (result == HandlerDispatchResult::missing ||
+                result == HandlerDispatchResult::stale) {
+                continue;
             }
-
-            // Determine event type
-            IOEvent event_type = static_cast<IOEvent>(0);
-
-            if (ev.filter == EVFILT_READ) {
-                event_type = IOEvent::READ;
-
-                // Check for EOF/HUP
-                if (ev.flags & EV_EOF) {
-                    event_type = event_type | IOEvent::HUP;
-                }
-            } else if (ev.filter == EVFILT_WRITE) {
-                event_type = IOEvent::WRITE;
+            if (result != HandlerDispatchResult::dispatched) {
+                dispatch_error = result;
+                break;
             }
-
-            // Check for errors
-            if (ev.flags & EV_ERROR) {
-                event_type = event_type | IOEvent::ERROR;
-            }
-
-            LOG_DEBUG("KQUEUE", "dispatching to handler fd=%d event_type=%d", fd, static_cast<int>(event_type));
-
-            // Invoke handler. `data` points into the registry's segmented
-            // pool — STABLE even if the handler itself calls add_fd() and
-            // grows the table (the unordered_map version could rehash here
-            // and dangle the iterator mid-dispatch).
-            data->handler(fd, event_type, data->user_data);
         }
 
-        // Grow event array if needed
-        if (n_events == static_cast<int>(events_.size())) {
-            events_.resize(events_.size() * 2);
+        poll_active_ = false;
+        if (dispatch_error == HandlerDispatchResult::busy) {
+            errno = EBUSY;
+            return -1;
         }
-
+        if (dispatch_error != HandlerDispatchResult::dispatched) {
+            errno = ENOBUFS;
+            return -1;
+        }
         return n_events;
     }
 
@@ -244,6 +222,39 @@ public:
     }
 
 private:
+    void snapshot_event_tokens(int n_events) noexcept {
+        assert(n_events >= 0);
+        assert(n_events <= static_cast<int>(events_.size()));
+        for (int i = 0; i < n_events; ++i) {
+            const int fd = static_cast<int>(events_[static_cast<size_t>(i)].ident);
+            EventHandlerData* const data = handlers_.find(fd);
+            event_tokens_[static_cast<size_t>(i)] =
+                data != nullptr ? data->token : 0;
+        }
+    }
+
+    HandlerDispatchResult dispatch_event(uint32_t index) noexcept {
+        assert(index < events_.size());
+        const struct kevent& ev = events_[index];
+        const int fd = static_cast<int>(ev.ident);
+        assert(fd >= 0);
+        const uint64_t token = event_tokens_[index];
+        if (token == 0) return HandlerDispatchResult::missing;
+
+        LOG_DEBUG("KQUEUE", "event fd=%d filter=%d flags=%d", fd, ev.filter, ev.flags);
+        IOEvent event_type = static_cast<IOEvent>(0);
+        if (ev.filter == EVFILT_READ) {
+            event_type = IOEvent::READ;
+            if (ev.flags & EV_EOF) event_type = event_type | IOEvent::HUP;
+        } else if (ev.filter == EVFILT_WRITE) {
+            event_type = IOEvent::WRITE;
+        }
+        if (ev.flags & EV_ERROR) event_type = event_type | IOEvent::ERROR;
+        LOG_DEBUG("KQUEUE", "dispatching fd=%d event_type=%d", fd,
+                  static_cast<int>(event_type));
+        return handlers_.dispatch(fd, token, event_type);
+    }
+
     int update_kqueue_events(int fd, IOEvent events, bool modify) {
         // Determine flags for ADD operations
         uint16_t flags = EV_ADD;
@@ -297,10 +308,16 @@ private:
         return 0;
     }
 
-    int kq_fd_;                                      // kqueue file descriptor
-    FdRegistry<EventHandlerData> handlers_;          // fd → handler registry
-    std::vector<struct kevent> events_;              // Event array for kevent()
-    std::atomic<bool> running_;                      // Running flag
+    static constexpr size_t kEventBatchCapacity = 256;
+
+    int kq_fd_;
+    EventHandlerRegistry handlers_;
+    // A fixed batch lets us snapshot every token before callbacks mutate the
+    // registry. The kernel retains excess readiness for a later poll.
+    std::array<struct kevent, kEventBatchCapacity> events_{};
+    std::array<uint64_t, kEventBatchCapacity> event_tokens_{};
+    std::atomic<bool> running_;
+    bool poll_active_{false};
 };
 
 // Factory function for kqueue

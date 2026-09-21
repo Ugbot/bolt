@@ -18,22 +18,16 @@
 #include <netinet/tcp.h>
 #include <errno.h>
 #include <cstring>
-#include "fd_registry.h"
+#include "event_handler_registry.h"
+#include <array>
 #include <atomic>
+#include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <cstdlib>   // std::abort (no exceptions in this build)
 
 namespace bolt::api {
 namespace net {
-
-/**
- * Event handler storage
- */
-struct EventHandlerData {
-    EventHandler handler;
-    void* user_data;
-    IOEvent events;  // Registered events
-};
 
 /**
  * epoll-based event loop implementation
@@ -52,9 +46,6 @@ public:
             std::cerr << "epoll_create1() failed: " << strerror(errno) << std::endl;
             std::abort();
         }
-
-        // Pre-allocate event array for epoll_wait()
-        events_.resize(256);  // Start with 256, will grow if needed
     }
 
     ~EpollEventLoop() override {
@@ -70,7 +61,7 @@ public:
         }
 
         // Store handler (insert-or-overwrite; slot addresses are stable)
-        EventHandlerData* data = handlers_.insert(static_cast<uint64_t>(fd));
+        EventHandlerData* data = handlers_.insert(fd);
         if (!data) {
             errno = ENOMEM;  // registry hard cap — honest fail, never silent
             return -1;
@@ -84,7 +75,7 @@ public:
     }
 
     int modify_fd(int fd, IOEvent events) override {
-        EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
+        EventHandlerData* data = handlers_.find(fd);
         if (!data) {
             errno = ENOENT;
             return -1;
@@ -98,7 +89,7 @@ public:
     }
 
     int remove_fd(int fd) override {
-        if (!handlers_.find(static_cast<uint64_t>(fd))) {
+        if (!handlers_.find(fd)) {
             errno = ENOENT;
             return -1;
         }
@@ -113,7 +104,9 @@ public:
         }
 
         // Remove handler
-        handlers_.erase(static_cast<uint64_t>(fd));
+        const bool removed = handlers_.remove(fd);
+        assert(removed);
+        (void)removed;
         return 0;
     }
 
@@ -122,59 +115,50 @@ public:
             errno = EBADF;
             return -1;
         }
+        if (poll_active_) {
+            errno = EBUSY;
+            return -1;
+        }
+        poll_active_ = true;
 
         // Wait for events
-        int n_events = epoll_wait(epoll_fd_, events_.data(), events_.size(), timeout_ms);
+        int n_events = epoll_wait(
+            epoll_fd_, events_.data(),
+            static_cast<int>(kEventBatchCapacity), timeout_ms);
 
         if (n_events < 0) {
+            poll_active_ = false;
             if (errno == EINTR) {
                 return 0;  // Interrupted, not an error
             }
             return -1;
         }
 
-        // Dispatch events
+        snapshot_event_tokens(n_events);
+
+        HandlerDispatchResult dispatch_error = HandlerDispatchResult::dispatched;
         for (int i = 0; i < n_events; i++) {
-            struct epoll_event& ev = events_[i];
-            int fd = ev.data.fd;
-
-            // Look up handler (SIMD-probed SwissTableGrowable — the old
-            // std::unordered_map here was the G2CHK-85 hot-path violation)
-            EventHandlerData* data = handlers_.find(static_cast<uint64_t>(fd));
-            if (!data) {
-                continue;  // Handler was removed
+            const HandlerDispatchResult result =
+                dispatch_event(static_cast<uint32_t>(i));
+            if (result == HandlerDispatchResult::missing ||
+                result == HandlerDispatchResult::stale) {
+                continue;
             }
-
-            // Determine event type
-            IOEvent event_type = static_cast<IOEvent>(0);
-
-            if (ev.events & EPOLLIN) {
-                event_type = IOEvent::READ;
+            if (result != HandlerDispatchResult::dispatched) {
+                dispatch_error = result;
+                break;
             }
-            if (ev.events & EPOLLOUT) {
-                event_type = event_type | IOEvent::WRITE;
-            }
-            if (ev.events & (EPOLLHUP | EPOLLRDHUP)) {
-                event_type = event_type | IOEvent::HUP;
-            }
-            if (ev.events & EPOLLERR) {
-                event_type = event_type | IOEvent::ERROR;
-            }
-
-            // Invoke handler directly — handlers are noexcept in this
-            // exception-free (-fno-exceptions) build.
-            // `data` points into the registry's segmented pool — STABLE
-            // even if the handler itself calls add_fd() and grows the table
-            // (the unordered_map version could rehash here and dangle the
-            // iterator mid-dispatch).
-            data->handler(fd, event_type, data->user_data);
         }
 
-        // Grow event array if needed
-        if (n_events == static_cast<int>(events_.size())) {
-            events_.resize(events_.size() * 2);
+        poll_active_ = false;
+        if (dispatch_error == HandlerDispatchResult::busy) {
+            errno = EBUSY;
+            return -1;
         }
-
+        if (dispatch_error != HandlerDispatchResult::dispatched) {
+            errno = ENOBUFS;
+            return -1;
+        }
         return n_events;
     }
 
@@ -203,6 +187,35 @@ public:
     }
 
 private:
+    void snapshot_event_tokens(int n_events) noexcept {
+        assert(n_events >= 0);
+        assert(n_events <= static_cast<int>(events_.size()));
+        for (int i = 0; i < n_events; ++i) {
+            const int fd = events_[static_cast<size_t>(i)].data.fd;
+            EventHandlerData* const data = handlers_.find(fd);
+            event_tokens_[static_cast<size_t>(i)] =
+                data != nullptr ? data->token : 0;
+        }
+    }
+
+    HandlerDispatchResult dispatch_event(uint32_t index) noexcept {
+        assert(index < events_.size());
+        const struct epoll_event& ev = events_[index];
+        const int fd = ev.data.fd;
+        assert(fd >= 0);
+        const uint64_t token = event_tokens_[index];
+        if (token == 0) return HandlerDispatchResult::missing;
+
+        IOEvent event_type = static_cast<IOEvent>(0);
+        if (ev.events & EPOLLIN) event_type = IOEvent::READ;
+        if (ev.events & EPOLLOUT) event_type = event_type | IOEvent::WRITE;
+        if (ev.events & (EPOLLHUP | EPOLLRDHUP)) {
+            event_type = event_type | IOEvent::HUP;
+        }
+        if (ev.events & EPOLLERR) event_type = event_type | IOEvent::ERROR;
+        return handlers_.dispatch(fd, token, event_type);
+    }
+
     int update_epoll_events(int fd, IOEvent events, bool modify) {
         struct epoll_event ev;
         ev.events = 0;
@@ -231,10 +244,16 @@ private:
         return 0;
     }
 
-    int epoll_fd_;                                       // epoll file descriptor
-    FdRegistry<EventHandlerData> handlers_;          // fd → handler registry
-    std::vector<struct epoll_event> events_;             // Event array for epoll_wait()
-    std::atomic<bool> running_;                          // Running flag
+    static constexpr size_t kEventBatchCapacity = 256;
+
+    int epoll_fd_;
+    EventHandlerRegistry handlers_;
+    // A fixed batch lets us snapshot every token before callbacks mutate the
+    // registry. The kernel retains excess readiness for a later poll.
+    std::array<struct epoll_event, kEventBatchCapacity> events_{};
+    std::array<uint64_t, kEventBatchCapacity> event_tokens_{};
+    std::atomic<bool> running_;
+    bool poll_active_{false};
 };
 
 // Factory function for epoll
