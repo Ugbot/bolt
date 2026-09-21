@@ -275,6 +275,158 @@ std::string wide_fixture_path() {
     return "arrow_ipc_wide_fixture.arrows";
 }
 
+// ---------------------------------------------------------------------
+// Nested fixture (G2ARROW-21): List<Utf8> and Struct{id:Int64,
+// label:Utf8}, alongside a plain Int64 baseline column — a realistic
+// mixed flat+nested query result. Generating rules mirror
+// check_nested_fixture() in scripts/arrow_ipc_check.py exactly, re-
+// derived independently there. Deliberately covers, per the ticket:
+// nulls at the PARENT level (a whole list/struct row is null) *and* the
+// CHILD level (one element/field is null while the parent row is
+// present), plus an EMPTY (non-null) list — same offset span as a null
+// list, distinguished only by the validity bit.
+// ---------------------------------------------------------------------
+
+constexpr std::int64_t kMaxTagElems = 512;   // 100 rows x up to 4 elements
+
+bool tag_list_is_null(std::int64_t i) { return (i % 13) == 0; }
+bool tag_list_is_empty(std::int64_t i) {
+    return !tag_list_is_null(i) && (i % 5) == 0;
+}
+std::int64_t tag_list_count(std::int64_t i) {
+    if (tag_list_is_null(i) || tag_list_is_empty(i)) return 0;
+    return 1 + (i % 4);
+}
+bool tag_elem_is_null(std::int64_t j) { return (j % 3) == 2; }
+std::string tag_elem_val(std::int64_t i, std::int64_t j) {
+    return "t" + std::to_string(i) + "_" + std::to_string(j);
+}
+
+bool person_is_null(std::int64_t i) { return (i % 17) == 0; }
+bool person_id_is_null(std::int64_t i) { return (i % 29) == 0; }
+bool person_label_is_null(std::int64_t i) { return (i % 9) == 0; }
+std::string person_label_val(std::int64_t i) { return "p" + std::to_string(i); }
+
+struct NestedFixture {
+    // col0: plain Int64 baseline.
+    std::int64_t ids[kRows];
+
+    // col1: List<Utf8> "tags".
+    std::int32_t  tag_offsets[kRows + 1];
+    StringView    tag_elems[kMaxTagElems];
+    std::uint8_t  tag_elem_validity[(kMaxTagElems + 7) / 8];
+    std::uint8_t  tag_list_validity[(kRows + 7) / 8];
+    char          tag_pool[8192];
+    std::uint32_t tag_pool_used = 0;
+
+    // col2: Struct{id: Int64, label: Utf8} "person".
+    std::int64_t  person_id[kRows];
+    std::uint8_t  person_id_validity[(kRows + 7) / 8];
+    StringView    person_label[kRows];
+    std::uint8_t  person_label_validity[(kRows + 7) / 8];
+    char          person_pool[8192];
+    std::uint32_t person_pool_used = 0;
+    std::uint8_t  person_validity[(kRows + 7) / 8];
+
+    bolt::Arena arena;
+    BoltBatch*  batch;
+
+    NestedFixture() {
+        std::memset(tag_elem_validity, 0xFF, sizeof(tag_elem_validity));
+        std::memset(tag_list_validity, 0xFF, sizeof(tag_list_validity));
+        std::memset(person_id_validity, 0xFF, sizeof(person_id_validity));
+        std::memset(person_label_validity, 0xFF, sizeof(person_label_validity));
+        std::memset(person_validity, 0xFF, sizeof(person_validity));
+
+        std::int64_t elem_cursor = 0;
+        tag_offsets[0] = 0;
+        for (std::int64_t i = 0; i < kRows; ++i) {
+            ids[i] = int_val(i);
+
+            if (tag_list_is_null(i)) {
+                tag_list_validity[i >> 3] &=
+                    static_cast<std::uint8_t>(~(1u << (i & 7)));
+            }
+            const std::int64_t count = tag_list_count(i);
+            for (std::int64_t j = 0; j < count; ++j) {
+                assert(elem_cursor < kMaxTagElems);
+                if (tag_elem_is_null(j)) {
+                    tag_elem_validity[elem_cursor >> 3] &=
+                        static_cast<std::uint8_t>(~(1u << (elem_cursor & 7)));
+                    tag_elems[elem_cursor] = StringView{};
+                } else {
+                    const std::string s = tag_elem_val(i, j);
+                    tag_elems[elem_cursor] = make_view(
+                        s.data(), static_cast<std::uint32_t>(s.size()),
+                        tag_pool, &tag_pool_used);
+                }
+                ++elem_cursor;
+            }
+            tag_offsets[i + 1] = static_cast<std::int32_t>(elem_cursor);
+
+            if (person_is_null(i)) {
+                person_validity[i >> 3] &=
+                    static_cast<std::uint8_t>(~(1u << (i & 7)));
+            }
+            person_id[i] = int_val(i);
+            if (person_id_is_null(i)) {
+                person_id_validity[i >> 3] &=
+                    static_cast<std::uint8_t>(~(1u << (i & 7)));
+            }
+            if (person_label_is_null(i)) {
+                person_label_validity[i >> 3] &=
+                    static_cast<std::uint8_t>(~(1u << (i & 7)));
+                person_label[i] = StringView{};
+            } else {
+                const std::string s = person_label_val(i);
+                person_label[i] = make_view(
+                    s.data(), static_cast<std::uint32_t>(s.size()),
+                    person_pool, &person_pool_used);
+            }
+        }
+
+        batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
+        BoltBatch::init_empty(batch);
+        const bool cols_ok = BoltBatch::alloc_columns(batch, &arena, 3);
+        assert(cols_ok);
+        (void)cols_ok;
+        batch->num_rows = kRows;
+        batch->num_cols = 3;
+
+        BoltColumn& c0 = batch->columns[batch->read_epoch][0];
+        c0.type = BoltType::Int64; c0.format = ColumnFormat::Flat;
+        c0.data = ids; c0.length = kRows; c0.type_size_bytes = 8;
+
+        BoltColumn elem = BoltColumn::make_empty();
+        elem.type = BoltType::Utf8; elem.format = ColumnFormat::Flat;
+        elem.data = tag_elems; elem.length = elem_cursor;
+        elem.str_overflow_base = tag_pool;
+        elem.validity = tag_elem_validity;
+        batch->columns[batch->read_epoch][1] = BoltColumn::make_list(
+            &elem, tag_offsets, kRows, tag_list_validity, &arena);
+
+        BoltColumn id_field = BoltColumn::make_empty();
+        id_field.type = BoltType::Int64; id_field.format = ColumnFormat::Flat;
+        id_field.data = person_id; id_field.length = kRows;
+        id_field.type_size_bytes = 8; id_field.validity = person_id_validity;
+        BoltColumn label_field = BoltColumn::make_empty();
+        label_field.type = BoltType::Utf8; label_field.format = ColumnFormat::Flat;
+        label_field.data = person_label; label_field.length = kRows;
+        label_field.str_overflow_base = person_pool;
+        label_field.validity = person_label_validity;
+        BoltColumn fields[2] = {id_field, label_field};
+        batch->columns[batch->read_epoch][2] = BoltColumn::make_struct(
+            fields, 2, kRows, person_validity, &arena);
+    }
+    ~NestedFixture() { std::free(batch); }
+};
+
+std::string nested_fixture_path() {
+    const char* env = std::getenv("BOLT_ARROW_IPC_NESTED_OUT");
+    if (env != nullptr && env[0] != '\0') return env;
+    return "arrow_ipc_nested_fixture.arrows";
+}
+
 }  // namespace
 
 TEST(ArrowIpc, RejectsUnsupportedTypeAtOpen) {
@@ -283,10 +435,17 @@ TEST(ArrowIpc, RejectsUnsupportedTypeAtOpen) {
     ASSERT_NE(w, nullptr);
     std::FILE* f = std::tmpfile();
     ASSERT_NE(f, nullptr);
-    // List remains genuinely unsupported (nested types are G2ARROW-20's
-    // documented follow-up) — Bool/Date32/Binary/Decimal128 moved out of
-    // this test into WritesPyarrowOracleWideTypesFixture below since they
-    // are now real, pyarrow-verified support, not a rejection case.
+    // List IS supported now (G2ARROW-21), but only through
+    // arrow_ipc_open_nested() with a real FieldSpec describing its
+    // element type — this FLAT entry point has no way to carry that, so
+    // BoltType::List correctly still fails here too, for a different,
+    // still-correct reason (see arrow_ipc_open()'s FieldSpec::n_children
+    // == 0 wrapper: a flat List has no children, and flatten_fields()
+    // rejects that shape). NestedOpenBuildsListAndStructSchema below is
+    // the positive case via the nested entry point. Bool/Date32/Binary/
+    // Decimal128 moved out of this test into
+    // WritesPyarrowOracleWideTypesFixture since they are real,
+    // pyarrow-verified support, not a rejection case.
     const BoltType bad[2] = {BoltType::Int64, BoltType::List};
     EXPECT_FALSE(arrow_ipc_open(w, f, bad, nullptr, 2));
     // Fail closed AT open: nothing was written.
@@ -410,6 +569,166 @@ TEST(ArrowIpc, WritesPyarrowOracleWideTypesFixture) {
     };
     const std::uint8_t scales[7] = {0, 0, 0, 0, 0, 0, kDecimalScale};
     ASSERT_TRUE(arrow_ipc_open(w, f, tys, names, 7, scales));
+    ASSERT_TRUE(arrow_ipc_write_batch(w, fx.batch));
+    ASSERT_TRUE(arrow_ipc_close(w));
+    std::fclose(f);
+    std::free(w);
+    ::testing::Test::RecordProperty("fixture", path);
+}
+
+// ---------------------------------------------------------------------
+// G2ARROW-21: nested List/Struct via arrow_ipc_open_nested().
+// ---------------------------------------------------------------------
+
+TEST(ArrowIpc, NestedOpenRejectsMalformedListChildCount) {
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    // A List must declare exactly 1 child — 0 or 2+ is malformed, not
+    // "no children" (that would silently mean something else: a List
+    // whose element type nobody stated).
+    FieldSpec elem{};
+    elem.type = BoltType::Utf8;
+    FieldSpec bad_list{};
+    bad_list.type = BoltType::List;
+    bad_list.n_children = 0;
+    bad_list.children = nullptr;
+    EXPECT_FALSE(arrow_ipc_open_nested(w, f, &bad_list, 1));
+    std::fflush(f);
+    EXPECT_EQ(std::ftell(f), 0);
+
+    FieldSpec two[2] = {elem, elem};
+    FieldSpec bad_list2{};
+    bad_list2.type = BoltType::List;
+    bad_list2.n_children = 2;
+    bad_list2.children = two;
+    EXPECT_FALSE(arrow_ipc_open_nested(w, f, &bad_list2, 1));
+    std::fflush(f);
+    EXPECT_EQ(std::ftell(f), 0);
+    std::fclose(f);
+    std::free(w);
+}
+
+TEST(ArrowIpc, NestedOpenRejectsStructWithNoChildren) {
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    FieldSpec bad_struct{};
+    bad_struct.type = BoltType::Struct;
+    bad_struct.n_children = 0;
+    bad_struct.children = nullptr;
+    EXPECT_FALSE(arrow_ipc_open_nested(w, f, &bad_struct, 1));
+    std::fflush(f);
+    EXPECT_EQ(std::ftell(f), 0);
+    std::fclose(f);
+    std::free(w);
+}
+
+TEST(ArrowIpc, NestedOpenRejectsLeafWithChildren) {
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    // Int64 declaring a child is a shape mismatch, not "extra metadata
+    // ignored" -- fail closed rather than silently drop it.
+    FieldSpec child{};
+    child.type = BoltType::Utf8;
+    FieldSpec bad_leaf{};
+    bad_leaf.type = BoltType::Int64;
+    bad_leaf.n_children = 1;
+    bad_leaf.children = &child;
+    EXPECT_FALSE(arrow_ipc_open_nested(w, f, &bad_leaf, 1));
+    std::fflush(f);
+    EXPECT_EQ(std::ftell(f), 0);
+    std::fclose(f);
+    std::free(w);
+}
+
+TEST(ArrowIpc, NestedOpenBuildsListAndStructSchema) {
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+
+    FieldSpec elem{};
+    elem.type = BoltType::Utf8;
+    FieldSpec list_col{};
+    list_col.type = BoltType::List;
+    list_col.name = "tags";
+    list_col.n_children = 1;
+    list_col.children = &elem;
+
+    FieldSpec struct_fields[2]{};
+    struct_fields[0].type = BoltType::Int64;
+    struct_fields[0].name = "id";
+    struct_fields[1].type = BoltType::Utf8;
+    struct_fields[1].name = "label";
+    FieldSpec struct_col{};
+    struct_col.type = BoltType::Struct;
+    struct_col.name = "person";
+    struct_col.n_children = 2;
+    struct_col.children = struct_fields;
+
+    FieldSpec top[3]{};
+    top[0].type = BoltType::Int64;
+    top[0].name = "id";
+    top[1] = list_col;
+    top[2] = struct_col;
+
+    ASSERT_TRUE(arrow_ipc_open_nested(w, f, top, 3));
+    ASSERT_TRUE(arrow_ipc_close(w));
+    const long total = std::ftell(f);
+    ASSERT_GT(total, 16);
+    EXPECT_EQ(total % 8, 0);
+    std::fclose(f);
+    std::free(w);
+}
+
+// Writes the fixture the pyarrow oracle (scripts/arrow_ipc_check.py)
+// validates value-for-value, including the List/Struct schema shapes,
+// parent-level nulls, child-level nulls, and the null-vs-empty-list
+// distinction (NestedFixture above).
+TEST(ArrowIpc, WritesPyarrowOracleNestedFixture) {
+    const std::string path = nested_fixture_path();
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr) << path;
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    NestedFixture fx;
+
+    FieldSpec elem{};
+    elem.type = BoltType::Utf8;
+    elem.name = "item";
+    FieldSpec list_col{};
+    list_col.type = BoltType::List;
+    list_col.name = "tags";
+    list_col.n_children = 1;
+    list_col.children = &elem;
+
+    FieldSpec struct_fields[2]{};
+    struct_fields[0].type = BoltType::Int64;
+    struct_fields[0].name = "id";
+    struct_fields[1].type = BoltType::Utf8;
+    struct_fields[1].name = "label";
+    FieldSpec struct_col{};
+    struct_col.type = BoltType::Struct;
+    struct_col.name = "person";
+    struct_col.n_children = 2;
+    struct_col.children = struct_fields;
+
+    FieldSpec top[3]{};
+    top[0].type = BoltType::Int64;
+    top[0].name = "ids";
+    top[1] = list_col;
+    top[2] = struct_col;
+
+    ASSERT_TRUE(arrow_ipc_open_nested(w, f, top, 3));
     ASSERT_TRUE(arrow_ipc_write_batch(w, fx.batch));
     ASSERT_TRUE(arrow_ipc_close(w));
     std::fclose(f);

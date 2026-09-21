@@ -1,4 +1,5 @@
-// bolt_arrow_ipc.cpp — Arrow IPC stream writer (G2ARROW-10).
+// bolt_arrow_ipc.cpp — Arrow IPC stream writer (G2ARROW-10; nested
+// List/Struct G2ARROW-21).
 // See include/bolt/ingest/bolt_arrow_ipc.h for the contract.
 //
 // The message headers are flatbuffers encoded FROM THE SPEC
@@ -13,6 +14,7 @@
 #include "bolt/ingest/bolt_arrow_ipc.h"
 
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 
 #include "bolt/bolt_arrow.h"     // bolt::arrow::detail::var_at — the ONE
@@ -30,8 +32,10 @@ constexpr std::int16_t kMetadataV5     = 4;   // MetadataVersion::V5
 constexpr std::uint8_t kHeaderSchema   = 1;   // MessageHeader union
 constexpr std::uint8_t kHeaderBatch    = 3;
 // Type union member ordinals — 1-indexed by flatbuffer declaration order
-// (format/Schema.fbs: Null, Int, FloatingPoint, Binary, Utf8, Bool,
-// Decimal, Date, Time, Timestamp, Interval, List, Struct_, ...).
+// (format/Schema.fbs `union Type`, fetched live and re-verified for
+// G2ARROW-21: Null, Int, FloatingPoint, Binary, Utf8, Bool, Decimal, Date,
+// Time, Timestamp, Interval, List, Struct_, Union, FixedSizeBinary,
+// FixedSizeList, Map, ...).
 constexpr std::uint8_t kTypeInt        = 2;
 constexpr std::uint8_t kTypeFloat      = 3;
 constexpr std::uint8_t kTypeBinary     = 4;
@@ -39,6 +43,8 @@ constexpr std::uint8_t kTypeUtf8       = 5;
 constexpr std::uint8_t kTypeBool       = 6;
 constexpr std::uint8_t kTypeDecimal    = 7;
 constexpr std::uint8_t kTypeDate       = 8;
+constexpr std::uint8_t kTypeList       = 12;
+constexpr std::uint8_t kTypeStruct     = 13;
 constexpr std::int16_t kPrecisionDouble = 2;  // FloatingPoint::Precision
 constexpr std::int16_t kDateUnitDay     = 0;  // DateUnit::DAY
 constexpr std::int32_t kDecimal128BitWidth  = 128;
@@ -211,7 +217,11 @@ std::uint32_t fb_finish(Fb* b, std::uint32_t root) noexcept {
 
 // Build the Type union table for one BoltType. Writes the union tag to
 // *out_tag. `decimal_scale` is used only for Decimal128. Returns table
-// pos, 0 for an unsupported type (fail closed).
+// pos, 0 for an unsupported type (fail closed). List/Struct union tables
+// are themselves EMPTY (format/Schema.fbs `table List {}` / `table
+// Struct_ {}`) — the element/field type(s) live on the enclosing Field's
+// `children` vector, built by the caller (build_all_fields below), not
+// here.
 std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
                                std::uint8_t* out_tag) noexcept {
     assert(out_tag != nullptr);
@@ -258,24 +268,152 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
         fb_field_scalar<std::int32_t>(b, 2, kDecimal128BitWidth);
         return fb_end_table(b);
     }
+    if (t == BoltType::List) {
+        *out_tag = kTypeList;
+        fb_start_table(b);                               // empty table
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Struct) {
+        *out_tag = kTypeStruct;
+        fb_start_table(b);                               // empty table
+        return fb_end_table(b);
+    }
     return 0;                                            // unsupported
 }
 
-// Field table: name / nullable / type union / empty children vector.
-std::uint32_t build_field(Fb* b, const char* name, BoltType t,
-                          std::uint8_t decimal_scale,
-                          std::uint32_t empty_children) noexcept {
-    std::uint8_t tag = 0;
-    const std::uint32_t type_pos = build_type_table(b, t, decimal_scale, &tag);
-    if (type_pos == 0) return 0;
-    const std::uint32_t name_pos = fb_string(b, name);
-    fb_start_table(b);
-    fb_field_offset(b, 0, name_pos);                     // name
-    fb_field_scalar<std::uint8_t>(b, 1, 1);              // nullable = true
-    fb_field_scalar<std::uint8_t>(b, 2, tag);            // type_type
-    fb_field_offset(b, 3, type_pos);                     // type
-    fb_field_offset(b, 5, empty_children);               // children = []
-    return fb_end_table(b);
+// ---- open()-time schema flattening (G2ARROW-21) --------------------------
+//
+// A FieldSpec tree is flattened into ArrowIpcWriter::desc[] BREADTH-FIRST
+// (not the wire format's own depth-first pre-order — that numbering is
+// produced separately, per batch, by layout_field/write_field_body below).
+// Breadth-first is what keeps a node's own direct children CONTIGUOUS at
+// `first_child..first_child+n_children-1` regardless of how large a
+// SIBLING's own subtree turns out to be: a depth-first numbering does not
+// have that property once a Struct has more than one child (a first
+// child's own descendants would land between the first and second
+// sibling's indices).
+//
+// `name_buf[i]` (out param, caller-allocated, transient — used only
+// during open(), never stored on the writer) receives field i's final
+// name: `spec->name` verbatim if non-null/non-empty, else the synthesized
+// default (top-level "cN"; a List's sole child "item"; a Struct's Kth
+// child "fK").
+bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
+                    std::uint16_t n_cols,
+                    char name_buf[kIpcMaxFields][kIpcNameCap]) noexcept {
+    assert(w != nullptr && top != nullptr && name_buf != nullptr);
+    if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
+
+    const FieldSpec* src[kIpcMaxFields];
+    std::uint16_t depth[kIpcMaxFields];
+    w->n_desc = n_cols;
+    for (std::uint16_t i = 0; i < n_cols; ++i) {
+        src[i] = &top[i];
+        depth[i] = 0;
+        if (top[i].name != nullptr && top[i].name[0] != '\0') {
+            std::snprintf(name_buf[i], kIpcNameCap, "%s", top[i].name);
+        } else {
+            std::snprintf(name_buf[i], kIpcNameCap, "c%u",
+                          static_cast<unsigned>(i));
+        }
+    }
+
+    for (std::uint16_t i = 0; i < w->n_desc; ++i) {
+        const FieldSpec* s = src[i];
+        const bool is_list = (s->type == BoltType::List);
+        const bool is_struct = (s->type == BoltType::Struct);
+        if (is_list) {
+            if (s->n_children != 1 || s->children == nullptr) return false;
+        } else if (is_struct) {
+            if (s->n_children == 0 || s->n_children > kIpcMaxCols ||
+                s->children == nullptr) {
+                return false;
+            }
+        } else if (s->n_children != 0 || s->children != nullptr) {
+            return false;   // a leaf type must carry no children
+        }
+        if (s->type == BoltType::Decimal128 &&
+            s->decimal_scale > kDecimal128Precision) {
+            return false;
+        }
+
+        IpcFieldDesc& fd = w->desc[i];
+        fd.type = static_cast<std::uint16_t>(s->type);
+        fd.n_children = static_cast<std::uint8_t>(s->n_children);
+        fd.decimal_scale =
+            (s->type == BoltType::Decimal128) ? s->decimal_scale : 0;
+        fd.first_child = 0;
+        if (s->n_children == 0) continue;
+
+        if (static_cast<std::uint32_t>(depth[i]) + 1 > kIpcMaxNestDepth) {
+            return false;
+        }
+        if (static_cast<std::uint32_t>(w->n_desc) + s->n_children >
+                kIpcMaxFields) {
+            return false;
+        }
+        fd.first_child = w->n_desc;
+        for (std::uint16_t k = 0; k < s->n_children; ++k) {
+            const std::uint16_t ci = w->n_desc++;
+            const FieldSpec& child = s->children[k];
+            src[ci] = &child;
+            depth[ci] = static_cast<std::uint16_t>(depth[i] + 1);
+            if (child.name != nullptr && child.name[0] != '\0') {
+                std::snprintf(name_buf[ci], kIpcNameCap, "%s", child.name);
+            } else if (is_list) {
+                std::snprintf(name_buf[ci], kIpcNameCap, "item");
+            } else {
+                std::snprintf(name_buf[ci], kIpcNameCap, "f%u",
+                              static_cast<unsigned>(k));
+            }
+        }
+    }
+    return true;
+}
+
+// Phase 2: build every desc[] entry's flatbuffer Field table, HIGHEST
+// index first. flatten_fields()'s breadth-first append order guarantees a
+// node's children always have a strictly greater index than the node
+// itself, so walking indices n_desc-1 downto 0 always builds a node's
+// children (and their own children, transitively) before the node that
+// references them — exactly the bottom-up order this flatbuffer builder
+// requires. `field_pos[i]` (out param) receives field i's finished table
+// position. Returns false (fail closed) on flatbuffer overflow or an
+// unsupported type.
+bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
+                      const char name_buf[kIpcMaxFields][kIpcNameCap],
+                      std::uint32_t empty_children,
+                      std::uint32_t field_pos[kIpcMaxFields]) noexcept {
+    assert(b != nullptr && w != nullptr);
+    for (std::uint16_t ii = 0; ii < w->n_desc; ++ii) {
+        const std::uint16_t i =
+            static_cast<std::uint16_t>(w->n_desc - 1 - ii);
+        const IpcFieldDesc& fd = w->desc[i];
+        std::uint32_t children_vec = empty_children;
+        if (fd.n_children > 0) {
+            if (fd.n_children > kIpcMaxCols) return false;  // defensive
+            std::uint32_t kids[kIpcMaxCols];
+            for (std::uint16_t k = 0; k < fd.n_children; ++k) {
+                kids[k] = field_pos[fd.first_child + k];
+                if (kids[k] == 0) return false;
+            }
+            children_vec = fb_offset_vector(b, kids, fd.n_children);
+        }
+        std::uint8_t tag = 0;
+        const std::uint32_t type_pos = build_type_table(
+            b, static_cast<BoltType>(fd.type), fd.decimal_scale, &tag);
+        if (type_pos == 0) return false;
+        const std::uint32_t name_pos = fb_string(b, name_buf[i]);
+        fb_start_table(b);
+        fb_field_offset(b, 0, name_pos);                 // name
+        fb_field_scalar<std::uint8_t>(b, 1, 1);          // nullable = true
+        fb_field_scalar<std::uint8_t>(b, 2, tag);        // type_type
+        fb_field_offset(b, 3, type_pos);                 // type
+        fb_field_offset(b, 5, children_vec);              // children
+        field_pos[i] = fb_end_table(b);
+        if (field_pos[i] == 0) return false;
+    }
+    return true;
 }
 
 // Message table wrapping a header union + bodyLength; finishes the fb.
@@ -399,7 +537,7 @@ bool write_varlen_buffers(std::FILE* f, const BoltColumn& col,
 // into Arrow's LSB-first bit-packed "b" buffer, streamed one output byte
 // at a time so no full-column scratch buffer is needed (mirrors the
 // offsets loop above). `col.data` must be non-null when n > 0 — checked
-// by the caller (layout_batch), same precondition every other fixed-width
+// by the caller (layout_field), same precondition every other fixed-width
 // branch enforces.
 bool write_bool_bits(std::FILE* f, const BoltColumn& col,
                      std::int64_t n) noexcept {
@@ -427,10 +565,14 @@ bool write_bool_bits(std::FILE* f, const BoltColumn& col,
 }
 
 struct BatchLayout {
-    std::int64_t nodes[kIpcMaxCols * 2];       // (length, null_count) pairs
-    std::int64_t buffers[kIpcMaxCols * 3 * 2]; // (offset, length) pairs
+    std::int64_t nodes[kIpcMaxFields * 2];        // (length, null_count), preorder
+    std::int64_t buffers[kIpcMaxFields * 3 * 2];  // (offset, length), preorder
+    std::uint32_t n_nodes;
     std::uint32_t n_buffers;
-    std::int64_t  varlen_total[kIpcMaxCols];   // Utf8/Binary packed-byte total
+    std::int64_t  varlen_total[kIpcMaxFields];    // Utf8/Binary leaf packed-byte
+                                                   // total, indexed by the SAME
+                                                   // preorder position n_nodes
+                                                   // assigned that leaf.
     std::int64_t  body_len;
 };
 
@@ -438,80 +580,191 @@ bool is_varlen_type(BoltType t) noexcept {
     return t == BoltType::Utf8 || t == BoltType::Binary;
 }
 
-// Measure the body: per-column validity/[offsets]/data buffer entries in
-// spec order, each 8-padded. Fails closed on unsupported shape.
+// Depth-first pre-order walk over the schema tree (ArrowIpcWriter::desc,
+// rooted at `desc_idx`) IN LOCKSTEP with the runtime column tree (`col`,
+// `n` rows at this level): measures this field's own (length, null_count)
+// into L->nodes and each of its buffers' (offset, length) into
+// L->buffers, exactly the order Message.fbs requires ("Nodes/Buffers
+// correspond to the pre-ordered flattened logical schema/buffer tree").
+// L->n_nodes IS that pre-order position at entry — write_field_body below
+// is an independent second walk over the identical tree and lands on the
+// same position for the same field, which is what lets it reuse
+// L->varlen_total[] without re-deriving the mapping.
+//
+// Fails closed (false) on any type/shape drift from the schema (a caller
+// handed a batch that doesn't match what arrow_ipc_open[_nested] declared),
+// a malformed offsets array, or exceeding kIpcMaxNestDepth/kIpcMaxFields.
+bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
+                  const BoltColumn& col, std::int64_t n,
+                  BatchLayout* L, std::uint16_t depth) noexcept {
+    assert(w != nullptr && L != nullptr);
+    if (depth > kIpcMaxNestDepth) return false;
+    if (desc_idx >= w->n_desc) return false;
+    if (n < 0 || col.length < n) return false;
+    const IpcFieldDesc& fd = w->desc[desc_idx];
+    if (static_cast<std::uint16_t>(col.type) != fd.type) return false;
+    if (L->n_nodes >= kIpcMaxFields) return false;
+
+    const std::int64_t nulls = count_nulls(col.validity, n);
+    const std::uint32_t node_idx = L->n_nodes++;
+    L->nodes[node_idx * 2] = n;
+    L->nodes[node_idx * 2 + 1] = nulls;
+
+    auto add_buf = [&](std::int64_t len) noexcept -> bool {
+        if (L->n_buffers >= kIpcMaxFields * 3) return false;
+        L->buffers[L->n_buffers * 2]     = L->body_len;
+        L->buffers[L->n_buffers * 2 + 1] = len;
+        L->n_buffers++;
+        L->body_len += (len + 7) & ~std::int64_t{7};
+        return true;
+    };
+
+    // Validity is every field's OWN first buffer — List, Struct, and leaf
+    // alike (Message.fbs: "most primitive arrays will have 2 buffers, 1
+    // for the validity bitmap and 1 for the values... For struct arrays,
+    // there will only be a single buffer for the validity bitmap"; a List
+    // is the same plus its offsets buffer). Measured once here, common to
+    // all three branches below, so it can't again go missing from exactly
+    // one of them the way the leaf case's got dropped during this
+    // refactor (write_field_body's matching bug, caught by the pyarrow
+    // oracle on the plain Int64/Float64/Utf8 fixture: injection-verified,
+    // dropping just this line reproduces the exact original "buffer_index
+    // out of range" pyarrow error byte-for-byte).
+    if (!add_buf(nulls > 0 ? (n + 7) / 8 : 0)) return false;
+
+    if (col.type == BoltType::List) {
+        if (fd.n_children != 1 || !col.is_nested()) return false;
+        if (!add_buf((n + 1) * 4)) return false;                  // offsets
+        const std::int32_t* offs = col.list_offsets();
+        const BoltColumn* elem = col.list_element();
+        if (offs == nullptr || elem == nullptr) return false;
+        if (offs[0] != 0) return false;   // make_list()'s own contract
+        const std::int64_t elem_n = offs[n];
+        if (elem_n < 0) return false;
+        return layout_field(w, fd.first_child, *elem, elem_n, L,
+                            static_cast<std::uint16_t>(depth + 1));
+    }
+    if (col.type == BoltType::Struct) {
+        if (!col.is_nested() || col.child_count() != fd.n_children) {
+            return false;
+        }
+        for (std::int64_t k = 0; k < fd.n_children; ++k) {
+            const BoltColumn* fc = col.child_at(k);
+            if (fc == nullptr) return false;
+            if (!layout_field(w, static_cast<std::uint16_t>(fd.first_child + k),
+                              *fc, n, L, static_cast<std::uint16_t>(depth + 1))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // Leaf.
+    if (is_varlen_type(col.type)) {
+        if (!varlen_total_bytes(col, n, &L->varlen_total[node_idx])) return false;
+        if (!add_buf((n + 1) * 4)) return false;              // int32 offsets
+        if (!add_buf(L->varlen_total[node_idx])) return false; // packed bytes
+    } else if (col.type == BoltType::Bool) {
+        if (col.format != ColumnFormat::Flat &&
+            col.format != ColumnFormat::View) {
+            return false;
+        }
+        if (col.data == nullptr && n > 0) return false;
+        L->varlen_total[node_idx] = 0;
+        if (!add_buf((n + 7) / 8)) return false;              // bit-packed
+    } else {
+        if (col.format != ColumnFormat::Flat &&
+            col.format != ColumnFormat::View) {
+            return false;
+        }
+        if (col.data == nullptr && n > 0) return false;
+        L->varlen_total[node_idx] = 0;
+        const std::size_t width = bolt::type_size(col.type);
+        if (width == 0) return false;                          // no fixed-width mapping
+        if (!add_buf(n * static_cast<std::int64_t>(width))) return false;
+    }
+    return true;
+}
+
 bool layout_batch(const ArrowIpcWriter* w, const BoltBatch* batch,
                   BatchLayout* L) noexcept {
     assert(w != nullptr && batch != nullptr && L != nullptr);
     const std::int64_t n = batch->num_rows;
-    std::int64_t off = 0;
-    L->n_buffers = 0;
-    auto add_buf = [&](std::int64_t len) noexcept {
-        L->buffers[L->n_buffers * 2]     = off;
-        L->buffers[L->n_buffers * 2 + 1] = len;
-        L->n_buffers++;
-        off += (len + 7) & ~std::int64_t{7};
-    };
     for (std::uint16_t c = 0; c < w->n_cols; ++c) {
-        const BoltColumn& col = batch->col(c);
-        if (static_cast<std::uint16_t>(col.type) != w->col_types[c]) {
-            return false;                      // schema drift: fail closed
-        }
-        if (col.length < n) return false;
-        const std::int64_t nulls = count_nulls(col.validity, n);
-        L->nodes[c * 2] = n;
-        L->nodes[c * 2 + 1] = nulls;
-        add_buf(nulls > 0 ? (n + 7) / 8 : 0);  // validity
-        if (is_varlen_type(col.type)) {
-            if (!varlen_total_bytes(col, n, &L->varlen_total[c])) return false;
-            add_buf((n + 1) * 4);              // int32 offsets
-            add_buf(L->varlen_total[c]);       // packed bytes
-        } else if (col.type == BoltType::Bool) {
-            if (col.format != ColumnFormat::Flat &&
-                col.format != ColumnFormat::View) {
-                return false;
-            }
-            if (col.data == nullptr && n > 0) return false;
-            L->varlen_total[c] = 0;
-            add_buf((n + 7) / 8);              // bit-packed, not byte-packed
-        } else {
-            if (col.format != ColumnFormat::Flat &&
-                col.format != ColumnFormat::View) {
-                return false;
-            }
-            if (col.data == nullptr && n > 0) return false;
-            L->varlen_total[c] = 0;
-            const std::size_t width = bolt::type_size(col.type);
-            if (width == 0) return false;      // no fixed-width mapping
-            add_buf(n * static_cast<std::int64_t>(width));
-        }
+        if (!layout_field(w, c, batch->col(c), n, L, 0)) return false;
     }
-    L->body_len = off;
     return true;
+}
+
+// Writes one field's own buffer bytes then recurses into its children, in
+// the SAME pre-order layout_field walked (see that function's comment) —
+// `*node_idx` threads the shared position counter across both this
+// function's own recursive calls and the top-level loop in
+// write_batch_body, landing on the identical L->varlen_total[]/L->nodes[]
+// slot layout_field populated for the same field.
+bool write_field_body(std::FILE* f, const ArrowIpcWriter* w,
+                      std::uint16_t desc_idx, const BoltColumn& col,
+                      std::int64_t n, const BatchLayout* L,
+                      std::uint32_t* node_idx) noexcept {
+    assert(f != nullptr && w != nullptr && L != nullptr && node_idx != nullptr);
+    const IpcFieldDesc& fd = w->desc[desc_idx];
+    const std::int64_t nulls = L->nodes[(*node_idx) * 2 + 1];
+    const std::uint32_t my_node = (*node_idx)++;
+
+    // Validity is every field's OWN first buffer (List/Struct/leaf alike —
+    // see layout_field's matching unconditional `add_buf(nulls > 0 ? ... :
+    // 0)` call at the top of each of the three branches there). Written
+    // once here, common to all three, rather than duplicated per branch
+    // (a per-branch copy is exactly how this was dropped for the leaf case
+    // during the G2ARROW-21 refactor — caught by the pyarrow oracle
+    // failing on the plain Int64/Float64/Utf8 fixture, which has no
+    // List/Struct column at all: injection-verified, this line dropped
+    // reproducibly shrinks the file by 32 bytes [2 batches x the Utf8
+    // column's 16-byte padded validity buffer] and pyarrow refuses it
+    // with "Expected to read N metadata bytes, but only read M").
+    if (nulls > 0 && !write_padded(f, col.validity, (n + 7) / 8)) {
+        return false;
+    }
+
+    if (col.type == BoltType::List) {
+        const std::int32_t* offs = col.list_offsets();
+        if (offs == nullptr) return false;
+        if (!write_padded(f, offs, (n + 1) * 4)) return false;
+        const BoltColumn* elem = col.list_element();
+        if (elem == nullptr) return false;
+        const std::int64_t elem_n = offs[n];
+        return write_field_body(f, w, fd.first_child, *elem, elem_n, L,
+                                node_idx);
+    }
+    if (col.type == BoltType::Struct) {
+        for (std::int64_t k = 0; k < fd.n_children; ++k) {
+            const BoltColumn* fc = col.child_at(k);
+            if (fc == nullptr) return false;
+            if (!write_field_body(f, w,
+                                  static_cast<std::uint16_t>(fd.first_child + k),
+                                  *fc, n, L, node_idx)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // Leaf.
+    if (is_varlen_type(col.type)) {
+        return write_varlen_buffers(f, col, n, L->varlen_total[my_node]);
+    }
+    if (col.type == BoltType::Bool) {
+        return write_bool_bits(f, col, n);
+    }
+    const std::size_t width = bolt::type_size(col.type);
+    return write_padded(f, col.data, n * static_cast<std::int64_t>(width));
 }
 
 bool write_batch_body(const ArrowIpcWriter* w, const BoltBatch* batch,
                       const BatchLayout* L) noexcept {
     const std::int64_t n = batch->num_rows;
+    std::uint32_t node_idx = 0;
     for (std::uint16_t c = 0; c < w->n_cols; ++c) {
-        const BoltColumn& col = batch->col(c);
-        const std::int64_t nulls = L->nodes[c * 2 + 1];
-        if (nulls > 0 &&
-            !write_padded(w->f, col.validity, (n + 7) / 8)) {
+        if (!write_field_body(w->f, w, c, batch->col(c), n, L, &node_idx)) {
             return false;
-        }
-        if (is_varlen_type(col.type)) {
-            if (!write_varlen_buffers(w->f, col, n, L->varlen_total[c])) {
-                return false;
-            }
-        } else if (col.type == BoltType::Bool) {
-            if (!write_bool_bits(w->f, col, n)) return false;
-        } else {
-            const std::size_t width = bolt::type_size(col.type);
-            if (!write_padded(w->f, col.data,
-                              n * static_cast<std::int64_t>(width))) {
-                return false;
-            }
         }
     }
     return true;
@@ -521,61 +774,35 @@ bool write_batch_body(const ArrowIpcWriter* w, const BoltBatch* batch,
 
 // ---- public API ----------------------------------------------------------
 
-bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
-                    const BoltType* types, const char* const* names,
-                    std::uint16_t n_cols,
-                    const std::uint8_t* decimal_scales) noexcept {
+bool arrow_ipc_open_nested(ArrowIpcWriter* w, std::FILE* f,
+                           const FieldSpec* fields,
+                           std::uint16_t n_cols) noexcept {
     assert(w != nullptr);
-    if (f == nullptr || types == nullptr) return false;
+    if (f == nullptr || fields == nullptr) return false;
     if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
     std::memset(w, 0, sizeof(*w));
     w->f = f;
     w->n_cols = n_cols;
-    for (std::uint16_t c = 0; c < n_cols; ++c) {
-        const BoltType t = types[c];
-        // Honest scope: reject unsupported types AT OPEN.
-        const bool supported =
-            t == BoltType::Int64  || t == BoltType::Float64 ||
-            t == BoltType::Utf8   || t == BoltType::Bool ||
-            t == BoltType::Date32 || t == BoltType::Binary ||
-            t == BoltType::Decimal128;
-        if (!supported) return false;
-        std::uint8_t scale = 0;
-        if (t == BoltType::Decimal128) {
-            // Schema-time-only knowledge: no later call carries it, so a
-            // Decimal128 column with no scale (or an out-of-range one)
-            // fails closed here rather than defaulting to a scale that
-            // would silently misrepresent every value on read.
-            if (decimal_scales == nullptr) return false;
-            scale = decimal_scales[c];
-            if (scale > kDecimal128Precision) return false;
-        }
-        w->col_types[c] = static_cast<std::uint16_t>(t);
-        w->decimal_scale[c] = scale;
-        const char* nm = (names != nullptr) ? names[c] : nullptr;
-        if (nm != nullptr && nm[0] != '\0') {
-            std::snprintf(w->names[c], kIpcNameCap, "%s", nm);
-        } else {
-            std::snprintf(w->names[c], kIpcNameCap, "c%u",
-                          static_cast<unsigned>(c));
-        }
-    }
+
+    // Transient — used only during this call, never retained on `w`.
+    // ~16 KB: bounded, and this runs once per stream open, never per-row.
+    char name_buf[kIpcMaxFields][kIpcNameCap];
+    if (!flatten_fields(w, fields, n_cols, name_buf)) return false;
 
     Fb b{};
     fb_init(&b, w->fb, kIpcFbCap);
-    // One shared empty children vector (pyarrow wants children present).
+    // One shared empty children vector (pyarrow wants children present
+    // even for a leaf field).
     const std::uint32_t zero = 0;
     fb_prealign(&b, 4, 4);
     fb_push(&b, &zero, 4);
     const std::uint32_t empty_children = b.used;
 
-    std::uint32_t field_pos[kIpcMaxCols];
-    for (std::uint16_t c = 0; c < n_cols; ++c) {
-        field_pos[c] = build_field(&b, w->names[c],
-                                   static_cast<BoltType>(w->col_types[c]),
-                                   w->decimal_scale[c], empty_children);
-        if (field_pos[c] == 0) return false;
+    std::uint32_t field_pos[kIpcMaxFields];
+    if (!build_all_fields(&b, w, name_buf, empty_children, field_pos)) {
+        return false;
     }
+
     const std::uint32_t fields_vec = fb_offset_vector(&b, field_pos, n_cols);
     fb_start_table(&b);                        // Schema table
     fb_field_offset(&b, 1, fields_vec);        // endianness Little = default
@@ -588,6 +815,37 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
     return true;
 }
 
+bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
+                    const BoltType* types, const char* const* names,
+                    std::uint16_t n_cols,
+                    const std::uint8_t* decimal_scales) noexcept {
+    assert(w != nullptr);
+    if (types == nullptr) return false;
+    if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
+    // Schema-time-only knowledge, same as the nested entry point's
+    // FieldSpec::decimal_scale field, but the FLAT signature's scale
+    // array is itself optional (most callers have no Decimal128 column
+    // at all) — so, unlike FieldSpec (which always carries an explicit
+    // scale), a missing array must fail closed here rather than silently
+    // becoming scale 0 for every Decimal128 column, which would
+    // misrepresent every value on read exactly as before G2ARROW-20.
+    for (std::uint16_t c = 0; c < n_cols; ++c) {
+        if (types[c] == BoltType::Decimal128 && decimal_scales == nullptr) {
+            return false;
+        }
+    }
+    FieldSpec specs[kIpcMaxCols];
+    for (std::uint16_t c = 0; c < n_cols; ++c) {
+        specs[c].type = types[c];
+        specs[c].name = (names != nullptr) ? names[c] : nullptr;
+        specs[c].decimal_scale =
+            (decimal_scales != nullptr) ? decimal_scales[c] : 0;
+        specs[c].n_children = 0;
+        specs[c].children = nullptr;
+    }
+    return arrow_ipc_open_nested(w, f, specs, n_cols);
+}
+
 bool arrow_ipc_write_batch(ArrowIpcWriter* w,
                            const BoltBatch* batch) noexcept {
     assert(w != nullptr);
@@ -598,7 +856,8 @@ bool arrow_ipc_write_batch(ArrowIpcWriter* w,
         return false;
     }
 
-    // ~4.6 KB local: bounded, well under any thread's stack budget.
+    // ~18.5 KB: bounded, well under any thread's stack budget (matches
+    // the original ~4.6 KB local's own reasoning at kIpcMaxCols scale).
     BatchLayout L{};
     if (!layout_batch(w, batch, &L)) { w->failed = 1; return false; }
 
@@ -607,7 +866,7 @@ bool arrow_ipc_write_batch(ArrowIpcWriter* w,
     const std::uint32_t bufs_vec =
         fb_struct16_vector(&b, L.buffers, L.n_buffers);
     const std::uint32_t nodes_vec =
-        fb_struct16_vector(&b, L.nodes, w->n_cols);
+        fb_struct16_vector(&b, L.nodes, L.n_nodes);
     fb_start_table(&b);                        // RecordBatch table
     if (batch->num_rows != 0) {
         fb_field_scalar<std::int64_t>(&b, 0, batch->num_rows);
