@@ -967,6 +967,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/delta_writer.cpp
     src/lakehouse/delta_update.cpp
     src/lakehouse/delta_delete.cpp
+    src/lakehouse/delta_dv_writer.cpp
     src/lakehouse/delta_merge.cpp
     src/lakehouse/delta_restore.cpp
     src/lakehouse/delta_optimize.cpp

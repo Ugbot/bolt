@@ -591,4 +591,108 @@ TEST(BoltLakehouseDeltaWrite, RestoreToEarlierVersion) {
     std::filesystem::remove_all(root, ec);
 }
 
+// G2ICE-80: attach a deletion vector to a live add WITHOUT rewriting the
+// physical parquet file — the cold-tier-eviction counterpart to
+// `delta_table_delete`'s copy-on-write rewrite. One file, 8 rows; mark row
+// id=3 deleted via a DV; the scan (which now applies DVs, G2ICE-80) must
+// exclude it while the underlying file's path/size are UNCHANGED (proving
+// no rewrite happened). A second call unions in another row (id=5) and
+// proves deletion vectors accumulate rather than replace.
+TEST(BoltLakehouseDeltaWrite, DeletionVectorMarksRowsDeletedWithoutRewrite) {
+    const std::string root = unique_root("dv");
+    FilesystemCatalog fc; Catalog cat;
+    ASSERT_TRUE(filesystem_catalog_init(&fc, root.c_str(), &cat));
+
+    bolt::Arena arena;
+    bolt::BoltSchema schema;
+    schema.add_field("id", bolt::BoltType::Int64, false);
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(dl::delta_table_create(&th, &arena, &cat, "ns", "t",
+                                       &schema, nullptr));
+    dl::AppendHandle* ah = nullptr;
+    ASSERT_TRUE(dl::delta_append_open(&ah, th));
+    bolt::Arena ba;
+    bolt::BoltBatch b{};
+    fill_int_batch(&ba, &b, 8, 0);
+    ASSERT_TRUE(dl::delta_append_write(ah, &b));
+    ASSERT_TRUE(dl::delta_append_commit(ah));
+
+    FilesystemObjectStore fs; ObjectStore os;
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    bolt::Arena s_ar;
+    dl::Snapshot before{};
+    ASSERT_TRUE(dl::delta_snapshot_build(&os, "ns/t", -1, &s_ar, &before));
+    ASSERT_EQ(before.n_files, 1u);
+    const std::string file_path = before.files[0].path;
+    const int64_t original_size = before.files[0].size;
+
+    const uint32_t del1[] = {3u};
+    ASSERT_TRUE(dl::delta_table_mark_deleted_via_dv(th, file_path.c_str(),
+                                                    del1, 1));
+
+    bolt::Arena r1_ar;
+    const auto ids1 = scan_all_ids(&r1_ar, &cat, "ns", "t");
+    const std::vector<std::int64_t> expected1{0, 1, 2, 4, 5, 6, 7};
+    EXPECT_EQ(ids1, expected1);
+
+    // Same physical file, same path, same size -- no rewrite happened.
+    bolt::Arena s2_ar;
+    dl::Snapshot after1{};
+    ASSERT_TRUE(dl::delta_snapshot_build(&os, "ns/t", -1, &s2_ar, &after1));
+    ASSERT_EQ(after1.n_files, 1u);
+    EXPECT_EQ(std::string(after1.files[0].path), file_path);
+    EXPECT_EQ(after1.files[0].size, original_size);
+    EXPECT_TRUE(after1.files[0].has_dv);
+    // Protocol upgraded to the deletionVectors reader/writer feature.
+    EXPECT_TRUE(after1.has_protocol);
+    EXPECT_GE(after1.protocol.min_reader_version, 3);
+    EXPECT_GE(after1.protocol.min_writer_version, 7);
+
+    // Second call unions in id=5 alongside the already-deleted id=3.
+    const uint32_t del2[] = {5u};
+    ASSERT_TRUE(dl::delta_table_mark_deleted_via_dv(th, file_path.c_str(),
+                                                    del2, 1));
+    bolt::Arena r2_ar;
+    const auto ids2 = scan_all_ids(&r2_ar, &cat, "ns", "t");
+    const std::vector<std::int64_t> expected2{0, 1, 2, 4, 6, 7};
+    EXPECT_EQ(ids2, expected2);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// A table created with `enable_deletion_vectors` declares the feature from
+// version 0, so the very first `mark_deleted_via_dv` call needs no
+// mid-life protocol-upgrade action.
+TEST(BoltLakehouseDeltaWrite, EnableDeletionVectorsAtCreateSkipsUpgrade) {
+    const std::string root = unique_root("dv_create");
+    FilesystemCatalog fc; Catalog cat;
+    ASSERT_TRUE(filesystem_catalog_init(&fc, root.c_str(), &cat));
+
+    bolt::Arena arena;
+    bolt::BoltSchema schema;
+    schema.add_field("id", bolt::BoltType::Int64, false);
+    dl::WriteOptions wopts;
+    dl::write_options_init(&wopts);
+    wopts.enable_deletion_vectors = true;
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(dl::delta_table_create(&th, &arena, &cat, "ns", "t", &schema,
+                                       &wopts));
+
+    FilesystemObjectStore fs; ObjectStore os;
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    bolt::Arena s_ar;
+    dl::Snapshot snap{};
+    ASSERT_TRUE(dl::delta_snapshot_build(&os, "ns/t", -1, &s_ar, &snap));
+    ASSERT_TRUE(snap.has_protocol);
+    EXPECT_EQ(snap.protocol.min_reader_version, 3);
+    EXPECT_EQ(snap.protocol.min_writer_version, 7);
+    EXPECT_EQ(snap.version, 0);   // one commit: protocol+metadata+commitInfo
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 }  // namespace

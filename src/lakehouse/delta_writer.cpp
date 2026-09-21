@@ -469,13 +469,41 @@ bool delta_table_create(TableHandle** out, Arena* arena, Catalog* cat,
     // delete-rewrite logic, but it directly blocked verifying that fix's
     // claimed external-reader check, so it is fixed here rather than filed
     // and left for later.
+    // G2ICE-80: a table created with `enable_deletion_vectors` declares the
+    // `deletionVectors` reader/writer feature (protocol v3/7) from version 0
+    // and sets the advisory `delta.enableDeletionVectors` property, so a
+    // spec-compliant reader is ready for DVs attached by
+    // `delta_table_mark_deleted_via_dv` at any point in the table's life —
+    // no later mid-life protocol upgrade needed for tables created this way.
+    // Spark's DeltaLog cross-checks protocol writerFeatures against what the
+    // METADATA implies is in use: any NOT NULL column implicitly enables the
+    // legacy "invariants" writer feature, and a table-features-protocol
+    // table (v3+) that omits it from writerFeatures is refused wholesale
+    // ([DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH], found verifying this
+    // ticket externally against real Apache Spark + delta-spark 4.0 — DuckDB's
+    // delta-kernel-based reader is more lenient and did not catch this).
+    bool schema_has_not_null = false;
+    for (uint32_t i = 0; i < schema->num_fields; ++i) {
+        if (!schema->field(static_cast<int>(i)).nullable) { schema_has_not_null = true; break; }
+    }
+    const char* protocol_json = !wopts.enable_deletion_vectors
+        ? "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n"
+        : (schema_has_not_null
+            ? "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+              "\"readerFeatures\":[\"deletionVectors\"],"
+              "\"writerFeatures\":[\"deletionVectors\",\"invariants\"]}}\n"
+            : "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,"
+              "\"readerFeatures\":[\"deletionVectors\"],"
+              "\"writerFeatures\":[\"deletionVectors\"]}}\n");
+    const char* config_json = wopts.enable_deletion_vectors
+        ? "{\"delta.enableDeletionVectors\":\"true\"}" : "{}";
     const int blen = std::snprintf(body, kDeltaMaxSchemaBytes + 4096u,
-        "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n"
+        "%s"
         "{\"metaData\":{\"id\":\"%s-%s\",\"name\":\"%s\",\"format\":{\"provider\":"
         "\"parquet\",\"options\":{}},\"schemaString\":\"%s\","
-        "\"partitionColumns\":[%s],\"configuration\":{},\"createdTime\":%llu}}\n"
+        "\"partitionColumns\":[%s],\"configuration\":%s,\"createdTime\":%llu}}\n"
         "{\"commitInfo\":{\"timestamp\":%llu,\"operation\":\"CREATE TABLE\"}}\n",
-        ns, name, name, escaped, parts,
+        protocol_json, ns, name, name, escaped, parts, config_json,
         static_cast<unsigned long long>(ms),
         static_cast<unsigned long long>(ms));
     if (blen <= 0) return false;

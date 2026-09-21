@@ -127,6 +127,20 @@ bool delta_table_update(TableHandle* th, const Predicate* pred,
 
 bool delta_table_delete(TableHandle* th, const Predicate* pred) noexcept;
 
+// Attach a deletion vector to the CURRENTLY LIVE `add` for `file_path`,
+// narrowing its visible rows without rewriting the physical parquet file
+// (G2ICE-80) — the cold-tier-eviction counterpart to `delta_table_delete`'s
+// copy-on-write rewrite. `deleted_rows` must be strictly increasing
+// (file-local, 0-based row indices); a pre-existing DV on the file is
+// unioned in (deletion vectors only grow). Upgrades the table's protocol to
+// the `deletionVectors` reader/writer feature in the same commit if it
+// hasn't been already. Returns false (no commit) if `file_path` is not a
+// currently-live add, the input isn't strictly increasing, or the commit
+// loses an optimistic-concurrency race (caller may retry).
+bool delta_table_mark_deleted_via_dv(TableHandle* th, const char* file_path,
+                                     const uint32_t* deleted_rows,
+                                     uint64_t n_deleted_rows) noexcept;
+
 bool delta_table_merge(TableHandle* th, const MergeSpec* spec) noexcept;
 
 bool delta_table_restore(TableHandle* th, int64_t target_version) noexcept;

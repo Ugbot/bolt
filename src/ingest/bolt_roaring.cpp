@@ -1,4 +1,4 @@
-// bolt/ingest/bolt_roaring.cpp — portable Roaring bitmap deserialiser.
+// bolt/ingest/bolt_roaring.cpp — portable Roaring bitmap (de)serialiser.
 // See bolt_roaring.h for the wire format. Bounds-checked end to end.
 
 #include "bolt/ingest/bolt_roaring.h"
@@ -37,6 +37,30 @@ bool rd_u32(Cursor* c, uint32_t* out) noexcept {
     std::memcpy(&v, c->p + c->off, 4);   // host is LE on all supported targets
     *out = v;
     c->off += 4u;
+    return true;
+}
+
+// Little-endian writers. Each bounds-checks against `cap` and returns false
+// on overflow rather than writing OOB.
+bool wr_u16(uint8_t* dst, uint64_t cap, uint64_t off, uint16_t v) noexcept {
+    assert(dst != nullptr || cap == 0);
+    if (off + 2u > cap) return false;
+    dst[off] = static_cast<uint8_t>(v & 0xFFu);
+    dst[off + 1u] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    return true;
+}
+
+bool wr_u32(uint8_t* dst, uint64_t cap, uint64_t off, uint32_t v) noexcept {
+    assert(dst != nullptr || cap == 0);
+    if (off + 4u > cap) return false;
+    std::memcpy(dst + off, &v, 4);   // host is LE on all supported targets
+    return true;
+}
+
+bool wr_u64(uint8_t* dst, uint64_t cap, uint64_t off, uint64_t v) noexcept {
+    assert(dst != nullptr || cap == 0);
+    if (off + 8u > cap) return false;
+    std::memcpy(dst + off, &v, 8);
     return true;
 }
 
@@ -153,9 +177,21 @@ bool roaring_deserialize(const uint8_t* src, uint64_t src_len,
                                                   : RoaringKind::kArray);
     }
 
-    // Optional offset header (NO_RUNCONTAINER && n >= threshold). We replay
-    // payloads sequentially regardless, so just skip it when present.
-    if (!has_run && n >= kRoaringNoOffsetThr) {
+    // Offset header: ALWAYS present for the NO_RUNCONTAINER cookie form
+    // (regardless of n — including n<4, the common single/few-container
+    // shape a small deletion vector produces); present for the run-cookie
+    // form only when n >= NO_OFFSET_THRESHOLD. Getting the NO_RUNCONTAINER
+    // case wrong (gating it on n>=4 like the run form) made every n<4
+    // no-run bitmap fail to skip 4*n real header bytes and misread them as
+    // payload — verified against a real `pyroaring` byte dump (G2ICE-80).
+    // We replay payloads sequentially regardless, so just skip it.
+    if (has_run) {
+        if (n >= kRoaringNoOffsetThr) {
+            const uint64_t off_bytes = static_cast<uint64_t>(n) * 4u;
+            if (c.off + off_bytes > c.len) return false;
+            c.off += off_bytes;
+        }
+    } else {
         const uint64_t off_bytes = static_cast<uint64_t>(n) * 4u;
         if (c.off + off_bytes > c.len) return false;
         c.off += off_bytes;
@@ -213,6 +249,45 @@ uint64_t roaring_cardinality(const RoaringBitmap* bm) noexcept {
     assert(bm != nullptr);
     assert(bm->n_containers <= kRoaringMaxContainers);
     return bm == nullptr ? 0u : bm->cardinality;
+}
+
+bool roaring_to_sorted_array(const RoaringBitmap* bm, uint32_t* dst,
+                             uint64_t dst_cap, uint64_t* out_n) noexcept {
+    assert(bm != nullptr);
+    assert(out_n != nullptr);
+    if (out_n == nullptr) return false;
+    *out_n = 0;
+    if (bm == nullptr) return false;
+    if (dst_cap < bm->cardinality) return false;
+    if (dst == nullptr && dst_cap > 0) return false;
+    uint64_t p = 0;
+    for (uint32_t i = 0; i < bm->n_containers; ++i) {   // bounded
+        const RoaringContainer* ct = &bm->containers[i];
+        const uint32_t hi = static_cast<uint32_t>(ct->key) << 16;
+        if (ct->kind == RoaringKind::kBitset) {
+            for (uint32_t w = 0; w < 1024u; ++w) {      // bounded
+                uint64_t bits = ct->words[w];
+                while (bits != 0ull) {
+                    const uint32_t bit = static_cast<uint32_t>(
+                        bolt_ctz64(bits));
+                    dst[p++] = hi | (w << 6) | bit;
+                    bits &= bits - 1ull;
+                }
+            }
+        } else if (ct->kind == RoaringKind::kRun) {
+            for (uint32_t r = 0; r < ct->n_runs; ++r) {   // bounded
+                const uint16_t start = ct->values[2u * r];
+                const uint16_t len_m1 = ct->values[2u * r + 1u];
+                for (uint32_t v = start; v <= static_cast<uint32_t>(start) + len_m1; ++v)
+                    dst[p++] = hi | v;
+            }
+        } else {
+            for (uint32_t c = 0; c < ct->cardinality; ++c)   // bounded
+                dst[p++] = hi | ct->values[c];
+        }
+    }
+    *out_n = p;
+    return true;
 }
 
 bool roaring_deserialize_r64(const uint8_t* src, uint64_t src_len,
@@ -279,6 +354,167 @@ uint64_t roaring_cardinality64(const RoaringBitmap64* bm) noexcept {
     assert(bm != nullptr);
     assert(bm->n_buckets <= kRoaringMaxContainers);
     return bm == nullptr ? 0u : bm->cardinality;
+}
+
+// ---------------------------------------------------------------------------
+// Serialisation (write path — G2ICE-80).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Group {
+    uint32_t key;      // high 16 bits (stored widened for alignment)
+    uint64_t start;     // index into the caller's value array
+    uint64_t count;
+};
+
+// Bounded single pass: `values` must already be strictly increasing (caller
+// validates before calling this). Returns the number of high-16-bit groups.
+uint64_t count_groups(const uint32_t* values, uint64_t n) noexcept {
+    assert(values != nullptr || n == 0);
+    if (n == 0) return 0;
+    uint64_t k = 1;
+    uint16_t cur = static_cast<uint16_t>(values[0] >> 16);
+    for (uint64_t i = 1; i < n; ++i) {   // bounded by n
+        const uint16_t key = static_cast<uint16_t>(values[i] >> 16);
+        if (key != cur) { ++k; cur = key; }
+    }
+    return k;
+}
+
+void fill_groups(const uint32_t* values, uint64_t n, Group* groups,
+                 uint64_t k) noexcept {
+    assert(values != nullptr && groups != nullptr);
+    assert(n > 0 && k > 0);
+    uint64_t gi = 0;
+    uint64_t start = 0;
+    uint16_t cur = static_cast<uint16_t>(values[0] >> 16);
+    for (uint64_t i = 1; i <= n; ++i) {   // bounded by n
+        const uint16_t key = (i < n) ? static_cast<uint16_t>(values[i] >> 16)
+                                     : 0xFFFFu /* sentinel — never matches
+                                                  a real key when i==n */;
+        const bool boundary = (i == n) || (key != cur);
+        if (boundary) {
+            assert(gi < k);
+            groups[gi].key = cur;
+            groups[gi].start = start;
+            groups[gi].count = i - start;
+            ++gi;
+            if (i < n) { start = i; cur = key; }
+        }
+    }
+    assert(gi == k);
+}
+
+}  // namespace
+
+uint64_t roaring_serialize_bound(uint64_t n_values) noexcept {
+    if (n_values == 0) return 8u;
+    const uint64_t k_max = n_values < kRoaringMaxContainers
+        ? n_values : static_cast<uint64_t>(kRoaringMaxContainers);
+    return 8u + k_max * 8u + k_max * 8192u;
+}
+
+bool roaring_serialize(const uint32_t* sorted_unique_values, uint64_t n_values,
+                       Arena* scratch, uint8_t* dst, uint64_t dst_cap,
+                       uint64_t* out_len) noexcept {
+    assert(scratch != nullptr);
+    assert(out_len != nullptr);
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (n_values > 0 && sorted_unique_values == nullptr) return false;
+    if (dst == nullptr && dst_cap > 0) return false;
+    if (scratch == nullptr) return false;
+    for (uint64_t i = 1; i < n_values; ++i) {   // bounded: strictly increasing
+        if (sorted_unique_values[i] <= sorted_unique_values[i - 1]) return false;
+    }
+
+    const uint64_t k = count_groups(sorted_unique_values, n_values);
+    if (k > kRoaringMaxContainers) return false;
+    Group* groups = scratch->allocate_array<Group>(k == 0 ? 1u : k);
+    if (groups == nullptr) return false;
+    if (k > 0) fill_groups(sorted_unique_values, n_values, groups, k);
+
+    uint64_t off = 0;
+    if (!wr_u32(dst, dst_cap, off, kRoaringCookieNoRun)) return false;
+    off += 4u;
+    if (!wr_u32(dst, dst_cap, off, static_cast<uint32_t>(k))) return false;
+    off += 4u;
+    for (uint64_t g = 0; g < k; ++g) {   // bounded: k <= 65536
+        assert(groups[g].count >= 1 && groups[g].count <= 65536u);
+        if (!wr_u16(dst, dst_cap, off, static_cast<uint16_t>(groups[g].key)))
+            return false;
+        off += 2u;
+        if (!wr_u16(dst, dst_cap, off,
+                    static_cast<uint16_t>(groups[g].count - 1u)))
+            return false;
+        off += 2u;
+    }
+    // Offset table: byte offset of each container's payload, measured from
+    // the start of this blob (offset 0) — matches real CRoaring output.
+    const uint64_t payload_region_start = off + k * 4u;
+    uint64_t running = payload_region_start;
+    const uint64_t offset_table_at = off;
+    for (uint64_t g = 0; g < k; ++g) {
+        const uint64_t this_off = offset_table_at + g * 4u;
+        if (!wr_u32(dst, dst_cap, this_off, static_cast<uint32_t>(running)))
+            return false;
+        running += (groups[g].count <= 4096u) ? groups[g].count * 2u : 8192u;
+    }
+    off = payload_region_start;
+    for (uint64_t g = 0; g < k; ++g) {   // bounded: k <= 65536
+        const uint64_t cnt = groups[g].count;
+        if (cnt <= 4096u) {
+            for (uint64_t i = 0; i < cnt; ++i) {   // bounded: <= 4096
+                const uint16_t lo = static_cast<uint16_t>(
+                    sorted_unique_values[groups[g].start + i] & 0xFFFFu);
+                if (!wr_u16(dst, dst_cap, off, lo)) return false;
+                off += 2u;
+            }
+        } else {
+            if (off + 8192u > dst_cap) return false;
+            std::memset(dst + off, 0, 8192u);
+            uint64_t* words = reinterpret_cast<uint64_t*>(dst + off);
+            for (uint64_t i = 0; i < cnt; ++i) {   // bounded: <= 65536
+                const uint16_t lo = static_cast<uint16_t>(
+                    sorted_unique_values[groups[g].start + i] & 0xFFFFu);
+                words[lo >> 6] |= (uint64_t{1} << (lo & 63u));
+            }
+            off += 8192u;
+        }
+    }
+    *out_len = off;
+    return true;
+}
+
+uint64_t roaring_serialize_r64_bound(uint64_t n_values) noexcept {
+    return 8u + (n_values == 0 ? 0u : (4u + roaring_serialize_bound(n_values)));
+}
+
+bool roaring_serialize_r64_single_bucket(const uint32_t* sorted_unique_values,
+                                         uint64_t n_values, Arena* scratch,
+                                         uint8_t* dst, uint64_t dst_cap,
+                                         uint64_t* out_len) noexcept {
+    assert(scratch != nullptr);
+    assert(out_len != nullptr);
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (dst == nullptr && dst_cap > 0) return false;
+    const uint64_t n_buckets = (n_values == 0) ? 0u : 1u;
+    if (!wr_u64(dst, dst_cap, 0, n_buckets)) return false;
+    uint64_t off = 8u;
+    if (n_buckets == 1u) {
+        if (!wr_u32(dst, dst_cap, off, 0u)) return false;   // high32 key = 0
+        off += 4u;
+        uint64_t sub_len = 0;
+        if (dst_cap < off) return false;
+        if (!roaring_serialize(sorted_unique_values, n_values, scratch,
+                               dst + off, dst_cap - off, &sub_len))
+            return false;
+        off += sub_len;
+    }
+    *out_len = off;
+    return true;
 }
 
 }  // namespace ingest
