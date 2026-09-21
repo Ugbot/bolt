@@ -4,10 +4,11 @@
 
 Do not change the codec from the ticket's old baseline. The ticket describes
 the decoder before Bolt commit `6a8b539f841c923487c40ab0e887372bedeb0abc`,
-which is an ancestor of the current Bolt HEAD,
+which is an ancestor of the initial audit baseline,
 `806bc12e6f58fb42c8e314b82dc5393fd6576882`. The targeted back-reference
-optimization already landed, so a fresh current-vs-Arrow comparison is needed
-before choosing another decoder change.
+optimization already landed. The paired comparison below now establishes a
+remaining Arrow advantage of 1.43x on ClickBench pages and 1.34x on SF10
+comments; retain this baseline before choosing another decoder change.
 
 That commit removed the `len <= 16` cutoff which sent long matches to the
 data-dependent copy loop. `snappy_copy_wide` now handles the Snappy format's
@@ -98,7 +99,7 @@ sized, byte-exact output for all 256 chunks before timing. Seven decode passes
 were 123.1..122.8 ms (2.19 GB/s at ratio 3.16). This is supplementary coverage;
 the real-file and differential gates above carry the correctness conclusion.
 
-## Timing qualification and remaining risk
+## Initial current-only timing qualification
 
 The host was contended throughout the fresh run: load averages were
 39.52/24.17/16.21 before ClickBench, 21.07/22.70/16.90 before TPC-H, and
@@ -114,7 +115,7 @@ that real-page manifest/checksum harness and establish a paired current-vs-new
 baseline on a quiet host. A fresh MSVC/x86 sanitizer run also remains a normal
 cross-platform integration gate.
 
-## Resolution
+## Initial audit conclusion
 
 G2PERF-33's specific `len <= 16` fast-lane cutoff has already been addressed,
 its exact-buffer and malformed-input behavior survives current
@@ -124,3 +125,66 @@ and today's current-only run cannot measure the remaining gap. Record
 `6a8b539` as the implemented increment and keep a fresh paired
 current-vs-Arrow measurement as the next evidence step before closing or
 retargeting the ticket.
+
+
+## Paired Arrow 21 baseline after the checkpoint
+
+The optional `benchmarks/bench_snappy_arrow.cpp` now makes the page-body
+comparison reproducible. The final source was manually compiled with AppleClang
+21 at `-O3 -DNDEBUG -march=native -fno-exceptions -fno-rtti -Wall -Wextra`.
+The baseline is the installed pyarrow 21.0.0 wheel's Arrow C++ library, git
+`ee4d09ebef61c663c1efbfa4c18e518a03b798be`, built with AppleClang 15.
+This is a comparison against the shipped Arrow binary, not a same-compiler
+source build. Arrow is an optional benchmark oracle, never a Bolt dependency.
+
+The harness maps the input file, extracts bounded views of Snappy page bodies,
+and allocates two maximum-page buffers before validation and timing. It handles
+DataPageV2 level prefixes separately. Every selected page must decode to the
+same exact bytes with intact trailing guards before timing begins. Both codecs
+receive caller-owned output buffers. One warm sweep precedes nine alternating
+Bolt/Arrow pairs; the measured loops include decode calls and status checks,
+with one engine branch per page. Hashing, metadata parsing, allocation and I/O
+setup are outside those loops. No allocation trace was collected, so this does
+not establish absence of allocations inside the external Arrow implementation.
+
+| Corpus | Pages | Exact output bytes | Output checksum | Arrow CPU speedup | Arrow wall speedup |
+|---|---:|---:|---|---:|---:|
+| ClickBench, first 20 row groups, columns 0/2/9/13/39 | 2,222 | 2,294,794,527 | `061931e9bcd6f680` | 1.4320x | 1.4317x |
+| SF10 lineitem, all row groups, column 15 | 489 | 1,829,650,322 | `afc0b0fa41193fe2` | 1.3371x | 1.3373x |
+
+Speedup is the median of paired Bolt-time / Arrow-time ratios. The host was
+Mac17,6 with 18 hardware threads; load averages were 5.22/3.90/5.47 before and
+4.29/3.85/5.37 after. Our workers paused builds and tests during measurement.
+Threads were unpinned. This measures codec sweeps, not whole Parquet pipelines,
+query latency, request p99, Windows, or x86 performance.
+
+Raw pairs, compiler output, checksums and source/binary identities are in
+[59-snappy-arrow-paired-results.json](59-snappy-arrow-paired-results.json).
+Final source SHA-256:
+`ca0c7ca37a1e02c025df16889681db594186a6dfb7a78799c171d6504e31654e`.
+Final small-corpus validation also passed after CLI cleanup; malformed trailing
+arguments returned exit code 2. The full timed runs repeated byte validation.
+
+Reproduce from the Gestalt2 root on macOS with the locally installed Arrow wheel
+(adapt the include/library paths for another installation). This manually
+compiled harness uses POSIX file mapping and is intended for macOS/Linux:
+
+```sh
+clang++ -std=c++20 -O3 -DNDEBUG -march=native -fno-exceptions -fno-rtti \
+  -Wall -Wextra -I extern/bolt/include \
+  -I /Users/bengamble/Library/Python/3.9/lib/python/site-packages/pyarrow/include \
+  extern/bolt/benchmarks/bench_snappy_arrow.cpp \
+  build/sol-snappy/release/libbolt_ingest.a \
+  /Users/bengamble/Library/Python/3.9/lib/python/site-packages/pyarrow/libarrow.2100.dylib \
+  -Wl,-rpath,/Users/bengamble/Library/Python/3.9/lib/python/site-packages/pyarrow \
+  -o /tmp/bench_snappy_arrow
+/tmp/bench_snappy_arrow /Users/bengamble/benchdata/clickbench/hits.parquet \
+  20 0,2,9,13,39 9
+/tmp/bench_snappy_arrow /Users/bengamble/tpch/sf10/lineitem.parquet all 15 9
+```
+
+G2PERF-33 remains open for optimization: the original cutoff fix is present,
+but the new controlled baseline establishes a remaining 1.43x/1.34x Arrow
+advantage on these corpora. Future codec changes should compare against this
+harness and retain the existing sanitizer and logical-value gates. No new codec
+optimization or end-to-end speedup is claimed by this measurement increment.
