@@ -1328,6 +1328,15 @@ target_link_libraries(test_bolt_parquet_read_par
 bolt_apply_hardening(test_bolt_parquet_read_par)
 add_test(NAME test_bolt_parquet_read_par COMMAND test_bolt_parquet_read_par)
 
+# G2PQ-36: parquet_read_file on a genuinely wide (110-column) real-shaped
+# file -- the ClickBench hits.parquet class of file that exhausted
+# bolt::Arena's fixed block-table cap regardless of row count or block size.
+add_executable(test_bolt_parquet_wide_schema test_bolt_parquet_wide_schema.cpp)
+target_link_libraries(test_bolt_parquet_wide_schema
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_wide_schema)
+add_test(NAME test_bolt_parquet_wide_schema COMMAND test_bolt_parquet_wide_schema)
+
 # Page-level skipping end to end: write a page index, decode only the pages a
 # predicate can match, prove the kept rows are right AND that pages really
 # were skipped. Only possible now that bolt can write a page index.

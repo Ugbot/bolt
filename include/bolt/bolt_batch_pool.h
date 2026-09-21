@@ -139,7 +139,7 @@ struct alignas(64) TypedBatchPool {
     // SAME column shape but pathological when batch shapes vary
     // (e.g. small-i64 batches grew block 0; later large-vector_f32
     // batches added more blocks; after enough cycles the arena hit
-    // `kArenaMaxBlocks = 32` and refused to grow). Compacting when
+    // `kArenaMaxBlocks` and refused to grow). Compacting when
     // the block count exceeds a heuristic threshold (4) drops the
     // excess back to block 0 and lets subsequent batches re-grow
     // from a clean slate. The cost is `O(blocks)` aligned_free

@@ -29,10 +29,32 @@ struct ArenaConfig {
 
 /// Maximum number of backing blocks an arena can hold.
 /// NOTE: doubling is CAPPED at config.max_block_size, so total capacity is
-/// roughly 32 x max_block_size (default 64 MB => ~1.8 GB), NOT the "128 GB"
-/// an uncapped doubling would suggest. Long-lived arenas that back operator
-/// state (the scheduler's worker arenas) pass a larger max_block_size.
-static constexpr uint32_t kArenaMaxBlocks = 32;
+/// roughly kArenaMaxBlocks x max_block_size (default 64 MB => ~14.6 GB), NOT
+/// an uncapped doubling's much larger implied ceiling. Long-lived arenas that
+/// back operator state (the scheduler's worker arenas) pass a larger
+/// max_block_size to raise that further.
+///
+/// G2PQ-36: this was 32 until a real wide-schema file (ClickBench
+/// hits.parquet, 105 columns) proved 32 is exhausted by BLOCK COUNT, not by
+/// bytes -- raising max_block_size alone cannot fix it. bolt::ingest::
+/// parquet::parquet_read_file decodes an entire file's worth of columns
+/// into ONE caller-supplied arena, and several of that file's wide Utf8
+/// columns each need a single allocation (the string-overflow buffer, sized
+/// from the column's total uncompressed byte-array bytes across every row
+/// group) bigger than any reasonable max_block_size -- each such request
+/// takes the oversize lane (bolt_arena.h's allocate_slow), which mints a
+/// bespoke block and consumes ONE block-table slot regardless of how large
+/// max_block_size is configured. With kPqMaxColumns (128) worth of columns
+/// to decode into one arena, 32 slots is simply too few table entries,
+/// independent of row count or block size -- confirmed by injection: raising
+/// max_block_size from 1 GB to 4 GB only moved the wall to a higher peak
+/// (num_blocks_ pinned at exactly 32 either way). 256 gives roughly 2 oversize
+/// slots per column at kPqMaxColumns scale, plus headroom for the normal-lane
+/// growing blocks and the reader's small fixed-size metadata allocations.
+static constexpr uint32_t kArenaMaxBlocks = 256;
+
+/// Number of 64-bit words backing the oversize-lane usage bitmap below.
+static constexpr uint32_t kArenaOversizeWords = (kArenaMaxBlocks + 63u) / 64u;
 
 /// Arena: Bump allocator. One per thread. Reset per morsel epoch.
 ///
@@ -125,7 +147,7 @@ public:
         }
         // New epoch: blocks the oversize lane consumed become plain empty
         // blocks again, visible to the normal lane's forward scan.
-        oversize_used_ = 0;
+        oversize_clear_all();
         total_allocated_ = 0;
     }
 
@@ -142,13 +164,13 @@ public:
             cursor_ = reinterpret_cast<uintptr_t>(blocks_[0]);
             end_ = cursor_ + block_sizes_[0];
         }
-        oversize_used_ = 0;
+        oversize_clear_all();
         total_allocated_ = 0;
     }
 
     /// reset() plus block-table trimming: free tail blocks until at most
     /// `keep_bytes` stays reserved (block 0 always survives). The warm pool's
-    /// worker arenas live for the PROCESS, and their 32-slot block table only
+    /// worker arenas live for the PROCESS, and their block table only
     /// ever grew — a heterogeneous query mix ratchets it to the cap within a
     /// few heavy queries, after which allocations fail (surfacing as bogus
     /// downstream errors) and, before that, throughput quietly degrades as
@@ -242,7 +264,7 @@ private:
         // 128 MB request at block 11 of 30 permanently stranded blocks 12..29
         // for the rest of the epoch (measured on a warm-pool worker arena:
         // 2.69 GB reserved, ~600 MB reachable, then a 208 KB allocation FAILED
-        // at the 32-block table cap). The bespoke block is consumed whole by
+        // at the block table cap). The bespoke block is consumed whole by
         // this request, so there is nothing in it for the cursor to use anyway.
         if (size + alignment > config_.max_block_size) {
             // Reuse first: a bespoke block minted by an earlier epoch is a
@@ -251,11 +273,11 @@ private:
             // exists to prevent. Any not-yet-used block past the cursor that
             // fits is taken whole.
             for (uint32_t i = current_idx_ + 1; i < num_blocks_; ++i) {
-                if ((oversize_used_ & (1u << i)) != 0u) continue;
+                if (oversize_test(i)) continue;
                 const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
                 const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
                 if (aligned + size <= base + block_sizes_[i]) {
-                    oversize_used_ |= (1u << i);
+                    oversize_set(i);
                     total_allocated_ += size;
                     if (total_allocated_ > peak_usage_) peak_usage_ = total_allocated_;
                     return reinterpret_cast<void*>(aligned);
@@ -270,7 +292,7 @@ private:
             // The bespoke block sits PAST the cursor while fully in use, so it
             // must be excluded from the forward scan below for the rest of
             // this epoch — otherwise its memory would be handed out twice.
-            oversize_used_ |= (1u << num_blocks_);
+            oversize_set(num_blocks_);
             num_blocks_++;
             const uintptr_t base = reinterpret_cast<uintptr_t>(block);
             const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
@@ -285,7 +307,7 @@ private:
         // grow() fallback) abandoned. Blocks skipped over are smaller than this
         // request — bounded early-progression blocks, not the big tail ones.
         for (uint32_t i = current_idx_ + 1; i < num_blocks_; ++i) {
-            if ((oversize_used_ & (1u << i)) != 0u) continue;   // in use this epoch
+            if (oversize_test(i)) continue;   // in use this epoch
             const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
             const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
             if (aligned + size <= base + block_sizes_[i]) {
@@ -307,6 +329,21 @@ private:
         return reinterpret_cast<void*>(aligned);
     }
 
+    // Bit-array helpers over oversize_used_ (see the member comment below).
+    // Cold-path bookkeeping only (allocate_slow's oversize lane), so plain
+    // word-indexed bit ops are fine -- no need for std::bitset here.
+    bool oversize_test(uint32_t i) const noexcept {
+        assert(i < kArenaMaxBlocks);
+        return (oversize_used_[i >> 6] & (uint64_t{1} << (i & 63u))) != 0u;
+    }
+    void oversize_set(uint32_t i) noexcept {
+        assert(i < kArenaMaxBlocks);
+        oversize_used_[i >> 6] |= (uint64_t{1} << (i & 63u));
+    }
+    void oversize_clear_all() noexcept {
+        for (uint32_t w = 0; w < kArenaOversizeWords; ++w) oversize_used_[w] = 0;
+    }
+
     ArenaConfig config_;
     void*    blocks_[kArenaMaxBlocks];
     size_t   block_sizes_[kArenaMaxBlocks];
@@ -316,10 +353,12 @@ private:
     uintptr_t end_;
     size_t   total_allocated_;
     size_t   peak_usage_;
-    // Bitmask over blocks_ (kArenaMaxBlocks == 32 fits uint32_t exactly):
-    // blocks consumed whole by the oversize lane THIS epoch, so the normal
-    // lane's forward scan must not reuse them until the next reset().
-    uint32_t oversize_used_ = 0;
+    // Bit array over blocks_ (one bit per block index, kArenaOversizeWords
+    // 64-bit words): blocks consumed whole by the oversize lane THIS epoch,
+    // so the normal lane's forward scan must not reuse them until the next
+    // reset(). G2PQ-36: was a single uint32_t (32 blocks max) -- widened
+    // alongside kArenaMaxBlocks.
+    uint64_t oversize_used_[kArenaOversizeWords] = {};
 
     // Opt-in shared-arena support (see set_concurrent / allocate). concurrent_
     // is set once before any sharing thread runs and cleared after they join,
@@ -327,7 +366,6 @@ private:
     bool concurrent_ = false;
     std::atomic_flag alloc_lock_{};   // C++20: value-init is the clear state
 };
-static_assert(kArenaMaxBlocks <= 32, "oversize_used_ bitmask is 32 bits");
 
 // Thread-local arena pointer. Set by slot, reset at morsel boundary.
 inline thread_local Arena* tl_arena = nullptr;
