@@ -119,7 +119,10 @@ RunResult run_once(const uint8_t* buf, uint64_t len, uint64_t arena_gb,
                    bolt::Scheduler* pool) {
     bolt::ArenaConfig ac;
     ac.initial_block_size = 64ull << 20;
-    ac.max_block_size     = (arena_gb << 30) / 32ull;
+    // G2PQ-36: size each block off kArenaMaxBlocks (not a hardcoded 32) so
+    // `arena_gb` keeps meaning "total addressable capacity" now that the cap
+    // is wider than it was when this literal was written.
+    ac.max_block_size     = (arena_gb << 30) / static_cast<uint64_t>(bolt::kArenaMaxBlocks);
     bolt::Arena arena(ac);
     bolt::BoltBatch* b = arena.allocate_array<bolt::BoltBatch>(1);
     RunResult r{false, 0.0, 0, 0, 0};
