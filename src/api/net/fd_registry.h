@@ -49,15 +49,16 @@ public:
     static constexpr uint32_t kMaxSegs = 1024;           // 512K fds hard cap
     static constexpr uint32_t kTableCeiling = 1u << 21;  // <=50% load at cap
 
-    FdRegistry() noexcept
-        : arena_(registry_arena_config()), seg_count_(0), slot_count_(0),
-          free_head_(kNilSlot) {
+    FdRegistry() noexcept : FdRegistry(registry_arena_config()) {}
+
+    explicit FdRegistry(ArenaConfig arena_config) noexcept
+        : arena_(arena_config), seg_count_(0), slot_count_(0),
+          free_head_(kNilSlot), links_ok_(false) {
         for (uint32_t i = 0; i < kMaxSegs; ++i) {
             segs_[i] = nullptr;
             seg_links_[i] = nullptr;
         }
         links_ok_ = SwissTableGrowable::create(&table_, 64, &arena_, kTableCeiling);
-        assert(links_ok_ && "fd registry table creation cannot fail at 64 slots");
     }
 
     ~FdRegistry() noexcept {
@@ -72,7 +73,7 @@ public:
 
     // Hot path: one SIMD-probed lookup + one indexed load. nullptr = absent.
     Data* find(uint64_t fd) noexcept {
-        assert(links_ok_);
+        if (!links_ok_) return nullptr;
         const int32_t v = table_.find(fd);
         if (v < 0) return nullptr;
         assert(static_cast<uint32_t>(v) < slot_count_);
@@ -81,9 +82,10 @@ public:
 
     // Insert-or-overwrite (unordered_map operator[] semantics): an existing
     // fd returns its current slot for the caller to overwrite. Returns
-    // nullptr only when the registry is at its hard cap (caller → ENOMEM).
+    // nullptr when initial table allocation failed, the registry is at its
+    // hard cap, or later arena growth fails (caller reports ENOMEM).
     Data* insert(uint64_t fd) noexcept {
-        assert(links_ok_);
+        if (!links_ok_) return nullptr;
         const int32_t existing = table_.find(fd);
         if (existing >= 0) return slot_at(static_cast<uint32_t>(existing));
 
@@ -100,7 +102,7 @@ public:
     // Erase. Returns false if `fd` is absent. The slot's Data is reset to a
     // default-constructed state (releasing captures) and recycled.
     bool erase(uint64_t fd) noexcept {
-        assert(links_ok_);
+        if (!links_ok_) return false;
         const int32_t v = table_.find(fd);
         if (v < 0) return false;
         const bool erased = table_.erase(fd);
@@ -110,7 +112,7 @@ public:
         return true;
     }
 
-    uint32_t size() const noexcept { return table_.size; }
+    uint32_t size() const noexcept { return links_ok_ ? table_.size : 0u; }
 
 private:
     static ArenaConfig registry_arena_config() noexcept {

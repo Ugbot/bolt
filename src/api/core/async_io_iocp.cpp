@@ -8,13 +8,14 @@
 
 #ifdef _WIN32
 
+#include "associated_handle_registry.h"
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <windows.h>
 
 #include <vector>
-#include <unordered_map>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -170,28 +171,51 @@ struct iocp_io::impl {
     // submit (e.g. per-datagram recvfrom on a long-lived UDP socket) is pure
     // overhead and fails with ERROR_INVALID_PARAMETER anyway. Cache the set so
     // the hot path skips the syscall after the first association.
-    std::mutex          assoc_mutex;
-    std::unordered_map<SOCKET, char> associated;
+    std::mutex assoc_mutex;
+    AssociatedHandleRegistry associated;
 
     int associate_socket(SOCKET sock) {
-        {
-            std::lock_guard<std::mutex> lock(assoc_mutex);
-            if (associated.find(sock) != associated.end()) {
-                return 0;  // already associated — skip the CreateIoCompletionPort syscall
-            }
+        const uint64_t key = static_cast<uint64_t>(sock);
+        std::lock_guard<std::mutex> lock(assoc_mutex);
+        DWORD platform_error = ERROR_SUCCESS;
+        const AssociationResult result = associated.ensure(key, [&]() noexcept {
+            HANDLE h = CreateIoCompletionPort(
+                reinterpret_cast<HANDLE>(sock), iocp_handle,
+                static_cast<ULONG_PTR>(sock), 0);
+            if (h == iocp_handle) return true;
+            platform_error = GetLastError();
+            return false;
+        });
+
+        if (result == AssociationResult::registry_refused) {
+            WSASetLastError(WSAENOBUFS);
+            return -1;
         }
-        HANDLE h = CreateIoCompletionPort((HANDLE)sock, iocp_handle, (ULONG_PTR)sock, 0);
-        const bool ok = (h == iocp_handle);
-        if (ok) {
-            std::lock_guard<std::mutex> lock(assoc_mutex);
-            associated.emplace(sock, char{1});
+        if (result == AssociationResult::platform_failed) {
+            WSASetLastError(static_cast<int>(platform_error));
+            return -1;
         }
-        return ok ? 0 : -1;
+        return 0;
     }
 
-    void forget_socket(SOCKET sock) {
-        std::lock_guard<std::mutex> lock(assoc_mutex);
-        associated.erase(sock);
+    int close_socket(SOCKET sock) {
+        int close_result = SOCKET_ERROR;
+        int platform_error = ERROR_SUCCESS;
+        bool closed = false;
+        {
+            std::lock_guard<std::mutex> lock(assoc_mutex);
+            closed = associated.close_and_forget(
+                static_cast<uint64_t>(sock), [&]() noexcept {
+                    close_result = closesocket(sock);
+                    if (close_result == SOCKET_ERROR) {
+                        platform_error = WSAGetLastError();
+                    }
+                    return close_result == 0;
+                });
+        }
+
+        if (!closed) WSASetLastError(platform_error);
+        return close_result;
     }
 
     // ---- iocp_op free-list pool ------------------------------------------
@@ -246,7 +270,10 @@ int iocp_io::accept_async(
     SOCKET listen_socket = (SOCKET)listen_fd;
     
     // Associate with IOCP
-    impl_->associate_socket(listen_socket);
+    if (impl_->associate_socket(listen_socket) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
     
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -295,7 +322,10 @@ int iocp_io::read_async(
     void* user_data
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
-    impl_->associate_socket(sock);
+    if (impl_->associate_socket(sock) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
     
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -330,7 +360,10 @@ int iocp_io::write_async(
     void* user_data
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
-    impl_->associate_socket(sock);
+    if (impl_->associate_socket(sock) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
     
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -364,7 +397,10 @@ int iocp_io::connect_async(
     void* user_data
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
-    impl_->associate_socket(sock);
+    if (impl_->associate_socket(sock) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
     
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -414,7 +450,10 @@ int iocp_io::recvfrom_async(
     void* user_data
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
-    impl_->associate_socket(sock);
+    if (impl_->associate_socket(sock) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
 
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -463,7 +502,10 @@ int iocp_io::sendto_async(
     void* user_data
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
-    impl_->associate_socket(sock);
+    if (impl_->associate_socket(sock) != 0) {
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
 
     auto* op = impl_->alloc_op();
     if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
@@ -505,10 +547,10 @@ int iocp_io::sendto_async(
 
 int iocp_io::close_async(int fd) noexcept {
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
-    // Drop the association cache entry: the SOCKET value may be recycled by the
-    // OS for a future socket, which must be (re-)associated on its first op.
-    impl_->forget_socket((SOCKET)fd);
-    return closesocket((SOCKET)fd);
+    // Keep close and the conditional cache removal under one lock. A failed
+    // close leaves the live socket associated; a successful close removes the
+    // entry before its numeric value can be reused by another submitter.
+    return impl_->close_socket((SOCKET)fd);
 }
 
 int iocp_io::poll(uint32_t timeout_us) noexcept {
