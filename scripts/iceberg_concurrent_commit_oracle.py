@@ -58,7 +58,7 @@ def check_pyiceberg(root, errs, mutate=None):
     # Linear history: exactly one root, every other parent is a real snapshot,
     # and no snapshot has two children (a fork = a lost update).
     # bolt writes the root snapshot's parent as -1 rather than omitting the
-    # field (separate spec-conformance ticket); treat it as "no parent".
+    # field (G2ICE-177); treat it as "no parent" until that lands.
     parents = [None if s.parent_snapshot_id in (None, -1) else s.parent_snapshot_id
                for s in snaps]
     if sum(1 for p in parents if p is None) != 1:
