@@ -87,6 +87,14 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
 
 void table_close(TableHandle* h) noexcept;
 
+// Why the most recent metadata-committing call on `th` returned false.
+// kConflict: another writer committed a newer table version first (or claimed
+// a file name this commit needed). Nothing of this commit is visible; the
+// handle is stale and must be reopened (table_open) before retrying.
+// kFailed: any other failure (IO, capacity, refused operation).
+enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2 };
+CommitError table_last_commit_error(const TableHandle* th) noexcept;
+
 // Append path: open → write N batches → commit. Each commit emits one new
 // data Parquet file + a manifest + a manifest list + a new metadata.json.
 bool append_open  (AppendHandle** out, TableHandle* th) noexcept;

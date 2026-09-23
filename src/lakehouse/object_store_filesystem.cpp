@@ -3,10 +3,18 @@
 
 #include "bolt/lakehouse/object_store.h"
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+
+#include "bolt/bolt_port.h"   // windows.h / unistd.h, bolt_getpid
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
 
 namespace bolt {
 namespace lakehouse {
@@ -165,8 +173,111 @@ int fs_head(void* impl, const char* key, ObjectMeta* out) noexcept {
     return kOsOk;
 }
 
+// ---------------------------------------------------------------------------
+// put_if_absent (G2ICE-163). The body is staged in a private temp file and
+// then PUBLISHED under `key` by an operation the OS itself refuses when the
+// name exists: link(2) on POSIX, MoveFileExW without REPLACE_EXISTING on
+// Windows. Readers therefore never see a partial object, and of N racing
+// writers exactly one wins. HEAD-then-PUT (what the Iceberg writer used to
+// do) is not atomic: every racer can observe "absent" before any of them
+// writes.
+// ---------------------------------------------------------------------------
+
+std::atomic<uint64_t> g_tmp_nonce{0};
+
+// Stage data[0..len) at `tmp`. Returns kOs* code.
+int stage_tmp(const char* tmp, const uint8_t* data, uint64_t len) noexcept {
+    assert(tmp != nullptr);
+    assert(data != nullptr || len == 0);
+    std::FILE* f = std::fopen(tmp, "wb");
+    if (f == nullptr) return kOsIoError;
+    const size_t wrote = len == 0 ? 0u
+                                  : std::fwrite(data, 1, static_cast<size_t>(len), f);
+    const bool flushed = std::fflush(f) == 0;
+    const bool closed  = std::fclose(f) == 0;
+    if (wrote != static_cast<size_t>(len) || !flushed || !closed) {
+        std::remove(tmp);
+        return kOsIoError;
+    }
+    return kOsOk;
+}
+
+#if !defined(_WIN32)
+// Fallback for filesystems without hard links: an O_EXCL create is still
+// atomic with respect to existence (only the content becomes visible
+// progressively).
+int publish_excl_create(const char* path, const uint8_t* data,
+                        uint64_t len) noexcept {
+    assert(path != nullptr);
+    assert(data != nullptr || len == 0);
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return errno == EEXIST ? kOsExists : kOsIoError;
+    uint64_t off = 0;
+    for (uint32_t guard = 0; off < len && guard < (1u << 30); ++guard) {
+        const ssize_t w = ::write(fd, data + off, static_cast<size_t>(len - off));
+        if (w <= 0) { ::close(fd); ::unlink(path); return kOsIoError; }
+        off += static_cast<uint64_t>(w);
+    }
+    return ::close(fd) == 0 && off == len ? kOsOk : kOsIoError;
+}
+#endif
+
+// Move staged `tmp` to `path` iff `path` does not exist. Consumes `tmp`.
+int publish_no_replace(const char* tmp, const char* path, const uint8_t* data,
+                       uint64_t len) noexcept {
+    assert(tmp != nullptr && path != nullptr);
+    assert(std::strcmp(tmp, path) != 0);
+#if defined(_WIN32)
+    (void)data; (void)len;
+    const std::filesystem::path wt(tmp), wp(path);
+    if (::MoveFileExW(wt.c_str(), wp.c_str(), MOVEFILE_WRITE_THROUGH))
+        return kOsOk;
+    const DWORD e = ::GetLastError();
+    std::remove(tmp);
+    return (e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS) ? kOsExists
+                                                                 : kOsIoError;
+#else
+    int rc = kOsOk;
+    if (::link(tmp, path) != 0) {
+        const int e = errno;
+        if (e == EEXIST) rc = kOsExists;
+        else if (e == EPERM || e == ENOTSUP || e == EOPNOTSUPP || e == EXDEV ||
+                 e == EMLINK || e == ENOSYS)
+            rc = publish_excl_create(path, data, len);
+        else rc = kOsIoError;
+    }
+    ::unlink(tmp);
+    return rc;
+#endif
+}
+
+int fs_put_if_absent(void* impl, const char* key, const uint8_t* data,
+                     uint64_t len) noexcept {
+    assert(impl != nullptr);
+    assert(data != nullptr || len == 0);
+    FilesystemObjectStore* fs = static_cast<FilesystemObjectStore*>(impl);
+    char path[kOsMaxRoot + kOsMaxKey + 2u];
+    if (!join_path(fs->root, key, path, sizeof(path))) return kOsBadArg;
+    std::error_code ec;
+    std::filesystem::path p(path);
+    if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path(), ec);
+    }
+    // Private staging name: pid separates processes (read live, so a forked
+    // child never shares its parent's), the nonce separates threads/calls.
+    char tmp[sizeof(path) + 64u];
+    const int n = std::snprintf(
+        tmp, sizeof(tmp), "%s.tmp-%d-%llu", path, bolt_getpid(),
+        static_cast<unsigned long long>(
+            g_tmp_nonce.fetch_add(1, std::memory_order_relaxed)));
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(tmp)) return kOsBadArg;
+    const int st = stage_tmp(tmp, data, len);
+    if (st != kOsOk) return st;
+    return publish_no_replace(tmp, path, data, len);
+}
+
 const ObjectStoreVT kFilesystemVT = {
-    fs_get, fs_put, fs_list, fs_delete, fs_head,
+    fs_get, fs_put, fs_list, fs_delete, fs_head, fs_put_if_absent,
 };
 
 }  // namespace

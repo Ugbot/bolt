@@ -1934,3 +1934,25 @@ if(TARGET bolt_reactor)
     bolt_apply_hardening(test_timer_queue)
     add_test(NAME test_timer_queue COMMAND test_timer_queue)
 endif()
+
+# G2ICE-163 — concurrent committers (threads + forked processes) on one
+# Iceberg table: a loser gets a conflict, never clobbers; every reported
+# commit survives. The oracle half reads the multi-process fixture with
+# pyiceberg AND DuckDB (exit 2 = oracle not installed -> SKIPPED).
+add_executable(test_bolt_iceberg_concurrent_commit
+    test_bolt_iceberg_concurrent_commit.cpp)
+target_link_libraries(test_bolt_iceberg_concurrent_commit
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_concurrent_commit)
+add_test(NAME test_bolt_iceberg_concurrent_commit
+         COMMAND test_bolt_iceberg_concurrent_commit)
+set_tests_properties(test_bolt_iceberg_concurrent_commit PROPERTIES
+    FIXTURES_SETUP iceberg_concurrent_fixture
+    ENVIRONMENT BOLT_ICEBERG_CONCURRENT_DIR=${CMAKE_CURRENT_BINARY_DIR}/ice_concurrent_fixture)
+add_test(NAME test_bolt_iceberg_concurrent_commit_oracle
+         COMMAND ${BOLT_ORACLE_PYTHON}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_concurrent_commit_oracle.py
+                 ${CMAKE_CURRENT_BINARY_DIR}/ice_concurrent_fixture/default/t)
+set_tests_properties(test_bolt_iceberg_concurrent_commit_oracle PROPERTIES
+    SKIP_RETURN_CODE 2
+    FIXTURES_REQUIRED iceberg_concurrent_fixture)

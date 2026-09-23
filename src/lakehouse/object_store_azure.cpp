@@ -247,6 +247,7 @@ int az_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kAzureVT = {
     az_get, az_put, az_list, az_delete, az_head,
+    nullptr,  // put_if_absent: no conditional-put transport yet
 };
 
 }  // namespace

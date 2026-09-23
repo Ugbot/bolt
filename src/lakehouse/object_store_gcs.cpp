@@ -323,6 +323,7 @@ int gc_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kGcsVT = {
     gc_get, gc_put, gc_list, gc_delete, gc_head,
+    nullptr,  // put_if_absent: no conditional-put transport yet
 };
 
 }  // namespace

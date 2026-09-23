@@ -57,6 +57,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head,
+    nullptr,  // put_if_absent: no conditional-put transport yet
 };
 
 // Bounded config-field copy. Returns false on overflow.

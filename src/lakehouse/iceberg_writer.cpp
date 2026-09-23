@@ -19,13 +19,16 @@
 // and the JSON ones this file used to emit were unreadable by every real
 // reader.
 //
-// All commits go through put_if_absent emulated atop ObjectStore (head_object
-// then put if absent). Bounded everything: 256 manifests/snapshot,
+// Every commit object goes through the store's atomic put_if_absent, and the
+// table version (metadata/v<N>.metadata.json) is the compare-and-swap token:
+// of two writers building on version N, exactly one creates v<N+1>; the other
+// gets CommitError::kConflict (G2ICE-163). Bounded everything: 256 manifests/snapshot,
 // 64 snapshots, 16 refs. No exceptions, no smart pointers, ≥2 asserts/fn.
 
 #include "bolt/lakehouse/iceberg/writer.h"
 #include "bolt/lakehouse/iceberg/view.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -36,6 +39,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
@@ -80,7 +84,8 @@ struct TableHandle {
     char           view_dialect[kIcebergMaxSqlDialect];
     char           view_sql[kIcebergMaxSql];
     int64_t        view_version_id;
-    uint8_t        _pad[3];
+    CommitError    last_error;
+    uint8_t        _pad[2];
 };
 
 struct AppendHandle {
@@ -244,6 +249,30 @@ int64_t now_ms() noexcept {
     using namespace std::chrono;
     return duration_cast<milliseconds>(
                system_clock::now().time_since_epoch()).count();
+}
+
+// G2ICE-163: 64 bits that differ across calls, threads AND processes. Same
+// convention as G2ICE-161's Delta part names (process seed + atomic nonce),
+// with the pid read on every call rather than cached, so a fork()ed child —
+// which inherits the parent's nonce value and any cached seed — still
+// diverges. Finalised through splitmix64 so every output bit depends on all
+// inputs.
+std::atomic<uint64_t> g_unique_nonce{0};
+
+uint64_t unique_u64() noexcept {
+    static const uint64_t seed = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t nonce = g_unique_nonce.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    uint64_t z = ns ^ seed ^
+                 (static_cast<uint64_t>(static_cast<uint32_t>(bolt_getpid())) << 32) ^
+                 (nonce * 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    assert(nonce != UINT64_MAX);
+    return z;
 }
 
 const char* bolt_type_iceberg_name(BoltType t) noexcept {
@@ -622,50 +651,11 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
 }
 
 // ---------------------------------------------------------------------------
-// Commit emulation (put_if_absent atop ObjectStore).
+// Commit protocol: atomic put_if_absent + version CAS (G2ICE-163).
 // ---------------------------------------------------------------------------
 
 namespace {
-
-bool commit_object(ObjectStore* os, const char* key, const uint8_t* data,
-                   uint64_t len) noexcept {
-    assert(os != nullptr && key != nullptr);
-    ObjectMeta m{};
-    const int hr = os_head(os, key, &m);
-    if (hr == kOsOk && m.exists) return false;       // already exists
-    return os_put(os, key, data, len) == kOsOk;
-}
-
-bool write_version_hint(ObjectStore* os, int64_t v) noexcept {
-    assert(os != nullptr);
-    char body[32];
-    const int n = std::snprintf(body, sizeof(body), "%lld",
-                                static_cast<long long>(v));
-    if (n <= 0) return false;
-    // version-hint is overwritten — bypass put_if_absent.
-    return os_put(os, "metadata/version-hint.text",
-                  reinterpret_cast<const uint8_t*>(body),
-                  static_cast<uint64_t>(n)) == kOsOk;
-}
-
-bool persist_metadata(TableHandle* th) noexcept {
-    assert(th != nullptr && th->arena != nullptr && th->os != nullptr);
-    th->meta_version++;
-    th->meta.last_updated_ms = now_ms();
-    const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (!metadata_json_emit(&th->meta, th->refs, th->n_refs, th->is_view,
-                            th->view_dialect, th->view_sql,
-                            th->view_version_id, th->arena, &body, &blen))
-        return false;
-    char rel[64];
-    const int n = std::snprintf(rel, sizeof(rel),
-                                "metadata/v%lld.metadata.json",
-                                static_cast<long long>(th->meta_version));
-    if (n <= 0) return false;
-    if (!commit_object(th->os, rel, body, blen)) return false;
-    return write_version_hint(th->os, th->meta_version);
-}
-
+#include "iceberg_commit.inc"
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -762,21 +752,26 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     h->os    = os;
     std::strncpy(h->root, path, sizeof(h->root) - 1u);
 
-    // Read version-hint (key is relative to the ObjectStore root).
+    // The hint is a starting point only (G2ICE-163): it can lag behind a
+    // concurrent writer or be caught mid-rewrite, so fall back to v1 and
+    // probe forward to the real latest version either way.
     const uint8_t* hb = nullptr; uint64_t hl = 0;
-    if (os_get(os, "metadata/version-hint.text", arena, &hb, &hl) != kOsOk)
-        return false;
     int64_t v = 0; bool any = false;
-    for (uint64_t i = 0; i < hl; ++i) {
-        const char c = static_cast<char>(hb[i]);
-        if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
-        else if (any) break;
+    if (os_get(os, "metadata/version-hint.text", arena, &hb, &hl) == kOsOk) {
+        for (uint64_t i = 0; i < hl && i < 20u; ++i) {   // bounded: int64 digits
+            const char c = static_cast<char>(hb[i]);
+            if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
+            else if (any) break;
+        }
     }
-    if (!any) return false;
+    if (!any || v < 1 || !version_exists(os, v)) {
+        if (!version_exists(os, 1)) return false;
+        v = 1;
+    }
+    v = probe_latest(os, v);
     h->meta_version = v;
     char rel[64];
-    std::snprintf(rel, sizeof(rel), "metadata/v%lld.metadata.json",
-                  static_cast<long long>(v));
+    version_key(v, rel);
     const uint8_t* mb = nullptr; uint64_t ml = 0;
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
@@ -786,6 +781,11 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
 }
 
 void table_close(TableHandle* /*h*/) noexcept {}
+
+CommitError table_last_commit_error(const TableHandle* th) noexcept {
+    assert(th != nullptr);
+    return th->last_error;
+}
 
 const Metadata* table_metadata(const TableHandle* th) noexcept {
     assert(th != nullptr);
@@ -981,11 +981,13 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
                      int64_t* out_size, int64_t* out_rows) noexcept {
     assert(th != nullptr && batches != nullptr);
     if (n_batches == 0) return false;
-    // Compose path: data/<snap-id>-<rand>.parquet
+    // data/<snap-id>-<unique>.parquet. The suffix used to be `snap_id & 0xFFFF`
+    // — no entropy of its own, so a snapshot-id collision was also a data-file
+    // collision (G2ICE-163). It is independent of the snapshot id now.
     const int n = std::snprintf(rel_out, rel_cap,
-                                "data/%lld-%u.parquet",
+                                "data/%lld-%016llx.parquet",
                                 static_cast<long long>(snap_id),
-                                static_cast<unsigned>(snap_id & 0xFFFFu));
+                                static_cast<unsigned long long>(unique_u64()));
     if (n <= 0 || static_cast<uint32_t>(n) >= rel_cap) return false;
     char full[kMaxPathLen];
     if (!path_join(th->root, rel_out, full, sizeof(full))) return false;
@@ -1033,9 +1035,27 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
 // entry then names a snapshot that does not exist -- which is precisely the
 // join an Iceberg reader makes for incremental and time-travel scans. It
 // reproduced in ~9.5% of runs (38 of 400).
+//
+// G2ICE-163: it was `now_ms() * 1000 + n_snapshots` — identical for every
+// handle opened on the same table version that commits in the same
+// millisecond, and the id names the data file, manifest and manifest list. The
+// losing writer's data file then overwrote the winner's already-committed one.
+// Now a positive 63-bit value unique across threads and processes (Iceberg's
+// own reference implementation uses a random UUID-derived long), re-drawn in
+// the vanishing case it repeats an id already in this table's history.
 int64_t mint_snapshot_id(const TableHandle* th) noexcept {
     assert(th != nullptr);
-    return now_ms() * 1000 + static_cast<int64_t>(th->meta.n_snapshots);
+    for (uint32_t attempt = 0; attempt < 16u; ++attempt) {   // bounded
+        const int64_t id = static_cast<int64_t>(unique_u64() & 0x7FFFFFFFFFFFFFFFull);
+        if (id <= 0) continue;
+        bool taken = false;
+        for (uint32_t i = 0; i < th->meta.n_snapshots; ++i) {   // bounded
+            if (th->meta.snapshots[i].snapshot_id == id) { taken = true; break; }
+        }
+        if (!taken) return id;
+    }
+    assert(false && "unique_u64 repeated 16 times");
+    return 1;
 }
 
 // `snap_id` is minted by the caller so the data files it already stamped and
@@ -1047,6 +1067,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     assert(th->arena != nullptr && th->os != nullptr);
     if (th->meta.n_snapshots >= kIcebergMaxSnapshots) return false;
     if (files == nullptr && nf != 0) return false;
+    if (!handle_is_current(th)) return false;
 
     // A manifest for a PARTITIONED table must carry each data file's partition
     // tuple, whose shape comes from the spec. `manifest_write_avro` emits the
@@ -1083,7 +1104,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     char mrel[128];
     std::snprintf(mrel, sizeof(mrel), "metadata/manifest-%lld.avro",
                   static_cast<long long>(snap_id));
-    if (!commit_object(th->os, mrel, manifest_body, manifest_len)) return false;
+    if (!commit_object(th, mrel, manifest_body, manifest_len)) return false;
 
     // A snapshot's manifest list names EVERY manifest live at that snapshot,
     // not just the one the commit added. This wrote a one-entry list, so each
@@ -1200,7 +1221,10 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // leave a half-written snapshot in the metadata.
     char mlabs[kIcebergMaxManifestPath];
     if (!abs_location(th->root, mlrel, mlabs, sizeof(mlabs))) return false;
-    if (!commit_object(th->os, mlrel, mlb, mll)) return false;
+    if (!commit_object(th, mlrel, mlb, mll)) {
+        (void)os_delete(th->os, mrel);
+        return false;
+    }
 
     // Record the snapshot.
     Snapshot& s = th->meta.snapshots[th->meta.n_snapshots++];
@@ -1216,7 +1240,15 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     s.schema_id          = th->meta.current_schema_id;
     std::strncpy(s.manifest_list, mlabs, sizeof(s.manifest_list) - 1u);
     th->meta.current_snapshot_id = snap_id;
-    return persist_metadata(th);
+    if (persist_metadata(th)) return true;
+    // Not committed (typically a conflict): withdraw the snapshot from this
+    // handle and remove the objects only this commit referenced.
+    --th->meta.n_snapshots;
+    --th->meta.last_sequence_number;
+    th->meta.current_snapshot_id = parent;
+    (void)os_delete(th->os, mlrel);
+    (void)os_delete(th->os, mrel);
+    return false;
 }
 
 }  // namespace
@@ -1224,12 +1256,18 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
 bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
                       int64_t* out_rows) noexcept {
     assert(ah != nullptr && ah->th != nullptr);
+    ah->th->last_error = CommitError::kNone;
     if (ah->n_pending == 0) return true;
+    // Don't write a data file for a commit that has already lost.
+    if (!handle_is_current(ah->th)) return false;
     const int64_t snap_id = mint_snapshot_id(ah->th);
     char rel[128];
     int64_t size = 0, rows = 0;
     if (!write_data_file(ah->th, ah->pending, ah->n_pending, snap_id,
-                         rel, sizeof(rel), &size, &rows)) return false;
+                         rel, sizeof(rel), &size, &rows)) {
+        ah->th->last_error = CommitError::kFailed;
+        return false;
+    }
     DataFileRef df{};
     df.status            = ManifestStatus::kAdded;
     df.content           = FileContent::kData;
@@ -1248,6 +1286,10 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
         compute_file_stats(ah->pending, ah->n_pending, cur, &df.stats);
     }
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
+        // Never referenced by a committed snapshot: remove it.
+        (void)os_delete(ah->th->os, rel);
+        if (ah->th->last_error == CommitError::kNone)
+            ah->th->last_error = CommitError::kFailed;
         return false;
     }
     ah->n_pending = 0;
@@ -1367,8 +1409,9 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
 
     char rel[128];
     const int rn = std::snprintf(rel, sizeof(rel),
-                                 "data/%lld-deletes.parquet",
-                                 static_cast<long long>(snap_id));
+                                 "data/%lld-%016llx-deletes.parquet",
+                                 static_cast<long long>(snap_id),
+                                 static_cast<unsigned long long>(unique_u64()));
     if (rn <= 0 || static_cast<uint32_t>(rn) >= sizeof(rel)) return false;
     char full[kMaxPathLen];
     if (!path_join(th->root, rel, full, sizeof(full))) return false;

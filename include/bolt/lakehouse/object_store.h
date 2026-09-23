@@ -26,6 +26,7 @@ enum : int {
     kOsBadArg          = 3,
     kOsIoError         = 4,
     kOsBufferSmall     = 5,
+    kOsExists          = 6,   // put_if_absent: the key already exists
 };
 
 static constexpr uint32_t kOsMaxKey     = 2048u;
@@ -66,6 +67,15 @@ struct ObjectStoreVT {
 
     // HEAD object `key` → meta.
     int (*head_object)(void* impl, const char* key, ObjectMeta* out) noexcept;
+
+    // Atomically create `key` with body data[0..len) iff it does not exist.
+    // Returns kOsExists (and changes nothing) when it does. This is the
+    // compare-and-swap every table-format commit is built on: a HEAD followed
+    // by a PUT is not one, because two writers can both see "absent". A store
+    // that cannot provide the guarantee leaves this null (os_put_if_absent
+    // then reports kOsNotImplemented) — it must never be emulated.
+    int (*put_if_absent)(void* impl, const char* key,
+                         const uint8_t* data, uint64_t len) noexcept;
 };
 
 struct ObjectStore {
@@ -101,6 +111,13 @@ inline int os_head(ObjectStore* s, const char* key, ObjectMeta* m) noexcept {
     assert(s != nullptr && s->vt != nullptr);
     assert(s->vt->head_object != nullptr);
     return s->vt->head_object(s->impl, key, m);
+}
+inline int os_put_if_absent(ObjectStore* s, const char* key, const uint8_t* d,
+                            uint64_t n) noexcept {
+    assert(s != nullptr && s->vt != nullptr);
+    assert(key != nullptr && (d != nullptr || n == 0));
+    if (s->vt->put_if_absent == nullptr) return kOsNotImplemented;
+    return s->vt->put_if_absent(s->impl, key, d, n);
 }
 
 // ---------------------------------------------------------------------------
