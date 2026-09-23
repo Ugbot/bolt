@@ -1934,3 +1934,11 @@ if(TARGET bolt_reactor)
     bolt_apply_hardening(test_timer_queue)
     add_test(NAME test_timer_queue COMMAND test_timer_queue)
 endif()
+# G2ICE-166: scheduler workers keep a real stack under a static-TLS block
+# larger than RLIMIT_STACK (the chukonu-linked marbledb maint-worker SIGSEGV).
+add_executable(test_bolt_scheduler_worker_stack
+    test_bolt_scheduler_worker_stack.cpp)
+target_link_libraries(test_bolt_scheduler_worker_stack PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_scheduler_worker_stack)
+add_test(NAME test_bolt_scheduler_worker_stack
+         COMMAND test_bolt_scheduler_worker_stack)
