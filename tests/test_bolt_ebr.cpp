@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "bolt/bolt_ebr.h"
+#include "bolt/bolt_retire_queue.h"
 
 #include <atomic>
 #include <chrono>
@@ -229,4 +230,60 @@ TEST(BoltEbr, DestroyDrainsAllEpochs) {
 
     ebr_destroy(&e);
     EXPECT_EQ(g_free_count.load(), 3u);
+}
+
+// ---------------------------------------------------------------------------
+// RetireQueue must honour the same drain rule as ebr_retire: an entry
+// stamped at epoch R may still be read by a reader pinned at R, and the
+// collector only refuses the R+2 -> R+3 advance for such a reader.
+// ---------------------------------------------------------------------------
+using TestRetireQueue = RetireQueue<uint64_t, 16>;
+
+TEST(BoltRetireQueue, ReaderPinnedAtRetireEpochBlocksDequeue) {
+    Ebr e;
+    ebr_init(&e, 2);
+    auto* q = new TestRetireQueue();
+    q->init();
+
+    ebr_enter(&e, 1);                       // reader pins epoch R
+    const uint64_t r = e.global_epoch.load();
+    ASSERT_TRUE(q->enqueue(uint64_t{99}, &e));
+
+    for (int i = 0; i < 8; ++i) (void)ebr_try_advance_and_collect(&e);
+    EXPECT_EQ(e.global_epoch.load(), r + 2u);   // pinned reader caps at R+2
+    uint64_t out = 0;
+    EXPECT_FALSE(q->try_dequeue(&e, &out));
+
+    ebr_exit(&e, 1);
+    bool got = false;
+    for (int i = 0; i < 8 && !got; ++i) {
+        (void)ebr_try_advance_and_collect(&e);
+        got = q->try_dequeue(&e, &out);
+    }
+    EXPECT_TRUE(got);
+    EXPECT_EQ(out, 99u);
+    EXPECT_TRUE(q->empty());
+
+    delete q;
+    ebr_destroy(&e);
+}
+
+TEST(BoltRetireQueue, UnpinnedEntryDequeuesAfterThreeAdvances) {
+    Ebr e;
+    ebr_init(&e, 1);
+    auto* q = new TestRetireQueue();
+    q->init();
+
+    ASSERT_TRUE(q->enqueue(uint64_t{7}, &e));
+    uint64_t out = 0;
+    for (int i = 0; i < 2; ++i) {
+        (void)ebr_try_advance_and_collect(&e);
+        EXPECT_FALSE(q->try_dequeue(&e, &out));
+    }
+    (void)ebr_try_advance_and_collect(&e);
+    EXPECT_TRUE(q->try_dequeue(&e, &out));
+    EXPECT_EQ(out, 7u);
+
+    delete q;
+    ebr_destroy(&e);
 }

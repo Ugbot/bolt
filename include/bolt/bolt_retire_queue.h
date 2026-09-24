@@ -9,8 +9,11 @@
 // filesystem path for deferred `filesystem::remove` after an SST
 // close. This primitive stores fat payloads in its own ring with an
 // epoch stamp; a reaper thread dequeues entries only once
-// `ebr_global_epoch() >= retire_epoch + 2`, guaranteeing no EBR
-// reader still holds a pointer to the object.
+// `ebr_global_epoch() >= retire_epoch + 3`, guaranteeing no EBR
+// reader still holds a pointer to the object. +3, not +2: a reader
+// pinned AT the retire epoch R may hold the object, and the collector
+// only checks for such a reader on the R+2 -> R+3 advance (the same
+// point at which `ebr_retire`'s own slot for R is drained).
 //
 // Templated on the payload type T. The producer enqueues a T with
 // the current epoch at retirement time. The reaper tries to dequeue;
@@ -24,6 +27,10 @@
 #include <cstdint>
 
 namespace bolt {
+
+// Advances past the retire epoch before an entry is reclaimable; matches
+// `ebr_try_advance_and_collect`'s drain of slot (ge + 1) mod 3.
+inline constexpr uint64_t kRetireQueueDrainAdvances = 3u;
 
 template <typename T, uint32_t Capacity>
 struct alignas(64) RetireQueue {
@@ -55,7 +62,7 @@ struct alignas(64) RetireQueue {
 
     // SC-dequeue — only the reaper thread calls this. Returns true
     // and writes into `*out` if an entry is available AND its
-    // retire_epoch + 2 has been reached by the global epoch. Returns
+    // retire_epoch + 3 has been reached by the global epoch. Returns
     // false if the queue is empty or the head entry isn't drained yet.
     BOLT_FORCE_INLINE bool try_dequeue(Ebr* e, T* out) noexcept {
         const uint64_t next = consumer_cursor.load_acquire();
@@ -63,7 +70,7 @@ struct alignas(64) RetireQueue {
         if (next >= pub) return false;   // empty
         const Entry* head = ring.slot(next);
         const uint64_t ge = e->global_epoch.load(std::memory_order_acquire);
-        if (ge < head->retire_epoch + 2) {
+        if (ge < head->retire_epoch + kRetireQueueDrainAdvances) {
             return false;  // not drained yet — try to advance the epoch
         }
         *out = head->payload;
