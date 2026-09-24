@@ -1983,3 +1983,17 @@ target_link_libraries(test_bolt_delta_concurrent_commit
 bolt_apply_hardening(test_bolt_delta_concurrent_commit)
 add_test(NAME test_bolt_delta_concurrent_commit
          COMMAND test_bolt_delta_concurrent_commit)
+
+# IODispatcher inbox backpressure (G2ETL-54): a full post_to_io_thread inbox
+# must neither hang a foreign poster nor deadlock the IO thread on itself.
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_io_inbox test_bolt_io_inbox.cpp)
+    target_link_libraries(test_bolt_io_inbox
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_io_inbox)
+    add_test(NAME test_bolt_io_inbox COMMAND test_bolt_io_inbox)
+endif()
