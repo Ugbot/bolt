@@ -1009,6 +1009,13 @@ target_link_libraries(test_bolt_utf8
 bolt_apply_hardening(test_bolt_utf8)
 add_test(NAME test_bolt_utf8 COMMAND test_bolt_utf8)
 
+# MD5 (RFC 1321) — backs SQL md5(s) (dbt.hash / generate_surrogate_key).
+add_executable(test_bolt_md5 test_bolt_md5.cpp)
+target_link_libraries(test_bolt_md5
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_md5)
+add_test(NAME test_bolt_md5 COMMAND test_bolt_md5)
+
 # SQL INTERVAL arithmetic kernels (date32 + months/days, sub_date, mul, filter).
 # Tiny semantic, ubiquitous in TPC-H predicates like
 # `l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY`.
