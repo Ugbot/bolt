@@ -94,6 +94,29 @@ public:
         return true;
     }
 
+    /// Push from any thread without waiting: false when the ring is full.
+    /// Claims a slot only once it is free, so a refused push leaves no hole.
+    bool try_push_nowait(T&& item) noexcept {
+        constexpr size_t kMaxRetries = size_t{1} << 16;
+        size_t pos = wseq_.load(std::memory_order_relaxed);
+        for (size_t attempt = 0; attempt < kMaxRetries; ++attempt) {
+            Slot& slot = slots_[pos & kMask];
+            const size_t seq = slot.seq.load(std::memory_order_acquire);
+            const intptr_t diff = static_cast<intptr_t>(seq - pos);
+            if (diff < 0) return false;  // slot still holds an unconsumed item
+            if (diff > 0) {              // another producer claimed pos
+                pos = wseq_.load(std::memory_order_relaxed);
+                continue;
+            }
+            if (wseq_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                slot.data = static_cast<T&&>(item);
+                slot.seq.store(pos + 1, std::memory_order_release);
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Pop (single consumer only).
     bool try_pop(T* out) noexcept {
         size_t pos = rpos_;

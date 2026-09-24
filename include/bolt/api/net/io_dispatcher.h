@@ -342,9 +342,20 @@ public:
     /// inbox and wake it, so the thread resumes `h` (running it up to its first
     /// co_await) on that thread. Used to pin a per-thread accept loop to IO thread
     /// `io_thread_index` so its ops register on that thread's engine. Thread-safe
-    /// (call from any thread). Returns false on a bad index. Only meaningful for
-    /// per_thread_engines(); the shared backend keeps a single accept loop.
+    /// (call from any thread). Only meaningful for per_thread_engines(); the
+    /// shared backend keeps a single accept loop.
+    ///
+    /// A full inbox (IoInbox::kCapacity) never drops `h` silently: a foreign
+    /// thread waits for the target thread to drain; false (and the post is
+    /// counted in inbox_posts_rejected()) on a bad index, when the target IO
+    /// thread itself posts (it is the only consumer, so waiting would deadlock),
+    /// or when the dispatcher is not running. On false the caller still owns `h`.
     bool post_to_io_thread(size_t io_thread_index, std::coroutine_handle<> h) noexcept;
+
+    /// Posts refused by post_to_io_thread because the target inbox was full.
+    uint64_t inbox_posts_rejected() const noexcept {
+        return inbox_posts_rejected_.load(std::memory_order_relaxed);
+    }
 
     // =========================================================================
     // Statistics
@@ -418,6 +429,7 @@ private:
     alignas(core::kCacheLineSize) std::atomic<uint64_t> accepts_completed_{0};
     alignas(core::kCacheLineSize) std::atomic<uint64_t> connects_started_{0};
     alignas(core::kCacheLineSize) std::atomic<uint64_t> connects_completed_{0};
+    alignas(core::kCacheLineSize) std::atomic<uint64_t> inbox_posts_rejected_{0};
 };
 
 // =============================================================================

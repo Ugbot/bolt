@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <mutex>
 #include <iostream>
+#include <thread>
 
 namespace bolt::api {
 namespace net {
@@ -55,6 +56,7 @@ void drain_inbox(IoInbox* inbox) noexcept {
 namespace {
 thread_local IODispatcher*    t_current_owner = nullptr;
 thread_local core::async_io*  t_current_io    = nullptr;
+thread_local size_t           t_current_index = SIZE_MAX;
 }  // namespace
 
 // =============================================================================
@@ -373,6 +375,7 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
     // thread does not pick up our engine (it falls back to that dispatcher's #0).
     t_current_owner = this;
     t_current_io = my_io;
+    t_current_index = thread_id;
 
     IoInbox* inbox = (thread_id < inboxes_.size()) ? inboxes_[thread_id].get() : nullptr;
 
@@ -391,6 +394,7 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
 
     t_current_io = nullptr;
     t_current_owner = nullptr;
+    t_current_index = SIZE_MAX;
 
     std::cout << "IODispatcher I/O thread " << thread_id << " stopped" << std::endl;
 }
@@ -432,14 +436,28 @@ bool IODispatcher::post_to_io_thread(size_t io_thread_index,
     if (io_thread_index >= inboxes_.size() || !h) {
         return false;
     }
-    // MPSC push (capacity is ample for the low-volume startup/post path).
-    inboxes_[io_thread_index]->queue.try_push(std::move(h));
-    // Wake the target thread's engine so it drains promptly (for per-thread
-    // engines that thread is the sole poller of ios_[io_thread_index]).
     const size_t engine_idx = (io_thread_index < ios_.size()) ? io_thread_index : 0;
     assert(engine_idx < ios_.size() && "post_to_io_thread: engine index OOB");
-    ios_[engine_idx]->wake();
-    return true;
+    IoInbox* inbox = inboxes_[io_thread_index].get();
+    assert(inbox != nullptr && "post_to_io_thread: null inbox");
+    const bool on_target =
+        t_current_owner == this && t_current_index == io_thread_index;
+    // Bounded by the target draining (it pops up to kCapacity per loop turn) or
+    // by shutdown; each full turn wakes the target so it drains promptly.
+    for (;;) {
+        std::coroutine_handle<> item = h;
+        if (inbox->queue.try_push_nowait(std::move(item))) {
+            ios_[engine_idx]->wake();
+            return true;
+        }
+        if (on_target || !running_.load(std::memory_order_acquire) ||
+            shutdown_requested_.load(std::memory_order_acquire)) {
+            inbox_posts_rejected_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ios_[engine_idx]->wake();
+        std::this_thread::yield();
+    }
 }
 
 void IODispatcher::async_close(int fd) noexcept {
