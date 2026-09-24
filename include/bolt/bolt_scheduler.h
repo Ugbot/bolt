@@ -289,12 +289,14 @@ struct alignas(64) TaskRing {
     alignas(64) std::atomic<uint64_t> head;     // Published: slots < head are written
     alignas(64) std::atomic<uint64_t> tail;     // Last claimed slot
     alignas(64) std::atomic<uint64_t> reserve;  // Next sequence a producer may take
+    alignas(64) std::atomic<uint64_t> executed; // Task bodies that have returned
 
     void init() noexcept {
         memset(ring, 0, sizeof(ring));
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
         reserve.store(0, std::memory_order_relaxed);
+        executed.store(0, std::memory_order_relaxed);
     }
 
     /// Submit a task (producer side). Returns false if ring is full.
@@ -414,6 +416,10 @@ struct alignas(64) TaskRing {
         Sim::point(sched_point::kClaimWon);
 
         if (task.fn) task.fn(task.arg);
+        // Release pairs with wait_all()'s acquire: the body's stores are
+        // visible once the count covers it. Counts every claimed slot, raw
+        // or trampolined, whoever executes it.
+        executed.fetch_add(1, std::memory_order_release);
         return true;
     }
 
@@ -421,13 +427,19 @@ struct alignas(64) TaskRing {
         return try_claim_and_execute_sim<SchedSimNoop>();
     }
 
-    /// Wait until all submitted tasks have been claimed.
+    /// Wait until as many task bodies have returned as were published at
+    /// entry. Tasks published concurrently with the call may be counted in
+    /// place of earlier ones still running, so the barrier is exact only when
+    /// the caller's own submits are the last before the call. Must not be
+    /// called from inside a task on this ring (it would wait on itself).
     void wait_all(SpinPolicy policy) noexcept {
-        uint64_t target = head.load(std::memory_order_acquire);
+        const uint64_t target = head.load(std::memory_order_acquire);
+        assert(target <= reserve.load(std::memory_order_relaxed));
         uint32_t spins = 0;
-        while (tail.load(std::memory_order_acquire) < target) {
+        while (executed.load(std::memory_order_acquire) < target) {
             spin_wait(policy, spins, kDefaultSpinCount);
         }
+        assert(tail.load(std::memory_order_relaxed) >= target);
     }
 };
 
@@ -604,17 +616,11 @@ struct Scheduler {
                             void* write_batch, uint32_t entity_count,
                             float delta_time, uint32_t grain_size = 512) noexcept;
 
-    /// Wait for all submitted tasks to complete. Uses the tasks_submitted /
-    /// tasks_completed counters (incremented by the range/column trampolines)
-    /// for a precise post-execution barrier — ring tail advances at claim time,
-    /// which is not sufficient to guarantee the task body has finished.
+    /// Wait for all submitted tasks (raw, range and column) to complete.
+    /// Barrier is the ring's executed count, bumped after each task body
+    /// returns; `stats` are diagnostics only (raw submits bump
+    /// tasks_submitted but not tasks_completed) and never gate this call.
     void wait_all() noexcept {
-        const uint64_t target = stats.tasks_submitted.load(std::memory_order_acquire);
-        uint32_t spins = 0;
-        while (stats.tasks_completed.load(std::memory_order_acquire) < target) {
-            spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
-        }
-        // Also fence the ring to be safe for raw submit() consumers.
         ring.wait_all(SpinPolicy::SpinYield);
     }
 
@@ -722,15 +728,8 @@ inline void scheduler_range_trampoline(void* arg) noexcept {
     TaskPool* pool = p->owning_pool;
     pool->release(p);
     if (sched) {
-        // RELEASE, not relaxed: wait_all() acquire-loads this counter and then
-        // reads what the task WROTE. A relaxed increment publishes the count
-        // without publishing the task's stores, so the barrier would let the
-        // waiter observe a completed task's memory as it was before the task
-        // ran. Release here + acquire there is the only synchronizes-with edge
-        // between a worker finishing and the submitter proceeding (the ring's
-        // tail CAS happens at CLAIM time, before the body, so it publishes
-        // nothing about the result). Cost is one release RMW per task.
-        sched->stats.tasks_completed.fetch_add(1, std::memory_order_release);
+        // Diagnostic only; wait_all() synchronises on TaskRing::executed.
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -746,15 +745,8 @@ inline void scheduler_column_trampoline(void* arg) noexcept {
     TaskPool* pool = p->owning_pool;
     pool->release(p);
     if (sched) {
-        // RELEASE, not relaxed: wait_all() acquire-loads this counter and then
-        // reads what the task WROTE. A relaxed increment publishes the count
-        // without publishing the task's stores, so the barrier would let the
-        // waiter observe a completed task's memory as it was before the task
-        // ran. Release here + acquire there is the only synchronizes-with edge
-        // between a worker finishing and the submitter proceeding (the ring's
-        // tail CAS happens at CLAIM time, before the body, so it publishes
-        // nothing about the result). Cost is one release RMW per task.
-        sched->stats.tasks_completed.fetch_add(1, std::memory_order_release);
+        // Diagnostic only; wait_all() synchronises on TaskRing::executed.
+        sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

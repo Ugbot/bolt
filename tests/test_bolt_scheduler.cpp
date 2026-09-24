@@ -6,7 +6,10 @@
 #include <thread>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_scheduler.h"
@@ -206,6 +209,98 @@ TEST(BoltScheduler, AdaptiveGrainIgnoresZeroObservation) {
     s.record_morsel_ns_per_row(0.0);           // ignored — guard against NaN / zero
     EXPECT_EQ(s.recommended_grain_bytes(8), s.grain_bytes());
     s.shutdown();
+}
+
+}  // namespace
+
+namespace {
+
+// G2ICE-202: wait_all() after raw submit() tasks. Raw tasks bumped
+// tasks_submitted but only the range/column trampolines bumped
+// tasks_completed, so wait_all() spun forever. The barrier runs on a helper
+// thread under a deadline so a regression fails instead of hanging ctest.
+constexpr uint32_t kRawTasks = 20000;
+
+struct RawCtx {
+    std::atomic<uint64_t> ran;
+    uint64_t plain[kRawTasks];  // non-atomic: visibility is wait_all()'s job
+};
+
+struct RawArg {
+    RawCtx*  ctx;
+    uint32_t idx;
+};
+
+void raw_task(void* arg) noexcept {
+    auto* a = static_cast<RawArg*>(arg);
+    a->ctx->plain[a->idx] = static_cast<uint64_t>(a->idx) + 1u;
+    a->ctx->ran.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool wait_all_within(bolt::Scheduler& s, std::chrono::seconds limit) {
+    std::atomic<bool> done{false};
+    std::thread waiter([&] {
+        s.wait_all();
+        done.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!done.load(std::memory_order_acquire)) {
+        // The waiter can never be joined; exit loudly rather than hang.
+        std::fprintf(stderr, "wait_all() did not return within %lld s\n",
+                     static_cast<long long>(limit.count()));
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    waiter.join();
+    return true;
+}
+
+TEST(BoltScheduler, WaitAllReturnsAfterRawSubmits) {
+    bolt::Scheduler sched{};
+    ASSERT_TRUE(sched.init(4));
+    auto* ctx = new RawCtx{};
+    auto* args = new RawArg[kRawTasks];
+    for (uint32_t i = 0; i < kRawTasks; ++i) {
+        args[i] = RawArg{ctx, i};
+        sched.submit(raw_task, &args[i]);
+    }
+    ASSERT_TRUE(wait_all_within(sched, std::chrono::seconds(20)));
+    EXPECT_EQ(ctx->ran.load(std::memory_order_relaxed), kRawTasks);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < kRawTasks; ++i) {
+        if (ctx->plain[i] != static_cast<uint64_t>(i) + 1u) ++bad;
+    }
+    EXPECT_EQ(bad, 0u);
+    sched.shutdown();
+    delete[] args;
+    delete ctx;
+}
+
+TEST(BoltScheduler, RawSubmitsDoNotPoisonLaterRangeWaitAll) {
+    bolt::Scheduler sched{};
+    ASSERT_TRUE(sched.init(4));
+    auto* ctx = new RawCtx{};
+    auto* args = new RawArg[kRawTasks];
+    for (uint32_t i = 0; i < kRawTasks; ++i) {
+        args[i] = RawArg{ctx, i};
+        sched.submit(raw_task, &args[i]);
+    }
+    for (int round = 0; round < 3; ++round) {
+        RangeSumCtx rctx;
+        rctx.sum.store(0, std::memory_order_relaxed);
+        sched.submit_range(range_sum_fn, &rctx, 10000, 256);
+        ASSERT_TRUE(wait_all_within(sched, std::chrono::seconds(20)));
+        EXPECT_EQ(rctx.sum.load(std::memory_order_acquire),
+                  static_cast<uint64_t>(10000) * 9999 / 2);
+    }
+    EXPECT_EQ(ctx->ran.load(std::memory_order_relaxed), kRawTasks);
+    sched.shutdown();
+    delete[] args;
+    delete ctx;
 }
 
 }  // namespace
