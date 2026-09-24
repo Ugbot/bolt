@@ -50,12 +50,20 @@ namespace bolt {
 // A pool slot. `next_free_idx` is UINT32_MAX at pool-tail; the Treiber
 // stack head stores the live head index in the low 32 bits and a
 // generation counter in the high 32 bits.
+// `arena` sits in a union so it stays unconstructed until `acquire`
+// placement-news it: a plain member would run Arena() (a 4 MiB block) per
+// slot at pool construction and the placement-new would then drop it.
 struct alignas(64) TypedBatchPoolSlot {
-    Arena     arena;
+    union { Arena arena; };
     BoltBatch batch;
     uint32_t  next_free_idx;     // valid when slot is on the freelist
     uint8_t   initialized;       // 0 until first acquire
     uint8_t   _pad[3];
+
+    TypedBatchPoolSlot() noexcept : next_free_idx(0xFFFFFFFFu), initialized(0u) {}
+    ~TypedBatchPoolSlot() noexcept {}
+    TypedBatchPoolSlot(const TypedBatchPoolSlot&) = delete;
+    TypedBatchPoolSlot& operator=(const TypedBatchPoolSlot&) = delete;
 };
 
 // Packed stack head: [63:32] = generation, [31:0] = slot index (UINT32_MAX = empty).
@@ -82,6 +90,11 @@ struct alignas(64) TypedBatchPool {
     ArenaConfig arena_cfg;
 
     Slot slots[Capacity];
+
+    TypedBatchPool() noexcept = default;
+    ~TypedBatchPool() noexcept { destroy(); }
+    TypedBatchPool(const TypedBatchPool&) = delete;
+    TypedBatchPool& operator=(const TypedBatchPool&) = delete;
 
     BOLT_FORCE_INLINE void init(ArenaConfig cfg = ArenaConfig{}) noexcept {
         arena_cfg = cfg;
