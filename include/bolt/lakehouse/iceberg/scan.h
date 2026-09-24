@@ -28,6 +28,18 @@ struct Metadata;
 bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                         const char* namespace_, const char* name) noexcept;
 
+// Open a catalog-served table: `metadata_json` is the TableMetadata document
+// a REST catalog's loadTable returned, and every file it names is fetched
+// through `store` (S3, GCS, Azure, filesystem). `store->impl` is borrowed and
+// must outlive the handle. `table_key_prefix` is the store key of the table's
+// `location`; nullptr derives it by dropping the location's scheme and
+// authority ("s3://bucket/wh/ns/t" -> "wh/ns/t").
+bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
+                                 const ObjectStore* store,
+                                 const char* table_key_prefix,
+                                 const uint8_t* metadata_json,
+                                 uint32_t metadata_len) noexcept;
+
 void iceberg_table_close(TableHandle* h) noexcept;
 
 // The parsed metadata.json behind an open table — schemas, partition specs,

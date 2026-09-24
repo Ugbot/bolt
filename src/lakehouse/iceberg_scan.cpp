@@ -374,6 +374,58 @@ bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
     return true;
 }
 
+namespace {
+
+// "s3://bucket/wh/ns/t" -> "wh/ns/t": object-store keys are bucket-relative.
+bool key_prefix_from_location(const char* location, char* out,
+                              uint32_t cap) noexcept {
+    assert(location != nullptr && out != nullptr);
+    assert(cap > 0u);
+    const char* sep = std::strstr(location, "://");
+    if (sep == nullptr) return false;
+    const char* p = std::strchr(sep + 3, '/');
+    if (p == nullptr) return false;
+    while (*p == '/') ++p;
+    size_t n = std::strlen(p);
+    while (n > 0u && p[n - 1u] == '/') --n;
+    if (n == 0u || n + 1u > cap) return false;
+    std::memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
+}
+
+}  // namespace
+
+bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
+                                 const ObjectStore* store,
+                                 const char* table_key_prefix,
+                                 const uint8_t* metadata_json,
+                                 uint32_t metadata_len) noexcept {
+    assert(out != nullptr && arena != nullptr);
+    assert(store != nullptr && store->vt != nullptr);
+    *out = nullptr;
+    if (metadata_json == nullptr || metadata_len == 0u) return false;
+    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    if (h == nullptr) return false;
+    std::memset(h, 0, sizeof(*h));
+    h->arena = arena;
+    h->os = *store;
+    if (!metadata_parse(metadata_json, metadata_len, arena, &h->meta))
+        return false;
+    if (table_key_prefix != nullptr) {
+        const size_t n = std::strlen(table_key_prefix);
+        if (n == 0u || n + 1u > sizeof(h->table_rel)) return false;
+        std::memcpy(h->table_rel, table_key_prefix, n + 1u);
+    } else if (!key_prefix_from_location(h->meta.location, h->table_rel,
+                                         sizeof(h->table_rel))) {
+        return false;
+    }
+    h->meta_loaded = true;
+    assert(h->table_rel[0] != '\0' && h->fs_root[0] == '\0');
+    *out = h;
+    return true;
+}
+
 void iceberg_table_close(TableHandle* /*h*/) noexcept {}
 
 const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept {

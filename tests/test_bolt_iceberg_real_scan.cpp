@@ -423,3 +423,50 @@ TEST(IcebergRealScan, PruneEverythingIsCleanEof) {
     iceberg_scan_close(sh);
     iceberg_table_close(th);
 }
+
+// G2ICE-31: a REST catalog hands back the metadata document and an object
+// store, not a filesystem catalog. Same table, same rows, via that entry.
+TEST(IcebergRealScan, OpenOnStoreFromMetadataDocumentMatchesCatalogOpen) {
+    Arena arena;
+    FilesystemObjectStore fso{};
+    ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fso, warehouse_root(), &os));
+    const uint8_t* meta = nullptr;
+    uint64_t meta_len = 0;
+    ASSERT_EQ(os_get(&os,
+                     "db/trades/metadata/"
+                     "00002-b00d0cb3-a57c-4208-9373-ab87144fd133.metadata.json",
+                     &arena, &meta, &meta_len),
+              kOsOk);
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(iceberg_table_open_on_store(&th, &arena, &os, "db/trades", meta,
+                                            static_cast<uint32_t>(meta_len)));
+    ASSERT_EQ(iceberg_table_metadata(th)->n_snapshots, 2u);
+    ScanHandle* sh = nullptr;
+    ASSERT_TRUE(iceberg_scan_open(&sh, th, nullptr));
+    std::map<int64_t, Row> rows;
+    uint32_t batches = 0;
+    ASSERT_TRUE(drain(sh, &rows, &batches));
+    EXPECT_EQ(batches, 5u);
+    ASSERT_EQ(rows.size(), 9u);
+    EXPECT_EQ(rows[7].sym, "AAPL");
+    EXPECT_DOUBLE_EQ(rows[9].price, 251.0);
+    iceberg_scan_close(sh);
+    iceberg_table_close(th);
+}
+
+TEST(IcebergRealScan, OpenOnStoreRefusesWhatItCannotResolve) {
+    Arena arena;
+    FilesystemObjectStore fso{};
+    ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fso, warehouse_root(), &os));
+    TableHandle* th = nullptr;
+    EXPECT_FALSE(iceberg_table_open_on_store(&th, &arena, &os, "db/trades",
+                                             nullptr, 0u));
+    const char bad[] = "{\"format-version\":2}";
+    EXPECT_FALSE(iceberg_table_open_on_store(
+        &th, &arena, &os, nullptr, reinterpret_cast<const uint8_t*>(bad),
+        static_cast<uint32_t>(sizeof(bad) - 1u)));
+    EXPECT_EQ(th, nullptr);
+}
