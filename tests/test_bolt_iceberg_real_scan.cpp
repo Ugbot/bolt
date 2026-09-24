@@ -423,3 +423,98 @@ TEST(IcebergRealScan, PruneEverythingIsCleanEof) {
     iceberg_scan_close(sh);
     iceberg_table_close(th);
 }
+
+// ---------------------------------------------------------------------------
+// G2ICE-29: the same scan through a caller-supplied store. Every byte must come
+// through that store's vtable — the seam a synthesizing store plugs into.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct CountingStore {
+    ObjectStore inner;
+    uint32_t    gets = 0;
+    uint32_t    lists = 0;
+};
+
+int counting_get(void* impl, const char* key, Arena* a, const uint8_t** d,
+                 uint64_t* n) noexcept {
+    auto* c = static_cast<CountingStore*>(impl);
+    ++c->gets;
+    return os_get(&c->inner, key, a, d, n);
+}
+int counting_list(void* impl, const char* prefix, ObjectEntry* out,
+                  uint32_t cap, uint32_t* n) noexcept {
+    auto* c = static_cast<CountingStore*>(impl);
+    ++c->lists;
+    return os_list(&c->inner, prefix, out, cap, n);
+}
+int refuse_put(void*, const char*, const uint8_t*, uint64_t) noexcept {
+    return kOsNotImplemented;
+}
+int refuse_delete(void*, const char*) noexcept { return kOsNotImplemented; }
+int refuse_head(void*, const char*, ObjectMeta*) noexcept {
+    return kOsNotImplemented;
+}
+
+const ObjectStoreVT kCountingVT = {counting_get, refuse_put, counting_list,
+                                   refuse_delete, refuse_head, nullptr};
+
+}  // namespace
+
+TEST(IcebergRealScan, OpenThroughSuppliedStoreMatchesCatalogOpen) {
+    Arena arena;
+    FilesystemObjectStore fos{};
+    CountingStore cs{};
+    ASSERT_TRUE(filesystem_object_store_init(&fos, warehouse_root(), &cs.inner));
+    const ObjectStore store{&kCountingVT, &cs};
+
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(iceberg_table_open_store(&th, &arena, &store, "db/trades"));
+    ScanHandle* sh = nullptr;
+    ASSERT_TRUE(iceberg_scan_open(&sh, th, nullptr));
+    std::map<int64_t, Row> via_store;
+    uint32_t batches = 0;
+    ASSERT_TRUE(drain(sh, &via_store, &batches));
+    iceberg_scan_close(sh);
+    iceberg_table_close(th);
+
+    Arena arena2;
+    FilesystemCatalog fs{};
+    Catalog cat{};
+    TableHandle* th2 = nullptr;
+    ScanHandle* sh2 = nullptr;
+    ASSERT_TRUE(open_scan(&arena2, &fs, &cat, &th2, &sh2, nullptr));
+    std::map<int64_t, Row> via_catalog;
+    uint32_t batches2 = 0;
+    ASSERT_TRUE(drain(sh2, &via_catalog, &batches2));
+
+    ASSERT_EQ(via_store.size(), 9u);
+    ASSERT_EQ(via_store.size(), via_catalog.size());
+    for (const auto& [id, r] : via_catalog) {
+        const auto it = via_store.find(id);
+        ASSERT_NE(it, via_store.end()) << id;
+        EXPECT_EQ(it->second.sym, r.sym) << id;
+        EXPECT_EQ(it->second.price_null, r.price_null) << id;
+        EXPECT_EQ(it->second.price, r.price) << id;
+        EXPECT_EQ(it->second.active_null, r.active_null) << id;
+        EXPECT_EQ(it->second.active, r.active) << id;
+    }
+    EXPECT_EQ(via_store.at(8).sym, "TSLA");
+    EXPECT_EQ(via_store.at(4).price, 311.75);
+    // metadata + 2 manifest lists' worth of manifests + 5 data files, at least.
+    EXPECT_GE(cs.gets, 1u + 2u + 5u);
+    EXPECT_GE(cs.lists, 1u);
+}
+
+TEST(IcebergRealScan, OpenThroughSuppliedStoreRefusesMissingTable) {
+    Arena arena;
+    FilesystemObjectStore fos{};
+    CountingStore cs{};
+    ASSERT_TRUE(filesystem_object_store_init(&fos, warehouse_root(), &cs.inner));
+    const ObjectStore store{&kCountingVT, &cs};
+    TableHandle* th = nullptr;
+    EXPECT_FALSE(iceberg_table_open_store(&th, &arena, &store, "db/nope"));
+    EXPECT_EQ(th, nullptr);
+    EXPECT_FALSE(iceberg_table_open_store(&th, &arena, &store, ""));
+}

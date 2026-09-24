@@ -28,6 +28,13 @@ struct Metadata;
 bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                         const char* namespace_, const char* name) noexcept;
 
+// Open a table through a caller-supplied store instead of a catalog-rooted
+// filesystem. `table_rel` is the table's key prefix in that store (it holds
+// `metadata/`); the store is copied into the handle and must outlive it.
+bool iceberg_table_open_store(TableHandle** out, Arena* arena,
+                              const ObjectStore* store,
+                              const char* table_rel) noexcept;
+
 void iceberg_table_close(TableHandle* h) noexcept;
 
 // The parsed metadata.json behind an open table — schemas, partition specs,
