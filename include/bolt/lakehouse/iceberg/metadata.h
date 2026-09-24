@@ -17,6 +17,10 @@ static constexpr uint32_t kIcebergMaxFieldsPerSchema = 256u;
 static constexpr uint32_t kIcebergMaxLocation   = 1024u;
 static constexpr uint32_t kIcebergMaxUuid       = 64u;
 static constexpr uint32_t kIcebergMaxTypeName   = 32u;
+// Oldest entries are dropped past these caps, like Java's
+// write.metadata.previous-versions-max.
+static constexpr uint32_t kIcebergMaxSnapshotLog = 128u;
+static constexpr uint32_t kIcebergMaxMetadataLog = 64u;
 
 struct SchemaField {
     int32_t  id;
@@ -30,6 +34,19 @@ struct Schema {
     int32_t      schema_id;
     uint32_t     n_fields;
     SchemaField  fields[kIcebergMaxFieldsPerSchema];
+};
+
+// One `snapshot-log` entry: `snapshot_id` became current at `timestamp_ms`.
+struct SnapshotLogEntry {
+    int64_t timestamp_ms;
+    int64_t snapshot_id;
+};
+
+// One `metadata-log` entry: a superseded metadata file and its
+// last-updated-ms.
+struct MetadataLogEntry {
+    int64_t timestamp_ms;
+    char    metadata_file[kIcebergMaxManifestPath];
 };
 
 struct Metadata {
@@ -58,6 +75,11 @@ struct Metadata {
     uint32_t      n_sort_orders;
     uint32_t      _pad4;
     SortOrder     sort_orders[kIcebergMaxSortOrders];
+
+    uint32_t         n_snapshot_log;
+    uint32_t         n_metadata_log;
+    SnapshotLogEntry snapshot_log[kIcebergMaxSnapshotLog];
+    MetadataLogEntry metadata_log[kIcebergMaxMetadataLog];
 };
 
 }  // namespace iceberg
@@ -73,6 +95,12 @@ namespace iceberg {
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                     Metadata* out) noexcept;
 const Schema* metadata_current_schema(const Metadata* m) noexcept;
+
+// Append to a history log, dropping the oldest entry when full.
+void metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
+                                int64_t snapshot_id) noexcept;
+void metadata_metadata_log_push(Metadata* m,
+                                const MetadataLogEntry* e) noexcept;
 
 // Serialize a Metadata POD to Iceberg's `metadata.json`, allocated in `a`.
 // The inverse of `metadata_parse`. Previously defined but never declared in a

@@ -449,15 +449,64 @@ bool emit_name_mapping_json(Arena* a, const Schema* s,
     return true;
 }
 
+// snapshot-log, in timestamp order: Java rejects an unsorted log.
+bool emit_snapshot_log(Buf* b, const Metadata* m) noexcept {
+    assert(b != nullptr && m != nullptr);
+    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    uint32_t order[kIcebergMaxSnapshotLog];
+    for (uint32_t i = 0; i < m->n_snapshot_log; ++i) {          // bounded
+        uint32_t j = i;
+        while (j > 0 && m->snapshot_log[order[j - 1u]].timestamp_ms >
+                            m->snapshot_log[i].timestamp_ms) {
+            order[j] = order[j - 1u];
+            --j;
+        }
+        order[j] = i;
+    }
+    if (!buf_put(b, "\"snapshot-log\":[")) return false;
+    for (uint32_t i = 0; i < m->n_snapshot_log; ++i) {
+        const SnapshotLogEntry& e = m->snapshot_log[order[i]];
+        if (!buf_fmt(b, "%s{\"timestamp-ms\":%lld,\"snapshot-id\":%lld}",
+                     i > 0 ? "," : "",
+                     static_cast<long long>(e.timestamp_ms),
+                     static_cast<long long>(e.snapshot_id))) return false;
+    }
+    return buf_put(b, "],");
+}
+
+// metadata-log, with `pending` (the file this emit supersedes) appended and
+// the oldest entries dropped to stay within the cap.
+bool emit_metadata_log(Buf* b, const Metadata* m,
+                       const MetadataLogEntry* pending) noexcept {
+    assert(b != nullptr && m != nullptr);
+    assert(m->n_metadata_log <= kIcebergMaxMetadataLog);
+    const uint32_t total = m->n_metadata_log + (pending != nullptr ? 1u : 0u);
+    const uint32_t skip  = total > kIcebergMaxMetadataLog
+                               ? total - kIcebergMaxMetadataLog : 0u;
+    if (!buf_put(b, "\"metadata-log\":[")) return false;
+    for (uint32_t i = skip; i < total; ++i) {
+        const MetadataLogEntry& e = i < m->n_metadata_log ? m->metadata_log[i]
+                                                          : *pending;
+        if (!buf_fmt(b, "%s{\"timestamp-ms\":%lld,", i > skip ? "," : "",
+                     static_cast<long long>(e.timestamp_ms))) return false;
+        if (!buf_kv_str(b, "metadata-file", e.metadata_file, false))
+            return false;
+        if (!buf_put(b, "}")) return false;
+    }
+    return buf_put(b, "],");
+}
+
 }  // namespace
 
 bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         bool is_view, const char* view_dialect,
                         const char* view_sql, int64_t view_version_id,
+                        const MetadataLogEntry* pending_prev,
                         Arena* a, const uint8_t** out, uint64_t* out_len) noexcept {
     assert(m != nullptr && a != nullptr && out != nullptr && out_len != nullptr);
     Buf b;
-    if (!buf_init(&b, a, 64u * 1024u)) return false;
+    // Worst case: 64 snapshots + 64 metadata-log entries at 1 KiB paths.
+    if (!buf_init(&b, a, 256u * 1024u)) return false;
     if (!buf_fmt(&b, "{\"format-version\":%d,", m->format_version)) return false;
     if (!buf_kv_str(&b, "table-uuid", m->table_uuid, true)) return false;
     if (!buf_kv_str(&b, "location", m->location, true)) return false;
@@ -593,6 +642,9 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
         }
     }
     if (!buf_put(&b, "},")) return false;
+
+    if (!emit_snapshot_log(&b, m)) return false;
+    if (!emit_metadata_log(&b, m, pending_prev)) return false;
 
     // snapshots
     if (!buf_put(&b, "\"snapshots\":[")) return false;
@@ -1243,9 +1295,18 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     s.schema_id          = th->meta.current_schema_id;
     std::strncpy(s.manifest_list, mlabs, sizeof(s.manifest_list) - 1u);
     th->meta.current_snapshot_id = snap_id;
+    // Saved whole (2 KiB): a push into a full log drops the oldest entry.
+    SnapshotLogEntry log_saved[kIcebergMaxSnapshotLog];
+    const uint32_t n_log_saved = th->meta.n_snapshot_log;
+    std::memcpy(log_saved, th->meta.snapshot_log,
+                sizeof(SnapshotLogEntry) * n_log_saved);
+    metadata_snapshot_log_push(&th->meta, s.timestamp_ms, snap_id);
     if (persist_metadata(th)) return true;
     // Not committed (typically a conflict): withdraw the snapshot from this
     // handle and remove the objects only this commit referenced.
+    std::memcpy(th->meta.snapshot_log, log_saved,
+                sizeof(SnapshotLogEntry) * n_log_saved);
+    th->meta.n_snapshot_log = n_log_saved;
     --th->meta.n_snapshots;
     --th->meta.last_sequence_number;
     th->meta.current_snapshot_id = parent;
@@ -1645,6 +1706,30 @@ bool table_compact(TableHandle* th, int64_t /*target_file_size_bytes*/) noexcept
 // Snapshot expiry + orphan removal.
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Java's rule: drop every snapshot-log entry up to and including the newest
+// one whose snapshot is gone, so the log never names an expired snapshot and
+// never jumps over a hole.
+void prune_snapshot_log(Metadata* m) noexcept {
+    assert(m != nullptr);
+    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    uint32_t cut = 0;
+    for (uint32_t i = 0; i < m->n_snapshot_log; ++i) {        // bounded
+        if (snapshot_by_id(m, m->snapshot_log[i].snapshot_id) == nullptr) {
+            cut = i + 1u;
+        }
+    }
+    if (cut == 0) return;
+    const uint32_t keep = m->n_snapshot_log - cut;
+    std::memmove(&m->snapshot_log[0], &m->snapshot_log[cut],
+                 sizeof(SnapshotLogEntry) * keep);
+    m->n_snapshot_log = keep;
+    assert(m->n_snapshot_log < kIcebergMaxSnapshotLog);
+}
+
+}  // namespace
+
 bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
                             int32_t retain_last_n) noexcept {
     assert(th != nullptr);
@@ -1667,6 +1752,7 @@ bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
     if (nk == th->meta.n_snapshots) return true;   // nothing expired
     std::memcpy(th->meta.snapshots, kept, sizeof(Snapshot) * nk);
     th->meta.n_snapshots = nk;
+    prune_snapshot_log(&th->meta);
     if (nk > 0) {
         th->meta.current_snapshot_id = th->meta.snapshots[nk - 1].snapshot_id;
     } else {

@@ -22,6 +22,7 @@ struct NamedRef;
 bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         bool is_view, const char* view_dialect,
                         const char* view_sql, int64_t view_version_id,
+                        const MetadataLogEntry* pending_prev,
                         Arena* a, const uint8_t** out,
                         uint64_t* out_len) noexcept;
 
@@ -30,7 +31,7 @@ bool metadata_json_emit_plain(const Metadata* m, Arena* a,
                               const uint8_t** out, uint64_t* out_len) noexcept {
     assert(m != nullptr && a != nullptr && out != nullptr && out_len != nullptr);
     return metadata_json_emit(m, nullptr, 0u, false, nullptr, nullptr, 0,
-                              a, out, out_len);
+                              nullptr, a, out, out_len);
 }
 
 }  // namespace iceberg

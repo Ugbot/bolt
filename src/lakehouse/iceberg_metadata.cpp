@@ -3,7 +3,8 @@
 // v1 / v2 supported on read. We extract: format-version, table-uuid, location,
 // last-updated-ms, current-snapshot-id, snapshots[], schemas[]
 // (fields[{id,name,type,required}]), current-schema-id, partition-specs[] +
-// current-spec-id. v3 extras: ignored. Tiger Style.
+// current-spec-id, snapshot-log[], metadata-log[]. v3 extras: ignored.
+// Tiger Style.
 
 #include "bolt/lakehouse/iceberg/metadata.h"
 
@@ -299,6 +300,76 @@ bool parse_pspec(const bj::StructuralIndex* idx, bj::Iterator* it,
     return true;
 }
 
+// {"timestamp-ms":T,"snapshot-id":S} or {"timestamp-ms":T,"metadata-file":F}.
+bool parse_log_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
+                     int64_t* ts, int64_t* snap_id, char* file,
+                     uint32_t file_cap) noexcept {
+    assert(idx != nullptr && it != nullptr && ts != nullptr);
+    assert((snap_id != nullptr) != (file != nullptr));
+    if (bj::iter_peek(it) != bj::TokenType::BeginObject) {
+        skip_value(it); return false;
+    }
+    bj::iter_advance(it);
+    bool have_ts = false, have_ref = false;
+    uint32_t g = 0;
+    while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
+        const int32_t key = it->cursor;
+        bj::iter_advance(it);
+        if (tok_eq(idx, key, "timestamp-ms")) {
+            have_ts = read_int64(it, ts);
+        } else if (snap_id != nullptr && tok_eq(idx, key, "snapshot-id")) {
+            have_ref = read_int64(it, snap_id);
+        } else if (file != nullptr && tok_eq(idx, key, "metadata-file")) {
+            have_ref = read_str(idx, it, file, file_cap);
+        } else {
+            skip_value(it);
+        }
+    }
+    if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
+    return have_ts && have_ref;
+}
+
+bool parse_snapshot_log(const bj::StructuralIndex* idx, bj::Iterator* it,
+                        Metadata* out) noexcept {
+    assert(idx != nullptr && it != nullptr && out != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginArray) {
+        skip_value(it); return false;
+    }
+    bj::iter_advance(it);
+    uint32_t g = 0;
+    while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
+           g++ < kIterGuard) {
+        int64_t ts = 0, sid = 0;
+        if (parse_log_entry(idx, it, &ts, &sid, nullptr, 0u)) {
+            metadata_snapshot_log_push(out, ts, sid);
+        }
+    }
+    if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
+    assert(out->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    return true;
+}
+
+bool parse_metadata_log(const bj::StructuralIndex* idx, bj::Iterator* it,
+                        Metadata* out) noexcept {
+    assert(idx != nullptr && it != nullptr && out != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginArray) {
+        skip_value(it); return false;
+    }
+    bj::iter_advance(it);
+    uint32_t g = 0;
+    while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
+           g++ < kIterGuard) {
+        MetadataLogEntry e{};
+        if (parse_log_entry(idx, it, &e.timestamp_ms, nullptr,
+                            e.metadata_file, sizeof(e.metadata_file))) {
+            metadata_metadata_log_push(out, &e);
+        }
+    }
+    if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
+    assert(out->n_metadata_log <= kIcebergMaxMetadataLog);
+    return true;
+}
+
 }  // namespace
 
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
@@ -318,6 +389,7 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
     if (!bj::iter_init(&idx, &it)) return false;
     if (bj::iter_peek(&it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(&it);
+    bool saw_snapshot_log = false;
     uint32_t g = 0;
     while (bj::iter_peek(&it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it.cursor;
@@ -407,8 +479,20 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             }
             if (bj::iter_peek(&it) == bj::TokenType::EndArray)
                 bj::iter_advance(&it);
+        } else if (tok_eq(&idx, key, "snapshot-log")) {
+            saw_snapshot_log = parse_snapshot_log(&idx, &it, out);
+        } else if (tok_eq(&idx, key, "metadata-log")) {
+            parse_metadata_log(&idx, &it, out);
         } else {
             skip_value(&it);
+        }
+    }
+    // Tables bolt wrote before it emitted a snapshot-log: every bolt snapshot
+    // became current when published, so commit order IS the log.
+    if (!saw_snapshot_log) {
+        for (uint32_t i = 0; i < out->n_snapshots; ++i) {      // bounded
+            metadata_snapshot_log_push(out, out->snapshots[i].timestamp_ms,
+                                       out->snapshots[i].snapshot_id);
         }
     }
     if (out->current_schema_id < 0 && out->n_schemas > 0)
@@ -426,6 +510,35 @@ const Schema* metadata_current_schema(const Metadata* m) noexcept {
             return &m->schemas[i];
     }
     return &m->schemas[0];
+}
+
+void metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
+                                int64_t snapshot_id) noexcept {
+    assert(m != nullptr);
+    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    if (m->n_snapshot_log == kIcebergMaxSnapshotLog) {
+        std::memmove(&m->snapshot_log[0], &m->snapshot_log[1],
+                     sizeof(SnapshotLogEntry) * (kIcebergMaxSnapshotLog - 1u));
+        --m->n_snapshot_log;
+    }
+    SnapshotLogEntry& e = m->snapshot_log[m->n_snapshot_log++];
+    e.timestamp_ms = timestamp_ms;
+    e.snapshot_id  = snapshot_id;
+}
+
+void metadata_metadata_log_push(Metadata* m,
+                                const MetadataLogEntry* e) noexcept {
+    assert(m != nullptr && e != nullptr);
+    assert(m->n_metadata_log <= kIcebergMaxMetadataLog);
+    if (m->n_metadata_log == kIcebergMaxMetadataLog) {
+        std::memmove(&m->metadata_log[0], &m->metadata_log[1],
+                     sizeof(MetadataLogEntry) * (kIcebergMaxMetadataLog - 1u));
+        --m->n_metadata_log;
+    }
+    MetadataLogEntry& dst = m->metadata_log[m->n_metadata_log++];
+    dst.timestamp_ms = e->timestamp_ms;
+    std::memcpy(dst.metadata_file, e->metadata_file, sizeof(dst.metadata_file));
+    dst.metadata_file[sizeof(dst.metadata_file) - 1u] = '\0';
 }
 
 const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept {

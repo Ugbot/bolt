@@ -1,6 +1,6 @@
 // bolt/lakehouse/iceberg_commit.inc — the Iceberg writer's commit protocol
 // (G2ICE-163). Included INSIDE iceberg_writer.cpp's anonymous namespace; not
-// a standalone TU. Relies on TableHandle, now_ms and metadata_json_emit from
+// a standalone TU. Relies on TableHandle, now_ms, abs_location and metadata_json_emit from
 // the including file.
 //
 // The table version is the compare-and-swap token: metadata/v<N>.metadata.json
@@ -73,19 +73,42 @@ bool write_version_hint(ObjectStore* os, int64_t v) noexcept {
 
 bool persist_metadata(TableHandle* th) noexcept {
     assert(th != nullptr && th->arena != nullptr && th->os != nullptr);
+    assert(th->meta_version >= 0);
     const int64_t next = th->meta_version + 1;
+    // The version this commit supersedes goes on the metadata-log, stamped
+    // with that version's own last-updated-ms. Staged, not pushed, so a lost
+    // CAS leaves the handle's log untouched.
+    MetadataLogEntry prev{};
+    const bool has_prev = th->meta_version >= 1;
+    if (has_prev) {
+        char prel[64];
+        version_key(th->meta_version, prel);
+        if (!abs_location(th->root, prel, prev.metadata_file,
+                          sizeof(prev.metadata_file))) {
+            th->last_error = CommitError::kFailed;
+            return false;
+        }
+        prev.timestamp_ms = th->meta.last_updated_ms;
+    }
+    const int64_t prev_updated_ms = th->meta.last_updated_ms;
     th->meta.last_updated_ms = now_ms();
     const uint8_t* body = nullptr; uint64_t blen = 0;
     if (!metadata_json_emit(&th->meta, th->refs, th->n_refs, th->is_view,
                             th->view_dialect, th->view_sql,
-                            th->view_version_id, th->arena, &body, &blen)) {
+                            th->view_version_id, has_prev ? &prev : nullptr,
+                            th->arena, &body, &blen)) {
+        th->meta.last_updated_ms = prev_updated_ms;
         th->last_error = CommitError::kFailed;
         return false;
     }
     char rel[64];
     version_key(next, rel);
     // The CAS: v<next> is created only if no other writer created it first.
-    if (!commit_object(th, rel, body, blen)) return false;
+    if (!commit_object(th, rel, body, blen)) {
+        th->meta.last_updated_ms = prev_updated_ms;
+        return false;
+    }
+    if (has_prev) metadata_metadata_log_push(&th->meta, &prev);
     th->meta_version = next;
     th->last_error = CommitError::kNone;
     // Committed. A failed hint write does not un-commit it (readers probe).

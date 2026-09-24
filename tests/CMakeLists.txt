@@ -1746,6 +1746,14 @@ bolt_apply_hardening(test_bolt_iceberg_metadata_interop)
 add_test(NAME test_bolt_iceberg_metadata_interop
          COMMAND test_bolt_iceberg_metadata_interop)
 
+# G2ICE-6 — metadata.json snapshot-log + metadata-log: emitted, reopened,
+# bounded, pruned on expiry, withdrawn on a lost commit.
+add_executable(test_bolt_iceberg_history_logs test_bolt_iceberg_history_logs.cpp)
+target_link_libraries(test_bolt_iceberg_history_logs
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_history_logs)
+add_test(NAME test_bolt_iceberg_history_logs COMMAND test_bolt_iceberg_history_logs)
+
 # G2FEAT-125 — SCAN a real Iceberg table end to end (metadata -> manifests ->
 # Parquet -> rows) over the complete pyiceberg warehouse in
 # data/golden_iceberg_table. The test above only decodes manifests.
