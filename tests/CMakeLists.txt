@@ -224,6 +224,24 @@ add_test(NAME test_bolt_scheduler_ring_exactly_once
 set_tests_properties(test_bolt_scheduler_ring_exactly_once
                      PROPERTIES RUN_SERIAL TRUE)
 
+# G2ICE-189: concurrent producers on one Scheduler (submit + submit_range).
+add_executable(test_bolt_scheduler_multi_producer
+    test_bolt_scheduler_multi_producer.cpp)
+
+target_link_libraries(test_bolt_scheduler_multi_producer
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_scheduler_multi_producer)
+
+add_test(NAME test_bolt_scheduler_multi_producer
+         COMMAND test_bolt_scheduler_multi_producer)
+set_tests_properties(test_bolt_scheduler_multi_producer
+                     PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+
 # Deterministic simulation of the same ring (T1-L5). The complement of the
 # stress pin above: exactly one participant runs at a time and the interleaving
 # is drawn from a seed, so the result does NOT depend on the box or its load.

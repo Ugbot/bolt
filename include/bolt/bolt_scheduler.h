@@ -1,6 +1,6 @@
 // bolt_scheduler.h — Lock-free task scheduler with configurable spin policy
 //
-// Combines Venus job system patterns (SPMC ring, CAS claim, spin-then-yield,
+// Combines Venus job system patterns (MPMC ring, CAS claim, spin-then-yield,
 // job pools, range subdivision, phase barriers) with FasterAPI's I/O dispatch.
 //
 // RULES: No exceptions. No RTTI. No smart pointers. No heap on hot path.
@@ -167,6 +167,7 @@ struct TaskPool {
     struct Node { Node* next; };
 
     std::atomic<uintptr_t> head;
+    std::atomic<bool> pop_latch;
     size_t obj_size;
 
     static TaskPool* create(size_t data_size, uint32_t capacity) noexcept {
@@ -174,6 +175,7 @@ struct TaskPool {
         if (!p) return nullptr;
         p->obj_size = (data_size < sizeof(Node)) ? sizeof(Node) : data_size;
         p->head.store(0, std::memory_order_relaxed);
+        p->pop_latch.store(false, std::memory_order_relaxed);
 
         // Pre-populate
         for (uint32_t i = 0; i < capacity; ++i) {
@@ -190,7 +192,15 @@ struct TaskPool {
     }
 
     void* acquire() noexcept {
+        // Poppers are serialised: a Treiber pop is ABA-free only with one
+        // popper at a time, and Scheduler producers may be concurrent
+        // (G2ICE-189). Pushers (workers releasing) stay lock-free.
+        uint32_t spins = 0;
+        while (pop_latch.exchange(true, std::memory_order_acquire)) {
+            spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
+        }
         Node* n = pop();
+        pop_latch.store(false, std::memory_order_release);
         if (n) return static_cast<void*>(n);
         return calloc(1, obj_size);  // Pool exhausted, fallback
     }
@@ -222,7 +232,7 @@ private:
 };
 
 // ============================================================================
-// Task Ring — SPMC ring buffer (same pattern as Venus jobs.c)
+// Task Ring — MPMC ring buffer (Venus jobs.c claim + ordered multi-producer publish)
 // ============================================================================
 
 static constexpr uint32_t kTaskRingSize = config::kTaskRingSize;
@@ -251,6 +261,8 @@ enum : unsigned {
     kSubmitSpaceOk,         // space confirmed; BEFORE the slot store
     kSubmitSlotWritten,     // slot stored; before head is published
     kSubmitPublished,       // head published; submit is done
+    kSubmitReserveLost,     // lost the reservation CAS to another producer
+    kSubmitPublishWait,     // slot stored; waiting for predecessors to publish
     kClaimTailLoaded,       // tail loaded; before the head load
     kClaimNonEmpty,         // non-empty proven; before the slot copy
     kClaimCopied,           // slot copied; before the claiming CAS
@@ -265,16 +277,24 @@ struct SchedSimNoop {
     BOLT_FORCE_INLINE static void point(unsigned) noexcept {}
 };
 
+static constexpr uint32_t kTaskRingReserveRetries = 64;
+
+/// MPMC: any number of threads may submit concurrently (G2ICE-189). Producers
+/// reserve a sequence with a CAS on `reserve`, store their slot, then publish
+/// `head` strictly in reservation order, so every slot below `head` is written
+/// and the consumer protocol (copy-then-claim on `tail`) is unchanged.
 struct alignas(64) TaskRing {
     Task ring[kTaskRingSize];
 
-    alignas(64) std::atomic<uint64_t> head;   // Next slot to publish
-    alignas(64) std::atomic<uint64_t> tail;   // Last claimed slot
+    alignas(64) std::atomic<uint64_t> head;     // Published: slots < head are written
+    alignas(64) std::atomic<uint64_t> tail;     // Last claimed slot
+    alignas(64) std::atomic<uint64_t> reserve;  // Next sequence a producer may take
 
     void init() noexcept {
         memset(ring, 0, sizeof(ring));
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
+        reserve.store(0, std::memory_order_relaxed);
     }
 
     /// Submit a task (producer side). Returns false if ring is full.
@@ -284,19 +304,43 @@ struct alignas(64) TaskRing {
     /// than a copy of it; with the default policy every `Sim::point()` is an
     /// empty static function and the emitted code is byte-identical to the
     /// un-instrumented version.
+    ///
+    /// Space is checked against `tail` BEFORE the reservation CAS: tail only
+    /// grows, so a sequence reserved with `seq - tail < kTaskRingSize` still
+    /// satisfies it afterwards, and the slot it overwrites was copied by its
+    /// claimer (the invariant try_claim_and_execute_sim relies on). A lost CAS
+    /// means another producer advanced; after kTaskRingReserveRetries losses
+    /// this returns false and submit_wait retries, keeping each call bounded.
     template <class Sim>
     BOLT_FORCE_INLINE bool submit_sim(TaskFn fn, void* arg) noexcept {
-        uint64_t seq = head.load(std::memory_order_relaxed);
+        uint64_t seq = reserve.load(std::memory_order_relaxed);
         Sim::point(sched_point::kSubmitEnter);
 
-        // Backpressure: check if ring is full
-        if (seq - tail.load(std::memory_order_acquire) >= kTaskRingSize)
-            return false;
+        bool reserved = false;
+        for (uint32_t attempt = 0; attempt < kTaskRingReserveRetries; ++attempt) {
+            if (seq - tail.load(std::memory_order_acquire) >= kTaskRingSize)
+                return false;  // Backpressure: ring is full.
+            if (reserve.compare_exchange_weak(seq, seq + 1,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                reserved = true;
+                break;
+            }
+            Sim::point(sched_point::kSubmitReserveLost);
+        }
+        if (!reserved) return false;
         Sim::point(sched_point::kSubmitSpaceOk);
 
         ring[seq & kTaskRingMask] = Task{fn, arg};
         Sim::point(sched_point::kSubmitSlotWritten);
-        std::atomic_thread_fence(std::memory_order_release);
+
+        // Publish in reservation order. The acquire load chains each
+        // predecessor's slot store into our release store of head.
+        uint32_t spins = 0;
+        while (head.load(std::memory_order_acquire) != seq) {
+            Sim::point(sched_point::kSubmitPublishWait);
+            spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
+        }
+        assert(reserve.load(std::memory_order_relaxed) > seq);
         head.store(seq + 1, std::memory_order_release);
         Sim::point(sched_point::kSubmitPublished);
         return true;
@@ -540,7 +584,7 @@ struct Scheduler {
     // Submit (all noexcept, never allocate on hot path)
     // =====================================================================
 
-    /// Fire-and-forget task.
+    /// Fire-and-forget task. Safe from any number of threads concurrently.
     void submit(TaskFn fn, void* arg) noexcept {
         ring.submit_wait(fn, arg, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
