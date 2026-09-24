@@ -1,9 +1,8 @@
 // bolt/lakehouse/object_store/azure.h — Azure Blob Storage object store.
 //
 // W7. Auth: Shared Key (HMAC-SHA256 over canonical StringToSign) or SAS
-// (token appended verbatim). The signing path is fully implemented and
-// independently testable; HTTP transport is W1-stubbed (kOsNotImplemented)
-// until bolt::net grows an HTTP/1.1 client over TlsSocket.
+// (token appended verbatim). Transport is bolt::net's HTTP/1.1 client;
+// endpoint_override "http://host:port/<account>" targets Azurite.
 //
 // Canonical StringToSign (Shared Key, 2017-07-29+):
 //   VERB \n Content-Encoding \n Content-Language \n Content-Length \n

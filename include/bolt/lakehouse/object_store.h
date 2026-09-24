@@ -1,8 +1,8 @@
 // bolt/lakehouse/object_store.h — abstract object store (vtable, not virtual).
 //
 // One POD `ObjectStoreVT` of function pointers + a `void* impl` handle is the
-// trait. Two implementations in W1: filesystem (local paths) and S3 (SigV4
-// signing wired; HTTP transport stubbed as BOLT_NOT_IMPLEMENTED). All buffers
+// trait. Implementations: filesystem (local paths), S3 (SigV4 over
+// bolt::net), Azure Blob and GCS (object_store/). All buffers
 // are caller-owned / arena-allocated — no hidden heap.
 //
 // Tiger Style: PODs, ≥2 asserts/fn, no exceptions, no smart pointers.
@@ -135,7 +135,7 @@ bool filesystem_object_store_init(FilesystemObjectStore* fs, const char* root,
                                   ObjectStore* out) noexcept;
 
 // ---------------------------------------------------------------------------
-// S3 implementation — config + SigV4. Transport stubbed in W1.
+// S3 implementation — config + SigV4 over bolt::net's HTTP client.
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kS3MaxBucket   = 96u;
 static constexpr uint32_t kS3MaxRegion    = 32u;
@@ -156,9 +156,9 @@ struct S3ObjectStore {
     uint8_t  _pad[5];
 };
 
-// Initialise `s3` + bind `out`. The vtable's get/put/list/delete/head return
-// kOsNotImplemented in W1 (signing is exercised via bolt::crypto::sigv4 + the
-// s3_object_store_sign helper). Returns false on overflow of a config field.
+// Initialise `s3` + bind `out`. `endpoint` "" targets AWS; otherwise it is
+// "http[s]://host[:port][/base]" (no scheme = https). Returns false on
+// overflow of a config field.
 bool s3_object_store_init(S3ObjectStore* s3, const char* bucket,
                           const char* region, const char* access_key,
                           const char* secret_key, ObjectStore* out) noexcept;

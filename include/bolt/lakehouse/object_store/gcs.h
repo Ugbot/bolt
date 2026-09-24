@@ -11,8 +11,9 @@
 // BOLT_WITH_TLS is OFF the JWT builder returns false at runtime — there's no
 // other RSA implementation in-tree.
 //
-// HTTP transport is W1-stubbed (kOsNotImplemented). The deliverable here is
-// the auth machinery — independently testable offline.
+// Object ops go over the JSON API via bolt::net. They send `bearer_token`
+// when set; with no credentials they go anonymous (emulators). Service-account
+// token minting and HMAC auth are not wired: ops report kOsNotImplemented.
 //
 // Tiger Style: PODs, ≥2 asserts/fn, bounded everything, no heap.
 

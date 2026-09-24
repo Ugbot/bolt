@@ -1593,6 +1593,15 @@ target_link_libraries(test_bolt_lakehouse_azure_sign
 bolt_apply_hardening(test_bolt_lakehouse_azure_sign)
 add_test(NAME test_bolt_lakehouse_azure_sign COMMAND test_bolt_lakehouse_azure_sign)
 
+# G2ICE-181 — cloud stores against emulators (skip unless endpoint env set).
+add_executable(test_bolt_lakehouse_cloud_put_if_absent
+    test_bolt_lakehouse_cloud_put_if_absent.cpp)
+target_link_libraries(test_bolt_lakehouse_cloud_put_if_absent
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_cloud_put_if_absent)
+add_test(NAME test_bolt_lakehouse_cloud_put_if_absent
+    COMMAND test_bolt_lakehouse_cloud_put_if_absent)
+
 add_executable(test_bolt_lakehouse_gcs_jwt test_bolt_lakehouse_gcs_jwt.cpp)
 target_link_libraries(test_bolt_lakehouse_gcs_jwt
     PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)

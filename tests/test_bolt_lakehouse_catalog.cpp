@@ -124,14 +124,20 @@ TEST(BoltLakehouseObjectStore, FilesystemPutGetListDelete) {
     std::filesystem::remove_all(root, ec);
 }
 
-TEST(BoltLakehouseObjectStore, S3StubsNotImplemented) {
+// Live-endpoint behaviour is in test_bolt_lakehouse_cloud_put_if_absent; an
+// unreachable endpoint must surface as an I/O error, never a silent success.
+TEST(BoltLakehouseObjectStore, S3UnreachableEndpointIsIoError) {
     S3ObjectStore s3;
     ObjectStore os;
     ASSERT_TRUE(s3_object_store_init(&s3, "my-bucket", "us-east-1",
                                      "AKID", "SECRET", &os));
+    std::strcpy(s3.endpoint, "http://127.0.0.1:1");
+    s3.path_style = true;
     ObjectMeta meta;
-    EXPECT_EQ(os_head(&os, "k", &meta), kOsNotImplemented);
-    EXPECT_EQ(os_delete(&os, "k"), kOsNotImplemented);
+    EXPECT_EQ(os_head(&os, "k", &meta), kOsIoError);
+    EXPECT_EQ(os_delete(&os, "k"), kOsIoError);
+    const uint8_t b = 'x';
+    EXPECT_EQ(os_put_if_absent(&os, "k", &b, 1), kOsIoError);
 }
 
 }  // namespace
