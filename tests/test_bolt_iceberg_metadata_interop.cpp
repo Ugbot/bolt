@@ -310,6 +310,61 @@ TEST(IcebergMetadataInterop, SnapshotsRecordTheSchemaTheyWereCommittedUnder) {
     table_close(th);
 }
 
+// G2ICE-177: a root snapshot has no parent, so the spec's optional
+// "parent-snapshot-id" is absent -- never -1, which pyiceberg reports as a
+// dangling parent. The child must still name the root, and the reader must
+// map the absent field back to -1.
+TEST(IcebergMetadataInterop, RootSnapshotOmitsParentSnapshotId) {
+    bolt::Arena arena;
+    const std::string root = fresh_root("ancestry");
+    FilesystemObjectStore fs{};
+    ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    Schema sch = make_schema();
+    PartitionSpec spec{}; spec.spec_id = 0; spec.n_fields = 0;
+    SortOrder sort{};     sort.order_id = 0; sort.n_fields = 0;
+    WriteOptions wo;      write_options_init(&wo);
+    TableHandle* th = nullptr;
+    ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, &spec,
+                             &sort, &wo));
+    for (int32_t n : {4, 6}) {
+        AppendHandle* ah = nullptr;
+        ASSERT_TRUE(append_open(&ah, th));
+        auto* b = arena.allocate_array<bolt::BoltBatch>(1);
+        ASSERT_NE(b, nullptr);
+        make_batch(&arena, b, n);
+        ASSERT_TRUE(append_write(ah, b));
+        ASSERT_TRUE(append_commit(ah));
+        append_close(ah);
+    }
+    const Metadata* m = table_metadata(th);
+    ASSERT_EQ(m->n_snapshots, 2u);
+    const long long root_id = static_cast<long long>(m->snapshots[0].snapshot_id);
+    const long long child_id = static_cast<long long>(m->snapshots[1].snapshot_id);
+    table_close(th);
+
+    const std::string j = read_latest_metadata(root);
+    ASSERT_FALSE(j.empty());
+    EXPECT_FALSE(has(j, "\"parent-snapshot-id\":-1")) << j;
+    const std::string root_obj = "{\"snapshot-id\":" + std::to_string(root_id) + ",";
+    const size_t at = j.find(root_obj);
+    ASSERT_NE(at, std::string::npos) << j;
+    const size_t end = j.find('}', at);
+    EXPECT_EQ(j.substr(at, end - at).find("parent-snapshot-id"), std::string::npos)
+        << "root snapshot names a parent\n" << j;
+    const std::string child_obj = "{\"snapshot-id\":" + std::to_string(child_id) +
+        ",\"parent-snapshot-id\":" + std::to_string(root_id) + ",";
+    EXPECT_TRUE(has(j, child_obj.c_str())) << j;
+
+    TableHandle* th2 = nullptr;
+    ASSERT_TRUE(table_open(&th2, &arena, &os, root.c_str()));
+    const Metadata* m2 = table_metadata(th2);
+    ASSERT_EQ(m2->n_snapshots, 2u);
+    EXPECT_EQ(m2->snapshots[0].parent_snapshot_id, -1);
+    EXPECT_EQ(static_cast<long long>(m2->snapshots[1].parent_snapshot_id), root_id);
+    table_close(th2);
+}
+
 // Discriminating power: the assertion above must be able to FAIL. A schema
 // object that carries only "schema-id" and "fields" — exactly what bolt
 // emitted before this fix — is rejected by the same predicate, so a green run
