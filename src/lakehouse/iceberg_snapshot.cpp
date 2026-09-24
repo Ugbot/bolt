@@ -22,6 +22,16 @@ const Snapshot* snapshot_by_id(const Metadata* m, int64_t snapshot_id) noexcept 
 const Snapshot* snapshot_at_timestamp(const Metadata* m,
                                       int64_t ts_ms) noexcept {
     assert(m != nullptr);
+    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    // The snapshot-log says what was CURRENT at ts; snapshots[] also holds
+    // snapshots that never were (branch commits). Prefer it, newest first.
+    for (uint32_t i = m->n_snapshot_log; i > 0; --i) {
+        const SnapshotLogEntry& e = m->snapshot_log[i - 1u];
+        if (e.timestamp_ms > ts_ms) continue;
+        const Snapshot* s = snapshot_by_id(m, e.snapshot_id);
+        if (s != nullptr) return s;
+        break;   // expired: fall back to the snapshots[] scan
+    }
     const Snapshot* best = nullptr;
     int64_t best_ts = -1;
     for (uint32_t i = 0; i < m->n_snapshots; ++i) {

@@ -39,9 +39,12 @@ emitted:
 Exit 0 = pass, 1 = a real mismatch, 2 = the oracle is not installed (SKIP).
 """
 import glob
+import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 N_ROWS = 12
 # G2ICE-82: after the two appends the fixture commits an Iceberg v2 POSITIONAL
@@ -68,6 +71,104 @@ def latest_metadata(root):
         if m and int(m.group(1)) > best_v:
             best, best_v = p, int(m.group(1))
     return best
+
+
+# G2ICE-6: live row count after each snapshot, from the generating rules --
+# two 6-row appends, then the positional delete.
+SNAPSHOT_ROWS = [6, 12, 11]
+
+
+def check_history(root, meta):
+    """snapshot-log / metadata-log, read through pyiceberg's own model and used
+    for time travel by pyiceberg and DuckDB. Returns [] or errors."""
+    from pyiceberg.table import StaticTable
+
+    errs = []
+    table = StaticTable.from_metadata(meta)
+    md = table.metadata
+    snaps = [s.snapshot_id for s in md.snapshots]
+    hist = table.history()
+    if len(hist) != len(SNAPSHOT_ROWS):
+        errs.append("snapshot-log has %d entries, expected %d"
+                    % (len(hist), len(SNAPSHOT_ROWS)))
+        return errs
+    if [h.snapshot_id for h in hist] != snaps:
+        errs.append("snapshot-log order %r != commit order %r"
+                    % ([h.snapshot_id for h in hist], snaps))
+    ts = [h.timestamp_ms for h in hist]
+    for i, h in enumerate(hist):
+        # Ties at one millisecond resolve to the newest snapshot at that ms.
+        j = max(k for k in range(len(ts)) if ts[k] == h.timestamp_ms)
+        s = table.snapshot_as_of_timestamp(h.timestamp_ms)
+        if s is None:
+            errs.append("snapshot_as_of_timestamp(%d) found nothing"
+                        % h.timestamp_ms)
+            continue
+        n = table.scan(snapshot_id=s.snapshot_id).to_arrow().num_rows
+        if n != SNAPSHOT_ROWS[j]:
+            errs.append("as-of %d: %d rows, expected %d"
+                        % (h.timestamp_ms, n, SNAPSHOT_ROWS[j]))
+
+    latest_v = int(re.search(r"v(\d+)\.metadata\.json$", meta).group(1))
+    mlog = md.metadata_log
+    if len(mlog) != latest_v - 1:
+        errs.append("metadata-log has %d entries, expected %d (v1..v%d)"
+                    % (len(mlog), latest_v - 1, latest_v - 1))
+        return errs
+    prev_ts = 0
+    for k, e in enumerate(mlog, start=1):
+        want = os.path.join(root, "metadata", "v%d.metadata.json" % k)
+        if os.path.normpath(e.metadata_file) != os.path.normpath(want):
+            errs.append("metadata-log[%d] = %s, expected %s"
+                        % (k - 1, e.metadata_file, want))
+            continue
+        if not os.path.exists(want):
+            errs.append("metadata-log names a missing file: %s" % want)
+            continue
+        with open(want) as f:
+            own = json.load(f)["last-updated-ms"]
+        if e.timestamp_ms != own:
+            errs.append("metadata-log[%d] timestamp %d != that file's "
+                        "last-updated-ms %d" % (k - 1, e.timestamp_ms, own))
+        if e.timestamp_ms < prev_ts:
+            errs.append("metadata-log not in time order at %d" % (k - 1))
+        prev_ts = e.timestamp_ms
+    if prev_ts > md.last_updated_ms:
+        errs.append("metadata-log newer than last-updated-ms")
+    return errs
+
+
+def check_duckdb_history(meta):
+    """DuckDB time travel to every snapshot. None = not installed."""
+    try:
+        import duckdb
+        con = duckdb.connect()
+        con.execute("INSTALL iceberg; LOAD iceberg;")
+    except Exception:
+        return None
+    with open(meta) as f:
+        snaps = [s["snapshot-id"] for s in json.load(f)["snapshots"]]
+    errs = []
+    for i, sid in enumerate(snaps):
+        n = con.execute("SELECT count(*) FROM iceberg_scan('%s', "
+                        "snapshot_from_id=%d)" % (meta, sid)).fetchone()[0]
+        if n != SNAPSHOT_ROWS[i]:
+            errs.append("duckdb snapshot %d: %d rows, expected %d"
+                        % (sid, n, SNAPSHOT_ROWS[i]))
+    return errs
+
+
+def history_stripped(root, meta):
+    """The pre-G2ICE-6 shape: no snapshot-log, no metadata-log."""
+    with open(meta) as f:
+        doc = json.load(f)
+    doc.pop("snapshot-log", None)
+    doc.pop("metadata-log", None)
+    tmp = tempfile.mkdtemp(prefix="bolt_ice_hist_")
+    path = os.path.join(tmp, os.path.basename(meta))
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    return tmp, path
 
 
 def check(root, mutate=None):
@@ -151,6 +252,29 @@ def main():
         if not check(root, mutate=mut):
             print("FAIL: injection not caught -- %s" % name)
             return 1
+
+    meta = latest_metadata(root)
+    errs = check_history(root, meta)
+    if errs:
+        print("FAIL: history logs of %s" % meta)
+        for e in errs:
+            print("  " + e)
+        return 1
+    tmp, stripped = history_stripped(root, meta)
+    try:
+        if not check_history(root, stripped):
+            print("FAIL: injection not caught -- history logs removed")
+            return 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    derrs = check_duckdb_history(meta)
+    if derrs:
+        print("FAIL: duckdb time travel")
+        for e in derrs:
+            print("  " + e)
+        return 1
+    print("PASS: snapshot-log/metadata-log drive pyiceberg as-of reads%s"
+          % ("" if derrs is None else " and duckdb time travel"))
 
     print("PASS: pyiceberg read %d rows value-for-value from %s" % (N_ROWS - 1, root))
     print("      (deleted row %d absent; 4 injections caught)" % (1000 + DELETED_ROW))
