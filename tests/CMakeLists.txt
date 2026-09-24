@@ -1893,6 +1893,14 @@ target_link_libraries(test_bolt_arena_concurrent
 bolt_apply_hardening(test_bolt_arena_concurrent)
 add_test(NAME test_bolt_arena_concurrent COMMAND test_bolt_arena_concurrent)
 
+# TypedBatchPool / ArenaRing slot lifetime (G2CHK-148: eager per-slot Arena()
+# at pool construction, dropped by acquire's placement-new -> 4 MiB leaks).
+add_executable(test_bolt_pool_lifecycle test_bolt_pool_lifecycle.cpp)
+target_link_libraries(test_bolt_pool_lifecycle
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_pool_lifecycle)
+add_test(NAME test_bolt_pool_lifecycle COMMAND test_bolt_pool_lifecycle)
+
 # SwissTableGrowable — growable/erasable SwissTable sibling (G2CHK-85 audit:
 # the fd→handler registries in src/api/net event loops needed a live
 # insert/erase table; std::unordered_map is banned on hot paths).

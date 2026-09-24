@@ -43,11 +43,17 @@
 
 namespace bolt {
 
+// Union: see TypedBatchPoolSlot — Arena is constructed only by `acquire`.
 struct alignas(64) ArenaRingSlot {
-    Arena    arena;
+    union { Arena arena; };
     uint32_t next_free_idx;   // UINT32_MAX = end-of-stack
     uint8_t  initialized;
     uint8_t  _pad[3];
+
+    ArenaRingSlot() noexcept : next_free_idx(0xFFFFFFFFu), initialized(0u) {}
+    ~ArenaRingSlot() noexcept {}
+    ArenaRingSlot(const ArenaRingSlot&) = delete;
+    ArenaRingSlot& operator=(const ArenaRingSlot&) = delete;
 };
 
 static constexpr uint32_t kArenaRingEmptyIdx = 0xFFFFFFFFu;
@@ -68,6 +74,11 @@ struct alignas(64) ArenaRing {
     alignas(64) std::atomic<uint32_t> slots_used;
     ArenaConfig                       arena_cfg;
     Slot                              slots[Capacity];
+
+    ArenaRing() noexcept = default;
+    ~ArenaRing() noexcept { destroy(); }
+    ArenaRing(const ArenaRing&) = delete;
+    ArenaRing& operator=(const ArenaRing&) = delete;
 
     BOLT_FORCE_INLINE void init(ArenaConfig cfg = ArenaConfig{}) noexcept {
         arena_cfg = cfg;
