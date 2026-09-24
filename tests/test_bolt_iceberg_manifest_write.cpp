@@ -339,3 +339,138 @@ TEST(IcebergManifestWrite, NonNullContainerNeedsPayloadBytes) {
     EXPECT_NE(std::search(dst, dst + len, payload, payload + sizeof(payload)),
              dst + len);
 }
+
+namespace {
+
+ice::PartitionSpec make_truncate_spec(int32_t width) {
+    ice::PartitionSpec spec{};
+    spec.spec_id  = 1;
+    spec.n_fields = 1;
+    spec.fields[0].source_id = 1;
+    spec.fields[0].field_id  = 1000;
+    spec.fields[0].transform.kind  = ice::TransformKind::kTruncate;
+    spec.fields[0].transform.param = width;
+    std::snprintf(spec.fields[0].name, sizeof(spec.fields[0].name), "%s",
+                  "id_trunc");
+    return spec;
+}
+
+void set_part(ice::DataFileRef* d, int64_t v) {
+    d->n_partition = 1;
+    d->partition_spec_id = 1;
+    d->partition[0].field_id = 0;
+    d->partition[0].is_int   = true;
+    d->partition[0].i64      = v;
+}
+
+bool contains(const uint8_t* buf, uint64_t len, const char* needle) {
+    const size_t n = std::strlen(needle);
+    return std::search(buf, buf + len, needle, needle + n) != buf + len;
+}
+
+}  // namespace
+
+// G2ICE-39 — a partitioned manifest carries each file's tuple value, and its
+// schema + partition-spec metadata are derived from the same spec.
+TEST(IcebergManifestWrite, PartitionedRoundTrip) {
+    bolt::Arena arena;
+    ice::DataFileRef in[2] = {
+        make_file("s3://wh/db/t/data/r-0.parquet", 10, 100, 5),
+        make_file("s3://wh/db/t/data/r-1.parquet", 20, 200, 5),
+    };
+    set_part(&in[0], -86400000);
+    set_part(&in[1], 172800000);
+    const ice::PartitionSpec spec = make_truncate_spec(86400000);
+    const ice::PartitionAvroType types[1] = {ice::PartitionAvroType::kLong};
+
+    const uint8_t* buf = nullptr;
+    uint64_t len = 0;
+    ASSERT_TRUE(ice::manifest_write_avro_partitioned(
+        in, 2, 5, 5, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, types,
+        &arena, &buf, &len));
+
+    EXPECT_TRUE(contains(buf, len,
+        "{\"name\":\"id_trunc\",\"field-id\":1000,\"type\":[\"null\",\"long\"]"));
+    EXPECT_TRUE(contains(buf, len,
+        "[{\"name\":\"id_trunc\",\"transform\":\"truncate[86400000]\","
+        "\"source-id\":1,\"field-id\":1000}]"));
+
+    ice::DataFileRef out[4]{};
+    uint32_t n = 0;
+    ASSERT_TRUE(ice::manifest_parse_avro(buf, len, &arena, 1, out, 4, &n));
+    ASSERT_EQ(n, 2u);
+    ASSERT_EQ(out[0].n_partition, 1u);
+    ASSERT_EQ(out[1].n_partition, 1u);
+    EXPECT_TRUE(out[0].partition[0].is_int);
+    EXPECT_EQ(out[0].partition[0].i64, -86400000);
+    EXPECT_EQ(out[1].partition[0].i64, 172800000);
+    // Fields after the tuple must not shift.
+    EXPECT_STREQ(out[1].file_path, "s3://wh/db/t/data/r-1.parquet");
+    EXPECT_EQ(out[1].stats.record_count, 20);
+    EXPECT_EQ(out[1].stats.file_size_in_bytes, 200);
+}
+
+// Zero fields is the unpartitioned manifest, byte for byte.
+TEST(IcebergManifestWrite, EmptySpecMatchesUnpartitioned) {
+    bolt::Arena arena;
+    ice::DataFileRef in = make_file("s3://wh/db/t/data/b-1.parquet", 5, 99, 1);
+    ice::PartitionSpec spec{};
+    const uint8_t* a = nullptr;
+    const uint8_t* b = nullptr;
+    uint64_t la = 0, lb = 0;
+    ASSERT_TRUE(ice::manifest_write_avro(&in, 1, 1, 1, kSchemaJson,
+                                         sizeof(kSchemaJson) - 1u, 0, &arena,
+                                         &a, &la));
+    ASSERT_TRUE(ice::manifest_write_avro_partitioned(
+        &in, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, nullptr,
+        &arena, &b, &lb));
+    ASSERT_EQ(la, lb);
+    EXPECT_EQ(std::memcmp(a, b, la), 0);
+}
+
+// Every shape that would write a tuple the spec does not describe fails.
+TEST(IcebergManifestWrite, PartitionedRefusals) {
+    bolt::Arena arena;
+    const ice::PartitionAvroType types[1] = {ice::PartitionAvroType::kLong};
+    const uint8_t* buf = nullptr;
+    uint64_t len = 0;
+
+    ice::DataFileRef unpart = make_file("s3://x/a.parquet", 1, 1, 1);
+    ice::PartitionSpec spec = make_truncate_spec(10);
+    EXPECT_FALSE(ice::manifest_write_avro_partitioned(
+        &unpart, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, types,
+        &arena, &buf, &len));
+
+    ice::DataFileRef str = make_file("s3://x/a.parquet", 1, 1, 1);
+    set_part(&str, 0);
+    str.partition[0].is_int = false;
+    str.partition[0].is_str = true;
+    EXPECT_FALSE(ice::manifest_write_avro_partitioned(
+        &str, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, types,
+        &arena, &buf, &len));
+
+    ice::DataFileRef ok = make_file("s3://x/a.parquet", 1, 1, 1);
+    set_part(&ok, 10);
+    ice::PartitionSpec bad_name = make_truncate_spec(10);
+    std::snprintf(bad_name.fields[0].name, sizeof(bad_name.fields[0].name),
+                  "%s", "id-trunc");
+    EXPECT_FALSE(ice::manifest_write_avro_partitioned(
+        &ok, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &bad_name, types,
+        &arena, &buf, &len));
+
+    ice::PartitionSpec bad_tf = make_truncate_spec(0);
+    EXPECT_FALSE(ice::manifest_write_avro_partitioned(
+        &ok, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &bad_tf, types,
+        &arena, &buf, &len));
+
+    const ice::PartitionAvroType int_types[1] = {ice::PartitionAvroType::kInt};
+    ice::DataFileRef wide = make_file("s3://x/a.parquet", 1, 1, 1);
+    set_part(&wide, int64_t{1} << 40);
+    EXPECT_FALSE(ice::manifest_write_avro_partitioned(
+        &wide, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, int_types,
+        &arena, &buf, &len));
+
+    EXPECT_TRUE(ice::manifest_write_avro_partitioned(
+        &ok, 1, 1, 1, kSchemaJson, sizeof(kSchemaJson) - 1u, &spec, types,
+        &arena, &buf, &len));
+}

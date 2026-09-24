@@ -4,10 +4,11 @@
 //
 // Scope, stated plainly:
 //
-//   * **format-version 2, unpartitioned, uncompressed (codec = null).** A
-//     partition spec with fields is REJECTED rather than written wrong — the
-//     partition tuple is a nested record whose shape comes from the spec, and
-//     emitting a mismatched one produces a manifest that parses and then lies.
+//   * **format-version 2, uncompressed (codec = null).** `manifest_write_avro`
+//     is unpartitioned and REJECTS a partitioned file rather than writing it
+//     wrong; `manifest_write_avro_partitioned` derives the nested partition
+//     record from the spec itself, so the tuple shape and the spec cannot
+//     disagree. Only integral partition results are written.
 //     Readers accept a null codec; the reference writer's `deflate` is not
 //     required.
 //
@@ -53,6 +54,35 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
                          uint32_t table_schema_len,
                          int32_t partition_spec_id, Arena* scratch,
                          const uint8_t** out, uint64_t* out_len) noexcept;
+
+// Result type of one partition-tuple field. Only the integral results are
+// written: identity/truncate over int/long, bucket, and year/month/day/hour.
+enum class PartitionAvroType : uint8_t {
+    kInt  = 0,
+    kLong = 1,
+};
+
+// The partitioned form of `manifest_write_avro`. `spec` supplies the tuple's
+// field names, field-ids and transforms (in spec order); `result_types` holds
+// `spec->n_fields` entries. Every file must carry exactly `spec->n_fields`
+// partition values, each integral or null, with `partition[i]` belonging to
+// `spec->fields[i]`. The manifest's `partition` record and its
+// `partition-spec` / `partition-spec-id` metadata are derived from `spec`, so
+// the three cannot disagree. A spec with zero fields writes byte-identically
+// to `manifest_write_avro`.
+//
+// Returns false on anything `manifest_write_avro` refuses, a field name that
+// is not an Avro identifier, a transform with no spelling, a string partition
+// value, or a file whose tuple arity differs from the spec's.
+bool manifest_write_avro_partitioned(const DataFileRef* files, uint32_t n_files,
+                                     int64_t snapshot_id,
+                                     int64_t sequence_number,
+                                     const char* table_schema_json,
+                                     uint32_t table_schema_len,
+                                     const PartitionSpec* spec,
+                                     const PartitionAvroType* result_types,
+                                     Arena* scratch, const uint8_t** out,
+                                     uint64_t* out_len) noexcept;
 
 // Write `n_entries` manifest-list entries (the snapshot's `snap-*.avro`).
 // `partitions` and `key_metadata` are written null; the six required
