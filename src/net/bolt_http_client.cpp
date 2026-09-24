@@ -423,8 +423,12 @@ int http_send(bolt::Arena* arena, const HttpRequest* req,
                                  "Transfer-Encoding");
     uint8_t* body = nullptr;
     uint32_t body_len = 0;
+    const bool no_body = ieq(req->method, "HEAD") || out->status == 204 ||
+                         out->status == 304 || out->status / 100 == 1;
 
-    if (cl != nullptr) {
+    if (no_body) {
+        // HEAD's Content-Length describes the entity, not bytes on the wire.
+    } else if (cl != nullptr) {
         uint32_t want = static_cast<uint32_t>(std::atoll(cl));
         if (want > kHttpMaxBody) {
             std::free(rbuf); conn_close(&conn); return -17;

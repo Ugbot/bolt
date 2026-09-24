@@ -7,13 +7,17 @@
 //   - Service-account JSON parsing (purpose-built scan for client_email +
 //     private_key — no general-purpose JSON parser).
 //
-// HTTP transport (token exchange, XML API ops) is W1-stubbed.
+// Object ops go over the JSON API via bolt::net (see the vtable below);
+// the OAuth token exchange is not wired yet.
 
 #include "bolt/lakehouse/object_store/gcs.h"
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include "object_store_http.h"
 
 #if defined(BOLT_WITH_TLS)
 #  include <openssl/bio.h>
@@ -278,52 +282,240 @@ bool parse_service_account_json(const char* json, uint32_t json_len,
 }
 
 // ---------------------------------------------------------------------------
-// ObjectStore vtable — transport stubbed.
+// ObjectStore vtable over the GCS JSON API. put_if_absent is a media upload
+// with ifGenerationMatch=0 (412 when the object exists). Requests carry
+// `bearer_token` when set; with no credentials configured they go anonymous
+// (emulators such as fake-gcs-server). Minting a token from a service
+// account, and HMAC auth, are not wired: those report kOsNotImplemented.
 // ---------------------------------------------------------------------------
 
 namespace {
 
+using oshttp::Buf;
+
+bool gc_auth(const GcsStore* g, net::HttpRequest* req, bool* ok) noexcept {
+    assert(g != nullptr && req != nullptr);
+    assert(ok != nullptr);
+    *ok = true;
+    if (g->bearer_token[0] != '\0') {
+        char h[kGcsMaxBearer + 16u];
+        std::snprintf(h, sizeof(h), "Bearer %s", g->bearer_token);
+        *ok = net::http_request_add_header(req, "Authorization", h);
+        return true;
+    }
+    const bool anonymous = g->cfg.auth_mode == AuthMode::Hmac &&
+                           g->cfg.hmac_access_id.len == 0;
+    return anonymous;
+}
+
+// `api` is "" (metadata) or "/upload"; `obj` is null for bucket-level calls.
+int gc_send(GcsStore* g, const char* verb, const char* api, const char* obj,
+            const char* query, const uint8_t* body, uint64_t len,
+            Arena* arena, net::HttpResponse* resp) noexcept {
+    assert(g != nullptr && verb != nullptr && api != nullptr);
+    assert(arena != nullptr && resp != nullptr);
+    if (len > net::kHttpMaxBody) return kOsBadArg;
+    net::HttpRequest req;
+    std::memset(&req, 0, sizeof(req));
+    bool hdr_ok = true;
+    if (!gc_auth(g, &req, &hdr_ok)) return kOsNotImplemented;
+    Buf u; oshttp::buf_init(&u, req.url, sizeof(req.url));
+    oshttp::buf_str(&u, g->cfg.endpoint_override[0] != '\0'
+                            ? g->cfg.endpoint_override
+                            : "https://storage.googleapis.com");
+    while (u.n > 0 && u.p[u.n - 1] == '/') u.p[--u.n] = '\0';
+    oshttp::buf_str(&u, api);
+    oshttp::buf_str(&u, "/storage/v1/b/");
+    oshttp::buf_pct(&u, g->cfg.bucket, false);
+    oshttp::buf_str(&u, "/o");
+    if (obj != nullptr) {
+        oshttp::buf_str(&u, "/");
+        oshttp::buf_pct(&u, obj, /*keep_slash=*/false);
+    }
+    if (query != nullptr && query[0] != '\0') {
+        oshttp::buf_str(&u, "?");
+        oshttp::buf_str(&u, query);
+    }
+    if (!u.ok || !hdr_ok) return kOsBadArg;
+    std::strncpy(req.method, verb, sizeof(req.method) - 1u);
+    req.body = body;
+    req.body_len = static_cast<uint32_t>(len);
+    if (std::strcmp(verb, "POST") == 0) {
+        bool ok = net::http_request_add_header(
+            &req, "Content-Type", "application/octet-stream");
+        if (len == 0) {
+            ok = ok && net::http_request_add_header(&req, "Content-Length",
+                                                    "0");
+        }
+        if (!ok) return kOsBadArg;
+    }
+    return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
+}
+
 int gc_get(void* impl, const char* key, Arena* arena,
            const uint8_t** out_data, uint64_t* out_len) noexcept {
-    assert(impl != nullptr);
+    assert(impl != nullptr && key != nullptr && arena != nullptr);
     assert(out_data != nullptr && out_len != nullptr);
-    (void)impl; (void)key; (void)arena;
     *out_data = nullptr;
     *out_len = 0;
-    return kOsNotImplemented;
+    net::HttpResponse resp;
+    const int rc = gc_send(static_cast<GcsStore*>(impl), "GET", "", key,
+                           "alt=media", nullptr, 0, arena, &resp);
+    if (rc != kOsOk) return rc;
+    const int st = oshttp::map_status(resp.status);
+    if (st != kOsOk) return st;
+    *out_data = resp.body;
+    *out_len = resp.body_len;
+    return kOsOk;
 }
+
+int gc_upload(void* impl, const char* key, const uint8_t* data,
+              uint64_t len, bool if_absent) noexcept {
+    assert(impl != nullptr && key != nullptr);
+    assert(data != nullptr || len == 0);
+    char qb[kOsMaxKey * 3u + 64u];
+    Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
+    oshttp::buf_str(&q, "uploadType=media&name=");
+    oshttp::buf_pct(&q, key, false);
+    if (if_absent) oshttp::buf_str(&q, "&ifGenerationMatch=0");
+    if (!q.ok) return kOsBadArg;
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = gc_send(static_cast<GcsStore*>(impl), "POST", "/upload",
+                           nullptr, qb, data, len, &scratch, &resp);
+    if (rc != kOsOk) return rc;
+    if (if_absent && resp.status == 412) return kOsExists;
+    return resp.status / 100 == 2 ? kOsOk : kOsIoError;
+}
+
 int gc_put(void* impl, const char* key, const uint8_t* data,
            uint64_t len) noexcept {
     assert(impl != nullptr);
     assert(key != nullptr);
-    (void)impl; (void)key; (void)data; (void)len;
-    return kOsNotImplemented;
+    return gc_upload(impl, key, data, len, false);
 }
+
+int gc_put_if_absent(void* impl, const char* key, const uint8_t* data,
+                     uint64_t len) noexcept {
+    assert(impl != nullptr);
+    assert(key != nullptr);
+    return gc_upload(impl, key, data, len, true);
+}
+
+// Next "field": "<string>" value at or after *pos (simple escapes only).
+bool json_field(const char* s, uint32_t len, uint32_t* pos,
+                const char* field, char* out, uint32_t cap) noexcept {
+    assert(s != nullptr && pos != nullptr && field != nullptr);
+    assert(out != nullptr && cap > 0);
+    char pat[64];
+    const int pl = std::snprintf(pat, sizeof(pat), "\"%s\"", field);
+    if (pl <= 0) return false;
+    for (uint32_t i = *pos; i + static_cast<uint32_t>(pl) <= len; ++i) {
+        if (std::memcmp(s + i, pat, static_cast<size_t>(pl)) != 0) continue;
+        uint32_t j = i + static_cast<uint32_t>(pl);
+        while (j < len && (s[j] == ' ' || s[j] == ':' || s[j] == '\n' ||
+                           s[j] == '\t' || s[j] == '\r')) ++j;
+        if (j >= len || s[j] != '"') continue;
+        uint32_t o = 0;
+        for (++j; j < len && s[j] != '"'; ++j) {
+            char c = s[j];
+            if (c == '\\') {
+                if (j + 1u >= len) return false;
+                c = s[++j];
+                if (c == 'u') return false;
+                if (c == 'n') c = '\n';
+                else if (c == 't') c = '\t';
+            }
+            if (o + 1u >= cap) return false;
+            out[o++] = c;
+        }
+        if (j >= len) return false;
+        out[o] = '\0';
+        *pos = j + 1u;
+        return true;
+    }
+    return false;
+}
+
 int gc_list(void* impl, const char* prefix, ObjectEntry* out,
             uint32_t cap, uint32_t* out_n) noexcept {
     assert(impl != nullptr);
-    assert(out_n != nullptr);
-    (void)impl; (void)prefix; (void)out; (void)cap;
+    assert(out != nullptr && out_n != nullptr);
     *out_n = 0;
-    return kOsNotImplemented;
+    GcsStore* g = static_cast<GcsStore*>(impl);
+    char token[1024] = "";
+    uint32_t count = 0;
+    for (uint32_t page = 0; page < 4096u && count < cap; ++page) {
+        char qb[4096];
+        Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
+        oshttp::buf_str(&q, "fields=items(name,size),nextPageToken&prefix=");
+        oshttp::buf_pct(&q, prefix != nullptr ? prefix : "", false);
+        if (token[0] != '\0') {
+            oshttp::buf_str(&q, "&pageToken=");
+            oshttp::buf_pct(&q, token, false);
+        }
+        if (!q.ok) return kOsBadArg;
+        Arena scratch;
+        net::HttpResponse resp;
+        const int rc = gc_send(g, "GET", "", nullptr, qb, nullptr, 0,
+                               &scratch, &resp);
+        if (rc != kOsOk) return rc;
+        if (resp.status / 100 != 2) return kOsIoError;
+        const char* x = reinterpret_cast<const char*>(resp.body);
+        uint32_t pos = 0;
+        while (count < cap && json_field(x, resp.body_len, &pos, "name",
+                                         out[count].key, kOsMaxKey)) {
+            char sz[32];
+            if (!json_field(x, resp.body_len, &pos, "size", sz, sizeof(sz))) {
+                return kOsIoError;
+            }
+            out[count].size = std::strtoull(sz, nullptr, 10);
+            ++count;
+        }
+        uint32_t tp = 0;
+        token[0] = '\0';
+        (void)json_field(x, resp.body_len, &tp, "nextPageToken", token,
+                         sizeof(token));
+        if (token[0] == '\0') break;
+    }
+    *out_n = count;
+    assert(count <= cap);
+    return kOsOk;
 }
+
 int gc_delete(void* impl, const char* key) noexcept {
     assert(impl != nullptr);
     assert(key != nullptr);
-    (void)impl; (void)key;
-    return kOsNotImplemented;
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = gc_send(static_cast<GcsStore*>(impl), "DELETE", "", key,
+                           "", nullptr, 0, &scratch, &resp);
+    if (rc != kOsOk) return rc;
+    return oshttp::map_status(resp.status);
 }
+
 int gc_head(void* impl, const char* key, ObjectMeta* out) noexcept {
     assert(impl != nullptr);
-    assert(out != nullptr);
-    (void)impl; (void)key;
+    assert(out != nullptr && key != nullptr);
     std::memset(out, 0, sizeof(*out));
-    return kOsNotImplemented;
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = gc_send(static_cast<GcsStore*>(impl), "GET", "", key,
+                           "fields=size", nullptr, 0, &scratch, &resp);
+    if (rc != kOsOk) return rc;
+    const int st = oshttp::map_status(resp.status);
+    if (st != kOsOk) return st;
+    char sz[32] = "0";
+    uint32_t pos = 0;
+    (void)json_field(reinterpret_cast<const char*>(resp.body), resp.body_len,
+                     &pos, "size", sz, sizeof(sz));
+    out->size = std::strtoull(sz, nullptr, 10);
+    out->exists = true;
+    return kOsOk;
 }
 
 const ObjectStoreVT kGcsVT = {
-    gc_get, gc_put, gc_list, gc_delete, gc_head,
-    nullptr,  // put_if_absent: no conditional-put transport yet
+    gc_get, gc_put, gc_list, gc_delete, gc_head, gc_put_if_absent,
 };
 
 }  // namespace
