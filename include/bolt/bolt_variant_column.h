@@ -148,14 +148,14 @@ BOLT_FORCE_INLINE uint8_t variant_column_at(const VariantColumn* v,
     assert(row >= 0);
     assert(row < v->length);
 
-    // Discriminator may be Flat (one byte per row) or Constant
-    // (single inline value broadcast across rows). The Constant form
-    // stores the value in `inline_value` and points `data` at it, so
-    // a uniform load through `data` works for both shapes — the row
-    // offset is multiplied by the per-row stride.
-    const uint8_t* disc_data = static_cast<const uint8_t*>(v->discriminator.data);
-    const int64_t  stride    = (v->discriminator.format == ColumnFormat::Constant)
-                                ? int64_t{0} : int64_t{1};
+    // Constant reads `inline_value`, never `data`: a by-value copy of the
+    // column leaves `data` pointing at the source's inline_value.
+    const bool     is_const  = v->discriminator.format == ColumnFormat::Constant;
+    const uint8_t* disc_data = is_const
+        ? v->discriminator.inline_value
+        : static_cast<const uint8_t*>(v->discriminator.data);
+    assert(disc_data != nullptr);
+    const int64_t  stride    = is_const ? int64_t{0} : int64_t{1};
     const uint8_t  disc      = disc_data[row * stride];
 
     const uint32_t in_range  =
@@ -199,6 +199,8 @@ inline bool variant_column_compact(VariantColumn* v, Arena* arena) noexcept {
     BoltColumn c = BoltColumn::make_constant<uint8_t>(
         first, v->length, BoltType::UInt8);
     v->discriminator = c;
+    v->discriminator.data = v->discriminator.inline_value;
+    assert(v->discriminator.get_constant<uint8_t>() == first);
     return true;
 }
 
