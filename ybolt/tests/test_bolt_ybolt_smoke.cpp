@@ -235,6 +235,35 @@ TEST(YboltDoc, ConcurrentWriteToSameKeyResolvesByLamport) {
     }
 }
 
+// G2CHK-136: the chukonu reaper overwrites a peer-owned members[*] key. An
+// overwrite that observed the prior value must be visible to its writer
+// and win on every peer, even from the smaller client id.
+TEST(YboltDoc, CrossClientOverwriteIsVisibleAndConverges) {
+    bolt::Arena arena_a;
+    bolt::Arena arena_b;
+    Doc a = make_doc(arena_a, /*client_id=*/0x11);
+    Doc b = make_doc(arena_b, /*client_id=*/0x22);
+
+    ASSERT_EQ(b.map_set_string("members", "22", "status=alive"), ycpp::Status::kOk);
+    ASSERT_EQ(sync_via_bolt(b, a), ycpp::Status::kOk);
+
+    auto* m = a.get_or_create_map("members");
+    ASSERT_NE(m, nullptr);
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_EQ(a.map_set_string("members", "22", "status=dead;reaped=1"),
+                  ycpp::Status::kOk);
+        auto* head = m->get(sv_lit("22"));
+        ASSERT_NE(head, nullptr);
+        EXPECT_EQ(as_sv(head->content_view), std::string_view{"status=dead;reaped=1"})
+            << "round=" << round;
+    }
+
+    ASSERT_EQ(sync_via_bolt(a, b), ycpp::Status::kOk);
+    auto* head_b = b.get_or_create_map("members")->get(sv_lit("22"));
+    ASSERT_NE(head_b, nullptr);
+    EXPECT_EQ(as_sv(head_b->content_view), std::string_view{"status=dead;reaped=1"});
+}
+
 // ---------------------------------------------------------------------
 // Collaborative text editing through bolt::Arena. Y.Text rides on top
 // of Y.Array; the YATA integration converges concurrent appends.
