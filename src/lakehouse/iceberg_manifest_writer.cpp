@@ -33,6 +33,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace bolt {
@@ -267,28 +268,171 @@ uint32_t encode_bound_map(const FileStats* st, bool want_lower, uint8_t* dst,
     return o;
 }
 
+// Bound on the spliced partition text: per field, the JSON skeleton plus a
+// name and two ints; per spec, the brackets.
+constexpr uint32_t kPartFieldJsonCap =
+    96u + kIcebergMaxFieldName + kIcebergMaxTransformName;
+constexpr uint32_t kPartJsonCap = 8u + kIcebergMaxFieldsPerSpec * kPartFieldJsonCap;
+
+// Avro names are [A-Za-z_][A-Za-z0-9_]*. A name outside that grammar would
+// make the schema unparseable or, worse, bind a different field.
+bool avro_name_ok(const char* n) noexcept {
+    assert(n != nullptr);
+    if (n[0] == '\0') return false;
+    for (uint32_t i = 0; i < kIcebergMaxFieldName; ++i) {   // bounded
+        const char c = n[i];
+        if (c == '\0') return true;
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           c == '_';
+        const bool digit = c >= '0' && c <= '9';
+        if (!(alpha || (digit && i != 0u))) return false;
+    }
+    return false;   // unterminated within the field
+}
+
+// Advance `*o` by an snprintf result; false on error or overflow.
+bool part_advance(int n, uint32_t cap, uint32_t* o) noexcept {
+    assert(o != nullptr);
+    assert(*o <= cap);
+    if (n < 0 || static_cast<uint32_t>(n) >= cap - *o) return false;
+    *o += static_cast<uint32_t>(n);
+    return true;
+}
+
+// The `partition` record's fields (Avro) and the `partition-spec` metadata
+// value (Iceberg JSON), both rendered from the one spec.
+bool render_partition(const PartitionSpec* spec,
+                      const PartitionAvroType* types, char* avro,
+                      uint32_t* avro_len, char* meta,
+                      uint32_t* meta_len) noexcept {
+    assert(spec != nullptr && types != nullptr);
+    assert(avro != nullptr && meta != nullptr);
+    uint32_t a = 0;
+    uint32_t m = 1;
+    meta[0] = '[';
+    for (uint32_t i = 0; i < spec->n_fields; ++i) {   // bounded: kMaxFieldsPerSpec
+        const PartitionField& f = spec->fields[i];
+        if (!avro_name_ok(f.name)) return false;
+        char tf[kIcebergMaxTransformName];
+        if (transform_format(f.transform, tf, sizeof(tf)) == 0u) return false;
+        const char* t = types[i] == PartitionAvroType::kInt ? "int" : "long";
+        const char* sep = i == 0u ? "" : ",";
+        if (!part_advance(std::snprintf(avro + a, kPartJsonCap - a,
+                                        "%s{\"name\":\"%s\",\"field-id\":%d,"
+                                        "\"type\":[\"null\",\"%s\"],"
+                                        "\"default\":null}",
+                                        sep, f.name, f.field_id, t),
+                          kPartJsonCap, &a)) {
+            return false;
+        }
+        if (!part_advance(std::snprintf(meta + m, kPartJsonCap - m,
+                                        "%s{\"name\":\"%s\",\"transform\":"
+                                        "\"%s\",\"source-id\":%d,"
+                                        "\"field-id\":%d}",
+                                        sep, f.name, tf, f.source_id,
+                                        f.field_id),
+                          kPartJsonCap, &m)) {
+            return false;
+        }
+    }
+    if (m + 2u > kPartJsonCap) return false;
+    meta[m++] = ']';
+    meta[m]   = '\0';
+    *avro_len = a;
+    *meta_len = m;
+    assert(m >= 2u);
+    return true;
+}
+
+// kManifestEntrySchema with `avro[0..avro_len)` spliced into the empty
+// `partition` record. The splice point is located, never assumed, so a schema
+// edit that moves it fails the write instead of corrupting it.
+bool splice_entry_schema(const char* avro, uint32_t avro_len, Arena* scratch,
+                         const char** out, uint32_t* out_len) noexcept {
+    assert(avro != nullptr && scratch != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    static const char kMark[] = "\"fields\":[],\"name\":\"r102\"";
+    const char* hit = std::strstr(kManifestEntrySchema, kMark);
+    if (hit == nullptr) return false;
+    const uint32_t head =
+        static_cast<uint32_t>(hit - kManifestEntrySchema) + 10u;   // past `"fields":[`
+    const uint32_t base = static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u);
+    char* dst = scratch->allocate_array<char>(base + avro_len + 1u);
+    if (dst == nullptr) return false;
+    std::memcpy(dst, kManifestEntrySchema, head);
+    std::memcpy(dst + head, avro, avro_len);
+    std::memcpy(dst + head + avro_len, kManifestEntrySchema + head, base - head);
+    dst[base + avro_len] = '\0';
+    *out     = dst;
+    *out_len = base + avro_len;
+    return true;
+}
+
 }  // namespace
 
-bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
-                         int64_t snapshot_id, int64_t sequence_number,
-                         const char* table_schema_json,
-                         uint32_t table_schema_len,
-                         int32_t partition_spec_id, Arena* scratch,
-                         const uint8_t** out, uint64_t* out_len) noexcept {
+namespace {
+
+// Shared body. `spec == nullptr` (or zero fields) is the unpartitioned form
+// and encodes byte-identically to what this writer always produced.
+bool write_manifest(const DataFileRef* files, uint32_t n_files,
+                    int64_t snapshot_id, int64_t sequence_number,
+                    const char* table_schema_json, uint32_t table_schema_len,
+                    int32_t partition_spec_id, const PartitionSpec* spec,
+                    const PartitionAvroType* result_types, Arena* scratch,
+                    const uint8_t** out, uint64_t* out_len) noexcept {
     assert(scratch != nullptr);
     assert(out != nullptr && out_len != nullptr);
     if (files == nullptr && n_files != 0) return false;
     if (scratch == nullptr || out == nullptr || out_len == nullptr) return false;
     if (table_schema_json == nullptr || table_schema_len == 0) return false;
     if (n_files > kIcebergMaxManifestEntries) return false;
+    const uint32_t np = spec == nullptr ? 0u : spec->n_fields;
+    if (np > kIcebergMaxFieldsPerSpec || np > kIcebergMaxPartitionValues) return false;
+    if (np != 0u && result_types == nullptr) return false;
+    const uint32_t nf = kEntryFields + np;
 
-    ing::AvroField* fields = scratch->allocate_array<ing::AvroField>(kEntryFields);
+    const char* entry_schema = kManifestEntrySchema;
+    uint32_t    entry_schema_len =
+        static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u);
+    const char* spec_json = "[]";
+    uint32_t    spec_json_len = 2u;
+    if (np != 0u) {
+        char* avro = scratch->allocate_array<char>(kPartJsonCap);
+        char* meta = scratch->allocate_array<char>(kPartJsonCap);
+        if (avro == nullptr || meta == nullptr) return false;
+        uint32_t avro_len = 0;
+        if (!render_partition(spec, result_types, avro, &avro_len, meta,
+                              &spec_json_len)) {
+            return false;
+        }
+        spec_json = meta;
+        if (!splice_entry_schema(avro, avro_len, scratch, &entry_schema,
+                                 &entry_schema_len)) {
+            return false;
+        }
+    }
+
+    ing::AvroField* fields = scratch->allocate_array<ing::AvroField>(nf);
     if (fields == nullptr) return false;
-    build_entry_fields(fields);
+    {
+        // The partition tuple is inline after file_format (see the wire-order
+        // note on build_entry_fields).
+        ing::AvroField base[kEntryFields];
+        build_entry_fields(base);
+        std::memcpy(fields, base, 7u * sizeof(ing::AvroField));
+        for (uint32_t p = 0; p < np; ++p) {            // bounded: np
+            set_field(&fields[7u + p], spec->fields[p].name,
+                      result_types[p] == PartitionAvroType::kInt
+                          ? ing::AvroType::kInt : ing::AvroType::kLong,
+                      true);
+        }
+        std::memcpy(fields + 7u + np, base + 7u,
+                    (kEntryFields - 7u) * sizeof(ing::AvroField));
+    }
 
     ing::AvroValue* rows =
         scratch->allocate_array<ing::AvroValue>(
-            static_cast<uint64_t>(n_files) * kEntryFields + 1u);
+            static_cast<uint64_t>(n_files) * nf + 1u);
     if (rows == nullptr) return false;
 
     // A manifest is homogeneous by spec: it holds data files or delete files,
@@ -309,8 +453,8 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         // A partitioned file needs partition-tuple fields this flat schema
         // does not declare. Writing it anyway yields a manifest that PARSES
         // and reports the wrong partition — fail instead.
-        if (d->n_partition != 0) return false;
-        ing::AvroValue* v = rows + static_cast<uint64_t>(r) * kEntryFields;
+        if (d->n_partition != np) return false;
+        ing::AvroValue* v = rows + static_cast<uint64_t>(r) * nf;
         uint32_t i = 0;
         put_long(&v[i++], static_cast<int64_t>(d->status));
         put_long(&v[i++], d->snapshot_id != 0 ? d->snapshot_id : snapshot_id);
@@ -319,6 +463,16 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         put_long(&v[i++], static_cast<int64_t>(d->content));
         put_str(&v[i++], d->file_path);
         put_str(&v[i++], kFileFormat);
+        for (uint32_t p = 0; p < np; ++p) {            // bounded: np
+            const PartitionValue& pv = d->partition[p];
+            if (pv.is_null) { put_null(&v[i++]); continue; }
+            if (!pv.is_int || pv.is_str) return false;
+            if (result_types[p] == PartitionAvroType::kInt &&
+                (pv.i64 < INT32_MIN || pv.i64 > INT32_MAX)) {
+                return false;
+            }
+            put_long(&v[i++], pv.i64);
+        }
         put_long(&v[i++], d->stats.record_count);
         put_long(&v[i++], d->stats.file_size_in_bytes);
         // SEVEN fields here (was a flat put_null loop before G2ICE-135):
@@ -367,9 +521,10 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
         put_null(&v[i++]);                                   // split_offsets
         put_null(&v[i++]);                                   // equality_ids
         put_null(&v[i++]);                                   // sort_order_id
-        assert(i == kEntryFields);
+        assert(i == nf);
         value_bytes += v[5].bytes_len + v[6].bytes_len +
-                       v[11].bytes_len + v[13].bytes_len + v[14].bytes_len;
+                       v[11u + np].bytes_len + v[13u + np].bytes_len +
+                       v[14u + np].bytes_len;
     }
 
     char spec_id_buf[16];
@@ -380,7 +535,8 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
     const ing::AvroMetaKV meta[] = {
         {"schema", reinterpret_cast<const uint8_t*>(table_schema_json),
          table_schema_len, 0u},
-        {"partition-spec", reinterpret_cast<const uint8_t*>("[]"), 2u, 0u},
+        {"partition-spec", reinterpret_cast<const uint8_t*>(spec_json),
+         spec_json_len, 0u},
         {"partition-spec-id", reinterpret_cast<const uint8_t*>(spec_id_buf),
          static_cast<uint32_t>(spec_id_len), 0u},
         {"format-version", reinterpret_cast<const uint8_t*>("2"), 1u, 0u},
@@ -391,25 +547,56 @@ bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
     };
     constexpr uint32_t kNMeta = sizeof(meta) / sizeof(meta[0]);
 
-    uint64_t meta_bytes = sizeof(kManifestEntrySchema) + table_schema_len;
+    uint64_t meta_bytes = entry_schema_len + 1u + table_schema_len;
     for (uint32_t m = 0; m < kNMeta; ++m) meta_bytes += meta[m].val_len + 32u;
 
-    uint64_t cap = ing::avro_write_ex_max_len(fields, kEntryFields, value_bytes,
+    uint64_t cap = ing::avro_write_ex_max_len(fields, nf, value_bytes,
                                               n_files, meta_bytes);
     uint8_t* dst = scratch->allocate_array<uint8_t>(cap);
     if (dst == nullptr) return false;
 
     uint64_t len = cap;
-    if (!ing::avro_write_ex(fields, kEntryFields, rows, n_files,
-                            kManifestEntrySchema,
-                            static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u),
-                            meta, kNMeta, kSync, dst, &len)) {
+    if (!ing::avro_write_ex(fields, nf, rows, n_files, entry_schema,
+                            entry_schema_len, meta, kNMeta, kSync, dst, &len)) {
         return false;
     }
     assert(len <= cap);
     *out     = dst;
     *out_len = len;
     return true;
+}
+
+}  // namespace
+
+bool manifest_write_avro(const DataFileRef* files, uint32_t n_files,
+                         int64_t snapshot_id, int64_t sequence_number,
+                         const char* table_schema_json,
+                         uint32_t table_schema_len,
+                         int32_t partition_spec_id, Arena* scratch,
+                         const uint8_t** out, uint64_t* out_len) noexcept {
+    assert(scratch != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    return write_manifest(files, n_files, snapshot_id, sequence_number,
+                          table_schema_json, table_schema_len,
+                          partition_spec_id, nullptr, nullptr, scratch, out,
+                          out_len);
+}
+
+bool manifest_write_avro_partitioned(const DataFileRef* files, uint32_t n_files,
+                                     int64_t snapshot_id,
+                                     int64_t sequence_number,
+                                     const char* table_schema_json,
+                                     uint32_t table_schema_len,
+                                     const PartitionSpec* spec,
+                                     const PartitionAvroType* result_types,
+                                     Arena* scratch, const uint8_t** out,
+                                     uint64_t* out_len) noexcept {
+    assert(scratch != nullptr);
+    assert(out != nullptr && out_len != nullptr);
+    if (spec == nullptr) return false;
+    return write_manifest(files, n_files, snapshot_id, sequence_number,
+                          table_schema_json, table_schema_len, spec->spec_id,
+                          spec, result_types, scratch, out, out_len);
 }
 
 bool manifest_list_write_avro(const ManifestListEntry* entries,
