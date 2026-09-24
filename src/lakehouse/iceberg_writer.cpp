@@ -606,10 +606,13 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
             case SnapshotOp::kDelete:    op = "delete"; break;
             default: break;
         }
-        if (!buf_fmt(&b, "{\"snapshot-id\":%lld,\"parent-snapshot-id\":%lld,"
-                     "\"timestamp-ms\":%lld,\"sequence-number\":%lld,",
-                     static_cast<long long>(s.snapshot_id),
-                     static_cast<long long>(s.parent_snapshot_id),
+        if (!buf_fmt(&b, "{\"snapshot-id\":%lld,",
+                     static_cast<long long>(s.snapshot_id))) return false;
+        // A root snapshot omits the optional field (G2ICE-177).
+        if (s.parent_snapshot_id > 0 &&
+            !buf_fmt(&b, "\"parent-snapshot-id\":%lld,",
+                     static_cast<long long>(s.parent_snapshot_id))) return false;
+        if (!buf_fmt(&b, "\"timestamp-ms\":%lld,\"sequence-number\":%lld,",
                      static_cast<long long>(s.timestamp_ms),
                      static_cast<long long>(s.sequence_number))) return false;
         if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
