@@ -1,19 +1,18 @@
 // bolt/lakehouse/object_store/gcs.h — Google Cloud Storage object store.
 //
-// W7. Two auth modes:
-//   - Hmac:           XML API, reuses bolt::crypto::sigv4 with service="storage".
-//   - ServiceAccount: builds a JWT (RS256) over the service-account JSON
-//                     credentials, exchanges it for an OAuth2 bearer token
-//                     (`https://oauth2.googleapis.com/token`), caches the
-//                     token with refresh 60s before expiry.
+// Auth, by precedence:
+//   - ServiceAccount: an RS256 JWT over the service-account JSON is exchanged
+//                     at its token_uri (default oauth2.googleapis.com/token)
+//                     for a bearer token, cached and re-minted 60s before
+//                     expiry. Object ops go over the JSON API.
+//   - Hmac + key:     XML API (storage.googleapis.com, path style, region
+//                     "auto"), AWS4-HMAC-SHA256 via bolt::crypto::sigv4.
+//                     put_if_absent sends a signed x-goog-if-generation-match: 0.
+//   - Hmac, no key:   JSON API with the caller-set `bearer_token`, or
+//                     anonymous when it is empty (emulators).
 //
 // RS256 signing uses OpenSSL EVP (bolt::net already links OpenSSL 3.x). When
-// BOLT_WITH_TLS is OFF the JWT builder returns false at runtime — there's no
-// other RSA implementation in-tree.
-//
-// Object ops go over the JSON API via bolt::net. They send `bearer_token`
-// when set; with no credentials they go anonymous (emulators). Service-account
-// token minting and HMAC auth are not wired: ops report kOsNotImplemented.
+// BOLT_WITH_TLS is OFF, ServiceAccount ops report kOsNotImplemented.
 //
 // Tiger Style: PODs, ≥2 asserts/fn, bounded everything, no heap.
 
@@ -62,19 +61,37 @@ static constexpr uint32_t kGcsMaxClientEmail = 256u;
 static constexpr uint32_t kGcsMaxPrivateKey  = 3072u;       // PEM
 static constexpr uint32_t kGcsMaxBearer      = 2048u;
 
+static constexpr uint32_t kGcsMaxAuthError  = 256u;
+static constexpr uint32_t kGcsRefreshMarginS = 60u;
+static constexpr uint32_t kGcsJwtTtlS        = 3600u;
+
 struct GcsStore {
     Config   cfg;
     char     client_email[kGcsMaxClientEmail];   // extracted from SA JSON
     char     private_key_pem[kGcsMaxPrivateKey]; // extracted from SA JSON
     uint32_t private_key_pem_len;
-    char     bearer_token[kGcsMaxBearer];        // last fetched, "" = unset
+    uint32_t token_lock;                         // atomic_ref spinlock
+    char     token_uri[kGcsMaxEndpoint];         // SA JSON token_uri
+    char     bearer_token[kGcsMaxBearer];        // minted, or caller-set
     uint64_t bearer_expiry_unix;                 // 0 = no token cached
-    uint8_t  _pad[4];
+    uint64_t token_mints;                        // successful exchanges
+    char     last_auth_error[kGcsMaxAuthError];  // token endpoint reply
+    S3ObjectStore xml;                           // Hmac: XML API store
+    ObjectStore   xml_os;
+    bool     use_xml;
+    uint8_t  _pad[7];
 };
 
-// Initialise + bind `out`. Returns false on overflow or malformed SA JSON
-// (when auth_mode is ServiceAccount).
+// Initialise + bind `out`. Returns false on overflow, malformed SA JSON
+// (ServiceAccount), or an HMAC access id without a secret.
 bool gcs_store_new(ObjectStore* out, Arena* arena, const Config* cfg) noexcept;
+
+// ServiceAccount: exchange a freshly signed JWT for a bearer token now,
+// regardless of the cached one's expiry. Returns kOsOk, kOsIoError (endpoint
+// unreachable or refused; reply kept in last_auth_error), kOsBadArg (key
+// unusable) or kOsNotImplemented (built without TLS). Not thread-safe: object
+// ops serialise their own refreshes.
+int gcs_mint_token(GcsStore* g, uint64_t now_unix) noexcept;
 
 // ---------------------------------------------------------------------------
 // JWT primitives — exposed for tests.

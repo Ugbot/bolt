@@ -75,7 +75,8 @@ bool s3_target(const S3ObjectStore* s3, const char* key, const char* query,
 }
 
 // Build, SigV4-sign and send one request. `if_none_match` adds the
-// If-None-Match: * precondition that makes a PUT a create-only CAS.
+// create-only precondition (If-None-Match: *, or GCS's signed
+// x-goog-if-generation-match: 0) that makes a PUT a CAS.
 int s3_send(S3ObjectStore* s3, const char* method, const char* key,
             const char* query, const uint8_t* body, uint64_t len,
             bool if_none_match, Arena* arena,
@@ -115,6 +116,9 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
     sr.secret_key = s3->secret_key;
     sr.session_token = s3->session_token[0] != '\0' ? s3->session_token
                                                     : nullptr;
+    const bool goog_cas = if_none_match &&
+                          s3->create_only == kS3CreateOnlyGoogGeneration;
+    if (goog_cas) sr.extra_header = "x-goog-if-generation-match:0";
     char auth[crypto::kSigV4MaxAuth];
     char amz_out[24];
     crypto::SigV4Result so;
@@ -131,7 +135,10 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
         ok = ok && net::http_request_add_header(&req, "X-Amz-Security-Token",
                                                 sr.session_token);
     }
-    if (if_none_match) {
+    if (goog_cas) {
+        ok = ok && net::http_request_add_header(
+                       &req, "x-goog-if-generation-match", "0");
+    } else if (if_none_match) {
         ok = ok && net::http_request_add_header(&req, "If-None-Match", "*");
     }
     if (len == 0 && std::strcmp(method, "PUT") == 0) {
@@ -228,7 +235,8 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         uint32_t tp = 0;
         (void)oshttp::xml_next(x, resp.body_len, &tp, "IsTruncated", trunc,
                                sizeof(trunc));
-        if (std::strcmp(trunc, "true") != 0) break;
+        if (std::strcmp(trunc, "true") != 0 &&
+            std::strcmp(trunc, "True") != 0) break;
         tp = 0;
         if (!oshttp::xml_next(x, resp.body_len, &tp, "NextContinuationToken",
                               token, sizeof(token))) {

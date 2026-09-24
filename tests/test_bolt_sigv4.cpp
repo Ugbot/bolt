@@ -108,6 +108,49 @@ TEST(BoltSigV4, SessionTokenSignedHeader) {
               std::string::npos);
 }
 
+// GCS XML API create-only PUT: the signed x-goog-if-generation-match header.
+// Signature from an independent Python hmac/hashlib SigV4 chain.
+TEST(BoltSigV4, ExtraSignedHeaderGcsGenerationMatch) {
+    char empty_hash[65];
+    sha256_empty_hex(empty_hash);
+    SigV4Request req;
+    req.method = "PUT"; req.host = "storage.googleapis.com";
+    req.path = "/bkt/d/_delta_log/0.json"; req.query_string = "";
+    req.service = "s3"; req.region = "auto";
+    req.amz_date = "20260924T120000Z"; req.payload_sha256 = empty_hash;
+    req.access_key = "GOOG1EXAMPLE"; req.secret_key = "GOOGSECRETEXAMPLE";
+    req.session_token = nullptr;
+    req.extra_header = "x-goog-if-generation-match:0";
+    char auth[kSigV4MaxAuth];
+    char date_out[24];
+    SigV4Result out{auth, sizeof(auth), date_out, sizeof(date_out)};
+    ASSERT_TRUE(sigv4_sign(&req, &out));
+    const std::string a(auth);
+    EXPECT_NE(a.find("SignedHeaders=host;x-amz-content-sha256;x-amz-date;"
+                     "x-goog-if-generation-match,"), std::string::npos) << a;
+    EXPECT_NE(a.find("Signature=729f009732e3e6f817da0f3b3df601bbdbda8d9e9"
+                     "2ed30051a86386743fc8f79"), std::string::npos) << a;
+}
+
+// An extra header must be lowercase, well-formed and sort last.
+TEST(BoltSigV4, ExtraHeaderRejectsBadNames) {
+    char empty_hash[65];
+    sha256_empty_hex(empty_hash);
+    SigV4Request req;
+    req.method = "PUT"; req.host = "h"; req.path = "/"; req.query_string = "";
+    req.service = "s3"; req.region = "auto";
+    req.amz_date = "20260924T120000Z"; req.payload_sha256 = empty_hash;
+    req.access_key = "a"; req.secret_key = "s"; req.session_token = nullptr;
+    char auth[kSigV4MaxAuth];
+    char date_out[24];
+    SigV4Result out{auth, sizeof(auth), date_out, sizeof(date_out)};
+    for (const char* bad : {"X-Goog-If-Generation-Match:0", "no-colon",
+                            ":0", "content-type:x", "x-goog a:0"}) {
+        req.extra_header = bad;
+        EXPECT_FALSE(sigv4_sign(&req, &out)) << bad;
+    }
+}
+
 // Null required fields must fail cleanly.
 TEST(BoltSigV4, RejectsNullFields) {
     SigV4Request req;

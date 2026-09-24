@@ -267,9 +267,8 @@ TEST(BoltCloudPutIfAbsent, GcsFakeServer) {
     exercise(&os);
 }
 
-// HMAC auth is not wired: a configured-but-unusable credential must refuse,
-// never fall back to unauthenticated requests.
-TEST(BoltCloudPutIfAbsent, GcsHmacIsNotImplemented) {
+// An HMAC access id without its secret is a config error, never anonymous.
+TEST(BoltCloudPutIfAbsent, GcsHmacWithoutSecretIsRejected) {
     bolt::Arena arena;
     static gcs::Config cfg;
     std::memset(&cfg, 0, sizeof(cfg));
@@ -277,9 +276,61 @@ TEST(BoltCloudPutIfAbsent, GcsHmacIsNotImplemented) {
     cfg.auth_mode = gcs::AuthMode::Hmac;
     ASSERT_TRUE(s3_compat::secret_set(&cfg.hmac_access_id, "GOOG1EXAMPLE"));
     ObjectStore os;
-    ASSERT_TRUE(gcs::gcs_store_new(&os, &arena, &cfg));
-    const uint8_t b = 'x';
-    EXPECT_EQ(os_put_if_absent(&os, "k", &b, 1), kOsNotImplemented);
+    EXPECT_FALSE(gcs::gcs_store_new(&os, &arena, &cfg));
+}
+
+// GCS HMAC keys sign XML API requests with AWS4-HMAC-SHA256 (region "auto").
+// fake-gcs-server has no XML PUT and checks no signatures, so the signing is
+// proven against MinIO, which verifies every one. MinIO ignores
+// x-goog-if-generation-match, so the CAS itself is not exercised here.
+gcs::Config* gcs_hmac_cfg(const char* ep, const char* secret) {
+    static gcs::Config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    std::strncpy(cfg.bucket, kBucket, sizeof(cfg.bucket) - 1u);
+    cfg.auth_mode = gcs::AuthMode::Hmac;
+    std::strncpy(cfg.endpoint_override, ep, sizeof(cfg.endpoint_override) - 1u);
+    if (!s3_compat::secret_set(&cfg.hmac_access_id, "minioadmin") ||
+        !s3_compat::secret_set(&cfg.hmac_secret, secret)) return nullptr;
+    return &cfg;
+}
+
+TEST(BoltCloudPutIfAbsent, GcsHmacSigningAgainstMinIO) {
+    const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
+    if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
+    make_s3_bucket(ep);
+    bolt::Arena arena;
+    gcs::Config* cfg = gcs_hmac_cfg(ep, "minioadmin");
+    ASSERT_NE(cfg, nullptr);
+    ObjectStore os;
+    ASSERT_TRUE(gcs::gcs_store_new(&os, &arena, cfg));
+    const std::string pre = unique_prefix();
+    const std::string key = pre + "_delta_log/00000000000000000001.json";
+    int rc = 0;
+    ASSERT_EQ(put_str(&os, key, "first", true), kOsOk);
+    EXPECT_EQ(get_str(&os, key, &rc), "first");
+    EXPECT_EQ(rc, kOsOk);
+    ObjectMeta m;
+    ASSERT_EQ(os_head(&os, key.c_str(), &m), kOsOk);
+    EXPECT_EQ(m.size, 5u);
+    ASSERT_EQ(put_str(&os, pre + "a b+c.json", "x", false), kOsOk);
+    static ObjectEntry entries[16];
+    uint32_t n = 0;
+    ASSERT_EQ(os_list(&os, pre.c_str(), entries, 16, &n), kOsOk);
+    EXPECT_EQ(n, 2u);
+    ASSERT_EQ(os_delete(&os, key.c_str()), kOsOk);
+    EXPECT_EQ(os_head(&os, key.c_str(), &m), kOsNotFound);
+}
+
+TEST(BoltCloudPutIfAbsent, GcsHmacWrongSecretIsRefused) {
+    const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
+    if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
+    make_s3_bucket(ep);
+    bolt::Arena arena;
+    gcs::Config* cfg = gcs_hmac_cfg(ep, "not-the-secret");
+    ASSERT_NE(cfg, nullptr);
+    ObjectStore os;
+    ASSERT_TRUE(gcs::gcs_store_new(&os, &arena, cfg));
+    EXPECT_EQ(put_str(&os, unique_prefix() + "x", "v", true), kOsIoError);
 }
 
 }  // namespace

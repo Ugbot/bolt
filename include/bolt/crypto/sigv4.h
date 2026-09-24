@@ -10,9 +10,10 @@
 // The canonical request we build is the common case used by S3 / Glue / STS:
 //   METHOD \n CANONICAL_URI \n CANONICAL_QUERY \n
 //   host:HOST \n x-amz-content-sha256:HASH \n x-amz-date:DATE \n
-//   [x-amz-security-token:TOKEN \n] \n
+//   [x-amz-security-token:TOKEN \n] [EXTRA_NAME:EXTRA_VALUE \n] \n
 //   SIGNED_HEADERS \n PAYLOAD_SHA256
-// with SIGNED_HEADERS = "host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]".
+// with SIGNED_HEADERS =
+//   "host;x-amz-content-sha256;x-amz-date[;x-amz-security-token][;EXTRA_NAME]".
 //
 // Tiger Style: PODs, caller-owned output buffers, ≥2 asserts/fn, no heap,
 // no exceptions.
@@ -54,6 +55,9 @@ struct SigV4Request {
     const char* access_key;      // "AKID..."
     const char* secret_key;      // signing secret
     const char* session_token;   // STS token or nullptr
+    // One extra signed header, "name:value" with a lowercase name that sorts
+    // after x-amz-security-token (e.g. GCS "x-goog-if-generation-match:0").
+    const char* extra_header = nullptr;
 };
 
 // The signed outputs, written into caller buffers. `auth_header` is the full

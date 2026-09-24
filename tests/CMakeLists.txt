@@ -1639,6 +1639,17 @@ endif()
 bolt_apply_hardening(test_bolt_lakehouse_gcs_jwt)
 add_test(NAME test_bolt_lakehouse_gcs_jwt COMMAND test_bolt_lakehouse_gcs_jwt)
 
+# G2ICE-190 — GCS service-account token exchange against an in-process fake.
+add_executable(test_bolt_lakehouse_gcs_oauth test_bolt_lakehouse_gcs_oauth.cpp)
+target_link_libraries(test_bolt_lakehouse_gcs_oauth
+    PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+if(OpenSSL_FOUND)
+    target_compile_definitions(test_bolt_lakehouse_gcs_oauth PRIVATE BOLT_WITH_TLS=1)
+    target_link_libraries(test_bolt_lakehouse_gcs_oauth PRIVATE OpenSSL::Crypto)
+endif()
+bolt_apply_hardening(test_bolt_lakehouse_gcs_oauth)
+add_test(NAME test_bolt_lakehouse_gcs_oauth COMMAND test_bolt_lakehouse_gcs_oauth)
+
 add_executable(test_bolt_lakehouse_prefetch test_bolt_lakehouse_prefetch.cpp)
 target_link_libraries(test_bolt_lakehouse_prefetch
     PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
