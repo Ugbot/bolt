@@ -103,6 +103,7 @@ struct Sim {
     std::uint64_t yields_at[bolt::sched_point::kPointCount];
     std::uint64_t hazard_windows;      // see sim_note_slot_write()
     std::uint64_t hazard_collisions;   // ...with a colliding slot index
+    std::uint64_t producer_overlaps;   // two producers inside submit at once
     const bolt::TaskRing* ring;        // borrowed, for the hazard witness only
 };
 
@@ -152,6 +153,7 @@ inline void sim_init(Sim* s, std::uint32_t participants, std::uint64_t seed,
     }
     s->hazard_windows = 0u;
     s->hazard_collisions = 0u;
+    s->producer_overlaps = 0u;
     s->ring = ring;
     assert(s->n == participants);
 }
@@ -278,6 +280,31 @@ inline void sim_note_slot_write(Sim* s, std::uint32_t self) noexcept {
     }
 }
 
+inline bool sim_in_submit(std::uint32_t point) noexcept {
+    return point == bolt::sched_point::kSubmitEnter ||
+           point == bolt::sched_point::kSubmitReserveLost ||
+           point == bolt::sched_point::kSubmitSpaceOk ||
+           point == bolt::sched_point::kSubmitSlotWritten ||
+           point == bolt::sched_point::kSubmitPublishWait;
+}
+
+/// Multi-producer witness (G2ICE-189): `self` is past its reservation while
+/// another participant is suspended inside submit. Without that state a
+/// multi-producer scenario proves nothing about producer/producer races.
+inline void sim_note_producer_overlap(Sim* s, std::uint32_t self,
+                                      std::uint32_t point) noexcept {
+    assert(s != nullptr);
+    assert(self < s->n);
+    if (point != bolt::sched_point::kSubmitSpaceOk &&
+        point != bolt::sched_point::kSubmitSlotWritten) return;
+    for (std::uint32_t i = 0; i < s->n; ++i) {
+        if (i != self && sim_in_submit(s->at_point[i])) {
+            ++s->producer_overlaps;
+            return;
+        }
+    }
+}
+
 /// One interleaving point: check invariants, age the fault schedule, hand the
 /// token to a seed-chosen participant, and block until it comes back.
 inline void sim_yield(Sim* s, std::uint32_t point) noexcept {
@@ -292,6 +319,7 @@ inline void sim_yield(Sim* s, std::uint32_t point) noexcept {
         if (msg != nullptr) { s->invariant_msg = msg; s->invariant_step = s->steps; }
     }
     if (point == bolt::sched_point::kSubmitSlotWritten) sim_note_slot_write(s, self);
+    sim_note_producer_overlap(s, self, point);
 
     ++s->steps;
     ++s->yields;

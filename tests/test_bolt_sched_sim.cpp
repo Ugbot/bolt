@@ -76,6 +76,7 @@ struct Scenario {
     std::uint32_t consumers;
     std::uint32_t parks;           // injected "worker parked at instant N"
     std::uint32_t alloc_refusals;  // injected "allocation refused at call N"
+    std::uint32_t producers;       // concurrent submitters (G2ICE-189)
 };
 
 struct Run {
@@ -87,7 +88,8 @@ struct Run {
     std::uint32_t   executed;
     std::uint32_t   submitted;
     std::uint64_t   full_spins;    // submit() reported the ring full
-    bool            producer_done;
+    std::uint32_t   producers;
+    std::uint32_t   producers_done;
 };
 
 Run* g_run = nullptr;
@@ -114,8 +116,11 @@ const char* ring_invariant(void* ctx) noexcept {
     const auto* r = static_cast<const bolt::TaskRing*>(ctx);
     const std::uint64_t h = r->head.load(std::memory_order_relaxed);
     const std::uint64_t t = r->tail.load(std::memory_order_relaxed);
+    const std::uint64_t rv = r->reserve.load(std::memory_order_relaxed);
     if (t > h) return "tail overtook head";
     if (h - t > bolt::kTaskRingSize) return "ring holds more than kTaskRingSize entries";
+    if (h > rv) return "head published past the reservation counter";
+    if (rv - t > bolt::kTaskRingSize) return "reserved more than kTaskRingSize ahead of tail";
     return nullptr;
 }
 
@@ -126,8 +131,11 @@ const char* ring_invariant(void* ctx) noexcept {
 void producer_main(Sim* s, std::uint32_t id) noexcept {
     assert(s != nullptr);
     assert(g_run != nullptr);
+    assert(id < g_run->producers);
     bolt_sim::sim_enter(s, id);
-    for (std::uint32_t i = g_run->prefill; i < g_run->total; ++i) {
+    // Producer `id` owns every index congruent to it mod the producer count.
+    for (std::uint32_t i = g_run->prefill + id; i < g_run->total;
+         i += g_run->producers) {
         if (bolt_sim::sim_aborted(s)) break;
         if (g_run->skipped[i]) continue;      // injected allocation refusal
         bool ok = false;
@@ -144,7 +152,7 @@ void producer_main(Sim* s, std::uint32_t id) noexcept {
         if (!ok) break;
         ++g_run->submitted;
     }
-    g_run->producer_done = true;
+    ++g_run->producers_done;
     bolt_sim::sim_finish(s);
 }
 
@@ -157,7 +165,7 @@ void consumer_main(Sim* s, std::uint32_t id) noexcept {
     for (std::uint32_t spins = 0; spins < kMaxConsumerSpins; ++spins) {
         if (bolt_sim::sim_aborted(s)) break;
         if (g_run->ring->try_claim_and_execute_sim<Hook>()) { spins = 0; continue; }
-        if (g_run->producer_done &&
+        if (g_run->producers_done == g_run->producers &&
             g_run->ring->tail.load(std::memory_order_acquire) >=
             g_run->ring->head.load(std::memory_order_acquire)) {
             break;
@@ -178,6 +186,7 @@ struct Verdict {
     std::uint64_t full_spins  = 0;
     std::uint64_t hazards     = 0;
     std::uint64_t collisions  = 0;
+    std::uint64_t overlaps    = 0;
     std::uint64_t steps       = 0;
     std::uint64_t park_events = 0;
     const char*   invariant   = nullptr;
@@ -186,7 +195,9 @@ struct Verdict {
 };
 
 Verdict simulate(const Scenario& sc, std::uint64_t seed) {
-    assert(sc.consumers >= 1u && sc.consumers + 1u <= bolt_sim::kMaxParticipants);
+    assert(sc.producers >= 1u);
+    assert(sc.consumers >= 1u &&
+           sc.consumers + sc.producers <= bolt_sim::kMaxParticipants);
     assert(sc.extra > 0u);
 
     static bolt::TaskRing ring;            // 256 KB — never a stack local
@@ -200,10 +211,11 @@ Verdict simulate(const Scenario& sc, std::uint64_t seed) {
     run.skipped = skipped.data();
     run.total = total;
     run.prefill = sc.prefill;
+    run.producers = sc.producers;
     g_run = &run;
 
     Sim* s = &g_sim_storage;
-    bolt_sim::sim_init(s, sc.consumers + 1u, seed, kStepCap, &ring);
+    bolt_sim::sim_init(s, sc.consumers + sc.producers, seed, kStepCap, &ring);
     bolt_sim::sim_set_invariant(s, &ring_invariant, &ring);
 
     // Injected allocation refusals: drawn from the SAME seed stream, so they are
@@ -245,10 +257,12 @@ Verdict simulate(const Scenario& sc, std::uint64_t seed) {
 
     bolt_sim::g_sim = s;
     std::vector<std::thread> parts;
-    parts.reserve(sc.consumers + 1u);
-    parts.emplace_back(producer_main, s, 0u);
+    parts.reserve(sc.consumers + sc.producers);
+    for (std::uint32_t p = 0; p < sc.producers; ++p) {
+        parts.emplace_back(producer_main, s, p);
+    }
     for (std::uint32_t c = 0; c < sc.consumers; ++c) {
-        parts.emplace_back(consumer_main, s, c + 1u);
+        parts.emplace_back(consumer_main, s, sc.producers + c);
     }
     for (auto& t : parts) t.join();
     bolt_sim::g_sim = nullptr;
@@ -264,6 +278,7 @@ Verdict simulate(const Scenario& sc, std::uint64_t seed) {
     v.full_spins  = run.full_spins;
     v.hazards     = s->hazard_windows;
     v.collisions  = s->hazard_collisions;
+    v.overlaps    = s->producer_overlaps;
     v.steps       = s->steps;
     v.park_events = s->park_events;
     v.invariant   = s->invariant_msg;
@@ -282,18 +297,23 @@ Verdict simulate(const Scenario& sc, std::uint64_t seed) {
 constexpr std::uint32_t kRing = bolt::kTaskRingSize;
 
 const Scenario kScenarios[] = {
-    // name                     prefill    extra consumers parks refusals
-    {"saturated-1c",            kRing,     2048u,      1u,    0u,   0u},
-    {"saturated-2c",            kRing,     2048u,      2u,    0u,   0u},
-    {"saturated-3c",            kRing,     2048u,      3u,    0u,   0u},
-    {"saturated-parked-2c",     kRing,     2048u,      2u,    8u,   0u},
-    {"saturated-refusals-2c",   kRing,     2048u,      2u,    0u,   7u},
+    // name                     prefill    extra consumers parks refusals producers
+    {"saturated-1c",            kRing,     2048u,      1u,    0u,   0u,      1u},
+    {"saturated-2c",            kRing,     2048u,      2u,    0u,   0u,      1u},
+    {"saturated-3c",            kRing,     2048u,      3u,    0u,   0u,      1u},
+    {"saturated-parked-2c",     kRing,     2048u,      2u,    8u,   0u,      1u},
+    {"saturated-refusals-2c",   kRing,     2048u,      2u,    0u,   7u,      1u},
     // Control: starts half empty, so the first thousands of claims run with the
     // window CLOSED, and the ring only fills as the producer outruns the
     // consumers. Still laps the ring (total > kTaskRingSize) — a scenario that
     // cannot lap can never place a claimed slot in the producer's path, and the
     // non-vacuity assertion below rejects one that does not.
-    {"fills-from-half-2c",      kRing / 2u, kRing,     2u,    0u,   0u},
+    {"fills-from-half-2c",      kRing / 2u, kRing,     2u,    0u,   0u,      1u},
+    // G2ICE-189: concurrent submitters. The producer/producer race needs no
+    // saturation, so these also run from half full.
+    {"mp2-saturated-2c",        kRing,     2048u,      2u,    0u,   0u,      2u},
+    {"mp3-fills-from-half-2c",  kRing / 2u, kRing,     2u,    0u,   0u,      3u},
+    {"mp4-parked-3c",           kRing,     2048u,      3u,    8u,   0u,      4u},
 };
 constexpr std::uint32_t kScenarioCount =
     static_cast<std::uint32_t>(sizeof(kScenarios) / sizeof(kScenarios[0]));
@@ -342,6 +362,12 @@ void check(const Scenario& sc, std::uint64_t seed, const Verdict& v,
                         "CAS and its body while the producer stored a slot — the "
                         "claim-vs-overwrite window was never open, so a green "
                         "result here proves nothing";
+    }
+    if (sc.producers > 1u) {
+        ASSERT_GT(v.overlaps, 0u)
+            << where << ": no producer ever stored a slot while another was "
+                        "suspended inside submit — the producer/producer race "
+                        "(G2ICE-189) was never reachable in this run";
     }
     if (require_collision) {
         ASSERT_GT(v.collisions, 0u)
@@ -440,10 +466,16 @@ TEST(BoltSchedSim, SeedSweepRunsEveryTaskExactlyOnce) {
     // that scenario contributed nothing and the sweep is wider than it is deep.
     for (std::uint32_t si = 0; si < kScenarioCount; ++si) {
         if (kScenarios[si].prefill != kRing) continue;
-        EXPECT_GT(agg_coll[si], 0u)
-            << kScenarios[si].name << ": across all " << seeds
-            << " seeds the producer never overwrote a slot a suspended consumer "
-               "had claimed — this scenario never reached the defect state";
+        // The collision witness keys on `head` as the sequence being stored,
+        // which holds only with one producer; multi-producer scenarios are
+        // held to the overlap witness in check() instead.
+        if (kScenarios[si].producers == 1u) {
+            EXPECT_GT(agg_coll[si], 0u)
+                << kScenarios[si].name << ": across all " << seeds
+                << " seeds the producer never overwrote a slot a suspended "
+                   "consumer had claimed — this scenario never reached the "
+                   "defect state";
+        }
         EXPECT_GT(agg_spins[si], 0u)
             << kScenarios[si].name << ": across all " << seeds
             << " seeds backpressure never fired — the ring was never actually "
