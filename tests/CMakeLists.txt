@@ -1965,3 +1965,12 @@ target_link_libraries(test_bolt_scheduler_worker_stack PRIVATE bolt::bolt)
 bolt_apply_hardening(test_bolt_scheduler_worker_stack)
 add_test(NAME test_bolt_scheduler_worker_stack
          COMMAND test_bolt_scheduler_worker_stack)
+
+# G2ICE-176: concurrent Delta committers — at most one winner per log version.
+add_executable(test_bolt_delta_concurrent_commit
+    test_bolt_delta_concurrent_commit.cpp)
+target_link_libraries(test_bolt_delta_concurrent_commit
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_delta_concurrent_commit)
+add_test(NAME test_bolt_delta_concurrent_commit
+         COMMAND test_bolt_delta_concurrent_commit)

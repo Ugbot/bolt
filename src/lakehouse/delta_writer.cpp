@@ -3,7 +3,7 @@
 // AppendHandle, table_create.
 //
 // Tiger Style: PODs, ≥2 asserts/fn, ≤70 line fns, no exceptions, Arena allocs,
-// commits atomic-via-conflict-check + os_put.
+// commits are an atomic create of _delta_log/<v>.json (os_put_if_absent).
 
 #include "bolt/lakehouse/delta/writer.h"
 
@@ -429,6 +429,18 @@ bool log_key_for_version(const char* table_rel, int64_t version, char* out,
                          static_cast<long long>(version)) > 0;
 }
 
+// Publish one log entry. The version file name is the CAS token: of several
+// writers on the same base exactly one creates it, the rest get kOsExists.
+// A store without an atomic create returns kOsNotImplemented and the commit
+// fails rather than degrading to a racy head-then-put.
+int put_log_entry(ObjectStore* os, const char* key, const char* body,
+                  uint64_t len) noexcept {
+    assert(os != nullptr && key != nullptr && key[0] != '\0');
+    assert(body != nullptr && len > 0);
+    return os_put_if_absent(os, key, reinterpret_cast<const uint8_t*>(body),
+                            len);
+}
+
 // Return highest visible commit version, or -1 if none.
 int64_t latest_version(ObjectStore* os, const char* table_rel,
                        Arena* scratch) noexcept {
@@ -557,16 +569,10 @@ bool delta_table_create(TableHandle** out, Arena* arena, Catalog* cat,
     char key[kDeltaMaxPath];
     if (!log_key_for_version(th->table_rel, 0, key, sizeof(key))) return false;
 
-    // Atomicity: refuse if a v0 commit already lives there.
-    ObjectMeta meta{};
-    if (os_head(&th->os, key, &meta) == kOsOk && meta.exists) {
-        *out = th;
-        return true;  // table already created — idempotent
-    }
-    if (os_put(&th->os, key, reinterpret_cast<const uint8_t*>(body),
-               static_cast<uint64_t>(blen)) != kOsOk) {
-        return false;
-    }
+    // An existing v0 means the table is already created: idempotent.
+    const int rc = put_log_entry(&th->os, key, body,
+                                 static_cast<uint64_t>(blen));
+    if (rc != kOsOk && rc != kOsExists) return false;
     *out = th;
     return true;
 }
@@ -713,10 +719,7 @@ bool delta_append_commit(AppendHandle* ah) noexcept {
     char key[kDeltaMaxPath];
     if (!log_key_for_version(ah->th->table_rel, target, key, sizeof(key)))
         return false;
-    ObjectMeta meta{};
-    if (os_head(&ah->th->os, key, &meta) == kOsOk && meta.exists) return false;
-    if (os_put(&ah->th->os, key, reinterpret_cast<const uint8_t*>(body),
-               static_cast<uint64_t>(off)) != kOsOk) return false;
+    if (put_log_entry(&ah->th->os, key, body, off) != kOsOk) return false;
     ah->base_version = target;
     ah->n_batches = 0;
     return true;
@@ -739,10 +742,7 @@ bool delta_writer_commit_raw(TableHandle* th, const char* body,
     char key[kDeltaMaxPath];
     if (!log_key_for_version(th->table_rel, target, key, sizeof(key)))
         return false;
-    ObjectMeta meta{};
-    if (os_head(&th->os, key, &meta) == kOsOk && meta.exists) return false;
-    if (os_put(&th->os, key, reinterpret_cast<const uint8_t*>(body),
-               static_cast<uint64_t>(body_len)) != kOsOk) return false;
+    if (put_log_entry(&th->os, key, body, body_len) != kOsOk) return false;
     *inout_base_version = target;
     return true;
 }
