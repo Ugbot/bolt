@@ -659,7 +659,7 @@ TEST(BoltSbbf, EmptyFilterAlwaysAbsent) {
     Arena arena;
     SplitBlockBloom sbf{};
     ASSERT_TRUE(sbbf_create(&sbf, /*expected_n=*/64, &arena));
-    for (uint64_t k : {1ULL, 42ULL, 0xDEADBEEFULL, ~uint64_t{0}}) {
+    for (uint64_t k : {uint64_t{1}, uint64_t{42}, uint64_t{0xDEADBEEF}, ~uint64_t{0}}) {
         EXPECT_FALSE(sbbf_test(sbf, swiss_mix(k)));
     }
 }
