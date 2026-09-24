@@ -51,6 +51,9 @@ struct alignas(64) RetireQueue {
     // passed-in Ebr (caller's responsibility to hand in the right
     // one).
     BOLT_FORCE_INLINE bool enqueue(T&& payload, const Ebr* e) noexcept {
+        assert(e != nullptr);
+        // StoreLoad: see ebr_retire.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         const uint64_t ge = e->global_epoch.load(std::memory_order_acquire);
         const uint64_t seq = ring.claim(1);
         Entry* slot = ring.slot(seq);

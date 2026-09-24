@@ -114,6 +114,8 @@ BOLT_FORCE_INLINE uint32_t ebr_min_pinned_slot(const Ebr* e) noexcept {
     assert(e != nullptr);
     assert(e->num_shards <= kEbrMaxShards);
 
+    // Pairs with the seq_cst fence in ebr_enter (store-buffering).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     uint32_t seen_mask = 0;  // bit i set ⇒ some shard pinned to slot i
     for (uint32_t s = 0; s < e->num_shards; ++s) {
         const uint64_t le = e->shards[s].local_epoch.load(std::memory_order_acquire);
@@ -196,10 +198,10 @@ inline void ebr_destroy(Ebr* e) noexcept {
 //                                             │
 //                                             ▼
 //                                  reader sees advanced epoch
-//   reader's ebr_enter acquire-fences any subsequent load of `obj` to
-//   happen after the pin store is visible to the collector. Therefore a
-//   reader that loads `obj` after pinning cannot race with the drain of
-//   the epoch the object was retired in.
+//   reader's ebr_enter seq_cst-fences the pin store against any later
+//   load of `obj`; each collector scan and each retire stamp issues the
+//   paired seq_cst fence. Therefore a reader that loads `obj` after
+//   pinning cannot race with the drain of the epoch it was retired in.
 //
 // Invariant (unobserved-retire): if a reader pins epoch E after the
 // retire is enqueued, it still sees a valid `obj` because retire-to-free
@@ -214,15 +216,11 @@ BOLT_FORCE_INLINE void ebr_enter(Ebr* e, uint32_t shard_id) noexcept {
     // Read the current global epoch with acquire — we need to observe
     // any prior collector advance before we commit our pin.
     const uint64_t ge = e->global_epoch.load(std::memory_order_acquire);
-    // Publish the pin with release: the collector's acquire load of
-    // local_epoch in ebr_try_advance_and_collect / ebr_min_pinned_slot
-    // synchronises-with this store.
-    e->shards[shard_id].local_epoch.store(ge, std::memory_order_release);
-    // Acquire fence: subsequent loads of the protected object cannot be
-    // reordered before the pin store from this thread's point of view.
-    // Combined with the release above this gives the StoreLoad barrier
-    // EBR requires on weak memory models (ARM/POWER).
-    std::atomic_thread_fence(std::memory_order_acquire);
+    e->shards[shard_id].local_epoch.store(ge, std::memory_order_relaxed);
+    // StoreLoad: the pin must be visible before any protected load. An
+    // acquire fence does not order a prior store (ARM64: dmb ishld). Pairs
+    // with the seq_cst fence each collector scan issues before loading pins.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 BOLT_FORCE_INLINE void ebr_exit(Ebr* e, uint32_t shard_id) noexcept {
@@ -248,6 +246,9 @@ inline bool ebr_retire(Ebr* e,
     assert(obj != nullptr);
     assert(free_fn != nullptr);
 
+    // StoreLoad: the caller's unlink must be visible before the epoch is
+    // sampled, or the stamp can be older than a reader that still sees obj.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint64_t ge   = e->global_epoch.load(std::memory_order_acquire);
     const uint32_t slot = ebr_epoch_slot(ge);
     EbrShard*      sh   = &e->shards[shard_id];
@@ -294,6 +295,8 @@ inline uint32_t ebr_try_advance_and_collect(Ebr* e) noexcept {
     const uint64_t ge         = e->global_epoch.load(std::memory_order_acquire);
     const uint32_t drain_slot = ebr_epoch_slot(ge + 1);  // i.e. ge - 2 mod 3
 
+    // Pairs with the seq_cst fence in ebr_enter (store-buffering).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     // If any shard is pinned to the slot we want to drain, abort.
     for (uint32_t s = 0; s < e->num_shards; ++s) {
         const uint64_t le = e->shards[s].local_epoch.load(std::memory_order_acquire);

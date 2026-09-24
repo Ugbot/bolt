@@ -287,3 +287,83 @@ TEST(BoltRetireQueue, UnpinnedEntryDequeuesAfterThreeAdvances) {
     delete q;
     ebr_destroy(&e);
 }
+
+// ---------------------------------------------------------------------------
+// Store-buffering litmus on the pin (G2ICE-193). Reader: ebr_enter, then load
+// the protected pointer. Unlinker/collector: clear the pointer, then scan the
+// pins. Forbidden: the reader saw the old pointer AND the scan saw no pin —
+// the collector would free what the reader holds. The reader stays pinned
+// until the scan finished, so an unpinned scan result is never legitimate.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SpinBarrier {
+    alignas(64) std::atomic<uint32_t> arrived{0};
+    alignas(64) std::atomic<uint32_t> phase{0};
+
+    void wait(uint32_t parties) noexcept {
+        const uint32_t p = phase.load(std::memory_order_acquire);
+        if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == parties) {
+            arrived.store(0, std::memory_order_relaxed);
+            phase.store(p + 1, std::memory_order_release);
+            return;
+        }
+        while (phase.load(std::memory_order_acquire) == p) BOLT_PAUSE();
+    }
+};
+
+void litmus_jitter(uint32_t n) noexcept {
+    for (uint32_t i = 0; i < n; ++i) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+}
+
+}  // namespace
+
+TEST(BoltEbr, PinStoreBufferingLitmus) {
+    constexpr uint32_t kIters = 2000000;
+    auto* e = static_cast<Ebr*>(std::malloc(sizeof(Ebr)));
+    ASSERT_NE(e, nullptr);
+    ebr_init(e, 1);
+
+    alignas(64) std::atomic<uint32_t> ptr_live{1};
+    SpinBarrier start, scanned, reset;
+    uint64_t violations = 0;
+    std::atomic<uint32_t> reader_saw_live{0};
+
+    std::thread reader([&] {
+        uint32_t seed = 0x9E3779B9u;
+        for (uint32_t i = 0; i < kIters; ++i) {
+            start.wait(2);
+            seed = seed * 1664525u + 1013904223u;
+            litmus_jitter((seed >> 24) & 7u);
+            ebr_enter(e, 0);
+            reader_saw_live.store(ptr_live.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            scanned.wait(2);
+            ebr_exit(e, 0);
+            reset.wait(2);
+        }
+    });
+
+    uint32_t seed = 0x7F4A7C15u;
+    for (uint32_t i = 0; i < kIters; ++i) {
+        start.wait(2);
+        seed = seed * 1664525u + 1013904223u;
+        litmus_jitter((seed >> 24) & 7u);
+        ptr_live.store(0, std::memory_order_relaxed);
+        const uint32_t pinned = ebr_min_pinned_slot(e);
+        scanned.wait(2);
+        if (reader_saw_live.load(std::memory_order_relaxed) == 1 &&
+            pinned == UINT32_MAX) {
+            violations++;
+        }
+        ptr_live.store(1, std::memory_order_relaxed);
+        reset.wait(2);
+    }
+    reader.join();
+
+    EXPECT_EQ(violations, 0u) << "reader held the pointer while the scan saw no pin";
+    ebr_destroy(e);
+    std::free(e);
+}
