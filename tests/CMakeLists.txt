@@ -1497,6 +1497,13 @@ target_link_libraries(test_bolt_deflate
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_deflate)
 add_test(NAME test_bolt_deflate COMMAND test_bolt_deflate)
+
+# G2CHK-145 — heap-backed per-thread scratch (keeps big tables out of static TLS).
+add_executable(test_bolt_tls_scratch test_bolt_tls_scratch.cpp)
+target_link_libraries(test_bolt_tls_scratch
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_tls_scratch)
+add_test(NAME test_bolt_tls_scratch COMMAND test_bolt_tls_scratch)
 # Produces the streams scripts/deflate_zlib_check.py hands to python zlib --
 # the check that an INDEPENDENT inflater accepts bolt's output, which bolt's
 # own inflate cannot establish.
