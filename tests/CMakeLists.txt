@@ -1956,3 +1956,12 @@ add_test(NAME test_bolt_iceberg_concurrent_commit_oracle
 set_tests_properties(test_bolt_iceberg_concurrent_commit_oracle PROPERTIES
     SKIP_RETURN_CODE 2
     FIXTURES_REQUIRED iceberg_concurrent_fixture)
+
+# G2ICE-166: scheduler workers keep a real stack under a static-TLS block
+# larger than RLIMIT_STACK (the chukonu-linked marbledb maint-worker SIGSEGV).
+add_executable(test_bolt_scheduler_worker_stack
+    test_bolt_scheduler_worker_stack.cpp)
+target_link_libraries(test_bolt_scheduler_worker_stack PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_scheduler_worker_stack)
+add_test(NAME test_bolt_scheduler_worker_stack
+         COMMAND test_bolt_scheduler_worker_stack)

@@ -13,6 +13,7 @@
 #include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_topology.h"
+#include "bolt/api/core/stacked_thread.h"
 
 #include <atomic>
 #include <cassert>
@@ -418,8 +419,15 @@ static constexpr uint32_t kMaxWorkers = config::kMaxWorkers;
 struct Scheduler {
     TaskRing ring;
 
-    // Worker threads (std::thread — portable across MSVC / gcc / clang).
-    std::thread workers[kMaxWorkers];
+    // Worker threads, spawned with an EXPLICIT stack size (G2ICE-166).
+    // A bare std::thread takes the platform default, and on glibc that
+    // default is RLIMIT_STACK (8 MiB) with the whole static-TLS block carved
+    // out of it. Once a linking binary's static TLS exceeds the rlimit
+    // (chukonu's thread_local scratch tables are ~11.3 MiB), glibc clamps the
+    // default to its minimum and a worker is left with ~4.5 KiB of real
+    // stack: the first task with a 4 KiB frame (marbledb's
+    // flush_zone_write_open) runs off the end into the guard page.
+    bolt::api::core::StackedThread workers[kMaxWorkers];
     uint32_t    num_workers;
     std::atomic<bool> shutdown_flag;
 
@@ -914,8 +922,16 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     // Spawn workers last so they see fully-initialised state.
     num_workers = num_threads;
     for (uint32_t i = 0; i < num_threads; ++i) {
-        workers[i] = std::thread(scheduler_worker_loop, this, i);
+        workers[i] = bolt::api::core::StackedThread(
+            bolt::api::core::kDefaultStackBytes,
+            scheduler_worker_loop, this, i);
+        if (!workers[i].joinable()) {
+            num_workers = i;
+            shutdown();
+            return false;
+        }
     }
+    assert(num_workers == num_threads);
     return true;
 }
 
