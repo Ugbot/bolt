@@ -153,8 +153,13 @@ struct S3ObjectStore {
     char     session_token[kS3MaxSession];  // "" = no STS
     uint16_t port;                          // 0 = scheme default
     bool     path_style;
-    uint8_t  _pad[5];
+    uint8_t  create_only;                   // kS3CreateOnly*
+    uint8_t  _pad[4];
 };
+
+// How put_if_absent expresses "only if the key does not exist".
+static constexpr uint8_t kS3CreateOnlyIfNoneMatch   = 0;  // If-None-Match: *
+static constexpr uint8_t kS3CreateOnlyGoogGeneration = 1; // GCS XML API
 
 // Initialise `s3` + bind `out`. `endpoint` "" targets AWS; otherwise it is
 // "http[s]://host[:port][/base]" (no scheme = https). Returns false on

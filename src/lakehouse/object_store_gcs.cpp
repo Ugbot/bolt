@@ -6,16 +6,18 @@
 //     already links OpenSSL 3.x; we don't introduce a new dep).
 //   - Service-account JSON parsing (purpose-built scan for client_email +
 //     private_key — no general-purpose JSON parser).
-//
-// Object ops go over the JSON API via bolt::net (see the vtable below);
-// the OAuth token exchange is not wired yet.
+//   - OAuth2 JWT-bearer exchange at the SA token_uri, cached per store.
+//   - HMAC keys ride the XML API through the SigV4 S3 store.
 
 #include "bolt/lakehouse/object_store/gcs.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <thread>
 
 #include "object_store_http.h"
 
@@ -283,124 +285,18 @@ bool parse_service_account_json(const char* json, uint32_t json_len,
 
 // ---------------------------------------------------------------------------
 // ObjectStore vtable over the GCS JSON API. put_if_absent is a media upload
-// with ifGenerationMatch=0 (412 when the object exists). Requests carry
-// `bearer_token` when set; with no credentials configured they go anonymous
-// (emulators such as fake-gcs-server). Minting a token from a service
-// account, and HMAC auth, are not wired: those report kOsNotImplemented.
+// with ifGenerationMatch=0 (412 when the object exists). HMAC-configured
+// stores delegate to an S3-style XML API store instead.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 using oshttp::Buf;
 
-bool gc_auth(const GcsStore* g, net::HttpRequest* req, bool* ok) noexcept {
-    assert(g != nullptr && req != nullptr);
-    assert(ok != nullptr);
-    *ok = true;
-    if (g->bearer_token[0] != '\0') {
-        char h[kGcsMaxBearer + 16u];
-        std::snprintf(h, sizeof(h), "Bearer %s", g->bearer_token);
-        *ok = net::http_request_add_header(req, "Authorization", h);
-        return true;
-    }
-    const bool anonymous = g->cfg.auth_mode == AuthMode::Hmac &&
-                           g->cfg.hmac_access_id.len == 0;
-    return anonymous;
-}
-
-// `api` is "" (metadata) or "/upload"; `obj` is null for bucket-level calls.
-int gc_send(GcsStore* g, const char* verb, const char* api, const char* obj,
-            const char* query, const uint8_t* body, uint64_t len,
-            Arena* arena, net::HttpResponse* resp) noexcept {
-    assert(g != nullptr && verb != nullptr && api != nullptr);
-    assert(arena != nullptr && resp != nullptr);
-    if (len > net::kHttpMaxBody) return kOsBadArg;
-    net::HttpRequest req;
-    std::memset(&req, 0, sizeof(req));
-    bool hdr_ok = true;
-    if (!gc_auth(g, &req, &hdr_ok)) return kOsNotImplemented;
-    Buf u; oshttp::buf_init(&u, req.url, sizeof(req.url));
-    oshttp::buf_str(&u, g->cfg.endpoint_override[0] != '\0'
-                            ? g->cfg.endpoint_override
-                            : "https://storage.googleapis.com");
-    while (u.n > 0 && u.p[u.n - 1] == '/') u.p[--u.n] = '\0';
-    oshttp::buf_str(&u, api);
-    oshttp::buf_str(&u, "/storage/v1/b/");
-    oshttp::buf_pct(&u, g->cfg.bucket, false);
-    oshttp::buf_str(&u, "/o");
-    if (obj != nullptr) {
-        oshttp::buf_str(&u, "/");
-        oshttp::buf_pct(&u, obj, /*keep_slash=*/false);
-    }
-    if (query != nullptr && query[0] != '\0') {
-        oshttp::buf_str(&u, "?");
-        oshttp::buf_str(&u, query);
-    }
-    if (!u.ok || !hdr_ok) return kOsBadArg;
-    std::strncpy(req.method, verb, sizeof(req.method) - 1u);
-    req.body = body;
-    req.body_len = static_cast<uint32_t>(len);
-    if (std::strcmp(verb, "POST") == 0) {
-        bool ok = net::http_request_add_header(
-            &req, "Content-Type", "application/octet-stream");
-        if (len == 0) {
-            ok = ok && net::http_request_add_header(&req, "Content-Length",
-                                                    "0");
-        }
-        if (!ok) return kOsBadArg;
-    }
-    return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
-}
-
-int gc_get(void* impl, const char* key, Arena* arena,
-           const uint8_t** out_data, uint64_t* out_len) noexcept {
-    assert(impl != nullptr && key != nullptr && arena != nullptr);
-    assert(out_data != nullptr && out_len != nullptr);
-    *out_data = nullptr;
-    *out_len = 0;
-    net::HttpResponse resp;
-    const int rc = gc_send(static_cast<GcsStore*>(impl), "GET", "", key,
-                           "alt=media", nullptr, 0, arena, &resp);
-    if (rc != kOsOk) return rc;
-    const int st = oshttp::map_status(resp.status);
-    if (st != kOsOk) return st;
-    *out_data = resp.body;
-    *out_len = resp.body_len;
-    return kOsOk;
-}
-
-int gc_upload(void* impl, const char* key, const uint8_t* data,
-              uint64_t len, bool if_absent) noexcept {
-    assert(impl != nullptr && key != nullptr);
-    assert(data != nullptr || len == 0);
-    char qb[kOsMaxKey * 3u + 64u];
-    Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
-    oshttp::buf_str(&q, "uploadType=media&name=");
-    oshttp::buf_pct(&q, key, false);
-    if (if_absent) oshttp::buf_str(&q, "&ifGenerationMatch=0");
-    if (!q.ok) return kOsBadArg;
-    Arena scratch;
-    net::HttpResponse resp;
-    const int rc = gc_send(static_cast<GcsStore*>(impl), "POST", "/upload",
-                           nullptr, qb, data, len, &scratch, &resp);
-    if (rc != kOsOk) return rc;
-    if (if_absent && resp.status == 412) return kOsExists;
-    return resp.status / 100 == 2 ? kOsOk : kOsIoError;
-}
-
-int gc_put(void* impl, const char* key, const uint8_t* data,
-           uint64_t len) noexcept {
-    assert(impl != nullptr);
-    assert(key != nullptr);
-    return gc_upload(impl, key, data, len, false);
-}
-
-int gc_put_if_absent(void* impl, const char* key, const uint8_t* data,
-                     uint64_t len) noexcept {
-    assert(impl != nullptr);
-    assert(key != nullptr);
-    return gc_upload(impl, key, data, len, true);
-}
+constexpr const char* kDefaultTokenUri = "https://oauth2.googleapis.com/token";
+constexpr const char* kScope =
+    "https://www.googleapis.com/auth/devstorage.read_write";
+constexpr uint32_t kLockSpinMax = 1u << 24;
 
 // Next "field": "<string>" value at or after *pos (simple escapes only).
 bool json_field(const char* s, uint32_t len, uint32_t* pos,
@@ -437,12 +333,280 @@ bool json_field(const char* s, uint32_t len, uint32_t* pos,
     return false;
 }
 
+// "field": <unsigned integer> anywhere in s.
+bool json_uint(const char* s, uint32_t len, const char* field,
+               uint64_t* out) noexcept {
+    assert(s != nullptr && field != nullptr);
+    assert(out != nullptr);
+    char pat[64];
+    const int pl = std::snprintf(pat, sizeof(pat), "\"%s\"", field);
+    if (pl <= 0) return false;
+    for (uint32_t i = 0; i + static_cast<uint32_t>(pl) <= len; ++i) {
+        if (std::memcmp(s + i, pat, static_cast<size_t>(pl)) != 0) continue;
+        uint32_t j = i + static_cast<uint32_t>(pl);
+        while (j < len && (s[j] == ' ' || s[j] == ':' || s[j] == '\n' ||
+                           s[j] == '\t' || s[j] == '\r')) ++j;
+        uint64_t v = 0;
+        uint32_t digits = 0;
+        while (j < len && s[j] >= '0' && s[j] <= '9' && digits < 18u) {
+            v = v * 10u + static_cast<uint64_t>(s[j] - '0');
+            ++j; ++digits;
+        }
+        if (digits == 0) return false;
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+// A bearer token goes verbatim into a header: printable ASCII only.
+bool token_ok(const char* t) noexcept {
+    assert(t != nullptr);
+    uint32_t i = 0;
+    for (; t[i] != '\0' && i < kGcsMaxBearer; ++i) {
+        if (t[i] <= ' ' || t[i] > '~') return false;
+    }
+    assert(i <= kGcsMaxBearer);
+    return i > 0 && i < kGcsMaxBearer;
+}
+
+void set_auth_error(GcsStore* g, int status, const uint8_t* body,
+                    uint32_t len) noexcept {
+    assert(g != nullptr);
+    assert(body != nullptr || len == 0);
+    const int n = std::snprintf(g->last_auth_error, kGcsMaxAuthError,
+                                "HTTP %d: ", status);
+    uint32_t o = n > 0 ? static_cast<uint32_t>(n) : 0u;
+    for (uint32_t i = 0; i < len && o + 1u < kGcsMaxAuthError; ++i) {
+        const char c = static_cast<char>(body[i]);
+        g->last_auth_error[o++] = (c >= ' ' && c <= '~') ? c : ' ';
+    }
+    g->last_auth_error[o < kGcsMaxAuthError ? o : kGcsMaxAuthError - 1u] =
+        '\0';
+}
+
+// Signed "header.claims.signature" into out. Returns kOs*.
+int signed_jwt(const GcsStore* g, uint64_t now, char* out,
+               uint32_t cap) noexcept {
+    assert(g != nullptr && out != nullptr);
+    assert(cap > 0);
+    const uint32_t n = build_jwt_unsigned(g->client_email, kScope,
+                                          g->token_uri, now, kGcsJwtTtlS,
+                                          out, cap);
+    if (n == 0 || n + 2u >= cap) return kOsBadArg;
+#if defined(BOLT_WITH_TLS)
+    out[n] = '.';
+    const uint32_t s = sign_jwt_rs256(g->private_key_pem,
+                                      g->private_key_pem_len, out, n,
+                                      out + n + 1u, cap - n - 1u);
+    return s == 0 ? kOsBadArg : kOsOk;
+#else
+    return kOsNotImplemented;
+#endif
+}
+
+}  // namespace
+
+int gcs_mint_token(GcsStore* g, uint64_t now_unix) noexcept {
+    assert(g != nullptr);
+    assert(now_unix > 0);
+    if (g->cfg.auth_mode != AuthMode::ServiceAccount) return kOsBadArg;
+    static constexpr const char kGrant[] =
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
+        "&assertion=";
+    char body[4096];
+    const uint32_t gl = static_cast<uint32_t>(sizeof(kGrant) - 1u);
+    std::memcpy(body, kGrant, gl);
+    const int jrc = signed_jwt(g, now_unix, body + gl, sizeof(body) - gl);
+    if (jrc != kOsOk) return jrc;
+    net::HttpRequest req;
+    std::memset(&req, 0, sizeof(req));
+    std::strncpy(req.method, "POST", sizeof(req.method) - 1u);
+    std::strncpy(req.url, g->token_uri, sizeof(req.url) - 1u);
+    req.body = reinterpret_cast<const uint8_t*>(body);
+    req.body_len = static_cast<uint32_t>(std::strlen(body));
+    if (!net::http_request_add_header(&req, "Content-Type",
+                                      "application/x-www-form-urlencoded")) {
+        return kOsBadArg;
+    }
+    Arena scratch;
+    net::HttpResponse resp;
+    if (net::http_send(&scratch, &req, &resp) != 0) {
+        set_auth_error(g, 0, nullptr, 0);
+        return kOsIoError;
+    }
+    set_auth_error(g, resp.status, resp.body, resp.body_len);
+    if (resp.status / 100 != 2) return kOsIoError;
+    const char* x = reinterpret_cast<const char*>(resp.body);
+    char tok[kGcsMaxBearer];
+    uint32_t pos = 0;
+    uint64_t ttl = 0;
+    if (!json_field(x, resp.body_len, &pos, "access_token", tok, sizeof(tok)) ||
+        !token_ok(tok) || !json_uint(x, resp.body_len, "expires_in", &ttl)) {
+        return kOsIoError;
+    }
+    std::memcpy(g->bearer_token, tok, sizeof(tok));
+    g->bearer_expiry_unix = now_unix + ttl;
+    ++g->token_mints;
+    g->last_auth_error[0] = '\0';
+    assert(g->bearer_token[0] != '\0');
+    return kOsOk;
+}
+
+namespace {
+
+// Copy a live bearer token into out, minting under the store's lock when
+// none is cached or it is within kGcsRefreshMarginS of expiry.
+int sa_token(GcsStore* g, char* out, uint32_t cap) noexcept {
+    assert(g != nullptr && out != nullptr);
+    assert(cap >= kGcsMaxBearer);
+    std::atomic_ref<uint32_t> lock(g->token_lock);
+    uint32_t spins = 0;
+    for (;;) {
+        uint32_t expected = 0;
+        if (lock.compare_exchange_weak(expected, 1u,
+                                       std::memory_order_acquire)) break;
+        if (++spins >= kLockSpinMax) return kOsIoError;
+        std::this_thread::yield();
+    }
+    const std::time_t t = std::time(nullptr);
+    const uint64_t now = t > 0 ? static_cast<uint64_t>(t) : 1u;
+    int rc = kOsOk;
+    if (g->bearer_token[0] == '\0' ||
+        g->bearer_expiry_unix <= now + kGcsRefreshMarginS) {
+        rc = gcs_mint_token(g, now);
+    }
+    if (rc == kOsOk) std::memcpy(out, g->bearer_token, kGcsMaxBearer);
+    lock.store(0u, std::memory_order_release);
+    return rc;
+}
+
+int gc_auth(GcsStore* g, net::HttpRequest* req) noexcept {
+    assert(g != nullptr && req != nullptr);
+    assert(!g->use_xml);
+    char tok[kGcsMaxBearer];
+    if (g->cfg.auth_mode == AuthMode::ServiceAccount) {
+        const int rc = sa_token(g, tok, sizeof(tok));
+        if (rc != kOsOk) return rc;
+    } else if (g->bearer_token[0] != '\0') {
+        std::memcpy(tok, g->bearer_token, sizeof(tok));
+    } else {
+        return kOsOk;   // anonymous (emulators)
+    }
+    char h[kGcsMaxBearer + 16u];
+    std::snprintf(h, sizeof(h), "Bearer %s", tok);
+    return net::http_request_add_header(req, "Authorization", h) ? kOsOk
+                                                                 : kOsBadArg;
+}
+
+// `api` is "" (metadata) or "/upload"; `obj` is null for bucket-level calls.
+int gc_send(GcsStore* g, const char* verb, const char* api, const char* obj,
+            const char* query, const uint8_t* body, uint64_t len,
+            Arena* arena, net::HttpResponse* resp) noexcept {
+    assert(g != nullptr && verb != nullptr && api != nullptr);
+    assert(arena != nullptr && resp != nullptr);
+    if (len > net::kHttpMaxBody) return kOsBadArg;
+    net::HttpRequest req;
+    std::memset(&req, 0, sizeof(req));
+    const int arc = gc_auth(g, &req);
+    if (arc != kOsOk) return arc;
+    Buf u; oshttp::buf_init(&u, req.url, sizeof(req.url));
+    oshttp::buf_str(&u, g->cfg.endpoint_override[0] != '\0'
+                            ? g->cfg.endpoint_override
+                            : "https://storage.googleapis.com");
+    while (u.n > 0 && u.p[u.n - 1] == '/') u.p[--u.n] = '\0';
+    oshttp::buf_str(&u, api);
+    oshttp::buf_str(&u, "/storage/v1/b/");
+    oshttp::buf_pct(&u, g->cfg.bucket, false);
+    oshttp::buf_str(&u, "/o");
+    if (obj != nullptr) {
+        oshttp::buf_str(&u, "/");
+        oshttp::buf_pct(&u, obj, /*keep_slash=*/false);
+    }
+    if (query != nullptr && query[0] != '\0') {
+        oshttp::buf_str(&u, "?");
+        oshttp::buf_str(&u, query);
+    }
+    if (!u.ok) return kOsBadArg;
+    std::strncpy(req.method, verb, sizeof(req.method) - 1u);
+    req.body = body;
+    req.body_len = static_cast<uint32_t>(len);
+    if (std::strcmp(verb, "POST") == 0) {
+        bool ok = net::http_request_add_header(
+            &req, "Content-Type", "application/octet-stream");
+        if (len == 0) {
+            ok = ok && net::http_request_add_header(&req, "Content-Length",
+                                                    "0");
+        }
+        if (!ok) return kOsBadArg;
+    }
+    return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
+}
+
+int gc_get(void* impl, const char* key, Arena* arena,
+           const uint8_t** out_data, uint64_t* out_len) noexcept {
+    assert(impl != nullptr && key != nullptr && arena != nullptr);
+    assert(out_data != nullptr && out_len != nullptr);
+    GcsStore* g = static_cast<GcsStore*>(impl);
+    if (g->use_xml) return os_get(&g->xml_os, key, arena, out_data, out_len);
+    *out_data = nullptr;
+    *out_len = 0;
+    net::HttpResponse resp;
+    const int rc = gc_send(g, "GET", "", key, "alt=media", nullptr, 0, arena,
+                           &resp);
+    if (rc != kOsOk) return rc;
+    const int st = oshttp::map_status(resp.status);
+    if (st != kOsOk) return st;
+    *out_data = resp.body;
+    *out_len = resp.body_len;
+    return kOsOk;
+}
+
+int gc_upload(void* impl, const char* key, const uint8_t* data,
+              uint64_t len, bool if_absent) noexcept {
+    assert(impl != nullptr && key != nullptr);
+    assert(data != nullptr || len == 0);
+    GcsStore* g = static_cast<GcsStore*>(impl);
+    if (g->use_xml) {
+        return if_absent ? os_put_if_absent(&g->xml_os, key, data, len)
+                         : os_put(&g->xml_os, key, data, len);
+    }
+    char qb[kOsMaxKey * 3u + 64u];
+    Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
+    oshttp::buf_str(&q, "uploadType=media&name=");
+    oshttp::buf_pct(&q, key, false);
+    if (if_absent) oshttp::buf_str(&q, "&ifGenerationMatch=0");
+    if (!q.ok) return kOsBadArg;
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = gc_send(g, "POST", "/upload", nullptr, qb, data, len,
+                           &scratch, &resp);
+    if (rc != kOsOk) return rc;
+    if (if_absent && resp.status == 412) return kOsExists;
+    return resp.status / 100 == 2 ? kOsOk : kOsIoError;
+}
+
+int gc_put(void* impl, const char* key, const uint8_t* data,
+           uint64_t len) noexcept {
+    assert(impl != nullptr);
+    assert(key != nullptr);
+    return gc_upload(impl, key, data, len, false);
+}
+
+int gc_put_if_absent(void* impl, const char* key, const uint8_t* data,
+                     uint64_t len) noexcept {
+    assert(impl != nullptr);
+    assert(key != nullptr);
+    return gc_upload(impl, key, data, len, true);
+}
+
 int gc_list(void* impl, const char* prefix, ObjectEntry* out,
             uint32_t cap, uint32_t* out_n) noexcept {
     assert(impl != nullptr);
     assert(out != nullptr && out_n != nullptr);
-    *out_n = 0;
     GcsStore* g = static_cast<GcsStore*>(impl);
+    if (g->use_xml) return os_list(&g->xml_os, prefix, out, cap, out_n);
+    *out_n = 0;
     char token[1024] = "";
     uint32_t count = 0;
     for (uint32_t page = 0; page < 4096u && count < cap; ++page) {
@@ -486,10 +650,12 @@ int gc_list(void* impl, const char* prefix, ObjectEntry* out,
 int gc_delete(void* impl, const char* key) noexcept {
     assert(impl != nullptr);
     assert(key != nullptr);
+    GcsStore* g = static_cast<GcsStore*>(impl);
+    if (g->use_xml) return os_delete(&g->xml_os, key);
     Arena scratch;
     net::HttpResponse resp;
-    const int rc = gc_send(static_cast<GcsStore*>(impl), "DELETE", "", key,
-                           "", nullptr, 0, &scratch, &resp);
+    const int rc = gc_send(g, "DELETE", "", key, "", nullptr, 0, &scratch,
+                           &resp);
     if (rc != kOsOk) return rc;
     return oshttp::map_status(resp.status);
 }
@@ -497,11 +663,13 @@ int gc_delete(void* impl, const char* key) noexcept {
 int gc_head(void* impl, const char* key, ObjectMeta* out) noexcept {
     assert(impl != nullptr);
     assert(out != nullptr && key != nullptr);
+    GcsStore* g = static_cast<GcsStore*>(impl);
+    if (g->use_xml) return os_head(&g->xml_os, key, out);
     std::memset(out, 0, sizeof(*out));
     Arena scratch;
     net::HttpResponse resp;
-    const int rc = gc_send(static_cast<GcsStore*>(impl), "GET", "", key,
-                           "fields=size", nullptr, 0, &scratch, &resp);
+    const int rc = gc_send(g, "GET", "", key, "fields=size", nullptr, 0,
+                           &scratch, &resp);
     if (rc != kOsOk) return rc;
     const int st = oshttp::map_status(resp.status);
     if (st != kOsOk) return st;
@@ -518,6 +686,52 @@ const ObjectStoreVT kGcsVT = {
     gc_get, gc_put, gc_list, gc_delete, gc_head, gc_put_if_absent,
 };
 
+// SA JSON token_uri (optional; Google's endpoint when absent).
+bool init_service_account(GcsStore* g) noexcept {
+    assert(g != nullptr);
+    assert(g->cfg.auth_mode == AuthMode::ServiceAccount);
+    const Config* cfg = &g->cfg;
+    if (cfg->service_account_json.len == 0 ||
+        cfg->service_account_json.len > kGcsMaxSaJson) return false;
+    if (!parse_service_account_json(cfg->service_account_json.bytes,
+                                    cfg->service_account_json.len,
+                                    g->client_email, kGcsMaxClientEmail,
+                                    g->private_key_pem, kGcsMaxPrivateKey,
+                                    &g->private_key_pem_len)) {
+        return false;
+    }
+    uint32_t pos = 0;
+    if (!json_field(cfg->service_account_json.bytes,
+                    cfg->service_account_json.len, &pos, "token_uri",
+                    g->token_uri, kGcsMaxEndpoint)) {
+        std::strncpy(g->token_uri, kDefaultTokenUri, kGcsMaxEndpoint - 1u);
+    }
+    return std::strncmp(g->token_uri, "https://", 8) == 0 ||
+           std::strncmp(g->token_uri, "http://", 7) == 0;
+}
+
+// Hmac key: an S3-style store on the XML API (path style, region "auto").
+bool init_hmac(GcsStore* g) noexcept {
+    assert(g != nullptr);
+    assert(g->cfg.hmac_access_id.len > 0);
+    if (g->cfg.hmac_secret.len == 0) return false;
+    if (!s3_object_store_init(&g->xml, g->cfg.bucket, "auto",
+                              g->cfg.hmac_access_id.bytes,
+                              g->cfg.hmac_secret.bytes, &g->xml_os)) {
+        return false;
+    }
+    const char* ep = g->cfg.endpoint_override[0] != '\0'
+                         ? g->cfg.endpoint_override
+                         : "https://storage.googleapis.com";
+    const size_t n = std::strlen(ep);
+    if (n + 1u > kS3MaxEndpoint) return false;
+    std::memcpy(g->xml.endpoint, ep, n + 1u);
+    g->xml.path_style = true;
+    g->xml.create_only = kS3CreateOnlyGoogGeneration;
+    g->use_xml = true;
+    return true;
+}
+
 }  // namespace
 
 bool gcs_store_new(ObjectStore* out, Arena* arena, const Config* cfg) noexcept {
@@ -530,14 +744,9 @@ bool gcs_store_new(ObjectStore* out, Arena* arena, const Config* cfg) noexcept {
     std::memset(g, 0, sizeof(*g));
     g->cfg = *cfg;
     if (cfg->auth_mode == AuthMode::ServiceAccount) {
-        if (cfg->service_account_json.len == 0) return false;
-        if (!parse_service_account_json(cfg->service_account_json.bytes,
-                                        cfg->service_account_json.len,
-                                        g->client_email, kGcsMaxClientEmail,
-                                        g->private_key_pem, kGcsMaxPrivateKey,
-                                        &g->private_key_pem_len)) {
-            return false;
-        }
+        if (!init_service_account(g)) return false;
+    } else if (cfg->hmac_access_id.len > 0) {
+        if (!init_hmac(g)) return false;
     }
     out->vt = &kGcsVT;
     out->impl = g;

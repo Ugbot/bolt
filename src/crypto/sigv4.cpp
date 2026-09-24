@@ -198,7 +198,7 @@ void sha256_empty_hex(char out_hex[65]) noexcept {
 namespace {
 
 // Build the canonical request into `buf`; returns its length or 0 on overflow.
-// Also fills `signed_headers` (caller buffer >= 96 bytes).
+// Also fills `signed_headers` (caller buffer >= 160 bytes).
 uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
                          char* signed_headers, uint32_t sh_cap) noexcept {
     assert(r != nullptr);
@@ -209,6 +209,26 @@ uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
     if (r->session_token != nullptr) {
         if (!app(signed_headers, sh_cap, &shp, ";x-amz-security-token"))
             return 0;
+    }
+    char extra_name[64];
+    const char* extra_value = nullptr;
+    if (r->extra_header != nullptr) {
+        const char* colon = std::strchr(r->extra_header, ':');
+        if (colon == nullptr) return 0;
+        const size_t nl = static_cast<size_t>(colon - r->extra_header);
+        if (nl == 0 || nl + 1u > sizeof(extra_name)) return 0;
+        for (size_t i = 0; i < nl; ++i) {
+            const char c = r->extra_header[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-')) return 0;
+        }
+        std::memcpy(extra_name, r->extra_header, nl);
+        extra_name[nl] = '\0';
+        // Canonical headers are sorted; the extra one is emitted last.
+        if (std::strcmp(extra_name, "x-amz-security-token") <= 0) return 0;
+        extra_value = colon + 1;
+        if (!app(signed_headers, sh_cap, &shp, ";") ||
+            !app(signed_headers, sh_cap, &shp, extra_name)) return 0;
     }
     uint32_t p = 0;
     bool ok = app(buf, cap, &p, r->method) && app(buf, cap, &p, "\n") &&
@@ -222,6 +242,10 @@ uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
     if (r->session_token != nullptr) {
         ok = ok && app(buf, cap, &p, "x-amz-security-token:") &&
              app(buf, cap, &p, r->session_token) && app(buf, cap, &p, "\n");
+    }
+    if (extra_value != nullptr) {
+        ok = ok && app(buf, cap, &p, extra_name) && app(buf, cap, &p, ":") &&
+             app(buf, cap, &p, extra_value) && app(buf, cap, &p, "\n");
     }
     ok = ok && app(buf, cap, &p, "\n") &&
          app(buf, cap, &p, signed_headers) && app(buf, cap, &p, "\n") &&
@@ -256,7 +280,7 @@ bool sigv4_sign(const SigV4Request* req, SigV4Result* out) noexcept {
     // 1) canonical request → its SHA-256 hex.
     char canon[kSigV4MaxPath + kSigV4MaxQuery + kSigV4MaxHost +
                kSigV4MaxToken + 512u];
-    char signed_headers[96];
+    char signed_headers[160];
     const uint32_t clen = build_canonical(req, canon, sizeof(canon),
                                           signed_headers, sizeof(signed_headers));
     if (clen == 0) return false;
