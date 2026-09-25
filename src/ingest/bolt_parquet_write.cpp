@@ -58,6 +58,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_scheduler.h"
+#include "bolt/bolt_tls_scratch.h"
 #include "bolt/ingest/bolt_snappy.h"        // snappy_compress
 #include "bolt/ingest/bolt_lz4_raw.h"      // lz4_raw_compress
 #include "bolt/ingest/bolt_deflate.h"      // gzip_compress
@@ -995,13 +996,14 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
         const std::size_t cap = static_cast<std::size_t>(gzip_bound(src_len));
         dst->resize(cap);
         std::uint64_t out_len = 0;
-        // The DeflateState is 256 KiB, far too big for the stack and pointless
-        // to reallocate per page; one per thread, reused for the process.
-        // Thread-local rather than shared because parallel column encoding
-        // runs this concurrently.
-        static thread_local DeflateState gz_state;
+        // The DeflateState is 256 KiB: one per thread (parallel column
+        // encoding runs this concurrently), heap-backed so it stays out of
+        // every thread's static TLS.
+        struct GzStateTag {};
+        DeflateState* gz_state = bolt::tls_scratch<GzStateTag, DeflateState>();
+        if (gz_state == nullptr) return false;
         if (!gzip_compress(src, src_len, dst->data(), cap, &out_len,
-                           &gz_state)) {
+                           gz_state)) {
             return false;
         }
         dst->resize(static_cast<std::size_t>(out_len));
