@@ -1049,6 +1049,13 @@ target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_date PRIVATE)
 add_test(NAME bolt_date COMMAND test_bolt_date)
 
+# Locale-independent double <-> text (std::to_chars / from_chars semantics
+# without the availability-gated <charconv> float overloads).
+add_executable(test_bolt_float_chars test_bolt_float_chars.cpp)
+target_link_libraries(test_bolt_float_chars PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_float_chars PRIVATE)
+add_test(NAME bolt_float_chars COMMAND test_bolt_float_chars)
+
 # Lock-free queue zoo (Wave: morsel-distribution substrate).
 # Borrowed from chukonu-v1 lockfree_queue.h, stripped of Arrow / shared_ptr
 # and rebuilt to Bolt's Tiger-Style header-only rules.
