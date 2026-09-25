@@ -813,10 +813,11 @@ inline int64_t d128_filter_cmp_col_selected(
 // ============================================================================
 // Decimal → f64 coercion (Perf Wave 2) — feeds f64_filter_cmp_col in
 // bolt_numeric.h for MIXED numeric-type compares. Semantics match chukonu's
-// numeric_as_double exactly: value = (hi * 2^64 + (u64)lo) / 10^scale, with
-// the divisor built by repeated `*= 10.0` (kept identical so the bits match
-// the scalar loop being replaced; division by 1.0 is an exact identity, so
-// scale==0 needs no branch).
+// numeric_as_double: value = |m| / 10^scale with the sign applied last, the
+// magnitude built as (u64)|hi| * 2^64 + (u64)|lo| from the two's-complement
+// negation. The signed form hi*2^64 + (u64)lo cancels to 0 for small
+// negatives (hi=-1, lo=2^64-k rounds to 2^64). The divisor is built by
+// repeated `*= 10.0`; division by 1.0 is exact, so scale==0 needs no branch.
 // ============================================================================
 
 inline void d128_to_f64(const Decimal128* BOLT_RESTRICT a, uint8_t scale,
@@ -826,9 +827,16 @@ inline void d128_to_f64(const Decimal128* BOLT_RESTRICT a, uint8_t scale,
     double p = 1.0;
     for (uint8_t s = 0; s < scale; ++s) p *= 10.0;  // bounded: scale <= ~38
     for (int64_t i = 0; i < n; ++i) {
-        const double v = static_cast<double>(a[i].hi) * 18446744073709551616.0
-                       + static_cast<double>(static_cast<uint64_t>(a[i].lo));
-        out[i] = v / p;
+        const bool neg = a[i].hi < 0;
+        uint64_t ulo = static_cast<uint64_t>(a[i].lo);
+        uint64_t uhi = static_cast<uint64_t>(a[i].hi);
+        if (neg) {
+            ulo = ~ulo + 1ull;
+            uhi = ~uhi + ((ulo == 0ull) ? 1ull : 0ull);
+        }
+        const double m = static_cast<double>(uhi) * 18446744073709551616.0
+                       + static_cast<double>(ulo);
+        out[i] = (neg ? -m : m) / p;
     }
 }
 

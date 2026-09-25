@@ -443,13 +443,39 @@ TEST(Coerce, WidenI64AndI32) {
     widen_i64_to_f64(nullptr, 0, nullptr);  // empty no-op
 }
 
-// numeric_as_double oracle for Decimal128 (chukonu filter_op.cpp).
+// Sign-magnitude oracle: negate by 0 - x with borrow, convert, reapply sign.
 double oracle_d128_to_f64(dec::Decimal128 d, uint8_t scale) {
     double p = 1.0;
     for (uint8_t s = 0; s < scale; ++s) p *= 10.0;
-    const double v = static_cast<double>(d.hi) * 18446744073709551616.0
-                   + static_cast<double>(static_cast<uint64_t>(d.lo));
-    return (scale == 0) ? v : v / p;
+    uint64_t lo = static_cast<uint64_t>(d.lo);
+    uint64_t hi = static_cast<uint64_t>(d.hi);
+    const bool neg = d.hi < 0;
+    if (neg) {
+        hi = 0ull - hi - (lo != 0ull ? 1ull : 0ull);
+        lo = 0ull - lo;
+    }
+    const double m = static_cast<double>(hi) * 18446744073709551616.0
+                   + static_cast<double>(lo);
+    return (neg ? -m : m) / p;
+}
+
+// G2CHK-211: hi=-1 small negatives used to cancel to 0.
+TEST(Coerce, D128ToF64SmallNegatives) {
+    const int64_t m[7] = {-1, -5, -375, -2000, -123456789,
+                          std::numeric_limits<int64_t>::min(), 7};
+    dec::Decimal128 v[7];
+    for (int i = 0; i < 7; ++i) v[i] = dec::d128_from_i64(m[i]);
+    double out[7];
+    const uint8_t scales[3] = {0, 2, 6};
+    for (uint8_t sc : scales) {
+        double p = 1.0;
+        for (uint8_t s = 0; s < sc; ++s) p *= 10.0;
+        dec::d128_to_f64(v, sc, 7, out);
+        for (int i = 0; i < 7; ++i)
+            EXPECT_EQ(out[i], static_cast<double>(m[i]) / p)
+                << "m=" << m[i] << " scale=" << int(sc);
+    }
+    EXPECT_LT(out[0], 0.0);
 }
 
 TEST(Coerce, D128ToF64MatchesNumericAsDouble) {
