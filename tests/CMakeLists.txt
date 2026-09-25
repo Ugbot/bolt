@@ -1953,6 +1953,13 @@ target_link_libraries(test_bolt_arena_concurrent
 bolt_apply_hardening(test_bolt_arena_concurrent)
 add_test(NAME test_bolt_arena_concurrent COMMAND test_bolt_arena_concurrent)
 
+# G2LAUNCH-35: trimmed arena blocks return to the OS.
+add_executable(test_bolt_arena_os_release test_bolt_arena_os_release.cpp)
+target_link_libraries(test_bolt_arena_os_release
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_os_release)
+add_test(NAME test_bolt_arena_os_release COMMAND test_bolt_arena_os_release)
+
 # TypedBatchPool / ArenaRing slot lifetime (G2CHK-148: eager per-slot Arena()
 # at pool construction, dropped by acquire's placement-new -> 4 MiB leaks).
 add_executable(test_bolt_pool_lifecycle test_bolt_pool_lifecycle.cpp)

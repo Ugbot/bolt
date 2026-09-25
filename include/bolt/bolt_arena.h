@@ -27,6 +27,13 @@ struct ArenaConfig {
     bool   poison_on_reset    = false;              // Debug: 0xDE fill
 };
 
+/// Arena blocks at least this large are mapped straight from the OS on POSIX
+/// (see Arena::os_block). Smaller blocks stay on malloc so short-lived
+/// default arenas (4 MB first block) keep reusing warm pages. Page alignment
+/// covers any alignment up to 4 KiB.
+inline constexpr size_t kArenaOsBlockMinBytes = 32 * 1024 * 1024;
+inline constexpr size_t kArenaOsBlockMaxAlign = 4096;
+
 /// Maximum number of backing blocks an arena can hold.
 /// NOTE: doubling is CAPPED at config.max_block_size, so total capacity is
 /// roughly kArenaMaxBlocks x max_block_size (default 64 MB => ~14.6 GB), NOT
@@ -78,7 +85,7 @@ public:
 
     ~Arena() noexcept {
         for (uint32_t i = 0; i < num_blocks_; ++i) {
-            aligned_free(blocks_[i]);
+            aligned_free(blocks_[i], block_sizes_[i]);
         }
     }
 
@@ -154,7 +161,7 @@ public:
     /// Release all blocks except the first.
     void compact() noexcept {
         for (uint32_t i = 1; i < num_blocks_; ++i) {
-            aligned_free(blocks_[i]);
+            aligned_free(blocks_[i], block_sizes_[i]);
             blocks_[i] = nullptr;
             block_sizes_[i] = 0;
         }
@@ -183,7 +190,7 @@ public:
         while (num_blocks_ > 1 && reserved > keep_bytes) {
             num_blocks_--;
             reserved -= block_sizes_[num_blocks_];
-            aligned_free(blocks_[num_blocks_]);
+            aligned_free(blocks_[num_blocks_], block_sizes_[num_blocks_]);
             blocks_[num_blocks_] = nullptr;
             block_sizes_[num_blocks_] = 0;
         }
@@ -209,11 +216,47 @@ public:
     }
 
 private:
-    static void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
+    // Large blocks come straight from the OS on POSIX, so freeing one returns
+    // its pages at once. Through malloc, macOS's large cache (and glibc's
+    // grown mmap threshold) keep freed blocks dirty, and a long-lived process
+    // ratchets toward the sum of every query's peak (G2LAUNCH-35). Windows
+    // already releases large blocks on free (HeapFree -> VirtualFree).
+    bool os_block(size_t size) const noexcept {
+#if defined(__linux__) || defined(__APPLE__)
+        return size >= kArenaOsBlockMinBytes &&
+               config_.alignment <= kArenaOsBlockMaxAlign;
+#else
+        (void)size;
+        return false;
+#endif
+    }
+
+    void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
+        assert(alignment == config_.alignment);
+        assert(size > 0);
+#if defined(__linux__) || defined(__APPLE__)
+        if (os_block(size)) {
+            void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            return (p == MAP_FAILED) ? nullptr : p;
+        }
+#endif
         return bolt_aligned_alloc(alignment, size);
     }
 
-    static void aligned_free(void* p) noexcept {
+    // `size` must be the block's recorded size: it picks the same path the
+    // allocation took.
+    void aligned_free(void* p, size_t size) noexcept {
+        assert(p != nullptr);
+        assert(size > 0);
+#if defined(__linux__) || defined(__APPLE__)
+        if (os_block(size)) {
+            const int rc = ::munmap(p, size);
+            assert(rc == 0);
+            (void)rc;
+            return;
+        }
+#endif
         bolt_aligned_free(p);
     }
 
