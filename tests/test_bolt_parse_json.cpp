@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <clocale>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -162,6 +163,41 @@ TEST(BoltParseJson, NumbersLazyMaterialise) {
 
     ASSERT_TRUE(bolt::parse::json::iter_float64(&it, &f));
     EXPECT_DOUBLE_EQ(f, 1.0e3);
+}
+
+// G2CHK-197: numbers must not follow LC_NUMERIC (strtod read "1.5" as 1 under
+// a ',' radix locale).
+TEST(BoltParseJson, NumbersIgnoreLcNumeric) {
+    const char* const kCommaLocales[] = {"de_DE.UTF-8", "de_DE", "fr_FR.UTF-8",
+                                         "fr_FR", "de_DE.utf8", "fr_FR.utf8"};
+    const char* prev = std::setlocale(LC_NUMERIC, nullptr);
+    const std::string saved = prev != nullptr ? prev : "C";
+    bool comma = false;
+    for (const char* loc : kCommaLocales) {
+        if (std::setlocale(LC_NUMERIC, loc) != nullptr &&
+            std::localeconv()->decimal_point[0] == ',') { comma = true; break; }
+    }
+    if (!comma) {
+        std::setlocale(LC_NUMERIC, saved.c_str());
+        GTEST_SKIP() << "no ',' radix locale installed";
+    }
+    Arena a = make_arena();
+    StructuralIndex idx;
+    const bool built = build(a, "[1.5, 2.25e1, -0.125]", &idx);
+    double f[3] = {0.0, 0.0, 0.0};
+    bool ok = built;
+    Iterator it;
+    if (ok) ok = bolt::parse::json::iter_init(&idx, &it);
+    if (ok) bolt::parse::json::iter_advance(&it);
+    for (int i = 0; ok && i < 3; ++i) {
+        ok = bolt::parse::json::iter_float64(&it, &f[i]);
+        bolt::parse::json::iter_advance(&it);
+    }
+    std::setlocale(LC_NUMERIC, saved.c_str());
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(f[0], 1.5);
+    EXPECT_EQ(f[1], 22.5);
+    EXPECT_EQ(f[2], -0.125);
 }
 
 TEST(BoltParseJson, SkipToCloseEqualsSequentialAdvance) {

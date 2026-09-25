@@ -5,6 +5,8 @@
 // cap (path depth, key length, skip nesting depth).
 
 #include <cinttypes>
+#include <clocale>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +113,37 @@ int main() {
         CHK(!json_span_to_i64(big, &iv));
         JsonSpan minv{"-9223372036854775808", 20};
         CHK(json_span_to_i64(minv, &iv) && iv == INT64_MIN);
+        // G2CHK-197: JSON has no inf/nan/hex literals; out-of-range saturates
+        // like strtod did.
+        CHK(!json_span_to_f64(JsonSpan{"-inf", 4}, &dv));
+        CHK(!json_span_to_f64(JsonSpan{"-nan", 4}, &dv));
+        CHK(!json_span_to_f64(JsonSpan{"-infinity", 9}, &dv));
+        CHK(!json_span_to_f64(JsonSpan{"0x1p3", 5}, &dv));
+        CHK(json_span_to_f64(JsonSpan{"1e400", 5}, &dv) && std::isinf(dv) && dv > 0);
+        CHK(json_span_to_f64(JsonSpan{"-1e400", 6}, &dv) && std::isinf(dv) && dv < 0);
+        CHK(json_span_to_f64(JsonSpan{"1e-400", 6}, &dv) && dv == 0.0 && !std::signbit(dv));
+        CHK(json_span_to_f64(JsonSpan{"-1e-400", 7}, &dv) && dv == 0.0 && std::signbit(dv));
+        CHK(json_span_to_f64(JsonSpan{"0.1", 3}, &dv) && dv == 0.1);
+        CHK(json_span_to_f64(JsonSpan{"-2.5E-3", 7}, &dv) && dv == -2.5e-3);
+    }
+
+    // --- G2CHK-197: numbers ignore LC_NUMERIC -----------------------------
+    {
+        const char* const locs[] = {"de_DE.UTF-8", "de_DE", "fr_FR.UTF-8",
+                                    "fr_FR", "de_DE.utf8", "fr_FR.utf8"};
+        const char* prev = std::setlocale(LC_NUMERIC, nullptr);
+        char saved[128] = "C";
+        if (prev != nullptr) std::snprintf(saved, sizeof saved, "%s", prev);
+        bool comma = false;
+        for (const char* l : locs) {
+            if (std::setlocale(LC_NUMERIC, l) != nullptr &&
+                std::localeconv()->decimal_point[0] == ',') { comma = true; break; }
+        }
+        double dv = 0.0;
+        const bool ok = json_span_to_f64(JsonSpan{"1.5", 3}, &dv);
+        std::setlocale(LC_NUMERIC, saved);
+        if (comma) CHK(ok && dv == 1.5);
+        else std::fprintf(stderr, "note: no ',' radix locale; locale check skipped\n");
     }
 
     // --- ->> unquote: escapes incl. \uXXXX + surrogate pair --------------

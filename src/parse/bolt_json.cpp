@@ -18,6 +18,7 @@
 //      reset per record) or per-record SAX (no arena).
 // ---------------------------------------------------------------------------
 #include "bolt/parse/bolt_json.h"
+#include "bolt/kernels/bolt_float_parse.h"
 
 #include <cassert>
 #include <cstdint>
@@ -440,14 +441,8 @@ bool parse_float64_slice(const uint8_t* src, int32_t start, int32_t length,
     assert(src != nullptr);
     assert(out != nullptr);
     if (length <= 0 || length > 64) return false;
-    char buf[65];
-    memcpy(buf, src + start, static_cast<size_t>(length));
-    buf[length] = '\0';
-    char* end = nullptr;
-    const double v = std::strtod(buf, &end);
-    if (end != buf + length) return false;
-    *out = v;
-    return true;
+    const char* first = reinterpret_cast<const char*>(src + start);
+    return bolt::kernels::float_chars::f64_from_json_chars(first, first + length, out);
 }
 
 // Consume a JSON string starting at `*p->pos == '"'`. Sets out_start /

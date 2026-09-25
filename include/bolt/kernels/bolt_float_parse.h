@@ -213,6 +213,31 @@ inline ParseResult f64_from_chars(const char* first, const char* last,
     return ParseResult{end, ParseStatus::ok};
 }
 
+// JSON number text -> double, locale-independent. The caller's scanner owns
+// the JSON grammar; this only refuses what from_chars accepts beyond it
+// (inf/nan) and saturates out-of-range values as strtod does (+-inf on
+// overflow, signed zero on underflow). The whole [first, last) must match.
+inline bool f64_from_json_chars(const char* first, const char* last,
+                                double* out) noexcept {
+    assert(first != nullptr && out != nullptr);
+    assert(first <= last);
+    const bool neg = first != last && *first == '-';
+    const char* p = neg ? first + 1 : first;
+    if (p == last || *p < '0' || *p > '9') return false;
+    const ParseResult r = f64_from_chars(first, last, out);
+    if (r.ptr != last) return false;
+    if (r.status == ParseStatus::ok) return true;
+    assert(r.status == ParseStatus::out_of_range);
+    pdetail::Decimal d;
+    const char* e = pdetail::scan_decimal(p, last, &d);
+    assert(e == last && d.nd > 0);
+    (void)e;
+    const bool overflow = d.exp10 + static_cast<int32_t>(d.nd) > 0;
+    const double mag = overflow ? std::numeric_limits<double>::infinity() : 0.0;
+    *out = neg ? -mag : mag;
+    return true;
+}
+
 }  // namespace float_chars
 }  // namespace kernels
 }  // namespace bolt

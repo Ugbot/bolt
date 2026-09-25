@@ -36,6 +36,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bolt/kernels/bolt_float_parse.h"
+
 namespace bolt {
 namespace kernels {
 namespace json {
@@ -340,20 +342,11 @@ inline bool json_span_to_i64(const JsonSpan& sp, std::int64_t* out) noexcept {
     return true;
 }
 
-// JSON number (int or float) to double via strtod on a bounded local copy.
+// JSON number (int or float) to double; locale-independent.
 inline bool json_span_to_f64(const JsonSpan& sp, double* out) noexcept {
     assert(out != nullptr);
     if (sp.len == 0 || sp.p == nullptr || sp.len > 63) return false;
-    const char c0 = sp.p[0];
-    if (c0 != '-' && (c0 < '0' || c0 > '9')) return false;   // not a number
-    char buf[64];
-    std::memcpy(buf, sp.p, sp.len);
-    buf[sp.len] = '\0';
-    char* end = nullptr;
-    const double v = std::strtod(buf, &end);
-    if (end != buf + sp.len) return false;              // trailing garbage
-    *out = v;
-    return true;
+    return ::bolt::kernels::float_chars::f64_from_json_chars(sp.p, sp.p + sp.len, out);
 }
 
 // Decode one \uXXXX (surrogate-pair aware) at s[*i] (past the 'u').
