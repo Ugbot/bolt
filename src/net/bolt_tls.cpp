@@ -5,6 +5,7 @@
 #include "bolt/net/bolt_tls.h"
 
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -110,8 +111,8 @@ static bool sock_wait(sock_t fd, bool want_read, bool want_write,
     if (want_write) FD_SET(fd, &wfds);
 
     timeval tv;
-    tv.tv_sec  = static_cast<long>(remain / 1000);
-    tv.tv_usec = static_cast<long>((remain % 1000) * 1000);
+    tv.tv_sec  = static_cast<decltype(tv.tv_sec)>(remain / 1000);
+    tv.tv_usec = static_cast<decltype(tv.tv_usec)>((remain % 1000) * 1000);
 
     const int rc = ::select(static_cast<int>(fd) + 1,
                             want_read ? &rfds : nullptr,
@@ -136,6 +137,13 @@ static sock_t tcp_connect(std::uint32_t ipv4_host, std::uint16_t port,
     ensure_winsock();
     sock_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd == kInvalidSock) return kInvalidSock;
+#if defined(SO_NOSIGPIPE)
+    const int one = 1;
+    if (::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0) {
+        BOLT_TLS_CLOSESOCK(fd);
+        return kInvalidSock;
+    }
+#endif
     if (!set_nonblocking(fd)) {
         BOLT_TLS_CLOSESOCK(fd);
         return kInvalidSock;
@@ -251,6 +259,99 @@ static SSL_CTX* make_ctx(const TlsConfig* cfg) noexcept {
     return ctx;
 }
 
+#if defined(MSG_NOSIGNAL)
+// OpenSSL's socket BIO writes with write(), which raises SIGPIPE on a reset
+// peer. This BIO sends with MSG_NOSIGNAL so the error comes back as a return
+// value. It never closes the fd; tls_close does.
+static int nosig_fd(BIO* b) noexcept {
+    return static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(b)));
+}
+
+static int nosig_write(BIO* b, const char* buf, int len) {
+    assert(b != nullptr && "nosig_write: null bio");
+    assert(len >= 0 && "nosig_write: negative len");
+    BIO_clear_retry_flags(b);
+    const ssize_t n = ::send(nosig_fd(b), buf, static_cast<std::size_t>(len),
+                             MSG_NOSIGNAL);
+    if (n < 0 && BIO_sock_should_retry(-1)) BIO_set_retry_write(b);
+    return static_cast<int>(n);
+}
+
+static int nosig_read(BIO* b, char* buf, int len) {
+    assert(b != nullptr && "nosig_read: null bio");
+    assert(len >= 0 && "nosig_read: negative len");
+    if (buf == nullptr) return 0;
+    BIO_clear_retry_flags(b);
+    const ssize_t n = ::recv(nosig_fd(b), buf, static_cast<std::size_t>(len), 0);
+    if (n == 0) {
+        BIO_set_flags(b, BIO_FLAGS_IN_EOF);
+    } else if (n < 0 && BIO_sock_should_retry(-1)) {
+        BIO_set_retry_read(b);
+    }
+    return static_cast<int>(n);
+}
+
+static long nosig_ctrl(BIO* b, int cmd, long num, void* ptr) {
+    assert(b != nullptr && "nosig_ctrl: null bio");
+    switch (cmd) {
+        case BIO_CTRL_FLUSH:
+        case BIO_CTRL_DUP:
+            return 1;
+        case BIO_CTRL_EOF:
+            return BIO_test_flags(b, BIO_FLAGS_IN_EOF) != 0 ? 1 : 0;
+        case BIO_CTRL_GET_CLOSE:
+            return BIO_get_shutdown(b);
+        case BIO_CTRL_SET_CLOSE:
+            BIO_set_shutdown(b, static_cast<int>(num));
+            return 1;
+        case BIO_C_GET_FD:
+            if (ptr != nullptr) *static_cast<int*>(ptr) = nosig_fd(b);
+            return nosig_fd(b);
+        default:
+            return 0;
+    }
+}
+
+static const BIO_METHOD* nosig_method() noexcept {
+    static BIO_METHOD* const m = []() noexcept -> BIO_METHOD* {
+        const int idx = BIO_get_new_index();
+        if (idx < 0) return nullptr;
+        BIO_METHOD* bm = BIO_meth_new(
+            idx | BIO_TYPE_SOURCE_SINK | BIO_TYPE_DESCRIPTOR, "bolt_nosigpipe");
+        if (bm == nullptr) return nullptr;
+        if (BIO_meth_set_write(bm, nosig_write) != 1 ||
+            BIO_meth_set_read(bm, nosig_read) != 1 ||
+            BIO_meth_set_ctrl(bm, nosig_ctrl) != 1) {
+            BIO_meth_free(bm);
+            return nullptr;
+        }
+        return bm;
+    }();
+    return m;
+}
+
+// Attach fd to ssl through the MSG_NOSIGNAL BIO. Returns false on failure.
+static bool attach_fd(SSL* ssl, sock_t fd) noexcept {
+    assert(ssl != nullptr && "attach_fd: null ssl");
+    assert(fd != kInvalidSock && "attach_fd: invalid fd");
+    const BIO_METHOD* m = nosig_method();
+    if (m == nullptr) return false;
+    BIO* bio = BIO_new(m);
+    if (bio == nullptr) return false;
+    BIO_set_data(bio, reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)));
+    BIO_set_shutdown(bio, BIO_NOCLOSE);
+    BIO_set_init(bio, 1);
+    SSL_set_bio(ssl, bio, bio);  // ssl owns the single reference
+    return true;
+}
+#else
+static bool attach_fd(SSL* ssl, sock_t fd) noexcept {
+    assert(ssl != nullptr && "attach_fd: null ssl");
+    assert(fd != kInvalidSock && "attach_fd: invalid fd");
+    return SSL_set_fd(ssl, static_cast<int>(fd)) == 1;
+}
+#endif
+
 // Drive a single SSL_connect call inside the bounded handshake loop.
 // Returns 1 on success, 0 to keep looping, -1 on hard failure.
 static int handshake_step(SSL* ssl, sock_t fd, std::int64_t deadline_ms) noexcept {
@@ -291,7 +392,7 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
     SSL* ssl = SSL_new(ctx);
     if (!ssl) { SSL_CTX_free(ctx); BOLT_TLS_CLOSESOCK(fd); return false; }
 
-    if (SSL_set_fd(ssl, static_cast<int>(fd)) != 1) {
+    if (!attach_fd(ssl, fd)) {
         SSL_free(ssl); SSL_CTX_free(ctx); BOLT_TLS_CLOSESOCK(fd); return false;
     }
     // SNI — required by all modern HTTPS endpoints.
