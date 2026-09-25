@@ -10,6 +10,8 @@
 
 #include "bolt/lakehouse/format.h"
 
+namespace bolt { namespace ingest { namespace parquet { struct PqMeta; } } }
+
 namespace bolt {
 namespace lakehouse {
 namespace iceberg {
@@ -48,6 +50,21 @@ struct FileStats {
 
 struct DataFileRef;
 struct Schema;
+
+// G2ICE-43 — fold a parquet footer's per-row-group chunk statistics into the
+// Iceberg per-column stats of that ONE file: null_value_counts from the summed
+// null counts, lower/upper bounds as Iceberg's binary single-value encoding.
+// `field_ids[c]` names parquet column c's Iceberg field id (<= 0 skips it).
+// Bounds are emitted only where the parquet stat bytes ARE the Iceberg
+// encoding (plain int32/int64/float/double/boolean, UTF-8 byte arrays via
+// min_value/max_value) and every non-all-null row group carries them; any
+// doubt drops the bound, never guesses one. A column whose null count is
+// unknown in any row group is left out entirely. Writes only `n_cols` and
+// `cols` — record_count / file_size_in_bytes stay the caller's.
+bool file_stats_from_parquet_meta(const ::bolt::ingest::parquet::PqMeta* meta,
+                                  const int32_t* field_ids,
+                                  uint32_t n_field_ids,
+                                  FileStats* out) noexcept;
 
 // Per-file predicate prune via lower/upper/null_value_counts. Conservative:
 // returns true on anything it can't evaluate. Numeric comparisons only at W4.

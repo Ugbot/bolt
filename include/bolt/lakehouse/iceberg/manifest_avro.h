@@ -12,13 +12,12 @@
 //     Readers accept a null codec; the reference writer's `deflate` is not
 //     required.
 //
-//   * **Every optional repeated field is written as null** — `column_sizes`,
-//     `value_counts`, `lower_bounds`, `split_offsets`, ... These carry
-//     pruning statistics: a reader that has them can skip files without
-//     opening them. Writing null is CORRECT (they are optional) but forfeits
-//     that pruning, so a scan reads every file it is given. Measured safe
-//     against pyiceberg 0.11.1, which accepts an all-null data_file and falls
-//     back to reading the files. Populating them is a later, separate step.
+//   * `null_value_counts`, `lower_bounds` and `upper_bounds` carry the
+//     entry's `stats` when `stats.n_cols > 0` (G2ICE-135; a parquet footer
+//     folds into them via `file_stats_from_parquet_meta`, G2ICE-43). Every
+//     other optional repeated field (`column_sizes`, `value_counts`,
+//     `nan_value_counts`, `split_offsets`, ...) is written null — legal, it
+//     only forfeits the pruning those fields would allow.
 //
 //   * `record_count` and `file_size_in_bytes` are REQUIRED and are trusted by
 //     readers without verification. `record_count` in particular answers

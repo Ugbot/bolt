@@ -1784,6 +1784,13 @@ target_link_libraries(test_bolt_iceberg_manifest_write
 bolt_apply_hardening(test_bolt_iceberg_manifest_write)
 add_test(NAME test_bolt_iceberg_manifest_write COMMAND test_bolt_iceberg_manifest_write)
 
+# G2ICE-43: Iceberg data-file stats folded from a parquet footer.
+add_executable(test_bolt_iceberg_parquet_stats test_bolt_iceberg_parquet_stats.cpp)
+target_link_libraries(test_bolt_iceberg_parquet_stats
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_parquet_stats)
+add_test(NAME test_bolt_iceberg_parquet_stats COMMAND test_bolt_iceberg_parquet_stats)
+
 # G2ICE-135 — end-to-end: a real BoltBatch WITH nulls through append_commit_ex
 # (the exact TieringManager::upload_iceberg call), manifest bytes read back
 # OFF DISK and decoded by the pyiceberg-verified reader above. Proves
