@@ -4,11 +4,54 @@
 #include "bolt/api/net/event_loop.h"
 #include "bolt/api/core/logger.h"
 #include "bolt/api/net/sys_compat.h"
+#include <cassert>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
 
 namespace bolt::api {
 namespace net {
+
+namespace {
+
+// Binds the port once WITHOUT SO_REUSEPORT and releases it. SO_REUSEPORT on the
+// real sockets is for this process's per-thread accept loops; if another
+// process already holds the port with it set, our own binds would silently
+// join its kernel load-balancing group. This bind fails instead.
+int probe_port_exclusive(uint16_t port) {
+    assert(port != 0);
+    sys::startup();
+
+    int fd = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
+    if (fd < 0) {
+        return -1;
+    }
+#ifndef _WIN32
+    // Tolerate our own TIME_WAIT leftovers; Windows SO_REUSEADDR would let the
+    // probe steal a live port, so it is POSIX-only.
+    int opt = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&opt), sizeof(opt)) < 0) {
+        const int saved = errno;
+        sys::close_socket(fd);
+        errno = saved;
+        return -1;
+    }
+#endif
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    const int rc = bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    const int saved = errno;
+    sys::close_socket(fd);
+    errno = saved;
+    assert(rc == 0 || errno != 0);
+    return rc < 0 ? -1 : 0;
+}
+
+} // namespace
 
 // =============================================================================
 // Constructor / Destructor
@@ -74,6 +117,15 @@ int CoroTcpListener::start_background() {
     LOG_INFO("CORO_TCP", "Starting on %s:%d (shared_resources: %s)",
              config_.host.c_str(), config_.port,
              owns_resources_ ? "no" : "yes");
+
+    if (config_.port != 0 && probe_port_exclusive(config_.port) != 0) {
+        const int saved = errno;
+        LOG_ERROR("CORO_TCP", "Port %d is already in use (%s); refusing to share it "
+                  "with another listener", config_.port, strerror(saved));
+        running_.store(false);
+        errno = saved;
+        return -1;
+    }
 
     // Get pointers to worker pool and I/O dispatcher
     core::WorkerThreadPool* worker_pool = nullptr;

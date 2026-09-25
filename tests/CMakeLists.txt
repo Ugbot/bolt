@@ -2003,6 +2003,20 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     add_test(NAME test_bolt_event_loop COMMAND test_bolt_event_loop)
 endif()
 
+# CoroTcpListener refuses a port another listener already holds instead of
+# joining its SO_REUSEPORT group (G2LAUNCH-64). POSIX only (forks).
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_coro_listener_port_clash test_bolt_coro_listener_port_clash.cpp)
+    target_link_libraries(test_bolt_coro_listener_port_clash
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_coro_listener_port_clash)
+    add_test(NAME test_bolt_coro_listener_port_clash COMMAND test_bolt_coro_listener_port_clash)
+endif()
+
 # timer_queue — backend-agnostic reactor timer facility (STATION-82). Was not
 # wired into the test build at all (found while doing the G2CHK-85 Part 4
 # broader sweep); the file is self-contained (plain assert-based main(), no
