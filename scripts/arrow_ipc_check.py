@@ -9,7 +9,7 @@ schema + every value against the generating rule re-derived here in
 python (mirrors tests/test_bolt_arrow_ipc.cpp exactly). A size/row-count
 check alone would pass on scrambled bytes; values are the gate.
 
-Usage: arrow_ipc_check.py <fixture.arrows> [wide_fixture.arrows] [nested_fixture.arrows]
+Usage: arrow_ipc_check.py [--timestamp ts_fixture.arrows] <fixture.arrows> [wide_fixture.arrows] [nested_fixture.arrows]
   fixture.arrows        — the original Int64/Float64/Utf8 fixture (G2ARROW-10)
   wide_fixture.arrows   — optional: the +Bool/Date32/Binary/Decimal128
                            fixture (G2ARROW-20); checked when given.
@@ -403,7 +403,40 @@ def check_nested_fixture(path: str) -> None:
           "verified)")
 
 
+def ts_val(i: int) -> int:
+    return (i - 10) * 86400000000 + i * 1234567
+
+
+def check_timestamp_fixture(path: str) -> None:
+    with pa.OSFile(path, "rb") as f:
+        reader = ipc.open_stream(f)
+        schema = reader.schema
+        batches = list(reader)
+    if schema.names != ["id", "ts"]:
+        fail(f"timestamp schema names {schema.names}")
+    if schema.field(1).type != pa.timestamp("us"):
+        fail(f"timestamp col1 type {schema.field(1).type} != timestamp[us]")
+    b = batches[0]
+    if len(batches) != 1 or b.num_rows != K_ROWS:
+        fail("timestamp: expected one batch of K_ROWS")
+    ts = b.column(1).cast(pa.int64())
+    n_null = 0
+    for i in range(K_ROWS):
+        if i % 7 == 3:
+            n_null += 1
+            if ts[i].is_valid:
+                fail(f"timestamp ts[{i}] should be NULL")
+        elif ts[i].as_py() != ts_val(i):
+            fail(f"timestamp ts[{i}] = {ts[i].as_py()} != {ts_val(i)}")
+    print(f"OK: timestamp[us] pyarrow read {K_ROWS} rows ({n_null} NULL)")
+
+
 def main() -> None:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--timestamp":
+        check_timestamp_fixture(sys.argv[2])
+        del sys.argv[1:3]
+        if len(sys.argv) == 1:
+            return
     if len(sys.argv) not in (2, 3, 4):
         fail("usage: arrow_ipc_check.py <fixture.arrows> "
              "[wide_fixture.arrows] [nested_fixture.arrows]")
