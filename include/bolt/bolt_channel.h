@@ -36,28 +36,34 @@ public:
 
     /// Push. Returns false if full. No allocation, no exception.
     bool try_push(T&& item) noexcept {
-        size_t pos = wpos_;
+        const size_t pos = wpos_.load(std::memory_order_relaxed);
         if (slots_[pos & kMask].seq.load(std::memory_order_acquire) != pos)
             return false;
         slots_[pos & kMask].data = static_cast<T&&>(item);
         slots_[pos & kMask].seq.store(pos + 1, std::memory_order_release);
-        wpos_ = pos + 1;
+        wpos_.store(pos + 1, std::memory_order_relaxed);
         return true;
     }
 
     /// Pop. Returns false if empty. Writes result into *out.
     bool try_pop(T* out) noexcept {
-        size_t pos = rpos_;
+        const size_t pos = rpos_.load(std::memory_order_relaxed);
         if (slots_[pos & kMask].seq.load(std::memory_order_acquire) != pos + 1)
             return false;
         *out = static_cast<T&&>(slots_[pos & kMask].data);
         slots_[pos & kMask].seq.store(pos + Capacity, std::memory_order_release);
-        rpos_ = pos + 1;
+        rpos_.store(pos + 1, std::memory_order_relaxed);
         return true;
     }
 
-    size_t approx_size() const noexcept { return wpos_ - rpos_; }
-    bool   empty()       const noexcept { return wpos_ == rpos_; }
+    // Advisory from any thread. The consumer can pop a slot before the
+    // producer bumps wpos_, so rpos_ may briefly lead by one: clamp, don't wrap.
+    size_t approx_size() const noexcept {
+        const size_t r = rpos_.load(std::memory_order_acquire);
+        const size_t w = wpos_.load(std::memory_order_acquire);
+        return w > r ? w - r : 0;
+    }
+    bool empty() const noexcept { return approx_size() == 0; }
 
 private:
     struct alignas(kCacheLine) Slot {
@@ -65,8 +71,8 @@ private:
         T data;
     };
     std::array<Slot, Capacity> slots_;
-    alignas(kCacheLine) size_t wpos_ = 0;
-    alignas(kCacheLine) size_t rpos_ = 0;
+    alignas(kCacheLine) std::atomic<size_t> wpos_{0};
+    alignas(kCacheLine) std::atomic<size_t> rpos_{0};
 };
 
 /// MPSC ring buffer. Multiple producers (atomic claim), single consumer.
@@ -119,18 +125,22 @@ public:
 
     /// Pop (single consumer only).
     bool try_pop(T* out) noexcept {
-        size_t pos = rpos_;
-        size_t idx = pos & kMask;
+        const size_t pos = rpos_.load(std::memory_order_relaxed);
+        const size_t idx = pos & kMask;
         if (slots_[idx].seq.load(std::memory_order_acquire) != pos + 1)
             return false;
         *out = static_cast<T&&>(slots_[idx].data);
         slots_[idx].seq.store(pos + Capacity, std::memory_order_release);
-        rpos_ = pos + 1;
+        rpos_.store(pos + 1, std::memory_order_relaxed);
         return true;
     }
 
+    // Advisory from any thread; counts claimed-but-unwritten slots. rpos_
+    // first so the monotonic wseq_ read after it cannot be behind it.
     size_t approx_size() const noexcept {
-        return wseq_.load(std::memory_order_relaxed) - rpos_;
+        const size_t r = rpos_.load(std::memory_order_acquire);
+        const size_t w = wseq_.load(std::memory_order_acquire);
+        return w - r;
     }
 
 private:
@@ -140,7 +150,7 @@ private:
     };
     std::array<Slot, Capacity> slots_;
     alignas(kCacheLine) std::atomic<size_t> wseq_{0};
-    alignas(kCacheLine) size_t rpos_ = 0;
+    alignas(kCacheLine) std::atomic<size_t> rpos_{0};
 };
 
 // ---------------------------------------------------------------------------

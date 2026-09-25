@@ -2084,3 +2084,14 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     bolt_apply_hardening(test_bolt_async_io)
     add_test(NAME test_bolt_async_io COMMAND test_bolt_async_io)
 endif()
+
+# G2CHK-200 — empty()/approx_size() peeked from a non-owner thread.
+add_executable(test_bolt_channel_observer test_bolt_channel_observer.cpp)
+target_link_libraries(test_bolt_channel_observer
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_channel_observer)
+add_test(NAME test_bolt_channel_observer COMMAND test_bolt_channel_observer)
