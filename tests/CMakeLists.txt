@@ -803,6 +803,12 @@ if(BOLT_BUILD_IO)
         PRIVATE bolt::bolt bolt::io GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_binsearch_crc32c)
     add_test(NAME test_bolt_binsearch_crc32c COMMAND test_bolt_binsearch_crc32c)
+
+    add_executable(test_bolt_crc64nvme test_bolt_crc64nvme.cpp)
+    target_link_libraries(test_bolt_crc64nvme
+        PRIVATE bolt::bolt bolt::io GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_crc64nvme)
+    add_test(NAME test_bolt_crc64nvme COMMAND test_bolt_crc64nvme)
 endif()
 
 # Scan/scatter + CSR graph kernels — exclusive_scan / histogram / scatter
@@ -1618,6 +1624,12 @@ target_link_libraries(test_bolt_sigv4
     PRIVATE bolt::crypto GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_sigv4)
 add_test(NAME test_bolt_sigv4 COMMAND test_bolt_sigv4)
+
+add_executable(test_bolt_sha1 test_bolt_sha1.cpp)
+target_link_libraries(test_bolt_sha1
+    PRIVATE bolt::crypto GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_sha1)
+add_test(NAME test_bolt_sha1 COMMAND test_bolt_sha1)
 
 add_executable(test_bolt_lakehouse_catalog test_bolt_lakehouse_catalog.cpp)
 target_link_libraries(test_bolt_lakehouse_catalog

@@ -155,7 +155,7 @@ target_link_libraries(bolt INTERFACE
 option(BOLT_BUILD_IO "Build bolt::io compiled library" ON)
 
 if(BOLT_BUILD_IO)
-    add_library(bolt_io STATIC src/io/bolt_crc32c.cpp)
+    add_library(bolt_io STATIC src/io/bolt_crc32c.cpp src/io/bolt_crc64nvme.cpp)
     add_library(bolt::io ALIAS bolt_io)
     target_link_libraries(bolt_io PUBLIC bolt::core)
     target_include_directories(bolt_io PUBLIC
@@ -815,7 +815,7 @@ endif()
 
 if(BOLT_BUILD_CRYPTO)
     add_library(bolt_crypto STATIC src/crypto/sigv4.cpp src/crypto/noise.cpp
-                src/crypto/ed25519.cpp)
+                src/crypto/ed25519.cpp src/crypto/sha1.cpp)
     add_library(bolt::crypto ALIAS bolt_crypto)
     target_link_libraries(bolt_crypto PUBLIC bolt::core)
     target_include_directories(bolt_crypto PUBLIC
