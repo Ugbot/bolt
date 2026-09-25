@@ -2049,3 +2049,17 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     bolt_apply_hardening(test_bolt_io_inbox)
     add_test(NAME test_bolt_io_inbox COMMAND test_bolt_io_inbox)
 endif()
+
+# async_io readiness backends (G2ETL-56): pooled ops, close_async completes
+# in-flight ops. kqueue/epoll only.
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_async_io test_bolt_async_io.cpp)
+    target_link_libraries(test_bolt_async_io
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_async_io)
+    add_test(NAME test_bolt_async_io COMMAND test_bolt_async_io)
+endif()
