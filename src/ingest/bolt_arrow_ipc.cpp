@@ -43,10 +43,12 @@ constexpr std::uint8_t kTypeUtf8       = 5;
 constexpr std::uint8_t kTypeBool       = 6;
 constexpr std::uint8_t kTypeDecimal    = 7;
 constexpr std::uint8_t kTypeDate       = 8;
+constexpr std::uint8_t kTypeTimestamp  = 10;
 constexpr std::uint8_t kTypeList       = 12;
 constexpr std::uint8_t kTypeStruct     = 13;
 constexpr std::int16_t kPrecisionDouble = 2;  // FloatingPoint::Precision
 constexpr std::int16_t kDateUnitDay     = 0;  // DateUnit::DAY
+constexpr std::int16_t kTimeUnitMicro   = 2;  // TimeUnit::MICROSECOND
 constexpr std::int32_t kDecimal128BitWidth  = 128;
 constexpr std::int32_t kDecimal128Precision = 38;  // bolt tracks no
                                                     // narrower precision;
@@ -257,6 +259,13 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
         *out_tag = kTypeDate;
         fb_start_table(b);
         fb_field_scalar<std::int16_t>(b, 0, kDateUnitDay);  // unit = DAY
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Timestamp) {
+        // bolt's Timestamp is epoch micros, no zone (timestamp[us]).
+        *out_tag = kTypeTimestamp;
+        fb_start_table(b);
+        fb_field_scalar<std::int16_t>(b, 0, kTimeUnitMicro);  // unit
         return fb_end_table(b);
     }
     if (t == BoltType::Decimal128) {

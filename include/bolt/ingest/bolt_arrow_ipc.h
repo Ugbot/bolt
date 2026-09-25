@@ -63,8 +63,8 @@
 //   type.
 //
 // HONEST SCOPE (fail closed at open, never a misencoded stream):
-//   Leaf column types: Int64, Float64, Utf8, Bool, Date32, Binary,
-//   Decimal128. Nested: List (1 child), Struct (N children), to any depth
+//   Leaf column types: Int64, Float64, Utf8, Bool, Date32, Timestamp
+//   (timestamp[us], no zone), Binary, Decimal128. Nested: List (1 child), Struct (N children), to any depth
 //   up to kIpcMaxNestDepth.
 //   Everything else — Decimal64 (bolt_arrow.h's own C-Data export has no
 //   Arrow format string for it either; extending only this writer would

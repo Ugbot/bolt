@@ -427,6 +427,20 @@ std::string nested_fixture_path() {
     return "arrow_ipc_nested_fixture.arrows";
 }
 
+// Timestamp fixture (G2CHK-215): epoch micros, pre-epoch and sub-second
+// values, every 7th row NULL. check_timestamp_fixture() in
+// scripts/arrow_ipc_check.py re-derives it.
+std::int64_t ts_val(std::int64_t i) {
+    return (i - 10) * 86400000000LL + i * 1234567LL;
+}
+bool ts_is_null(std::int64_t i) { return (i % 7) == 3; }
+
+std::string timestamp_fixture_path() {
+    const char* env = std::getenv("BOLT_ARROW_IPC_TIMESTAMP_OUT");
+    if (env != nullptr && env[0] != '\0') return env;
+    return "arrow_ipc_timestamp_fixture.arrows";
+}
+
 }  // namespace
 
 TEST(ArrowIpc, RejectsUnsupportedTypeAtOpen) {
@@ -732,6 +746,51 @@ TEST(ArrowIpc, WritesPyarrowOracleNestedFixture) {
     ASSERT_TRUE(arrow_ipc_write_batch(w, fx.batch));
     ASSERT_TRUE(arrow_ipc_close(w));
     std::fclose(f);
+    std::free(w);
+    ::testing::Test::RecordProperty("fixture", path);
+}
+
+// G2CHK-215: a Timestamp column is written as timestamp[us] with its raw
+// micros, so a SQL TIMESTAMP result reaches Arrow typed and lossless.
+TEST(ArrowIpc, WritesPyarrowOracleTimestampFixture) {
+    const std::string path = timestamp_fixture_path();
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr) << path;
+    auto* w = static_cast<ArrowIpcWriter*>(
+        std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    static std::int64_t ids[kRows];
+    static std::int64_t ts[kRows];
+    static std::uint8_t valid[(kRows + 7) / 8];
+    std::memset(valid, 0xFF, sizeof(valid));
+    for (std::int64_t i = 0; i < kRows; ++i) {
+        ids[i] = i;
+        ts[i] = ts_val(i);
+        if (ts_is_null(i)) {
+            valid[i >> 3] &= static_cast<std::uint8_t>(~(1u << (i & 7)));
+        }
+    }
+    bolt::Arena arena;
+    BoltBatch* batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
+    ASSERT_NE(batch, nullptr);
+    BoltBatch::init_empty(batch);
+    ASSERT_TRUE(BoltBatch::alloc_columns(batch, &arena, 2));
+    batch->num_rows = kRows;
+    batch->num_cols = 2;
+    BoltColumn& c0 = batch->columns[batch->read_epoch][0];
+    c0.type = BoltType::Int64; c0.format = ColumnFormat::Flat;
+    c0.data = ids; c0.length = kRows; c0.type_size_bytes = 8;
+    BoltColumn& c1 = batch->columns[batch->read_epoch][1];
+    c1.type = BoltType::Timestamp; c1.format = ColumnFormat::Flat;
+    c1.data = ts; c1.length = kRows; c1.type_size_bytes = 8;
+    c1.validity = valid;
+    const BoltType tys[2] = {BoltType::Int64, BoltType::Timestamp};
+    const char* names[2] = {"id", "ts"};
+    ASSERT_TRUE(arrow_ipc_open(w, f, tys, names, 2));
+    ASSERT_TRUE(arrow_ipc_write_batch(w, batch));
+    ASSERT_TRUE(arrow_ipc_close(w));
+    std::fclose(f);
+    std::free(batch);
     std::free(w);
     ::testing::Test::RecordProperty("fixture", path);
 }
