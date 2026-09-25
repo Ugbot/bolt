@@ -343,6 +343,24 @@ struct ScanHandle {
     EqualityDeleteSetI64 eq_dels;
 };
 
+namespace {
+
+bool load_latest_metadata(TableHandle* h) noexcept {
+    assert(h != nullptr && h->arena != nullptr);
+    assert(h->os.vt != nullptr && h->table_rel[0] != '\0');
+    char key[kCatMaxPath];
+    if (!find_latest_metadata(&h->os, h->table_rel, h->arena, key, sizeof(key)))
+        return false;
+    const uint8_t* body = nullptr; uint64_t blen = 0;
+    if (os_get(&h->os, key, h->arena, &body, &blen) != kOsOk) return false;
+    if (!metadata_parse(body, static_cast<uint32_t>(blen), h->arena, &h->meta))
+        return false;
+    h->meta_loaded = true;
+    return true;
+}
+
+}  // namespace
+
 bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                         const char* namespace_, const char* name) noexcept {
     assert(out != nullptr && arena != nullptr);
@@ -362,14 +380,28 @@ bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                                  &h->fs_store, &h->os,
                                  h->fs_root, sizeof(h->fs_root)))
         return false;
-    char key[kCatMaxPath];
-    if (!find_latest_metadata(&h->os, h->table_rel, arena, key, sizeof(key)))
+    if (!load_latest_metadata(h)) return false;
+    *out = h;
+    return true;
+}
+
+bool iceberg_table_open_store(TableHandle** out, Arena* arena,
+                              const ObjectStore* store,
+                              const char* table_rel) noexcept {
+    assert(out != nullptr && arena != nullptr);
+    assert(store != nullptr && table_rel != nullptr);
+    if (store == nullptr || store->vt == nullptr || table_rel == nullptr)
         return false;
-    const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (os_get(&h->os, key, arena, &body, &blen) != kOsOk) return false;
-    if (!metadata_parse(body, static_cast<uint32_t>(blen), arena, &h->meta))
-        return false;
-    h->meta_loaded = true;
+    const size_t tl = std::strlen(table_rel);
+    if (tl == 0u || tl + 1u > kMaxFsRoot) return false;
+    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    if (h == nullptr) return false;
+    std::memset(h, 0, sizeof(*h));
+    h->arena = arena;
+    h->os = *store;
+    std::memcpy(h->table_rel, table_rel, tl + 1u);
+    if (!load_latest_metadata(h)) return false;
+    assert(h->meta_loaded);
     *out = h;
     return true;
 }
