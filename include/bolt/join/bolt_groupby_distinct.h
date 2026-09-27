@@ -31,6 +31,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_hash.h"     // swiss_mix — spill-set hashing
 #include "bolt/bolt_arena.h"    // Arena — exact spill on cell saturation
+#include "bolt/bolt_types.h"    // StringView — content-exact Utf8 dedup
 
 #include <cassert>
 #include <cstdint>
@@ -112,6 +113,25 @@ struct DistinctSet64 {
         occ[i] = 1; keys[i] = v; ++size;
         return true;
     }
+
+    BOLT_FORCE_INLINE bool contains(std::int64_t v) const noexcept {
+        assert(cap > 0 && (cap & (cap - 1)) == 0);
+        const std::uint32_t mask = cap - 1;
+        std::uint32_t i = static_cast<std::uint32_t>(
+            bolt::swiss_mix(static_cast<std::uint64_t>(v))) & mask;
+        for (std::uint32_t probes = 0; probes < cap && occ[i]; ++probes) {
+            if (keys[i] == v) return true;
+            i = (i + 1) & mask;
+        }
+        return false;
+    }
+
+    // 1 new, 0 duplicate, -1 arena exhausted (never read as a duplicate).
+    BOLT_FORCE_INLINE int insert_exact(std::int64_t v, bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        if (insert(v, arena)) return 1;
+        return contains(v) ? 0 : -1;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -149,15 +169,20 @@ struct DistinctSetUtf8 {
         return h;
     }
 
-    static DistinctSetUtf8* create(std::uint32_t cap_hint, bolt::Arena* arena) noexcept {
+    // `min_cap` / `pool_bytes` let a per-group cell start small; the
+    // global (one set per query) default keeps the historical sizing.
+    static DistinctSetUtf8* create(std::uint32_t cap_hint, bolt::Arena* arena,
+                                   std::uint32_t pool_bytes = 1u << 16,
+                                   std::uint32_t min_cap = 128) noexcept {
         assert(arena != nullptr);
+        assert(pool_bytes > 0 && min_cap > 0 && (min_cap & (min_cap - 1)) == 0);
         DistinctSetUtf8* s = arena->allocate_array<DistinctSetUtf8>(1);
         if (s == nullptr) return nullptr;
-        std::uint32_t cap = 128;
+        std::uint32_t cap = min_cap;
         while (cap < cap_hint) cap <<= 1;
         s->slots = arena->allocate_array<DistinctSetU8Slot>(cap);
         s->occ   = arena->allocate_array<std::uint8_t>(cap);
-        s->pool_cap  = 1u << 16;
+        s->pool_cap  = pool_bytes;
         s->pool      = arena->allocate_array<char>(s->pool_cap);
         if (s->slots == nullptr || s->occ == nullptr || s->pool == nullptr) return nullptr;
         std::memset(s->occ, 0, cap);
@@ -180,6 +205,20 @@ struct DistinctSetUtf8 {
         }
         slots = ns; occ = no; cap = ncap;
         return true;
+    }
+
+    BOLT_FORCE_INLINE bool contains(const char* bytes, std::uint32_t len) const noexcept {
+        assert(cap > 0 && (cap & (cap - 1)) == 0);
+        assert(bytes != nullptr || len == 0);
+        const std::uint64_t h = hash_bytes(bytes, len);
+        const std::uint32_t mask = cap - 1;
+        std::uint32_t i = static_cast<std::uint32_t>(h) & mask;
+        for (std::uint32_t probes = 0; probes < cap && occ[i]; ++probes) {
+            if (slots[i].hash == h && slots[i].len == len &&
+                std::memcmp(pool + slots[i].off, bytes, len) == 0) return true;
+            i = (i + 1) & mask;
+        }
+        return false;
     }
 
     // Returns true iff the content was newly inserted.
@@ -271,6 +310,29 @@ struct DistinctCell {
         for (std::uint32_t i = 0; i < cur; ++i) (void)spill->insert(values[i], arena);
         return spill->insert(v, arena);  // v not in inline set → newly inserted
     }
+
+    // Exact insert: 1 new, 0 duplicate, -1 arena exhausted. The caller fails
+    // the query on -1 instead of counting the value as a duplicate.
+    int insert_exact(std::int64_t v, bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(n <= k_distinct_cell_cap);
+        if (spill != nullptr) return spill->insert_exact(v, arena);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (values[i] == v) return 0;
+        }
+        if (n < k_distinct_cell_cap) {
+            values[n] = v;
+            n += 1;
+            return 1;
+        }
+        DistinctSet64* s = DistinctSet64::create(k_distinct_cell_cap * 4, arena);
+        if (s == nullptr) return -1;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (s->insert_exact(values[i], arena) != 1) return -1;
+        }
+        spill = s;
+        return spill->insert_exact(v, arena);
+    }
 };
 
 static_assert(sizeof(DistinctCell) == 8 + k_distinct_cell_cap * 8 + sizeof(void*),
@@ -282,32 +344,38 @@ static_assert(sizeof(DistinctCell) == 8 + k_distinct_cell_cap * 8 + sizeof(void*
 // mirrors `accums_flat`: cell for (agg j, group g) lives at
 //   distinct_cells[j * entry_cap + g]
 // Caller seeds via `cell_at(...)->init()` lazily on first touch.
-// 16-byte-wide DistinctCell variant for inline Utf8 keys (and any other
-// 16-byte-key DISTINCT semantics that arrive). Same linear-scan dedup as
-// the int64 version; 64-entry inline cap; saturates silently after cap.
-// Callers pad unused bytes to zero (e.g. StringView's inline_data tail) —
-// equality is a flat 16-byte memcmp.
+// Per-(group, agg) COUNT(DISTINCT utf8) tracker. Short (<=12-byte) values
+// live canonicalised (length + zero-padded bytes) in the inline array and
+// are deduped by a 16-byte memcmp. Spilled values never compare by their
+// view (it holds a buffer offset, meaningless across offsets or morsels):
+// they go by content into an arena-backed DistinctSetUtf8 that owns its
+// bytes. A short value can never equal a spilled one (lengths differ), so
+// the two stores are disjoint until the inline array fills; then every
+// inline value migrates into the set (`promoted`) and all values route there.
 struct DistinctCell16 {
-    std::uint32_t n;                              // live entries (≤ cap)
-    std::uint32_t overflow_seen;                  // inserts attempted past cap
-    std::uint8_t values[k_distinct_cell_cap * 16];   // 64 * 16 B (no align pad)
+    std::uint32_t n;                              // live inline entries (<= cap)
+    std::uint32_t overflow_seen;                  // legacy raw-insert drops
+    std::uint32_t promoted;                       // 1: all values in `spill`
+    std::uint32_t _pad;
+    std::uint8_t values[k_distinct_cell_cap * 16];   // 64 * 16 B
+    DistinctSetUtf8* spill;                       // content set; lazily created
 
     BOLT_FORCE_INLINE void init() noexcept {
-        n = 0; overflow_seen = 0;
+        n = 0; overflow_seen = 0; promoted = 0; _pad = 0; spill = nullptr;
     }
 
     BOLT_FORCE_INLINE bool saturated() const noexcept {
         return n >= k_distinct_cell_cap;
     }
 
-    // Insert a 16-byte value if not already present. Returns true if it
-    // was a NEW value, false on duplicate or saturation.
+    // Raw 16-byte insert — exact only for canonical inline values. Kept for
+    // callers that dedup fixed 16-byte cells; saturates (drops) past cap.
     BOLT_FORCE_INLINE bool insert(const std::uint8_t value[16]) noexcept {
         assert(value != nullptr);
         assert(n <= k_distinct_cell_cap);
         const std::uint32_t cur = n;
         for (std::uint32_t i = 0; i < cur; ++i) {
-            if (std::memcmp(&values[i * 16], value, 16) == 0) return false;
+            if (std::memcmp(&values[i * 16], value, 16) == 0) return false;  // sv-memcmp-ok: caller-canonical cells
         }
         if (cur >= k_distinct_cell_cap) {
             overflow_seen += 1;
@@ -318,10 +386,96 @@ struct DistinctCell16 {
         assert(n <= k_distinct_cell_cap);
         return true;
     }
+
+    BOLT_FORCE_INLINE bool ensure_spill(bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        if (spill == nullptr) spill = DistinctSetUtf8::create(8, arena, 256, 8);
+        return spill != nullptr;
+    }
+
+    // Moves every inline value into the content set. False on arena OOM.
+    bool promote(bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(promoted == 0 && n == k_distinct_cell_cap);
+        if (!ensure_spill(arena)) return false;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::uint32_t len = 0;
+            std::memcpy(&len, &values[i * 16], 4);
+            assert(len <= 12u);
+            const char* b = reinterpret_cast<const char*>(&values[i * 16 + 4]);
+            if (!spill->insert(b, len, arena)) return false;   // disjoint: only OOM
+        }
+        promoted = 1;
+        return true;
+    }
+
+    // Content-exact insert of a Utf8 value whose spilled bytes resolve through
+    // `base`. Returns 1 if new, 0 if already present, -1 on arena OOM.
+    int insert_sv(const StringView& v, const char* base,
+                  bolt::Arena* arena) noexcept {
+        assert(arena != nullptr);
+        assert(n <= k_distinct_cell_cap);
+        if (v.length > 12u || promoted != 0) {
+            assert(v.length <= 12u || base != nullptr);
+            if (!ensure_spill(arena)) return -1;
+            const char* bytes = (v.length <= 12u) ? v.prefix : base + v.ref.offset;
+            return insert_bytes(bytes, v.length, arena);
+        }
+        std::uint8_t canon[16] = {};
+        std::memcpy(canon, &v.length, 4);
+        std::memcpy(canon + 4, v.prefix, v.length);   // prefix+inline_data contiguous
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (std::memcmp(&values[i * 16], canon, 16) == 0) return 0;  // sv-memcmp-ok: canonical inline view
+        }
+        if (n < k_distinct_cell_cap) {
+            std::memcpy(&values[n * 16], canon, 16);
+            n += 1;
+            return 1;
+        }
+        if (!promote(arena)) return -1;
+        return insert_bytes(v.prefix, v.length, arena);
+    }
+
+    // Content-exact insert of a fixed 16-byte value (Decimal128). The inline
+    // store holds the raw cells; past the cap they move into the content set
+    // as 16-byte strings. A cell carries one agg, so it never mixes this with
+    // insert_sv. 1 new, 0 duplicate, -1 arena exhausted.
+    int insert_raw16(const std::uint8_t value[16], bolt::Arena* arena) noexcept {
+        assert(value != nullptr && arena != nullptr);
+        assert(n <= k_distinct_cell_cap);
+        const char* bytes = reinterpret_cast<const char*>(value);
+        if (promoted != 0) return insert_bytes(bytes, 16, arena);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (std::memcmp(&values[i * 16], value, 16) == 0) return 0;  // sv-memcmp-ok: fixed Decimal128
+        }
+        if (n < k_distinct_cell_cap) {
+            std::memcpy(&values[n * 16], value, 16);
+            n += 1;
+            return 1;
+        }
+        if (!ensure_spill(arena)) return -1;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (insert_bytes(reinterpret_cast<const char*>(&values[i * 16]), 16,
+                             arena) != 1) return -1;
+        }
+        promoted = 1;
+        return insert_bytes(bytes, 16, arena);
+    }
+
+private:
+    // DistinctSetUtf8::insert reports OOM as "not inserted"; a miss that is
+    // not a duplicate is OOM.
+    int insert_bytes(const char* bytes, std::uint32_t len,
+                     bolt::Arena* arena) noexcept {
+        assert(spill != nullptr);
+        assert(bytes != nullptr || len == 0);
+        if (spill->insert(bytes, len, arena)) return 1;
+        return spill->contains(bytes, len) ? 0 : -1;
+    }
 };
 
-static_assert(sizeof(DistinctCell16) == 8 + k_distinct_cell_cap * 16,
-              "DistinctCell16 layout — packed (8B header + N*16B values)");
+static_assert(sizeof(DistinctCell16) == 16 + k_distinct_cell_cap * 16 + sizeof(void*),
+              "DistinctCell16 layout — 16B header + N*16B values + spill ptr");
 
 // Free-function helpers — match the API shape described in the K-AGG-B plan
 // (some callers prefer C-style; the methods above are kept for parity with

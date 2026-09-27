@@ -44,7 +44,7 @@ inline bool gb_merge_keys_equal(const GroupbyTypedState* dst, uint32_t dgid,
             std::memcpy(&dsv, &drow[k], 16);
             std::memcpy(&ssv, &srow[k], 16);
             if (dsv.length != ssv.length) return false;
-            if (dsv.length == 0) continue;
+            if (dsv.length == 0 || gb_detail::gb_sv_is_null_key(dsv)) continue;
             const char* db = kernels::utf8::sv_bytes(dsv, dst->key_str_buf[k]);
             const char* sb = kernels::utf8::sv_bytes(ssv, src->key_str_buf[k]);
             if (std::memcmp(db, sb, dsv.length) != 0) return false;
@@ -77,7 +77,7 @@ inline bool gb_merge_insert_group(GroupbyTypedState* dst,
         drow[k] = srow[k];
         if (dst->key_types[k] == BoltType::Utf8) {
             StringView* sv = reinterpret_cast<StringView*>(&drow[k]);
-            if (sv->length > 12u) {
+            if (gb_detail::gb_sv_key_spilled(*sv)) {
                 const char* sb = kernels::utf8::sv_bytes(*sv,
                                                          src->key_str_buf[k]);
                 uint32_t off = 0;

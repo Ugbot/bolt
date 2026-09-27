@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -850,37 +851,124 @@ TEST(BoltGroupbyTyped, NullGroupKeyFoldsAsOneGroup) {
         << "a null-free aggregate must emit the SAME column shape as before";
 }
 
-// The half that is still REFUSED, and why it must stay so. A Utf8 key uses
-// BOTH cell halves (length + prefix + inline bytes), so the reserved b-tag
-// would be indistinguishable from data — and worse than ambiguous, since
-// keys_equal compares lengths and then memcmps, so a fabricated length would
-// read that many bytes. This is the exact shape the header paragraph measured
-// against DuckDB (6 groups where DuckDB gives 7).
-TEST(BoltGroupbyTyped, NullUtf8GroupKeyIsStillRefused) {
+// G2CHK-311: a NULL Utf8 key is its own group, distinct from "" (the defect
+// the header paragraph measured: NULL decoded as a zero-length view merged
+// with ""). DuckDB 1.5: SELECT k, sum(v) over ('a',10),(NULL,20),('',30),
+// (NULL,40),('a',50) -> ('a',60), ('',30), (NULL,60).
+TEST(BoltGroupbyTyped, NullUtf8GroupKeyIsItsOwnGroup) {
     Arena a;
-    // Built with this file's own sv_inline: a 1-char string's byte lives in
-    // `prefix`, not `inline_data`. Writing inline_data[0] made all three keys
-    // compare EQUAL (one group, not three) and the control was vacuous.
-    const char* txt[3] = {"a", "b", "c"};
-    StringView ks[3];
-    for (int i = 0; i < 3; ++i) ks[i] = sv_inline(txt[i], 1);
-    int64_t vs[] = {10, 20, 30};
-    uint8_t kvalid[1] = {0b00000101};        // row 1's KEY is NULL
-    BoltColumn key = BoltColumn::make_flat(ks, kvalid, 3, BoltType::Utf8);
-    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 3, BoltType::Int64);
+    const char* txt[5] = {"a", "junk", "", "zz", "a"};
+    const uint32_t lens[5] = {1, 4, 0, 2, 1};
+    StringView ks[5];
+    for (int i = 0; i < 5; ++i) ks[i] = sv_inline(txt[i], lens[i]);
+    ks[3].length = 0;                        // a null slot's bytes are junk
+    int64_t vs[] = {10, 20, 30, 40, 50};
+    uint8_t kvalid[1] = {0b00010101};        // rows 1 and 3 are NULL
+    BoltColumn key = BoltColumn::make_flat(ks, kvalid, 5, BoltType::Utf8);
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 5, BoltType::Int64);
     AggSpec specs[1] = { make_spec(AggKind::Sum, 0) };
     BoltColumn ok[1], oa[1];
     uint32_t ng = 0;
-    EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 3,
-                                             ok, oa, &ng, &a, /*hint=*/4));
-    // CONTROL: the same Utf8 keys with no NULL fold normally, so the refusal
-    // is about the null and not about Utf8 keys as such.
-    uint8_t all_valid[1] = {0b00000111};
-    BoltColumn key2 = BoltColumn::make_flat(ks, all_valid, 3, BoltType::Utf8);
-    ng = 0;
-    ASSERT_TRUE(groupby_agg_multi_key_typed(&key2, 1, &val, 1, specs, 1, 3,
-                                            ok, oa, &ng, &a, /*hint=*/4));
-    EXPECT_EQ(ng, 3u);
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 5,
+                                            ok, oa, &ng, &a, /*hint=*/8));
+    ASSERT_EQ(ng, 3u);
+    ASSERT_NE(ok[0].validity, nullptr);
+    const auto* kb = static_cast<const StringView*>(ok[0].data);
+    const auto* sb = static_cast<const int64_t*>(oa[0].data);
+    int64_t sum_a = -1, sum_empty = -1, sum_null = -1;
+    for (uint32_t g = 0; g < ng; ++g) {
+        if (((ok[0].validity[g >> 3] >> (g & 7)) & 1) == 0) {
+            EXPECT_EQ(kb[g].length, 0u) << "the NULL slot holds defined bytes";
+            sum_null = sb[g];
+        } else if (kb[g].length == 0) {
+            sum_empty = sb[g];
+        } else {
+            sum_a = sb[g];
+        }
+    }
+    EXPECT_EQ(sum_a, 60);
+    EXPECT_EQ(sum_empty, 30);
+    EXPECT_EQ(sum_null, 60);
+}
+
+// The stateful path across morsels, with a spilled (>12) key and a NULL in
+// each morsel: the null group must be found again, not re-inserted.
+TEST(BoltGroupbyTyped, NullUtf8GroupKeyStatefulAcrossMorsels) {
+    Arena a;
+    char big[] = "a-long-spilled-key";
+    StringView ks[4];
+    ks[0] = sv_inline("x", 1);
+    std::memset(&ks[1], 0, sizeof(StringView));
+    ks[1].length = 18; std::memcpy(ks[1].prefix, big, 4);
+    ks[1].ref.buf_idx = 0; ks[1].ref.offset = 0;
+    ks[2] = sv_inline("x", 1);
+    ks[3] = ks[1];
+    int64_t vs[] = {1, 2, 4, 8};
+    uint8_t v0[1] = {0b00000001};            // morsel 0: row 1 NULL
+    uint8_t v1[1] = {0b00000010};            // morsel 1: row 0 NULL
+    GroupbyTypedState st{};
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Utf8);
+    BoltColumn vd = BoltColumn::make_flat(vs, nullptr, 0, BoltType::Int64);
+    AggSpec spec = make_spec(AggKind::Sum, 0);
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &kd, 1, &vd, 1,
+                                                  &spec, 1, 8));
+    for (int m = 0; m < 2; ++m) {
+        BoltColumn k = BoltColumn::make_flat(ks + 2 * m, m == 0 ? v0 : v1, 2,
+                                             BoltType::Utf8);
+        k.str_overflow_base = big;
+        BoltColumn v = BoltColumn::make_flat(vs + 2 * m, nullptr, 2,
+                                             BoltType::Int64);
+        groupby_agg_multi_key_typed_ingest(&st, &k, &v, nullptr, 0, 2);
+        ASSERT_FALSE(st.oom);
+        ASSERT_FALSE(st.null_key);
+    }
+    BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 3u);                       // "x", NULL, the spilled key
+    ASSERT_NE(ok[0].validity, nullptr);
+    const auto* sb = static_cast<const int64_t*>(oa[0].data);
+    const auto* kb = static_cast<const StringView*>(ok[0].data);
+    int64_t sum_x = -1, sum_null = -1, sum_big = -1;
+    for (uint32_t g = 0; g < ng; ++g) {
+        if (((ok[0].validity[g >> 3] >> (g & 7)) & 1) == 0) sum_null = sb[g];
+        else if (kb[g].length == 1) sum_x = sb[g];
+        else sum_big = sb[g];
+    }
+    EXPECT_EQ(sum_x, 1);
+    EXPECT_EQ(sum_null, 2 + 4);
+    EXPECT_EQ(sum_big, 8);
+}
+
+// Decimal keys: Decimal64's b is a sign extension and Decimal128 is bounded
+// by precision, so {0, tag} is exact. A zero-valued key stays distinct.
+TEST(BoltGroupbyTyped, NullDecimalGroupKeyIsItsOwnGroup) {
+    Arena a;
+    int64_t m64[4] = {0, 0, -5, 0};
+    dec::Decimal128 m128[4] = {{0, 0}, {0, 0}, {-5, -1}, {0, 0}};
+    uint8_t kvalid[1] = {0b00000101};        // rows 1 and 3 NULL
+    int64_t vs[] = {1, 2, 4, 8};
+    BoltColumn val = BoltColumn::make_flat(vs, nullptr, 4, BoltType::Int64);
+    AggSpec specs[1] = { make_spec(AggKind::Sum, 0) };
+    for (int t = 0; t < 2; ++t) {
+        BoltColumn key = (t == 0)
+            ? BoltColumn::make_flat(m64, kvalid, 4, BoltType::Decimal64)
+            : BoltColumn::make_flat(m128, kvalid, 4, BoltType::Decimal128);
+        BoltColumn ok[1], oa[1];
+        uint32_t ng = 0;
+        ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 1, 4,
+                                                ok, oa, &ng, &a, 8)) << t;
+        ASSERT_EQ(ng, 3u) << t;
+        ASSERT_NE(ok[0].validity, nullptr) << t;
+        const auto* sb = static_cast<const int64_t*>(oa[0].data);
+        int64_t sum_null = -1, sum_rest = 0;
+        for (uint32_t g = 0; g < ng; ++g) {
+            if (((ok[0].validity[g >> 3] >> (g & 7)) & 1) == 0) sum_null = sb[g];
+            else sum_rest += sb[g];
+        }
+        EXPECT_EQ(sum_null, 10) << t;
+        EXPECT_EQ(sum_rest, 5) << t;
+    }
 }
 
 // The scan is byte-at-a-time with masked partial ends, so the arithmetic is
@@ -891,10 +979,8 @@ TEST(BoltGroupbyTyped, NullUtf8GroupKeyIsStillRefused) {
 // W31-L5z — THE KEY TYPE HERE IS LOAD-BEARING AND IT CHANGED. `window_has_null
 // _key` no longer scans a type the kernel can now ANSWER, so over an Int64 key
 // it correctly returns false everywhere and this sweep would assert NOTHING
-// while still printing green. Re-pointed to Decimal64, whose cell.b carries a
-// SIGN EXTENSION and therefore has no free slot for the null tag — it is still
-// refused, so the bit arithmetic is still under test. The data is the same
-// int64 mantissa buffer; only the type tag moves.
+// while still printing green. G2CHK-311 answers Decimal64 too, so the sweep
+// uses Binary, a type the kernel still refuses; only the type tag moves.
 TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
     constexpr int64_t kN = 40;                 // 5 bytes of bitmap
     int64_t ks[kN];
@@ -904,7 +990,7 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
         for (int b = 0; b < 8; ++b) bits[b] = 0xFF;
         bits[null_row >> 3] = static_cast<uint8_t>(
             bits[null_row >> 3] & ~(1u << (null_row & 7)));
-        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Decimal64);
+        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Binary);
         for (int64_t start = 0; start < kN; ++start) {
             for (int64_t count = 0; start + count <= kN; ++count) {
                 const bool want = (null_row >= start && null_row < start + count);
@@ -922,10 +1008,9 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
 TEST(BoltGroupbyTyped, WindowHasNullKeyHonoursSelection) {
     int64_t ks[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t bits[1] = {0b11110111};            // row 3 is NULL
-    // W31-L5z: Decimal64 for the same reason as the sweep above —
-    // an Int64 key is no longer scanned at all, so this would pass
-    // vacuously.
-    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Decimal64);
+    // Binary for the same reason as the sweep above: an answered key type
+    // is no longer scanned, so this would pass vacuously.
+    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Binary);
     const uint32_t skips[4] = {0, 1, 2, 4};
     const uint32_t hits[4]  = {0, 3, 5, 7};
     EXPECT_FALSE(gb_detail::window_has_null_key(&key, 1, skips, 0, 4));
@@ -934,3 +1019,141 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyHonoursSelection) {
     BoltColumn plain = BoltColumn::make_flat(ks, nullptr, 8, BoltType::Int64);
     EXPECT_FALSE(gb_detail::window_has_null_key(&plain, 1, nullptr, 0, 8));
 }
+
+// ---------------------------------------------------------------------------
+// G2CHK-295: COUNT(DISTINCT utf8) must dedup spilled (>12-byte) strings by
+// CONTENT. The view of a spilled string carries a buffer offset, so equal
+// content at two offsets (or two morsels' buffers at one offset) compared
+// by raw 16 bytes gives the wrong count. Also: more than the inline-cell
+// capacity of distinct values per group must still count exactly.
+// ---------------------------------------------------------------------------
+namespace g2chk295 {
+
+bolt::StringView sv_spilled(const char* buf, uint32_t off, uint32_t len) {
+    bolt::StringView v{};
+    v.length = len;
+    std::memcpy(v.prefix, buf + off, 4);
+    v.ref.buf_idx = 0;
+    v.ref.offset  = off;
+    return v;
+}
+
+TEST(BoltGroupbyTypedG2chk295, SpilledEqualContentAtTwoOffsetsCountsOnce) {
+    bolt::Arena a;
+    const std::string z(40, 'z');
+    const std::string y = std::string(4, 'z') + std::string(36, 'y');
+    const std::string pool = z + z + y;
+    int64_t ks[] = {1, 1, 1, 2, 2};
+    bolt::StringView vs[5] = {
+        sv_spilled(pool.data(), 0, 40), sv_spilled(pool.data(), 40, 40),
+        sv_spilled(pool.data(), 80, 40), sv_spilled(pool.data(), 0, 40),
+        sv_spilled(pool.data(), 40, 40),
+    };
+    bolt::BoltColumn key = bolt::BoltColumn::make_flat(ks, nullptr, 5, bolt::BoltType::Int64);
+    bolt::BoltColumn val = bolt::BoltColumn::make_flat(vs, nullptr, 5, bolt::BoltType::Utf8);
+    val.str_overflow_base = const_cast<char*>(pool.data());
+    bolt::AggSpec spec = make_spec(bolt::AggKind::Count, 0, /*distinct=*/1);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed(&key, 1, &val, 1, &spec, 1, 5,
+                                                  ok, oa, &ng, &a, /*hint=*/4));
+    ASSERT_EQ(ng, 2u);
+    const int64_t* outk = static_cast<int64_t*>(ok[0].data);
+    const int64_t* cnts = static_cast<int64_t*>(oa[0].data);
+    for (uint32_t i = 0; i < ng; ++i) {
+        if (outk[i] == 1) EXPECT_EQ(cnts[i], 2);
+        if (outk[i] == 2) EXPECT_EQ(cnts[i], 1);
+    }
+}
+
+TEST(BoltGroupbyTypedG2chk295, SpilledAcrossMorselsComparesContent) {
+    bolt::Arena a;
+    bolt::BoltColumn key_desc = bolt::BoltColumn::make_flat(static_cast<int64_t*>(nullptr), nullptr, 0, bolt::BoltType::Int64);
+    bolt::BoltColumn val_desc = bolt::BoltColumn::make_flat(static_cast<bolt::StringView*>(nullptr), nullptr, 0, bolt::BoltType::Utf8);
+    bolt::AggSpec spec = make_spec(bolt::AggKind::Count, 0, /*distinct=*/1);
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a, &key_desc, 1, &val_desc, 1, &spec, 1, 4));
+    // Same offset, same prefix, different tails, different buffers: the
+    // raw views are byte-identical but the strings are not.
+    std::string p1 = std::string(4, 'x') + std::string(36, 'a');
+    std::string p2 = std::string(4, 'x') + std::string(36, 'b');
+    std::string p3 = std::string(4, 'x') + std::string(36, 'a');
+    const bolt::StringView v1[1] = {sv_spilled(p1.data(), 0, 40)};
+    const bolt::StringView v2[1] = {sv_spilled(p2.data(), 0, 40)};
+    const bolt::StringView v3[1] = {sv_spilled(p3.data(), 0, 40)};
+    int64_t ks[] = {7};
+    const bolt::StringView* morsels[3] = {v1, v2, v3};
+    char* bases[3] = {p1.data(), p2.data(), p3.data()};
+    for (int m = 0; m < 3; ++m) {
+        bolt::BoltColumn k = bolt::BoltColumn::make_flat(ks, nullptr, 1, bolt::BoltType::Int64);
+        bolt::BoltColumn v = bolt::BoltColumn::make_flat(
+            const_cast<bolt::StringView*>(morsels[m]), nullptr, 1, bolt::BoltType::Utf8);
+        v.str_overflow_base = bases[m];
+        bolt::groupby_agg_multi_key_typed_ingest(&st, &k, &v, nullptr, 0, 1);
+        // The morsel's buffer dies with it; the set must own its bytes.
+        std::memset(bases[m], '?', 40);
+    }
+    ASSERT_FALSE(st.oom);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 1u);
+    EXPECT_EQ(static_cast<int64_t*>(oa[0].data)[0], 2);
+}
+
+TEST(BoltGroupbyTypedG2chk295, ManyDistinctPerGroupCountsExactly) {
+    bolt::Arena a;
+    constexpr uint32_t kN = 300;
+    std::string pool;
+    std::vector<int64_t> ks;
+    std::vector<bolt::StringView> vs;
+    for (uint32_t i = 0; i < kN; ++i) {
+        // Even i: short inline strings; odd i: long spilled ones. Each
+        // value appears twice.
+        const std::string s = (i % 2 == 0)
+            ? "s" + std::to_string(i)
+            : "a-long-spilled-string-" + std::to_string(i);
+        for (int rep = 0; rep < 2; ++rep) {
+            ks.push_back(1);
+            if (s.size() <= 12) {
+                bolt::StringView v{};
+                v.length = static_cast<uint32_t>(s.size());
+                std::memcpy(v.prefix, s.data(), s.size() < 4 ? s.size() : 4);
+                if (s.size() > 4) std::memcpy(v.inline_data, s.data() + 4, s.size() - 4);
+                vs.push_back(v);
+            } else {
+                const uint32_t off = static_cast<uint32_t>(pool.size());
+                pool += s;
+                bolt::StringView v{};
+                v.length = static_cast<uint32_t>(s.size());
+                std::memcpy(v.prefix, s.data(), 4);
+                v.ref.offset = off;
+                vs.push_back(v);
+            }
+        }
+    }
+    const int64_t n = static_cast<int64_t>(ks.size());
+    bolt::BoltColumn key = bolt::BoltColumn::make_flat(ks.data(), nullptr, n, bolt::BoltType::Int64);
+    bolt::BoltColumn val = bolt::BoltColumn::make_flat(vs.data(), nullptr, n, bolt::BoltType::Utf8);
+    val.str_overflow_base = pool.data();
+    bolt::AggSpec spec = make_spec(bolt::AggKind::Count, 0, /*distinct=*/1);
+    bolt::BoltColumn ok[1], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed(&key, 1, &val, 1, &spec, 1, n,
+                                                  ok, oa, &ng, &a, /*hint=*/4));
+    ASSERT_EQ(ng, 1u);
+    EXPECT_EQ(static_cast<int64_t*>(oa[0].data)[0], static_cast<int64_t>(kN));
+
+    bolt::Arena a2;
+    bolt::GroupbyTypedState st{};
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_begin(
+        &st, &a2, &key, 1, &val, 1, &spec, 1, 4));
+    bolt::groupby_agg_multi_key_typed_ingest(&st, &key, &val, nullptr, 0, n);
+    ASSERT_FALSE(st.oom);
+    ASSERT_TRUE(bolt::groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 1u);
+    EXPECT_EQ(static_cast<int64_t*>(oa[0].data)[0], static_cast<int64_t>(kN));
+}
+
+}  // namespace g2chk295
