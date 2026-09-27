@@ -1045,4 +1045,117 @@ TEST_F(Utf8Test, BytesFindRandomizedAlignmentsAndPlantedMatches) {
     EXPECT_GT(hits, 5000u);   // a sweep with no matches proves nothing
 }
 
+// G2CHK-259: LIKE escape. Postgres's default escape is '\', so
+// `nspname LIKE 'pg\_%'` must NOT match pg_catalog-less names like "pgxcat"
+// and must match "pg_catalog" only through a literal '_'.
+bool ref_like_esc(const char* s, uint32_t slen,
+                  const char* p, uint32_t plen, char esc) noexcept {
+    if (plen == 0) return slen == 0;
+    if (p[0] == esc) {
+        if (plen < 2 || slen == 0 || s[0] != p[1]) return false;
+        return ref_like_esc(s + 1, slen - 1, p + 2, plen - 2, esc);
+    }
+    if (p[0] == '%') {
+        for (uint32_t k = 0; k <= slen; ++k) {
+            if (ref_like_esc(s + k, slen - k, p + 1, plen - 1, esc)) return true;
+        }
+        return false;
+    }
+    if (slen == 0) return false;
+    if (p[0] != '_' && p[0] != s[0]) return false;
+    return ref_like_esc(s + 1, slen - 1, p + 1, plen - 1, esc);
+}
+
+bool compiled_like_esc(const char* p, uint32_t pl, const char* s, uint32_t sl,
+                       int32_t esc, bool* compiled_ok) {
+    ku::CompiledLike cl{};
+    bolt::StringView pv{};
+    const char* base = nullptr;
+    if (pl <= 12u) {
+        pv = ku::sv_make_inline(p, pl);
+    } else {
+        pv.length = pl; pv.ref.buf_idx = 0; pv.ref.offset = 0; base = p;
+    }
+    *compiled_ok = ku::utf8_like_compile(pv, &cl, base, esc);
+    if (!*compiled_ok) return false;
+    return ku::utf8_like_match_one(&cl, s, sl);
+}
+
+TEST_F(Utf8Test, LikeEscapeTicketCases) {
+    const int32_t bs = '\\';
+    EXPECT_FALSE(ku::bytes_like("pgxcat", 6, "pg\\_%", 5, bs));
+    EXPECT_TRUE(ku::bytes_like("pg_catalog", 10, "pg\\_%", 5, bs));
+    EXPECT_FALSE(ku::bytes_like("main", 4, "pg\\_%", 5, bs));
+    EXPECT_TRUE(ku::bytes_like("50%", 3, "%\\%", 3, bs));
+    EXPECT_FALSE(ku::bytes_like("50x", 3, "%\\%", 3, bs));
+    EXPECT_TRUE(ku::bytes_like("a\\b", 3, "a\\\\b", 4, bs));
+    EXPECT_FALSE(ku::bytes_like("a", 1, "a\\", 2, bs));     // trailing lone escape
+    // No escape: backslash is an ordinary byte (unchanged default).
+    EXPECT_TRUE(ku::bytes_like("pg\\_x", 5, "pg\\_%", 5));
+    EXPECT_FALSE(ku::bytes_like("pg_x", 4, "pg\\_%", 5));
+
+    ku::CompiledLike cl{};
+    ASSERT_TRUE(ku::utf8_like_compile(make_inline("pg\\_%"), &cl, nullptr, bs));
+    EXPECT_EQ(cl.kind, ku::LikeKind::Prefix);
+    EXPECT_EQ(cl.literal_len, 3u);
+    EXPECT_EQ(std::memcmp(cl.literal, "pg_", 3), 0);
+    EXPECT_TRUE(ku::utf8_like_match_one(&cl, "pg_catalog", 10));
+    EXPECT_FALSE(ku::utf8_like_match_one(&cl, "pgxcatalog", 10));
+    ASSERT_TRUE(ku::utf8_like_compile(make_inline("%\\%%"), &cl, nullptr, bs));
+    EXPECT_EQ(cl.kind, ku::LikeKind::Contains);
+    ASSERT_TRUE(ku::utf8_like_compile(make_inline("%a\\_"), &cl, nullptr, bs));
+    EXPECT_EQ(cl.kind, ku::LikeKind::Suffix);
+    ASSERT_TRUE(ku::utf8_like_compile(make_inline("a\\%"), &cl, nullptr, bs));
+    EXPECT_EQ(cl.kind, ku::LikeKind::Exact);
+    EXPECT_FALSE(ku::utf8_like_compile(make_inline("ab\\"), &cl, nullptr, bs));
+}
+
+TEST_F(Utf8Test, LikeEscapeExhaustiveVsReference) {
+    // Both matchers against the reference, over an alphabet holding both
+    // wildcards and the escape byte itself.
+    const char alpha[] = {'a', '%', '_', '\\'};
+    constexpr int kA = 4;
+    char sb[6], pb[6];
+    std::int64_t checked = 0, mism = 0, hits = 0;
+    for (uint32_t sl = 0; sl <= 5u; ++sl) {
+        const std::int64_t sn = static_cast<std::int64_t>(std::pow(kA, sl));
+        for (std::int64_t sc = 0; sc < sn; ++sc) {
+            std::int64_t t = sc;
+            for (uint32_t i = 0; i < sl; ++i) { sb[i] = alpha[t % kA]; t /= kA; }
+            for (uint32_t pl = 0; pl <= 5u; ++pl) {
+                const std::int64_t pn = static_cast<std::int64_t>(std::pow(kA, pl));
+                for (std::int64_t pc = 0; pc < pn; ++pc) {
+                    std::int64_t v = pc;
+                    for (uint32_t i = 0; i < pl; ++i) { pb[i] = alpha[v % kA]; v /= kA; }
+                    const bool want = ref_like_esc(sb, sl, pb, pl, '\\');
+                    const bool a = ku::bytes_like(sb, sl, pb, pl, '\\');
+                    bool ok = false;
+                    const bool b = compiled_like_esc(pb, pl, sb, sl, '\\', &ok);
+                    // Only a trailing lone escape may fail to compile.
+                    const bool lone = pl > 0 && pb[pl - 1] == '\\' && [&] {
+                        uint32_t k = 0; for (uint32_t i = pl; i > 0 && pb[i - 1] == '\\'; --i) ++k;
+                        return (k & 1u) == 1u; }();
+                    ++checked;
+                    hits += want ? 1 : 0;
+                    const bool bad = a != want || (ok ? b != want : !lone) ||
+                                     (lone && ok);
+                    if (bad) {
+                        ++mism;
+                        if (mism <= 3) {
+                            ADD_FAILURE() << "s='" << std::string(sb, sl)
+                                          << "' p='" << std::string(pb, pl)
+                                          << "' want=" << want << " bytes=" << a
+                                          << " compiled=" << b << " ok=" << ok;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_EQ(mism, 0);
+    constexpr std::int64_t kWords = 1 + 4 + 16 + 64 + 256 + 1024;   // 1365
+    EXPECT_EQ(checked, kWords * kWords);
+    EXPECT_GT(hits, 1000);
+}
+
 }  // namespace

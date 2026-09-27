@@ -156,12 +156,18 @@ BOLT_FORCE_INLINE int32_t sv_compare(
 
 // SQL LIKE match over raw bytes. `%` matches any (possibly empty) run of
 // bytes, `_` matches exactly one byte, every other pattern byte is literal.
-// Iterative two-pointer with single-star backtracking — O(slen * plen) worst
-// case, no recursion (Tiger Style: bounded, no stack growth). Returns true on
-// a full match.
+// `escape` (a byte value, or -1 for none) makes the byte after it literal,
+// '%'/'_'/the escape itself included; a pattern ending in a lone escape
+// matches nothing. Iterative two-pointer with single-star backtracking —
+// O(slen * plen) worst case, no recursion (Tiger Style: bounded, no stack
+// growth). Returns true on a full match.
 BOLT_FORCE_INLINE bool bytes_like(
         const char* BOLT_RESTRICT s, uint32_t slen,
-        const char* BOLT_RESTRICT p, uint32_t plen) noexcept {
+        const char* BOLT_RESTRICT p, uint32_t plen,
+        int32_t escape = -1) noexcept {
+    assert(s != nullptr || slen == 0);
+    assert(p != nullptr || plen == 0);
+    assert(escape >= -1 && escape <= 255);
     uint32_t si = 0, pi = 0;
     uint32_t star_p = 0xFFFFFFFFu;   // last '%' position in pattern (+1)
     uint32_t star_s = 0;             // string position when '%' was taken
@@ -176,13 +182,22 @@ BOLT_FORCE_INLINE bool bytes_like(
         // ClickBench: `URL LIKE '%.ru%'` missed every row of the form
         // `...bonprix.ru%2F...` because the byte after `.ru` is '%'
         // (G2FEAT-146; `%.r%` and `%.ru%2F%` both matched the same row).
-        if (pi < plen && p[pi] == '%') {
+        if (pi < plen && static_cast<uint8_t>(p[pi]) == escape) {
+            if (pi + 1 < plen && p[pi + 1] == s[si]) {
+                ++si; pi += 2;
+                continue;
+            }
+            // fall through to backtracking below
+        } else if (pi < plen && p[pi] == '%') {
             star_p = pi;             // remember star; it matches empty for now
             star_s = si;
             ++pi;
+            continue;
         } else if (pi < plen && (p[pi] == '_' || p[pi] == s[si])) {
             ++si; ++pi;
-        } else if (star_p != 0xFFFFFFFFu) {
+            continue;
+        }
+        if (star_p != 0xFFFFFFFFu) {
             pi = star_p + 1;         // backtrack: let the star eat one more byte
             ++star_s;
             si = star_s;
@@ -190,7 +205,8 @@ BOLT_FORCE_INLINE bool bytes_like(
             return false;
         }
     }
-    while (pi < plen && p[pi] == '%') ++pi;   // trailing stars match empty
+    // trailing stars match empty
+    while (pi < plen && p[pi] == '%' && static_cast<uint8_t>(p[pi]) != escape) ++pi;
     return pi == plen;
 }
 
@@ -198,9 +214,10 @@ BOLT_FORCE_INLINE bool bytes_like(
 // pass nullptr when known inline.
 BOLT_FORCE_INLINE bool sv_like(
         const StringView& s, const char* s_base,
-        const StringView& p, const char* p_base) noexcept {
+        const StringView& p, const char* p_base,
+        int32_t escape = -1) noexcept {
     return bytes_like(sv_bytes(s, s_base), s.length,
-                      sv_bytes(p, p_base), p.length);
+                      sv_bytes(p, p_base), p.length, escape);
 }
 
 // memmem byte search, scalar reference. First-byte memchr scan + memcmp on a
@@ -800,15 +817,90 @@ enum : uint8_t {
     kLikeTokUnd = 3, // _ — match exactly one byte
 };
 
-// Compile a SQL LIKE pattern.  Escape via doubled '%' / '_' not supported
-// (SQL standard uses ESCAPE clause; chukonu lowers that to a different rule).
+// Tokenize an escaped LIKE pattern into dfa_buf, then classify the token
+// stream into the same fast shapes the unescaped path uses. Adjacent literal
+// bytes (escaped or not) coalesce into one run. False on a trailing lone
+// escape (Postgres: "LIKE pattern must not end with escape character") or a
+// pattern past CompiledLike's caps.
+BOLT_FORCE_INLINE bool utf8_like_compile_escaped(
+        const char* p, uint32_t n, uint8_t esc, CompiledLike* out) noexcept {
+    assert(out != nullptr);
+    assert(p != nullptr || n == 0);
+    uint32_t w = 0;
+    uint32_t lit_at = 0xFFFFFFFFu;   // dfa_buf index of the open run's len byte
+    uint32_t ntok = 0, npct = 0, nund = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t c = static_cast<uint8_t>(p[i]);
+        if (c == esc) {
+            if (i + 1 >= n) return false;
+            c = static_cast<uint8_t>(p[++i]);
+        } else if (c == '%' || c == '_') {
+            if (w + 1u > sizeof(out->dfa_buf)) return false;
+            out->dfa_buf[w++] = (c == '%') ? kLikeTokPct : kLikeTokUnd;
+            lit_at = 0xFFFFFFFFu;
+            ++ntok;
+            if (c == '%') ++npct; else ++nund;
+            continue;
+        }
+        if (lit_at == 0xFFFFFFFFu || out->dfa_buf[lit_at] == 255u) {
+            if (w + 2u > sizeof(out->dfa_buf)) return false;
+            out->dfa_buf[w++] = kLikeTokLit;
+            lit_at = w;
+            out->dfa_buf[w++] = 0;
+            ++ntok;
+        }
+        if (w + 1u > sizeof(out->dfa_buf)) return false;
+        out->dfa_buf[w++] = c;
+        ++out->dfa_buf[lit_at];
+    }
+    out->dfa_len = static_cast<uint16_t>(w);
+    // Shape classification over the token stream: literal run (if any) and
+    // where the single/double '%' sit.
+    const uint8_t* t = out->dfa_buf;
+    const bool lead_pct = w > 0 && t[0] == kLikeTokPct;
+    const uint32_t lit_start = lead_pct ? 1u : 0u;
+    const bool has_lit = lit_start < w && t[lit_start] == kLikeTokLit;
+    const uint32_t lit_len = has_lit ? t[lit_start + 1] : 0u;
+    const uint32_t after = has_lit ? lit_start + 2u + lit_len : lit_start;
+    const bool trail_pct = after < w && t[after] == kLikeTokPct && after + 1u == w;
+    const uint32_t lit_toks = has_lit ? 1u : 0u;
+    const bool simple = nund == 0 && ntok == lit_toks + npct &&
+                        (after == w || trail_pct) && lit_toks <= 1u &&
+                        lit_len <= sizeof(out->literal);
+    if (simple) {
+        LikeKind k = LikeKind::General;
+        if (npct == 0) k = LikeKind::Exact;
+        else if (npct == 1 && lead_pct && has_lit) k = LikeKind::Suffix;
+        else if (npct == 1 && trail_pct) k = LikeKind::Prefix;
+        else if (npct == 2 && lead_pct && trail_pct) k = LikeKind::Contains;
+        if (k != LikeKind::General) {
+            out->kind = k;
+            out->literal_len = lit_len;
+            if (lit_len > 0) memcpy(out->literal, t + lit_start + 2, lit_len);
+            out->dfa_len = 0;
+            memset(out->dfa_buf, 0, sizeof(out->dfa_buf));
+            return true;
+        }
+    }
+    out->kind = LikeKind::General;
+    return true;
+}
+
+// Compile a SQL LIKE pattern. `escape` (a byte value, or -1 for none) makes
+// the byte after it literal; see bytes_like.
 BOLT_FORCE_INLINE bool utf8_like_compile(
         StringView pattern, CompiledLike* out,
-        const char* spilled_base = nullptr) noexcept {
+        const char* spilled_base = nullptr,
+        int32_t escape = -1) noexcept {
     assert(out != nullptr);
+    assert(escape >= -1 && escape <= 255);
     memset(out, 0, sizeof(*out));
     const char* p = sv_bytes(pattern, spilled_base);
     const uint32_t n = pattern.length;
+    if (escape >= 0 && n > 0 &&
+        memchr(p, escape, n) != nullptr) {
+        return utf8_like_compile_escaped(p, n, static_cast<uint8_t>(escape), out);
+    }
     // Fast-path classification.
     if (n == 0) {
         out->kind = LikeKind::Exact;
