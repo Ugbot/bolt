@@ -2128,3 +2128,12 @@ target_link_libraries(test_bolt_channel_observer
 )
 bolt_apply_hardening(test_bolt_channel_observer)
 add_test(NAME test_bolt_channel_observer COMMAND test_bolt_channel_observer)
+
+# L1a loud sweep: one injection per cap that used to drop/clamp/overrun.
+add_executable(test_bolt_loud_caps test_bolt_loud_caps.cpp)
+target_link_libraries(test_bolt_loud_caps
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_loud_caps PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_loud_caps)
+add_test(NAME test_bolt_loud_caps COMMAND test_bolt_loud_caps)

@@ -98,8 +98,13 @@ inline void execute_throttle_check(ThrottleCheckState<kCap>* state,
         const int64_t t       = ts_in[i];
         const int64_t t_start = t - window;
 
-        // Insert t. Ring invariant: kCap-1 slots must be enough to hold
-        // max_count + 1 live entries. Caller enforces kCap > max_count.
+        // Insert t. A full ring drops its oldest entry: with kCap > max_count
+        // the kCap newest in-window entries already decide the flag, and a
+        // dropped entry is older than all of them, so the answer is exact.
+        if (count == kCap) {
+            head = (head + 1u) % kCap;
+            --count;
+        }
         assert(count < kCap);
         state->ring[tail] = t;
         tail              = (tail + 1u) % kCap;
@@ -131,9 +136,10 @@ inline ThrottleCheckState<kCap>* make_throttle_check_state(::bolt::Arena* arena,
                                                            int64_t window,
                                                            int64_t max_count) noexcept {
     assert(arena != nullptr);
-    assert(window >= 0);
-    assert(max_count >= 0);
-    assert(static_cast<int64_t>(kCap) > max_count);
+    // Caller-supplied: refuse rather than build a ring that cannot decide.
+    if (window < 0 || max_count < 0 ||
+        static_cast<int64_t>(kCap) <= max_count)
+        return nullptr;
     ThrottleCheckState<kCap>* s = arena->allocate_array<ThrottleCheckState<kCap>>(1);
     if (s == nullptr) return nullptr;
     s->desc.ts_col    = ts_col;

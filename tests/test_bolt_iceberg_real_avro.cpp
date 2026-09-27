@@ -363,16 +363,27 @@ TEST(IcebergRealAvro, ManifestListRejectsAManifestFile) {
                                           8, &n));
 }
 
-TEST(IcebergRealAvro, CapIsRespected) {
+// 3 entries into room for 1: refused (never a silent 1-file manifest), with
+// n == cap so a caller can tell "needs more room" from a parse error, and
+// nothing written past the cap.
+TEST(IcebergRealAvro, CapOverflowIsRefusedNotTruncated) {
     auto raw = load("golden_iceberg_real_manifest_nulls.avro");
     ASSERT_FALSE(raw.empty());
     bolt::Arena arena;
     DataFileRef* files = arena.allocate_array<DataFileRef>(2);
     ASSERT_NE(files, nullptr);
+    std::memset(&files[1], 0xAB, sizeof(files[1]));
     uint32_t n = 0;
-    ASSERT_TRUE(manifest_parse_avro(raw.data(), raw.size(), &arena, 0, files, 1,
-                                    &n));
-    EXPECT_EQ(n, 1u);                                  // 3 available, cap 1
+    EXPECT_FALSE(manifest_parse_avro(raw.data(), raw.size(), &arena, 0, files,
+                                     1, &n));
+    EXPECT_EQ(n, 1u);
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(&files[1])[0], 0xABu);
+    DataFileRef* all = arena.allocate_array<DataFileRef>(3);
+    ASSERT_NE(all, nullptr);
+    uint32_t n3 = 0;
+    EXPECT_TRUE(manifest_parse_avro(raw.data(), raw.size(), &arena, 0, all, 3,
+                                    &n3));
+    EXPECT_EQ(n3, 3u);
 }
 
 }  // namespace

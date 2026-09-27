@@ -37,10 +37,10 @@ struct HistoricalCVaRState {
     double                         confidence;
     SortedRing<double, kCap>       ring;
 
-    inline void init(int32_t in, int32_t out,
+    inline bool init(int32_t in, int32_t out,
                      uint32_t w, double conf) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         assert(conf > 0.0);
         assert(conf < 1.0);
         in_col     = in;
@@ -48,6 +48,7 @@ struct HistoricalCVaRState {
         window     = w;
         confidence = conf;
         ring.init(w);
+        return true;
     }
 };
 

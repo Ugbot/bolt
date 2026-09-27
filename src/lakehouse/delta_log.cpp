@@ -68,8 +68,11 @@ bool eat_string(bj::Iterator* it, char* out, uint32_t cap) noexcept {
         iter_skip_value(it);
         return false;
     }
+    // A cut string is a different value: report it rather than keep a prefix.
+    const bool fits = it->idx->tokens[it->cursor].length <
+                      static_cast<int32_t>(cap);
     copy_token(it->idx, it->cursor, out, cap);
-    return bj::iter_advance(it);
+    return bj::iter_advance(it) && fits;
 }
 
 bool eat_int(bj::Iterator* it, int64_t* out) noexcept {
@@ -169,7 +172,10 @@ bool parse_partition_values(bj::Iterator* it, PartitionKV* out,
     while (bj::iter_peek(it) == bj::TokenType::Key && guard++ < cap * 4u) {
         const int32_t key_cur = it->cursor;
         bj::iter_advance(it);
-        if (*out_n >= cap) { iter_skip_value(it); continue; }
+        if (*out_n >= cap) return false;   // dropping one mis-prunes
+        if (it->idx->tokens[key_cur].length >=
+            static_cast<int32_t>(kLakeMaxColName))
+            return false;
         PartitionKV* kv = &out[*out_n];
         copy_token(it->idx, key_cur, kv->key, kLakeMaxColName);
         kv->is_null = false;
@@ -179,8 +185,7 @@ bool parse_partition_values(bj::Iterator* it, PartitionKV* out,
             kv->value[0] = '\0';
             bj::iter_advance(it);
         } else if (vt == bj::TokenType::String) {
-            copy_token(it->idx, it->cursor, kv->value, kLakeMaxValBytes);
-            bj::iter_advance(it);
+            if (!eat_string(it, kv->value, kLakeMaxValBytes)) return false;
         } else if (vt == bj::TokenType::Int64) {
             int64_t iv = 0;
             bj::iter_int64(it, &iv);
@@ -213,7 +218,8 @@ bool parse_dv(bj::Iterator* it, DvDescriptor* out) noexcept {
         if (tok_eq(it->idx, key_cur, "storageType")) {
             eat_string(it, storage, sizeof(storage));
         } else if (tok_eq(it->idx, key_cur, "pathOrInlineDv")) {
-            eat_string(it, path_or_inline, sizeof(path_or_inline));
+            if (!eat_string(it, path_or_inline, sizeof(path_or_inline)))
+                return false;
         } else if (tok_eq(it->idx, key_cur, "sizeInBytes")) {
             int64_t v = 0; eat_int(it, &v); out->size_in_bytes = v;
         } else if (tok_eq(it->idx, key_cur, "cardinality")) {
@@ -233,8 +239,8 @@ bool parse_dv(bj::Iterator* it, DvDescriptor* out) noexcept {
     } else if (storage[0] == 'i') {
         out->type = DvStorageType::kInline;
         const size_t n = std::strlen(path_or_inline);
-        out->inline_len = static_cast<uint32_t>(
-            n > kDeltaMaxDvInline ? kDeltaMaxDvInline : n);
+        if (n > kDeltaMaxDvInline) return false;   // a cut DV deletes wrong rows
+        out->inline_len = static_cast<uint32_t>(n);
         std::memcpy(out->inline_bytes, path_or_inline, out->inline_len);
     } else {
         out->type = DvStorageType::kNone;
@@ -253,7 +259,7 @@ bool parse_add(bj::Iterator* it, DeltaAdd* out) noexcept {
         const int32_t key_cur = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(it->idx, key_cur, "path")) {
-            eat_string(it, out->path, sizeof(out->path));
+            if (!eat_string(it, out->path, sizeof(out->path))) return false;
         } else if (tok_eq(it->idx, key_cur, "size")) {
             eat_int(it, &out->size);
         } else if (tok_eq(it->idx, key_cur, "modificationTime")) {
@@ -261,15 +267,16 @@ bool parse_add(bj::Iterator* it, DeltaAdd* out) noexcept {
         } else if (tok_eq(it->idx, key_cur, "dataChange")) {
             eat_bool(it, &out->data_change);
         } else if (tok_eq(it->idx, key_cur, "partitionValues")) {
-            parse_partition_values(it, out->partition_values,
-                                    kDeltaMaxPartitions,
-                                    &out->n_partition_values);
+            if (!parse_partition_values(it, out->partition_values,
+                                        kDeltaMaxPartitions,
+                                        &out->n_partition_values))
+                return false;
         } else if (tok_eq(it->idx, key_cur, "stats")) {
             out->stats_len = eat_raw(it, out->stats_json,
                                        sizeof(out->stats_json));
         } else if (tok_eq(it->idx, key_cur, "deletionVector")) {
             out->has_dv = true;
-            parse_dv(it, &out->dv);
+            if (!parse_dv(it, &out->dv)) return false;
         } else {
             iter_skip_value(it);
         }
@@ -288,7 +295,7 @@ bool parse_remove(bj::Iterator* it, DeltaRemove* out) noexcept {
         const int32_t key_cur = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(it->idx, key_cur, "path")) {
-            eat_string(it, out->path, sizeof(out->path));
+            if (!eat_string(it, out->path, sizeof(out->path))) return false;
         } else if (tok_eq(it->idx, key_cur, "deletionTimestamp")) {
             eat_int(it, &out->deletion_timestamp);
         } else if (tok_eq(it->idx, key_cur, "dataChange")) {
@@ -367,8 +374,8 @@ bool parse_metadata(bj::Iterator* it, DeltaMetadata* out) noexcept {
             bj::iter_advance(it);
             uint32_t g2 = 0;
             while (bj::iter_peek(it) == bj::TokenType::String &&
-                   out->n_partition_columns < kLakeMaxPartCols &&
                    g2++ < 64u) {
+                if (out->n_partition_columns >= kLakeMaxPartCols) return false;
                 copy_token(it->idx, it->cursor,
                            out->partition_columns[out->n_partition_columns],
                            kLakeMaxColName);
@@ -456,7 +463,9 @@ bool on_record(void* raw_ctx, const bj::StructuralIndex* record,
         case ActionKind::kCommitInfo: ok = parse_commit_info(&it, &a.commit_info); break;
         default: iter_skip_value(&it); break;
     }
-    if (!ok) return true;
+    // An action that does not parse (or does not fit) is missing table state;
+    // skipping it would report the table without that file.
+    if (!ok) { rc->stop = true; return false; }
     if (!rc->cb(rc->user_ctx, &a)) { rc->stop = true; return false; }
     return true;
 }
@@ -478,7 +487,7 @@ bool delta_log_parse_commit(const uint8_t* src, uint64_t src_len,
     rc.stop = false;
     bj::NdjsonStats st{};
     const bool ok = bj::ndjson_for_each(src, static_cast<int64_t>(src_len),
-                                         /*ignore_errors=*/true, scratch,
+                                         /*ignore_errors=*/false, scratch,
                                          &rc, on_record, &st);
     return ok && !rc.stop;
 }
@@ -549,16 +558,17 @@ bool delta_log_walk_all(ObjectStore* os, const char* table_rel_prefix,
     char prefix[kDeltaMaxPath];
     if (!join_rel(table_rel_prefix, "_delta_log/", prefix, sizeof(prefix)))
         return false;
-    ObjectEntry* entries = scratch->allocate_array<ObjectEntry>(kLakeMaxCommits);
-    if (entries == nullptr) return false;
+    ObjectEntry* entries = nullptr;
     uint32_t n_entries = 0;
-    const int rc = os_list(os, prefix, entries, kLakeMaxCommits, &n_entries);
+    const int rc = os_list_all(os, prefix, scratch, kLakeMaxCommits, &entries,
+                               &n_entries);
     if (rc != kOsOk) return false;
-    int64_t* versions = scratch->allocate_array<int64_t>(kLakeMaxCommits);
-    uint32_t* idxs    = scratch->allocate_array<uint32_t>(kLakeMaxCommits);
+    const uint32_t slots = n_entries > 0u ? n_entries : 1u;
+    int64_t* versions = scratch->allocate_array<int64_t>(slots);
+    uint32_t* idxs    = scratch->allocate_array<uint32_t>(slots);
     if (versions == nullptr || idxs == nullptr) return false;
     uint32_t n = 0;
-    for (uint32_t i = 0; i < n_entries && n < kLakeMaxCommits; ++i) {
+    for (uint32_t i = 0; i < n_entries; ++i) {
         const int64_t v = commit_version_for_key(entries[i].key,
                                                   table_rel_prefix);
         if (v < 0) continue;

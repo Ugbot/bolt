@@ -98,8 +98,11 @@ void read_stat_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
         } else if (tok_eq(idx, key, "value")) {
             const bj::TokenType t = bj::iter_peek(it);
             if (t == bj::TokenType::String) {
+                // A cut bound is not a bound: drop it rather than prune on it.
+                const bool fits = idx->tokens[it->cursor].length <
+                                  static_cast<int32_t>(sizeof(val));
                 read_str(idx, it, val, sizeof(val));
-                have_val = true;
+                have_val = fits;
             } else if (t == bj::TokenType::Int64 ||
                        t == bj::TokenType::Float64) {
                 int64_t iv = 0; read_int64(it, &iv);
@@ -194,11 +197,11 @@ void read_stat_array(const bj::StructuralIndex* idx, bj::Iterator* it,
     if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
 }
 
-void read_partition_array(const bj::StructuralIndex* idx, bj::Iterator* it,
+bool read_partition_array(const bj::StructuralIndex* idx, bj::Iterator* it,
                           DataFileRef* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
     if (bj::iter_peek(it) != bj::TokenType::BeginArray) {
-        skip_value(it); return;
+        skip_value(it); return true;
     }
     bj::iter_advance(it);
     uint32_t g = 0;
@@ -220,6 +223,9 @@ void read_partition_array(const bj::StructuralIndex* idx, bj::Iterator* it,
                 if (t == bj::TokenType::Null) {
                     bj::iter_advance(it); pv.is_null = true;
                 } else if (t == bj::TokenType::String) {
+                    if (idx->tokens[it->cursor].length >=
+                        static_cast<int32_t>(kLakeMaxValBytes))
+                        return false;
                     read_str(idx, it, pv.str, kLakeMaxValBytes);
                     pv.is_str = true; pv.is_null = false;
                 } else if (t == bj::TokenType::Int64 ||
@@ -240,11 +246,14 @@ void read_partition_array(const bj::StructuralIndex* idx, bj::Iterator* it,
         }
         if (bj::iter_peek(it) == bj::TokenType::EndObject)
             bj::iter_advance(it);
-        if (out->n_partition < kIcebergMaxPartitionValues) {
-            out->partition[out->n_partition++] = pv;
-        }
+        // Dropping a partition value would prune on the wrong value.
+        if (out->n_partition >= kIcebergMaxPartitionValues) return false;
+        out->partition[out->n_partition++] = pv;
     }
-    if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
+    if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+    bj::iter_advance(it);
+    assert(out->n_partition <= kIcebergMaxPartitionValues);
+    return true;
 }
 
 void read_eq_ids(const bj::StructuralIndex* /*idx*/, bj::Iterator* it,
@@ -270,11 +279,11 @@ void read_eq_ids(const bj::StructuralIndex* /*idx*/, bj::Iterator* it,
     }
 }
 
-void parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
+bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
                      DataFileRef* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) {
-        skip_value(it); return;
+        skip_value(it); return true;
     }
     bj::iter_advance(it);
     uint32_t g = 0;
@@ -291,13 +300,18 @@ void parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
             }
         } else if (tok_eq(idx, key, "file_path") ||
                    tok_eq(idx, key, "file-path")) {
+            // A cut path names a different (or no) file.
+            if (bj::iter_peek(it) == bj::TokenType::String &&
+                idx->tokens[it->cursor].length >=
+                    static_cast<int32_t>(kIcebergMaxPath))
+                return false;
             read_str(idx, it, out->file_path, kIcebergMaxPath);
         } else if (tok_eq(idx, key, "file_format") ||
                    tok_eq(idx, key, "file-format")) {
             char buf[16]; read_str(idx, it, buf, sizeof(buf));
             (void)buf;
         } else if (tok_eq(idx, key, "partition")) {
-            read_partition_array(idx, it, out);
+            if (!read_partition_array(idx, it, out)) return false;
         } else if (tok_eq(idx, key, "record_count") ||
                    tok_eq(idx, key, "record-count")) {
             read_int64(it, &out->stats.record_count);
@@ -321,6 +335,7 @@ void parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
         }
     }
     if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
+    return true;
 }
 
 bool parse_manifest_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -349,7 +364,7 @@ bool parse_manifest_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
             read_int64(it, &out->snapshot_id);
         } else if (tok_eq(idx, key, "data_file") ||
                    tok_eq(idx, key, "data-file")) {
-            parse_data_file(idx, it, out);
+            if (!parse_data_file(idx, it, out)) return false;
         } else {
             skip_value(it);
         }
@@ -376,7 +391,7 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
     uint32_t g = 0;
     while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
            g++ < kIterGuard) {
-        if (*out_n >= cap) { bj::iter_skip_to_close(&it); break; }
+        if (*out_n >= cap) return false;   // caller retries with more room
         ManifestListEntry* slot = &out[*out_n];
         std::memset(slot, 0, sizeof(*slot));
         slot->partition_spec_id = -1;
@@ -388,8 +403,12 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
             bj::iter_advance(&it);
             if (tok_eq(&idx, key, "manifest_path") ||
                 tok_eq(&idx, key, "manifest-path")) {
-                read_str(&idx, &it, slot->manifest_path,
-                         kIcebergMaxManifestPath);
+                if (bj::iter_peek(&it) == bj::TokenType::String &&
+                idx.tokens[it.cursor].length >=
+                    static_cast<int32_t>(kIcebergMaxManifestPath))
+                return false;
+            read_str(&idx, &it, slot->manifest_path,
+                     kIcebergMaxManifestPath);
             } else if (tok_eq(&idx, key, "manifest_length") ||
                        tok_eq(&idx, key, "manifest-length")) {
                 read_int64(&it, &slot->manifest_length);
@@ -415,7 +434,7 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
             bj::iter_advance(&it);
         ++*out_n;
     }
-    return true;
+    return bj::iter_peek(&it) == bj::TokenType::EndArray;
 }
 
 bool manifest_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
@@ -435,13 +454,13 @@ bool manifest_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
     uint32_t g = 0;
     while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
            g++ < kIterGuard) {
-        if (*out_n >= cap) { bj::iter_skip_to_close(&it); break; }
+        if (*out_n >= cap) return false;   // caller retries with more room
         DataFileRef* slot = &out[*out_n];
         if (!parse_manifest_entry(&idx, &it, slot)) return false;
         if (slot->partition_spec_id < 0) slot->partition_spec_id = default_spec_id;
         ++*out_n;
     }
-    return true;
+    return bj::iter_peek(&it) == bj::TokenType::EndArray;
 }
 
 }  // namespace iceberg

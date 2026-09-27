@@ -32,7 +32,9 @@ bool collect_path(void* raw, const DeltaAction* a) noexcept {
     assert(raw != nullptr && a != nullptr);
     auto* c = static_cast<HistCtx*>(raw);
     if (a->kind != ActionKind::kAdd) return true;
-    if (c->n >= c->cap) return true;
+    // An unrecorded live path would be vacuumed: abort the walk instead.
+    if (c->n >= c->cap) return false;
+    if (std::strlen(a->add.path) >= kDeltaMaxPath) return false;
     std::strncpy(c->paths[c->n], a->add.path, kDeltaMaxPath - 1u);
     c->paths[c->n][kDeltaMaxPath - 1u] = '\0';
     ++c->n;
@@ -66,11 +68,10 @@ bool delta_table_vacuum(TableHandle* th, uint64_t retention_hours,
     // List all objects under <table_rel>/data/
     char prefix[kDeltaMaxPath];
     std::snprintf(prefix, sizeof(prefix), "%s/data/", th->table_rel);
-    ObjectEntry* entries = scratch.allocate_array<ObjectEntry>(kLakeMaxLiveFiles);
-    if (entries == nullptr) return false;
+    ObjectEntry* entries = nullptr;
     uint32_t n_entries = 0;
-    if (os_list(&th->os, prefix, entries, kLakeMaxLiveFiles, &n_entries)
-        != kOsOk) return false;
+    if (os_list_all(&th->os, prefix, &scratch, kLakeMaxLiveFiles, &entries,
+                    &n_entries) != kOsOk) return false;
 
     const uint64_t now_s = delta_writer_now_ms() / 1000ull;
     const uint64_t cutoff_s = retention_hours * 3600ull;

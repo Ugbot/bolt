@@ -46,10 +46,10 @@ struct StochasticOscState {
     uint32_t                        window;
     DonchianChannelState<kCap>      donchian;
 
-    inline void init(int32_t close, int32_t high, int32_t low,
+    inline bool init(int32_t close, int32_t high, int32_t low,
                      int32_t k_out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         close_col = close;
         high_col  = high;
         low_col   = low;
@@ -58,6 +58,7 @@ struct StochasticOscState {
         // Donchian upper/lower column indices are unused here — the
         // values come out through donchian.dq_max/dq_min.front_val().
         donchian.init(high, low, /*upper*/ -1, /*lower*/ -1, w);
+        return true;
     }
 };
 

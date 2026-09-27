@@ -2699,6 +2699,7 @@ bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
         uint8_t  scale = 0;
         // Same mapping the decoder uses — the schema cannot drift from it.
         if (!parquet_map_type(&pc, &bt, &scale)) return false;
+        if (pc.name_truncated != 0u) return false;   // longer than BoltField
 
         BoltField& f = out->fields[c];
         std::memset(&f, 0, sizeof(f));
@@ -3279,6 +3280,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
                 return false;
             }
             if (lrows != meta->num_rows) return false;
+            if (meta->columns[c].name_truncated != 0u) return false;
             (void)out_batch->schema.add_field(meta->columns[c].name,
                                               BoltType::List);
             continue;
@@ -3287,6 +3289,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
                           arena, &cols[c], &cxs[c])) {
             return false;
         }
+        if (meta->columns[c].name_truncated != 0u) return false;
         (void)out_batch->schema.add_field(meta->columns[c].name, cxs[c].type);
     }
     // Precompute each row group's starting row offset up front (single-

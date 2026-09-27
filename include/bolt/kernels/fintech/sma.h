@@ -34,13 +34,14 @@ struct SMAState {
     uint32_t                      window;
     RollingRing<double, kCap>     ring;
 
-    inline void init(int32_t in, int32_t out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+    inline bool init(int32_t in, int32_t out, uint32_t w) noexcept {
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         in_col  = in;
         out_col = out;
         window  = w;
         ring.init(w);
+        return true;
     }
 };
 

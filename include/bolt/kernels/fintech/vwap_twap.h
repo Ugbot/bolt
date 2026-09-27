@@ -45,16 +45,17 @@ struct VWAPState {
     RollingRing<double, kCap>     ring_pv;   // price * volume
     RollingRing<double, kCap>     ring_v;    // volume
 
-    inline void init(int32_t price, int32_t volume, int32_t out,
+    inline bool init(int32_t price, int32_t volume, int32_t out,
                      uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         price_col  = price;
         volume_col = volume;
         out_col    = out;
         window     = w;
         ring_pv.init(w);
         ring_v.init(w);
+        return true;
     }
 };
 
@@ -109,13 +110,14 @@ struct TWAPState {
     uint32_t                      window;
     RollingRing<double, kCap>     ring;
 
-    inline void init(int32_t price, int32_t out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+    inline bool init(int32_t price, int32_t out, uint32_t w) noexcept {
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         price_col = price;
         out_col   = out;
         window    = w;
         ring.init(w);
+        return true;
     }
 };
 

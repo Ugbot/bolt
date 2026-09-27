@@ -153,13 +153,16 @@ BOLT_FORCE_INLINE uint32_t ebr_drain_epoch(Ebr* e, uint32_t slot) noexcept {
 // ---------------------------------------------------------------------------
 // Init / destroy.
 // ---------------------------------------------------------------------------
-inline void ebr_init(Ebr* e, uint32_t num_shards) noexcept {
+// A `num_shards` outside [1, kEbrMaxShards] is refused (returns false) and
+// leaves an Ebr with no shards, which no reader loop can index past.
+inline bool ebr_init(Ebr* e, uint32_t num_shards) noexcept {
     assert(e != nullptr);
-    assert(num_shards > 0 && num_shards <= kEbrMaxShards);
+    static_assert(kEbrMaxShards > 0, "at least one shard");
+    const bool ok = num_shards > 0 && num_shards <= kEbrMaxShards;
 
     e->global_epoch.store(0, std::memory_order_relaxed);
     e->collector_busy.store(0, std::memory_order_relaxed);
-    e->num_shards = num_shards;
+    e->num_shards = ok ? num_shards : 0u;
     e->_pad_hdr   = 0;
 
     for (uint32_t s = 0; s < kEbrMaxShards; ++s) {
@@ -172,12 +175,14 @@ inline void ebr_init(Ebr* e, uint32_t num_shards) noexcept {
             sh->nodes[i].free_fn = nullptr;
         }
     }
+    assert(e->num_shards <= kEbrMaxShards);
+    return ok;
 }
 
 // Drain every remaining retire slot. Caller guarantees no readers remain.
 inline void ebr_destroy(Ebr* e) noexcept {
     assert(e != nullptr);
-    assert(e->num_shards > 0 && e->num_shards <= kEbrMaxShards);
+    assert(e->num_shards <= kEbrMaxShards);   // 0 = refused by ebr_init
 
     // Unpin everyone so the collector path isn't blocked on a stale reader.
     for (uint32_t s = 0; s < e->num_shards; ++s) {

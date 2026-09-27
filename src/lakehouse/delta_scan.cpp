@@ -345,7 +345,13 @@ bool delta_scan_next_batch(ScanHandle* s, BoltBatch* out,
                 const char* m = dl::delta_column_map_logical(&s->col_map, phys);
                 if (m != nullptr) logical = m;
             }
-            out->schema.add_field(logical, cols[c].type, true);
+            // Physical names that were cut, or logical names longer than a
+            // BoltField holds, would bind the wrong column: refuse.
+            if (logical == phys && s->cur_meta->columns[c].name_truncated)
+                return false;
+            if (std::strlen(logical) > kMaxFieldName) return false;
+            if (!out->schema.add_field(logical, cols[c].type, true))
+                return false;
         }
         return true;
     }

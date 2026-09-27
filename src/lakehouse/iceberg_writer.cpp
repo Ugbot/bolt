@@ -1062,6 +1062,8 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
     // original field layout instead of the one just evolved to.
     const Schema* write_sch = metadata_current_schema(&th->meta);
     if (write_sch == nullptr) return false;
+    // make_pq_opts clamps to the writer's column array: refuse, never drop.
+    if (write_sch->n_fields > kMaxFixedColumns) return false;
     ingest::parquet::ParquetWriteOpts po = make_pq_opts(write_sch, nullptr);
     auto* w = ingest::parquet::parquet_write_open(full, &po);
     if (w == nullptr) return false;
@@ -1192,7 +1194,10 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                 break;
             }
         }
-        if (ps != nullptr && ps->manifest_list[0] != '\0') {
+        // An unresolvable parent would start a fresh list: every prior
+        // manifest dropped.
+        if (ps == nullptr) return false;
+        if (ps->manifest_list[0] != '\0') {
             const uint8_t* pb = nullptr; uint64_t pl = 0;
             const char* pkey = store_key_for(th->root, ps->manifest_list);
             // A parent list the store cannot produce means manifests we would
@@ -1590,6 +1595,7 @@ bool table_add_column(TableHandle* th, const char* name, BoltType type,
     Schema* s = begin_schema_evolution(th);
     if (s == nullptr) return false;
     if (s->n_fields >= kIcebergMaxFieldsPerSchema) return false;
+    if (std::strlen(name) >= sizeof(SchemaField::name)) return false;
     SchemaField& f = s->fields[s->n_fields];
     std::memset(&f, 0, sizeof(f));
     f.id = static_cast<int32_t>(s->n_fields + 1);
@@ -1619,6 +1625,7 @@ bool table_drop_column(TableHandle* th, const char* name) noexcept {
 bool table_rename_column(TableHandle* th, const char* from,
                          const char* to) noexcept {
     assert(th != nullptr && from != nullptr && to != nullptr);
+    if (std::strlen(to) >= sizeof(SchemaField::name)) return false;
     Schema* s = begin_schema_evolution(th);
     if (s == nullptr) return false;
     for (uint32_t i = 0; i < s->n_fields; ++i) {
@@ -1768,13 +1775,11 @@ bool table_remove_orphans(TableHandle* th, uint64_t /*older_than_ms*/,
     *n = 0;
     if (!dry_run) return true;
     // List the table data/ prefix, report all paths.
-    ObjectEntry* listing = th->arena->allocate_array<ObjectEntry>(256u);
-    if (listing == nullptr) return false;
+    ObjectEntry* listing = nullptr;
     uint32_t nl = 0;
-    if (os_list(th->os, "data/", listing, 256u, &nl) != kOsOk) {
-        // No data directory yet — that's fine.
-        return true;
-    }
+    // A missing data/ lists empty; any other failure must not read as "none".
+    if (os_list_all(th->os, "data/", th->arena, 256u, &listing, &nl) != kOsOk)
+        return false;
     uint32_t emit = 0;
     for (uint32_t i = 0; i < nl && emit < cap; ++i) {
         std::strncpy(out[emit], listing[i].key, 511);

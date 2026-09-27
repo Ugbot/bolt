@@ -45,10 +45,10 @@ struct ATRState {
     double                        prev_close;
     RollingRing<double, kCap>     ring_tr;
 
-    inline void init(int32_t high, int32_t low, int32_t close, int32_t out,
+    inline bool init(int32_t high, int32_t low, int32_t close, int32_t out,
                      uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         high_col        = high;
         low_col         = low;
         close_col       = close;
@@ -57,6 +57,7 @@ struct ATRState {
         have_prev_close = false;
         prev_close      = 0.0;
         ring_tr.init(w);
+        return true;
     }
 };
 

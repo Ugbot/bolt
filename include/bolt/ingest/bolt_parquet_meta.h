@@ -276,6 +276,9 @@ struct PqColumn {
     // duplicate list_def/rep_def above.
     uint8_t  list_defs[kPqMaxRepLevels];
     uint8_t  rep_defs[kPqMaxRepLevels];
+    // `name` was cut to fit kPqMaxNameBytes: anything that binds this column
+    // BY NAME must refuse it (a prefix can collide with a sibling).
+    uint8_t  name_truncated;
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

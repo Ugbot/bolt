@@ -174,9 +174,17 @@ bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
         if (tok_eq(idx, key, "id")) {
             int64_t v = 0; read_int64(it, &v); out->id = static_cast<int32_t>(v);
         } else if (tok_eq(idx, key, "name")) {
+            // A cut name can collide with a sibling: refuse the schema.
+            if (bj::iter_peek(it) == bj::TokenType::String &&
+                idx->tokens[it->cursor].length >=
+                    static_cast<int32_t>(kIcebergMaxFieldName))
+                return false;
             read_str(idx, it, out->name, kIcebergMaxFieldName);
         } else if (tok_eq(idx, key, "type")) {
             if (bj::iter_peek(it) == bj::TokenType::String) {
+                if (idx->tokens[it->cursor].length >=
+                    static_cast<int32_t>(kIcebergMaxTypeName))
+                    return false;
                 read_str(idx, it, out->type, kIcebergMaxTypeName);
             } else {
                 std::strcpy(out->type, "struct");
@@ -215,14 +223,13 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
             uint32_t g2 = 0;
             while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
                    g2++ < kIterGuard) {
-                if (out->n_fields >= kIcebergMaxFieldsPerSchema) {
-                    bj::iter_skip_to_close(it); break;
-                }
-                parse_field(idx, it, &out->fields[out->n_fields]);
+                if (out->n_fields >= kIcebergMaxFieldsPerSchema) return false;
+                if (!parse_field(idx, it, &out->fields[out->n_fields]))
+                    return false;
                 ++out->n_fields;
             }
-            if (bj::iter_peek(it) == bj::TokenType::EndArray)
-                bj::iter_advance(it);
+            if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+            bj::iter_advance(it);
         } else {
             skip_value(it);
         }
@@ -284,14 +291,12 @@ bool parse_pspec(const bj::StructuralIndex* idx, bj::Iterator* it,
             uint32_t g2 = 0;
             while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
                    g2++ < kIterGuard) {
-                if (out->n_fields >= kIcebergMaxFieldsPerSpec) {
-                    bj::iter_skip_to_close(it); break;
-                }
+                if (out->n_fields >= kIcebergMaxFieldsPerSpec) return false;
                 parse_pspec_field(idx, it, &out->fields[out->n_fields]);
                 ++out->n_fields;
             }
-            if (bj::iter_peek(it) == bj::TokenType::EndArray)
-                bj::iter_advance(it);
+            if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+            bj::iter_advance(it);
         } else {
             skip_value(it);
         }
@@ -428,14 +433,12 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             uint32_t g2 = 0;
             while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
                    g2++ < kIterGuard) {
-                if (out->n_snapshots >= kIcebergMaxSnapshots) {
-                    bj::iter_skip_to_close(&it); break;
-                }
+                if (out->n_snapshots >= kIcebergMaxSnapshots) return false;
                 parse_snapshot(&idx, &it, &out->snapshots[out->n_snapshots]);
                 ++out->n_snapshots;
             }
-            if (bj::iter_peek(&it) == bj::TokenType::EndArray)
-                bj::iter_advance(&it);
+            if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
+            bj::iter_advance(&it);
         } else if (tok_eq(&idx, key, "schemas")) {
             if (bj::iter_peek(&it) != bj::TokenType::BeginArray) {
                 skip_value(&it); continue;
@@ -444,22 +447,18 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             uint32_t g2 = 0;
             while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
                    g2++ < kIterGuard) {
-                if (out->n_schemas >= kIcebergMaxSchemas) {
-                    bj::iter_skip_to_close(&it); break;
-                }
-                parse_schema(&idx, &it, &out->schemas[out->n_schemas]);
+                if (out->n_schemas >= kIcebergMaxSchemas) return false;
+                if (!parse_schema(&idx, &it, &out->schemas[out->n_schemas])) return false;
                 ++out->n_schemas;
             }
-            if (bj::iter_peek(&it) == bj::TokenType::EndArray)
-                bj::iter_advance(&it);
+            if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
+            bj::iter_advance(&it);
         } else if (tok_eq(&idx, key, "schema")) {
             if (bj::iter_peek(&it) == bj::TokenType::BeginObject) {
-                if (out->n_schemas < kIcebergMaxSchemas) {
-                    parse_schema(&idx, &it, &out->schemas[out->n_schemas]);
-                    ++out->n_schemas;
-                } else {
-                    skip_value(&it);
-                }
+                if (out->n_schemas >= kIcebergMaxSchemas) return false;
+                if (!parse_schema(&idx, &it, &out->schemas[out->n_schemas]))
+                    return false;
+                ++out->n_schemas;
             } else {
                 skip_value(&it);
             }
@@ -471,14 +470,12 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             uint32_t g2 = 0;
             while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
                    g2++ < kIterGuard) {
-                if (out->n_specs >= kIcebergMaxSpecs) {
-                    bj::iter_skip_to_close(&it); break;
-                }
-                parse_pspec(&idx, &it, &out->specs[out->n_specs]);
+                if (out->n_specs >= kIcebergMaxSpecs) return false;
+                if (!parse_pspec(&idx, &it, &out->specs[out->n_specs])) return false;
                 ++out->n_specs;
             }
-            if (bj::iter_peek(&it) == bj::TokenType::EndArray)
-                bj::iter_advance(&it);
+            if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
+            bj::iter_advance(&it);
         } else if (tok_eq(&idx, key, "snapshot-log")) {
             saw_snapshot_log = parse_snapshot_log(&idx, &it, out);
         } else if (tok_eq(&idx, key, "metadata-log")) {
@@ -495,6 +492,10 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                                        out->snapshots[i].snapshot_id);
         }
     }
+    // A current snapshot the list does not carry would scan as an empty table.
+    if (out->current_snapshot_id >= 0 &&
+        snapshot_by_id(out, out->current_snapshot_id) == nullptr)
+        return false;
     if (out->current_schema_id < 0 && out->n_schemas > 0)
         out->current_schema_id = out->schemas[0].schema_id;
     if (out->current_spec_id < 0 && out->n_specs > 0)
