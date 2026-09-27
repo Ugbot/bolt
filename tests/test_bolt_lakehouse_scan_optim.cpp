@@ -281,9 +281,40 @@ TEST(W8Parallel, ConfigClampsToCaps) {
     cfg.inflight_max = 1024;
     cfg.use_prefetch = false;
     ASSERT_TRUE(parallel_scan_config_clamp(&cfg));
-    ASSERT_EQ(cfg.parallelism, kScanMaxParallelism);
+    ASSERT_EQ(cfg.parallelism, 1024u);   // never clamped; open() validates
     ASSERT_EQ(cfg.lookahead,   kScanMaxLookahead);
     ASSERT_EQ(cfg.inflight_max, kScanMaxInflight);
+}
+
+TEST(W8Parallel, DefaultParallelismIsTheWorkerCount) {
+    ParallelScanConfig cfg{};
+    parallel_scan_config_init(&cfg);
+    EXPECT_EQ(cfg.parallelism, bolt::bolt_auto_workers());
+    EXPECT_GE(cfg.parallelism, 1u);
+}
+
+TEST(W8Parallel, ParallelismPastTheCeilingIsRefusedNotClamped) {
+    bolt::Arena arena;
+    ParallelScanConfig cfg{};
+    parallel_scan_config_init(&cfg);
+    cfg.use_prefetch = false;
+    cfg.parallelism  = kScanMaxParallelism + 1;
+    ParallelScanPool* pool = nullptr;
+    EXPECT_FALSE(parallel_scan_open(&pool, &arena, nullptr, &cfg));
+    EXPECT_EQ(pool, nullptr);
+    cfg.parallelism = 0;
+    EXPECT_FALSE(parallel_scan_open(&pool, &arena, nullptr, &cfg));
+}
+
+TEST(W8Parallel, WideParallelismRuns) {
+    bolt::Arena arena;
+    ParallelScanConfig cfg{};
+    parallel_scan_config_init(&cfg);
+    cfg.use_prefetch = false;
+    cfg.parallelism  = 48;   // past the old silent 16 clamp
+    ParallelScanPool* pool = nullptr;
+    ASSERT_TRUE(parallel_scan_open(&pool, &arena, nullptr, &cfg));
+    parallel_scan_close(pool);
 }
 
 TEST(W8Parallel, OpenSubmitPollClose) {

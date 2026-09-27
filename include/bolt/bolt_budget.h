@@ -20,8 +20,10 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_port.h"
 #include "bolt/bolt_config.h"
 #include "bolt/bolt_limits.h"
 #include "bolt/bolt_resource.h"
@@ -36,7 +38,9 @@
       "process memory budget; 0 = 40% of physical RAM clamped to [2, 64] GiB")  \
     X(max_workers, kInvariant, "threads", BOLT_MAX_WORKERS, BOLT_MAX_WORKERS,   \
       BOLT_MAX_WORKERS, nullptr, nullptr,                                       \
-      "scheduler worker ceiling (BOLT_MAX_WORKERS at build time)")              \
+      "scheduler worker validation ceiling (BOLT_MAX_WORKERS at build time)")   \
+    X(workers, kFixedAtAlloc, "threads", 0, 0, BOLT_MAX_WORKERS, "BOLT_WORKERS", \
+      nullptr, "workers of an auto-sized bolt::Scheduler; 0 = hardware threads") \
     X(arena_max_blocks, kInvariant, "blocks", 256, 256, 256, nullptr, nullptr,  \
       "backing blocks per bolt::Arena")                                         \
     X(stack_array_lint_bytes, kInvariant, "bytes", 16384, 16384, 16384,         \
@@ -47,6 +51,35 @@ namespace bolt {
 BOLT_LIMITS_TABLE(bolt_limits, "bolt", BOLT_LIMITS)
 
 static_assert(kArenaMaxBlocks == 256, "update BOLT_LIMITS arena_max_blocks");
+
+// The worker count an auto-sized pool uses: BOLT_WORKERS when set, else the
+// hardware thread count, capped at the ceiling with a stderr line (the
+// machine chose that number, not the caller). 0 when BOLT_WORKERS is invalid;
+// the caller refuses to start and bolt_limits().error says why.
+inline uint32_t bolt_auto_workers() noexcept {
+    static_assert(BOLT_MAX_WORKERS >= 1u, "worker ceiling");
+    const LimitTable& t = bolt_limits();
+    const uint32_t wi = static_cast<uint32_t>(bolt_limits_id::workers);
+    if (limits_source(t, wi) == LimitSource::kInvalid) return 0;
+    uint64_t w = limits_value(t, wi);
+    if (w != 0) {
+        assert(w <= BOLT_MAX_WORKERS);
+        return static_cast<uint32_t>(w);
+    }
+    w = bolt_get_hardware_concurrency();
+    if (w == 0) w = 1;
+    if (w > BOLT_MAX_WORKERS) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr, "bolt: %llu hardware threads, using the "
+                         "BOLT_MAX_WORKERS ceiling %u\n",
+                         static_cast<unsigned long long>(w), BOLT_MAX_WORKERS);
+        }
+        w = BOLT_MAX_WORKERS;
+    }
+    assert(w >= 1u && w <= BOLT_MAX_WORKERS);
+    return static_cast<uint32_t>(w);
+}
 
 inline constexpr uint32_t kBudgetMaxDepth = 16;
 

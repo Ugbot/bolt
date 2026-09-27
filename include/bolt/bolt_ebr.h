@@ -31,16 +31,19 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
+#include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
 
 namespace bolt {
 
 // ---------------------------------------------------------------------------
-// Compile-time bounds. No runtime growth — every loop, every queue is
-// capped at init time (Tiger Style).
+// Bounds. Shards are allocated by ebr_init for exactly the requested count
+// (one per worker thread); kEbrMaxShards only validates it and derives from
+// the scheduler's worker ceiling. Retire rings are fixed per shard.
 // ---------------------------------------------------------------------------
-constexpr uint32_t kEbrMaxShards      = 64;   // one slot per worker thread
+constexpr uint32_t kEbrMaxShards      = config::kMaxWorkers;
 constexpr uint32_t kEbrRetirePerEpoch = 256;  // bounded retire queue / epoch
 constexpr uint64_t kEbrUnpinned       = UINT64_MAX;
 
@@ -98,7 +101,7 @@ struct alignas(64) Ebr {
     alignas(64) std::atomic<uint32_t> collector_busy;  // 0 = free, 1 = draining
     uint32_t                          num_shards;
     uint32_t                          _pad_hdr;
-    EbrShard                          shards[kEbrMaxShards];
+    EbrShard*                         shards;   // [num_shards], owned; ebr_destroy frees
 };
 
 // ---------------------------------------------------------------------------
@@ -153,19 +156,24 @@ BOLT_FORCE_INLINE uint32_t ebr_drain_epoch(Ebr* e, uint32_t slot) noexcept {
 // ---------------------------------------------------------------------------
 // Init / destroy.
 // ---------------------------------------------------------------------------
-// A `num_shards` outside [1, kEbrMaxShards] is refused (returns false) and
-// leaves an Ebr with no shards, which no reader loop can index past.
+// Allocates exactly num_shards shards (startup allocation; pair with
+// ebr_destroy). A `num_shards` outside [1, kEbrMaxShards], or a failed
+// allocation, is refused (returns false) and leaves an Ebr with no shards,
+// which no reader loop can index past.
 inline bool ebr_init(Ebr* e, uint32_t num_shards) noexcept {
     assert(e != nullptr);
     static_assert(kEbrMaxShards > 0, "at least one shard");
-    const bool ok = num_shards > 0 && num_shards <= kEbrMaxShards;
-
     e->global_epoch.store(0, std::memory_order_relaxed);
     e->collector_busy.store(0, std::memory_order_relaxed);
-    e->num_shards = ok ? num_shards : 0u;
+    e->num_shards = 0u;
     e->_pad_hdr   = 0;
+    e->shards     = nullptr;
+    if (num_shards == 0 || num_shards > kEbrMaxShards) return false;
+    e->shards = new (std::nothrow) EbrShard[num_shards];
+    if (e->shards == nullptr) return false;
+    e->num_shards = num_shards;
 
-    for (uint32_t s = 0; s < kEbrMaxShards; ++s) {
+    for (uint32_t s = 0; s < num_shards; ++s) {
         EbrShard* sh = &e->shards[s];
         sh->local_epoch.store(kEbrUnpinned, std::memory_order_relaxed);
         for (uint32_t k = 0; k < 3; ++k) { sh->head[k] = 0; sh->tail[k] = 0; }
@@ -175,8 +183,8 @@ inline bool ebr_init(Ebr* e, uint32_t num_shards) noexcept {
             sh->nodes[i].free_fn = nullptr;
         }
     }
-    assert(e->num_shards <= kEbrMaxShards);
-    return ok;
+    assert(e->num_shards == num_shards && e->shards != nullptr);
+    return true;
 }
 
 // Drain every remaining retire slot. Caller guarantees no readers remain.
@@ -193,6 +201,8 @@ inline void ebr_destroy(Ebr* e) noexcept {
         (void)ebr_drain_epoch(e, slot);
     }
     e->num_shards = 0;
+    delete[] e->shards;
+    e->shards = nullptr;
 }
 
 // ---------------------------------------------------------------------------

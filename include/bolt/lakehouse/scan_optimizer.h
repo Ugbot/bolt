@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_config.h"
 #include "bolt/lakehouse/format.h"
 
 namespace bolt {
@@ -22,8 +23,9 @@ namespace lakehouse {
 
 // Hard caps (W8 contract).
 static constexpr uint32_t kScanMorselMaxRows     = 1u << 20;    // 1M rows
-static constexpr uint32_t kScanMaxParallelism    = 16u;
-static constexpr uint32_t kScanDefaultParallel   = 4u;
+// Scan parallelism is a worker count: validated against the scheduler's
+// ceiling, defaulting to the auto-sized worker count (bolt_auto_workers).
+static constexpr uint32_t kScanMaxParallelism    = config::kMaxWorkers;
 static constexpr uint32_t kScanMaxLookahead      = 32u;
 static constexpr uint32_t kScanDefaultLookahead  = 8u;
 static constexpr uint32_t kScanMaxInflight       = 64u;

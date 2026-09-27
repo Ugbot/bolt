@@ -9,6 +9,7 @@
 #pragma once
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_budget.h"
 #include "bolt/bolt_channel.h"
 #include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
@@ -18,7 +19,9 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <new>
 #include <thread>
 
 namespace bolt {
@@ -483,22 +486,23 @@ struct Scheduler {
     // default to its minimum and a worker is left with ~4.5 KiB of real
     // stack: the first task with a 4 KiB frame (marbledb's
     // flush_zone_write_open) runs off the end into the guard page.
-    bolt::api::core::StackedThread workers[kMaxWorkers];
+    //
+    // Every per-worker array is allocated by init() for exactly the resolved
+    // worker count and freed by shutdown(); kMaxWorkers only validates.
+    bolt::api::core::StackedThread* workers;
     uint32_t    num_workers;
+    uint32_t    worker_slots;     // length of every per-worker array below
     std::atomic<bool> shutdown_flag;
 
-    // Per-worker arenas
-    Arena*     worker_arenas[kMaxWorkers];
-
-    // Per-worker config
-    WorkerConfig worker_configs[kMaxWorkers];
+    Arena**       worker_arenas;
+    WorkerConfig* worker_configs;
 
     // Applied scheduler-level config (from init()).
     SchedulerConfig cfg;
 
     // Observed placement: UINT32_MAX means floating / not bound.
-    uint32_t worker_cpus[kMaxWorkers];
-    uint32_t worker_numa[kMaxWorkers];
+    uint32_t* worker_cpus;
+    uint32_t* worker_numa;
 
     // Task pools for range/column tasks
     TaskPool*  range_task_pool;
@@ -588,6 +592,8 @@ struct Scheduler {
     // Init / Shutdown
     // =====================================================================
 
+    // init refuses (false, reason on stderr) a worker count above kMaxWorkers
+    // or an invalid BOLT_WORKERS; it never clamps an explicit request.
     bool init(uint32_t num_threads, SpinPolicy default_policy = SpinPolicy::SpinYield) noexcept;
     bool init(const SchedulerConfig& cfg) noexcept;
     void shutdown() noexcept;
@@ -647,6 +653,7 @@ struct Scheduler {
     static constexpr size_t kWorkerArenaKeepBytes = 256ull * 1024 * 1024;
 
     void reset_worker_arenas() noexcept {
+        assert(num_workers <= worker_slots);
         for (uint32_t i = 0; i < num_workers; ++i) {
             if (worker_arenas[i] != nullptr) {
                 worker_arenas[i]->reset_keep(kWorkerArenaKeepBytes);
@@ -752,7 +759,7 @@ inline void scheduler_column_trampoline(void* arg) noexcept {
 
 inline void scheduler_worker_loop(Scheduler* sched, uint32_t worker_id) noexcept {
     assert(sched != nullptr);
-    assert(worker_id < kMaxWorkers);
+    assert(worker_id < sched->worker_slots);
 
     // ------------------------------------------------------------------------
     // Pinning + NUMA binding: MUST happen before tl_arena is set so that the
@@ -866,14 +873,70 @@ inline void scheduler_assign_cpus(const CpuTopology& topo,
 }
 
 inline bool Scheduler::init(uint32_t num_threads, SpinPolicy default_policy) noexcept {
-    // Every num_threads value is legal here: init(SchedulerConfig) maps 0 to
-    // bolt_get_hardware_concurrency() (the documented auto-size sentinel) and
-    // clamps anything above kMaxWorkers. A precondition assert on num_threads
-    // would abort on inputs this function is specified to accept.
+    // 0 is the auto-size sentinel (see init(SchedulerConfig)).
     SchedulerConfig c{};
     c.num_workers = num_threads;
     c.spin        = default_policy;
     return init(c);
+}
+
+// Resolve the worker count: an explicit request is validated, never clamped;
+// 0 takes bolt_auto_workers(). Returns 0 on refusal after printing why.
+inline uint32_t scheduler_resolve_workers(uint32_t requested) noexcept {
+    static_assert(kMaxWorkers >= 1u, "worker ceiling");
+    if (requested > kMaxWorkers) {
+        std::fprintf(stderr,
+                     "bolt::Scheduler: %u workers requested, above the "
+                     "BOLT_MAX_WORKERS ceiling %u\n", requested, kMaxWorkers);
+        return 0;
+    }
+    if (requested != 0) return requested;
+    const uint32_t w = bolt_auto_workers();
+    if (w == 0) std::fprintf(stderr, "bolt::Scheduler: %s\n", bolt_limits().error);
+    assert(w <= kMaxWorkers);
+    return w;
+}
+
+inline void scheduler_free_slots(Scheduler* s) noexcept {
+    assert(s != nullptr);
+    delete[] s->workers;        s->workers        = nullptr;
+    delete[] s->worker_arenas;  s->worker_arenas  = nullptr;
+    delete[] s->worker_configs; s->worker_configs = nullptr;
+    delete[] s->worker_cpus;    s->worker_cpus    = nullptr;
+    delete[] s->worker_numa;    s->worker_numa    = nullptr;
+    s->worker_slots = 0;
+}
+
+// Startup allocation of every per-worker array, sized to n.
+inline bool scheduler_alloc_slots(Scheduler* s, uint32_t n) noexcept {
+    assert(s != nullptr);
+    assert(n >= 1u && n <= kMaxWorkers);
+    s->workers        = new (std::nothrow) bolt::api::core::StackedThread[n];
+    s->worker_arenas  = new (std::nothrow) Arena*[n];
+    s->worker_configs = new (std::nothrow) WorkerConfig[n];
+    s->worker_cpus    = new (std::nothrow) uint32_t[n];
+    s->worker_numa    = new (std::nothrow) uint32_t[n];
+    s->worker_slots   = n;
+    if (!s->workers || !s->worker_arenas || !s->worker_configs ||
+        !s->worker_cpus || !s->worker_numa) {
+        scheduler_free_slots(s);
+        return false;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        s->worker_arenas[i] = nullptr;
+        s->worker_configs[i] = WorkerConfig{ i, -1, SpinPolicy::SpinYield, kDefaultSpinCount };
+        s->worker_cpus[i]   = UINT32_MAX;
+        s->worker_numa[i]   = UINT32_MAX;
+    }
+    return true;
+}
+
+inline void scheduler_free_arenas(Scheduler* s) noexcept {
+    assert(s != nullptr);
+    for (uint32_t i = 0; i < s->worker_slots; ++i) {
+        delete s->worker_arenas[i];
+        s->worker_arenas[i] = nullptr;
+    }
 }
 
 inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
@@ -881,20 +944,15 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     assert(in_cfg.dispatch_batch > 0);
 
     cfg = in_cfg;
-
-    uint32_t num_threads = cfg.num_workers;
-    if (num_threads == 0) num_threads = bolt_get_hardware_concurrency();
-    if (num_threads == 0) num_threads = 1;
-    if (num_threads > kMaxWorkers) num_threads = kMaxWorkers;
-
-    // Defensive: clear owned pointers in case caller didn't value-init.
     range_task_pool = nullptr;
     column_task_pool = nullptr;
-    for (uint32_t i = 0; i < kMaxWorkers; ++i) {
-        worker_arenas[i] = nullptr;
-        worker_cpus[i]   = UINT32_MAX;
-        worker_numa[i]   = UINT32_MAX;
-    }
+    workers = nullptr; worker_arenas = nullptr; worker_configs = nullptr;
+    worker_cpus = nullptr; worker_numa = nullptr; worker_slots = 0;
+    num_workers = 0;
+
+    const uint32_t num_threads = scheduler_resolve_workers(cfg.num_workers);
+    if (num_threads == 0) return false;
+    if (!scheduler_alloc_slots(this, num_threads)) return false;
 
     ring.init();
     shutdown_flag.store(false, std::memory_order_relaxed);
@@ -903,20 +961,13 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     submit_seq_.store(0, std::memory_order_relaxed);
     adaptive.ns_per_row_ewma.store(0.0, std::memory_order_relaxed);
     adaptive.samples.store(0, std::memory_order_relaxed);
-    num_workers = 0;
 
-    // Detect topology on the stack (~2KB): not persisted after init.
     CpuTopology topo;
     bolt_detect_topology(&topo);
-
-    // Pre-compute CPU assignments.
-    uint32_t planned_cpus[kMaxWorkers];
-    for (uint32_t i = 0; i < kMaxWorkers; ++i) planned_cpus[i] = UINT32_MAX;
     if (cfg.pin_workers) {
-        scheduler_assign_cpus(topo, num_threads, cfg.prefer_p_cores, planned_cpus);
+        scheduler_assign_cpus(topo, num_threads, cfg.prefer_p_cores, worker_cpus);
     }
 
-    // Allocate per-worker arenas (startup allocation — permitted).
     for (uint32_t i = 0; i < num_threads; ++i) {
         // Deliberate config, not the default: a pool worker arena backs whole
         // OPERATOR states (join builds, aggregate tables) for the process
@@ -930,20 +981,16 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
         wa_cfg.max_block_size = 512ull * 1024 * 1024;
         worker_arenas[i] = new (std::nothrow) Arena(wa_cfg);
         if (!worker_arenas[i]) {
-            for (uint32_t j = 0; j < i; ++j) { delete worker_arenas[j]; worker_arenas[j] = nullptr; }
+            scheduler_free_arenas(this);
+            scheduler_free_slots(this);
             return false;
         }
         worker_configs[i] = WorkerConfig{ i, -1, cfg.spin, kDefaultSpinCount };
-
-        // Stamp intended placement. The worker thread will attempt to apply it
-        // and overwrite with UINT32_MAX on failure for honest diagnostics.
-        worker_cpus[i] = planned_cpus[i];
-        if (cfg.numa_bind && planned_cpus[i] != UINT32_MAX
-                          && planned_cpus[i] < kTopologyMaxCpus) {
-            worker_numa[i] = topo.cpu_to_node[planned_cpus[i]];
-        } else {
-            worker_numa[i] = UINT32_MAX;
-        }
+        // The worker applies this placement and overwrites it with
+        // UINT32_MAX on failure, for honest diagnostics.
+        const uint32_t cpu = worker_cpus[i];
+        worker_numa[i] = (cfg.numa_bind && cpu != UINT32_MAX && cpu < kTopologyMaxCpus)
+            ? topo.cpu_to_node[cpu] : UINT32_MAX;
     }
 
     range_task_pool  = TaskPool::create(kSchedulerPoolSlot, kSchedulerPoolCapacity);
@@ -951,7 +998,8 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
     if (!range_task_pool || !column_task_pool) {
         if (range_task_pool)  { range_task_pool->destroy();  range_task_pool  = nullptr; }
         if (column_task_pool) { column_task_pool->destroy(); column_task_pool = nullptr; }
-        for (uint32_t i = 0; i < num_threads; ++i) { delete worker_arenas[i]; worker_arenas[i] = nullptr; }
+        scheduler_free_arenas(this);
+        scheduler_free_slots(this);
         return false;
     }
 
@@ -967,12 +1015,13 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
             return false;
         }
     }
-    assert(num_workers == num_threads);
+    assert(num_workers == num_threads && worker_slots == num_threads);
     return true;
 }
 
 inline void Scheduler::shutdown() noexcept {
-    assert(num_workers <= kMaxWorkers);
+    assert(num_workers <= worker_slots);
+    assert(worker_slots <= kMaxWorkers);
 
     shutdown_flag.store(true, std::memory_order_release);
     // Wave 18a — wake any ParkWait workers sleeping on submit_seq_ so
@@ -988,9 +1037,8 @@ inline void Scheduler::shutdown() noexcept {
     if (range_task_pool)  { range_task_pool->destroy();  range_task_pool  = nullptr; }
     if (column_task_pool) { column_task_pool->destroy(); column_task_pool = nullptr; }
 
-    for (uint32_t i = 0; i < kMaxWorkers; ++i) {
-        if (worker_arenas[i]) { delete worker_arenas[i]; worker_arenas[i] = nullptr; }
-    }
+    if (worker_arenas != nullptr) scheduler_free_arenas(this);
+    scheduler_free_slots(this);
 }
 
 inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
