@@ -715,8 +715,14 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
 // Card S: hash a Utf8 key's CONTENT bytes (length + bytes) so spilled and
 // inline views with equal content hash equal regardless of where the bytes
 // physically live. `base` resolves spilled (>12) views; ignored for inline.
+// The stored length of a NULL Utf8 group key (see W31-L5z below).
+inline constexpr uint32_t kGbNullUtf8Len = 0xFFFFFFFFu;
+
 BOLT_FORCE_INLINE uint64_t hash_utf8_content(const StringView& sv,
                                              const char* base) noexcept {
+    if (sv.length == kGbNullUtf8Len) {
+        return swiss_mix_wyhash3(0x9E3779B97F4A7C15ULL ^ 0x4E554C4C4B45593FULL);
+    }
     const char* p = kernels::utf8::sv_bytes(sv, base);
     uint64_t h = swiss_mix_wyhash3(0x9E3779B97F4A7C15ULL ^
                                    static_cast<uint64_t>(sv.length));
@@ -757,12 +763,12 @@ BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept;
 // type below, so a reserved `b` tag is a key identity no real key of those
 // types can produce. That is exact rather than probable.
 //
-// TYPES WITH NO FREE SLOT STAY REFUSED BY NAME. Decimal128 and Utf8 use BOTH
-// halves (a StringView's length+prefix+inline bytes; a d128's two limbs) and
-// Decimal64 puts its SIGN EXTENSION in `b` -- so for those three a tag would
-// be indistinguishable from data, and `window_has_null_key` still declines
-// them. For Utf8 it would be worse than ambiguous: `keys_equal` compares
-// lengths and then memcmps, so a fabricated length would read that many bytes.
+// G2CHK-311: Decimal64's `b` is a sign extension (0 or -1) and a Decimal128 of
+// precision <= 38 never reaches |x| >= 10^38, so {0, tag} (about 1.04e38) is
+// outside both. Utf8 has no free cell bit, so its null is a StringView whose
+// LENGTH is 0xFFFFFFFF: no real view can carry it (offsets are 32-bit), and
+// every Utf8 key reader tests it before touching bytes (`hash_utf8_content`,
+// the length-first equality compares, the >12 deep-copy guards).
 //
 // WHY THIS IS NOT IN `read_cell16` ITSELF, which is the obvious place: that
 // function is SHARED with AGGREGATE INPUT reads (`payload[spec.in_col]`), and
@@ -779,22 +785,50 @@ BOLT_FORCE_INLINE bool cell_valid(const BoltColumn& c, int64_t r) noexcept;
 // entirely by `gb_classify` routing any nullable key to the Fallback shape.
 inline constexpr int64_t kGbNullKeyTag = static_cast<int64_t>(0x4E554C4C4B45593FULL);
 
-// Does `t` leave cell.b free, so the tag above is unambiguous?
+// Can a null key of type `t` be given an exact stored identity? The types
+// `read_cell16` reads with a defined width; the rest stay refused.
 BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
-    return t == BoltType::Int64 || t == BoltType::Int32 ||
-           t == BoltType::Date32 || t == BoltType::Float64 ||
-           t == BoltType::Float32;
+    switch (t) {
+        case BoltType::Int64:     case BoltType::Int32:
+        case BoltType::Date32:    case BoltType::Date64:
+        case BoltType::Timestamp: case BoltType::Duration:
+        case BoltType::Float64:   case BoltType::Float32:
+        case BoltType::Decimal64: case BoltType::Decimal128:
+        case BoltType::Utf8:
+            return true;
+        default:
+            return false;
+    }
 }
 
-// Read one KEY cell, mapping a NULL slot onto the reserved tag. The `a` half
-// is forced to 0 so the stored bytes are DEFINED -- a consumer that reads the
-// cell without consulting validity gets a fixed value rather than arena
-// residue (the G2FEAT-350 shape).
+BOLT_FORCE_INLINE bool gb_sv_is_null_key(const StringView& sv) noexcept {
+    return sv.length == kGbNullUtf8Len;
+}
+
+// A stored Utf8 key whose bytes live out of line (not inline, not null).
+BOLT_FORCE_INLINE bool gb_sv_key_spilled(const StringView& sv) noexcept {
+    return sv.length > 12u && sv.length != kGbNullUtf8Len;
+}
+
+BOLT_FORCE_INLINE GbCell16 gb_null_key_cell(BoltType t) noexcept {
+    GbCell16 out{0, kGbNullKeyTag};
+    if (t == BoltType::Utf8) {
+        StringView sv;
+        std::memset(&sv, 0, sizeof(sv));
+        sv.length = kGbNullUtf8Len;
+        std::memcpy(&out, &sv, 16);
+    }
+    return out;
+}
+
+// Read one KEY cell, mapping a NULL slot onto the reserved identity. The
+// stored bytes are DEFINED -- a consumer that reads the cell without
+// consulting validity gets a fixed value rather than arena residue (the
+// G2FEAT-350 shape).
 BOLT_FORCE_INLINE GbCell16 read_key_cell16(const BoltColumn& c,
                                            int64_t r) noexcept {
     if (c.validity != nullptr && !cell_valid(c, r)) {
-        GbCell16 out{0, kGbNullKeyTag};
-        return out;
+        return gb_null_key_cell(c.type);
     }
     return read_cell16(c, r);
 }
@@ -802,7 +836,20 @@ BOLT_FORCE_INLINE GbCell16 read_key_cell16(const BoltColumn& c,
 // Is the stored group cell for a key column of type `t` the NULL group?
 BOLT_FORCE_INLINE bool gb_cell_is_null_key(const GbCell16& c,
                                            BoltType t) noexcept {
+    if (t == BoltType::Utf8) {
+        StringView sv;
+        std::memcpy(&sv, &c, 16);
+        return gb_sv_is_null_key(sv);
+    }
     return gb_key_type_can_tag_null(t) && c.a == 0 && c.b == kGbNullKeyTag;
+}
+
+// The value a finalize writes into a key column's data slot: the NULL group
+// gets zero bytes (an empty view for Utf8), never the tag.
+BOLT_FORCE_INLINE GbCell16 gb_key_out_cell(const GbCell16& c,
+                                           BoltType t) noexcept {
+    if (gb_cell_is_null_key(c, t)) return GbCell16{0, 0};
+    return c;
 }
 
 BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
@@ -811,9 +858,9 @@ BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (uint32_t k = 0; k < n_keys; ++k) {
         if (keys[k].type == BoltType::Utf8) {
+            const GbCell16 kc = read_key_cell16(keys[k], r);
             StringView sv;
-            std::memcpy(&sv,
-                        &static_cast<const StringView*>(keys[k].data)[r], 16);
+            std::memcpy(&sv, &kc, 16);
             h = swiss_mix_wyhash3(h ^ hash_utf8_content(
                 sv, static_cast<const char*>(keys[k].str_overflow_base)));
             continue;
@@ -838,13 +885,13 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
     const GbCell16* row = keys_flat + static_cast<size_t>(gid) * n_keys;
     for (uint32_t k = 0; k < n_keys; ++k) {
         if (keys[k].type == BoltType::Utf8) {
+            const GbCell16 kc = read_key_cell16(keys[k], r);
             StringView in_sv;
-            std::memcpy(&in_sv,
-                        &static_cast<const StringView*>(keys[k].data)[r], 16);
+            std::memcpy(&in_sv, &kc, 16);
             StringView st_sv;
             std::memcpy(&st_sv, &row[k], 16);
             if (in_sv.length != st_sv.length) return false;
-            if (in_sv.length == 0) continue;
+            if (in_sv.length == 0 || gb_sv_is_null_key(in_sv)) continue;
             const char* ib = kernels::utf8::sv_bytes(
                 in_sv, static_cast<const char*>(keys[k].str_overflow_base));
             const char* sb = kernels::utf8::sv_bytes(st_sv, stored_bases[k]);
@@ -1629,7 +1676,9 @@ inline void gb_ingest_fallback(
                 // resolve via the groupby's own per-key buffer.
                 if (keys[k].type == BoltType::Utf8) {
                     StringView* sv = reinterpret_cast<StringView*>(&krow[k]);
-                    if (sv->length > 12u) {
+                    if (gb_detail::gb_sv_is_null_key(*sv)) {
+                        // stored as the fixed null identity; nothing to own
+                    } else if (sv->length > 12u) {
                         const char* sb = kernels::utf8::sv_bytes(*sv,
                             static_cast<const char*>(keys[k].str_overflow_base));
                         uint32_t off = 0;
@@ -1776,7 +1825,12 @@ inline void gb_route_fold_utf8(const BoltColumn& key, const uint32_t* sel,
         const int64_t r = (sel != nullptr)
             ? static_cast<int64_t>(sel[start + i]) : (start + i);
         StringView sv;
-        std::memcpy(&sv, &svs[r], 16);
+        if (key.validity != nullptr && !cell_valid(key, r)) {
+            const GbCell16 nc = gb_null_key_cell(BoltType::Utf8);
+            std::memcpy(&sv, &nc, 16);
+        } else {
+            std::memcpy(&sv, &svs[r], 16);
+        }
         out[i] = swiss_mix_wyhash3(out[i] ^ hash_utf8_content(sv, base));
     }
 }
@@ -2070,22 +2124,24 @@ inline bool groupby_agg_multi_key_typed_finalize(
         const GbCell16* krow = state->keys_flat + static_cast<size_t>(r) * n_keys;
         for (uint8_t k = 0; k < n_keys; ++k) {
             void* buf = out_keys[k].data;
+            const GbCell16 kc =
+                gb_detail::gb_key_out_cell(krow[k], state->key_types[k]);
             switch (state->key_types[k]) {
                 case BoltType::Int64:
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
                 case BoltType::Date32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
                 case BoltType::Decimal128:
                     std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
-                                &krow[k], 16); break;
+                                &kc, 16); break;
                 case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Utf8:
-                    std::memcpy(&static_cast<StringView*>(buf)[r], &krow[k], 16); break;
+                    std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
                 default:
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
             }
         }
     }
@@ -2408,22 +2464,24 @@ inline bool groupby_agg_multi_key_typed(
         const GbCell16* krow = keys_flat + static_cast<size_t>(r) * n_keys;
         for (uint32_t k = 0; k < n_keys; ++k) {
             void* buf = out_keys[k].data;
+            const GbCell16 kc =
+                gb_detail::gb_key_out_cell(krow[k], key_types[k]);
             switch (key_types[k]) {
                 case BoltType::Int64:
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
                 case BoltType::Date32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(krow[k].a); break;
+                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
                 case BoltType::Decimal128:
                     std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
-                                &krow[k], 16); break;
+                                &kc, 16); break;
                 case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Utf8:
-                    std::memcpy(&static_cast<StringView*>(buf)[r], &krow[k], 16); break;
+                    std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
                 default:
-                    static_cast<int64_t*>(buf)[r] = krow[k].a; break;
+                    static_cast<int64_t*>(buf)[r] = kc.a; break;
             }
         }
     }
