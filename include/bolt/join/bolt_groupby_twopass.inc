@@ -464,12 +464,14 @@ inline bool gb_pass1_mru(GroupbyTypedState* st, const BoltColumn* keys,
 
 // ---- PASS 2: gid-driven branchless accumulate loops ----------------------
 //
-// One dispatch per (AggKind, BoltType) per WINDOW. `counts` has exactly
-// one reader — finalize's Avg divisor — so the specialised loops bump it
-// only when Cnt=true (kind==Avg). The fallback still bumps counts for
-// every kind; the divergence is benign because nothing reads counts for
-// non-Avg aggregates. gb_p2_generic keeps the fallback behaviour (it can
-// carry Avg over Float64).
+// One dispatch per (AggKind, BoltType) per WINDOW. `counts` is the exact
+// per-group count of non-NULL inputs for every value aggregate, on every
+// path (fallback, generic, specialised, banked): finalize divides Avg by
+// it, and a group whose count is 0 must answer NULL for Sum/Min/Max, not
+// the accumulator identity (G2CHK-258). Count/CountStar keep their result
+// in acc.a and leave counts unused. A banked window whose payload has no
+// validity bitmap adds the window's per-group row count (`win`, computed
+// once per window for every aggregate) instead of counting per row.
 
 template <bool Sparse, bool HasValid>
 BOLT_FORCE_INLINE bool gb_p2_valid(const BoltColumn& pc, int64_t r) noexcept {
@@ -497,7 +499,7 @@ BOLT_FORCE_INLINE void gb_d128_acc(
     dst->hi = dst->hi + src.hi + static_cast<int64_t>((lo < alo) ? 1 : 0);
 }
 
-template <bool Sparse, bool HasValid, bool Cnt>
+template <bool Sparse, bool HasValid>
 inline void gb_p2_sum_d128(GbCell16* BOLT_RESTRICT acc,
                            int64_t* BOLT_RESTRICT cnt,
                            const BoltColumn& pc, const uint32_t* sel,
@@ -513,14 +515,14 @@ inline void gb_p2_sum_d128(GbCell16* BOLT_RESTRICT acc,
         const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
         const int32_t g = gid[i];
         if (valid) gb_d128_acc(&a[g], p[r]);
-        if (Cnt) cnt[g] += valid ? 1 : 0;
+        cnt[g] += valid ? 1 : 0;
     }
 }
 
 // W-DEC: Decimal64 payload — int64 mantissas accumulated into the FULL
 // d128 cell (lo/hi lanes in place), so sums grow past int64 with no
 // plan-time proof needed. Columnar like sum_d128; reads 8B/row not 16B.
-template <bool Sparse, bool HasValid, bool Cnt>
+template <bool Sparse, bool HasValid>
 inline void gb_p2_sum_dec64(GbCell16* BOLT_RESTRICT acc,
                             int64_t* BOLT_RESTRICT cnt,
                             const BoltColumn& pc, const uint32_t* sel,
@@ -541,11 +543,11 @@ inline void gb_p2_sum_dec64(GbCell16* BOLT_RESTRICT acc,
             a[g].hi = a[g].hi + (m >> 63) +
                       static_cast<int64_t>((lo < alo) ? 1 : 0);
         }
-        if (Cnt) cnt[g] += valid ? 1 : 0;
+        cnt[g] += valid ? 1 : 0;
     }
 }
 
-template <bool Sparse, bool HasValid, typename SrcT, bool Cnt>
+template <bool Sparse, bool HasValid, typename SrcT>
 inline void gb_p2_sum_int(GbCell16* BOLT_RESTRICT acc,
                           int64_t* BOLT_RESTRICT cnt,
                           const BoltColumn& pc, const uint32_t* sel,
@@ -566,7 +568,7 @@ inline void gb_p2_sum_int(GbCell16* BOLT_RESTRICT acc,
         const uint64_t sm = lo + static_cast<uint64_t>(x);
         acc[g].b += ((sm < lo) ? 1 : 0) + (x >> 63);
         acc[g].a  = static_cast<int64_t>(sm);
-        if (Cnt) cnt[g] += valid ? 1 : 0;
+        cnt[g] += valid ? 1 : 0;
     }
 }
 
@@ -577,7 +579,6 @@ inline void gb_p2_minmax_int(GbCell16* BOLT_RESTRICT acc,
                              int64_t start, int64_t count,
                              const int32_t* BOLT_RESTRICT gid) noexcept {
     assert(acc != nullptr && cnt != nullptr && gid != nullptr);
-    (void)cnt;   // Min/Max never feed an Avg divisor
     const auto* p = static_cast<const SrcT*>(pc.data);
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
@@ -588,6 +589,7 @@ inline void gb_p2_minmax_int(GbCell16* BOLT_RESTRICT acc,
             acc[g].a = IsMin ? branchless::bmin(acc[g].a, v)
                              : branchless::bmax(acc[g].a, v);
         }
+        cnt[g] += valid ? 1 : 0;
     }
 }
 
@@ -629,32 +631,33 @@ inline void gb_p2_count(GbCell16* BOLT_RESTRICT acc,
 
 static_assert((kGbBankCount & (kGbBankCount - 1u)) == 0u, "banks are pow2");
 
-template <bool Cnt>
-BOLT_FORCE_INLINE void gb_p2_bank_zero(GroupbyTypedState* st,
-                                       uint32_t ec) noexcept {
+BOLT_FORCE_INLINE void gb_p2_bank_zero(GroupbyTypedState* st, uint32_t ec,
+                                       bool zero_cnt = true) noexcept {
     assert(st->bank_acc != nullptr);
     assert(ec <= kGbBankGroups);
     for (uint32_t b = 0; b < kGbBankCount; ++b) {
         std::memset(st->bank_acc + static_cast<size_t>(b) * kGbBankGroups, 0,
                     sizeof(GbCell16) * ec);
-        if (Cnt) {
+        if (zero_cnt) {
             std::memset(st->bank_cnt + static_cast<size_t>(b) * kGbBankGroups,
                         0, sizeof(int64_t) * ec);
         }
     }
 }
 
-template <bool Sparse, bool HasValid, bool Cnt>
+template <bool Sparse, bool HasValid>
 inline void gb_p2_sum_d128_bank(GroupbyTypedState* st,
                                 GbCell16* BOLT_RESTRICT acc,
                                 int64_t* BOLT_RESTRICT cnt,
                                 const BoltColumn& pc, const uint32_t* sel,
                                 int64_t start, int64_t count,
                                 const int32_t* BOLT_RESTRICT gid,
-                                uint32_t ec) noexcept {
+                                uint32_t ec,
+                                const int64_t* win) noexcept {
     namespace dec = kernels::decimal;
     assert(acc != nullptr && gid != nullptr);
-    gb_p2_bank_zero<Cnt>(st, ec);
+    assert(HasValid || win != nullptr);
+    gb_p2_bank_zero(st, ec, HasValid);
     auto* bk = reinterpret_cast<dec::Decimal128*>(st->bank_acc);
     int64_t* bc = st->bank_cnt;
     const auto* p = static_cast<const dec::Decimal128*>(pc.data);
@@ -664,7 +667,7 @@ inline void gb_p2_sum_d128_bank(GroupbyTypedState* st,
         const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
                          kGbBankGroups + static_cast<uint32_t>(gid[i]);
         if (valid) gb_d128_acc(&bk[o], p[r]);
-        if (Cnt) bc[o] += valid ? 1 : 0;
+        if (HasValid) bc[o] += valid ? 1 : 0;
     }
     auto* a = reinterpret_cast<dec::Decimal128*>(acc);
     for (uint32_t g = 0; g < ec; ++g) {
@@ -672,25 +675,26 @@ inline void gb_p2_sum_d128_bank(GroupbyTypedState* st,
         for (uint32_t b = 1; b < kGbBankCount; ++b)
             gb_d128_acc(&s, bk[static_cast<size_t>(b) * kGbBankGroups + g]);
         gb_d128_acc(&a[g], s);
-        if (Cnt) {
-            int64_t c = bc[g];
-            for (uint32_t b = 1; b < kGbBankCount; ++b)
-                c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
-            cnt[g] += c;
-        }
+        if (!HasValid) { cnt[g] += win[g]; continue; }
+        int64_t c = bc[g];
+        for (uint32_t b = 1; b < kGbBankCount; ++b)
+            c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
+        cnt[g] += c;
     }
 }
 
-template <bool Sparse, bool HasValid, typename SrcT, bool Cnt>
+template <bool Sparse, bool HasValid, typename SrcT>
 inline void gb_p2_sum_int_bank(GroupbyTypedState* st,
                                GbCell16* BOLT_RESTRICT acc,
                                int64_t* BOLT_RESTRICT cnt,
                                const BoltColumn& pc, const uint32_t* sel,
                                int64_t start, int64_t count,
                                const int32_t* BOLT_RESTRICT gid,
-                               uint32_t ec) noexcept {
+                               uint32_t ec,
+                                const int64_t* win) noexcept {
     assert(acc != nullptr && gid != nullptr);
-    gb_p2_bank_zero<Cnt>(st, ec);
+    assert(HasValid || win != nullptr);
+    gb_p2_bank_zero(st, ec, HasValid);
     GbCell16* bk = st->bank_acc;
     int64_t*  bc = st->bank_cnt;
     const auto* p = static_cast<const SrcT*>(pc.data);
@@ -700,19 +704,18 @@ inline void gb_p2_sum_int_bank(GroupbyTypedState* st,
         const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
                          kGbBankGroups + static_cast<uint32_t>(gid[i]);
         bk[o].a += valid ? static_cast<int64_t>(p[r]) : 0;
-        if (Cnt) bc[o] += valid ? 1 : 0;
+        if (HasValid) bc[o] += valid ? 1 : 0;
     }
     for (uint32_t g = 0; g < ec; ++g) {
         int64_t s = bk[g].a;
         for (uint32_t b = 1; b < kGbBankCount; ++b)
             s += bk[static_cast<size_t>(b) * kGbBankGroups + g].a;
         acc[g].a += s;
-        if (Cnt) {
-            int64_t c = bc[g];
-            for (uint32_t b = 1; b < kGbBankCount; ++b)
-                c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
-            cnt[g] += c;
-        }
+        if (!HasValid) { cnt[g] += win[g]; continue; }
+        int64_t c = bc[g];
+        for (uint32_t b = 1; b < kGbBankCount; ++b)
+            c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
+        cnt[g] += c;
     }
 }
 
@@ -725,7 +728,7 @@ inline void gb_p2_sum_int_bank(GroupbyTypedState* st,
 // per-group subtotal to d128 via gb_d128_acc, so the PERSISTENT cell
 // stays a true Decimal128 and composes freely with lane-0 / fallback
 // windows (no cross-path representation hazard, no finalize changes).
-template <bool Sparse, bool HasValid, bool Cnt>
+template <bool Sparse, bool HasValid>
 inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
                                       GbCell16* BOLT_RESTRICT acc,
                                       int64_t* BOLT_RESTRICT cnt,
@@ -733,10 +736,12 @@ inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
                                       const uint32_t* sel,
                                       int64_t start, int64_t count,
                                       const int32_t* BOLT_RESTRICT gid,
-                                      uint32_t ec) noexcept {
+                                      uint32_t ec,
+                                const int64_t* win) noexcept {
     assert(acc != nullptr && gid != nullptr);
+    assert(HasValid || win != nullptr);
     assert(st->bank_acc != nullptr);
-    gb_p2_bank_zero<Cnt>(st, ec);
+    gb_p2_bank_zero(st, ec, HasValid);
     GbCell16* bk = st->bank_acc;
     int64_t*  bc = st->bank_cnt;
     const auto* p = static_cast<const int64_t*>(pc.data);
@@ -746,7 +751,7 @@ inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
         const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
                          kGbBankGroups + static_cast<uint32_t>(gid[i]);
         bk[o].a += valid ? p[r] : 0;
-        if (Cnt) bc[o] += valid ? 1 : 0;
+        if (HasValid) bc[o] += valid ? 1 : 0;
     }
     auto* a = reinterpret_cast<kernels::decimal::Decimal128*>(acc);
     for (uint32_t g = 0; g < ec; ++g) {
@@ -754,12 +759,11 @@ inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
         for (uint32_t b = 1; b < kGbBankCount; ++b)
             s += bk[static_cast<size_t>(b) * kGbBankGroups + g].a;
         gb_d128_acc(&a[g], kernels::decimal::d128_from_i64(s));
-        if (Cnt) {
-            int64_t c = bc[g];
-            for (uint32_t b = 1; b < kGbBankCount; ++b)
-                c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
-            cnt[g] += c;
-        }
+        if (!HasValid) { cnt[g] += win[g]; continue; }
+        int64_t c = bc[g];
+        for (uint32_t b = 1; b < kGbBankCount; ++b)
+            c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
+        cnt[g] += c;
     }
 }
 
@@ -770,7 +774,7 @@ inline void gb_p2_count_star_bank(GroupbyTypedState* st,
                                   const int32_t* BOLT_RESTRICT gid,
                                   uint32_t ec) noexcept {
     assert(acc != nullptr && gid != nullptr);
-    gb_p2_bank_zero<true>(st, ec);
+    gb_p2_bank_zero(st, ec);
     int64_t* bc = st->bank_cnt;
     for (int64_t i = 0; i < count; ++i) {
         const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
@@ -795,7 +799,7 @@ inline void gb_p2_count_bank(GroupbyTypedState* st,
                              uint32_t ec) noexcept {
     assert(acc != nullptr && gid != nullptr);
     (void)cnt;
-    gb_p2_bank_zero<true>(st, ec);
+    gb_p2_bank_zero(st, ec);
     int64_t* bc = st->bank_cnt;
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
@@ -810,6 +814,31 @@ inline void gb_p2_count_bank(GroupbyTypedState* st,
             c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
         acc[g].a += c;
     }
+}
+
+// Per-group row count of one banked window, shared by every aggregate whose
+// payload carries no validity bitmap (all its rows are valid inputs). Lives in
+// the bank_cnt slice past the kGbBankCount banks.
+inline const int64_t* gb_p2_window_hist(GroupbyTypedState* st, int64_t count,
+                                        const int32_t* BOLT_RESTRICT gid,
+                                        uint32_t ec) noexcept {
+    assert(st->bank_cnt != nullptr && gid != nullptr);
+    assert(ec <= kGbBankGroups);
+    gb_p2_bank_zero(st, ec);
+    int64_t* bc = st->bank_cnt;
+    for (int64_t i = 0; i < count; ++i) {
+        const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
+                         kGbBankGroups + static_cast<uint32_t>(gid[i]);
+        bc[o] += 1;
+    }
+    int64_t* win = bc + static_cast<size_t>(kGbBankCount) * kGbBankGroups;
+    for (uint32_t g = 0; g < ec; ++g) {
+        int64_t c = bc[g];
+        for (uint32_t b = 1; b < kGbBankCount; ++b)
+            c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
+        win[g] = c;
+    }
+    return win;
 }
 
 // Generic gid-driven loop for unspecialised (kind, type) combos —
@@ -859,7 +888,7 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
                               const uint32_t* sel, int64_t start,
                               int64_t count, const int32_t* gid,
                               uint32_t ec, bool banked, BoltType t,
-                              bool is_avg, uint8_t lane) noexcept {
+                              uint8_t lane, const int64_t* win) noexcept {
     assert(st != nullptr && acc != nullptr);
     const bool hv = (pc.validity != nullptr);
 #define BOLT_GB_P2(FN, ...)                                                  \
@@ -872,17 +901,15 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
 #define BOLT_GB_P2B(FN, ...)                                                 \
     do {                                                                     \
         if (hv) FN<Sparse, true, ##__VA_ARGS__>(st, acc, cnt, pc, sel,       \
-                                                start, count, gid, ec);      \
+                                                start, count, gid, ec, win); \
         else    FN<Sparse, false, ##__VA_ARGS__>(st, acc, cnt, pc, sel,      \
-                                                 start, count, gid, ec);     \
+                                                 start, count, gid, ec, win);\
     } while (0)
     if (t == BoltType::Decimal128) {
         if (banked) {
-            if (is_avg) BOLT_GB_P2B(gb_p2_sum_d128_bank, true);
-            else        BOLT_GB_P2B(gb_p2_sum_d128_bank, false);
+            BOLT_GB_P2B(gb_p2_sum_d128_bank);
         } else {
-            if (is_avg) BOLT_GB_P2(gb_p2_sum_d128, true);
-            else        BOLT_GB_P2(gb_p2_sum_d128, false);
+            BOLT_GB_P2(gb_p2_sum_d128);
         }
         return true;
     }
@@ -894,11 +921,9 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
         // keep the overflow-safe columnar d128 loop, which is already
         // fast for the non-banked shape.
         if (lane == 1u && banked) {
-            if (is_avg) BOLT_GB_P2B(gb_p2_sum_dec64_lane_bank, true);
-            else        BOLT_GB_P2B(gb_p2_sum_dec64_lane_bank, false);
+            BOLT_GB_P2B(gb_p2_sum_dec64_lane_bank);
         } else {
-            if (is_avg) BOLT_GB_P2(gb_p2_sum_dec64, true);
-            else        BOLT_GB_P2(gb_p2_sum_dec64, false);
+            BOLT_GB_P2(gb_p2_sum_dec64);
         }
         return true;
     }
@@ -914,13 +939,11 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
     // and chukonu's own int64 aggregate operator — where the overwhelming
     // majority of integer sums execute — never used this kernel at all.
     if (t == BoltType::Int64) {
-        if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int64_t, true);
-        else        BOLT_GB_P2(gb_p2_sum_int, int64_t, false);
+        BOLT_GB_P2(gb_p2_sum_int, int64_t);
         return true;
     }
     if (t == BoltType::Int32 || t == BoltType::Date32) {
-        if (is_avg) BOLT_GB_P2(gb_p2_sum_int, int32_t, true);
-        else        BOLT_GB_P2(gb_p2_sum_int, int32_t, false);
+        BOLT_GB_P2(gb_p2_sum_int, int32_t);
         return true;
     }
 #undef BOLT_GB_P2B
@@ -935,14 +958,13 @@ template <bool Sparse>
 inline void gb_pass2_one(GroupbyTypedState* st, uint32_t j,
                          const BoltColumn* payload, const uint32_t* sel,
                          int64_t start, int64_t count,
-                         const int32_t* gid) noexcept {
+                         const int32_t* gid, bool banked,
+                         const int64_t* win) noexcept {
     assert(st != nullptr && gid != nullptr);
     GbCell16* acc = st->accums + static_cast<size_t>(j) * st->cap;
     int64_t*  cnt = st->counts + static_cast<size_t>(j) * st->cap;
     const AggKind kind = st->specs[j].kind;
     const uint32_t ec = st->entry_count;
-    const bool banked = (st->bank_acc != nullptr) && (ec <= kGbBankGroups) &&
-                        (count >= static_cast<int64_t>(ec) * 64);
     if (kind == AggKind::CountStar) {
         if (banked) gb_p2_count_star_bank<Sparse>(st, acc, count, gid, ec);
         else        gb_p2_count_star<Sparse>(acc, count, gid);
@@ -954,8 +976,7 @@ inline void gb_pass2_one(GroupbyTypedState* st, uint32_t j,
     const bool sum_like = (kind == AggKind::Sum || kind == AggKind::Avg);
     if (sum_like &&
         gb_pass2_sum_like<Sparse>(st, acc, cnt, pc, sel, start, count, gid,
-                                  ec, banked, t, kind == AggKind::Avg,
-                                  st->specs[j].lane)) {
+                                  ec, banked, t, st->specs[j].lane, win)) {
         return;
     }
 #define BOLT_GB_P2(FN, ...)                                                  \
@@ -1035,11 +1056,22 @@ inline bool gb_try_twopass(GroupbyTypedState* st, const BoltColumn* keys,
         }
     }
     if (!ok) { assert(st->oom); return true; }   // oom mid-window: stop
+    const uint32_t ec = st->entry_count;
+    const bool banked = (st->bank_acc != nullptr) && (ec <= kGbBankGroups) &&
+                        (count >= static_cast<int64_t>(ec) * 64);
+    const int64_t* win = nullptr;
+    for (uint32_t j = 0; banked && win == nullptr && j < st->n_aggs; ++j) {
+        const AggKind kd = st->specs[j].kind;
+        if ((kd == AggKind::Sum || kd == AggKind::Avg) &&
+            payload[st->specs[j].in_col].validity == nullptr) {
+            win = gb_p2_window_hist(st, count, gid, ec);
+        }
+    }
     for (uint32_t j = 0; j < st->n_aggs; ++j) {
         if (sel != nullptr) {
-            gb_pass2_one<true>(st, j, payload, sel, start, count, gid);
+            gb_pass2_one<true>(st, j, payload, sel, start, count, gid, banked, win);
         } else {
-            gb_pass2_one<false>(st, j, payload, sel, start, count, gid);
+            gb_pass2_one<false>(st, j, payload, sel, start, count, gid, banked, win);
         }
     }
     return true;

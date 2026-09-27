@@ -1143,7 +1143,9 @@ struct GroupbyTypedState {
     // same-group rows never serialize on the same accumulator; banks merge
     // into accums/counts once per window. Optional: null => plain loops.
     GbCell16*       bank_acc;           // [kGbBankCount * kGbBankGroups]
-    int64_t*        bank_cnt;           // [kGbBankCount * kGbBankGroups]
+    int64_t*        bank_cnt;           // [(kGbBankCount + 1) * kGbBankGroups];
+                                        // the last slice is the window's
+                                        // per-group row count
     // K-AGG-C: direct-mapped (hash -> gid) cache. Low-cardinality GROUP
     // BYs (TPC-H Q1's 4-6 groups) hit ~100% after warm-up and skip the
     // SwissTable probe; verification against keys_flat keeps it exact.
@@ -1342,7 +1344,7 @@ inline bool gb_begin_with_scratch(
         bank_acc = arena->allocate_array<GbCell16>(
             static_cast<size_t>(kGbBankCount) * kGbBankGroups);
         bank_cnt = arena->allocate_array<int64_t>(
-            static_cast<size_t>(kGbBankCount) * kGbBankGroups);
+            static_cast<size_t>(kGbBankCount + 1u) * kGbBankGroups);
         if (bank_acc == nullptr || bank_cnt == nullptr) {
             bank_acc = nullptr;
             bank_cnt = nullptr;
