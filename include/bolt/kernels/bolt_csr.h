@@ -43,10 +43,15 @@
 //     load of neighbors[j] / edge_ids[j] + the branch-free keep-advance +
 //     three stores). Per source there is fixed O(1) block-bound setup; the
 //     amortised floor is dominated by the per-neighbour inner loop.
+//   - csr_expand_bounded_sorted : with a bound destination over a CSR whose
+//     blocks are sorted by neighbour id, the per-source cost drops from
+//     O(degree) to O(log degree + matches) — the block is narrowed to the
+//     equal range of the bound before the same walk runs over it.
 
 #pragma once
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/bolt_binsearch.h"
 #include "bolt/kernels/bolt_scan.h"
 
 #include <cassert>
@@ -219,6 +224,27 @@ BOLT_FORCE_INLINE int64_t csr_edge_dst_keep(
     return static_cast<int64_t>(dst_bounds[src_index] == dst);
 }
 
+// Narrow [*begin, *end) of a block whose neighbours are sorted ascending to
+// the equal range of `dst`. Every edge outside that range has a different
+// destination and would be dropped by csr_edge_dst_keep, so the walk over the
+// narrowed range writes exactly the rows the full walk writes, in the same
+// order. Empty range when `dst` is absent.
+BOLT_FORCE_INLINE void csr_block_narrow_to_dst(
+        const int64_t* BOLT_RESTRICT csr_neighbors, int64_t dst,
+        int64_t* BOLT_RESTRICT begin, int64_t* BOLT_RESTRICT end) noexcept {
+    assert(begin != nullptr && end != nullptr && *begin <= *end);
+    assert(*begin == *end || csr_neighbors != nullptr);
+    const int64_t b = *begin;
+    const int64_t n = *end - b;
+    const int64_t lo = bolt_lower_bound_tmpl<int64_t>(csr_neighbors + b, n, dst);
+    const int64_t hi = lo + bolt_upper_bound_tmpl<int64_t>(
+                                csr_neighbors + b + lo, n - lo, dst);
+    assert(lo >= 0 && lo <= hi && hi <= n);
+    assert(lo == 0 || csr_neighbors[b + lo - 1] < dst);
+    *begin = b + lo;
+    *end   = b + hi;
+}
+
 // Sentinel returned by csr_expand_bounded (and its two forwarding entry
 // points) when the current source id is outside the CSR's [0, n_nodes)
 // range — see the G2CHK-92 note above csr_expand_bounded. A valid row count
@@ -291,18 +317,25 @@ struct CsrExpandCursor {
 // This is the ONE walk: `csr_expand` and `csr_expand_excluding` forward here
 // rather than duplicating the loop, because a second copy of the neighbour walk
 // is precisely the drift the count-mode path already refuses to risk.
-BOLT_FORCE_INLINE int64_t csr_expand_bounded(
+//
+// `dst_sorted` (G2GRAPH-178) declares that every block's neighbours are sorted
+// ascending. With a bound destination the block is then narrowed to the bound's
+// equal range (csr_block_narrow_to_dst) before the walk: a membership probe,
+// not a scan. The walk itself and its output are unchanged. `csr_expand_bounded`
+// is the dst_sorted == false case.
+BOLT_FORCE_INLINE int64_t csr_expand_bounded_sorted(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
         const int64_t* BOLT_RESTRICT csr_off,
         const int64_t* BOLT_RESTRICT csr_neighbors,
         const int64_t* BOLT_RESTRICT csr_edge_ids,
         const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
         const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
-        const int64_t* BOLT_RESTRICT dst_bounds,
+        const int64_t* BOLT_RESTRICT dst_bounds, bool dst_sorted,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
+    const bool probe = dst_sorted && dst_bounds != nullptr;
     assert(n == 0 || (src_ids != nullptr && csr_off != nullptr));
     assert(n_nodes >= 0);
     assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
@@ -317,9 +350,14 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded(
         // read past it (and the garbage begin/end would then drive further
         // out-of-bounds reads in the inner loop below). Fail closed instead.
         if (s < 0 || s >= n_nodes) return kCsrExpandOutOfRange;
-        const int64_t begin = csr_off[s];
-        const int64_t end   = csr_off[s + 1];
+        int64_t begin = csr_off[s];
+        int64_t end   = csr_off[s + 1];
         assert(begin <= end);
+        if (probe) {
+            csr_block_narrow_to_dst(csr_neighbors,
+                                    dst_bounds[cursor->src_index], &begin,
+                                    &end);
+        }
         int64_t j = (cursor->neighbor_j > 0) ? cursor->neighbor_j : begin;
         assert(j >= begin && j <= end);
         for (; j < end && w < out_cap; ++j) {
@@ -343,6 +381,27 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded(
     }
     assert(w <= out_cap);
     return w;
+}
+
+// Bound-destination walk over blocks in insertion (unsorted) order.
+BOLT_FORCE_INLINE int64_t csr_expand_bounded(
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
+        const int64_t* BOLT_RESTRICT csr_off,
+        const int64_t* BOLT_RESTRICT csr_neighbors,
+        const int64_t* BOLT_RESTRICT csr_edge_ids,
+        const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+        const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
+        const int64_t* BOLT_RESTRICT dst_bounds,
+        int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
+        int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
+        CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
+    assert(cursor != nullptr && n >= 0 && out_cap >= 0);
+    assert(n == 0 || src_ids != nullptr);
+    return csr_expand_bounded_sorted(src_ids, n, n_nodes, csr_off,
+                                     csr_neighbors, csr_edge_ids, edge_labels,
+                                     want_label, excluded, n_excl, dst_bounds,
+                                     /*dst_sorted=*/false, out_src, out_edge,
+                                     out_dst, out_cap, cursor);
 }
 
 // Isomorphic expansion with no bound destination — the W16-L1 entry point,
