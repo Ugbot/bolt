@@ -851,7 +851,7 @@ inline void scheduler_assign_cpus(const CpuTopology& topo,
                                   uint32_t want, bool prefer_p_cores,
                                   uint32_t* out) noexcept {
     assert(out != nullptr);
-    assert(want <= kMaxWorkers);
+    assert(topo.logical_cpus >= 1u);
 
     const uint32_t ncpu = (topo.logical_cpus < kTopologyMaxCpus)
         ? topo.logical_cpus : kTopologyMaxCpus;

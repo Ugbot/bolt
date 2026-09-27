@@ -29,7 +29,7 @@ void mark_tid(void* user, uint32_t start, uint32_t end, uint32_t tid) noexcept {
 }  // namespace
 
 TEST(WorkersKindB, CeilingIsGenerous) {
-    static_assert(bolt::kMaxWorkers >= 1024u, "workers ceiling");
+    static_assert(bolt::kMaxWorkers >= 4096u, "workers ceiling");
     static_assert(bolt::kEbrMaxShards == bolt::kMaxWorkers, "EBR derives");
     EXPECT_GE(bolt::kTopologyMaxCpus, 4096u);
 }
@@ -80,12 +80,12 @@ TEST(WorkersKindB, ShutdownThenReinit) {
 // BOLT_WORKERS resolves once per process, so each case runs in a fresh child.
 TEST(WorkersKindBDeathTest, InvalidBoltWorkersIsAStartupError) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    ::setenv("BOLT_WORKERS", "2000", 1);
+    ::setenv("BOLT_WORKERS", "5000", 1);
     EXPECT_EXIT({
         bolt::Scheduler* s = new bolt::Scheduler();
         const bool ok = s->init(0u);
         std::exit(ok ? 0 : 3);
-    }, ::testing::ExitedWithCode(3), "BOLT_WORKERS=2000 is invalid");
+    }, ::testing::ExitedWithCode(3), "BOLT_WORKERS=5000 is invalid");
     ::unsetenv("BOLT_WORKERS");
 }
 

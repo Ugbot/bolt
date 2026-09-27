@@ -34,7 +34,7 @@
 // Infrastructure bounds (sized at init, never at hot path).
 // ---------------------------------------------------------------------------
 #ifndef BOLT_MAX_WORKERS
-    #define BOLT_MAX_WORKERS 1024u         // validation ceiling; arrays are sized at init
+    #define BOLT_MAX_WORKERS 4096u         // validation ceiling (= kTopologyMaxCpus); arrays are sized at init
 #endif
 #ifndef BOLT_TASK_RING_SIZE
     #define BOLT_TASK_RING_SIZE 16384u     // SPMC ring slots (power of two)

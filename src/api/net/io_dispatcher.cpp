@@ -284,16 +284,11 @@ void IODispatcher::start() {
     if (config_.pin_io_threads) {
         bolt::CpuTopology topo;
         if (bolt::bolt_detect_topology(&topo)) {
-            // scheduler_assign_cpus writes up to kMaxWorkers; ensure fit.
-            const uint32_t want = (config_.num_io_threads < bolt::kMaxWorkers)
-                ? static_cast<uint32_t>(config_.num_io_threads)
-                : bolt::kMaxWorkers;
-            uint32_t out[bolt::kMaxWorkers];
-            for (uint32_t i = 0; i < bolt::kMaxWorkers; ++i) out[i] = UINT32_MAX;
-            bolt::scheduler_assign_cpus(topo, want, config_.prefer_p_cores, out);
-            for (uint32_t i = 0; i < want; ++i) {
-                planned_cpus_[i] = out[i];
-            }
+            // Writes exactly num_io_threads entries; CPUs past the machine
+            // stay UINT32_MAX (unpinned).
+            bolt::scheduler_assign_cpus(
+                topo, static_cast<uint32_t>(config_.num_io_threads),
+                config_.prefer_p_cores, planned_cpus_.data());
         }
         // Topology-detect failure: planned_cpus_ stays UINT32_MAX → io_thread_loop
         // skips pinning, runtime degrades to OS scheduling (still correct).
