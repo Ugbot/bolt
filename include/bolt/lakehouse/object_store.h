@@ -107,6 +107,30 @@ inline int os_delete(ObjectStore* s, const char* key) noexcept {
     assert(s->vt->delete_object != nullptr);
     return s->vt->delete_object(s->impl, key);
 }
+// list_prefix contract: past `cap` a backend returns kOsBufferSmall with
+// `*n == cap`, never a silently short listing. os_list_all retries with
+// doubled room in `arena` so no listing size is a ceiling; the arena's
+// allocation failure is the only bound.
+inline int os_list_all(ObjectStore* s, const char* prefix, Arena* arena,
+                       uint32_t initial_cap, ObjectEntry** out,
+                       uint32_t* n) noexcept {
+    assert(s != nullptr && arena != nullptr);
+    assert(out != nullptr && n != nullptr && initial_cap > 0u);
+    *out = nullptr;
+    *n = 0;
+    uint32_t cap = initial_cap;
+    for (uint32_t round = 0; round < 24u; ++round) {   // bounded
+        ObjectEntry* buf = arena->allocate_array<ObjectEntry>(cap);
+        if (buf == nullptr) return kOsBufferSmall;
+        uint32_t got = 0;
+        const int rc = os_list(s, prefix, buf, cap, &got);
+        if (rc == kOsOk) { *out = buf; *n = got; return kOsOk; }
+        if (rc != kOsBufferSmall) return rc;
+        if (cap > (UINT32_MAX / 2u)) return kOsBufferSmall;
+        cap *= 2u;
+    }
+    return kOsBufferSmall;
+}
 inline int os_head(ObjectStore* s, const char* key, ObjectMeta* m) noexcept {
     assert(s != nullptr && s->vt != nullptr);
     assert(s->vt->head_object != nullptr);

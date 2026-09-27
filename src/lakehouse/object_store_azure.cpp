@@ -412,7 +412,9 @@ int az_list(void* impl, const char* prefix, ObjectEntry* out,
     const char* pre = prefix != nullptr ? prefix : "";
     char marker[1024] = "";
     uint32_t count = 0;
-    for (uint32_t page = 0; page < 4096u && count < cap; ++page) {
+    char spill[kOsMaxKey];
+    bool more = true;
+    for (uint32_t page = 0; page < 4096u && more; ++page) {
         char qu[4096];
         char qc[4096];
         Buf u; oshttp::buf_init(&u, qu, sizeof(qu));
@@ -444,9 +446,10 @@ int az_list(void* impl, const char* prefix, ObjectEntry* out,
         if (resp.status / 100 != 2) return kOsIoError;
         const char* x = reinterpret_cast<const char*>(resp.body);
         uint32_t pos = 0;
-        while (count < cap &&
-               oshttp::xml_next(x, resp.body_len, &pos, "Name",
-                                out[count].key, kOsMaxKey)) {
+        while (oshttp::xml_next(x, resp.body_len, &pos, "Name",
+                                count < cap ? out[count].key : spill,
+                                kOsMaxKey)) {
+            if (count == cap) { *out_n = count; return kOsBufferSmall; }
             oshttp::xml_unescape(out[count].key);
             char sz[32];
             if (!oshttp::xml_next(x, resp.body_len, &pos, "Content-Length",
@@ -460,9 +463,11 @@ int az_list(void* impl, const char* prefix, ObjectEntry* out,
         marker[0] = '\0';
         (void)oshttp::xml_next(x, resp.body_len, &mp, "NextMarker", marker,
                                sizeof(marker));
-        if (marker[0] == '\0') break;
+        if (marker[0] == '\0') { more = false; break; }
+        if (count == cap) { *out_n = count; return kOsBufferSmall; }
         oshttp::xml_unescape(marker);
     }
+    if (more) return kOsIoError;   // page bound hit: never a short listing
     *out_n = count;
     assert(count <= cap);
     return kOsOk;

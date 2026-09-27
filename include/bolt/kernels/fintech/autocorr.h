@@ -42,17 +42,17 @@ struct AutocorrState {
     uint32_t                     ring_size;     // window + lag
     RollingRing<double, kCap>    ring;
 
-    inline void init(int32_t in, int32_t out,
+    inline bool init(int32_t in, int32_t out,
                      uint32_t w, uint32_t k) noexcept {
-        assert(w > 0u);
-        assert(k > 0u);
-        assert(w + k <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || k == 0u || w > kCap || k > kCap - w) return false;
         in_col    = in;
         out_col   = out;
         window    = w;
         lag       = k;
         ring_size = w + k;
         ring.init(w + k);
+        return true;
     }
 };
 

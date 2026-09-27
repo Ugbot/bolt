@@ -120,7 +120,7 @@ int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
     std::filesystem::recursive_directory_iterator end;
     if (ec) return kOsIoError;
     uint32_t count = 0;
-    while (it != end && count < cap) {   // bounded by cap
+    while (it != end) {   // bounded by the directory tree
         if (it->is_regular_file(ec)) {
             std::string full = it->path().generic_string();
             if (full.size() > root_len) {
@@ -128,9 +128,15 @@ int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
                 while (*rel == '/' || *rel == '\\') ++rel;
                 const size_t rl = std::strlen(rel);
                 const size_t pl = (prefix != nullptr) ? std::strlen(prefix) : 0u;
-                if (rl > 0 && rl < kOsMaxKey &&
-                    (pl == 0 ||
-                     (rl >= pl && std::memcmp(rel, prefix, pl) == 0))) {
+                const bool match =
+                    rl > 0 && (pl == 0 ||
+                               (rl >= pl && std::memcmp(rel, prefix, pl) == 0));
+                if (match && rl >= kOsMaxKey) return kOsIoError;  // never skip
+                if (match) {
+                    if (count == cap) {        // more than the caller holds
+                        *out_n = count;
+                        return kOsBufferSmall;
+                    }
                     std::memcpy(out[count].key, rel, rl + 1u);
                     out[count].size = static_cast<uint64_t>(it->file_size(ec));
                     ++count;

@@ -306,7 +306,9 @@ inline bool jk_build_core(const BoltColumn* key_cols, uint8_t n_keys,
                           uint64_t build_rows, Arena* arena, bool force_general,
                           JoinBuildTyped* out) noexcept {
     assert(arena != nullptr && out != nullptr);
-    assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
+    assert(key_cols != nullptr);
+    // Caller-supplied: the per-key meta arrays hold kHJMaxKeys entries.
+    if (n_keys < 1 || n_keys > kHJMaxKeys) return false;
     const uint64_t n = build_rows;
     // Past kJkMaxBuildRows the int32 chain/scatter carriers alias the -1
     // sentinel and the probe loses matches SILENTLY. Refuse, never truncate.
@@ -444,7 +446,8 @@ inline bool jk_build_scatter_and_alloc(const BoltColumn* key_cols,
         uint8_t n_keys, uint64_t build_rows, Arena* arena,
         JoinBuildTyped* out, JoinBuildScatterCtx* scat) noexcept {
     assert(arena != nullptr && out != nullptr && scat != nullptr);
-    assert(n_keys >= 1 && n_keys <= kHJMaxKeys);
+    assert(key_cols != nullptr);
+    if (n_keys < 1 || n_keys > kHJMaxKeys) return false;   // see jk_build_core
     const uint64_t n = build_rows;
     if (n > kJkMaxBuildRows) return false;     // see kJkMaxBuildRows
     const size_t   n_alloc = (n == 0 ? 1 : static_cast<size_t>(n));
@@ -559,7 +562,8 @@ inline bool jk_build_phase1_prepare(const BoltColumn* key_cols, uint8_t n_keys,
         JoinBuildTyped* out, JoinBuildScatterCtx* scat,
         JkPhase1Ctx* c) noexcept {
     assert(arena != nullptr && out != nullptr && scat != nullptr);
-    assert(c != nullptr && n_keys >= 1 && n_keys <= kHJMaxKeys);
+    assert(c != nullptr && key_cols != nullptr);
+    if (n_keys < 1 || n_keys > kHJMaxKeys) return false;   // see jk_build_core
     const uint64_t n = build_rows;
     if (n < kJkP1MinChunkRows * 2u) return false;      // not worth chunking
     if (n > kJkMaxBuildRows) return false;             // see kJkMaxBuildRows

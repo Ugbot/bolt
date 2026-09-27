@@ -52,9 +52,9 @@ struct RollSpreadState {
     RollingRing<double, kCap>    ring_curr;   // {Δp[i]}
     RollingRing<double, kCap>    ring_prev;   // {Δp[i-1]}
 
-    inline void init(int32_t p, int32_t out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+    inline bool init(int32_t p, int32_t out, uint32_t w) noexcept {
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         price_col  = p;
         out_col    = out;
         window     = w;
@@ -63,6 +63,7 @@ struct RollSpreadState {
         seen       = 0ull;
         ring_curr.init(w);
         ring_prev.init(w);
+        return true;
     }
 };
 
@@ -149,8 +150,7 @@ inline RollSpreadState<kCap>* make_roll_spread_state(::bolt::Arena* arena,
                                                      int32_t out_col,
                                                      uint32_t window) noexcept {
     assert(arena != nullptr);
-    assert(window > 0u);
-    assert(window <= kCap);
+    if (window == 0u || window > kCap) return nullptr;
     RollSpreadState<kCap>* s = arena->allocate_array<RollSpreadState<kCap>>(1);
     if (s == nullptr) return nullptr;
     s->init(price_col, out_col, window);

@@ -292,6 +292,7 @@ bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
                 const uint8_t* p; uint32_t n;
                 if (!tc_binary(c, &p, &n)) return false;
                 copy_name(p, n, out->col.name, kPqMaxNameBytes);
+                out->col.name_truncated = (n >= kPqMaxNameBytes) ? 1u : 0u;
                 break;
             }
             case 5:
@@ -800,6 +801,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                                        // parent (0 if none seen yet)
                     uint8_t  rdef;     // def AT the innermost REPEATED node
                     uint16_t plen;     // dotted-path length so far
+                    bool     cut;      // the dotted path was truncated
                     // G2PQ-15: one (ldef,rdef) pair per repeated ancestor seen
                     // so far, index k-1 for level k. ldef/rdef above track
                     // only the INNERMOST (most recent) repeated ancestor, same
@@ -822,6 +824,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[0].left = se.num_children;
                         stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
                         stk[0].ldef = 0; stk[0].rdef = 0;
+                        stk[0].cut = false;
                         for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
                             stk[0].ldefs[z] = 0; stk[0].rdefs[z] = 0;
                         }
@@ -838,11 +841,13 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     // exactly as every other parquet tool names it.
                     uint16_t plen = stk[sp - 1].plen;
                     const uint16_t base = plen;
-                    if (plen != 0u && plen + 1u < kPqMaxNameBytes) {
-                        path[plen++] = '.';
+                    bool cut = stk[sp - 1].cut || se.col.name_truncated != 0u;
+                    if (plen != 0u) {
+                        if (plen + 1u < kPqMaxNameBytes) path[plen++] = '.';
+                        else cut = true;
                     }
-                    for (uint32_t k = 0; se.col.name[k] != '\0' &&
-                                         plen + 1u < kPqMaxNameBytes; ++k) {
+                    for (uint32_t k = 0; se.col.name[k] != '\0'; ++k) {
+                        if (plen + 1u >= kPqMaxNameBytes) { cut = true; break; }
                         path[plen++] = se.col.name[k];
                     }
                     if (se.num_children > 0) {          // group: descend
@@ -865,6 +870,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                             stk[sp].rdefs[rep - 1u] = def;
                         }
                         stk[sp].plen = plen;
+                        stk[sp].cut = cut;
                         ++sp;
                         continue;
                     }
@@ -908,6 +914,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         col.name[w] = path[w];
                     }
                     col.name[w] = '\0';
+                    col.name_truncated = cut ? 1u : 0u;
                     out->columns[out->n_columns++] = col;
                     (void)base;
                     // close finished groups

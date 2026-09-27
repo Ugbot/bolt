@@ -448,10 +448,10 @@ int64_t latest_version(ObjectStore* os, const char* table_rel,
     char prefix[kDeltaMaxPath];
     if (std::snprintf(prefix, sizeof(prefix), "%s/_delta_log/", table_rel) <= 0)
         return -1;
-    ObjectEntry* entries = scratch->allocate_array<ObjectEntry>(kLakeMaxCommits);
-    if (entries == nullptr) return -1;
+    ObjectEntry* entries = nullptr;
     uint32_t n = 0;
-    if (os_list(os, prefix, entries, kLakeMaxCommits, &n) != kOsOk) return -1;
+    if (os_list_all(os, prefix, scratch, kLakeMaxCommits, &entries, &n) != kOsOk)
+        return -1;
     int64_t best = -1;
     for (uint32_t i = 0; i < n; ++i) {
         const char* k = entries[i].key;

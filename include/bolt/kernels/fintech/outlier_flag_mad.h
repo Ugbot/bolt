@@ -49,10 +49,10 @@ struct OutlierFlagMADState {
     SortedRing<double, kCap>       ring_x;   // rolling sorted window over x
     SortedRing<double, kCap>       ring_d;   // scratch ring for |x-median|
 
-    inline void init(int32_t in, int32_t out,
+    inline bool init(int32_t in, int32_t out,
                      uint32_t w, double kk) noexcept {
-        assert(w  > 0u);
-        assert(w  <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         assert(kk >= 0.0);
         in_col  = in;
         out_col = out;
@@ -60,6 +60,7 @@ struct OutlierFlagMADState {
         k       = kk;
         ring_x.init(w);
         ring_d.init(w);
+        return true;
     }
 };
 

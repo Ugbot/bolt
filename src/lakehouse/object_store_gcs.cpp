@@ -609,7 +609,9 @@ int gc_list(void* impl, const char* prefix, ObjectEntry* out,
     *out_n = 0;
     char token[1024] = "";
     uint32_t count = 0;
-    for (uint32_t page = 0; page < 4096u && count < cap; ++page) {
+    char spill[kOsMaxKey];
+    bool more = true;
+    for (uint32_t page = 0; page < 4096u && more; ++page) {
         char qb[4096];
         Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
         oshttp::buf_str(&q, "fields=items(name,size),nextPageToken&prefix=");
@@ -627,8 +629,9 @@ int gc_list(void* impl, const char* prefix, ObjectEntry* out,
         if (resp.status / 100 != 2) return kOsIoError;
         const char* x = reinterpret_cast<const char*>(resp.body);
         uint32_t pos = 0;
-        while (count < cap && json_field(x, resp.body_len, &pos, "name",
-                                         out[count].key, kOsMaxKey)) {
+        while (json_field(x, resp.body_len, &pos, "name",
+                          count < cap ? out[count].key : spill, kOsMaxKey)) {
+            if (count == cap) { *out_n = count; return kOsBufferSmall; }
             char sz[32];
             if (!json_field(x, resp.body_len, &pos, "size", sz, sizeof(sz))) {
                 return kOsIoError;
@@ -640,8 +643,10 @@ int gc_list(void* impl, const char* prefix, ObjectEntry* out,
         token[0] = '\0';
         (void)json_field(x, resp.body_len, &tp, "nextPageToken", token,
                          sizeof(token));
-        if (token[0] == '\0') break;
+        if (token[0] == '\0') { more = false; break; }
+        if (count == cap) { *out_n = count; return kOsBufferSmall; }
     }
+    if (more) return kOsIoError;   // page bound hit: never a short listing
     *out_n = count;
     assert(count <= cap);
     return kOsOk;

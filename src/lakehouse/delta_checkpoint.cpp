@@ -70,10 +70,10 @@ bool delta_checkpoint_discover(ObjectStore* os, const char* table_rel_prefix,
     char prefix[kDeltaMaxPath];
     if (!join_rel(table_rel_prefix, "_delta_log/", prefix, sizeof(prefix)))
         return false;
-    ObjectEntry* entries = scratch->allocate_array<ObjectEntry>(kLakeMaxCommits);
-    if (entries == nullptr) return false;
+    ObjectEntry* entries = nullptr;
     uint32_t n = 0;
-    const int rc = os_list(os, prefix, entries, kLakeMaxCommits, &n);
+    const int rc = os_list_all(os, prefix, scratch, kLakeMaxCommits, &entries,
+                               &n);
     if (rc != kOsOk) return false;
     int64_t best = -1;
     uint32_t best_idx = 0;

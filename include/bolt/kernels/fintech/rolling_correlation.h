@@ -40,15 +40,16 @@ struct RollingCorrelationState {
     RollingRing<double, kCap>    ring_a;
     RollingRing<double, kCap>    ring_b;
 
-    inline void init(int32_t ca, int32_t cb, int32_t out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+    inline bool init(int32_t ca, int32_t cb, int32_t out, uint32_t w) noexcept {
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         col_a   = ca;
         col_b   = cb;
         out_col = out;
         window  = w;
         ring_a.init(w);
         ring_b.init(w);
+        return true;
     }
 };
 

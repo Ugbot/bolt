@@ -333,7 +333,8 @@ inline bool hash_join_build_chained(
         HashJoinBuildChained*    out) noexcept {
     assert(key_cols != nullptr);
     assert(arena != nullptr && out != nullptr);
-    assert(cfg.n_keys >= 1 && cfg.n_keys <= kHJMaxKeys);
+    // Caller-supplied: cfg.keys holds kHJMaxKeys entries.
+    if (cfg.n_keys < 1 || cfg.n_keys > kHJMaxKeys) return false;
     const uint64_t n = cfg.build_rows;
     // `next` is an int32 index into chain_nodes[] and SwissTable::find()
     // returns int32 with -1 == absent, so a row id >= 2^31 aliases the

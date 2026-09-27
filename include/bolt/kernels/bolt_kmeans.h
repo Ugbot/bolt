@@ -38,17 +38,21 @@ namespace bolt {
 // based top-k. K must fit on a stack array for the per-vector argmin.
 inline constexpr size_t kKmeansMaxDim = 4096;
 inline constexpr size_t kKmeansMaxK   = 4096;
+// kmeans_assign_f32_l2 walks D and K in these stack blocks, so it has no
+// dimension or centroid-count ceiling of its own.
+inline constexpr size_t kKmeansDimBlock = 1024;
+inline constexpr size_t kKmeansKBlock   = 1024;
 
 // ---------------------------------------------------------------------------
 // kmeans_assign_f32_l2 — for each vector i, write argmin centroid id.
 // ---------------------------------------------------------------------------
 //
 // `slab`         : column-major float slab, slab[d * cluster_stride + i].
-// `D`            : vector dimension, ≤ kKmeansMaxDim.
+// `D`            : vector dimension (any size).
 // `n_vectors`    : number of vectors to assign.
 // `cluster_stride`: stride between dim columns (≥ n_vectors).
 // `centroids`    : row-major K × D, centroids[k*D + d].
-// `K`            : centroid count, ≤ kKmeansMaxK.
+// `K`            : centroid count (any size).
 // `assignments`  : output; assignments[i] := argmin_k ||vec_i - cent_k||^2.
 BOLT_FORCE_INLINE void kmeans_assign_f32_l2(
     const float* BOLT_RESTRICT slab,
@@ -60,36 +64,45 @@ BOLT_FORCE_INLINE void kmeans_assign_f32_l2(
     assert(centroids   != nullptr || K == 0);
     assert(assignments != nullptr || n_vectors == 0);
     assert(cluster_stride >= n_vectors);
-    assert(D <= kKmeansMaxDim);
-    assert(K <= kKmeansMaxK);
     if (n_vectors == 0 || K == 0) return;
 
-    // Stack scratch — bounded by the constexpr caps above.
-    float vec_i[kKmeansMaxDim];
-    float dists[kKmeansMaxK];
+    // Fixed stack blocks over D and K, so neither dimension is a ceiling
+    // (D <= kKmeansDimBlock sums in one pass, bit-identical to a flat loop).
+    float vec_blk[kKmeansDimBlock];
+    float dists[kKmeansKBlock];
 
     for (size_t i = 0; i < n_vectors; ++i) {
-        // Gather i-th vector out of the column-major slab into a dense
-        // row so the per-k inner loop is two contiguous walks.
-        for (size_t d = 0; d < D; ++d) {
-            vec_i[d] = slab[d * cluster_stride + i];
-        }
-        // Pair L2 against each centroid. Scalar; AVX2 TODO below.
-        for (size_t k = 0; k < K; ++k) {
-            const float* BOLT_RESTRICT cent_k = centroids + k * D;
-            float acc = 0.0f;
-            for (size_t d = 0; d < D; ++d) {
-                const float diff = vec_i[d] - cent_k[d];
-                acc += diff * diff;
+        float  best   = 0.0f;
+        size_t best_k = 0;
+        for (size_t k0 = 0; k0 < K; k0 += kKmeansKBlock) {
+            const size_t kn = (K - k0 < kKmeansKBlock) ? K - k0 : kKmeansKBlock;
+            for (size_t k = 0; k < kn; ++k) dists[k] = 0.0f;
+            for (size_t d0 = 0; d0 < D; d0 += kKmeansDimBlock) {
+                const size_t dn =
+                    (D - d0 < kKmeansDimBlock) ? D - d0 : kKmeansDimBlock;
+                // Gather the vector's slice out of the column-major slab so
+                // the per-k inner loop is two contiguous walks.
+                for (size_t d = 0; d < dn; ++d) {
+                    vec_blk[d] = slab[(d0 + d) * cluster_stride + i];
+                }
+                for (size_t k = 0; k < kn; ++k) {
+                    const float* BOLT_RESTRICT cent_k =
+                        centroids + (k0 + k) * D + d0;
+                    float acc = 0.0f;
+                    for (size_t d = 0; d < dn; ++d) {
+                        const float diff = vec_blk[d] - cent_k[d];
+                        acc += diff * diff;
+                    }
+                    dists[k] += acc;
+                }
             }
-            dists[k] = acc;
+            float mn = 0.0f;
+            const size_t arg = bolt::argmin_f32(dists, kn, &mn);
+            assert(arg < kn);
+            if (k0 == 0 || mn < best) { best = mn; best_k = k0 + arg; }
         }
-        // TODO(avx2): replace the scalar k×D accumulator with an FMA
-        // sweep using `l2_pair_f32` — currently inlined for clarity.
-        float mn = 0.0f;
-        const size_t arg = bolt::argmin_f32(dists, K, &mn);
-        assert(arg < K);
-        assignments[i] = static_cast<uint32_t>(arg);
+        assert(best_k < K);
+        assignments[i] = static_cast<uint32_t>(best_k);
     }
 }
 
@@ -117,8 +130,6 @@ BOLT_FORCE_INLINE void kmeans_update_centroids_f32(
     assert(centroids_out     != nullptr || K == 0);
     assert(cluster_sizes_out != nullptr || K == 0);
     assert(cluster_stride >= n_vectors);
-    assert(D <= kKmeansMaxDim);
-    assert(K <= kKmeansMaxK);
 
     // Zero accumulators.
     for (size_t k = 0; k < K; ++k) {
@@ -164,8 +175,6 @@ BOLT_FORCE_INLINE float kmeans_centroid_delta_f32(
     size_t K, size_t D) noexcept {
     assert(centroids_old != nullptr || (K == 0 || D == 0));
     assert(centroids_new != nullptr || (K == 0 || D == 0));
-    assert(D <= kKmeansMaxDim);
-    assert(K <= kKmeansMaxK);
     float acc = 0.0f;
     const size_t total = K * D;
     for (size_t i = 0; i < total; ++i) {

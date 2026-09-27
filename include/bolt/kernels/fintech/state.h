@@ -66,14 +66,18 @@ struct RollingRing {
     // Zero every field. Sets the effective window size. `size` must satisfy
     // 0 < size <= kCap. Caller is expected to pin the ring in graph arena
     // once and call init() once at graph compile time.
-    inline void init(uint32_t size) noexcept {
-        assert(size > 0u);
-        assert(size <= kCap);
-        effective_size = size;
+    // A caller-supplied `size` outside (0, kCap] is refused: the ring is left
+    // at effective_size 0, where push() only ever touches ring[0].
+    inline bool init(uint32_t size) noexcept {
+        static_assert(kCap > 0u, "RollingRing capacity must be > 0");
+        const bool ok = size > 0u && size <= kCap;
+        effective_size = ok ? size : 0u;
         pos   = 0u;
         count = 0u;
         sum   = Accum{0};
         for (uint32_t i = 0; i < kCap; ++i) ring[i] = T{0};
+        assert(effective_size <= kCap);
+        return ok;
     }
 
     inline bool full()  const noexcept { return count == effective_size; }
@@ -87,17 +91,19 @@ struct RollingRing {
     inline void push(T v) noexcept {
         assert(effective_size > 0u);
         assert(pos < effective_size);
+        // `>=` (not a modulo) keeps pos at 0 for a refused ring.
+        const uint32_t next = (pos + 1u >= effective_size) ? 0u : pos + 1u;
         if (count < effective_size) {
             ring[pos] = v;
             sum += static_cast<Accum>(v);
-            pos = (pos + 1u) % effective_size;
+            pos = next;
             ++count;
         } else {
             const T evicted = ring[pos];
             sum -= static_cast<Accum>(evicted);
             ring[pos] = v;
             sum += static_cast<Accum>(v);
-            pos = (pos + 1u) % effective_size;
+            pos = next;
         }
     }
 

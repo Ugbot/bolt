@@ -55,13 +55,17 @@ struct SortedRing {
 
     // Zero every field and configure the window. `size` must satisfy
     // 0 < size <= kCap. Caller pins SortedRing in graph arena once.
-    inline void init(uint32_t size) noexcept {
-        assert(size > 0u);
-        assert(size <= kCap);
-        window = size;
+    // A caller-supplied `size` outside (0, kCap] is refused and leaves
+    // window 0, on which push() is a no-op.
+    inline bool init(uint32_t size) noexcept {
+        const bool ok = size > 0u && size <= kCap;
+        window = ok ? size : 0u;
         pos    = 0u;
         count  = 0u;
         for (uint32_t i = 0; i < kCap; ++i) { raw[i] = T{0}; sorted[i] = T{0}; }
+        assert(window <= kCap);
+        assert(ok || window == 0u);
+        return ok;
     }
 
     inline bool     full()  const noexcept { return count == window; }
@@ -77,9 +81,9 @@ struct SortedRing {
     // outer kernel loop that walks many pushes), so the branch is not
     // a per-row branch in the Bolt sense.
     inline void push(T v) noexcept {
-        assert(window > 0u);
         assert(count <= window);
-        assert(pos   <  window);
+        assert(pos < window || window == 0u);
+        if (window == 0u) return;   // refused by init()
 
         if (count < window) {
             // Not full — pure insertion.

@@ -46,13 +46,14 @@ bool delta_cdf_list(ObjectStore* os, const char* table_rel_prefix,
     char prefix[kDeltaMaxPath];
     if (!join_rel(table_rel_prefix, "_change_data/", prefix, sizeof(prefix)))
         return false;
-    ObjectEntry* entries = arena->allocate_array<ObjectEntry>(kDeltaMaxCdfFiles);
-    if (entries == nullptr) return false;
+    ObjectEntry* entries = nullptr;
     uint32_t n_entries = 0;
-    const int rc = os_list(os, prefix, entries, kDeltaMaxCdfFiles, &n_entries);
+    const int rc = os_list_all(os, prefix, arena, kDeltaMaxCdfFiles, &entries,
+                               &n_entries);
     if (rc != kOsOk) return false;
-    for (uint32_t i = 0; i < n_entries && out->n_files < out->n_files_cap; ++i) {
+    for (uint32_t i = 0; i < n_entries; ++i) {
         if (!ends_with(entries[i].key, ".parquet")) continue;
+        if (out->n_files >= out->n_files_cap) return false;   // never drop
         CdfFile* f = &out->files[out->n_files++];
         std::memset(f, 0, sizeof(*f));
         const size_t kl = std::strlen(entries[i].key);

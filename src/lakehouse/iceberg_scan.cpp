@@ -46,6 +46,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -69,7 +70,7 @@ namespace {
 
 constexpr uint32_t kMaxNsName       = 128u;
 constexpr uint32_t kMaxFsRoot       = 1024u;
-constexpr uint32_t kMaxLiveFiles    = 4096u;
+constexpr uint32_t kLiveFilesInitial = 4096u;
 constexpr uint32_t kMaxPosDels      = 16384u;
 constexpr uint32_t kMaxEqDels       = 4096u;
 
@@ -279,10 +280,10 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
     }
     char prefix[kCatMaxPath];
     if (!path_join(table_rel, "metadata/", prefix, sizeof(prefix))) return false;
-    ObjectEntry* listing = scratch->allocate_array<ObjectEntry>(256u);
-    if (listing == nullptr) return false;
+    ObjectEntry* listing = nullptr;
     uint32_t nl = 0;
-    if (os_list(os, prefix, listing, 256u, &nl) != kOsOk) return false;
+    if (os_list_all(os, prefix, scratch, 256u, &listing, &nl) != kOsOk)
+        return false;
     int64_t best = -1;
     char best_key[kCatMaxPath]; best_key[0] = '\0';
     for (uint32_t i = 0; i < nl; ++i) {
@@ -326,6 +327,7 @@ struct ScanHandle {
     Snapshot      snap;
     DataFileRef*  live_files;
     uint32_t      n_live;
+    uint32_t      live_cap;
     uint32_t      cur_file_idx;
     pq::PqMeta*   cur_meta;
     const uint8_t* cur_body;
@@ -339,6 +341,9 @@ struct ScanHandle {
     // group -- this is what turns a row-group-local index into that
     // absolute position. Reset to 0 by open_next_file.
     uint64_t      cur_file_row_base;
+    // Footer metadata of the ONE open file, reset on each file advance so a
+    // table's file count is not bounded by the table arena's block table.
+    Arena*        meta_arena;
     PositionDeleteSet    pos_dels;
     EqualityDeleteSetI64 eq_dels;
 };
@@ -494,13 +499,13 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
         *out_err = true;
         return false;
     }
-    pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
+    assert(s->meta_arena != nullptr);
+    s->cur_meta = nullptr;
+    s->meta_arena->reset();
+    pq::PqMeta* meta = s->meta_arena->allocate_array<pq::PqMeta>(1);
     if (meta == nullptr) { *out_err = true; return false; }
     std::memset(meta, 0, sizeof(*meta));
-    meta->chunks = s->scratch->allocate_array<pq::PqChunk>(
-        pq::kPqMaxColumns * 16u);
-    meta->chunks_cap = pq::kPqMaxColumns * 16u;
-    if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) {
+    if (!pq::parquet_read_meta(body, blen, s->meta_arena, meta)) {
         *out_err = true;
         return false;
     }
@@ -688,6 +693,70 @@ bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
 
 }  // namespace
 
+namespace {
+
+// Live files double in the scan arena; a failed allocation fails the scan
+// rather than dropping files past a fixed count.
+bool grow_live_files(ScanHandle* s) noexcept {
+    assert(s != nullptr && s->live_files != nullptr);
+    assert(s->n_live == s->live_cap);
+    if (s->live_cap > (UINT32_MAX / 2u)) return false;
+    const uint32_t cap = s->live_cap * 2u;
+    DataFileRef* grown = s->scratch->allocate_array<DataFileRef>(cap);
+    if (grown == nullptr) return false;
+    std::memcpy(grown, s->live_files, sizeof(DataFileRef) * s->n_live);
+    s->live_files = grown;
+    s->live_cap = cap;
+    return true;
+}
+
+// The parsers refuse past `cap` with `*n == cap`; any other failure is a real
+// parse error. Retry with doubled room so no count is a ceiling.
+constexpr uint32_t kParseGrowRounds = 16u;
+
+bool parse_manifest_list_grow(Arena* a, const uint8_t* body, uint64_t blen,
+                              ManifestListEntry** out, uint32_t* n) noexcept {
+    assert(a != nullptr && body != nullptr);
+    assert(out != nullptr && n != nullptr);
+    uint32_t cap = kIcebergMaxManifestsPerList;
+    for (uint32_t r = 0; r < kParseGrowRounds; ++r, cap *= 2u) {   // bounded
+        ManifestListEntry* buf = a->allocate_array<ManifestListEntry>(cap);
+        if (buf == nullptr) return false;
+        *n = 0;
+        // A real manifest list is Avro; the W4 fixtures are JSON. Dispatch on
+        // the bytes, never on a build flag.
+        const bool ok = is_avro_ocf(body, blen)
+            ? manifest_list_parse_avro(body, blen, a, buf, cap, n)
+            : manifest_list_parse_json(body, static_cast<uint32_t>(blen), a,
+                                       buf, cap, n);
+        if (ok) { *out = buf; return true; }
+        if (*n < cap) return false;
+    }
+    return false;
+}
+
+bool parse_manifest_grow(Arena* a, const uint8_t* body, uint64_t blen,
+                         int32_t spec_id, DataFileRef** out,
+                         uint32_t* n) noexcept {
+    assert(a != nullptr && body != nullptr);
+    assert(out != nullptr && n != nullptr);
+    uint32_t cap = kIcebergMaxManifestEntries;
+    for (uint32_t r = 0; r < kParseGrowRounds; ++r, cap *= 2u) {   // bounded
+        DataFileRef* buf = a->allocate_array<DataFileRef>(cap);
+        if (buf == nullptr) return false;
+        *n = 0;
+        const bool ok = is_avro_ocf(body, blen)
+            ? manifest_parse_avro(body, blen, a, spec_id, buf, cap, n)
+            : manifest_parse_json(body, static_cast<uint32_t>(blen), a,
+                                  spec_id, buf, cap, n);
+        if (ok) { *out = buf; return true; }
+        if (*n < cap) return false;
+    }
+    return false;
+}
+
+}  // namespace
+
 bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                        const ReadOptions* opts) noexcept {
     assert(out != nullptr && h != nullptr);
@@ -697,17 +766,22 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
     std::memset(s, 0, sizeof(*s));
     s->table = h;
     s->scratch = h->arena;
+    void* ma = h->arena->allocate(sizeof(Arena), alignof(Arena));
+    if (ma == nullptr) return false;
+    s->meta_arena = new (ma) Arena();
     if (opts != nullptr) s->opts = *opts; else read_options_init(&s->opts);
     if (!snapshot_resolve(&h->meta, s->opts.snapshot_id, s->opts.timestamp_ms,
                           &s->snap)) {
+        // Only a table with no snapshot at all is legitimately empty.
+        if (s->opts.snapshot_id >= 0 || s->opts.timestamp_ms >= 0 ||
+            h->meta.current_snapshot_id >= 0)
+            return false;
         s->live_files = h->arena->allocate_array<DataFileRef>(1u);
         s->n_live = 0;
         *out = s;
         return true;
     }
-    ManifestListEntry* mlist =
-        h->arena->allocate_array<ManifestListEntry>(kIcebergMaxManifestsPerList);
-    if (mlist == nullptr) return false;
+    ManifestListEntry* mlist = nullptr;
     uint32_t n_mlist = 0;
     {
         const uint8_t* body = nullptr; uint64_t blen = 0;
@@ -715,18 +789,12 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                       s->snap.manifest_list, h->arena, &body, &blen)) {
             return false;
         }
-        // A real manifest list is Avro; the W4 fixtures are JSON. Dispatch on
-        // the bytes, never on a build flag.
-        const bool ok = is_avro_ocf(body, blen)
-            ? manifest_list_parse_avro(body, blen, h->arena, mlist,
-                                       kIcebergMaxManifestsPerList, &n_mlist)
-            : manifest_list_parse_json(body, static_cast<uint32_t>(blen),
-                                       h->arena, mlist,
-                                       kIcebergMaxManifestsPerList, &n_mlist);
-        if (!ok) return false;
+        if (!parse_manifest_list_grow(h->arena, body, blen, &mlist, &n_mlist))
+            return false;
     }
-    s->live_files = h->arena->allocate_array<DataFileRef>(kMaxLiveFiles);
+    s->live_files = h->arena->allocate_array<DataFileRef>(kLiveFilesInitial);
     if (s->live_files == nullptr) return false;
+    s->live_cap = kLiveFilesInitial;
     PositionDeleteEntry* pd_buf =
         h->arena->allocate_array<PositionDeleteEntry>(kMaxPosDels);
     EqualityDeleteI64* ed_buf =
@@ -745,18 +813,11 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                       mle.manifest_path, h->arena, &body, &blen)) {
             return false;
         }
-        DataFileRef* entries =
-            h->arena->allocate_array<DataFileRef>(kIcebergMaxManifestEntries);
-        if (entries == nullptr) return false;
+        DataFileRef* entries = nullptr;
         uint32_t n_entries = 0;
-        const bool parsed = is_avro_ocf(body, blen)
-            ? manifest_parse_avro(body, blen, h->arena, mle.partition_spec_id,
-                                  entries, kIcebergMaxManifestEntries,
-                                  &n_entries)
-            : manifest_parse_json(body, static_cast<uint32_t>(blen), h->arena,
-                                  mle.partition_spec_id, entries,
-                                  kIcebergMaxManifestEntries, &n_entries);
-        if (!parsed) return false;
+        if (!parse_manifest_grow(h->arena, body, blen, mle.partition_spec_id,
+                                 &entries, &n_entries))
+            return false;
         const PartitionSpec* spec =
             metadata_spec(&h->meta, mle.partition_spec_id);
         for (uint32_t ei = 0; ei < n_entries; ++ei) {
@@ -783,10 +844,9 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
             if (!stats_pass(&e, sch,
                             s->opts.predicates, s->opts.n_predicates))
                 continue;
-            if (s->n_live >= kMaxLiveFiles) break;
+            if (s->n_live == s->live_cap && !grow_live_files(s)) return false;
             s->live_files[s->n_live++] = e;
         }
-        if (s->n_live >= kMaxLiveFiles) break;
     }
     // position_delete_set_contains binary-searches once n > 32; entries were
     // appended file-by-file, not (file_path, pos)-ordered, across possibly
@@ -805,7 +865,9 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     BoltBatch::init_empty(out);
     out->arena = s->scratch;
     if (s->n_live == 0) { *out_eof = true; return true; }
-    for (uint32_t guard = 0; guard <= kMaxLiveFiles; ++guard) {   // bounded
+    const uint64_t guard_max =
+        static_cast<uint64_t>(s->n_live) * (kLakeMaxRowGroups + 1u) + 1u;
+    for (uint64_t guard = 0; guard <= guard_max; ++guard) {   // bounded
         if (!s->cur_file_open) {
             bool err = false;
             if (!open_next_file(s, &err)) {
@@ -852,7 +914,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         out->num_cols = s->cur_meta->n_columns;
         for (uint32_t c = 0; c < s->cur_meta->n_columns; ++c) {
             const char* phys = s->cur_meta->columns[c].name;
-            out->schema.add_field(phys, cols[c].type, true);
+            if (s->cur_meta->columns[c].name_truncated != 0u) return false;
+            if (!out->schema.add_field(phys, cols[c].type, true)) return false;
         }
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
@@ -863,7 +926,12 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     return false;
 }
 
-void iceberg_scan_close(ScanHandle* /*s*/) noexcept {}
+void iceberg_scan_close(ScanHandle* s) noexcept {
+    if (s == nullptr || s->meta_arena == nullptr) return;
+    s->cur_meta = nullptr;
+    s->meta_arena->~Arena();
+    s->meta_arena = nullptr;
+}
 
 }  // namespace iceberg
 }  // namespace lakehouse

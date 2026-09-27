@@ -44,15 +44,16 @@ struct KyleLambdaState {
     RollingRing<double, kCap>    ring_dp;
     RollingRing<double, kCap>    ring_sv;
 
-    inline void init(int32_t dp, int32_t sv, int32_t out, uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+    inline bool init(int32_t dp, int32_t sv, int32_t out, uint32_t w) noexcept {
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         dp_col  = dp;
         sv_col  = sv;
         out_col = out;
         window  = w;
         ring_dp.init(w);
         ring_sv.init(w);
+        return true;
     }
 };
 
@@ -117,8 +118,7 @@ inline KyleLambdaState<kCap>* make_kyle_lambda_state(::bolt::Arena* arena,
                                                      int32_t out_col,
                                                      uint32_t window) noexcept {
     assert(arena != nullptr);
-    assert(window > 0u);
-    assert(window <= kCap);
+    if (window == 0u || window > kCap) return nullptr;
     KyleLambdaState<kCap>* s = arena->allocate_array<KyleLambdaState<kCap>>(1);
     if (s == nullptr) return nullptr;
     s->init(dp_col, sv_col, out_col, window);

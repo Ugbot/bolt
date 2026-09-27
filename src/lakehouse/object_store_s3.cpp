@@ -200,7 +200,9 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
     S3ObjectStore* s3 = static_cast<S3ObjectStore*>(impl);
     char token[1024] = "";
     uint32_t count = 0;
-    for (uint32_t page = 0; page < 4096u && count < cap; ++page) {
+    char spill[kOsMaxKey];
+    bool more = true;
+    for (uint32_t page = 0; page < 4096u && more; ++page) {
         char qb[4096];
         Buf q; oshttp::buf_init(&q, qb, sizeof(qb));
         if (token[0] != '\0') {
@@ -219,9 +221,10 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         if (resp.status / 100 != 2) return kOsIoError;
         const char* x = reinterpret_cast<const char*>(resp.body);
         uint32_t pos = 0;
-        while (count < cap &&
-               oshttp::xml_next(x, resp.body_len, &pos, "Key",
-                                out[count].key, kOsMaxKey)) {
+        while (oshttp::xml_next(x, resp.body_len, &pos, "Key",
+                                count < cap ? out[count].key : spill,
+                                kOsMaxKey)) {
+            if (count == cap) { *out_n = count; return kOsBufferSmall; }
             oshttp::xml_unescape(out[count].key);
             char sz[32];
             if (!oshttp::xml_next(x, resp.body_len, &pos, "Size", sz,
@@ -236,7 +239,8 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         (void)oshttp::xml_next(x, resp.body_len, &tp, "IsTruncated", trunc,
                                sizeof(trunc));
         if (std::strcmp(trunc, "true") != 0 &&
-            std::strcmp(trunc, "True") != 0) break;
+            std::strcmp(trunc, "True") != 0) { more = false; break; }
+        if (count == cap) { *out_n = count; return kOsBufferSmall; }
         tp = 0;
         if (!oshttp::xml_next(x, resp.body_len, &tp, "NextContinuationToken",
                               token, sizeof(token))) {
@@ -244,6 +248,7 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         }
         oshttp::xml_unescape(token);
     }
+    if (more) return kOsIoError;   // page bound hit: never a short listing
     *out_n = count;
     assert(count <= cap);
     return kOsOk;

@@ -46,11 +46,11 @@ struct BollingerBandsState {
     RollingRing<double, kCap>     ring_x;
     RollingRing<double, kCap>     ring_xx; // x²
 
-    inline void init(int32_t in,
+    inline bool init(int32_t in,
                      int32_t upper, int32_t middle, int32_t lower,
                      uint32_t w, double k_sigma) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         in_col     = in;
         upper_col  = upper;
         middle_col = middle;
@@ -59,6 +59,7 @@ struct BollingerBandsState {
         k          = k_sigma;
         ring_x.init(w);
         ring_xx.init(w);
+        return true;
     }
 };
 

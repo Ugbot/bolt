@@ -42,11 +42,11 @@ struct DonchianChannelState {
     IndexRing<kCap>     dq_max;
     IndexRing<kCap>     dq_min;
 
-    inline void init(int32_t high, int32_t low,
+    inline bool init(int32_t high, int32_t low,
                      int32_t upper, int32_t lower,
                      uint32_t w) noexcept {
-        assert(w > 0u);
-        assert(w <= kCap);
+        // Caller-supplied window: refuse rather than overrun the ring.
+        if (w == 0u || w > kCap) return false;
         high_col    = high;
         low_col     = low;
         upper_col   = upper;
@@ -55,6 +55,7 @@ struct DonchianChannelState {
         row_counter = 0;
         dq_max.init();
         dq_min.init();
+        return true;
     }
 };
 

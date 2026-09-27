@@ -67,6 +67,12 @@ int64_t i64_or(const ing::AvroValue* v, int64_t dflt) noexcept {
     return v->is_null ? dflt : v->num.i64;
 }
 
+bool fits(uint32_t cap, const ing::AvroValue* v) noexcept {
+    assert(cap > 0u);
+    return v == nullptr || v->is_null || v->bytes == nullptr ||
+           v->bytes_len <= cap - 1u;
+}
+
 // Copy a string/bytes value into a fixed char buffer, NUL-terminated and
 // truncated rather than overflowing. Returns the bytes copied.
 uint32_t copy_str(char* dst, uint32_t cap, const ing::AvroValue* v) noexcept {
@@ -98,13 +104,14 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     MlCtx* s = static_cast<MlCtx*>(c);
     assert(s != nullptr);
     assert(vals != nullptr);
-    if (s->n >= s->cap) return true;              // bounded: stop filling
+    if (s->n >= s->cap) return false;             // caller retries with more room
     ManifestListEntry* e = &s->out[s->n];
     std::memset(e, 0, sizeof(*e));
     const auto at = [&](int32_t i) noexcept -> const ing::AvroValue* {
         return (i >= 0 && static_cast<uint32_t>(i) < n) ? &vals[i] : nullptr;
     };
     if (const ing::AvroValue* v = at(s->f_path)) {
+        if (!fits(kIcebergMaxManifestPath, v)) return false;
         copy_str(e->manifest_path, kIcebergMaxManifestPath, v);
     }
     e->manifest_length   = i64_or(at(s->f_len), 0);
@@ -204,13 +211,14 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
     if (rep == kRepNullCounts) {
         col->null_count = i64_or(v, 0);
     } else if (rep == kRepLower) {
+        // A cut bound is not a bound: drop it rather than prune on it.
         col->lower_len = static_cast<uint8_t>(
             copy_str(col->lower, kLakeMaxValBytes, v));
-        col->has_lower = !v->is_null;
+        col->has_lower = !v->is_null && fits(kLakeMaxValBytes, v);
     } else if (rep == kRepUpper) {
         col->upper_len = static_cast<uint8_t>(
             copy_str(col->upper, kLakeMaxValBytes, v));
-        col->has_upper = !v->is_null;
+        col->has_upper = !v->is_null && fits(kLakeMaxValBytes, v);
     }
     return true;
 }
@@ -236,6 +244,7 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
     e->snapshot_id = i64_or(at(s->f_snap), 0);
     e->content     = static_cast<FileContent>(i64_or(at(s->f_content), 0));
     if (const ing::AvroValue* v = at(s->f_path)) {
+        if (!fits(kIcebergMaxPath, v)) return false;
         copy_str(e->file_path, kIcebergMaxPath, v);
     }
     e->stats.record_count       = i64_or(at(s->f_records), 0);
@@ -255,6 +264,7 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
         p->is_null  = v->is_null;
         if (v->is_null) continue;
         if (v->type == ing::AvroType::kString || v->type == ing::AvroType::kBytes) {
+            if (!fits(kLakeMaxValBytes, v)) return false;
             p->is_str = true;
             copy_str(p->str, kLakeMaxValBytes, v);
         } else if (v->type == ing::AvroType::kDouble ||
@@ -266,7 +276,8 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
             p->i64    = v->num.i64;
         }
     }
-    if (s->n < s->cap) s->out[s->n++] = *e;             // bounded: cap
+    if (s->n >= s->cap) return false;       // caller retries with more room
+    s->out[s->n++] = *e;
     s->have_pending = false;
     return true;
 }
@@ -320,8 +331,9 @@ bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     if (s.f_path < 0) return false;
 
     int64_t rows = 0;
-    if (!ing::avro_read(src, len, scratch, &s, ml_row, &rows)) return false;
+    const bool ok = ing::avro_read(src, len, scratch, &s, ml_row, &rows);
     *out_n = s.n;
+    if (!ok) return false;
     return true;
 }
 
@@ -364,6 +376,11 @@ bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
         s->part_idx[s->n_part++] = p;
         from = static_cast<uint32_t>(p) + 1u;
     }
+    // More partition columns than a DataFileRef holds: refuse, never drop.
+    if (s->n_part == kMaxPartCols &&
+        find_prefixed(h, "data_file.partition.", from) >= 0) {
+        return false;
+    }
 
     bind_rep(s, h, "data_file.lower_bounds",      kRepLower);
     bind_rep(s, h, "data_file.upper_bounds",      kRepUpper);
@@ -372,10 +389,10 @@ bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     bind_rep(s, h, "data_file.equality_ids",      kRepEqualityIds);
 
     int64_t rows = 0;
-    if (!ing::avro_read_ex(src, len, scratch, s, df_row, df_elem, &rows)) {
-        return false;
-    }
+    const bool ok =
+        ing::avro_read_ex(src, len, scratch, s, df_row, df_elem, &rows);
     *out_n = s->n;
+    if (!ok) return false;
     return true;
 }
 
