@@ -1,0 +1,4 @@
+# function-scope arrays > the stack budget (key<TAB>bytes). Only shrinks.
+include/bolt/ingest/bolt_snappy.h::table::uint16_t[kHashSize]	32768
+src/lakehouse/catalog_glue_ext.cpp::body::char[kGlueMaxBody]	65536
+src/lakehouse/catalog_hive_metastore.cpp::reply::uint8_t[65536]	65536

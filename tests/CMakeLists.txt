@@ -2142,3 +2142,27 @@ target_link_libraries(test_bolt_channel_observer
 )
 bolt_apply_hardening(test_bolt_channel_observer)
 add_test(NAME test_bolt_channel_observer COMMAND test_bolt_channel_observer)
+
+# G2CHK-330 (limits L2): ArenaVec/ArenaRingBuffer growth policy, Budget
+# accounting under contention, ResourceExhausted, BOLT_BOUND_CHECK and the
+# Limits registry (parse / clamp / source).
+add_executable(test_bolt_limits_primitives test_bolt_limits_primitives.cpp)
+target_link_libraries(test_bolt_limits_primitives
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_limits_primitives)
+add_test(NAME test_bolt_limits_primitives COMMAND test_bolt_limits_primitives)
+
+# G2CHK-330 (limits L2): stack-array lint (no function-scope array > 16 KiB)
+# and the literal-cap ratchet (no new capacity literal outside *limits.h).
+# Both compare against scripts/limits_lint_baseline/, which may only shrink.
+# The self-test proves each check still detects what it is meant to.
+add_test(NAME bolt_limits_lint
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py
+                 --root ${CMAKE_CURRENT_SOURCE_DIR}/.. --src include --src src
+                 --baseline-dir scripts/limits_lint_baseline)
+add_test(NAME bolt_limits_lint_selftest
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py --self-test)
