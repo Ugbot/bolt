@@ -2,6 +2,7 @@
 // per-file stats parsing + predicate/partition push-down evaluation.
 
 #include "bolt/lakehouse/delta/snapshot.h"
+#include "lake_grow.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -52,17 +53,85 @@ bool skip_value(bj::Iterator* it) noexcept {
     return bj::iter_skip_to_close(it);
 }
 
-int32_t find_file_idx(LiveFile* files, uint32_t n,
-                      const char* path) noexcept {
-    assert(files != nullptr && path != nullptr);
-    for (uint32_t i = 0; i < n; ++i) {
-        if (std::strcmp(files[i].path, path) == 0)
-            return static_cast<int32_t>(i);
+// Path -> live-file index, open addressing in the replay arena, so replaying
+// N adds/removes is O(N) rather than a linear search per action. Slot values:
+// 0 empty, kTomb removed, else index + 1.
+constexpr uint32_t kTomb = UINT32_MAX;
+
+struct ReplayCtx {
+    Snapshot* snap;
+    Arena*    arena;
+    uint32_t* slots;
+    uint32_t  n_slots;   // power of two
+    uint32_t  used;      // live + tombstones
+};
+
+uint64_t path_hash(const char* p) noexcept {
+    assert(p != nullptr);
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < kDeltaMaxPath && p[i] != '\0'; ++i) {   // bounded
+        h ^= static_cast<uint8_t>(p[i]);
+        h *= 1099511628211ull;
     }
-    return -1;
+    return h ^ (h >> 29);
 }
 
-struct ReplayCtx { Snapshot* snap; Arena* arena; };
+// Slot holding `path`, or the first free slot on its probe path when absent
+// (*found false). Needs at least one empty slot (load <= 1/2 guarantees it).
+uint32_t index_probe(const ReplayCtx* c, const char* path, bool* found) noexcept {
+    assert(c != nullptr && c->n_slots != 0u && found != nullptr);
+    const uint32_t mask = c->n_slots - 1u;
+    uint32_t i = static_cast<uint32_t>(path_hash(path)) & mask;
+    uint32_t first_free = kTomb;
+    for (uint32_t k = 0; k < c->n_slots; ++k, i = (i + 1u) & mask) {   // bounded
+        const uint32_t v = c->slots[i];
+        if (v == 0u) {
+            *found = false;
+            return first_free != kTomb ? first_free : i;
+        }
+        if (v == kTomb) {
+            if (first_free == kTomb) first_free = i;
+            continue;
+        }
+        if (std::strcmp(c->snap->files[v - 1u].path, path) == 0) {
+            *found = true;
+            return i;
+        }
+    }
+    assert(first_free != kTomb);
+    *found = false;
+    return first_free;
+}
+
+// Size the index for `need` live paths at load <= 1/2 and re-insert every
+// live file (drops tombstones).
+bool index_rebuild(ReplayCtx* c, uint32_t need) noexcept {
+    assert(c != nullptr && c->arena != nullptr);
+    uint64_t n = 64u;
+    while (n < static_cast<uint64_t>(need) * 2u + 2u) n *= 2u;   // bounded: 32 doublings
+    if (n > (UINT64_C(1) << 31)) {
+        set_resource_exhausted(kLakeMetadataKnob, n, UINT64_C(1) << 31);
+        return false;
+    }
+    uint32_t* slots = c->arena->allocate_array<uint32_t>(static_cast<size_t>(n));
+    if (slots == nullptr) {
+        set_resource_exhausted("arena_max_blocks", n * sizeof(uint32_t), 0);
+        return false;
+    }
+    std::memset(slots, 0, sizeof(uint32_t) * n);
+    c->slots = slots;
+    c->n_slots = static_cast<uint32_t>(n);
+    c->used = 0;
+    for (uint32_t f = 0; f < c->snap->n_files; ++f) {   // bounded
+        bool found = false;
+        const uint32_t i = index_probe(c, c->snap->files[f].path, &found);
+        assert(!found);
+        c->slots[i] = f + 1u;
+        ++c->used;
+    }
+    assert(c->used == c->snap->n_files);
+    return true;
+}
 
 bool apply_action(void* raw, const DeltaAction* a) noexcept {
     assert(raw != nullptr && a != nullptr);
@@ -78,13 +147,20 @@ bool apply_action(void* raw, const DeltaAction* a) noexcept {
             s->has_metadata = true;
             break;
         case ActionKind::kAdd: {
-            const int32_t exist = find_file_idx(s->files, s->n_files,
-                                                  a->add.path);
+            if ((ctx->used + 1u) * 2u > ctx->n_slots &&
+                !index_rebuild(ctx, s->n_files + 1u))
+                return false;
+            bool found = false;
+            const uint32_t si = index_probe(ctx, a->add.path, &found);
             LiveFile* slot = nullptr;
-            if (exist >= 0) {
-                slot = &s->files[exist];
+            if (found) {
+                slot = &s->files[ctx->slots[si] - 1u];
             } else {
-                if (s->n_files >= s->n_files_cap) return false;
+                if (!lake_grow(ctx->arena, nullptr, &s->files, s->n_files,
+                               &s->n_files_cap, s->n_files + 1u))
+                    return false;
+                if (ctx->slots[si] == 0u) ++ctx->used;
+                ctx->slots[si] = s->n_files + 1u;
                 slot = &s->files[s->n_files++];
             }
             std::memset(slot, 0, sizeof(*slot));
@@ -100,12 +176,19 @@ bool apply_action(void* raw, const DeltaAction* a) noexcept {
             break;
         }
         case ActionKind::kRemove: {
-            const int32_t e = find_file_idx(s->files, s->n_files,
-                                              a->rem.path);
-            if (e >= 0) {
+            bool found = false;
+            const uint32_t si = index_probe(ctx, a->rem.path, &found);
+            if (found) {
+                const uint32_t e = ctx->slots[si] - 1u;
                 const uint32_t last = s->n_files - 1u;
-                if (static_cast<uint32_t>(e) != last)
+                ctx->slots[si] = kTomb;
+                if (e != last) {
+                    bool lf = false;
+                    const uint32_t li = index_probe(ctx, s->files[last].path, &lf);
+                    assert(lf);
                     s->files[e] = s->files[last];
+                    ctx->slots[li] = e + 1u;
+                }
                 --s->n_files;
             }
             break;
@@ -124,20 +207,25 @@ bool delta_snapshot_build(ObjectStore* os, const char* table_rel_prefix,
     assert(os != nullptr && arena != nullptr && out != nullptr);
     std::memset(out, 0, sizeof(*out));
     out->version = -1;
-    out->files = arena->allocate_array<LiveFile>(kLakeMaxLiveFiles);
-    if (out->files == nullptr) return false;
-    out->n_files_cap = kLakeMaxLiveFiles;
+    // Live files double in `arena` (lake_grow); no file count is a ceiling.
+    out->files = nullptr;
+    out->n_files_cap = 0;
+    if (!lake_grow(arena, nullptr, &out->files, 0u, &out->n_files_cap, 64u))
+        return false;
     ReplayCtx ctx{};
     ctx.snap = out;
     ctx.arena = arena;
+    if (!index_rebuild(&ctx, 64u)) return false;
     CheckpointInfo cp{};
     if (delta_checkpoint_discover(os, table_rel_prefix, max_version, arena, &cp)
         && cp.present) {
         if (!delta_checkpoint_replay(os, &cp, arena, &ctx, apply_action))
             return false;
     }
-    return delta_log_walk_all(os, table_rel_prefix, max_version, arena,
-                              &ctx, apply_action);
+    // Checkpoint replay does not decode yet, so the JSON walk must see every
+    // commit from 0; delta_log_walk_range refuses a log with a gap.
+    return delta_log_walk_range(os, table_rel_prefix, -1, max_version, arena,
+                                &ctx, apply_action);
 }
 
 namespace {

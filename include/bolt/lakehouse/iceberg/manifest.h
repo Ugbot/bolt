@@ -83,7 +83,8 @@ namespace iceberg {
 
 static constexpr uint32_t kIcebergMaxManifestEntries  = 4096u;
 static constexpr uint32_t kIcebergMaxManifestsPerList = 256u;
-static constexpr uint32_t kIcebergMaxPartitionValues  = 8u;
+// A file carries one value per field of its spec.
+static constexpr uint32_t kIcebergMaxPartitionValues  = kIcebergMaxFieldsPerSpec;
 
 enum class ManifestStatus : uint8_t {
     kExisting = 0,
@@ -217,6 +218,25 @@ bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
                          int32_t default_spec_id,
                          DataFileRef* out, uint32_t cap,
                          uint32_t* out_n) noexcept;
+
+// Growing forms: the output array doubles in `arena` (starting at `hint`), so
+// no entry count is a ceiling. Refused only when the arena is exhausted
+// (ResourceExhausted set).
+bool manifest_list_parse_avro_grow(const uint8_t* src, uint64_t len,
+                                   Arena* arena, uint32_t hint,
+                                   ManifestListEntry** out,
+                                   uint32_t* out_n) noexcept;
+bool manifest_parse_avro_grow(const uint8_t* src, uint64_t len, Arena* arena,
+                              int32_t default_spec_id, uint32_t hint,
+                              DataFileRef** out, uint32_t* out_n) noexcept;
+
+// Streaming form: each decoded entry is handed to `fn` and not retained, so a
+// manifest of any size is read in O(1) entries. `fn` returning false aborts
+// the parse (which then returns false). *out_n counts the entries visited.
+using DataFileVisitFn = bool (*)(void* ctx, const DataFileRef* f) noexcept;
+bool manifest_visit_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                         int32_t default_spec_id, DataFileVisitFn fn,
+                         void* ctx, uint32_t* out_n) noexcept;
 
 bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
                               ManifestListEntry* out, uint32_t cap,

@@ -88,22 +88,21 @@ std::string metadata_json(const std::string& location, uint32_t n_snaps,
 
 // ---- Iceberg metadata ------------------------------------------------------
 
-// Past the snapshot array the current snapshot used to be dropped and the
-// scan returned an EMPTY table with success.
-TEST(LoudIcebergMetadata, SnapshotsPastCapAreRefusedNotDropped) {
+// Snapshots have no count cap (L5): 5,000 parse, and the current one (last)
+// resolves. Before L1a the 65th made the scan return an empty table; L1a
+// refused past 64.
+TEST(LoudIcebergMetadata, SnapshotsGrowPastTheOldArray) {
     using namespace bolt::lakehouse::iceberg;
     bolt::Arena arena;
     Metadata* m = arena.allocate_array<Metadata>(1);
     ASSERT_NE(m, nullptr);
-    const std::string ok = metadata_json("/t", kIcebergMaxSnapshots,
-                                         1000 + kIcebergMaxSnapshots - 1);
-    ASSERT_TRUE(metadata_parse(u8(ok), static_cast<uint32_t>(ok.size()),
+    const std::string big = metadata_json("/t", 5000, 1000 + 4999);
+    ASSERT_TRUE(metadata_parse(u8(big), static_cast<uint32_t>(big.size()),
                                &arena, m));
-    EXPECT_EQ(m->n_snapshots, kIcebergMaxSnapshots);
-    const std::string over = metadata_json("/t", kIcebergMaxSnapshots + 6,
-                                           1000 + kIcebergMaxSnapshots + 5);
-    EXPECT_FALSE(metadata_parse(u8(over), static_cast<uint32_t>(over.size()),
-                                &arena, m));
+    EXPECT_EQ(m->n_snapshots, 5000u);
+    EXPECT_EQ(m->n_snapshot_log, 5000u);
+    ASSERT_NE(snapshot_by_id(m, 1000 + 4999), nullptr);
+    ASSERT_NE(snapshot_by_id(m, 1000), nullptr);
 }
 
 TEST(LoudIcebergMetadata, CurrentSnapshotMissingFromListIsRefused) {

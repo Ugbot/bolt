@@ -84,6 +84,9 @@ std::string fixture_root() {
 
 Schema make_schema() {
     Schema s{};
+    static SchemaField s_fields[8]{};  // Schema::fields is caller-owned storage
+    s.fields = s_fields;
+    s.cap_fields = 8u;
     s.schema_id = 0;
     s.n_fields  = 2;
     s.fields[0].id = 1; s.fields[0].required = true;

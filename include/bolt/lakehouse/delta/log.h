@@ -27,7 +27,7 @@ enum class DvStorageType : uint8_t {
 };
 
 static constexpr uint32_t kDeltaMaxPath        = 1024u;
-static constexpr uint32_t kDeltaMaxPartitions  = 8u;
+static constexpr uint32_t kDeltaMaxPartitions  = kLakeMaxPartCols;
 static constexpr uint32_t kDeltaMaxStatsBytes  = 4096u;
 static constexpr uint32_t kDeltaMaxDvInline    = 1024u;
 static constexpr uint32_t kDeltaMaxSchemaBytes = 8192u;
@@ -121,6 +121,11 @@ bool delta_log_parse_commit(const uint8_t* src, uint64_t src_len,
 bool delta_log_walk_all(ObjectStore* os, const char* table_rel_prefix,
                         int64_t max_version, Arena* scratch,
                         void* ctx, ActionFn cb) noexcept;
+// Commits with after_version < version <= max_version (max < 0: no upper
+// bound), in version order. Snapshot builds start after the checkpoint.
+bool delta_log_walk_range(ObjectStore* os, const char* table_rel_prefix,
+                          int64_t after_version, int64_t max_version,
+                          Arena* scratch, void* ctx, ActionFn cb) noexcept;
 
 bool delta_log_version_for_timestamp(ObjectStore* os,
                                      const char* table_rel_prefix,

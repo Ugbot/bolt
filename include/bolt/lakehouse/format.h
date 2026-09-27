@@ -56,7 +56,7 @@ static constexpr uint32_t kLakeMaxPredicates = 16u;
 // assert-ceiling-style cap: `column_prune_plan` rejects (returns false)
 // rather than truncating when `n_src > kLakeMaxProjection`.
 static constexpr uint32_t kLakeMaxProjection = 128u;
-static constexpr uint32_t kLakeMaxPartCols  = 8u;
+static constexpr uint32_t kLakeMaxPartCols  = 32u;
 static constexpr uint32_t kLakeMaxLiveFiles = 4096u;
 static constexpr uint32_t kLakeMaxRowGroups = 4096u;
 static constexpr uint32_t kLakeMaxCommits   = 512u;

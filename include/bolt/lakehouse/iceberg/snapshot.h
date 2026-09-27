@@ -10,7 +10,6 @@ namespace bolt {
 namespace lakehouse {
 namespace iceberg {
 
-static constexpr uint32_t kIcebergMaxSnapshots = 64u;
 static constexpr uint32_t kIcebergMaxManifestPath = 1024u;
 
 enum class SnapshotOp : uint8_t {

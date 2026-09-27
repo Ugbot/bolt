@@ -14,6 +14,7 @@
 
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/transform.h"
+#include "lake_grow.h"
 
 namespace bolt {
 namespace lakehouse {
@@ -23,7 +24,14 @@ namespace bj = bolt::parse::json;
 
 namespace {
 
+// Object keys per JSON object. Arrays are bounded by the token count instead:
+// every element consumes at least one token, so no array is capped by a guard.
 constexpr uint32_t kIterGuard = 4096u;
+
+inline uint32_t array_guard(const bj::StructuralIndex* idx) noexcept {
+    assert(idx != nullptr && idx->token_count >= 0);
+    return static_cast<uint32_t>(idx->token_count) + 1u;
+}
 
 inline bool tok_eq(const bj::StructuralIndex* idx, int32_t cur,
                    const char* lit) noexcept {
@@ -124,6 +132,10 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
             int64_t v = 0; read_int64(it, &v);
             out->schema_id = static_cast<int32_t>(v);
         } else if (tok_eq(idx, key, "manifest-list")) {
+            if (bj::iter_peek(it) == bj::TokenType::String &&
+                idx->tokens[it->cursor].length >=
+                    static_cast<int32_t>(kIcebergMaxManifestPath))
+                return false;   // a cut path names a different object
             read_str(idx, it, out->manifest_list, kIcebergMaxManifestPath);
         } else if (tok_eq(idx, key, "summary")) {
             if (bj::iter_peek(it) == bj::TokenType::BeginObject) {
@@ -203,8 +215,9 @@ bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
 }
 
 bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
-                  Schema* out) noexcept {
+                  Arena* a, Budget* b, Schema* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
+    assert(a != nullptr);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
     std::memset(out, 0, sizeof(*out));
@@ -221,12 +234,12 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
             }
             bj::iter_advance(it);
             uint32_t g2 = 0;
+            const uint32_t guard = array_guard(idx);
             while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
-                   g2++ < kIterGuard) {
-                if (out->n_fields >= kIcebergMaxFieldsPerSchema) return false;
-                if (!parse_field(idx, it, &out->fields[out->n_fields]))
-                    return false;
-                ++out->n_fields;
+                   g2++ < guard) {
+                SchemaField f;
+                if (!parse_field(idx, it, &f)) return false;
+                if (!schema_push_field(out, a, b, &f)) return false;
             }
             if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(it);
@@ -334,6 +347,44 @@ bool parse_log_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
     return have_ts && have_ref;
 }
 
+// Property values are strings; a non-numeric retention value is refused
+// rather than read as "no policy".
+bool parse_i64_str(const char* v, int64_t* out) noexcept {
+    assert(v != nullptr && out != nullptr);
+    int64_t x = 0;
+    uint32_t d = 0;
+    for (; v[d] >= '0' && v[d] <= '9' && d < 18u; ++d) x = x * 10 + (v[d] - '0');
+    if (d == 0u || v[d] != '\0') return false;
+    *out = x;
+    return true;
+}
+
+bool parse_properties(const bj::StructuralIndex* idx, bj::Iterator* it,
+                      Metadata* out) noexcept {
+    assert(idx != nullptr && it != nullptr && out != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginObject) return skip_value(it);
+    bj::iter_advance(it);
+    const uint32_t guard = array_guard(idx);
+    uint32_t g = 0;
+    while (bj::iter_peek(it) == bj::TokenType::Key && g++ < guard) {
+        const int32_t key = it->cursor;
+        bj::iter_advance(it);
+        const bool age = tok_eq(idx, key, "history.expire.max-snapshot-age-ms");
+        const bool keep = tok_eq(idx, key, "history.expire.min-snapshots-to-keep");
+        if (!age && !keep) { skip_value(it); continue; }
+        char v[32];
+        if (!read_str(idx, it, v, sizeof(v))) return false;
+        int64_t x = 0;
+        if (!parse_i64_str(v, &x)) return false;
+        if (age) out->retention_max_age_ms = x;
+        else if (x > INT32_MAX) return false;
+        else out->retention_min_snapshots = static_cast<int32_t>(x);
+    }
+    if (bj::iter_peek(it) != bj::TokenType::EndObject) return false;
+    bj::iter_advance(it);
+    return true;
+}
+
 bool parse_snapshot_log(const bj::StructuralIndex* idx, bj::Iterator* it,
                         Metadata* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
@@ -342,15 +393,17 @@ bool parse_snapshot_log(const bj::StructuralIndex* idx, bj::Iterator* it,
     }
     bj::iter_advance(it);
     uint32_t g = 0;
-    while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
-           g++ < kIterGuard) {
+    const uint32_t guard = array_guard(idx);
+    while (bj::iter_peek(it) == bj::TokenType::BeginObject && g++ < guard) {
         int64_t ts = 0, sid = 0;
-        if (parse_log_entry(idx, it, &ts, &sid, nullptr, 0u)) {
-            metadata_snapshot_log_push(out, ts, sid);
+        if (parse_log_entry(idx, it, &ts, &sid, nullptr, 0u) &&
+            !metadata_snapshot_log_push(out, ts, sid)) {
+            return false;
         }
     }
-    if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
-    assert(out->n_snapshot_log <= kIcebergMaxSnapshotLog);
+    if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+    bj::iter_advance(it);
+    assert(out->n_snapshot_log <= out->cap_snapshot_log);
     return true;
 }
 
@@ -362,26 +415,41 @@ bool parse_metadata_log(const bj::StructuralIndex* idx, bj::Iterator* it,
     }
     bj::iter_advance(it);
     uint32_t g = 0;
-    while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
-           g++ < kIterGuard) {
+    const uint32_t guard = array_guard(idx);
+    while (bj::iter_peek(it) == bj::TokenType::BeginObject && g++ < guard) {
         MetadataLogEntry e{};
         if (parse_log_entry(idx, it, &e.timestamp_ms, nullptr,
                             e.metadata_file, sizeof(e.metadata_file))) {
             metadata_metadata_log_push(out, &e);
         }
     }
-    if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
+    if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+    bj::iter_advance(it);
     assert(out->n_metadata_log <= kIcebergMaxMetadataLog);
     return true;
 }
 
 }  // namespace
 
+void metadata_init(Metadata* m, Arena* arena, Budget* budget) noexcept {
+    assert(m != nullptr && arena != nullptr);
+    std::memset(m, 0, sizeof(*m));
+    m->arena = arena;
+    m->budget = budget;
+    m->current_snapshot_id = -1;
+    assert(m->n_snapshots == 0 && m->snapshots == nullptr);
+}
+
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                     Metadata* out) noexcept {
+    return metadata_parse_budget(src, len, scratch, nullptr, out);
+}
+
+bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
+                           Budget* budget, Metadata* out) noexcept {
     assert(src != nullptr && scratch != nullptr && out != nullptr);
     assert(len > 0u && len < (1u << 30));
-    std::memset(out, 0, sizeof(*out));
+    metadata_init(out, scratch, budget);
     out->format_version = 0;
     out->current_snapshot_id = -1;
     out->current_schema_id = -1;
@@ -431,11 +499,13 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             }
             bj::iter_advance(&it);
             uint32_t g2 = 0;
+            const uint32_t guard = array_guard(&idx);
             while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
-                   g2++ < kIterGuard) {
-                if (out->n_snapshots >= kIcebergMaxSnapshots) return false;
-                parse_snapshot(&idx, &it, &out->snapshots[out->n_snapshots]);
-                ++out->n_snapshots;
+                   g2++ < guard) {
+                Snapshot snap;
+                std::memset(&snap, 0, sizeof(snap));
+                if (!parse_snapshot(&idx, &it, &snap)) return false;
+                if (!metadata_push_snapshot(out, &snap)) return false;
             }
             if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(&it);
@@ -445,20 +515,20 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             }
             bj::iter_advance(&it);
             uint32_t g2 = 0;
+            const uint32_t guard = array_guard(&idx);
             while (bj::iter_peek(&it) == bj::TokenType::BeginObject &&
-                   g2++ < kIterGuard) {
-                if (out->n_schemas >= kIcebergMaxSchemas) return false;
-                if (!parse_schema(&idx, &it, &out->schemas[out->n_schemas])) return false;
-                ++out->n_schemas;
+                   g2++ < guard) {
+                Schema* sch = metadata_push_schema(out);
+                if (sch == nullptr) return false;
+                if (!parse_schema(&idx, &it, scratch, budget, sch)) return false;
             }
             if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(&it);
         } else if (tok_eq(&idx, key, "schema")) {
             if (bj::iter_peek(&it) == bj::TokenType::BeginObject) {
-                if (out->n_schemas >= kIcebergMaxSchemas) return false;
-                if (!parse_schema(&idx, &it, &out->schemas[out->n_schemas]))
-                    return false;
-                ++out->n_schemas;
+                Schema* sch = metadata_push_schema(out);
+                if (sch == nullptr) return false;
+                if (!parse_schema(&idx, &it, scratch, budget, sch)) return false;
             } else {
                 skip_value(&it);
             }
@@ -476,10 +546,21 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
             }
             if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(&it);
+        } else if (tok_eq(&idx, key, "properties")) {
+            if (!parse_properties(&idx, &it, out)) return false;
         } else if (tok_eq(&idx, key, "snapshot-log")) {
-            saw_snapshot_log = parse_snapshot_log(&idx, &it, out);
+            if (bj::iter_peek(&it) == bj::TokenType::BeginArray) {
+                if (!parse_snapshot_log(&idx, &it, out)) return false;
+                saw_snapshot_log = true;
+            } else {
+                skip_value(&it);
+            }
         } else if (tok_eq(&idx, key, "metadata-log")) {
-            parse_metadata_log(&idx, &it, out);
+            if (bj::iter_peek(&it) == bj::TokenType::BeginArray) {
+                if (!parse_metadata_log(&idx, &it, out)) return false;
+            } else {
+                skip_value(&it);
+            }
         } else {
             skip_value(&it);
         }
@@ -488,8 +569,9 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
     // became current when published, so commit order IS the log.
     if (!saw_snapshot_log) {
         for (uint32_t i = 0; i < out->n_snapshots; ++i) {      // bounded
-            metadata_snapshot_log_push(out, out->snapshots[i].timestamp_ms,
-                                       out->snapshots[i].snapshot_id);
+            if (!metadata_snapshot_log_push(out, out->snapshots[i].timestamp_ms,
+                                            out->snapshots[i].snapshot_id))
+                return false;
         }
     }
     // A current snapshot the list does not carry would scan as an empty table.
@@ -513,18 +595,68 @@ const Schema* metadata_current_schema(const Metadata* m) noexcept {
     return &m->schemas[0];
 }
 
-void metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
+bool metadata_push_snapshot(Metadata* m, const Snapshot* s) noexcept {
+    assert(m != nullptr && s != nullptr);
+    assert(m->arena != nullptr && "Metadata not bound to an arena");
+    if (!lake_grow(m->arena, m->budget, &m->snapshots, m->n_snapshots,
+                   &m->cap_snapshots, m->n_snapshots + 1u))
+        return false;
+    m->snapshots[m->n_snapshots++] = *s;
+    assert(m->n_snapshots <= m->cap_snapshots);
+    return true;
+}
+
+Schema* metadata_push_schema(Metadata* m) noexcept {
+    assert(m != nullptr);
+    assert(m->arena != nullptr && "Metadata not bound to an arena");
+    if (!lake_grow(m->arena, m->budget, &m->schemas, m->n_schemas,
+                   &m->cap_schemas, m->n_schemas + 1u))
+        return nullptr;
+    Schema* s = &m->schemas[m->n_schemas++];
+    std::memset(s, 0, sizeof(*s));
+    return s;
+}
+
+bool schema_reserve(Schema* s, Arena* a, Budget* b, uint32_t n) noexcept {
+    assert(s != nullptr && a != nullptr);
+    assert(s->n_fields <= s->cap_fields);
+    return lake_grow(a, b, &s->fields, s->n_fields, &s->cap_fields, n);
+}
+
+bool schema_push_field(Schema* s, Arena* a, Budget* b,
+                       const SchemaField* f) noexcept {
+    assert(s != nullptr && f != nullptr);
+    if (!schema_reserve(s, a, b, s->n_fields + 1u)) return false;
+    s->fields[s->n_fields++] = *f;
+    assert(s->n_fields <= s->cap_fields);
+    return true;
+}
+
+bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept {
+    assert(dst != nullptr && src != nullptr && a != nullptr);
+    assert(dst != src);
+    Schema out;
+    std::memset(&out, 0, sizeof(out));
+    out.schema_id = src->schema_id;
+    if (!schema_reserve(&out, a, b, src->n_fields)) return false;
+    if (src->n_fields != 0u)
+        std::memcpy(out.fields, src->fields, sizeof(SchemaField) * src->n_fields);
+    out.n_fields = src->n_fields;
+    *dst = out;
+    return true;
+}
+
+bool metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
                                 int64_t snapshot_id) noexcept {
     assert(m != nullptr);
-    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
-    if (m->n_snapshot_log == kIcebergMaxSnapshotLog) {
-        std::memmove(&m->snapshot_log[0], &m->snapshot_log[1],
-                     sizeof(SnapshotLogEntry) * (kIcebergMaxSnapshotLog - 1u));
-        --m->n_snapshot_log;
-    }
+    assert(m->arena != nullptr && "Metadata not bound to an arena");
+    if (!lake_grow(m->arena, m->budget, &m->snapshot_log, m->n_snapshot_log,
+                   &m->cap_snapshot_log, m->n_snapshot_log + 1u))
+        return false;
     SnapshotLogEntry& e = m->snapshot_log[m->n_snapshot_log++];
     e.timestamp_ms = timestamp_ms;
     e.snapshot_id  = snapshot_id;
+    return true;
 }
 
 void metadata_metadata_log_push(Metadata* m,

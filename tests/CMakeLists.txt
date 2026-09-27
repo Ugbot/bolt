@@ -2182,3 +2182,17 @@ target_link_libraries(test_bolt_parquet_null_slots
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_parquet_null_slots)
 add_test(NAME test_bolt_parquet_null_slots COMMAND test_bolt_parquet_null_slots)
+
+# LIMITS L5: Iceberg metadata growth, expiry/retention, metadata budget.
+add_executable(test_bolt_lakehouse_growth test_bolt_lakehouse_growth.cpp)
+target_link_libraries(test_bolt_lakehouse_growth
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_growth)
+add_test(NAME test_bolt_lakehouse_growth COMMAND test_bolt_lakehouse_growth)
+# Scale proof vs pyiceberg/DuckDB; skipped unless BOLT_L5_SCALE_DIR names the
+# output of scripts/l5_iceberg_scale.py.
+add_executable(test_bolt_lakehouse_scale test_bolt_lakehouse_scale.cpp)
+target_link_libraries(test_bolt_lakehouse_scale
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_lakehouse_scale)
+add_test(NAME test_bolt_lakehouse_scale COMMAND test_bolt_lakehouse_scale)

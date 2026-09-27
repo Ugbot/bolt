@@ -8,18 +8,19 @@
 #include "bolt/lakehouse/iceberg/snapshot.h"
 #include "bolt/lakehouse/iceberg/sort_order.h"
 
+namespace bolt { class Arena; class Budget; }
+
 namespace bolt {
 namespace lakehouse {
 namespace iceberg {
 
-static constexpr uint32_t kIcebergMaxSchemas    = 8u;
-static constexpr uint32_t kIcebergMaxFieldsPerSchema = 256u;
 static constexpr uint32_t kIcebergMaxLocation   = 1024u;
 static constexpr uint32_t kIcebergMaxUuid       = 64u;
 static constexpr uint32_t kIcebergMaxTypeName   = 32u;
-// Oldest entries are dropped past these caps, like Java's
-// write.metadata.previous-versions-max.
-static constexpr uint32_t kIcebergMaxSnapshotLog = 128u;
+// Oldest metadata-log entries are dropped past this, like Java's
+// write.metadata.previous-versions-max. Snapshots, schemas, schema fields and
+// the snapshot-log have no count cap: they grow in Metadata::arena, charged to
+// Metadata::budget, and only table_expire_snapshots shrinks them.
 static constexpr uint32_t kIcebergMaxMetadataLog = 64u;
 
 struct SchemaField {
@@ -30,10 +31,14 @@ struct SchemaField {
     char     type[kIcebergMaxTypeName];
 };
 
+// `fields` lives in an arena; a Schema copied by value shares it. Use
+// schema_copy for an independent copy.
 struct Schema {
     int32_t      schema_id;
     uint32_t     n_fields;
-    SchemaField  fields[kIcebergMaxFieldsPerSchema];
+    uint32_t     cap_fields;
+    uint32_t     _pad;
+    SchemaField* fields;
 };
 
 // One `snapshot-log` entry: `snapshot_id` became current at `timestamp_ms`.
@@ -57,16 +62,25 @@ struct Metadata {
     int64_t   last_sequence_number;
     int64_t   last_updated_ms;
     int64_t   current_snapshot_id;
+    // Retention policy (table properties history.expire.*); 0 = unset.
+    int64_t   retention_max_age_ms;
+    int32_t   retention_min_snapshots;
+    int32_t   _pad0;
     char      table_uuid[kIcebergMaxUuid];
     char      location[kIcebergMaxLocation];
 
+    // Growth arena and (optional) byte budget for the arrays below. Set by
+    // metadata_init / metadata_parse; the arena must outlive the Metadata.
+    Arena*        arena;
+    Budget*       budget;
+
     uint32_t      n_snapshots;
-    uint32_t      _pad;
-    Snapshot      snapshots[kIcebergMaxSnapshots];
+    uint32_t      cap_snapshots;
+    Snapshot*     snapshots;
 
     uint32_t      n_schemas;
-    uint32_t      _pad2;
-    Schema        schemas[kIcebergMaxSchemas];
+    uint32_t      cap_schemas;
+    Schema*       schemas;
 
     uint32_t      n_specs;
     uint32_t      _pad3;
@@ -77,8 +91,10 @@ struct Metadata {
     SortOrder     sort_orders[kIcebergMaxSortOrders];
 
     uint32_t         n_snapshot_log;
+    uint32_t         cap_snapshot_log;
+    SnapshotLogEntry* snapshot_log;
     uint32_t         n_metadata_log;
-    SnapshotLogEntry snapshot_log[kIcebergMaxSnapshotLog];
+    uint32_t         _pad5;
     MetadataLogEntry metadata_log[kIcebergMaxMetadataLog];
 };
 
@@ -92,12 +108,30 @@ namespace bolt {
 namespace lakehouse {
 namespace iceberg {
 
+// Zero `m` and bind its growth arena/budget (budget may be nullptr).
+void metadata_init(Metadata* m, Arena* arena, Budget* budget) noexcept;
+
+// `scratch` becomes the Metadata's growth arena, so it must outlive `out`.
+// `budget` (optional) is charged for every array the parse grows; past it the
+// parse fails with ResourceExhausted set.
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                     Metadata* out) noexcept;
+bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
+                           Budget* budget, Metadata* out) noexcept;
 const Schema* metadata_current_schema(const Metadata* m) noexcept;
 
-// Append to a history log, dropping the oldest entry when full.
-void metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
+// Growth. Each returns false (ResourceExhausted set) when the arena or budget
+// refuses; the Metadata is unchanged.
+bool metadata_push_snapshot(Metadata* m, const Snapshot* s) noexcept;
+Schema* metadata_push_schema(Metadata* m) noexcept;   // zeroed, fields empty
+bool schema_reserve(Schema* s, Arena* a, Budget* b, uint32_t n) noexcept;
+bool schema_push_field(Schema* s, Arena* a, Budget* b,
+                       const SchemaField* f) noexcept;
+// Deep copy: dst gets its own field array.
+bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept;
+
+// snapshot-log grows; metadata-log drops its oldest entry when full.
+bool metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
                                 int64_t snapshot_id) noexcept;
 void metadata_metadata_log_push(Metadata* m,
                                 const MetadataLogEntry* e) noexcept;

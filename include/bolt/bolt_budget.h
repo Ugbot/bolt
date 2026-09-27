@@ -40,7 +40,10 @@
     X(arena_max_blocks, kInvariant, "blocks", 256, 256, 256, nullptr, nullptr,  \
       "backing blocks per bolt::Arena")                                         \
     X(stack_array_lint_bytes, kInvariant, "bytes", 16384, 16384, 16384,         \
-      nullptr, nullptr, "largest function-scope array the stack lint allows")
+      nullptr, nullptr, "largest function-scope array the stack lint allows")    \
+    X(lake_metadata_budget_mb, kBudget, "MiB", 1024, 1, (UINT64_MAX >> 20),     \
+      "BOLT_LAKE_METADATA_BUDGET_MB", nullptr,                                  \
+      "Iceberg/Delta metadata held by one table handle or one scan")
 
 namespace bolt {
 

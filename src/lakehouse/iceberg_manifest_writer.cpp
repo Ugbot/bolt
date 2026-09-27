@@ -385,7 +385,6 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
     if (files == nullptr && n_files != 0) return false;
     if (scratch == nullptr || out == nullptr || out_len == nullptr) return false;
     if (table_schema_json == nullptr || table_schema_len == 0) return false;
-    if (n_files > kIcebergMaxManifestEntries) return false;
     const uint32_t np = spec == nullptr ? 0u : spec->n_fields;
     if (np > kIcebergMaxFieldsPerSpec || np > kIcebergMaxPartitionValues) return false;
     if (np != 0u && result_types == nullptr) return false;
@@ -607,7 +606,6 @@ bool manifest_list_write_avro(const ManifestListEntry* entries,
     assert(out != nullptr && out_len != nullptr);
     if (entries == nullptr && n_entries != 0) return false;
     if (scratch == nullptr || out == nullptr || out_len == nullptr) return false;
-    if (n_entries > kIcebergMaxManifestsPerList) return false;
 
     ing::AvroField* fields = scratch->allocate_array<ing::AvroField>(kListFields);
     if (fields == nullptr) return false;

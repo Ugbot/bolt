@@ -160,6 +160,32 @@ bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept;
 bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
                             int32_t retain_last_n) noexcept;
 
+// Iceberg ExpireSnapshots: removes snapshots older than `older_than_ms`, but
+// never the current snapshot, a branch/tag head, or the newest `retain_last`
+// (>= 1) ancestors of the current snapshot. The snapshot-log is pruned the
+// way Java prunes it. With `delete_files`, the expired manifest lists and every
+// manifest no retained snapshot reaches are deleted after the commit; data
+// files are left to table_remove_orphans.
+struct ExpireOptions {
+    int64_t  older_than_ms;
+    uint32_t retain_last;
+    bool     delete_files;
+    uint8_t  _pad[3];
+};
+struct ExpireResult {
+    uint32_t expired;
+    uint32_t files_deleted;
+};
+bool table_expire_snapshots_ex(TableHandle* th, const ExpireOptions* o,
+                               ExpireResult* r) noexcept;
+
+// Per-table retention policy, persisted as the table properties
+// history.expire.max-snapshot-age-ms / history.expire.min-snapshots-to-keep
+// and applied after every commit (0 = unset; both 0 = keep everything, which
+// is Iceberg's own default without an expiry job).
+bool table_set_retention(TableHandle* th, int64_t max_snapshot_age_ms,
+                         int32_t min_snapshots_to_keep) noexcept;
+
 // Identify (and optionally delete) orphan files. `dry_run` populates out[][512]
 // with up to `cap` paths; *n is the total found.
 bool table_remove_orphans(TableHandle* th, uint64_t older_than_ms, bool dry_run,

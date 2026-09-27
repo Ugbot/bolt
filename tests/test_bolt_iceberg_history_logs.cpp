@@ -40,6 +40,9 @@ std::string fresh_root(const char* tag) {
 
 Schema make_schema() {
     Schema s{};
+    static SchemaField s_fields[8]{};  // Schema::fields is caller-owned storage
+    s.fields = s_fields;
+    s.cap_fields = 8u;
     s.schema_id = 0;
     s.n_fields  = 1;
     s.fields[0].id = 1; s.fields[0].required = true;
@@ -221,16 +224,19 @@ TEST(IcebergHistoryLogs, ExpiryPrunesSnapshotLog) {
     EXPECT_EQ(m.n_metadata_log, 4u);
 }
 
-// Both logs are bounded: the oldest entries go, the newest stay.
-TEST(IcebergHistoryLogs, LogsAreBoundedOldestDropped) {
+// The snapshot-log grows with the snapshots (only expiry prunes it); the
+// metadata-log keeps the newest kIcebergMaxMetadataLog, like Java's
+// write.metadata.previous-versions-max.
+TEST(IcebergHistoryLogs, SnapshotLogGrowsMetadataLogBounded) {
+    static bolt::Arena arena;
     static Metadata m{};
-    for (uint32_t i = 0; i < kIcebergMaxSnapshotLog + 5u; ++i) {
-        metadata_snapshot_log_push(&m, 1000 + i, 7000 + i);
+    metadata_init(&m, &arena, nullptr);
+    for (uint32_t i = 0; i < 300u; ++i) {
+        ASSERT_TRUE(metadata_snapshot_log_push(&m, 1000 + i, 7000 + i));
     }
-    ASSERT_EQ(m.n_snapshot_log, kIcebergMaxSnapshotLog);
-    EXPECT_EQ(m.snapshot_log[0].snapshot_id, 7005);
-    EXPECT_EQ(m.snapshot_log[kIcebergMaxSnapshotLog - 1u].snapshot_id,
-              7000 + static_cast<int64_t>(kIcebergMaxSnapshotLog) + 4);
+    ASSERT_EQ(m.n_snapshot_log, 300u);
+    EXPECT_EQ(m.snapshot_log[0].snapshot_id, 7000);
+    EXPECT_EQ(m.snapshot_log[299].snapshot_id, 7299);
     for (uint32_t i = 0; i < kIcebergMaxMetadataLog + 3u; ++i) {
         MetadataLogEntry e{};
         e.timestamp_ms = i;
@@ -244,11 +250,14 @@ TEST(IcebergHistoryLogs, LogsAreBoundedOldestDropped) {
 // Time travel by timestamp answers "what was CURRENT at T": a snapshot that
 // exists but never became current (a branch commit) must not be returned.
 TEST(IcebergHistoryLogs, AsOfTimestampFollowsSnapshotLog) {
+    static bolt::Arena arena;
     static Metadata m{};
-    m.n_snapshots = 2;
-    m.snapshots[0].snapshot_id = 11; m.snapshots[0].timestamp_ms = 100;
-    m.snapshots[1].snapshot_id = 22; m.snapshots[1].timestamp_ms = 200;
-    metadata_snapshot_log_push(&m, 100, 11);
+    metadata_init(&m, &arena, nullptr);
+    Snapshot a{}; a.snapshot_id = 11; a.timestamp_ms = 100;
+    Snapshot b{}; b.snapshot_id = 22; b.timestamp_ms = 200;
+    ASSERT_TRUE(metadata_push_snapshot(&m, &a));
+    ASSERT_TRUE(metadata_push_snapshot(&m, &b));
+    ASSERT_TRUE(metadata_snapshot_log_push(&m, 100, 11));
     const Snapshot* s = snapshot_at_timestamp(&m, 250);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->snapshot_id, 11);

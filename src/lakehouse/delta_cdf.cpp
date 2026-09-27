@@ -1,6 +1,7 @@
 // bolt/lakehouse/delta_cdf.cpp — CDF file lister (skeleton).
 
 #include "bolt/lakehouse/delta/cdf.h"
+#include "lake_grow.h"
 
 #include <cstring>
 
@@ -40,9 +41,8 @@ bool delta_cdf_list(ObjectStore* os, const char* table_rel_prefix,
                     Arena* arena, CdfFileSet* out) noexcept {
     assert(os != nullptr && arena != nullptr && out != nullptr);
     std::memset(out, 0, sizeof(*out));
-    out->files = arena->allocate_array<CdfFile>(kDeltaMaxCdfFiles);
-    if (out->files == nullptr) return false;
-    out->n_files_cap = kDeltaMaxCdfFiles;
+    out->files = nullptr;
+    out->n_files_cap = 0;
     char prefix[kDeltaMaxPath];
     if (!join_rel(table_rel_prefix, "_change_data/", prefix, sizeof(prefix)))
         return false;
@@ -53,12 +53,14 @@ bool delta_cdf_list(ObjectStore* os, const char* table_rel_prefix,
     if (rc != kOsOk) return false;
     for (uint32_t i = 0; i < n_entries; ++i) {
         if (!ends_with(entries[i].key, ".parquet")) continue;
-        if (out->n_files >= out->n_files_cap) return false;   // never drop
+        if (!lake_grow(arena, nullptr, &out->files, out->n_files,
+                       &out->n_files_cap, out->n_files + 1u))
+            return false;
         CdfFile* f = &out->files[out->n_files++];
         std::memset(f, 0, sizeof(*f));
         const size_t kl = std::strlen(entries[i].key);
-        const uint32_t n = kl >= sizeof(f->path) ? sizeof(f->path) - 1u
-                                                  : static_cast<uint32_t>(kl);
+        if (kl >= sizeof(f->path)) return false;   // a cut path names another file
+        const uint32_t n = static_cast<uint32_t>(kl);
         std::memcpy(f->path, entries[i].key, n);
         f->path[n] = '\0';
         f->kind = CdfKind::kInsert;

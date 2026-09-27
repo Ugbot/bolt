@@ -20,6 +20,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/ingest/bolt_avro.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
+#include "lake_grow.h"
 
 namespace bolt {
 namespace lakehouse {
@@ -92,6 +93,7 @@ struct MlCtx {
     ManifestListEntry* out;
     uint32_t           cap;
     uint32_t           n;
+    Arena*             grow;    // non-null: `out` doubles here instead of refusing
     int32_t f_path, f_len, f_spec, f_content, f_snap, f_added;
     int32_t f_seq, f_minseq;
     // G2ICE-49 -- the five file/row tallies `added_files_count` always had
@@ -104,7 +106,10 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     MlCtx* s = static_cast<MlCtx*>(c);
     assert(s != nullptr);
     assert(vals != nullptr);
-    if (s->n >= s->cap) return false;             // caller retries with more room
+    if (s->n >= s->cap &&
+        (s->grow == nullptr ||
+         !lake_grow(s->grow, nullptr, &s->out, s->n, &s->cap, s->n + 1u)))
+        return false;
     ManifestListEntry* e = &s->out[s->n];
     std::memset(e, 0, sizeof(*e));
     const auto at = [&](int32_t i) noexcept -> const ing::AvroValue* {
@@ -143,6 +148,9 @@ struct DfCtx {
     uint32_t     cap;
     uint32_t     n;
     int32_t      default_spec_id;
+    Arena*       grow;          // non-null: `out` doubles here instead of refusing
+    DataFileVisitFn visit;      // non-null: entries go here, `out` is unused
+    void*        visit_ctx;
 
     DataFileRef  pending;      // accumulates elements + scalars for one row
     int64_t      cur_row;
@@ -276,9 +284,13 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
             p->i64    = v->num.i64;
         }
     }
-    if (s->n >= s->cap) return false;       // caller retries with more room
-    s->out[s->n++] = *e;
     s->have_pending = false;
+    if (s->visit != nullptr) { ++s->n; return s->visit(s->visit_ctx, e); }
+    if (s->n >= s->cap &&
+        (s->grow == nullptr ||
+         !lake_grow(s->grow, nullptr, &s->out, s->n, &s->cap, s->n + 1u)))
+        return false;
+    s->out[s->n++] = *e;
     return true;
 }
 
@@ -294,25 +306,17 @@ void bind_rep(DfCtx* s, const ing::AvroHeader* h, const char* name,
 
 }  // namespace
 
-bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
-                              ManifestListEntry* out, uint32_t cap,
-                              uint32_t* out_n) noexcept {
-    assert(scratch != nullptr);
-    assert(out_n != nullptr);
-    if (src == nullptr || scratch == nullptr || out == nullptr ||
-        out_n == nullptr || cap == 0u) {
-        return false;
-    }
-    *out_n = 0;
+namespace {
+
+bool ml_parse(const uint8_t* src, uint64_t len, Arena* scratch,
+              MlCtx* ctx) noexcept {
+    assert(scratch != nullptr && ctx != nullptr);
     ing::AvroHeader* h = scratch->allocate_array<ing::AvroHeader>(1);
     if (h == nullptr) return false;                 // AvroHeader is ~34 KB
     uint64_t body = 0;
     if (!ing::avro_read_header(src, len, scratch, h, &body)) return false;
 
-    MlCtx s;
-    std::memset(&s, 0, sizeof(s));
-    s.out       = out;
-    s.cap       = cap;
+    MlCtx& s = *ctx;
     s.f_path    = find_field(h, "manifest_path");
     s.f_len     = find_field(h, "manifest_length");
     s.f_spec    = find_field(h, "partition_spec_id");
@@ -331,22 +335,55 @@ bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     if (s.f_path < 0) return false;
 
     int64_t rows = 0;
-    const bool ok = ing::avro_read(src, len, scratch, &s, ml_row, &rows);
-    *out_n = s.n;
-    if (!ok) return false;
-    return true;
+    return ing::avro_read(src, len, scratch, &s, ml_row, &rows);
 }
 
-bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
-                         int32_t default_spec_id,
-                         DataFileRef* out, uint32_t cap,
-                         uint32_t* out_n) noexcept {
+}  // namespace
+
+bool manifest_list_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                              ManifestListEntry* out, uint32_t cap,
+                              uint32_t* out_n) noexcept {
     assert(scratch != nullptr);
     assert(out_n != nullptr);
     if (src == nullptr || scratch == nullptr || out == nullptr ||
         out_n == nullptr || cap == 0u) {
         return false;
     }
+    MlCtx s;
+    std::memset(&s, 0, sizeof(s));
+    s.out = out;
+    s.cap = cap;
+    const bool ok = ml_parse(src, len, scratch, &s);
+    *out_n = s.n;
+    return ok;
+}
+
+bool manifest_list_parse_avro_grow(const uint8_t* src, uint64_t len,
+                                   Arena* arena, uint32_t hint,
+                                   ManifestListEntry** out,
+                                   uint32_t* out_n) noexcept {
+    assert(arena != nullptr);
+    assert(out != nullptr && out_n != nullptr);
+    *out = nullptr;
+    *out_n = 0;
+    if (src == nullptr) return false;
+    MlCtx s;
+    std::memset(&s, 0, sizeof(s));
+    s.grow = arena;
+    if (!lake_grow(arena, nullptr, &s.out, 0u, &s.cap, hint > 0u ? hint : 1u))
+        return false;
+    const bool ok = ml_parse(src, len, arena, &s);
+    *out = s.out;
+    *out_n = s.n;
+    return ok;
+}
+
+namespace {
+
+// Fills the field bindings of `proto` and decodes every entry.
+bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
+              const DfCtx* proto, uint32_t* out_n, DataFileRef** out) noexcept {
+    assert(scratch != nullptr && proto != nullptr && out_n != nullptr);
     *out_n = 0;
     ing::AvroHeader* h = scratch->allocate_array<ing::AvroHeader>(1);
     if (h == nullptr) return false;
@@ -357,9 +394,12 @@ bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     DfCtx* s = scratch->allocate_array<DfCtx>(1);
     if (s == nullptr) return false;
     std::memset(s, 0, sizeof(*s));
-    s->out             = out;
-    s->cap             = cap;
-    s->default_spec_id = default_spec_id;
+    s->out             = proto->out;
+    s->cap             = proto->cap;
+    s->default_spec_id = proto->default_spec_id;
+    s->grow            = proto->grow;
+    s->visit           = proto->visit;
+    s->visit_ctx       = proto->visit_ctx;
     s->f_status  = find_field(h, "status");
     s->f_snap    = find_field(h, "snapshot_id");
     s->f_content = find_field(h, "data_file.content");
@@ -392,8 +432,62 @@ bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
     const bool ok =
         ing::avro_read_ex(src, len, scratch, s, df_row, df_elem, &rows);
     *out_n = s->n;
-    if (!ok) return false;
-    return true;
+    if (out != nullptr) *out = s->out;
+    return ok;
+}
+
+}  // namespace
+
+bool manifest_parse_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                         int32_t default_spec_id,
+                         DataFileRef* out, uint32_t cap,
+                         uint32_t* out_n) noexcept {
+    assert(scratch != nullptr);
+    assert(out_n != nullptr);
+    if (src == nullptr || scratch == nullptr || out == nullptr ||
+        out_n == nullptr || cap == 0u) {
+        return false;
+    }
+    DfCtx proto;
+    std::memset(&proto, 0, sizeof(proto));
+    proto.out = out;
+    proto.cap = cap;
+    proto.default_spec_id = default_spec_id;
+    return df_parse(src, len, scratch, &proto, out_n, nullptr);
+}
+
+bool manifest_parse_avro_grow(const uint8_t* src, uint64_t len, Arena* arena,
+                              int32_t default_spec_id, uint32_t hint,
+                              DataFileRef** out, uint32_t* out_n) noexcept {
+    assert(arena != nullptr);
+    assert(out != nullptr && out_n != nullptr);
+    *out = nullptr;
+    *out_n = 0;
+    if (src == nullptr) return false;
+    DfCtx* proto = arena->allocate_array<DfCtx>(1);
+    if (proto == nullptr) return false;
+    std::memset(proto, 0, sizeof(*proto));
+    proto->grow = arena;
+    proto->default_spec_id = default_spec_id;
+    if (!lake_grow(arena, nullptr, &proto->out, 0u, &proto->cap,
+                   hint > 0u ? hint : 1u))
+        return false;
+    return df_parse(src, len, arena, proto, out_n, out);
+}
+
+bool manifest_visit_avro(const uint8_t* src, uint64_t len, Arena* scratch,
+                         int32_t default_spec_id, DataFileVisitFn fn,
+                         void* ctx, uint32_t* out_n) noexcept {
+    assert(scratch != nullptr && fn != nullptr);
+    assert(out_n != nullptr);
+    if (src == nullptr) return false;
+    DfCtx* proto = scratch->allocate_array<DfCtx>(1);
+    if (proto == nullptr) return false;
+    std::memset(proto, 0, sizeof(*proto));
+    proto->default_spec_id = default_spec_id;
+    proto->visit = fn;
+    proto->visit_ctx = ctx;
+    return df_parse(src, len, scratch, proto, out_n, nullptr);
 }
 
 }  // namespace iceberg

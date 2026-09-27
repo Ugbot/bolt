@@ -38,6 +38,9 @@ Schema make_schema_i64_utf8() {
     // slice — the parquet writer requires precise StringView setup the
     // append path doesn't perform yet).
     Schema s{};
+    static SchemaField s_fields[8]{};  // Schema::fields is caller-owned storage
+    s.fields = s_fields;
+    s.cap_fields = 8u;
     s.schema_id = 0;
     s.n_fields  = 1;
     s.fields[0].id = 1; s.fields[0].required = true;

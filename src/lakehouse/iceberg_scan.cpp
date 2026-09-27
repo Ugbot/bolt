@@ -59,6 +59,7 @@
 #include "bolt/lakehouse/iceberg/snapshot.h"
 #include "bolt/lakehouse/iceberg/statistics.h"
 #include "bolt/lakehouse/object_store.h"
+#include "lake_grow.h"
 
 namespace bolt {
 namespace lakehouse {
@@ -70,9 +71,6 @@ namespace {
 
 constexpr uint32_t kMaxNsName       = 128u;
 constexpr uint32_t kMaxFsRoot       = 1024u;
-constexpr uint32_t kLiveFilesInitial = 4096u;
-constexpr uint32_t kMaxPosDels      = 16384u;
-constexpr uint32_t kMaxEqDels       = 4096u;
 
 bool join_ns(const char* ns, const char* name, char* out,
              uint32_t cap) noexcept {
@@ -320,15 +318,33 @@ struct TableHandle {
     uint8_t               _pad[7];
 };
 
+// One live data file that passed pruning. The path lives in the manifest
+// arena, which is reset when the scan moves to the next manifest.
+struct FileTask {
+    const char* path;
+};
+
+// Manifests are evaluated one at a time as the scan reaches them (delete
+// manifests all at open, since a delete applies to every data file). Only the
+// current manifest's surviving files are held, in `man_arena`; metadata
+// memory is O(manifest list + largest manifest + delete set), charged to
+// `budget`, never O(table files).
 struct ScanHandle {
     TableHandle*  table;
     Arena*        scratch;
     ReadOptions   opts;
     Snapshot      snap;
-    DataFileRef*  live_files;
-    uint32_t      n_live;
-    uint32_t      live_cap;
+    Budget*       budget;
+    ManifestListEntry* mlist;
+    uint32_t      n_mlist;
+    uint32_t      next_manifest;
+    Arena*        man_arena;
+    uint64_t      man_charged;
+    FileTask*     tasks;
+    uint32_t      n_tasks;
+    uint32_t      tasks_cap;
     uint32_t      cur_file_idx;
+    uint32_t      _pad0;
     pq::PqMeta*   cur_meta;
     const uint8_t* cur_body;
     uint64_t      cur_body_len;
@@ -478,13 +494,19 @@ namespace {
 // than advancing past the file — the pre-G2FEAT-125 code skipped, which
 // silently returned a short result. Returns false with *out_err false only
 // when the file list is genuinely exhausted.
+bool load_next_manifest(ScanHandle* s, bool* out_err) noexcept;
+
 bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
     assert(s != nullptr);
     assert(out_err != nullptr);
     *out_err = false;
-    if (s->cur_file_idx >= s->n_live) return false;
-    const DataFileRef& f = s->live_files[s->cur_file_idx];
-    const char* dot = std::strrchr(f.file_path, '.');
+    // Bounded: each round consumes one manifest.
+    while (s->cur_file_idx >= s->n_tasks) {
+        if (s->next_manifest >= s->n_mlist) return false;
+        if (!load_next_manifest(s, out_err)) return false;
+    }
+    const FileTask& f = s->tasks[s->cur_file_idx];
+    const char* dot = std::strrchr(f.path, '.');
     if (dot == nullptr ||
         !(std::strcmp(dot, ".parquet") == 0 ||
           std::strcmp(dot, ".PARQUET") == 0 ||
@@ -494,7 +516,7 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
     }
     const uint8_t* body = nullptr; uint64_t blen = 0;
     if (!read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
-                  s->table->table_rel, f.file_path, s->scratch,
+                  s->table->table_rel, f.path, s->scratch,
                   &body, &blen)) {
         *out_err = true;
         return false;
@@ -581,8 +603,19 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
             return false;
         }
         const int64_t* pos_vals = static_cast<const int64_t*>(pos_col.data);
+        if (rows < 0 ||
+            static_cast<uint64_t>(s->pos_dels.n) + static_cast<uint64_t>(rows) >
+                UINT32_MAX) {
+            set_resource_exhausted(kLakeMetadataKnob,
+                                   static_cast<uint64_t>(rows), UINT32_MAX);
+            return false;
+        }
+        if (!lake_grow(s->scratch, s->budget, &s->pos_dels.entries,
+                       s->pos_dels.n, &s->pos_dels.cap,
+                       s->pos_dels.n + static_cast<uint32_t>(rows)))
+            return false;   // budget refused: fail closed, never a partial set
         for (int64_t r = 0; r < rows; ++r) {
-            if (s->pos_dels.n >= s->pos_dels.cap) return false;  // overflow: fail closed
+            assert(s->pos_dels.n < s->pos_dels.cap);
             const uint8_t* pdata = nullptr; int32_t plen = 0;
             path_col.utf8_at(r, &pdata, &plen);
             if (plen <= 0 || static_cast<uint32_t>(plen) >= kIcebergMaxPath) return false;
@@ -596,27 +629,40 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
     return true;
 }
 
-// Insertion sort by (file_path, pos) -- position_delete_set_contains'
-// binary-search branch (n > 32) requires this ordering. One-time cost at
-// scan_open, bounded by kMaxPosDels; a real Iceberg delete file for a
-// single seal/tier eviction is tiny (hundreds to low thousands of rows),
-// so O(n^2) here is not the risk kMaxPosDels' size might suggest -- but
-// bound the outer loop defensively anyway.
-void sort_position_deletes(PositionDeleteSet* s) noexcept {
-    assert(s != nullptr);
-    for (uint32_t i = 1; i < s->n; ++i) {
-        PositionDeleteEntry key = s->entries[i];
-        uint32_t j = i;
-        while (j > 0) {
-            const PositionDeleteEntry& prev = s->entries[j - 1];
-            const int c = std::strcmp(prev.file_path, key.file_path);
-            const bool after = (c > 0) || (c == 0 && prev.pos > key.pos);
-            if (!after) break;
-            s->entries[j] = s->entries[j - 1];
-            --j;
+// Order by (file_path, pos) -- position_delete_set_contains' binary-search
+// branch (n > 32) requires it. Entries are 1 KiB, so sort indices (shell sort:
+// no recursion, no allocation beyond two arrays) and permute once.
+bool pos_del_less(const PositionDeleteEntry& a,
+                  const PositionDeleteEntry& b) noexcept {
+    const int c = std::strcmp(a.file_path, b.file_path);
+    return c < 0 || (c == 0 && a.pos < b.pos);
+}
+
+bool sort_position_deletes(PositionDeleteSet* s, Arena* a, Budget* b) noexcept {
+    assert(s != nullptr && a != nullptr);
+    if (s->n < 2u) return true;
+    uint32_t* idx = nullptr; uint32_t icap = 0;
+    PositionDeleteEntry* out = nullptr; uint32_t ocap = 0;
+    if (!lake_grow(a, b, &idx, 0u, &icap, s->n)) return false;
+    if (!lake_grow(a, b, &out, 0u, &ocap, s->n)) return false;
+    for (uint32_t i = 0; i < s->n; ++i) idx[i] = i;
+    const PositionDeleteEntry* e = s->entries;
+    for (uint32_t gap = s->n / 2u; gap > 0u; gap /= 2u) {     // bounded
+        for (uint32_t i = gap; i < s->n; ++i) {
+            const uint32_t x = idx[i];
+            uint32_t j = i;
+            while (j >= gap && pos_del_less(e[x], e[idx[j - gap]])) {
+                idx[j] = idx[j - gap];
+                j -= gap;
+            }
+            idx[j] = x;
         }
-        s->entries[j] = key;
     }
+    for (uint32_t i = 0; i < s->n; ++i) out[i] = e[idx[i]];
+    s->entries = out;
+    s->cap = ocap;
+    assert(s->n <= s->cap);
+    return true;
 }
 
 // Filter deleted rows out of one just-decoded row group, in place. `cols`
@@ -695,64 +741,173 @@ bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
 
 namespace {
 
-// Live files double in the scan arena; a failed allocation fails the scan
-// rather than dropping files past a fixed count.
-bool grow_live_files(ScanHandle* s) noexcept {
-    assert(s != nullptr && s->live_files != nullptr);
-    assert(s->n_live == s->live_cap);
-    if (s->live_cap > (UINT32_MAX / 2u)) return false;
-    const uint32_t cap = s->live_cap * 2u;
-    DataFileRef* grown = s->scratch->allocate_array<DataFileRef>(cap);
-    if (grown == nullptr) return false;
-    std::memcpy(grown, s->live_files, sizeof(DataFileRef) * s->n_live);
-    s->live_files = grown;
-    s->live_cap = cap;
-    return true;
-}
+// JSON manifests (the W4 fixtures) refuse past `cap` with `*n == cap`;
+// retry with doubled room so no count is a ceiling.
+constexpr uint32_t kParseGrowRounds = 32u;
 
-// The parsers refuse past `cap` with `*n == cap`; any other failure is a real
-// parse error. Retry with doubled room so no count is a ceiling.
-constexpr uint32_t kParseGrowRounds = 16u;
-
-bool parse_manifest_list_grow(Arena* a, const uint8_t* body, uint64_t blen,
-                              ManifestListEntry** out, uint32_t* n) noexcept {
+bool parse_manifest_list_any(Arena* a, const uint8_t* body, uint64_t blen,
+                             ManifestListEntry** out, uint32_t* n) noexcept {
     assert(a != nullptr && body != nullptr);
     assert(out != nullptr && n != nullptr);
-    uint32_t cap = kIcebergMaxManifestsPerList;
+    // A real manifest list is Avro; the W4 fixtures are JSON. Dispatch on the
+    // bytes, never on a build flag.
+    if (is_avro_ocf(body, blen))
+        return manifest_list_parse_avro_grow(body, blen, a, 64u, out, n);
+    uint32_t cap = 64u;
     for (uint32_t r = 0; r < kParseGrowRounds; ++r, cap *= 2u) {   // bounded
         ManifestListEntry* buf = a->allocate_array<ManifestListEntry>(cap);
         if (buf == nullptr) return false;
         *n = 0;
-        // A real manifest list is Avro; the W4 fixtures are JSON. Dispatch on
-        // the bytes, never on a build flag.
-        const bool ok = is_avro_ocf(body, blen)
-            ? manifest_list_parse_avro(body, blen, a, buf, cap, n)
-            : manifest_list_parse_json(body, static_cast<uint32_t>(blen), a,
-                                       buf, cap, n);
-        if (ok) { *out = buf; return true; }
+        if (manifest_list_parse_json(body, static_cast<uint32_t>(blen), a,
+                                     buf, cap, n)) {
+            *out = buf;
+            return true;
+        }
         if (*n < cap) return false;
     }
     return false;
 }
 
-bool parse_manifest_grow(Arena* a, const uint8_t* body, uint64_t blen,
-                         int32_t spec_id, DataFileRef** out,
-                         uint32_t* n) noexcept {
-    assert(a != nullptr && body != nullptr);
-    assert(out != nullptr && n != nullptr);
-    uint32_t cap = kIcebergMaxManifestEntries;
+// What an entry means to the scan, one rule for the data and delete passes.
+enum class EntryUse : uint8_t { kSkip, kData, kPosDelete, kRefuse };
+
+EntryUse classify(const DataFileRef& e, ManifestContent mc) noexcept {
+    if (e.status == ManifestStatus::kDeleted) return EntryUse::kSkip;
+    // Equality deletes have no loader: skipping one over-reports rows.
+    if (e.content == FileContent::kEqualityDeletes) return EntryUse::kRefuse;
+    if (mc == ManifestContent::kDeleteManifest ||
+        e.content == FileContent::kPositionDeletes)
+        return EntryUse::kPosDelete;
+    return EntryUse::kData;
+}
+
+struct VisitCtx {
+    ScanHandle*          s;
+    const PartitionSpec* spec;
+    const Schema*        sch;
+    ManifestContent      mc;
+    bool                 deletes_pass;
+    bool                 failed;
+    uint8_t              _pad[5];
+};
+
+bool push_task(ScanHandle* s, const char* path) noexcept {
+    assert(s != nullptr && path != nullptr);
+    const size_t len = std::strlen(path);
+    const uint64_t before = s->tasks_cap;
+    if (!lake_grow(s->man_arena, nullptr, &s->tasks, s->n_tasks, &s->tasks_cap,
+                   s->n_tasks + 1u))
+        return false;
+    const uint64_t charge =
+        (s->tasks_cap - before) * sizeof(FileTask) + len + 1u;
+    if (!s->budget->try_reserve(charge)) return false;
+    s->man_charged += charge;
+    char* p = s->man_arena->allocate_array<char>(len + 1u);
+    if (p == nullptr) return false;
+    std::memcpy(p, path, len + 1u);
+    s->tasks[s->n_tasks++].path = p;
+    return true;
+}
+
+bool visit_entry(void* c, const DataFileRef* e) noexcept {
+    VisitCtx* v = static_cast<VisitCtx*>(c);
+    assert(v != nullptr && e != nullptr);
+    const EntryUse use = classify(*e, v->mc);
+    if (use == EntryUse::kRefuse) { v->failed = true; return false; }
+    if (use == EntryUse::kSkip) return true;
+    if (v->deletes_pass) {
+        if (use != EntryUse::kPosDelete) return true;
+        if (!load_position_delete_file(v->s, *e)) { v->failed = true; return false; }
+        return true;
+    }
+    // A delete file in a data manifest breaks the spec's layout and the delete
+    // pass skipped it: refuse rather than under-delete.
+    if (use == EntryUse::kPosDelete) {
+        if (v->mc == ManifestContent::kDeleteManifest) return true;
+        v->failed = true;
+        return false;
+    }
+    const ScanHandle* s = v->s;
+    if (!partition_passes(e, v->spec, v->sch, s->opts.predicates,
+                          s->opts.n_predicates))
+        return true;
+    if (!stats_pass(e, v->sch, s->opts.predicates, s->opts.n_predicates))
+        return true;
+    if (!push_task(v->s, e->file_path)) { v->failed = true; return false; }
+    return true;
+}
+
+// Decode one manifest, feeding every entry to visit_entry. Scratch is the
+// manifest arena; the caller resets it.
+bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
+                       bool deletes_pass) noexcept {
+    assert(s != nullptr && s->man_arena != nullptr);
+    TableHandle* h = s->table;
+    const uint8_t* body = nullptr; uint64_t blen = 0;
+    // A manifest the list names but the store cannot produce is missing data,
+    // not an empty manifest — fail rather than under-report.
+    if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
+                  mle.manifest_path, s->man_arena, &body, &blen))
+        return false;
+    VisitCtx v{};
+    v.s = s;
+    v.spec = metadata_spec(&h->meta, mle.partition_spec_id);
+    v.sch = metadata_current_schema(&h->meta);
+    v.mc = mle.content;
+    v.deletes_pass = deletes_pass;
+    uint32_t n = 0;
+    if (is_avro_ocf(body, blen)) {
+        const bool ok = manifest_visit_avro(body, blen, s->man_arena,
+                                            mle.partition_spec_id, visit_entry,
+                                            &v, &n);
+        return ok && !v.failed;
+    }
+    uint32_t cap = 64u;
     for (uint32_t r = 0; r < kParseGrowRounds; ++r, cap *= 2u) {   // bounded
-        DataFileRef* buf = a->allocate_array<DataFileRef>(cap);
+        DataFileRef* buf = s->man_arena->allocate_array<DataFileRef>(cap);
         if (buf == nullptr) return false;
-        *n = 0;
-        const bool ok = is_avro_ocf(body, blen)
-            ? manifest_parse_avro(body, blen, a, spec_id, buf, cap, n)
-            : manifest_parse_json(body, static_cast<uint32_t>(blen), a,
-                                  spec_id, buf, cap, n);
-        if (ok) { *out = buf; return true; }
-        if (*n < cap) return false;
+        n = 0;
+        if (manifest_parse_json(body, static_cast<uint32_t>(blen), s->man_arena,
+                                mle.partition_spec_id, buf, cap, &n)) {
+            for (uint32_t i = 0; i < n; ++i)                        // bounded
+                if (!visit_entry(&v, &buf[i])) return false;
+            return true;
+        }
+        if (n < cap) return false;
     }
     return false;
+}
+
+void reset_manifest_arena(ScanHandle* s) noexcept {
+    assert(s != nullptr && s->man_arena != nullptr);
+    s->man_arena->reset();
+    if (s->man_charged != 0) s->budget->release(s->man_charged);
+    s->man_charged = 0;
+    s->tasks = nullptr;
+    s->n_tasks = 0;
+    s->tasks_cap = 0;
+    s->cur_file_idx = 0;
+}
+
+// Advance to the next data manifest. The open file's body and footer live in
+// other arenas, so resetting the manifest arena between files is safe.
+bool load_next_manifest(ScanHandle* s, bool* out_err) noexcept {
+    assert(s != nullptr && out_err != nullptr);
+    assert(s->next_manifest < s->n_mlist);
+    reset_manifest_arena(s);
+    const ManifestListEntry& mle = s->mlist[s->next_manifest++];
+    if (mle.content == ManifestContent::kDeleteManifest) return true;
+    if (!evaluate_manifest(s, mle, false)) {
+        *out_err = true;
+        return false;
+    }
+    return true;
+}
+
+Arena* new_arena(Arena* in) noexcept {
+    assert(in != nullptr);
+    void* p = in->allocate(sizeof(Arena), alignof(Arena));
+    return p == nullptr ? nullptr : new (p) Arena();
 }
 
 }  // namespace
@@ -760,98 +915,60 @@ bool parse_manifest_grow(Arena* a, const uint8_t* body, uint64_t blen,
 bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                        const ReadOptions* opts) noexcept {
     assert(out != nullptr && h != nullptr);
+    *out = nullptr;
     if (!h->meta_loaded) return false;
     ScanHandle* s = h->arena->allocate_array<ScanHandle>(1);
     if (s == nullptr) return false;
     std::memset(s, 0, sizeof(*s));
     s->table = h;
     s->scratch = h->arena;
-    void* ma = h->arena->allocate(sizeof(Arena), alignof(Arena));
-    if (ma == nullptr) return false;
-    s->meta_arena = new (ma) Arena();
+    s->meta_arena = new_arena(h->arena);
+    s->man_arena = new_arena(h->arena);
+    void* bp = h->arena->allocate(sizeof(Budget), alignof(Budget));
+    EqualityDeleteI64* ed_buf = h->arena->allocate_array<EqualityDeleteI64>(1u);
+    if (s->meta_arena == nullptr || s->man_arena == nullptr || bp == nullptr ||
+        ed_buf == nullptr)
+        return false;
+    s->budget = new (bp) Budget(kLakeMetadataKnob, lake_metadata_budget_bytes());
     if (opts != nullptr) s->opts = *opts; else read_options_init(&s->opts);
+    s->pos_dels.entries = nullptr;
+    s->pos_dels.n = 0;
+    s->pos_dels.cap = 0;
+    equality_delete_set_init(&s->eq_dels, ed_buf, 1u);
     if (!snapshot_resolve(&h->meta, s->opts.snapshot_id, s->opts.timestamp_ms,
                           &s->snap)) {
         // Only a table with no snapshot at all is legitimately empty.
         if (s->opts.snapshot_id >= 0 || s->opts.timestamp_ms >= 0 ||
             h->meta.current_snapshot_id >= 0)
             return false;
-        s->live_files = h->arena->allocate_array<DataFileRef>(1u);
-        s->n_live = 0;
         *out = s;
         return true;
     }
-    ManifestListEntry* mlist = nullptr;
-    uint32_t n_mlist = 0;
     {
         const uint8_t* body = nullptr; uint64_t blen = 0;
         if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
                       s->snap.manifest_list, h->arena, &body, &blen)) {
             return false;
         }
-        if (!parse_manifest_list_grow(h->arena, body, blen, &mlist, &n_mlist))
+        if (!parse_manifest_list_any(h->arena, body, blen, &s->mlist,
+                                     &s->n_mlist))
+            return false;
+        if (!s->budget->try_reserve(sizeof(ManifestListEntry) *
+                                    static_cast<uint64_t>(s->n_mlist)))
             return false;
     }
-    s->live_files = h->arena->allocate_array<DataFileRef>(kLiveFilesInitial);
-    if (s->live_files == nullptr) return false;
-    s->live_cap = kLiveFilesInitial;
-    PositionDeleteEntry* pd_buf =
-        h->arena->allocate_array<PositionDeleteEntry>(kMaxPosDels);
-    EqualityDeleteI64* ed_buf =
-        h->arena->allocate_array<EqualityDeleteI64>(kMaxEqDels);
-    if (pd_buf == nullptr || ed_buf == nullptr) return false;
-    position_delete_set_init(&s->pos_dels, pd_buf, kMaxPosDels);
-    equality_delete_set_init(&s->eq_dels, ed_buf, kMaxEqDels);
-
-    const Schema* sch = metadata_current_schema(&h->meta);
-    for (uint32_t mi = 0; mi < n_mlist; ++mi) {
-        const ManifestListEntry& mle = mlist[mi];
-        const uint8_t* body = nullptr; uint64_t blen = 0;
-        // A manifest the list names but the store cannot produce is missing
-        // data, not an empty manifest — fail rather than under-report.
-        if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
-                      mle.manifest_path, h->arena, &body, &blen)) {
-            return false;
-        }
-        DataFileRef* entries = nullptr;
-        uint32_t n_entries = 0;
-        if (!parse_manifest_grow(h->arena, body, blen, mle.partition_spec_id,
-                                 &entries, &n_entries))
-            return false;
-        const PartitionSpec* spec =
-            metadata_spec(&h->meta, mle.partition_spec_id);
-        for (uint32_t ei = 0; ei < n_entries; ++ei) {
-            DataFileRef& e = entries[ei];
-            if (e.status == ManifestStatus::kDeleted) continue;
-            // G2ICE-82/W5-delete-load: POSITION deletes are now loaded and
-            // applied against every row group they cover (see
-            // apply_position_deletes_to_group below) -- bolt's own
-            // table_delete_positions() writes exactly this shape. EQUALITY
-            // deletes still have no loader and no writer anywhere in this
-            // tree, so skipping one would over-report rows: decline the
-            // scan rather than silently under-delete.
-            if (e.content == FileContent::kEqualityDeletes) {
-                return false;
-            }
-            if (mle.content == ManifestContent::kDeleteManifest ||
-                e.content == FileContent::kPositionDeletes) {
-                if (!load_position_delete_file(s, e)) return false;
-                continue;  // a delete file is never itself a live data file
-            }
-            if (!partition_passes(&e, spec, sch,
-                                  s->opts.predicates, s->opts.n_predicates))
-                continue;
-            if (!stats_pass(&e, sch,
-                            s->opts.predicates, s->opts.n_predicates))
-                continue;
-            if (s->n_live == s->live_cap && !grow_live_files(s)) return false;
-            s->live_files[s->n_live++] = e;
-        }
+    // Delete manifests first: a delete applies to data files in any manifest,
+    // including ones the scan has not reached yet.
+    // The spec keeps delete files in delete manifests; one found in a data
+    // manifest later fails the scan (visit_entry).
+    for (uint32_t mi = 0; mi < s->n_mlist; ++mi) {                // bounded
+        if (s->mlist[mi].content != ManifestContent::kDeleteManifest) continue;
+        reset_manifest_arena(s);
+        if (!evaluate_manifest(s, s->mlist[mi], true)) return false;
     }
-    // position_delete_set_contains binary-searches once n > 32; entries were
-    // appended file-by-file, not (file_path, pos)-ordered, across possibly
-    // several delete files -- sort once, here, rather than per lookup.
-    sort_position_deletes(&s->pos_dels);
+    reset_manifest_arena(s);
+    if (!sort_position_deletes(&s->pos_dels, h->arena, s->budget)) return false;
+    s->next_manifest = 0;
     s->cur_file_idx = 0;
     s->cur_file_open = false;
     *out = s;
@@ -864,10 +981,9 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     *out_eof = false;
     BoltBatch::init_empty(out);
     out->arena = s->scratch;
-    if (s->n_live == 0) { *out_eof = true; return true; }
-    const uint64_t guard_max =
-        static_cast<uint64_t>(s->n_live) * (kLakeMaxRowGroups + 1u) + 1u;
-    for (uint64_t guard = 0; guard <= guard_max; ++guard) {   // bounded
+    // Bounded: every iteration returns, decodes a row group, or retires a file.
+    constexpr uint64_t kGuardMax = UINT64_C(1) << 48;
+    for (uint64_t guard = 0; guard <= kGuardMax; ++guard) {
         if (!s->cur_file_open) {
             bool err = false;
             if (!open_next_file(s, &err)) {
@@ -902,8 +1018,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // pre-filter row count -- capture it before the filter can shrink
         // `rows`.
         const int64_t decoded_rows = rows;
-        const DataFileRef& live_file = s->live_files[s->cur_file_idx];
-        if (!apply_position_deletes_to_group(&s->pos_dels, live_file.file_path,
+        const FileTask& live_file = s->tasks[s->cur_file_idx];
+        if (!apply_position_deletes_to_group(&s->pos_dels, live_file.path,
                                              s->cur_file_row_base, cols,
                                              s->cur_meta->n_columns, &rows,
                                              s->scratch)) {
@@ -931,6 +1047,10 @@ void iceberg_scan_close(ScanHandle* s) noexcept {
     s->cur_meta = nullptr;
     s->meta_arena->~Arena();
     s->meta_arena = nullptr;
+    if (s->man_arena != nullptr) {
+        s->man_arena->~Arena();
+        s->man_arena = nullptr;
+    }
 }
 
 }  // namespace iceberg

@@ -49,6 +49,7 @@
 
 #if defined(BOLT_BUILD_INGEST_PARQUET) || 1
 #include "bolt/ingest/bolt_parquet_write.h"
+#include "lake_grow.h"
 #endif
 
 namespace bolt {
@@ -101,7 +102,12 @@ struct AppendHandle {
 
 namespace {
 
+// Doubles in its arena; `cap` is only the first block. Past 4 GiB (uint32 len)
+// an emit fails rather than truncating.
+void apply_retention_policy(TableHandle* th) noexcept;
+
 struct Buf {
+    Arena*   arena;
     uint8_t* data;
     uint32_t len;
     uint32_t cap;
@@ -109,6 +115,7 @@ struct Buf {
 
 bool buf_init(Buf* b, Arena* a, uint32_t cap) noexcept {
     assert(b != nullptr && a != nullptr && cap > 0u);
+    b->arena = a;
     b->data = a->allocate_array<uint8_t>(cap);
     if (b->data == nullptr) return false;
     b->len = 0;
@@ -116,10 +123,28 @@ bool buf_init(Buf* b, Arena* a, uint32_t cap) noexcept {
     return true;
 }
 
+// Room for `n` more bytes plus a NUL.
+bool buf_room(Buf* b, uint64_t n) noexcept {
+    assert(b != nullptr && b->arena != nullptr);
+    const uint64_t need = static_cast<uint64_t>(b->len) + n + 1u;
+    if (need <= b->cap) return true;
+    if (need > UINT32_MAX) return false;
+    uint64_t want = static_cast<uint64_t>(b->cap) * 2u;
+    if (want < need) want = need;
+    if (want > UINT32_MAX) want = UINT32_MAX;
+    uint8_t* next = b->arena->allocate_array<uint8_t>(static_cast<size_t>(want));
+    if (next == nullptr) return false;
+    std::memcpy(next, b->data, b->len);
+    b->data = next;
+    b->cap = static_cast<uint32_t>(want);
+    assert(b->cap >= need);
+    return true;
+}
+
 bool buf_put(Buf* b, const char* s) noexcept {
     assert(b != nullptr && s != nullptr);
     const size_t n = std::strlen(s);
-    if (b->len + n > b->cap) return false;
+    if (!buf_room(b, n)) return false;
     std::memcpy(b->data + b->len, s, n);
     b->len += static_cast<uint32_t>(n);
     return true;
@@ -127,7 +152,7 @@ bool buf_put(Buf* b, const char* s) noexcept {
 
 bool buf_putn(Buf* b, const void* p, uint32_t n) noexcept {
     assert(b != nullptr && p != nullptr);
-    if (b->len + n > b->cap) return false;
+    if (!buf_room(b, n)) return false;
     std::memcpy(b->data + b->len, p, n);
     b->len += n;
     return true;
@@ -162,7 +187,7 @@ bool buf_put_jstr(Buf* b, const char* s) noexcept {
         if (esc != nullptr) {
             if (!buf_put(b, esc)) return false;
         } else {
-            if (b->len + 1u > b->cap) return false;
+            if (!buf_room(b, 1u)) return false;
             b->data[b->len++] = static_cast<uint8_t>(c);
         }
     }
@@ -429,7 +454,6 @@ bool emit_name_mapping_json(Arena* a, const Schema* s,
                             const char** out) noexcept {
     assert(a != nullptr && out != nullptr);
     if (s == nullptr) return false;
-    if (s->n_fields > kIcebergMaxFieldsPerSchema) return false;
     Buf b;
     // One extra byte is reserved below for the NUL, so cap is never reached
     // exactly by buf_put; a full buffer fails the emit rather than truncating.
@@ -452,8 +476,11 @@ bool emit_name_mapping_json(Arena* a, const Schema* s,
 // snapshot-log, in timestamp order: Java rejects an unsorted log.
 bool emit_snapshot_log(Buf* b, const Metadata* m) noexcept {
     assert(b != nullptr && m != nullptr);
-    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
-    uint32_t order[kIcebergMaxSnapshotLog];
+    assert(m->n_snapshot_log <= m->cap_snapshot_log);
+    // Insertion sort: the log is appended in commit order, so it is almost
+    // always already sorted and this is linear.
+    uint32_t* order = b->arena->allocate_array<uint32_t>(m->n_snapshot_log + 1u);
+    if (order == nullptr) return false;
     for (uint32_t i = 0; i < m->n_snapshot_log; ++i) {          // bounded
         uint32_t j = i;
         while (j > 0 && m->snapshot_log[order[j - 1u]].timestamp_ms >
@@ -505,7 +532,7 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         Arena* a, const uint8_t** out, uint64_t* out_len) noexcept {
     assert(m != nullptr && a != nullptr && out != nullptr && out_len != nullptr);
     Buf b;
-    // Worst case: 64 snapshots + 64 metadata-log entries at 1 KiB paths.
+    // First block; grows with the snapshot count.
     if (!buf_init(&b, a, 256u * 1024u)) return false;
     if (!buf_fmt(&b, "{\"format-version\":%d,", m->format_version)) return false;
     if (!buf_kv_str(&b, "table-uuid", m->table_uuid, true)) return false;
@@ -640,6 +667,16 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
             if (!buf_kv_str(&b, "schema.name-mapping.default", nm,
                             false)) return false;
         }
+        if (m->retention_max_age_ms > 0 &&
+            !buf_fmt(&b, "%s\"history.expire.max-snapshot-age-ms\":\"%lld\"",
+                     cur != nullptr ? "," : "",
+                     static_cast<long long>(m->retention_max_age_ms)))
+            return false;
+        if (m->retention_min_snapshots > 0 &&
+            !buf_fmt(&b, "%s\"history.expire.min-snapshots-to-keep\":\"%d\"",
+                     (cur != nullptr || m->retention_max_age_ms > 0) ? "," : "",
+                     m->retention_min_snapshots))
+            return false;
     }
     if (!buf_put(&b, "},")) return false;
 
@@ -729,7 +766,6 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
                       uint64_t* out_len) noexcept {
     assert(a != nullptr && s != nullptr);
     assert(out != nullptr && out_len != nullptr);
-    if (s->n_fields > kIcebergMaxFieldsPerSchema) return false;
     Buf b;
     if (!buf_init(&b, a, 64u * 1024u)) return false;
     if (!buf_fmt(&b, "{\"type\":\"struct\",\"schema-id\":%d,\"fields\":[",
@@ -769,6 +805,7 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     h->arena = arena;
     h->os    = os;
     std::strncpy(h->root, path, sizeof(h->root) - 1u);
+    metadata_init(&h->meta, arena, nullptr);
     h->meta.format_version       = 2;
     h->meta.current_schema_id    = schema->schema_id;
     h->meta.current_spec_id      = spec ? spec->spec_id : 0;
@@ -779,8 +816,11 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     table_uuid_from_location(path, h->meta.table_uuid,
                              sizeof(h->meta.table_uuid));
     std::strncpy(h->meta.location, path, sizeof(h->meta.location) - 1u);
-    h->meta.n_schemas        = 1;
-    h->meta.schemas[0]       = *schema;
+    {
+        Schema* s0 = metadata_push_schema(&h->meta);
+        if (s0 == nullptr || !schema_copy(s0, schema, arena, nullptr))
+            return false;
+    }
     h->meta.n_specs          = 1;
     if (spec != nullptr) h->meta.specs[0] = *spec;
     else                  h->meta.specs[0].spec_id = 0;
@@ -1122,7 +1162,6 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                       SnapshotOp op, int64_t snap_id) noexcept {
     assert(th != nullptr);
     assert(th->arena != nullptr && th->os != nullptr);
-    if (th->meta.n_snapshots >= kIcebergMaxSnapshots) return false;
     if (files == nullptr && nf != 0) return false;
     if (!handle_is_current(th)) return false;
 
@@ -1176,9 +1215,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // table_overwrite/table_delete), and carrying files forward under an
     // operation named "overwrite" would assert a table state the writer has
     // not actually computed.
-    ManifestListEntry* mlist =
-        th->arena->allocate_array<ManifestListEntry>(kIcebergMaxManifestsPerList);
-    if (mlist == nullptr) return false;
+    ManifestListEntry* mlist = nullptr;
     uint32_t n_mlist = 0;
     // kDelete joins kAppend here. A delete snapshot that started a fresh list
     // would drop every data manifest and empty the table -- the delete would
@@ -1203,12 +1240,19 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
             // A parent list the store cannot produce means manifests we would
             // silently drop — fail the commit instead.
             if (os_get(th->os, pkey, th->arena, &pb, &pl) != kOsOk) return false;
-            if (!manifest_list_parse_avro(pb, pl, th->arena, mlist,
-                                          kIcebergMaxManifestsPerList - 1u,
-                                          &n_mlist)) return false;
+            if (!manifest_list_parse_avro_grow(pb, pl, th->arena, 1u, &mlist,
+                                               &n_mlist)) return false;
         }
     }
-    if (n_mlist >= kIcebergMaxManifestsPerList) return false;
+    // Room for the entry this commit adds.
+    {
+        ManifestListEntry* grown =
+            th->arena->allocate_array<ManifestListEntry>(n_mlist + 1u);
+        if (grown == nullptr) return false;
+        if (n_mlist != 0u)
+            std::memcpy(grown, mlist, sizeof(ManifestListEntry) * n_mlist);
+        mlist = grown;
+    }
 
     // G2ICE-49 — the manifest-list must report REAL per-status file/row
     // tallies, not just a file count. Every entry `files[]` holds for THIS
@@ -1223,7 +1267,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // that ever mixes statuses in one manifest.
     int64_t files_added = 0, files_existing = 0, files_deleted = 0;
     int64_t rows_added = 0, rows_existing = 0, rows_deleted = 0;
-    for (uint32_t r = 0; r < nf; ++r) {        // bounded: nf <= kIcebergMaxManifestEntries
+    for (uint32_t r = 0; r < nf; ++r) {        // bounded: nf
         const DataFileRef& d = files[r];
         switch (d.status) {
             case ManifestStatus::kAdded:
@@ -1276,9 +1320,8 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     char mlrel[128];
     std::snprintf(mlrel, sizeof(mlrel), "metadata/snap-%lld.avro",
                   static_cast<long long>(snap_id));
-    // Resolved BEFORE the snapshot record is opened below: past that point
-    // `n_snapshots` has already been incremented, so a late failure would
-    // leave a half-written snapshot in the metadata.
+    // Resolved BEFORE the snapshot record is pushed below, so a late failure
+    // cannot leave a half-written snapshot in the metadata.
     char mlabs[kIcebergMaxManifestPath];
     if (!abs_location(th->root, mlrel, mlabs, sizeof(mlabs))) return false;
     if (!commit_object(th, mlrel, mlb, mll)) {
@@ -1287,7 +1330,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     }
 
     // Record the snapshot.
-    Snapshot& s = th->meta.snapshots[th->meta.n_snapshots++];
+    Snapshot s;
     std::memset(&s, 0, sizeof(s));
     s.snapshot_id        = snap_id;
     s.parent_snapshot_id = parent;
@@ -1299,20 +1342,25 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // schema evolution cannot retroactively relabel it (G2ICE-50).
     s.schema_id          = th->meta.current_schema_id;
     std::strncpy(s.manifest_list, mlabs, sizeof(s.manifest_list) - 1u);
-    th->meta.current_snapshot_id = snap_id;
-    // Saved whole (2 KiB): a push into a full log drops the oldest entry.
-    SnapshotLogEntry log_saved[kIcebergMaxSnapshotLog];
+    // Both pushes only append, so withdrawing is a count decrement.
     const uint32_t n_log_saved = th->meta.n_snapshot_log;
-    std::memcpy(log_saved, th->meta.snapshot_log,
-                sizeof(SnapshotLogEntry) * n_log_saved);
-    metadata_snapshot_log_push(&th->meta, s.timestamp_ms, snap_id);
-    if (persist_metadata(th)) return true;
+    const uint32_t n_snap_saved = th->meta.n_snapshots;
+    const bool pushed =
+        metadata_push_snapshot(&th->meta, &s) &&
+        metadata_snapshot_log_push(&th->meta, s.timestamp_ms, snap_id);
+    if (pushed) {
+        th->meta.current_snapshot_id = snap_id;
+        if (persist_metadata(th)) {
+            apply_retention_policy(th);
+            return true;
+        }
+    } else {
+        th->last_error = CommitError::kFailed;
+    }
     // Not committed (typically a conflict): withdraw the snapshot from this
     // handle and remove the objects only this commit referenced.
-    std::memcpy(th->meta.snapshot_log, log_saved,
-                sizeof(SnapshotLogEntry) * n_log_saved);
     th->meta.n_snapshot_log = n_log_saved;
-    --th->meta.n_snapshots;
+    th->meta.n_snapshots = n_snap_saved;
     --th->meta.last_sequence_number;
     th->meta.current_snapshot_id = parent;
     (void)os_delete(th->os, mlrel);
@@ -1403,9 +1451,12 @@ namespace {
 
 // The Iceberg-defined schema of a positional delete file, spec section
 // "Position Delete Files": field 2147483546 file_path, 2147483545 pos.
-Schema position_delete_schema() noexcept {
+bool position_delete_schema(Arena* a, Schema* out) noexcept {
+    assert(a != nullptr && out != nullptr);
     Schema s{};
     s.schema_id = 0;
+    if (!schema_reserve(&s, a, nullptr, 2u)) return false;
+    std::memset(s.fields, 0, sizeof(SchemaField) * 2u);
     s.n_fields  = 2;
     s.fields[0].id = 2147483546;
     s.fields[0].required = true;
@@ -1415,7 +1466,9 @@ Schema position_delete_schema() noexcept {
     s.fields[1].required = true;
     std::strncpy(s.fields[1].name, "pos",  sizeof(s.fields[1].name) - 1u);
     std::strncpy(s.fields[1].type, "long", sizeof(s.fields[1].type) - 1u);
-    return s;
+    *out = s;
+    assert(out->n_fields == 2u);
+    return true;
 }
 
 }  // namespace
@@ -1426,7 +1479,6 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     assert(dels != nullptr || n == 0);
     if (th == nullptr || th->arena == nullptr || th->os == nullptr) return false;
     if (dels == nullptr || n == 0) return false;
-    if (n > kIcebergMaxManifestEntries) return false;
 
     const int64_t snap_id = mint_snapshot_id(th);
 
@@ -1491,7 +1543,8 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
             std::filesystem::create_directories(p.parent_path(), ec);
         }
     }
-    const Schema dsch = position_delete_schema();
+    Schema dsch{};
+    if (!position_delete_schema(a, &dsch)) return false;
     ingest::parquet::ParquetWriteOpts po = make_pq_opts(&dsch, nullptr);
     // G2ICE-117 — stamp the spec-RESERVED field ids into the physical
     // parquet footer, not only into `dsch` (which only ever reached the
@@ -1552,53 +1605,61 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
 // pyiceberg's own `schemas()[snapshot.schema_id]` to the 3-field shape --
 // binding a column to rows written before that column existed.
 
-// Begins an evolution: returns a pointer to a NEW schema slot
-// (`th->meta.schemas[th->meta.n_schemas]`) seeded with a copy of the current
-// schema, for the caller to mutate in place. Returns nullptr -- leaving `th`
-// completely untouched -- when the schema cap (kIcebergMaxSchemas) is
-// reached or there is no current schema to copy; evolution then fails
-// closed rather than reusing or clobbering an existing entry.
-Schema* begin_schema_evolution(TableHandle* th) noexcept {
-    assert(th != nullptr);
+// Begins an evolution: fills `next` with a DEEP copy of the current schema
+// (its own field array) under a fresh schema-id, for the caller to mutate.
+// Nothing in `th` changes until commit_schema_evolution.
+bool begin_schema_evolution(TableHandle* th, Schema* next) noexcept {
+    assert(th != nullptr && next != nullptr);
     Metadata& m = th->meta;
-    if (m.n_schemas == 0 || m.n_schemas >= kIcebergMaxSchemas) return nullptr;
+    if (m.n_schemas == 0) return false;
     const Schema* cur = metadata_current_schema(&m);
-    if (cur == nullptr) return nullptr;
+    if (cur == nullptr) return false;
     int32_t max_id = cur->schema_id;
     for (uint32_t i = 0; i < m.n_schemas; ++i) {          // bounded
         if (m.schemas[i].schema_id > max_id) max_id = m.schemas[i].schema_id;
     }
-    Schema& next = m.schemas[m.n_schemas];
-    next = *cur;                       // copy -- the caller mutates `next`,
-    next.schema_id = max_id + 1;       // `cur` (an existing published schema
-    assert(next.schema_id != cur->schema_id);  // an old snapshot may point at)
-    return &next;                              // never changes
+    // One spare slot so a field add cannot fail after the copy.
+    if (!schema_copy(next, cur, th->arena, m.budget)) return false;
+    if (!schema_reserve(next, th->arena, m.budget, next->n_fields + 1u))
+        return false;
+    next->schema_id = max_id + 1;
+    assert(next->schema_id != cur->schema_id);
+    return true;
 }
 
-// Publishes a schema `begin_schema_evolution` handed back: makes it the new
-// current schema (bumping n_schemas, so it is now immutable too) and
-// persists metadata.json. The caller must not call this after a validation
-// failure (an unknown column to drop/rename, a full schema) -- returning
-// false without calling it leaves the uncommitted copy at schemas[n_schemas]
-// simply unused; it is overwritten in place by the next evolution attempt.
-bool commit_schema_evolution(TableHandle* th, Schema* next) noexcept {
+// Publishes `next` as the new current schema and persists metadata.json. On a
+// failed persist the schema is withdrawn again.
+bool commit_schema_evolution(TableHandle* th, const Schema* next) noexcept {
     assert(th != nullptr && next != nullptr);
-    assert(next == &th->meta.schemas[th->meta.n_schemas]);
+    const int32_t prev_id = th->meta.current_schema_id;
+    Schema* slot = metadata_push_schema(&th->meta);
+    if (slot == nullptr) return false;
+    *slot = *next;
     th->meta.current_schema_id = next->schema_id;
-    th->meta.n_schemas++;
-    return persist_metadata(th);
+    if (persist_metadata(th)) return true;
+    th->meta.n_schemas--;
+    th->meta.current_schema_id = prev_id;
+    return false;
 }
 
 bool table_add_column(TableHandle* th, const char* name, BoltType type,
                       bool nullable) noexcept {
     assert(th != nullptr && name != nullptr);
-    Schema* s = begin_schema_evolution(th);
-    if (s == nullptr) return false;
-    if (s->n_fields >= kIcebergMaxFieldsPerSchema) return false;
     if (std::strlen(name) >= sizeof(SchemaField::name)) return false;
+    Schema next{};
+    Schema* s = &next;
+    if (!begin_schema_evolution(th, s)) return false;
+    assert(s->n_fields < s->cap_fields);
     SchemaField& f = s->fields[s->n_fields];
     std::memset(&f, 0, sizeof(f));
-    f.id = static_cast<int32_t>(s->n_fields + 1);
+    // last-column-id + 1: n_fields + 1 reused a dropped column's id.
+    int32_t max_id = 0;
+    for (uint32_t i = 0; i < th->meta.n_schemas; ++i) {       // bounded
+        const Schema& o = th->meta.schemas[i];
+        for (uint32_t j = 0; j < o.n_fields; ++j)
+            if (o.fields[j].id > max_id) max_id = o.fields[j].id;
+    }
+    f.id = max_id + 1;
     f.required = !nullable;
     std::strncpy(f.name, name, sizeof(f.name) - 1u);
     std::strncpy(f.type, bolt_type_iceberg_name(type), sizeof(f.type) - 1u);
@@ -1608,8 +1669,9 @@ bool table_add_column(TableHandle* th, const char* name, BoltType type,
 
 bool table_drop_column(TableHandle* th, const char* name) noexcept {
     assert(th != nullptr && name != nullptr);
-    Schema* s = begin_schema_evolution(th);
-    if (s == nullptr) return false;
+    Schema next{};
+    Schema* s = &next;
+    if (!begin_schema_evolution(th, s)) return false;
     uint32_t out = 0;
     bool dropped = false;
     for (uint32_t i = 0; i < s->n_fields; ++i) {
@@ -1626,8 +1688,9 @@ bool table_rename_column(TableHandle* th, const char* from,
                          const char* to) noexcept {
     assert(th != nullptr && from != nullptr && to != nullptr);
     if (std::strlen(to) >= sizeof(SchemaField::name)) return false;
-    Schema* s = begin_schema_evolution(th);
-    if (s == nullptr) return false;
+    Schema next{};
+    Schema* s = &next;
+    if (!begin_schema_evolution(th, s)) return false;
     for (uint32_t i = 0; i < s->n_fields; ++i) {
         if (std::strcmp(s->fields[i].name, from) == 0) {
             std::memset(s->fields[i].name, 0, sizeof(s->fields[i].name));
@@ -1709,64 +1772,7 @@ bool table_compact(TableHandle* th, int64_t /*target_file_size_bytes*/) noexcept
     return table_rewrite(th, nullptr);
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot expiry + orphan removal.
-// ---------------------------------------------------------------------------
-
-namespace {
-
-// Java's rule: drop every snapshot-log entry up to and including the newest
-// one whose snapshot is gone, so the log never names an expired snapshot and
-// never jumps over a hole.
-void prune_snapshot_log(Metadata* m) noexcept {
-    assert(m != nullptr);
-    assert(m->n_snapshot_log <= kIcebergMaxSnapshotLog);
-    uint32_t cut = 0;
-    for (uint32_t i = 0; i < m->n_snapshot_log; ++i) {        // bounded
-        if (snapshot_by_id(m, m->snapshot_log[i].snapshot_id) == nullptr) {
-            cut = i + 1u;
-        }
-    }
-    if (cut == 0) return;
-    const uint32_t keep = m->n_snapshot_log - cut;
-    std::memmove(&m->snapshot_log[0], &m->snapshot_log[cut],
-                 sizeof(SnapshotLogEntry) * keep);
-    m->n_snapshot_log = keep;
-    assert(m->n_snapshot_log < kIcebergMaxSnapshotLog);
-}
-
-}  // namespace
-
-bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
-                            int32_t retain_last_n) noexcept {
-    assert(th != nullptr);
-    if (th->meta.n_snapshots == 0) return true;
-    const int64_t cutoff = static_cast<int64_t>(older_than_ms);
-    const uint32_t keep_floor = retain_last_n > 0
-        ? static_cast<uint32_t>(retain_last_n) : 0u;
-    // Copy snapshots that pass.
-    Snapshot kept[kIcebergMaxSnapshots];
-    uint32_t nk = 0;
-    for (uint32_t i = 0; i < th->meta.n_snapshots; ++i) {
-        const Snapshot& s = th->meta.snapshots[i];
-        const bool old = s.timestamp_ms < cutoff;
-        const uint32_t remaining = th->meta.n_snapshots - i;
-        const bool must_keep = remaining <= keep_floor;
-        if (!old || must_keep) {
-            kept[nk++] = s;
-        }
-    }
-    if (nk == th->meta.n_snapshots) return true;   // nothing expired
-    std::memcpy(th->meta.snapshots, kept, sizeof(Snapshot) * nk);
-    th->meta.n_snapshots = nk;
-    prune_snapshot_log(&th->meta);
-    if (nk > 0) {
-        th->meta.current_snapshot_id = th->meta.snapshots[nk - 1].snapshot_id;
-    } else {
-        th->meta.current_snapshot_id = -1;
-    }
-    return persist_metadata(th);
-}
+#include "iceberg_expire.inc"
 
 bool table_remove_orphans(TableHandle* th, uint64_t /*older_than_ms*/,
                           bool dry_run, char (*out)[512], uint32_t cap,

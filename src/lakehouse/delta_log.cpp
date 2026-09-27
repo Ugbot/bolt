@@ -533,19 +533,22 @@ bool join_rel(const char* prefix, const char* sub, char* out,
     return true;
 }
 
+// Shell sort: a log of 10^5 commits must not cost an O(n^2) insertion sort.
 void sort_versions(int64_t* arr, uint32_t* keys_idx, uint32_t n) noexcept {
     assert(arr != nullptr && keys_idx != nullptr);
-    for (uint32_t i = 1; i < n; ++i) {
-        const int64_t v = arr[i];
-        const uint32_t ki = keys_idx[i];
-        uint32_t j = i;
-        while (j > 0 && arr[j - 1] > v) {
-            arr[j] = arr[j - 1];
-            keys_idx[j] = keys_idx[j - 1];
-            --j;
+    for (uint32_t gap = n / 2u; gap > 0u; gap /= 2u) {          // bounded
+        for (uint32_t i = gap; i < n; ++i) {
+            const int64_t v = arr[i];
+            const uint32_t ki = keys_idx[i];
+            uint32_t j = i;
+            while (j >= gap && arr[j - gap] > v) {
+                arr[j] = arr[j - gap];
+                keys_idx[j] = keys_idx[j - gap];
+                j -= gap;
+            }
+            arr[j] = v;
+            keys_idx[j] = ki;
         }
-        arr[j] = v;
-        keys_idx[j] = ki;
     }
 }
 
@@ -554,7 +557,15 @@ void sort_versions(int64_t* arr, uint32_t* keys_idx, uint32_t n) noexcept {
 bool delta_log_walk_all(ObjectStore* os, const char* table_rel_prefix,
                         int64_t max_version, Arena* scratch,
                         void* ctx, ActionFn cb) noexcept {
+    return delta_log_walk_range(os, table_rel_prefix, -1, max_version, scratch,
+                                ctx, cb);
+}
+
+bool delta_log_walk_range(ObjectStore* os, const char* table_rel_prefix,
+                          int64_t after_version, int64_t max_version,
+                          Arena* scratch, void* ctx, ActionFn cb) noexcept {
     assert(os != nullptr && scratch != nullptr && cb != nullptr);
+    assert(after_version >= -1);
     char prefix[kDeltaMaxPath];
     if (!join_rel(table_rel_prefix, "_delta_log/", prefix, sizeof(prefix)))
         return false;
@@ -573,11 +584,24 @@ bool delta_log_walk_all(ObjectStore* os, const char* table_rel_prefix,
                                                   table_rel_prefix);
         if (v < 0) continue;
         if (max_version >= 0 && v > max_version) continue;
+        if (v <= after_version) continue;
         versions[n] = v;
         idxs[n] = i;
         ++n;
     }
     sort_versions(versions, idxs, n);
+    // Commits must run after_version+1, +2, ... with no gap: a missing commit
+    // (log retention without a decoded checkpoint) is missing adds/removes, so
+    // the walk refuses rather than reporting a table without them.
+    for (uint32_t i = 0; i < n; ++i) {                            // bounded
+        if (versions[i] != after_version + 1 + static_cast<int64_t>(i)) {
+            std::fprintf(stderr, "[delta] %s: log has no commit %lld; refusing "
+                         "a partial replay\n", table_rel_prefix,
+                         static_cast<long long>(after_version + 1 +
+                                                static_cast<int64_t>(i)));
+            return false;
+        }
+    }
     // ndjson_for_each resets the scratch arena between records; if we passed
     // the caller's `scratch` (which holds the snapshot's persistent bytes)
     // those bytes would vanish under us. Spin up a per-walk local arena for
