@@ -282,7 +282,6 @@ src/lakehouse/delta_write_internal.h::kMaxNsName
 src/lakehouse/iceberg_commit.inc::kMaxVersionProbe
 src/lakehouse/iceberg_scan.cpp::kMaxEqDels
 src/lakehouse/iceberg_scan.cpp::kMaxFsRoot
-src/lakehouse/iceberg_scan.cpp::kMaxLiveFiles
 src/lakehouse/iceberg_scan.cpp::kMaxNsName
 src/lakehouse/iceberg_scan.cpp::kMaxPosDels
 src/lakehouse/iceberg_writer.cpp::kMaxPathLen
