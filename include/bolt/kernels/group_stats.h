@@ -26,6 +26,7 @@
 
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_argsort.h"  // sort_indirect_i64_scratch
+#include "bolt/kernels/numeric_key.h"
 
 namespace bolt {
 namespace kernels {
@@ -58,15 +59,9 @@ namespace group_stats {
 //                              negative and ascends with the value.
 //
 // Verified over mixed signs, +/-0, subnormals and +/-1e308.
+// Canonicalises first (bolt/kernels/numeric_key.h): -0.0 == 0.0, NaN last.
 BOLT_FORCE_INLINE int64_t f64_sortable_key(double v) noexcept {
-    std::uint64_t u = 0;
-    static_assert(sizeof(u) == sizeof(v), "ieee754 double is 8 bytes");
-    std::memcpy(&u, &v, sizeof(u));
-    // mask = all-ones-BUT-THE-SIGN-BIT for negatives, zero for non-negatives.
-    const std::uint64_t mask =
-        (static_cast<std::uint64_t>(-static_cast<std::int64_t>(u >> 63))) &
-        0x7FFFFFFFFFFFFFFFULL;
-    return static_cast<std::int64_t>(u ^ mask);
+    return numeric_key::f64_sortable_key(v);
 }
 
 // Exact quantile (type-7 / linear interpolation — the NumPy/pandas/R-7

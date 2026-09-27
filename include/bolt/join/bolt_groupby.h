@@ -24,6 +24,7 @@
 #include "bolt/join/bolt_swiss.h"
 #include "bolt/kernels/bolt_decimal.h"
 #include "bolt/kernels/bolt_utf8.h"
+#include "bolt/kernels/numeric_key.h"
 
 #include <cassert>
 #include <cstdint>
@@ -825,12 +826,41 @@ BOLT_FORCE_INLINE GbCell16 gb_null_key_cell(BoltType t) noexcept {
 // stored bytes are DEFINED -- a consumer that reads the cell without
 // consulting validity gets a fixed value rather than arena residue (the
 // G2FEAT-350 shape).
+// A key cell by VALUE (bolt/kernels/numeric_key.h): a float key (Float32 is
+// already promoted to double) folds -0.0 into 0.0 and every NaN into one.
+BOLT_FORCE_INLINE GbCell16 canon_key_cell(GbCell16 cell, BoltType t) noexcept {
+    if (is_float_type(t)) cell.a = kernels::numeric_key::canon_f64_bits(cell.a);
+    return cell;
+}
+
 BOLT_FORCE_INLINE GbCell16 read_key_cell16(const BoltColumn& c,
                                            int64_t r) noexcept {
     if (c.validity != nullptr && !cell_valid(c, r)) {
         return gb_null_key_cell(c.type);
     }
-    return read_cell16(c, r);
+    return canon_key_cell(read_cell16(c, r), c.type);
+}
+
+// DISTINCT dedup keys wider than 8 bytes: Utf8 by content, Decimal128 by
+// its full 16 bytes (the 8-byte cell would keep only the low word).
+BOLT_FORCE_INLINE bool distinct_is_16(BoltType t) noexcept {
+    return t == BoltType::Utf8 || t == BoltType::Decimal128;
+}
+
+BOLT_FORCE_INLINE int distinct16_insert(DistinctCell16* cell,
+                                        const BoltColumn& c, GbCell16 v,
+                                        Arena* arena) noexcept {
+    assert(cell != nullptr && arena != nullptr);
+    assert(distinct_is_16(c.type));
+    if (c.type == BoltType::Utf8) {
+        StringView sv;
+        std::memcpy(&sv, &v, sizeof(sv));
+        return cell->insert_sv(
+            sv, static_cast<const char*>(c.str_overflow_base), arena);
+    }
+    std::uint8_t raw[16];
+    std::memcpy(raw, &v, 16);
+    return cell->insert_raw16(raw, arena);
 }
 
 // Is the stored group cell for a key column of type `t` the NULL group?
@@ -922,10 +952,9 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
     const bool d = (t == BoltType::Decimal128 || t == BoltType::Decimal64);
     const bool s = (t == BoltType::Utf8);
     const bool f = is_float_type(t);
-    // Float Min/Max identities are ±infinity stored as double bit patterns in
+    // Float Min/Max identities are NaN / -infinity stored as double bits in
     // the `.a` lane (the cell holds a double for float aggregation). Sum/Avg
     // identity 0.0 == bits {0,0}, shared with the int path below.
-    constexpr int64_t kPosInfBits = static_cast<int64_t>(0x7FF0000000000000ULL);
     constexpr int64_t kNegInfBits = static_cast<int64_t>(0xFFF0000000000000ULL);
     switch (k) {
         case AggKind::Sum:
@@ -933,7 +962,9 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
         case AggKind::Count:
         case AggKind::CountStar: return GbCell16{0, 0};
         case AggKind::Min:
-            if (f) return GbCell16{kPosInfBits, 0};
+            // NaN is the top of the total order, so an all-NaN group ends NaN.
+            if (f) return GbCell16{static_cast<int64_t>(
+                                       kernels::numeric_key::kCanonQNaN), 0};
             if (s) return GbCell16{static_cast<int64_t>(0xFFFFFFFF0000000CULL),
                                    static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL)};
             return d ? GbCell16{static_cast<int64_t>(0xFFFFFFFFFFFFFFFFULL), INT64_MAX}
@@ -1007,8 +1038,11 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         switch (k) {
             case AggKind::Sum:
             case AggKind::Avg: s += x;                  break;
-            case AggKind::Min: s = (x < s) ? x : s;     break;
-            case AggKind::Max: s = (x > s) ? x : s;     break;
+            // Total order with NaN largest (DuckDB/Postgres/Spark).
+            case AggKind::Min:
+                s = kernels::numeric_key::f64_total_less(x, s) ? x : s; break;
+            case AggKind::Max:
+                s = kernels::numeric_key::f64_total_less(s, x) ? x : s; break;
             default: break;
         }
         std::memcpy(&slot->a, &s, 8);
@@ -1350,7 +1384,7 @@ inline bool gb_begin_with_scratch(
     for (uint8_t j = 0; j < n_aggs; ++j) {
         if (specs[j].distinct == 0) continue;
         state->any_distinct = true;
-        if (state->agg_in_types[j] == BoltType::Utf8)
+        if (gb_detail::distinct_is_16(state->agg_in_types[j]))
             state->distinct16_idx[j] = n_distinct16++;
         else
             state->distinct_idx[j] = n_distinct++;
@@ -1715,14 +1749,20 @@ inline void gb_ingest_fallback(
                 const uint16_t i16 = state->distinct16_idx[j];
                 if (i16 != 0xFFFFu) {
                     const size_t doff = static_cast<size_t>(i16) * cap + slot;
-                    std::uint8_t buf[16];
-                    std::memcpy(buf, &v, 16);
-                    if (!state->distinct_cells16[doff].insert(buf)) continue;
+                    const int ins = gb_detail::distinct16_insert(
+                        &state->distinct_cells16[doff], *pc_ptr, v,
+                        state->arena);
+                    if (ins < 0) { state->oom = true; return; }
+                    if (ins == 0) continue;
                 } else {
                     const uint16_t i8 = state->distinct_idx[j];
                     assert(i8 != 0xFFFFu);
                     const size_t doff = static_cast<size_t>(i8) * cap + slot;
-                    if (!state->distinct_cells[doff].insert(v.a, state->arena)) continue;
+                    const int ins = state->distinct_cells[doff].insert_exact(
+                        gb_detail::canon_key_cell(v, pc_ptr->type).a,
+                        state->arena);
+                    if (ins < 0) { state->oom = true; return; }
+                    if (ins == 0) continue;
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;
@@ -2304,7 +2344,7 @@ inline bool groupby_agg_multi_key_typed(
         distinct16_idx[j] = 0xFFFFu;
         if (aggs[j].distinct == 0) continue;
         any_distinct = true;
-        if (agg_in_types[j] == BoltType::Utf8) distinct16_idx[j] = n_distinct16++;
+        if (gb_detail::distinct_is_16(agg_in_types[j])) distinct16_idx[j] = n_distinct16++;
         else                                   distinct_idx[j]   = n_distinct++;
     }
     DistinctCell*   distinct_cells   = nullptr;
@@ -2382,22 +2422,28 @@ inline bool groupby_agg_multi_key_typed(
             // K-AGG-A.2 item 2: DISTINCT — drop duplicates per (agg, group)
             // before the accumulator sees them. NULLs never enter the
             // dedup set; they short-circuit through the !valid branch in
-            // `apply`. Phase-A scope: linear-scan inline cells with hard
-            // cap (`k_distinct_cell_cap`); over-cap inserts silently drop.
+            // `apply`. Cells spill into arena-backed exact sets past cap.
             if (valid && aggs[j].distinct != 0) {
                 const uint16_t i16 = distinct16_idx[j];
                 if (i16 != 0xFFFFu) {
                     const size_t doff =
                         static_cast<size_t>(i16) * cap + slot;
-                    std::uint8_t buf[16];
-                    std::memcpy(buf, &v, 16);
-                    if (!distinct_cells16[doff].insert(buf)) continue;
+                    const int ins = gb_detail::distinct16_insert(
+                        &distinct_cells16[doff], payload[aggs[j].in_col], v,
+                        arena);
+                    if (ins < 0) return false;
+                    if (ins == 0) continue;
                 } else {
                     const uint16_t i8 = distinct_idx[j];
                     assert(i8 != 0xFFFFu);
                     const size_t doff =
                         static_cast<size_t>(i8) * cap + slot;
-                    if (!distinct_cells[doff].insert(v.a)) continue;
+                    const int ins = distinct_cells[doff].insert_exact(
+                        gb_detail::canon_key_cell(
+                            v, payload[aggs[j].in_col].type).a,
+                        arena);
+                    if (ins < 0) return false;
+                    if (ins == 0) continue;
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;

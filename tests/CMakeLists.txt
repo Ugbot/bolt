@@ -1108,6 +1108,20 @@ target_link_libraries(test_bolt_groupby_typed
 bolt_apply_hardening(test_bolt_groupby_typed)
 add_test(NAME test_bolt_groupby_typed COMMAND test_bolt_groupby_typed)
 
+# WI-1 value-canonical keys (numeric_key.h) + the group-by paths using them.
+add_executable(test_bolt_numeric_key test_bolt_numeric_key.cpp)
+target_link_libraries(test_bolt_numeric_key
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_numeric_key)
+add_test(NAME test_bolt_numeric_key COMMAND test_bolt_numeric_key)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME bolt_lint_sv_memcmp
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/lint_sv_memcmp.py)
+endif()
+
 # K-AGG-C two-pass typed GROUP BY ingest — cross-path hash/group parity.
 add_executable(test_bolt_groupby_twopass test_bolt_groupby_twopass.cpp)
 target_link_libraries(test_bolt_groupby_twopass

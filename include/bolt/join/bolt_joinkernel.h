@@ -127,19 +127,7 @@ namespace jk_detail {
 // canonical quiet NaN (0x7FF8000000000000). Finite/non-zero values unchanged.
 // Branch-light: the two corrections are predicated selects.
 BOLT_FORCE_INLINE int64_t canon_f64_bits(int64_t raw) noexcept {
-    constexpr uint64_t kSignMask = 0x8000000000000000ULL;
-    constexpr uint64_t kExpMask  = 0x7FF0000000000000ULL;
-    constexpr uint64_t kFracMask = 0x000FFFFFFFFFFFFFULL;
-    constexpr uint64_t kQNaN     = 0x7FF8000000000000ULL;  // canonical quiet NaN
-    const uint64_t b = static_cast<uint64_t>(raw);
-    // NaN iff all exponent bits set AND fraction != 0.
-    const bool is_nan = ((b & kExpMask) == kExpMask) && ((b & kFracMask) != 0);
-    // -0.0 iff bit pattern is exactly the sign bit.
-    const bool is_neg_zero = (b == kSignMask);
-    uint64_t out = b;
-    out = is_neg_zero ? 0ULL : out;
-    out = is_nan      ? kQNaN : out;
-    return static_cast<int64_t>(out);
+    return kernels::numeric_key::canon_f64_bits(raw);
 }
 
 // Read one key cell with join-local canonicalization. Identical to
@@ -148,9 +136,7 @@ BOLT_FORCE_INLINE int64_t canon_f64_bits(int64_t raw) noexcept {
 // pass straight through gb_detail (single source of truth for their layout).
 BOLT_FORCE_INLINE GbCell16 read_cell16_canon(const BoltColumn& c,
                                              int64_t r) noexcept {
-    GbCell16 out = gb_detail::read_cell16(c, r);
-    if (c.type == BoltType::Float64) out.a = canon_f64_bits(out.a);
-    return out;
+    return gb_detail::canon_key_cell(gb_detail::read_cell16(c, r), c.type);
 }
 
 // Composite-key hash with Float64 canonicalization + Utf8 byte resolution.
