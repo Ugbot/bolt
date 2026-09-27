@@ -7,7 +7,7 @@
 //   utf8_compare, utf8_filter_eq, utf8_filter_ne, utf8_hash,
 //   utf8_like_compile + utf8_filter_like / utf8_filter_not_like,
 //   utf8_substring, utf8_trim / utf8_ltrim / utf8_rtrim,
-//   utf8_upper / utf8_lower (ASCII fast path),
+//   utf8_upper / utf8_lower (Unicode simple case mapping, ASCII fast path),
 //   utf8_byte_length, utf8_char_length, utf8_position,
 //   utf8_concat, utf8_replace.
 //
@@ -38,6 +38,7 @@
 #include "bolt/bolt_hash.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
+#include "bolt/kernels/bolt_utf8_cp.h"
 
 namespace bolt {
 namespace kernels {
@@ -154,8 +155,9 @@ BOLT_FORCE_INLINE int32_t sv_compare(
                          sv_bytes(b, b_base), b.length);
 }
 
-// SQL LIKE match over raw bytes. `%` matches any (possibly empty) run of
-// bytes, `_` matches exactly one byte, every other pattern byte is literal.
+// SQL LIKE match over UTF-8. `%` matches any (possibly empty) run of
+// characters, `_` matches exactly one character (utf8_unit_len), every other
+// pattern byte is literal.
 // `escape` (a byte value, or -1 for none) makes the byte after it literal,
 // '%'/'_'/the escape itself included; a pattern ending in a lone escape
 // matches nothing. Iterative two-pointer with single-star backtracking —
@@ -193,13 +195,16 @@ BOLT_FORCE_INLINE bool bytes_like(
             star_s = si;
             ++pi;
             continue;
-        } else if (pi < plen && (p[pi] == '_' || p[pi] == s[si])) {
+        } else if (pi < plen && p[pi] == '_') {
+            si += utf8_unit_len(s, slen, si); ++pi;
+            continue;
+        } else if (pi < plen && p[pi] == s[si]) {
             ++si; ++pi;
             continue;
         }
         if (star_p != 0xFFFFFFFFu) {
-            pi = star_p + 1;         // backtrack: let the star eat one more byte
-            ++star_s;
+            pi = star_p + 1;         // backtrack: let the star eat one more char
+            star_s += utf8_unit_len(s, slen, star_s);
             si = star_s;
         } else {
             return false;
@@ -814,7 +819,7 @@ static_assert(sizeof(CompiledLike) <= 512, "CompiledLike too large");
 enum : uint8_t {
     kLikeTokLit = 1, // followed by uint8 len, len bytes
     kLikeTokPct = 2, // % — match any (greedy)
-    kLikeTokUnd = 3, // _ — match exactly one byte
+    kLikeTokUnd = 3, // _ — match exactly one character
 };
 
 // Tokenize an escaped LIKE pattern into dfa_buf, then classify the token
@@ -1000,7 +1005,11 @@ BOLT_FORCE_INLINE bool like_match_general(
                     continue;
                 }
             } else if (op == kLikeTokUnd) {
-                if (hi < hlen) { ti += 1u; hi += 1u; continue; }
+                if (hi < hlen) {
+                    ti += 1u;
+                    hi += utf8_unit_len(hay, hlen, hi);
+                    continue;
+                }
             } else { // kLikeTokPct
                 star_ti = static_cast<uint16_t>(ti + 1u);
                 star_hi = hi;
@@ -1012,7 +1021,8 @@ BOLT_FORCE_INLINE bool like_match_general(
         }
         if (star_ti != 0xFFFFu && star_hi < hlen) {
             ti = star_ti;
-            hi = ++star_hi;
+            star_hi += utf8_unit_len(hay, hlen, star_hi);
+            hi = star_hi;
             continue;
         }
         return false;
@@ -1102,12 +1112,11 @@ BOLT_FORCE_INLINE void utf8_like_mask(
 }
 
 // ===========================================================================
-// 5. SUBSTRING(s, start_1based, length).  SQL semantics:
+// 5. SUBSTRING(s, start_1based, length) in CHARACTERS (utf8_cp_advance), so
+//    it agrees with utf8_char_length and never splits a code point.
 //      start_1based <= 0  → treated as 1 (clamped).
 //      length      < 0   → empty result.
-//      length saturates at remaining bytes.
-//    NOTE: byte-level slicing.  Char-level slicing would require a
-//    codepoint walk; SQL standard permits either for VARCHAR.
+//      length saturates at the remaining characters.
 // ===========================================================================
 BOLT_FORCE_INLINE void utf8_substring(
         const StringView* BOLT_RESTRICT data, int64_t n,
@@ -1121,17 +1130,14 @@ BOLT_FORCE_INLINE void utf8_substring(
     assert(arena != nullptr);
     assert(arena_anchor != nullptr);
     assert(n >= 0);
-    const int32_t s0 = (start_1based < 1) ? 0 : (start_1based - 1);
-    const int32_t L  = (length < 0) ? 0 : length;
+    const uint32_t s0 = (start_1based < 1) ? 0u : static_cast<uint32_t>(start_1based - 1);
+    const uint32_t L  = (length < 0) ? 0u : static_cast<uint32_t>(length);
     for (int64_t i = 0; i < n; ++i) {
         const uint32_t slen = data[i].length;
         const char* p = sv_bytes(data[i], spilled_base);
-        uint32_t start_u = (static_cast<uint32_t>(s0) >= slen)
-                          ? slen : static_cast<uint32_t>(s0);
-        uint32_t rem = slen - start_u;
-        uint32_t take = (static_cast<uint32_t>(L) < rem)
-                       ? static_cast<uint32_t>(L) : rem;
-        out[i] = sv_make(p + start_u, take, arena, arena_anchor);
+        const uint32_t b = utf8_cp_advance(p, slen, 0, s0);
+        const uint32_t e = utf8_cp_advance(p, slen, b, L);
+        out[i] = sv_make(p + b, e - b, arena, arena_anchor);
     }
 }
 
@@ -1199,14 +1205,15 @@ BOLT_FORCE_INLINE void utf8_trim(
 }
 
 // ===========================================================================
-// 7. UPPER / LOWER — ASCII fast path.  Non-ASCII bytes pass through unchanged.
-//    Full Unicode case-folding is TODO (requires ICU-style tables).
+// 7. UPPER / LOWER — Unicode simple case mapping (utf8_case_map). ASCII rows
+//    take one high-bit check and a byte loop; the output length can differ
+//    from the input's for non-ASCII rows, so those are measured first.
 // ===========================================================================
-BOLT_FORCE_INLINE void utf8_upper(
+BOLT_FORCE_INLINE void utf8_case_map_col(
         const StringView* BOLT_RESTRICT in, int64_t n,
         StringView*       BOLT_RESTRICT out,
         Arena* arena, const char* arena_anchor,
-        const char* spilled_base = nullptr) noexcept {
+        const char* spilled_base, bool upper) noexcept {
     assert(in  != nullptr || n == 0);
     assert(out != nullptr || n == 0);
     assert(arena != nullptr);
@@ -1214,33 +1221,34 @@ BOLT_FORCE_INLINE void utf8_upper(
     for (int64_t i = 0; i < n; ++i) {
         const uint32_t L = in[i].length;
         const char* p = sv_bytes(in[i], spilled_base);
-        if (L == 0) { out[i] = sv_make_inline(p, 0); continue; }
-        char inline_buf[12];
-        char* dst;
-        char* anchor_dst = nullptr;
-        if (L <= 12u) {
-            dst = inline_buf;
-        } else {
-            dst = static_cast<char*>(arena->allocate(L, 1));
-            assert(dst != nullptr);
-            anchor_dst = dst;
+        const uint32_t M = utf8_is_ascii(p, L) ? L : utf8_case_map(p, L, upper, nullptr);
+        if (M <= 12u) {
+            char buf[12];
+            const uint32_t w = utf8_case_map(p, L, upper, buf);
+            assert(w == M);
+            out[i] = sv_make_inline(buf, w);
+            continue;
         }
-        for (uint32_t k = 0; k < L; ++k) {
-            unsigned char c = static_cast<unsigned char>(p[k]);
-            dst[k] = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : static_cast<char>(c);
-        }
-        if (L <= 12u) {
-            out[i] = sv_make_inline(dst, L);
-        } else {
-            StringView r;
-            memset(&r, 0, sizeof(r));
-            r.length = L;
-            memcpy(r.prefix, dst, 4);
-            r.ref.buf_idx = 0;
-            r.ref.offset  = static_cast<uint32_t>(anchor_dst - arena_anchor);
-            out[i] = r;
-        }
+        char* dst = static_cast<char*>(arena->allocate(M, 1));
+        assert(dst != nullptr);
+        const uint32_t w = utf8_case_map(p, L, upper, dst);
+        assert(w == M);
+        StringView r;
+        memset(&r, 0, sizeof(r));
+        r.length = w;
+        memcpy(r.prefix, dst, 4);
+        r.ref.buf_idx = 0;
+        r.ref.offset  = static_cast<uint32_t>(dst - arena_anchor);
+        out[i] = r;
     }
+}
+
+BOLT_FORCE_INLINE void utf8_upper(
+        const StringView* BOLT_RESTRICT in, int64_t n,
+        StringView*       BOLT_RESTRICT out,
+        Arena* arena, const char* arena_anchor,
+        const char* spilled_base = nullptr) noexcept {
+    utf8_case_map_col(in, n, out, arena, arena_anchor, spilled_base, true);
 }
 
 BOLT_FORCE_INLINE void utf8_lower(
@@ -1248,40 +1256,7 @@ BOLT_FORCE_INLINE void utf8_lower(
         StringView*       BOLT_RESTRICT out,
         Arena* arena, const char* arena_anchor,
         const char* spilled_base = nullptr) noexcept {
-    assert(in  != nullptr || n == 0);
-    assert(out != nullptr || n == 0);
-    assert(arena != nullptr);
-    assert(arena_anchor != nullptr);
-    for (int64_t i = 0; i < n; ++i) {
-        const uint32_t L = in[i].length;
-        const char* p = sv_bytes(in[i], spilled_base);
-        if (L == 0) { out[i] = sv_make_inline(p, 0); continue; }
-        char inline_buf[12];
-        char* dst;
-        char* anchor_dst = nullptr;
-        if (L <= 12u) {
-            dst = inline_buf;
-        } else {
-            dst = static_cast<char*>(arena->allocate(L, 1));
-            assert(dst != nullptr);
-            anchor_dst = dst;
-        }
-        for (uint32_t k = 0; k < L; ++k) {
-            unsigned char c = static_cast<unsigned char>(p[k]);
-            dst[k] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : static_cast<char>(c);
-        }
-        if (L <= 12u) {
-            out[i] = sv_make_inline(dst, L);
-        } else {
-            StringView r;
-            memset(&r, 0, sizeof(r));
-            r.length = L;
-            memcpy(r.prefix, dst, 4);
-            r.ref.buf_idx = 0;
-            r.ref.offset  = static_cast<uint32_t>(anchor_dst - arena_anchor);
-            out[i] = r;
-        }
-    }
+    utf8_case_map_col(in, n, out, arena, arena_anchor, spilled_base, false);
 }
 
 // ===========================================================================
@@ -1297,13 +1272,17 @@ BOLT_FORCE_INLINE void utf8_byte_length(
     }
 }
 
+// Number of units (bolt_utf8_cp.h): every non-continuation byte starts one,
+// and a leading run of continuation bytes is one more, exactly as
+// utf8_cp_advance steps.
 BOLT_FORCE_INLINE int32_t utf8_count_codepoints(
         const char* BOLT_RESTRICT p, uint32_t L) noexcept {
-    int32_t c = 0;
+    assert(p != nullptr || L == 0);
+    int32_t c = (L > 0 && utf8_is_cont(static_cast<uint8_t>(p[0]))) ? 1 : 0;
     for (uint32_t k = 0; k < L; ++k) {
-        // Count bytes whose top two bits aren't '10' (i.e. not continuation).
         if ((static_cast<unsigned char>(p[k]) & 0xC0u) != 0x80u) ++c;
     }
+    assert(c >= 0 && static_cast<uint32_t>(c) <= L);
     return c;
 }
 
@@ -1320,8 +1299,19 @@ BOLT_FORCE_INLINE void utf8_char_length(
 }
 
 // ===========================================================================
-// 9. POSITION — 1-based byte index of needle within each haystack; 0 if missing.
+// 9. POSITION — 1-based CHARACTER index of needle within each haystack; 0
+//    if missing (utf8_char_position).
 // ===========================================================================
+BOLT_FORCE_INLINE int32_t utf8_char_position(
+        const char* BOLT_RESTRICT hay, uint32_t hlen,
+        const char* BOLT_RESTRICT needle, uint32_t nlen) noexcept {
+    assert(hay != nullptr || hlen == 0);
+    assert(needle != nullptr || nlen == 0);
+    const int32_t at = bytes_find(hay, hlen, needle, nlen);
+    if (at < 0) return 0;
+    return utf8_count_codepoints(hay, static_cast<uint32_t>(at)) + 1;
+}
+
 BOLT_FORCE_INLINE void utf8_position(
         const StringView* BOLT_RESTRICT haystack, int64_t n,
         StringView        needle,
@@ -1334,8 +1324,7 @@ BOLT_FORCE_INLINE void utf8_position(
     const uint32_t nlen = needle.length;
     for (int64_t i = 0; i < n; ++i) {
         const char* hb = sv_bytes(haystack[i], spilled_base_h);
-        const int32_t at = bytes_find(hb, haystack[i].length, nb, nlen);
-        out_pos[i] = (at < 0) ? 0 : (at + 1);
+        out_pos[i] = utf8_char_position(hb, haystack[i].length, nb, nlen);
     }
 }
 
