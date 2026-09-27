@@ -237,7 +237,7 @@ TEST(LimitsRegistry, OutOfRangeEnvIsAStartupErrorAndKeepsDefault) {
     set_env("BOLT_TEST_SPROCKETS", "9");
     bolt::LimitTable& t = test_limits_bad();
     EXPECT_EQ(test_limits_bad_value(test_limits_bad_id::sprockets), 4u);
-    EXPECT_EQ(bolt::limits_source(t, 0), bolt::LimitSource::kDefault);
+    EXPECT_EQ(bolt::limits_source(t, 0), bolt::LimitSource::kInvalid);   // value is the default
     ASSERT_NE(t.error[0], '\0');
     EXPECT_NE(std::string(t.error).find("BOLT_TEST_SPROCKETS=9"), std::string::npos);
     const char* first = bolt::limits_first_error();

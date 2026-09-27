@@ -44,6 +44,7 @@ enum class LimitSource : uint8_t {
     kDefault = 0,
     kEnv     = 1,
     kSet     = 2,   // programmatic / CLI / config file
+    kInvalid = 3,   // env override rejected; value is the default, table->error says why
 };
 
 inline const char* limit_kind_name(LimitKind k) noexcept {
@@ -60,6 +61,7 @@ inline const char* limit_source_name(LimitSource s) noexcept {
         case LimitSource::kDefault: return "default";
         case LimitSource::kEnv:     return "env";
         case LimitSource::kSet:     return "set";
+        case LimitSource::kInvalid: return "invalid";
     }
     return "?";
 }
@@ -156,6 +158,8 @@ inline bool limits_resolve(LimitTable* t) noexcept {
                               static_cast<unsigned long long>(d.min),
                               static_cast<unsigned long long>(d.max), d.unit);
             }
+            t->sources[i].store(static_cast<uint8_t>(LimitSource::kInvalid),
+                                std::memory_order_relaxed);
             ok = false;
             continue;
         }

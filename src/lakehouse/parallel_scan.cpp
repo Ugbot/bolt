@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <thread>
@@ -37,10 +38,6 @@ bool parallel_scan_config_clamp(ParallelScanConfig* c) noexcept {
     assert(c != nullptr);
     if (c == nullptr) return false;
     bool clamped = false;
-    if (c->parallelism == 0) { c->parallelism = 1; clamped = true; }
-    if (c->parallelism > kScanMaxParallelism) {
-        c->parallelism = kScanMaxParallelism; clamped = true;
-    }
     if (c->lookahead > kScanMaxLookahead) {
         c->lookahead = kScanMaxLookahead; clamped = true;
     }
@@ -57,7 +54,7 @@ constexpr uint32_t kReqRingCap = 64u;   // ≤ kScanMaxInflight
 constexpr uint32_t kResRingCap = 64u;
 
 // Bounded MPMC ring for tasks. Producer = scan driver; consumers = worker
-// threads (genuinely multi-consumer — kScanMaxParallelism workers all pop
+// threads (genuinely multi-consumer — every worker pops
 // from the same ring). This used to be a hand-rolled array guarded by a
 // std::mutex ("one mutex for simplicity"); G2CHK-85 swapped it for the
 // same lock-free Vyukov-sequence MPMC bolt already ships
@@ -116,7 +113,7 @@ struct ParallelScanPool {
     prefetch::Prefetcher* prefetcher;
     TaskRing             reqs;
     ResultRing           results;
-    std::thread          workers[kScanMaxParallelism];
+    std::thread*         workers;     // [n_workers], from the pool arena
     uint32_t             n_workers;
     std::atomic<bool>    finishing;
     std::atomic<bool>    stopped;
@@ -168,6 +165,12 @@ bool parallel_scan_open(
     if (out == nullptr || arena == nullptr || cfg == nullptr) return false;
     ParallelScanConfig local = *cfg;
     (void)parallel_scan_config_clamp(&local);
+    if (local.parallelism == 0 || local.parallelism > kScanMaxParallelism) {
+        std::fprintf(stderr, "parallel_scan_open: parallelism %u outside [1, %u]%s\n",
+                     local.parallelism, kScanMaxParallelism,
+                     local.parallelism == 0 ? " (invalid BOLT_WORKERS?)" : "");
+        return false;
+    }
     auto* p = static_cast<ParallelScanPool*>(
         arena->allocate(sizeof(ParallelScanPool), alignof(ParallelScanPool)));
     if (p == nullptr) return false;
@@ -191,6 +194,12 @@ bool parallel_scan_open(
             &p->prefetcher, arena, store, local.lookahead);
         // Prefetcher is best-effort: open failure is non-fatal — scan
         // simply runs without read-ahead.
+    }
+    p->workers = static_cast<std::thread*>(arena->allocate(
+        sizeof(std::thread) * local.parallelism, alignof(std::thread)));
+    if (p->workers == nullptr) {
+        if (p->prefetcher != nullptr) prefetch::prefetcher_close(p->prefetcher);
+        return false;
     }
     p->n_workers = local.parallelism;
     for (uint32_t i = 0; i < p->n_workers; ++i) {

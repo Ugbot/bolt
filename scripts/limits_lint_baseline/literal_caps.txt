@@ -10,7 +10,6 @@ include/bolt/bolt_column.h::kMaxBatchColumns
 include/bolt/bolt_column.h::kMaxFixedColumns
 include/bolt/bolt_column.h::kSketchCap
 include/bolt/bolt_disruptor.h::kDisruptorMaxConsumers
-include/bolt/bolt_ebr.h::kEbrMaxShards
 include/bolt/bolt_ribbon.h::kMaxRetries
 include/bolt/bolt_tensor.h::kTensorMaxDims
 include/bolt/bolt_topology.h::kTopologyMaxCpus
@@ -201,7 +200,6 @@ include/bolt/lakehouse/object_store/prefetch.h::kPrefetchMaxDepth
 include/bolt/lakehouse/object_store/prefetch.h::kPrefetchUriCap
 include/bolt/lakehouse/scan_optimizer.h::kScanMaxInflight
 include/bolt/lakehouse/scan_optimizer.h::kScanMaxLookahead
-include/bolt/lakehouse/scan_optimizer.h::kScanMaxParallelism
 include/bolt/lakehouse/scan_optimizer.h::kScanMorselMaxRows
 include/bolt/net/bolt_http_client.h::kHttpMaxBody
 include/bolt/net/bolt_http_client.h::kHttpMaxHeader

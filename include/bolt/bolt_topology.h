@@ -1,8 +1,8 @@
 // bolt_topology.h — Host CPU topology detection (header-only, zero deps).
 //
-// RULES: No exceptions. No RTTI. No smart pointers. No std::string. No heap
-// outside the caller-provided struct (and a stack-only alloca for the Windows
-// query buffer). All functions noexcept.
+// RULES: No exceptions. No RTTI. No smart pointers. No std::string. Heap only
+// for the Linux per-CPU scratch during detection (plus a stack-only alloca for
+// the Windows query buffer). All functions noexcept.
 //
 // Provides a POD CpuTopology + platform-specialised detection:
 //   Windows : GetLogicalProcessorInformationEx (+ EfficiencyClass for hybrid)
@@ -14,9 +14,12 @@
 
 #include "bolt/bolt_port.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <new>
 
 // System headers must be included at GLOBAL scope so their declarations land
 // in the global namespace (and so a consumer that includes the same header
@@ -29,17 +32,21 @@
 
 namespace bolt {
 
-inline constexpr uint32_t kTopologyMaxCpus = 256;
+// Mapping ceiling for the per-CPU tables below (AMD Turin dual socket is 768
+// threads). CPUs past it are counted in `unmapped_cpus` and reported once.
+inline constexpr uint32_t kTopologyMaxCpus = 4096;
 
 struct CpuTopology {
-    uint32_t logical_cpus;       // total hardware threads
+    uint32_t logical_cpus;       // hardware threads mapped below (<= kTopologyMaxCpus)
     uint32_t physical_cores;     // physical cores (0 if detection failed)
     uint32_t performance_cores;  // P-cores on hybrid CPUs; 0 if not detected / not hybrid
     uint32_t efficiency_cores;   // E-cores on hybrid CPUs; 0 if not detected / not hybrid
     uint32_t numa_nodes;         // always >= 1
-    uint32_t cpu_to_node [kTopologyMaxCpus]; // CPU index -> NUMA node
+    uint32_t unmapped_cpus;      // hardware threads beyond kTopologyMaxCpus
+    uint16_t cpu_to_node [kTopologyMaxCpus]; // CPU index -> NUMA node
     uint8_t  cpu_is_perf [kTopologyMaxCpus]; // 1 if P-core or uniform, 0 if E-core
 };
+static_assert(sizeof(CpuTopology) <= 16u * 1024u, "CpuTopology is a stack local");
 
 // Forward decl for fallback (used by per-platform detectors on failure).
 inline void bolt_topology_fallback(CpuTopology* out) noexcept;
@@ -53,8 +60,21 @@ inline void topology_zero(CpuTopology* out) noexcept {
     out->performance_cores = 0;
     out->efficiency_cores  = 0;
     out->numa_nodes        = 0;
+    out->unmapped_cpus     = 0;
     std::memset(out->cpu_to_node, 0, sizeof(out->cpu_to_node));
     std::memset(out->cpu_is_perf, 0, sizeof(out->cpu_is_perf));
+}
+
+// One stderr line per process when the machine has more hardware threads
+// than the mapping ceiling: the extra CPUs run unpinned, never silently.
+inline void topology_report_unmapped(const CpuTopology* t) noexcept {
+    assert(t != nullptr);
+    static std::atomic<bool> reported{false};
+    if (t->unmapped_cpus == 0 || reported.exchange(true)) return;
+    std::fprintf(stderr,
+                 "bolt topology: %u hardware threads beyond kTopologyMaxCpus=%u "
+                 "are not mapped for pinning/NUMA\n",
+                 t->unmapped_cpus, kTopologyMaxCpus);
 }
 
 }  // namespace detail
@@ -69,7 +89,7 @@ inline void bolt_topology_fallback(CpuTopology* out) noexcept {
 
     uint32_t n = bolt_get_hardware_concurrency();
     if (n == 0) n = 1;
-    if (n > kTopologyMaxCpus) n = kTopologyMaxCpus;
+    if (n > kTopologyMaxCpus) { out->unmapped_cpus = n - kTopologyMaxCpus; n = kTopologyMaxCpus; }
 
     out->logical_cpus      = n;
     out->physical_cores    = n;
@@ -120,7 +140,7 @@ inline bool detect_windows(CpuTopology* out) noexcept {
     // --- hardware concurrency -------------------------------------------------
     uint32_t hc = bolt_get_hardware_concurrency();
     if (hc == 0) hc = 1;
-    if (hc > kTopologyMaxCpus) hc = kTopologyMaxCpus;
+    if (hc > kTopologyMaxCpus) { out->unmapped_cpus = hc - kTopologyMaxCpus; hc = kTopologyMaxCpus; }
     out->logical_cpus = hc;
 
     // --- cores + efficiency class --------------------------------------------
@@ -209,7 +229,7 @@ inline bool detect_windows(CpuTopology* out) noexcept {
             for (uint32_t b = 0; b < 64u && m != 0; ++b) {
                 if (m & (KAFFINITY{1} << b)) {
                     uint32_t cpu = group_base + b;
-                    if (cpu < kTopologyMaxCpus) out->cpu_to_node[cpu] = node_id;
+                    if (cpu < kTopologyMaxCpus) out->cpu_to_node[cpu] = static_cast<uint16_t>(node_id);
                     m &= ~(KAFFINITY{1} << b);
                 }
             }
@@ -226,6 +246,7 @@ inline bool bolt_detect_topology(CpuTopology* out) noexcept {
     if (!detail::detect_windows(out)) {
         bolt_topology_fallback(out);
     }
+    detail::topology_report_unmapped(out);
     return true;
 }
 
@@ -267,8 +288,8 @@ inline bool parse_u32(const char*& p, uint32_t& out) noexcept {
     return true;
 }
 
-// Count CPUs listed in a kernel "cpu list" (e.g. "0-3,6,8-9"), and for each
-// CPU in range [0, kTopologyMaxCpus) call `fn(cpu_id)`.
+// Count CPUs listed in a kernel "cpu list" (e.g. "0-3,6,8-9") and call
+// `fn(cpu_id)` for each; `fn` filters ids past kTopologyMaxCpus.
 template <typename F>
 inline uint32_t foreach_cpu_in_list(const char* s, F&& fn) noexcept {
     uint32_t count = 0;
@@ -283,7 +304,7 @@ inline uint32_t foreach_cpu_in_list(const char* s, F&& fn) noexcept {
             ++p;
             parse_u32(p, b);
         }
-        for (uint32_t c = a; c <= b && c < kTopologyMaxCpus; ++c) {
+        for (uint32_t c = a; c <= b && c < 0x100000u; ++c) {
             fn(c);
             ++count;
         }
@@ -302,22 +323,35 @@ inline bool detect_linux(CpuTopology* out) noexcept {
     if (n <= 0) return false;
 
     // Collect present CPU ids.
-    uint8_t present[kTopologyMaxCpus];
-    std::memset(present, 0, sizeof(present));
+    // Per-CPU scratch is ~100 KiB at the ceiling: heap, once, at detection.
+    struct Scratch {
+        uint8_t  present [kTopologyMaxCpus];
+        uint32_t pkg_ids [kTopologyMaxCpus];
+        uint32_t core_ids[kTopologyMaxCpus];
+        uint32_t freqs   [kTopologyMaxCpus];
+        uint32_t tmp     [kTopologyMaxCpus];
+        uint64_t seen    [kTopologyMaxCpus];
+    };
+    Scratch* sc = new (std::nothrow) Scratch;
+    if (sc == nullptr) return false;
+    struct ScratchFree { Scratch* p; ~ScratchFree() { delete p; } } sc_free{sc};
+    uint8_t*  present  = sc->present;
+    uint32_t* pkg_ids  = sc->pkg_ids;
+    uint32_t* core_ids = sc->core_ids;
+    uint32_t* freqs    = sc->freqs;
+    std::memset(present, 0, sizeof(sc->present));
+    uint32_t beyond = 0;
     uint32_t total = foreach_cpu_in_list(buf, [&](uint32_t c) noexcept {
-        if (c < kTopologyMaxCpus) present[c] = 1;
+        if (c < kTopologyMaxCpus) present[c] = 1; else ++beyond;
     });
     if (total == 0) return false;
 
     uint32_t logical = 0;
     for (uint32_t i = 0; i < kTopologyMaxCpus; ++i) if (present[i]) ++logical;
-    out->logical_cpus = logical;
+    out->logical_cpus  = logical;
+    out->unmapped_cpus = beyond;
 
     // --- physical cores via unique (pkg, core) ------------------------------
-    // Cap at modest sizes; use stacked arrays.
-    uint32_t pkg_ids [kTopologyMaxCpus];
-    uint32_t core_ids[kTopologyMaxCpus];
-    uint32_t freqs   [kTopologyMaxCpus];
     bool has_freq = false;
     for (uint32_t i = 0; i < kTopologyMaxCpus; ++i) {
         pkg_ids[i] = 0; core_ids[i] = i; freqs[i] = 0;
@@ -352,7 +386,7 @@ inline bool detect_linux(CpuTopology* out) noexcept {
     // Count unique (pkg, core) pairs among present CPUs.
     uint32_t physical = 0;
     {
-        uint64_t seen[kTopologyMaxCpus];  // sentinel array; max distinct == logical
+        uint64_t* seen = sc->seen;  // sentinel array; max distinct == logical
         for (uint32_t i = 0; i < kTopologyMaxCpus; ++i) seen[i] = ~uint64_t{0};
         for (uint32_t c = 0; c < kTopologyMaxCpus; ++c) {
             if (!present[c]) continue;
@@ -369,7 +403,7 @@ inline bool detect_linux(CpuTopology* out) noexcept {
     // --- P/E heuristic: above-median max freq = P, at/below = E -------------
     if (has_freq) {
         // Compute median of present CPUs' freqs (ignore zeros).
-        uint32_t tmp[kTopologyMaxCpus];
+        uint32_t* tmp = sc->tmp;
         uint32_t m = 0;
         for (uint32_t c = 0; c < kTopologyMaxCpus; ++c) {
             if (present[c] && freqs[c] > 0) tmp[m++] = freqs[c];
@@ -424,7 +458,7 @@ inline bool detect_linux(CpuTopology* out) noexcept {
         }
         nodes = node + 1;
         foreach_cpu_in_list(buf, [&](uint32_t c) noexcept {
-            if (c < kTopologyMaxCpus) out->cpu_to_node[c] = node;
+            if (c < kTopologyMaxCpus) out->cpu_to_node[c] = static_cast<uint16_t>(node);
         });
     }
     out->numa_nodes = nodes == 0 ? 1 : nodes;
@@ -439,6 +473,7 @@ inline bool bolt_detect_topology(CpuTopology* out) noexcept {
     if (!detail::detect_linux(out)) {
         bolt_topology_fallback(out);
     }
+    detail::topology_report_unmapped(out);
     return true;
 }
 
@@ -466,7 +501,10 @@ inline bool detect_macos(CpuTopology* out) noexcept {
 
     uint32_t logical = 0;
     if (!sysctl_u32("hw.logicalcpu", logical) || logical == 0) return false;
-    if (logical > kTopologyMaxCpus) logical = kTopologyMaxCpus;
+    if (logical > kTopologyMaxCpus) {
+        out->unmapped_cpus = logical - kTopologyMaxCpus;
+        logical = kTopologyMaxCpus;
+    }
     out->logical_cpus = logical;
 
     uint32_t physical = 0;
@@ -500,6 +538,7 @@ inline bool bolt_detect_topology(CpuTopology* out) noexcept {
     if (!detail::detect_macos(out)) {
         bolt_topology_fallback(out);
     }
+    detail::topology_report_unmapped(out);
     return true;
 }
 

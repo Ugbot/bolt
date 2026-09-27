@@ -34,7 +34,7 @@
 // Infrastructure bounds (sized at init, never at hot path).
 // ---------------------------------------------------------------------------
 #ifndef BOLT_MAX_WORKERS
-    #define BOLT_MAX_WORKERS 64u           // upper cap on scheduler thread pool
+    #define BOLT_MAX_WORKERS 4096u         // validation ceiling (= kTopologyMaxCpus); arrays are sized at init
 #endif
 #ifndef BOLT_TASK_RING_SIZE
     #define BOLT_TASK_RING_SIZE 16384u     // SPMC ring slots (power of two)
@@ -197,6 +197,5 @@ static_assert(kThroughputGrainBytes  >= 64,  "throughput grain too small");
 //   #define BOLT_THROUGHPUT_GRAIN_BYTES    (4u * 1024u * 1024u)
 //
 // Constrained hosts (shared tenant, laptop):
-//   #define BOLT_MAX_WORKERS               8u
 //   #define BOLT_TASK_RING_SIZE            4096u
 // ---------------------------------------------------------------------------

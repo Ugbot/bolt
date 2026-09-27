@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_budget.h"
 #include "bolt/lakehouse/scan_optimizer.h"
 #include "bolt/lakehouse/object_store.h"
 
@@ -35,31 +36,34 @@ struct RowGroupTask {
 };
 
 struct ParallelScanConfig {
-    uint32_t parallelism;        // worker thread count, capped at 16
+    uint32_t parallelism;        // worker threads, 1..kScanMaxParallelism
     uint32_t lookahead;          // prefetch depth, capped at 32
     uint32_t inflight_max;       // capped at 64
     bool     use_prefetch;
     uint8_t  _pad[3];
 };
 
-// Initialise a config with the W8 defaults.
+// Initialise a config with the W8 defaults. Parallelism is the auto-sized
+// worker count; 0 when BOLT_WORKERS is invalid, which open() refuses.
 inline void parallel_scan_config_init(ParallelScanConfig* c) noexcept {
     assert(c != nullptr);
     if (c == nullptr) return;
-    c->parallelism  = kScanDefaultParallel;
+    c->parallelism  = bolt_auto_workers();
     c->lookahead    = kScanDefaultLookahead;
     c->inflight_max = 16u;
     c->use_prefetch = true;
 }
 
-// Clamp a config to W8 hard caps. Returns true if any field was clamped.
+// Clamp lookahead/inflight to the W8 caps. Returns true if any field was
+// clamped. Parallelism is never clamped: open() refuses 0 or > the ceiling.
 bool parallel_scan_config_clamp(ParallelScanConfig* c) noexcept;
 
 // Opaque pool. Holds the worker threads + the request/result channels.
 struct ParallelScanPool;
 
 // Open. `store` is borrowed (for the prefetcher). `arena` backs the pool
-// struct + work-unit allocs. Returns false on bad arg / oversize.
+// struct, its worker array and work-unit allocs. Returns false on a bad arg
+// or a parallelism outside [1, kScanMaxParallelism] (reason on stderr).
 bool parallel_scan_open(
     ParallelScanPool** out, Arena* arena, ObjectStore* store,
     const ParallelScanConfig* cfg) noexcept;
