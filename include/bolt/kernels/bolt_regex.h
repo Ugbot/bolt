@@ -9,8 +9,10 @@
 // quantifier, anchored or not. Documented supported syntax:
 //
 //   literal chars          matched verbatim
-//   .                       any single byte
-//   [abc] / [^abc] / [a-z]  character class, optional negation, ranges
+//   .                       any single character (one UTF-8 code point)
+//   [abc] / [^abc] / [a-z]  character class over ASCII, optional negation,
+//                           ranges; a negated class matches any non-ASCII
+//                           character whole
 //   ?  *  +                 quantifier on the PRECEDING atom (greedy)
 //   ( ... )                 capturing group (up to kMaxGroups - 1, 1-based)
 //   (?: ... )                non-capturing group
@@ -19,8 +21,9 @@
 //
 // NOT supported (documented gap, not attempted): alternation `|`, backrefs
 // INSIDE the pattern, lazy quantifiers (`*?`), bounded repeat `{m,n}`,
-// lookaround, Unicode character classes (`\d`/`\w`/`\s`) — ASCII byte
-// matching only. A pattern using unsupported syntax fails to compile
+// lookaround, Unicode character classes (`\d`/`\w`/`\s`), non-ASCII
+// bytes inside `[...]`, a quantifier on a non-ASCII literal (it would bind to
+// the character's last byte). A pattern using unsupported syntax fails to compile
 // (returns false), which the SQL layer surfaces as a clean InvalidInput
 // rather than a wrong match.
 //
@@ -52,6 +55,7 @@
 #include <cstring>
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/bolt_utf8_cp.h"
 
 namespace bolt {
 namespace kernels {
@@ -127,6 +131,7 @@ inline bool regex_compile_class(const char* pat, uint32_t len, uint32_t* io,
             hi = static_cast<std::uint8_t>(pat[i + 1]);
             i += 2;
         }
+        if (lo >= 0x80u || hi >= 0x80u) return false;   // byte ranges only
         n->ranges[n->n_ranges].lo = lo;
         n->ranges[n->n_ranges].hi = hi;
         n->n_ranges += 1;
@@ -225,6 +230,7 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
         n->ch = static_cast<std::uint8_t>(c);
         ++i;
         regex_compile_quantifier(pat, pat_len, &i, n);
+        if (n->ch >= 0x80u && (n->min_rep != 1 || n->max_rep != 1)) return false;
         out->n_nodes++;
     }
     if (stack_n != 0) return false;   // unbalanced groups
@@ -288,30 +294,37 @@ bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
                      uint16_t node_i, uint16_t outer_hi,
                      int32_t pos, int32_t* out_pos) noexcept;
 
-// Try `count` in [min_rep, cap] repetitions of one atom (Char/Any/Class) at
-// `node_i`, greedy-then-backtrack, then continue matching
-// nodes[node_i+1 .. outer_hi) from the resulting position.
+// Try `count` in [min_rep, max_rep] repetitions of one atom (Char/Any/Class)
+// at `node_i`, greedy-then-backtrack, then continue matching
+// nodes[node_i+1 .. outer_hi) from the resulting position. Any/Class consume
+// one character (utf8_unit_len) per repetition, Char one byte.
 inline bool regex_match_atom_rep(const CompiledPattern* cp, MatchState* st,
                                  uint16_t node_i, uint16_t outer_hi,
                                  int32_t pos, int32_t* out_pos) noexcept {
     assert(cp != nullptr && st != nullptr && out_pos != nullptr);
+    assert(pos >= 0 && pos <= st->len);
     const Node& n = cp->nodes[node_i];
-    int32_t max_here = pos;
-    const int32_t cap = (n.max_rep == kUnbounded) ? st->len : pos + n.max_rep;
-    while (max_here < st->len && max_here < cap &&
-           regex_atom_matches(n, static_cast<std::uint8_t>(st->text[max_here]))) {
-        ++max_here;
+    const bool wide = n.kind != NodeKind::Char;
+    const uint32_t len = static_cast<uint32_t>(st->len);
+    uint32_t k = static_cast<uint32_t>(pos);
+    int32_t reps = 0;
+    while (k < len && (n.max_rep == kUnbounded || reps < n.max_rep) &&
+           regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k]))) {
+        k += wide ? utf8::utf8_unit_len(st->text, len, k) : 1u;
+        ++reps;
     }
-    const int32_t min_here = pos + n.min_rep;
-    if (max_here < min_here) return false;
-    for (int32_t k = max_here; k >= min_here; --k) {
+    if (reps < n.min_rep) return false;
+    for (;;) {
         if (--st->steps_left <= 0) return false;
         if (regex_match_seq(cp, st, static_cast<uint16_t>(node_i + 1), outer_hi,
-                            k, out_pos)) {
+                            static_cast<int32_t>(k), out_pos)) {
             return true;
         }
+        if (reps == n.min_rep) return false;
+        k = wide ? utf8::utf8_unit_back(st->text, static_cast<uint32_t>(pos), k)
+                 : k - 1u;
+        --reps;
     }
-    return false;
 }
 
 // Try `count` repetitions of a GROUP's sub-sequence [body_lo, body_hi) as a
@@ -418,6 +431,10 @@ inline bool regex_search(const CompiledPattern* cp, const char* text,
     const bool anchored = (cp->n_nodes > 0 &&
                           cp->nodes[0].kind == NodeKind::AnchorStart);
     for (int32_t start = 0; start <= n; ++start) {
+        if (start > 0 && start < n &&
+            utf8::utf8_is_cont(static_cast<std::uint8_t>(text[start]))) {
+            continue;   // never begin a match inside a character
+        }
         MatchState st{};
         st.text = text; st.len = n;
         st.steps_left = kMaxStepsPerByte * (n + 1);
@@ -503,7 +520,7 @@ inline int32_t regex_substitute(const MatchResult* mr, const char* text,
 //   a|b|c            alternation (top-level and inside any group)
 //   *  +  ?          quantifiers; optional lazy suffix accepted for membership
 //   {m} {m,} {m,n}   counted repetition (m,n bounded by kRe2MaxRepeat)
-//   .                any byte EXCEPT newline (RE2 default, no `s` flag)
+//   .                any character EXCEPT newline (RE2 default, no `s` flag)
 //   [abc] [a-z] [^..] character class, ranges, negation, leading `]` literal
 //   \d \w \s \D \W \S  ASCII byte classes (+ negations), standalone or in [..]
 //   \n \t \r \f \v \0  escaped control bytes; \. \\ \( \* … escaped literals
@@ -517,8 +534,11 @@ inline int32_t regex_substitute(const MatchResult* mr, const char* text,
 //   * No captures, backreferences, lookaround, named groups `(?P<..>)`.
 //   * Only the `i` inline flag; `(?s)`/`(?m)`/`(?U)`/`(?P<..>` etc. fail to
 //     compile (clean false, surfaced as InvalidInput by the caller).
-//   * ASCII/byte semantics only — no Unicode property classes `\p{..}`,
-//     no UTF-8-aware `.` (one `.` == one byte).
+//   * `.` and classes consume one whole UTF-8 character; class members are
+//     ASCII only (a non-ASCII byte in `[...]` fails to compile), and a
+//     negated class or \D \W \S matches any non-ASCII character. No Unicode
+//     property classes `\p{..}`. A quantifier on a non-ASCII literal fails to
+//     compile (it would bind to the character's last byte).
 //   * Leftmost-longest submatch capture is irrelevant here (membership only);
 //     accept/reject for the anchored full match is exactly RE2's.
 //   * Any construct exceeding a cap below fails to compile (never truncated).
@@ -952,6 +972,7 @@ inline void re2_compile_class(Re2C* c, int32_t idx, bool icase, uint32_t as,
         } else {
             ++i;
         }
+        if (lo >= 0x80u || hi >= 0x80u) { c->ok = false; return; }
         if (!re2_add_range(in, lo, hi)) { c->ok = false; return; }
     }
     assert(in->op == Re2Op::Class);
@@ -1046,6 +1067,11 @@ inline void re2_compile_concat(Re2C* c, bool icase, uint32_t start,
         int32_t mn = 1, mx = 1;
         re2_parse_quantifier(c, &pos, end, &mn, &mx);
         if (!c->ok) return;
+        if ((mn != 1 || mx != 1) && ae == static_cast<int32_t>(as) + 1 &&
+            static_cast<uint8_t>(c->pat[as]) >= 0x80u) {
+            c->ok = false;
+            return;
+        }
         re2_compile_atom_repeated(c, local_icase, as,
                                   static_cast<uint32_t>(ae), mn, mx);
     }
@@ -1154,7 +1180,10 @@ inline void re2_add_thread(const Re2Program* p, int32_t* list, int32_t* list_n,
 }
 
 // Anchored FULL MATCH: true iff the entire text[0..n) is matched by `prog`.
-// Linear in n * program-size; no heap, no exceptions, no ReDoS.
+// Linear in n * program-size; no heap, no exceptions, no ReDoS. Any/Class
+// consume a whole UTF-8 character: a thread that matches a lead byte of a
+// u-byte character (u <= 4) is parked in pend[(sp + u) & 3] and joins the
+// run list when the scan reaches sp + u.
 inline bool re2_full_match(const Re2Program* prog, const char* text,
                            int32_t n) noexcept {
     assert(prog != nullptr && (text != nullptr || n == 0));
@@ -1162,6 +1191,8 @@ inline bool re2_full_match(const Re2Program* prog, const char* text,
     int32_t buf_a[kRe2MaxInsts];
     int32_t buf_b[kRe2MaxInsts];
     int32_t visited[kRe2MaxInsts];
+    int32_t pend[4][3 * kRe2MaxInsts];
+    int32_t pend_n[4] = {0, 0, 0, 0};
     for (int32_t i = 0; i < prog->n_insts; ++i) visited[i] = -1;
     int32_t* clist = buf_a;
     int32_t* nlist = buf_b;
@@ -1175,22 +1206,35 @@ inline bool re2_full_match(const Re2Program* prog, const char* text,
         }
         if (sp == n) return matched;     // accept only when fully consumed
         const uint8_t b = static_cast<uint8_t>(text[sp]);
+        uint32_t u = (b < 0x80u) ? 1u
+            : utf8::utf8_unit_len(text, static_cast<uint32_t>(n), static_cast<uint32_t>(sp));
+        if (u > 4u) u = 1u;
         ++gen;
         int32_t nn = 0;
         for (int32_t i = 0; i < cn; ++i) {
             const Re2Inst& in = prog->insts[clist[i]];
             bool adv = false;
+            bool wide = false;
             switch (in.op) {
                 case Re2Op::Char:  adv = re2_char_matches(in, b); break;
-                case Re2Op::Any:   adv = (b != '\n'); break;
-                case Re2Op::Class: adv = re2_class_matches(in, b); break;
+                case Re2Op::Any:   adv = (b != '\n'); wide = true; break;
+                case Re2Op::Class: adv = re2_class_matches(in, b); wide = true; break;
                 default:           break;   // Match at non-end dies here
             }
-            if (adv) {
-                re2_add_thread(prog, nlist, &nn, visited, gen,
-                               clist[i] + 1, sp + 1, n);
+            if (!adv) continue;
+            if (wide && u > 1u) {
+                const int32_t slot = (sp + static_cast<int32_t>(u)) & 3;
+                assert(pend_n[slot] < 3 * kRe2MaxInsts);
+                pend[slot][pend_n[slot]++] = clist[i] + 1;
+                continue;
             }
+            re2_add_thread(prog, nlist, &nn, visited, gen, clist[i] + 1, sp + 1, n);
         }
+        const int32_t arrive = (sp + 1) & 3;
+        for (int32_t i = 0; i < pend_n[arrive]; ++i) {
+            re2_add_thread(prog, nlist, &nn, visited, gen, pend[arrive][i], sp + 1, n);
+        }
+        pend_n[arrive] = 0;
         int32_t* tmp = clist; clist = nlist; nlist = tmp;
         cn = nn;
     }

@@ -163,25 +163,23 @@ BOLT_FORCE_INLINE int64_t utf8_contains(
 
 // ---------------------------------------------------------------------------
 // utf8_substr_const: vectorized SUBSTRING(col, start1, len) with COMPILE-TIME
-// CONSTANT 1-based `start1` and byte `take`, producing one output StringView
-// per row. The hot case in OLAP — extracting a fixed prefix/field (TPC-H Q22's
-// substring(c_phone,1,2) country code) — is a tight, branch-light column loop.
+// CONSTANT 1-based `start1` and CHARACTER count `take` (utf8_cp_advance),
+// producing one inline output StringView per row. The hot case in OLAP —
+// extracting a fixed prefix/field (TPC-H Q22's substring(c_phone,1,2)
+// country code) — is a tight, branch-light column loop.
 //
-// Bolt/DuckDB/ClickHouse "inline prefix" insight: the first <=4 bytes of any
-// StringView live in its inline prefix and the next 8 in inline_data, so a
-// short substring that starts within the first 12 bytes NEVER chases the
-// spilled buffer. When the requested window is fully inside [0,12) we read
-// straight from the source view's inline bytes; only a window reaching past
-// byte 12 of a spilled source consults `spilled_base`. Output is always
-// inline when `take <= 12` (the OLAP case); a longer take is clamped to the
-// caller's contract (asserted) — substring-to-spill is a separate path.
+// A spilled source whose window lies in its 4 inline prefix bytes, all
+// ASCII, is answered without chasing the spilled buffer; any other window
+// resolves the bytes through `spilled_base`. Returns false (the caller falls
+// back to its per-row path, `out` is then unspecified) when a row's window
+// is wider than 12 bytes, which only non-ASCII text can produce for
+// take <= 12.
 //
-// Semantics match the per-row evaluator: start1 < 1 clamps to 1; a start past
-// the string yields empty; `take` saturates at the remaining bytes. Bytes, not
-// code points (ASCII/Latin TPC-H data). NULL handling is the caller's (it
-// vectorizes only null-free columns, like the numeric kernels).
+// Semantics match utf8_substring: start1 < 1 clamps to 1; a start past the
+// string yields empty; `take` saturates at the remaining characters. NULL
+// handling is the caller's.
 // ---------------------------------------------------------------------------
-BOLT_FORCE_INLINE void utf8_substr_const(
+BOLT_FORCE_INLINE bool utf8_substr_const(
         const StringView* BOLT_RESTRICT data, int64_t n,
         const char* spilled_base, uint32_t start1, uint32_t take,
         StringView* BOLT_RESTRICT out) noexcept {
@@ -193,22 +191,23 @@ BOLT_FORCE_INLINE void utf8_substr_const(
     for (int64_t i = 0; i < n; ++i) {
         const StringView& s = data[i];
         const uint32_t slen = s.length;
-        const uint32_t start = (s0 >= slen) ? slen : s0;
-        const uint32_t rem   = slen - start;
-        const uint32_t t     = (take < rem) ? take : rem;
-        // Inline-fast: window entirely within the 12 inline bytes (covers
-        // every inline source, and every spilled source whose window stays in
-        // the prefix — the country-code/fixed-field case). &s.prefix[0] is the
-        // canonical inline byte pointer.
-        const char* p;
-        if (s.length <= 12u || start + t <= 4u) {
-            p = s.prefix + start;
-        } else {
+        const char* p = s.prefix;
+        uint32_t b, e;
+        if (slen > 12u && !(s0 + take <= 4u && utf8::utf8_is_ascii(p, s0 + take))) {
             assert(spilled_base != nullptr);
-            p = utf8::sv_bytes(s, spilled_base) + start;
+            p = utf8::sv_bytes(s, spilled_base);
         }
-        out[i] = utf8::sv_make_inline(p, t);
+        if (slen > 12u && p == s.prefix) {
+            b = s0;
+            e = s0 + take;
+        } else {
+            b = utf8::utf8_cp_advance(p, slen, 0, s0);
+            e = utf8::utf8_cp_advance(p, slen, b, take);
+        }
+        if (e - b > 12u) return false;
+        out[i] = utf8::sv_make_inline(p + b, e - b);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,66 +223,6 @@ BOLT_FORCE_INLINE void utf8_length_bytes(
 
     for (int64_t i = 0; i < n; ++i) {
         out_lens[i] = static_cast<int32_t>(data[i].length);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// utf8_upper_ascii: ASCII-only uppercase. Maps 'a'-'z' to 'A'-'Z'; all other
-// bytes pass through. Non-ASCII/multi-byte UTF-8 is NOT case-folded. Document
-// this limitation: full Unicode casing requires ICU-style tables.
-//
-// Allocates output bytes from the arena. Rebuilds StringViews; inline-sized
-// outputs are repacked inline, larger outputs currently fall back to
-// inline representation only if they fit (<=12). Longer strings are not
-// supported here without a buffer-aware path; we assert that all inputs are
-// inline (matches the test's coverage and keeps the kernel focused).
-// ---------------------------------------------------------------------------
-BOLT_FORCE_INLINE void utf8_upper_ascii(
-        const StringView* BOLT_RESTRICT data, int64_t n,
-        StringView* BOLT_RESTRICT out,
-        Arena* arena) noexcept {
-    assert(data != nullptr || n == 0);
-    assert(out  != nullptr || n == 0);
-    assert(arena != nullptr);
-    assert(n >= 0);
-
-    for (int64_t i = 0; i < n; ++i) {
-        const StringView& s = data[i];
-        StringView r;
-        memset(&r, 0, sizeof(r));
-        r.length = s.length;
-        if (s.is_inline()) {
-            // Build a fresh inline view: case-fold the <=12 bytes in place.
-            char buf[12];
-            const uint32_t len = s.length;
-            memcpy(buf, s.prefix, (len < 4u) ? len : 4u);
-            if (len > 4u) memcpy(buf + 4, s.inline_data, len - 4u);
-            for (uint32_t k = 0; k < len; ++k) {
-                unsigned char c = static_cast<unsigned char>(buf[k]);
-                if (c >= 'a' && c <= 'z') buf[k] = static_cast<char>(c - 32);
-            }
-            memcpy(r.prefix, buf, (len < 4u) ? len : 4u);
-            if (len > 4u) memcpy(r.inline_data, buf + 4, len - 4u);
-        } else {
-            // Spilled: copy bytes into arena, but the StringView ref fields
-            // point into a caller-owned buf_idx layout that we don't know
-            // here. We only set the 4-byte prefix; caller populates ref.
-            // Allocate a tail buffer the caller can wire up.
-            char* dst = static_cast<char*>(arena->allocate(s.length, 1));
-            assert(dst != nullptr);
-            // We have no backing bytes to read from here — caller would need
-            // to pre-materialize. Zero-fill to be safe and set prefix upper.
-            memset(dst, 0, s.length);
-            char pfx[4];
-            memcpy(pfx, s.prefix, 4);
-            for (int k = 0; k < 4; ++k) {
-                unsigned char c = static_cast<unsigned char>(pfx[k]);
-                if (c >= 'a' && c <= 'z') pfx[k] = static_cast<char>(c - 32);
-            }
-            memcpy(r.prefix, pfx, 4);
-            // Leave ref fields zero; this path is a stub for spilled inputs.
-        }
-        out[i] = r;
     }
 }
 

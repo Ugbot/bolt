@@ -88,14 +88,15 @@ TEST(BoltStrTemp, Utf8ContainsInline) {
     EXPECT_EQ(out[1], 2);
 }
 
-TEST(BoltStrTemp, Utf8UpperAsciiInline) {
+TEST(BoltStrTemp, Utf8UpperInline) {
     bolt::Arena arena{};
     bolt::StringView rows[2];
     rows[0] = make_inline("Hello");
     rows[1] = make_inline("abc");
 
     bolt::StringView out[2];
-    bolt::kernels::utf8_upper_ascii(rows, 2, out, &arena);
+    char* anchor = static_cast<char*>(arena.allocate(1, 1));
+    bolt::kernels::utf8::utf8_upper(rows, 2, out, &arena, anchor);
     EXPECT_EQ(out[0].length, 5u);
     EXPECT_EQ(std::memcmp(out[0].prefix, "HELL", 4), 0);
     EXPECT_EQ(out[0].inline_data[0], 'O');
