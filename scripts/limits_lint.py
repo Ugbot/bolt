@@ -192,8 +192,27 @@ NOT_TYPES = {"return", "delete", "new", "throw", "case", "goto", "sizeof", "usin
              "typedef", "else", "do", "co_return", "co_yield", "co_await"}
 
 
+ALIASES: dict = {}   # using X = <primitive>; / typedef <primitive> X;
+
+
+def collect_aliases(files) -> None:
+    for _, code in files:
+        for m in re.finditer(r"\busing\s+(\w+)\s*=\s*([\w:\s]+?)\s*;", code):
+            ALIASES[m.group(1)] = re.sub(r"\s+", " ", m.group(2).strip())
+        for m in re.finditer(r"\btypedef\s+([\w:\s]+?)\s+(\w+)\s*;", code):
+            ALIASES[m.group(2)] = re.sub(r"\s+", " ", m.group(1).strip())
+
+
 def elem_size(t: str) -> int:
     t = re.sub(r"\s+", " ", t.strip())
+    for _ in range(4):
+        if t in PRIM_SIZES:
+            return PRIM_SIZES[t]
+        tail = t.split("::")[-1]
+        nxt = ALIASES.get(tail)
+        if nxt is None or nxt == t:
+            break
+        t = nxt
     if t in PRIM_SIZES:
         return PRIM_SIZES[t]
     if t.endswith("*"):
@@ -283,7 +302,7 @@ def scan_literal_caps(path: str, code: str):
         yield f"{path}::{name}"
 
 
-def run(root: Path, srcs, excludes, stack_limit: int):
+def read_all(root: Path, srcs, excludes):
     files = []
     for p in iter_sources(root, srcs, excludes):
         try:
@@ -291,7 +310,15 @@ def run(root: Path, srcs, excludes, stack_limit: int):
         except OSError:
             continue
         files.append((p.relative_to(root).as_posix(), strip_code(text)))
-    consts = collect_consts(files)
+    return files
+
+
+def run(root: Path, srcs, excludes, stack_limit: int, context=()):
+    files = read_all(root, srcs, excludes)
+    # Context dirs (dependency headers) only feed constants and aliases.
+    ctx = read_all(root, context, excludes) if context else []
+    consts = collect_consts(ctx + files)
+    collect_aliases(ctx + files)
     stack_hits = {}
     caps = set()
     for rel, code in files:
@@ -359,6 +386,8 @@ def main() -> int:
     ap.add_argument("--root", default=".")
     ap.add_argument("--src", action="append", default=[])
     ap.add_argument("--exclude", action="append", default=[])
+    ap.add_argument("--context", action="append", default=[],
+                    help="dir read only for constants/type aliases (dependency headers)")
     ap.add_argument("--baseline-dir", required=False)
     ap.add_argument("--stack-bytes", type=int, default=16384)
     ap.add_argument("--update", action="store_true")
@@ -367,7 +396,8 @@ def main() -> int:
     if a.self_test:
         return self_test(a.stack_bytes)
     root = Path(a.root).resolve()
-    stack_hits, caps = run(root, a.src or ["include", "src"], a.exclude, a.stack_bytes)
+    stack_hits, caps = run(root, a.src or ["include", "src"], a.exclude, a.stack_bytes,
+                           a.context)
     bdir = root / (a.baseline_dir or "scripts/limits_lint_baseline")
     sp, cp = bdir / "stack_arrays.txt", bdir / "literal_caps.txt"
     if a.update:
