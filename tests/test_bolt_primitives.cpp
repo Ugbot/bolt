@@ -828,6 +828,46 @@ TEST(BoltColumn, CloneIntoFlatUtf8AllInlineHasNoOverflowPointer) {
     delete[] ovf;
 }
 
+// G2CHK-247: a VarBinary clone must own its validity bitmap too. It used to
+// keep the source pointer, so a source arena reused by the next MarbleDB
+// scan_next() rewrote the clone's NULL bits (TPC-H lineitem read thousands of
+// spurious NULLs). The source bitmap starts at a non-zero bit offset to prove
+// the clone rebases it.
+TEST(BoltColumn, CloneIntoVarBinaryOwnsRebasedValidity) {
+    Arena src;
+    constexpr int64_t kN = 10;
+    char bytes[kN];
+    int32_t offs[kN + 1];
+    offs[0] = 0;
+    for (int64_t i = 0; i < kN; ++i) {
+        bytes[i] = static_cast<char>('a' + i);
+        offs[i + 1] = static_cast<int32_t>(i + 1);
+    }
+    uint8_t vbits[3] = {0xFF, 0xFF, 0xFF};   // offset 3: row r at bit r+3
+    vbits[(4 + 3) >> 3] &= static_cast<uint8_t>(~(1u << ((4 + 3) & 7)));
+    vbits[(9 + 3) >> 3] &= static_cast<uint8_t>(~(1u << ((9 + 3) & 7)));
+    BoltColumn col = BoltColumn::make_var_binary(bytes, vbits, offs, kN,
+                                                 BoltType::Utf8, &src);
+    ASSERT_EQ(col.length, kN);
+    col.validity_offset = 3;
+
+    Arena dst;
+    BoltColumn c2 = col.clone_into(&dst);
+    ASSERT_EQ(c2.length, kN);
+    ASSERT_NE(c2.validity, nullptr);
+    ASSERT_NE(c2.validity, static_cast<const uint8_t*>(vbits));
+    EXPECT_EQ(c2.validity_offset, 0);
+
+    std::memset(vbits, 0x00, sizeof(vbits));   // source reused: all "NULL"
+    std::memset(bytes, 'z', sizeof(bytes));
+    for (int64_t i = 0; i < kN; ++i) {
+        const bool valid = ((c2.validity[i >> 3] >> (i & 7)) & 1u) != 0u;
+        EXPECT_EQ(valid, i != 4 && i != 9) << "row " << i;
+        EXPECT_EQ(static_cast<const char*>(c2.data)[i],
+                  static_cast<char>('a' + i));
+    }
+}
+
 TEST(BoltColumn, MaterializeConstant) {
     Arena a;
     auto col = BoltColumn::make_constant<int32_t>(9, 64, BoltType::Int32);

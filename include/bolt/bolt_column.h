@@ -1755,6 +1755,22 @@ inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
                                         length + 1, BoltType::Int32);
             c.data       = ndata;
             c.dict_child = oc;
+            // The validity bitmap is source-owned too: rebase it to bit 0 in
+            // our arena, or a reused source arena rewrites this clone's NULLs.
+            if (validity != nullptr) {
+                const size_t vbytes = (static_cast<size_t>(length) + 7u) / 8u;
+                uint8_t* nval =
+                    static_cast<uint8_t*>(arena_in->allocate_zeroed(vbytes));
+                if (nval == nullptr) return make_empty();
+                for (int64_t i = 0; i < length; ++i) {
+                    const int64_t s = validity_offset + i;
+                    const uint8_t bit = (validity[s >> 3] >> (s & 7)) & 1u;
+                    nval[i >> 3] |= static_cast<uint8_t>(bit << (i & 7));
+                }
+                c.validity = nval;
+            }
+            c.validity_offset = 0;
+            assert(c.validity == nullptr || c.validity != validity);
             break;
         }
         case ColumnFormat::Flat: {
