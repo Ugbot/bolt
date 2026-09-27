@@ -109,11 +109,12 @@ ParquetWriteOpts make_opts(bool dict) {
     return o;
 }
 
-// Zero bytes normally; 0xA5 under BOLT_NULL_POISON=1. Never the 0xCC dirt.
-bool slot_is_filler(const void* p, std::size_t n) {
-    const auto* b = static_cast<const std::uint8_t*>(p);
-    for (std::size_t i = 0; i < n; ++i) if (b[i] != bolt::null_slot_byte()) return false;
-    return true;
+// The defined filler (zero normally; poison under BOLT_NULL_POISON=1), never
+// the 0xCC dirt.
+bool slot_is_filler(const void* p, std::size_t n, bool sv = false) {
+    std::uint8_t want[16];
+    bolt::null_slot_fill(want, n, sv);
+    return std::memcmp(p, want, n) == 0;
 }
 
 void check_round_trip(bool dict) {
@@ -153,7 +154,7 @@ void check_round_trip(bool dict) {
                                        8)) << i;
             EXPECT_TRUE(slot_is_filler(static_cast<const double*>(cols[1].data) + i, 8))
                 << i;
-            EXPECT_TRUE(slot_is_filler(sv, sizeof(*sv))) << "row " << i;
+            EXPECT_TRUE(slot_is_filler(sv, sizeof(*sv), true)) << "row " << i;
             EXPECT_EQ(len, 0);
             ASSERT_NE(p, nullptr);
             const char* ap = nullptr;

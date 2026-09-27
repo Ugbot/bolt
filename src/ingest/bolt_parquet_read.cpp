@@ -501,7 +501,9 @@ inline void null_row(ColCtx* cx, int64_t r) noexcept {
     assert(cx != nullptr && cx->validity != nullptr);
     assert(cx->out != nullptr && cx->elem > 0u && cx->elem <= 16u);
     bit_clear(cx->validity, r);
-    null_slot_fill(cx->out + static_cast<uint64_t>(r) * cx->elem, cx->elem);
+    null_slot_fill(cx->out + static_cast<uint64_t>(r) * cx->elem, cx->elem,
+                   (cx->type == BoltType::Utf8 || cx->type == BoltType::Binary) &&
+                       cx->elem == sizeof(StringView));
 }
 
 // Guarantee `need` more bytes of Utf8 spill room, growing if necessary.

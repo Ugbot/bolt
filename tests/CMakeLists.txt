@@ -2166,6 +2166,7 @@ add_test(NAME bolt_limits_lint
                  --baseline-dir scripts/limits_lint_baseline)
 add_test(NAME bolt_limits_lint_selftest
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py --self-test)
+
 # WI-2: NULL rows decode to a defined payload slot, never arena garbage.
 add_executable(test_bolt_parquet_null_slots test_bolt_parquet_null_slots.cpp)
 target_link_libraries(test_bolt_parquet_null_slots
