@@ -17,7 +17,7 @@
 //     X(max_widgets, kFixedAtAlloc, "count", 1024, 1, 1u << 20, \
 //       "MYREPO_MAX_WIDGETS", nullptr, "widgets per pool")
 //   BOLT_LIMITS_TABLE(myrepo_limits, "myrepo", MYREPO_LIMITS)
-//   ... myrepo_limit(myrepo_limits_id::max_widgets)
+//   ... myrepo_limits_value(myrepo_limits_id::max_widgets)
 //
 // RULES: No exceptions, no allocation. Environment parsing happens once per
 // table, at first access (never on a hot path).
