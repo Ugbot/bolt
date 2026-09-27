@@ -2210,3 +2210,11 @@ target_link_libraries(test_bolt_workers_kind_b
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_workers_kind_b)
 add_test(NAME test_bolt_workers_kind_b COMMAND test_bolt_workers_kind_b)
+
+# L8 (G2CHK-339): seeded fuzzer over the kind-B worker/topology surface —
+# BOLT_WORKERS-style override validation, scheduler sizing + range coverage,
+# EBR shard sizing + retire safety. --seed N replays a failure.
+add_executable(fuzz_workers_kind_b fuzz_workers_kind_b.cpp)
+target_link_libraries(fuzz_workers_kind_b PRIVATE bolt::bolt)
+bolt_apply_hardening(fuzz_workers_kind_b)
+add_test(NAME fuzz_workers_kind_b COMMAND fuzz_workers_kind_b --count 500)
