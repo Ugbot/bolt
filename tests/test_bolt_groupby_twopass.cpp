@@ -522,6 +522,88 @@ TEST(BoltGroupbyTwopass, BankedAvgAndSumsAreExact) {
     }
 }
 
+// G2CHK-258: counts[] is the exact per-group non-NULL input count for every
+// value aggregate on every specialised loop (plain and banked, with and
+// without a validity bitmap); a consumer answers NULL for a group whose
+// count is 0 instead of the accumulator identity.
+static void run_valid_counts(int64_t n_groups) {
+    constexpr int64_t N = 4096;
+    static int64_t ks[N];
+    static int64_t iv[N];
+    static int32_t i32[N];
+    static int32_t dt[N];
+    static dec::Decimal128 dv[N];
+    static uint8_t validity[N / 8];
+    std::vector<int64_t> want(static_cast<size_t>(n_groups), 0);
+    std::memset(validity, 0, sizeof(validity));
+    for (int64_t i = 0; i < N; ++i) {
+        ks[i] = i % n_groups;
+        iv[i] = i; i32[i] = static_cast<int32_t>(i); dt[i] = static_cast<int32_t>(i);
+        dv[i] = dec::d128_from_i64(i);
+        const bool valid = ks[i] != 0 && (i % 3) != 0;   // group 0 all NULL
+        if (valid) validity[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
+        want[static_cast<size_t>(ks[i])] += valid ? 1 : 0;
+    }
+    Arena a;
+    BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Int64);
+    BoltColumn pd[4];
+    pd[0] = BoltColumn::make_flat(iv, nullptr, 0, BoltType::Int64);
+    pd[1] = BoltColumn::make_flat(i32, nullptr, 0, BoltType::Int32);
+    pd[2] = BoltColumn::make_flat(dt, nullptr, 0, BoltType::Date32);
+    pd[3] = BoltColumn::make_flat(dv, nullptr, 0, BoltType::Decimal128);
+    AggSpec specs[8];
+    specs[0] = make_spec(AggKind::Sum, 0);
+    specs[1] = make_spec(AggKind::Min, 0);
+    specs[2] = make_spec(AggKind::Max, 0);
+    specs[3] = make_spec(AggKind::Sum, 1);
+    specs[4] = make_spec(AggKind::Min, 1);
+    specs[5] = make_spec(AggKind::Max, 2);
+    specs[6] = make_spec(AggKind::Sum, 3);
+    specs[7] = make_spec(AggKind::Avg, 0);
+    GroupbyTypedState st{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &kd, 1, pd, 4, specs, 8,
+                                                  static_cast<uint32_t>(n_groups * 4)));
+    BoltColumn k = BoltColumn::make_flat(ks, nullptr, N, BoltType::Int64);
+    BoltColumn p[4];
+    p[0] = BoltColumn::make_flat(iv, validity, N, BoltType::Int64);
+    p[1] = BoltColumn::make_flat(i32, validity, N, BoltType::Int32);
+    p[2] = BoltColumn::make_flat(dt, validity, N, BoltType::Date32);
+    p[3] = BoltColumn::make_flat(dv, validity, N, BoltType::Decimal128);
+    groupby_agg_multi_key_typed_ingest(&st, &k, p, nullptr, 0, N);
+    ASSERT_FALSE(st.oom);
+    // Validity-free rows for every group but 0.
+    static int64_t ks2[N];
+    int64_t n2 = 0;
+    for (int64_t i = 0; i < N; ++i) {
+        if (ks[i] == 0) continue;
+        ks2[n2++] = ks[i];
+        want[static_cast<size_t>(ks[i])] += 1;
+    }
+    BoltColumn k2 = BoltColumn::make_flat(ks2, nullptr, n2, BoltType::Int64);
+    BoltColumn q[4];
+    q[0] = BoltColumn::make_flat(iv, nullptr, n2, BoltType::Int64);
+    q[1] = BoltColumn::make_flat(i32, nullptr, n2, BoltType::Int32);
+    q[2] = BoltColumn::make_flat(dt, nullptr, n2, BoltType::Date32);
+    q[3] = BoltColumn::make_flat(dv, nullptr, n2, BoltType::Decimal128);
+    groupby_agg_multi_key_typed_ingest(&st, &k2, q, nullptr, 0, n2);
+    ASSERT_FALSE(st.oom);
+    BoltColumn ok[1], oa[8];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, static_cast<uint32_t>(n_groups));
+    const int64_t* outk = static_cast<const int64_t*>(ok[0].data);
+    for (uint32_t j = 0; j < 8; ++j) {
+        const int64_t* cnt = st.counts + static_cast<size_t>(j) * st.cap;
+        for (uint32_t r = 0; r < ng; ++r) {
+            EXPECT_EQ(cnt[r], want[static_cast<size_t>(outk[r])])
+                << "agg " << j << " group " << outk[r];
+        }
+    }
+}
+
+TEST(BoltGroupbyTwopass, ValidCountsExactBanked) { run_valid_counts(8); }
+TEST(BoltGroupbyTwopass, ValidCountsExactPlain) { run_valid_counts(200); }
+
 // ---------------------------------------------------------------------------
 // Specialised Min/Max + Date32 keys; Float64 keeps fallback-identical
 // semantics through gb_p2_generic.
