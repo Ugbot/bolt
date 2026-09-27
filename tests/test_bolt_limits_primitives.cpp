@@ -206,6 +206,7 @@ TEST(BoundCheck, EnforcedAndRecordsResourceExhausted) {
 }
 
 TEST(LimitsRegistry, ResolvesEnvAliasAndReportsSource) {
+    set_env("BOLT_TEST_WIDGETS", "");   // empty = unset: the alias wins
     set_env("BOLT_TEST_WIDGETS_LEGACY", "42");
     set_env("BOLT_TEST_GIZMOS", "999");
     bolt::LimitTable& t = test_limits_ok();

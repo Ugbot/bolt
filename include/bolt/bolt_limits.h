@@ -138,13 +138,14 @@ inline bool limits_resolve(LimitTable* t) noexcept {
         t->sources[i].store(static_cast<uint8_t>(LimitSource::kDefault),
                             std::memory_order_relaxed);
         if (d.kind == LimitKind::kInvariant) continue;
+        // An empty variable counts as unset.
         const char* var = d.env;
         const char* raw = d.env != nullptr ? std::getenv(d.env) : nullptr;
-        if (raw == nullptr && d.env_alias != nullptr) {
+        if ((raw == nullptr || *raw == '\0') && d.env_alias != nullptr) {
             raw = std::getenv(d.env_alias);
             var = d.env_alias;
         }
-        if (raw == nullptr) continue;
+        if (raw == nullptr || *raw == '\0') continue;
         uint64_t v = 0;
         if (!limits_parse_u64(raw, &v) || !limits_in_range(d, v)) {
             if (ok) {
