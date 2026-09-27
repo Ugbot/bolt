@@ -219,6 +219,58 @@ BOLT_FORCE_INLINE int64_t csr_edge_dst_keep(
     return static_cast<int64_t>(dst_bounds[src_index] == dst);
 }
 
+// ============================================================================
+// CsrGraphT — the walkable arrays of one CSR, generic over element width
+// ============================================================================
+//
+// Every traversal kernel (csr_expand_graph, csr_bfs_*, csr_shortest_bidir)
+// walks one of these. `Nbr`/`Eid` are the stored neighbour and relationship-id
+// types: int64_t for the original layout, uint32_t for the compact one
+// (8 B/edge per direction). Values are widened to int64 at the point of use.
+//
+// off[] covers the node WINDOW [node_lo, node_lo + n_win): a node outside it
+// has no edges in this CSR, which is what lets one relationship type index
+// only the id range its source label occupies instead of the whole graph.
+// n_win < 0 means the window is [0, n_nodes) — the value an aggregate-
+// initialised graph gets, so a caller that predates the window is unchanged.
+// n_nodes remains the range authority for ids (a source outside it is an
+// error, a source outside the window merely has degree 0).
+template <typename Nbr, typename Eid>
+struct CsrGraphT {
+    const int64_t* off         = nullptr;   // n_win + 1 (or n_nodes + 1)
+    const Nbr*     neighbors   = nullptr;   // num_edges
+    const Eid*     edge_ids    = nullptr;   // num_edges
+    const int32_t* edge_labels = nullptr;   // num_edges, or null
+    int64_t        n_nodes     = 0;
+    int32_t        want_label  = 0;         // < 0 => wildcard
+    int32_t        _pad        = 0;
+    int64_t        node_lo     = 0;
+    int64_t        n_win       = -1;
+};
+
+using CsrGraph64 = CsrGraphT<int64_t, int64_t>;
+using CsrGraph32 = CsrGraphT<uint32_t, uint32_t>;
+
+// [*b, *e) = node's block. `node` must be in [0, n_nodes); a node outside the
+// window yields the empty block.
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE void csr_graph_block(const CsrGraphT<Nbr, Eid>* g,
+                                       int64_t node, int64_t* b,
+                                       int64_t* e) noexcept {
+    assert(g != nullptr && b != nullptr && e != nullptr);
+    assert(node >= 0 && node < g->n_nodes);
+    const int64_t  win = (g->n_win < 0) ? g->n_nodes : g->n_win;
+    const uint64_t r   = static_cast<uint64_t>(node - g->node_lo);
+    if (r < static_cast<uint64_t>(win)) {
+        *b = g->off[r];
+        *e = g->off[r + 1];
+    } else {
+        *b = 0;
+        *e = 0;
+    }
+    assert(*b <= *e);
+}
+
 // Sentinel returned by csr_expand_bounded (and its two forwarding entry
 // points) when the current source id is outside the CSR's [0, n_nodes)
 // range — see the G2CHK-92 note above csr_expand_bounded. A valid row count
@@ -291,42 +343,39 @@ struct CsrExpandCursor {
 // This is the ONE walk: `csr_expand` and `csr_expand_excluding` forward here
 // rather than duplicating the loop, because a second copy of the neighbour walk
 // is precisely the drift the count-mode path already refuses to risk.
-BOLT_FORCE_INLINE int64_t csr_expand_bounded(
-        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
-        const int64_t* BOLT_RESTRICT csr_off,
-        const int64_t* BOLT_RESTRICT csr_neighbors,
-        const int64_t* BOLT_RESTRICT csr_edge_ids,
-        const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE int64_t csr_expand_graph(
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
         const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
         const int64_t* BOLT_RESTRICT dst_bounds,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
-    assert(n == 0 || (src_ids != nullptr && csr_off != nullptr));
-    assert(n_nodes >= 0);
+    assert(n == 0 || (src_ids != nullptr && g != nullptr && g->off != nullptr));
     assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
 
+    const Nbr* BOLT_RESTRICT nbrs = (g != nullptr) ? g->neighbors : nullptr;
+    const Eid* BOLT_RESTRICT eids = (g != nullptr) ? g->edge_ids : nullptr;
     int64_t w = 0;                              // rows written this call
     while (cursor->src_index < n && w < out_cap) {
         const int64_t s = src_ids[cursor->src_index];
-        assert(s >= 0 && s < n_nodes &&
+        assert(s >= 0 && s < g->n_nodes &&
                "csr_expand: source id out of CSR range (non-dense?)");
-        // G2CHK-92: real check, not just the assert above — `csr_off` has
-        // exactly n_nodes + 1 entries, so a `s` outside [0, n_nodes) would
-        // read past it (and the garbage begin/end would then drive further
-        // out-of-bounds reads in the inner loop below). Fail closed instead.
-        if (s < 0 || s >= n_nodes) return kCsrExpandOutOfRange;
-        const int64_t begin = csr_off[s];
-        const int64_t end   = csr_off[s + 1];
-        assert(begin <= end);
+        // G2CHK-92: real check, not just the assert above — a `s` outside
+        // [0, n_nodes) is not a node of this graph. Fail closed.
+        if (s < 0 || s >= g->n_nodes) return kCsrExpandOutOfRange;
+        int64_t begin = 0;
+        int64_t end   = 0;
+        csr_graph_block(g, s, &begin, &end);
         int64_t j = (cursor->neighbor_j > 0) ? cursor->neighbor_j : begin;
         assert(j >= begin && j <= end);
         for (; j < end && w < out_cap; ++j) {
-            const int64_t eid  = csr_edge_ids[j];
-            const int64_t dst  = csr_neighbors[j];
+            const int64_t eid  = static_cast<int64_t>(eids[j]);
+            const int64_t dst  = static_cast<int64_t>(nbrs[j]);
             const int64_t keep =
-                csr_edge_label_keep(edge_labels, want_label, j) &
+                csr_edge_label_keep(g->edge_labels, g->want_label, j) &
                 (1 - csr_edge_excluded(excluded, n_excl, eid)) &
                 csr_edge_dst_keep(dst_bounds, cursor->src_index, dst);
             out_src[w]  = s;                    // speculative write at slot w
@@ -343,6 +392,33 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded(
     }
     assert(w <= out_cap);
     return w;
+}
+
+// The int64-array entry point: a whole-id-space window over the given arrays,
+// walked by the ONE implementation above.
+BOLT_FORCE_INLINE int64_t csr_expand_bounded(
+        const int64_t* BOLT_RESTRICT src_ids, int64_t n, int64_t n_nodes,
+        const int64_t* BOLT_RESTRICT csr_off,
+        const int64_t* BOLT_RESTRICT csr_neighbors,
+        const int64_t* BOLT_RESTRICT csr_edge_ids,
+        const int32_t* BOLT_RESTRICT edge_labels, int32_t want_label,
+        const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
+        const int64_t* BOLT_RESTRICT dst_bounds,
+        int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
+        int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
+        CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
+    assert(cursor != nullptr && n >= 0 && out_cap >= 0);
+    assert(n == 0 || (src_ids != nullptr && csr_off != nullptr));
+    assert(n_nodes >= 0);
+    CsrGraph64 g{};
+    g.off         = csr_off;
+    g.neighbors   = csr_neighbors;
+    g.edge_ids    = csr_edge_ids;
+    g.edge_labels = edge_labels;
+    g.n_nodes     = n_nodes;
+    g.want_label  = want_label;
+    return csr_expand_graph(src_ids, n, &g, excluded, n_excl, dst_bounds,
+                            out_src, out_edge, out_dst, out_cap, cursor);
 }
 
 // Isomorphic expansion with no bound destination — the W16-L1 entry point,

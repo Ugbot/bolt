@@ -118,15 +118,7 @@ enum class CsrBfsStatus : int32_t {
 // be null (unlabeled CSR => every edge matches); `want_label < 0` is a
 // wildcard. Predicate is csr_edge_label_keep() from bolt_csr.h — the SAME
 // one csr_expand and chukonu's edge_label_keep use.
-struct CsrBfsGraph {
-    const int64_t* off;           // n_nodes + 1
-    const int64_t* neighbors;     // n_edges
-    const int64_t* edge_ids;      // n_edges
-    const int32_t* edge_labels;   // n_edges, or null
-    int64_t        n_nodes;
-    int32_t        want_label;    // < 0 => wildcard
-    int32_t        _pad;
-};
+using CsrBfsGraph = CsrGraph64;
 
 struct CsrBfsParams {
     // Endpoints materialised (or counted) for ONE source before the kernel
@@ -208,23 +200,29 @@ constexpr int64_t k_csr_bfs_edge_budget    = -2;   // work budget spent
 // Skips label-rejected and semantics-forbidden edges, charging one unit of
 // budget per edge examined, and PARKS iter[depth] at the exact resume point
 // in every exit path. Returns the CSR index, or a sentinel above.
+template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE int64_t csr_bfs_next_edge(
-        const CsrBfsGraph* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
         CsrPathSemantics sem, int32_t depth,
         int64_t* BOLT_RESTRICT budget) noexcept {
     assert(g != nullptr && sc != nullptr && budget != nullptr);
     assert(depth >= 0 && depth <= k_csr_bfs_max_hops);
     const int64_t node = sc->path[depth];
     assert(node >= 0 && node < g->n_nodes && "csr_bfs: node id out of CSR range");
-    const int64_t end = g->off[node + 1];
+    int64_t begin = 0;
+    int64_t end   = 0;
+    csr_graph_block(g, node, &begin, &end);
     int64_t j = sc->iter[depth];
-    assert(j >= g->off[node] && j <= end && "csr_bfs: iter left its block");
+    assert(j >= begin && j <= end && "csr_bfs: iter left its block");
+    (void)begin;
     while (j < end) {
         if (*budget <= 0) { sc->iter[depth] = j; return k_csr_bfs_edge_budget; }
         --(*budget);
         if (csr_edge_label_keep(g->edge_labels, g->want_label, j) != 0 &&
-            !csr_bfs_step_forbidden(sc, sem, g->edge_ids[j],
-                                    g->neighbors[j], depth)) {
+            !csr_bfs_step_forbidden(sc, sem,
+                                    static_cast<int64_t>(g->edge_ids[j]),
+                                    static_cast<int64_t>(g->neighbors[j]),
+                                    depth)) {
             sc->iter[depth] = j;
             return j;
         }
@@ -256,8 +254,9 @@ enum class CsrBfsStep : int32_t {
 // 30.3-30.5 ms inlined, against a 30.5-31.2 ms hand-rolled baseline — i.e.
 // out-of-line is a 1.2-1.4x LOSS and inlined is parity. Two copies of the
 // body (csr_bfs_expand + csr_bfs_count) is the price.
+template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE CsrBfsStep csr_bfs_run_source(
-        const CsrBfsGraph* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
         const CsrBfsParams* BOLT_RESTRICT p, CsrBfsCursor* BOLT_RESTRICT cursor,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_dst,
         int32_t* BOLT_RESTRICT out_hops, int64_t out_cap,
@@ -284,16 +283,19 @@ BOLT_FORCE_INLINE CsrBfsStep csr_bfs_run_source(
         if (j == k_csr_bfs_edge_budget) return CsrBfsStep::Suspended;
         if (j == k_csr_bfs_edge_exhausted) { --cursor->depth; continue; }
         assert(j >= 0);
-        const int64_t nb = g->neighbors[j];
+        const int64_t nb = static_cast<int64_t>(g->neighbors[j]);
         // Fail closed BEFORE dereferencing off[nb]: a neighbour outside the
         // dense node range is a malformed CSR, and the next line would read
         // out of bounds in a -DNDEBUG build where the assert is gone.
         if (nb < 0 || nb >= g->n_nodes) return CsrBfsStep::BadGraph;
         sc->iter[cursor->depth]  = j + 1;          // resume AFTER this edge
-        sc->epath[cursor->depth] = g->edge_ids[j];
+        sc->epath[cursor->depth] = static_cast<int64_t>(g->edge_ids[j]);
         ++cursor->depth;
         sc->path[cursor->depth] = nb;
-        sc->iter[cursor->depth] = g->off[nb];
+        int64_t nb_begin = 0;
+        int64_t nb_end   = 0;
+        csr_graph_block(g, nb, &nb_begin, &nb_end);
+        sc->iter[cursor->depth] = nb_begin;
         cursor->pending_emit =
             (cursor->depth >= p->min_hops) ? uint8_t{1} : uint8_t{0};
     }
@@ -302,8 +304,9 @@ BOLT_FORCE_INLINE CsrBfsStep csr_bfs_run_source(
 }
 
 // Contract validation shared by both public kernels. Cheap, always on.
+template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE bool csr_bfs_args_ok(
-        const int64_t* src_ids, int64_t n, const CsrBfsGraph* g,
+        const int64_t* src_ids, int64_t n, const CsrGraphT<Nbr, Eid>* g,
         const CsrBfsParams* p, const CsrBfsScratch* sc,
         const CsrBfsCursor* cursor) noexcept {
     assert(n >= 0);
@@ -324,16 +327,20 @@ BOLT_FORCE_INLINE bool csr_bfs_args_ok(
 
 // Begin the source at cursor->src_index. Returns false for a source id that
 // is not a dense CSR node (fail closed rather than read out of bounds).
+template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE bool csr_bfs_start_source(
-        const int64_t* BOLT_RESTRICT src_ids, const CsrBfsGraph* g,
+        const int64_t* BOLT_RESTRICT src_ids, const CsrGraphT<Nbr, Eid>* g,
         const CsrBfsParams* p, CsrBfsScratch* sc,
         CsrBfsCursor* cursor) noexcept {
     assert(src_ids != nullptr && cursor != nullptr && cursor->active == 0);
     assert(g != nullptr && p != nullptr && sc != nullptr);
     const int64_t s = src_ids[cursor->src_index];
     if (s < 0 || s >= g->n_nodes) return false;
+    int64_t s_begin = 0;
+    int64_t s_end   = 0;
+    csr_graph_block(g, s, &s_begin, &s_end);
     sc->path[0]             = s;
-    sc->iter[0]             = g->off[s];
+    sc->iter[0]             = s_begin;
     cursor->depth           = 0;
     cursor->emitted_for_src = 0;
     cursor->pending_emit    = (p->min_hops == 0) ? uint8_t{1} : uint8_t{0};
@@ -370,9 +377,10 @@ BOLT_FORCE_INLINE bool csr_bfs_start_source(
 // more than per_source_cap endpoints. Rows already written this call are
 // reported in *out_rows but the RESULT IS INCOMPLETE — the caller must fail
 // the query, never ship the prefix.
-inline CsrBfsStatus csr_bfs_expand(
+template <typename Nbr, typename Eid>
+inline CsrBfsStatus csr_bfs_expand_t(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n,
-        const CsrBfsGraph* BOLT_RESTRICT g,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
         const CsrBfsParams* BOLT_RESTRICT p, CsrBfsScratch* BOLT_RESTRICT sc,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_dst,
         int32_t* BOLT_RESTRICT out_hops, int64_t out_cap,
@@ -430,9 +438,10 @@ inline CsrBfsStatus csr_bfs_expand(
 // Caller owns out_counts[0..n) and need not pre-zero it (every completed
 // source is assigned, not accumulated). per_source_cap still applies: set it
 // to INT64_MAX when an aggregate genuinely wants an unbounded count.
-inline CsrBfsStatus csr_bfs_count(
+template <typename Nbr, typename Eid>
+inline CsrBfsStatus csr_bfs_count_t(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n,
-        const CsrBfsGraph* BOLT_RESTRICT g,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
         const CsrBfsParams* BOLT_RESTRICT p, CsrBfsScratch* BOLT_RESTRICT sc,
         int64_t* BOLT_RESTRICT out_counts,
         CsrBfsCursor* BOLT_RESTRICT cursor) noexcept {
@@ -462,6 +471,31 @@ inline CsrBfsStatus csr_bfs_count(
     assert(sink >= 0);
     return CsrBfsStatus::Ok;
 }
+
+// Concrete entry points (a template cannot deduce from a null graph pointer,
+// which the contract tests pass on purpose).
+#define BOLT_CSR_BFS_ENTRY(G)                                                  \
+    inline CsrBfsStatus csr_bfs_expand(                                        \
+            const int64_t* BOLT_RESTRICT src_ids, int64_t n,                   \
+            const G* BOLT_RESTRICT g, const CsrBfsParams* BOLT_RESTRICT p,     \
+            CsrBfsScratch* BOLT_RESTRICT sc, int64_t* BOLT_RESTRICT out_src,   \
+            int64_t* BOLT_RESTRICT out_dst, int32_t* BOLT_RESTRICT out_hops,   \
+            int64_t out_cap, CsrBfsCursor* BOLT_RESTRICT cursor,               \
+            int64_t* BOLT_RESTRICT out_rows) noexcept {                        \
+        return csr_bfs_expand_t(src_ids, n, g, p, sc, out_src, out_dst,        \
+                                out_hops, out_cap, cursor, out_rows);          \
+    }                                                                          \
+    inline CsrBfsStatus csr_bfs_count(                                         \
+            const int64_t* BOLT_RESTRICT src_ids, int64_t n,                   \
+            const G* BOLT_RESTRICT g, const CsrBfsParams* BOLT_RESTRICT p,     \
+            CsrBfsScratch* BOLT_RESTRICT sc,                                   \
+            int64_t* BOLT_RESTRICT out_counts,                                 \
+            CsrBfsCursor* BOLT_RESTRICT cursor) noexcept {                     \
+        return csr_bfs_count_t(src_ids, n, g, p, sc, out_counts, cursor);      \
+    }
+BOLT_CSR_BFS_ENTRY(CsrGraph64)
+BOLT_CSR_BFS_ENTRY(CsrGraph32)
+#undef BOLT_CSR_BFS_ENTRY
 
 }  // namespace kernels
 }  // namespace bolt
