@@ -148,6 +148,11 @@ inline const void* pack_bool(ExportState* st, const uint8_t* src,
 /// Resolve row `i` of a Utf8/Binary column to (bytes, len) for EITHER layout.
 inline bool var_at(const BoltColumn& col, int64_t i,
                    const char** out_p, int32_t* out_len) noexcept {
+    if (col.is_null(i)) {            // WI-2: a NULL row's slot is not data
+        *out_p = "";
+        *out_len = 0;
+        return true;
+    }
     if (col.format == ColumnFormat::VarBinary) {
         if (col.dict_child == nullptr || col.dict_child->data == nullptr) return false;
         const auto* offs = static_cast<const int32_t*>(col.dict_child->data);

@@ -868,6 +868,23 @@ struct BoltColumn {
         }
     }
 
+    /// `utf8_at` for a row that may be NULL: a NULL row yields the empty
+    /// span `(non-null ptr, 0)` without reading its payload slot, whose
+    /// contents are undefined (WI-2: NULL lives only in the validity bitmap).
+    BOLT_FORCE_INLINE void utf8_at_or_empty(int64_t row,
+                                            const uint8_t** out_data,
+                                            int32_t* out_len) const noexcept {
+        assert(out_data != nullptr && out_len != nullptr);
+        assert(row >= 0 && row < length);
+        if (is_null(row)) {
+            static constexpr uint8_t kEmpty[1] = {0};
+            *out_data = kEmpty;
+            *out_len  = 0;
+            return;
+        }
+        utf8_at(row, out_data, out_len);
+    }
+
     /// Bit-packed column (B3). `packed_words` holds `total_rows * bit_width`
     /// bits LSB-first, each value using `bit_width` ∈ [1,32] bits. Caller
     /// owns the buffer lifetime. `type` determines the output integer type
