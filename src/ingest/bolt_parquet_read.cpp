@@ -24,6 +24,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_null_slot.h"
 #include "bolt/bolt_scheduler.h"
 #include "bolt/ingest/bolt_deflate.h"
 #include "bolt/ingest/bolt_snappy.h"
@@ -494,6 +495,17 @@ struct ColCtx {
     void**   ovf_base;
 };
 
+// A NULL row: clear its validity bit and write the defined null filler into
+// its payload slot (bolt_null_slot.h) instead of leaving arena bytes there.
+inline void null_row(ColCtx* cx, int64_t r) noexcept {
+    assert(cx != nullptr && cx->validity != nullptr);
+    assert(cx->out != nullptr && cx->elem > 0u && cx->elem <= 16u);
+    bit_clear(cx->validity, r);
+    null_slot_fill(cx->out + static_cast<uint64_t>(r) * cx->elem, cx->elem,
+                   (cx->type == BoltType::Utf8 || cx->type == BoltType::Binary) &&
+                       cx->elem == sizeof(StringView));
+}
+
 // Guarantee `need` more bytes of Utf8 spill room, growing if necessary.
 //
 // The spill buffer is sized from the chunk's UNCOMPRESSED page bytes. That is a
@@ -723,7 +735,7 @@ bool plain_fixed(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     }
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
-        if (def[i] != cx->pc->max_def) { bit_clear(cx->validity, row0 + i); continue; }
+        if (def[i] != cx->pc->max_def) { null_row(cx, row0 + i); continue; }
         std::memcpy(dst + static_cast<uint64_t>(i) * w, v + src * w, w);
         ++src;
     }
@@ -743,7 +755,7 @@ bool plain_f32_widen(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         float f = 0.0f;
@@ -771,7 +783,7 @@ bool plain_int_conv(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         int64_t val = 0;
@@ -802,7 +814,7 @@ bool plain_int96(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         const uint8_t* s = v + src * 12u;
@@ -847,7 +859,7 @@ bool plain_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         dst[i] = static_cast<int64_t>((v[src >> 3] >> (src & 7u)) & 1u);
@@ -880,7 +892,7 @@ bool rle_bool(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint32_t k = 0;
     for (uint32_t i = 0; i < nrows; ++i) {         // bounded: page rows
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         if (k >= nvalid) return false;
@@ -901,7 +913,7 @@ bool plain_flba(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         uint64_t lo = 0;
@@ -939,7 +951,7 @@ bool plain_flba_raw(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint64_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         uint8_t* dst =
@@ -991,7 +1003,7 @@ bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
     uint32_t src = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             continue;
         }
         if (pos + 4 > vlen) return false;
@@ -1070,7 +1082,7 @@ bool dict_gather_sparse(ColCtx* cx, const uint32_t* idx, const uint32_t* def,
     uint32_t k = 0;
     for (uint32_t i = 0; i < nrows; ++i) {
         if (def != nullptr && def[i] != cx->pc->max_def) {
-            bit_clear(cx->validity, row0 + i);
+            null_row(cx, row0 + i);
             if (cx->codes != nullptr) cx->codes[row0 + i] = -1;   // null row
             continue;
         }
@@ -1665,7 +1677,7 @@ bool decode_values_by_encoding(ColCtx* cx, const uint8_t* v, uint64_t vlen,
             assert(def != nullptr);
             assert(cx->validity != nullptr);
             for (uint32_t i = 0; i < nvals; ++i) {
-                bit_clear(cx->validity, row0 + i);
+                null_row(cx, row0 + i);
                 if (cx->codes != nullptr) cx->codes[row0 + i] = -1;
             }
             return true;
