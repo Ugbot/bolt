@@ -59,6 +59,26 @@ const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept;
 bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                        const ReadOptions* opts) noexcept;
 
+// What planning cost so far (G2ICE-234). Planning must scale with the
+// manifests a predicate touches, not with the table's file count; these
+// counters are how a caller checks that.
+struct IcebergScanStats {
+    uint64_t manifests_listed;       // data manifests in the snapshot's list
+    uint64_t manifests_pruned;       // skipped on partition summaries alone
+    uint64_t manifests_read;         // data manifests fetched and decoded
+    uint64_t delete_manifests_read;
+    uint64_t entries_visited;        // data-manifest entries decoded
+    uint64_t files_planned;          // live data files that passed pruning
+    uint64_t metadata_bytes_read;    // manifest list + every manifest read
+};
+bool iceberg_scan_stats(const ScanHandle* h, IcebergScanStats* out) noexcept;
+
+// Plan without reading data: the next live data file that passed pruning, in
+// scan order. `*out_path` stays valid until the next call. Do not mix with
+// iceberg_scan_next_batch on the same handle.
+bool iceberg_scan_next_file(ScanHandle* h, const char** out_path,
+                            bool* out_eof) noexcept;
+
 bool iceberg_scan_next_batch(ScanHandle* h, BoltBatch* out,
                              bool* out_eof) noexcept;
 

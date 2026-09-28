@@ -93,6 +93,24 @@ enum class ManifestStatus : uint8_t {
     kUnknown  = 3,
 };
 
+// One manifest_file.partitions[i] field_summary (G2ICE-234): the bounds of
+// spec field i over every file the manifest names, in Iceberg's binary
+// single-value encoding. Bounds wider than kIcebergMaxSummaryBound bytes are
+// dropped (has_* false), which only ever disables pruning.
+static constexpr uint32_t kIcebergMaxSummaryBound = 16u;
+static constexpr uint32_t kIcebergMaxSummaries    = 8u;
+
+struct PartitionFieldSummary {
+    bool    contains_null;
+    bool    has_lower;
+    bool    has_upper;
+    uint8_t lower_len;
+    uint8_t upper_len;
+    uint8_t _pad[3];
+    char    lower[kIcebergMaxSummaryBound];
+    char    upper[kIcebergMaxSummaryBound];
+};
+
 struct ManifestListEntry {
     int32_t         partition_spec_id;
     // manifest_file.content: 0 = data manifest, 1 = delete manifest. This used
@@ -129,6 +147,11 @@ struct ManifestListEntry {
     // sequence number (the correct value for a manifest this commit added).
     int64_t      sequence_number;
     int64_t      min_sequence_number;
+    // partitions[] as read from the list; 0 when absent, unparsed, or the
+    // spec has more than kIcebergMaxSummaries fields (then nothing prunes).
+    uint32_t              n_partitions;
+    uint32_t              _pad_ps;
+    PartitionFieldSummary partitions[kIcebergMaxSummaries];
     char         manifest_path[kIcebergMaxManifestPath];
 };
 

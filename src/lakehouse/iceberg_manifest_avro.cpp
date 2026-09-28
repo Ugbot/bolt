@@ -99,10 +99,57 @@ struct MlCtx {
     // G2ICE-49 -- the five file/row tallies `added_files_count` always had
     // schema siblings for, that this reader never bound.
     int32_t f_exist_f, f_del_f, f_added_r, f_exist_r, f_del_r;
+    // partitions[] elements arrive before their row (G2ICE-234).
+    int32_t               f_parts;
+    uint32_t              n_pend;
+    int64_t               pend_row;
+    bool                  pend_overflow;
+    uint8_t               _pad[7];
+    PartitionFieldSummary pend[kIcebergMaxSummaries];
 };
 
+// A summary bound, kept only when it fits whole.
+void copy_bound(char* dst, uint8_t* len, bool* has,
+                const ing::AvroValue* v) noexcept {
+    assert(dst != nullptr && len != nullptr && has != nullptr);
+    *has = false;
+    *len = 0;
+    if (v->is_null || v->bytes == nullptr) return;
+    if (v->bytes_len > kIcebergMaxSummaryBound) return;
+    std::memcpy(dst, v->bytes, v->bytes_len);
+    *len = static_cast<uint8_t>(v->bytes_len);
+    *has = true;
+}
+
+bool ml_elem(void* c, uint32_t field_index, int64_t row_index,
+             int64_t elem_index, const ing::AvroValue* vals,
+             uint32_t n_vals) noexcept {
+    MlCtx* s = static_cast<MlCtx*>(c);
+    assert(s != nullptr);
+    assert(vals != nullptr);
+    if (s->f_parts < 0 || field_index != static_cast<uint32_t>(s->f_parts))
+        return true;
+    if (s->pend_row != row_index) {
+        s->pend_row = row_index;
+        s->n_pend = 0;
+        s->pend_overflow = false;
+    }
+    // contains_null, contains_nan, lower_bound, upper_bound
+    if (n_vals < 4u || elem_index != static_cast<int64_t>(s->n_pend) ||
+        s->n_pend >= kIcebergMaxSummaries) {
+        s->pend_overflow = true;
+        return true;
+    }
+    PartitionFieldSummary* ps = &s->pend[s->n_pend++];
+    std::memset(ps, 0, sizeof(*ps));
+    ps->contains_null = !vals[0].is_null && vals[0].num.i64 != 0;
+    copy_bound(ps->lower, &ps->lower_len, &ps->has_lower, &vals[2]);
+    copy_bound(ps->upper, &ps->upper_len, &ps->has_upper, &vals[3]);
+    return true;
+}
+
 bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
-            int64_t) noexcept {
+            int64_t row_index) noexcept {
     MlCtx* s = static_cast<MlCtx*>(c);
     assert(s != nullptr);
     assert(vals != nullptr);
@@ -137,6 +184,11 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     e->min_sequence_number = i64_or(at(s->f_minseq), 0);
     // `content` is v2-only (0 = data, 1 = deletes); v1 manifests are all data.
     e->content = static_cast<ManifestContent>(i64_or(at(s->f_content), 0));
+    if (s->pend_row == row_index && !s->pend_overflow && s->n_pend > 0u) {
+        std::memcpy(e->partitions, s->pend,
+                    sizeof(PartitionFieldSummary) * s->n_pend);
+        e->n_partitions = s->n_pend;
+    }
     ++s->n;
     return true;
 }
@@ -333,9 +385,11 @@ bool ml_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     // Without a path there is nothing to point a scan at — that is not a
     // manifest list, so fail rather than emit path-less entries.
     if (s.f_path < 0) return false;
+    s.f_parts  = find_field(h, "partitions");
+    s.pend_row = -1;
 
     int64_t rows = 0;
-    return ing::avro_read(src, len, scratch, &s, ml_row, &rows);
+    return ing::avro_read_ex(src, len, scratch, &s, ml_row, ml_elem, &rows);
 }
 
 }  // namespace

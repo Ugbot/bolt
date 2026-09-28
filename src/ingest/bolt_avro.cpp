@@ -401,6 +401,21 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
         }
         AvroType t = AvroType::kNull;
         if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
+        // A union branch written as a type object ({"type":"int",
+        // "logicalType":"date"}) is a branch like "int", not a field: Iceberg
+        // declares every optional date/timestamp partition value this way.
+        if (f->kind == kFrObj && s->sp > 0u &&
+            s->st[s->sp - 1u].kind == kFrUnion) {
+            SFrame* u = &s->st[s->sp - 1u];
+            if (t == AvroType::kNull || u->union_have_type) {
+                s->ok = false;           // a second typed branch: not modelled
+                return true;
+            }
+            u->union_type      = t;
+            u->union_have_type = true;
+            if (u->union_n < 0xFEu) ++u->union_n;
+            return true;
+        }
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
         if (fi < 0) return true;         // a "type" outside any field

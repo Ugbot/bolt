@@ -362,6 +362,7 @@ struct ScanHandle {
     Arena*        meta_arena;
     PositionDeleteSet    pos_dels;
     EqualityDeleteSetI64 eq_dels;
+    IcebergScanStats     stats;
 };
 
 namespace {
@@ -806,6 +807,7 @@ bool push_task(ScanHandle* s, const char* path) noexcept {
     if (p == nullptr) return false;
     std::memcpy(p, path, len + 1u);
     s->tasks[s->n_tasks++].path = p;
+    ++s->stats.files_planned;
     return true;
 }
 
@@ -828,6 +830,7 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
         return false;
     }
     const ScanHandle* s = v->s;
+    ++v->s->stats.entries_visited;
     if (!partition_passes(e, v->spec, v->sch, s->opts.predicates,
                           s->opts.n_predicates))
         return true;
@@ -849,6 +852,9 @@ bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
     if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
                   mle.manifest_path, s->man_arena, &body, &blen))
         return false;
+    s->stats.metadata_bytes_read += blen;
+    if (deletes_pass) ++s->stats.delete_manifests_read;
+    else              ++s->stats.manifests_read;
     VisitCtx v{};
     v.s = s;
     v.spec = metadata_spec(&h->meta, mle.partition_spec_id);
@@ -897,6 +903,16 @@ bool load_next_manifest(ScanHandle* s, bool* out_err) noexcept {
     reset_manifest_arena(s);
     const ManifestListEntry& mle = s->mlist[s->next_manifest++];
     if (mle.content == ManifestContent::kDeleteManifest) return true;
+    // A manifest whose partition summaries exclude the predicate holds no
+    // file the scan could keep; skipping it is what makes planning cost
+    // O(manifests touched) rather than O(table files).
+    const TableHandle* h = s->table;
+    if (!manifest_may_match(&mle, metadata_spec(&h->meta, mle.partition_spec_id),
+                            metadata_current_schema(&h->meta),
+                            s->opts.predicates, s->opts.n_predicates)) {
+        ++s->stats.manifests_pruned;
+        return true;
+    }
     if (!evaluate_manifest(s, mle, false)) {
         *out_err = true;
         return false;
@@ -953,6 +969,10 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
         if (!parse_manifest_list_any(h->arena, body, blen, &s->mlist,
                                      &s->n_mlist))
             return false;
+        s->stats.metadata_bytes_read += blen;
+        for (uint32_t mi = 0; mi < s->n_mlist; ++mi)               // bounded
+            if (s->mlist[mi].content != ManifestContent::kDeleteManifest)
+                ++s->stats.manifests_listed;
         if (!s->budget->try_reserve(sizeof(ManifestListEntry) *
                                     static_cast<uint64_t>(s->n_mlist)))
             return false;
@@ -1040,6 +1060,30 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     // the guard cannot expire. Fail closed if the invariant ever breaks.
     assert(false && "iceberg scan advance did not make progress");
     return false;
+}
+
+bool iceberg_scan_stats(const ScanHandle* s, IcebergScanStats* out) noexcept {
+    assert(out != nullptr);
+    if (s == nullptr || out == nullptr) return false;
+    *out = s->stats;
+    assert(out->manifests_read + out->manifests_pruned <= out->manifests_listed);
+    return true;
+}
+
+bool iceberg_scan_next_file(ScanHandle* s, const char** out_path,
+                            bool* out_eof) noexcept {
+    assert(s != nullptr && out_path != nullptr && out_eof != nullptr);
+    assert(!s->cur_file_open);
+    *out_path = nullptr;
+    *out_eof = false;
+    // Bounded: each round consumes one manifest.
+    while (s->cur_file_idx >= s->n_tasks) {
+        if (s->next_manifest >= s->n_mlist) { *out_eof = true; return true; }
+        bool err = false;
+        if (!load_next_manifest(s, &err) && err) return false;
+    }
+    *out_path = s->tasks[s->cur_file_idx++].path;
+    return true;
 }
 
 void iceberg_scan_close(ScanHandle* s) noexcept {
