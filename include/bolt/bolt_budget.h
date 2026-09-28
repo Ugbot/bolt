@@ -28,6 +28,7 @@
 #include "bolt/bolt_limits.h"
 #include "bolt/bolt_resource.h"
 #include "bolt/bolt_system_memory.h"
+#include "bolt/kernels/bolt_vector_limits.h"
 
 // ---------------------------------------------------------------------------
 // bolt's own Limits table.
@@ -47,13 +48,16 @@
       nullptr, nullptr, "largest function-scope array the stack lint allows")    \
     X(lake_metadata_budget_mb, kBudget, "MiB", 1024, 1, (UINT64_MAX >> 20),     \
       "BOLT_LAKE_METADATA_BUDGET_MB", nullptr,                                  \
-      "Iceberg/Delta metadata held by one table handle or one scan")
+      "Iceberg/Delta metadata held by one table handle or one scan")          \
+    X(max_vector_dim, kInvariant, "dims", 65535, 65535, 65535, nullptr,         \
+      nullptr, "vector dimension validation ceiling (bolt::kMaxVectorDim)")
 
 namespace bolt {
 
 BOLT_LIMITS_TABLE(bolt_limits, "bolt", BOLT_LIMITS)
 
 static_assert(kArenaMaxBlocks == 256, "update BOLT_LIMITS arena_max_blocks");
+static_assert(kMaxVectorDim == 65535u, "update BOLT_LIMITS max_vector_dim");
 
 // The worker count an auto-sized pool uses: BOLT_WORKERS when set, else the
 // hardware thread count, capped at the ceiling with a stderr line (the

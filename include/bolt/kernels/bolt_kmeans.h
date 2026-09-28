@@ -24,7 +24,8 @@
 // here is simpler and equivalent.
 
 #include "bolt/bolt_port.h"
-#include "bolt/kernels/bolt_topk.h"             // argmin_f32
+#include "bolt/kernels/bolt_topk.h"
+#include "bolt/kernels/bolt_vector_limits.h"             // argmin_f32
 #include "bolt/kernels/bolt_vector_distance.h"  // l2_pair_f32 (header dep)
 
 #include <cassert>
@@ -33,10 +34,9 @@
 
 namespace bolt {
 
-// Hard upper bounds (Tiger Style — every loop has a constexpr cap).
-// These match `marbledb::ext::pdx::kMaxDim` and the K cap on the heap-
-// based top-k. K must fit on a stack array for the per-vector argmin.
-inline constexpr size_t kKmeansMaxDim = 4096;
+// Validation ceilings. D derives from the one vector-dim ceiling; the
+// assign kernel walks D and K in fixed stack blocks, so neither sizes an array.
+inline constexpr size_t kKmeansMaxDim = kMaxVectorDim;
 inline constexpr size_t kKmeansMaxK   = 4096;
 // kmeans_assign_f32_l2 walks D and K in these stack blocks, so it has no
 // dimension or centroid-count ceiling of its own.

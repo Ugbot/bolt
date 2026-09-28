@@ -44,4 +44,35 @@ T* tls_scratch() noexcept {
     return h.p;
 }
 
+// tls_grow<Tag, T>(n) returns a per-thread buffer of at least n T, growing
+// x2 when a larger n arrives (contents are NOT preserved across growth: call
+// it at a query boundary, then hand the span to the per-row loop). Freed at
+// thread exit. nullptr when the allocation fails or n overflows size_t.
+template <class Tag, class T>
+T* tls_grow(std::size_t n) noexcept {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "tls_grow: T is reused without constructors");
+    static_assert(alignof(T) <= alignof(std::max_align_t),
+                  "tls_grow: over-aligned T needs aligned_alloc");
+    struct Holder {
+        T*          p   = nullptr;
+        std::size_t cap = 0;
+        ~Holder() { std::free(p); }
+    };
+    thread_local Holder h;
+    if (n == 0) n = 1;
+    if (n <= h.cap) return h.p;
+    if (n > SIZE_MAX / sizeof(T) / 2) return nullptr;
+    std::size_t want = h.cap * 2;
+    if (want < n) want = n;
+    void* mem = std::malloc(want * sizeof(T));
+    if (mem == nullptr) return nullptr;
+    std::free(h.p);
+    h.p = static_cast<T*>(mem);
+    h.cap = want;
+    assert(h.cap >= n);
+    assert(h.p != nullptr);
+    return h.p;
+}
+
 }  // namespace bolt

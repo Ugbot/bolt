@@ -25,6 +25,7 @@
 // `-O3 -mavx2 -mfma`.
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/bolt_vector_limits.h"
 
 #include <cassert>
 #include <cmath>
@@ -34,7 +35,7 @@
 namespace bolt {
 namespace vec {
 
-inline constexpr uint32_t kBondMaxDim = 4096;
+inline constexpr uint32_t kBondMaxDim = kMaxVectorDim;
 
 // ===========================================================================
 // bond_zone_rank_scores_f32 — score each contiguous dim-zone
