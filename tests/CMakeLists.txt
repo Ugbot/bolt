@@ -831,6 +831,14 @@ target_compile_definitions(test_bolt_csr_bounds PRIVATE NDEBUG)
 bolt_apply_hardening(test_bolt_csr_bounds)
 add_test(NAME test_bolt_csr_bounds COMMAND test_bolt_csr_bounds)
 
+# G2GRAPH-178 — bound-destination probe over dst-sorted blocks, with a seeded
+# differential fuzz against the linear bound walk.
+add_executable(test_bolt_csr_dst_probe test_bolt_csr_dst_probe.cpp)
+target_link_libraries(test_bolt_csr_dst_probe
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csr_dst_probe)
+add_test(NAME test_bolt_csr_dst_probe COMMAND test_bolt_csr_dst_probe)
+
 # Variable-length CSR traversal (bolt_csr_bfs.h): WALK/TRAIL/SIMPLE expansion
 # and the aggregate-pushdown count twin. Expected values come from
 # tests/csr_bfs_enumerate.py and (for the randomized graph) networkx.
