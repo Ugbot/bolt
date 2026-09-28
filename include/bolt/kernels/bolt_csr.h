@@ -308,6 +308,34 @@ BOLT_FORCE_INLINE void csr_graph_block(const CsrGraphT<Nbr, Eid>* g,
     assert(*b <= *e);
 }
 
+// Leapfrog step for a membership-restricted walk (G2GRAPH-342, the cyclic-
+// pattern intersection). Both `nbrs[j..end)` and `inb[*ib..ie)` are sorted
+// ascending; returns the first index >= j whose neighbour also occurs in
+// inb[*ib..ie), advancing *ib to that neighbour's position, or `end` when none
+// remains. Each side is advanced by a galloping search to the other's value,
+// so the cost is O(min * log(max/min)) over a block pair, not O(max). A run
+// of parallel edges to one neighbour is returned edge by edge: the second call
+// with the same neighbour finds *ib already on it and returns j unchanged.
+template <typename Nbr>
+BOLT_FORCE_INLINE int64_t csr_leapfrog_next(
+        const Nbr* BOLT_RESTRICT nbrs, int64_t j, int64_t end,
+        const Nbr* BOLT_RESTRICT inb, int64_t* BOLT_RESTRICT ib,
+        int64_t ie) noexcept {
+    assert(ib != nullptr && *ib <= ie && j <= end);
+    assert(j == end || nbrs != nullptr);
+    // Bounded: every iteration returns or advances j by at least one.
+    while (j < end) {
+        const Nbr v = nbrs[j];
+        *ib += bolt_gallop_lower_bound_tmpl<Nbr>(inb + *ib, ie - *ib, v);
+        if (*ib == ie) return end;
+        const Nbr u = inb[*ib];
+        if (u == v) return j;
+        // u > v, so nbrs[j] < u and the gallop moves j forward.
+        j += bolt_gallop_lower_bound_tmpl<Nbr>(nbrs + j, end - j, u);
+    }
+    return end;
+}
+
 // Sentinel returned by csr_expand_bounded (and its two forwarding entry
 // points) when the current source id is outside the CSR's [0, n_nodes)
 // range — see the G2CHK-92 note above csr_expand_bounded. A valid row count
@@ -383,6 +411,16 @@ struct CsrExpandCursor {
 // membership probe, not a scan. The walk itself and its output are unchanged.
 // `false` is the pre-change linear walk.
 //
+// `isect` / `isect_keys` (G2GRAPH-342) are the FOURTH keep term: non-null
+// means row i keeps only neighbours that also occur in the sorted block of
+// node `isect_keys[i]` in `isect` — the intersection a cyclic pattern needs
+// (`c` in N(b) AND c adjacent to the already-bound `a`). The two sorted blocks
+// are leapfrogged (csr_leapfrog_next), so the walk skips non-members in
+// O(log gap) instead of visiting them. Membership ignores `isect`'s labels and
+// edge ids: it answers "some edge exists", which is what a caller pruning
+// ahead of an exact closing hop needs. Requires `dst_sorted` (both CSRs).
+// A key outside [0, isect->n_nodes) fails closed like a bad source.
+//
 // This is the ONE walk: `csr_expand`, `csr_expand_excluding`, and the raw-
 // array `csr_expand_bounded_sorted` forward here rather than duplicating the
 // loop, because a second copy of the neighbour walk is precisely the drift
@@ -396,10 +434,14 @@ BOLT_FORCE_INLINE int64_t csr_expand_graph(
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
         CsrExpandCursor* BOLT_RESTRICT cursor,
-        bool dst_sorted = false) noexcept {
+        bool dst_sorted = false,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT isect = nullptr,
+        const int64_t* BOLT_RESTRICT isect_keys = nullptr) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
     assert(n == 0 || (src_ids != nullptr && g != nullptr && g->off != nullptr));
     assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
+    assert((isect == nullptr) == (isect_keys == nullptr));
+    assert(isect == nullptr || dst_sorted);
     const bool probe = dst_sorted && dst_bounds != nullptr;
 
     const Nbr* BOLT_RESTRICT nbrs = (g != nullptr) ? g->neighbors : nullptr;
@@ -421,7 +463,18 @@ BOLT_FORCE_INLINE int64_t csr_expand_graph(
         }
         int64_t j = (cursor->neighbor_j > 0) ? cursor->neighbor_j : begin;
         assert(j >= begin && j <= end);
+        int64_t ib = 0;
+        int64_t ie = 0;
+        if (isect != nullptr) {
+            const int64_t key = isect_keys[cursor->src_index];
+            if (key < 0 || key >= isect->n_nodes) return kCsrExpandOutOfRange;
+            csr_graph_block(isect, key, &ib, &ie);
+        }
         for (; j < end && w < out_cap; ++j) {
+            if (isect != nullptr) {
+                j = csr_leapfrog_next<Nbr>(nbrs, j, end, isect->neighbors, &ib, ie);
+                if (j == end) break;
+            }
             const int64_t eid  = static_cast<int64_t>(eids[j]);
             const int64_t dst  = static_cast<int64_t>(nbrs[j]);
             const int64_t keep =

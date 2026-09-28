@@ -839,6 +839,14 @@ target_link_libraries(test_bolt_csr_dst_probe
 bolt_apply_hardening(test_bolt_csr_dst_probe)
 add_test(NAME test_bolt_csr_dst_probe COMMAND test_bolt_csr_dst_probe)
 
+# G2GRAPH-342 — leapfrog intersection keep term of csr_expand_graph, with a
+# seeded differential fuzz against expand-then-membership-filter.
+add_executable(test_bolt_csr_isect test_bolt_csr_isect.cpp)
+target_link_libraries(test_bolt_csr_isect
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csr_isect)
+add_test(NAME test_bolt_csr_isect COMMAND test_bolt_csr_isect)
+
 # Variable-length CSR traversal (bolt_csr_bfs.h): WALK/TRAIL/SIMPLE expansion
 # and the aggregate-pushdown count twin. Expected values come from
 # tests/csr_bfs_enumerate.py and (for the randomized graph) networkx.

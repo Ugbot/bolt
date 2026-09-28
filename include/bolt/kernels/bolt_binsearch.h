@@ -102,6 +102,29 @@ BOLT_FORCE_INLINE int64_t bolt_upper_bound_tmpl(
     return static_cast<int64_t>(b - data);
 }
 
+// Galloping lower_bound: same result as bolt_lower_bound_tmpl, found by
+// probing 1, 3, 7, ... then a binary search inside the last span, so the cost
+// is O(log d) in the DISTANCE d to the answer rather than O(log n). The step
+// a leapfrog intersection takes when one side is much shorter than the other.
+template <typename T>
+BOLT_FORCE_INLINE int64_t bolt_gallop_lower_bound_tmpl(
+        const T* BOLT_RESTRICT data, int64_t n, T key) noexcept {
+    assert(n >= 0);
+    assert(n == 0 || data != nullptr);
+    int64_t lo = 0;
+    int64_t step = 1;
+    // Bounded: step doubles, so at most 63 iterations before it passes n.
+    while (lo + step - 1 < n && data[lo + step - 1] < key) {
+        lo += step;
+        step <<= 1;
+    }
+    const int64_t hi = (lo + step - 1 < n) ? (lo + step) : n;
+    const int64_t r = lo + bolt_lower_bound_tmpl<T>(data + lo, hi - lo, key);
+    assert(r >= 0 && r <= n);
+    assert(r == n || !(data[r] < key));
+    return r;
+}
+
 // Exact-match binary search. Returns an index of *any* matching element,
 // or -1 if none. Built on top of lower_bound: one extra compare after the
 // loop picks up the match case without branching inside the loop.
