@@ -165,8 +165,9 @@ constexpr int64_t csr_shortest_scratch_slots(int64_t n_nodes) noexcept {
 // ============================================================================
 
 // One side of the meet-in-the-middle search.
+template <typename Nbr, typename Eid>
 struct CsrSpSide {
-    const CsrBfsGraph* g;
+    const CsrGraphT<Nbr, Eid>* g;
     int32_t* stamp;
     int32_t* dist;
     int64_t* queue;
@@ -201,8 +202,9 @@ BOLT_FORCE_INLINE void csr_sp_begin_epoch(CsrShortestScratch* sc,
 // against side `b`'s stamps and keeping the best meeting in (*mu, *meet).
 // Each node enters a queue at most once (the stamp guarantees it), so the
 // writes are bounded by n_nodes.
-inline void csr_sp_expand_level(CsrSpSide* BOLT_RESTRICT a,
-                                const CsrSpSide* BOLT_RESTRICT b,
+template <typename Nbr, typename Eid>
+inline void csr_sp_expand_level(CsrSpSide<Nbr, Eid>* BOLT_RESTRICT a,
+                                const CsrSpSide<Nbr, Eid>* BOLT_RESTRICT b,
                                 int32_t epoch, int64_t n_nodes,
                                 int32_t* BOLT_RESTRICT mu,
                                 int64_t* BOLT_RESTRICT meet) noexcept {
@@ -212,18 +214,20 @@ inline void csr_sp_expand_level(CsrSpSide* BOLT_RESTRICT a,
     for (int64_t qi = a->lvl_begin; qi < a->lvl_end; ++qi) {
         const int64_t u = a->queue[qi];
         assert(u >= 0 && u < n_nodes && "csr_shortest: queued id out of range");
-        const int64_t e = a->g->off[u + 1];
-        for (int64_t j = a->g->off[u]; j < e; ++j) {
+        int64_t b0 = 0;
+        int64_t e  = 0;
+        csr_graph_block(a->g, u, &b0, &e);
+        for (int64_t j = b0; j < e; ++j) {
             if (csr_edge_label_keep(a->g->edge_labels, a->g->want_label, j) == 0)
                 continue;
-            const int64_t v = a->g->neighbors[j];
+            const int64_t v = static_cast<int64_t>(a->g->neighbors[j]);
             assert(v >= 0 && v < n_nodes && "csr_shortest: neighbour out of range");
             if (a->stamp[v] == epoch) continue;
             a->stamp[v] = epoch;
             a->dist[v]  = nd;
             if (a->parent != nullptr) {
                 a->parent[v] = u;
-                a->pedge[v]  = a->g->edge_ids[j];
+                a->pedge[v]  = static_cast<int64_t>(a->g->edge_ids[j]);
             }
             assert(a->tail < n_nodes && "csr_shortest: queue overflow");
             a->queue[a->tail++] = v;
@@ -239,7 +243,8 @@ inline void csr_sp_expand_level(CsrSpSide* BOLT_RESTRICT a,
 }
 
 // Seed one side with its start node at distance 0.
-BOLT_FORCE_INLINE void csr_sp_seed(CsrSpSide* side, int64_t start,
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE void csr_sp_seed(CsrSpSide<Nbr, Eid>* side, int64_t start,
                                    int32_t epoch) noexcept {
     assert(side != nullptr && start >= 0);
     assert(side->stamp != nullptr && side->queue != nullptr);
@@ -280,8 +285,9 @@ inline void csr_sp_build_witness(const CsrShortestScratch* sc, int64_t meet,
 }
 
 // Contract validation. Fails closed on every mixed/absent buffer combination.
-BOLT_FORCE_INLINE bool csr_shortest_args_ok(const CsrBfsGraph* fwd,
-                                            const CsrBfsGraph* rev,
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE bool csr_shortest_args_ok(const CsrGraphT<Nbr, Eid>* fwd,
+                                            const CsrGraphT<Nbr, Eid>* rev,
                                             int64_t s, int64_t t,
                                             int32_t max_hops,
                                             const CsrShortestScratch* sc) noexcept {
@@ -308,7 +314,8 @@ BOLT_FORCE_INLINE bool csr_shortest_args_ok(const CsrBfsGraph* fwd,
 // proven unreachable); false means the hop cap stopped the search first.
 // The stop-at-first-meeting rule is exact — see the CLAIM at the top of this
 // header for the proof and the differential that backs it.
-inline bool csr_sp_search(CsrSpSide* f, CsrSpSide* r, int32_t epoch,
+template <typename Nbr, typename Eid>
+inline bool csr_sp_search(CsrSpSide<Nbr, Eid>* f, CsrSpSide<Nbr, Eid>* r, int32_t epoch,
                           int64_t n_nodes, int32_t max_hops,
                           int32_t* BOLT_RESTRICT mu,
                           int64_t* BOLT_RESTRICT meet) noexcept {
@@ -345,9 +352,10 @@ inline bool csr_sp_search(CsrSpSide* f, CsrSpSide* r, int32_t epoch,
 // Returns Ok with out->length == -1 for a PROVEN unreachable pair, and
 // HopCapReached with out->length == -1 when max_hops stopped the search
 // first. These are different answers; a caller that conflates them is wrong.
-inline CsrShortestStatus csr_shortest_bidir(
-        const CsrBfsGraph* BOLT_RESTRICT fwd,
-        const CsrBfsGraph* BOLT_RESTRICT rev, int64_t s, int64_t t,
+template <typename Nbr, typename Eid>
+inline CsrShortestStatus csr_shortest_bidir_t(
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT fwd,
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT rev, int64_t s, int64_t t,
         int32_t max_hops, CsrShortestScratch* BOLT_RESTRICT sc,
         int64_t* BOLT_RESTRICT out_path_nodes,
         int64_t* BOLT_RESTRICT out_path_edges, int32_t out_path_cap,
@@ -374,9 +382,9 @@ inline CsrShortestStatus csr_shortest_bidir(
         return CsrShortestStatus::Ok;
     }
 
-    CsrSpSide f{fwd, sc->stamp_f, sc->dist_f, sc->queue_f, sc->parent_f,
+    CsrSpSide<Nbr, Eid> f{fwd, sc->stamp_f, sc->dist_f, sc->queue_f, sc->parent_f,
                 sc->pedge_f, 0, 0, 0, 0, 0};
-    CsrSpSide r{rev, sc->stamp_r, sc->dist_r, sc->queue_r, sc->parent_r,
+    CsrSpSide<Nbr, Eid> r{rev, sc->stamp_r, sc->dist_r, sc->queue_r, sc->parent_r,
                 sc->pedge_r, 0, 0, 0, 0, 0};
     csr_sp_seed(&f, s, epoch);
     csr_sp_seed(&r, t, epoch);
@@ -399,6 +407,24 @@ inline CsrShortestStatus csr_shortest_bidir(
     out->witness_len = mu + 1;
     return CsrShortestStatus::Ok;
 }
+
+// Concrete entry points (a template cannot deduce from a null graph pointer,
+// which the contract tests pass on purpose).
+#define BOLT_CSR_SHORTEST_ENTRY(G)                                             \
+    inline CsrShortestStatus csr_shortest_bidir(                              \
+            const G* BOLT_RESTRICT fwd, const G* BOLT_RESTRICT rev,           \
+            int64_t s, int64_t t, int32_t max_hops,                           \
+            CsrShortestScratch* BOLT_RESTRICT sc,                             \
+            int64_t* BOLT_RESTRICT out_path_nodes,                            \
+            int64_t* BOLT_RESTRICT out_path_edges, int32_t out_path_cap,      \
+            CsrShortestResult* BOLT_RESTRICT out) noexcept {                  \
+        return csr_shortest_bidir_t(fwd, rev, s, t, max_hops, sc,             \
+                                    out_path_nodes, out_path_edges,           \
+                                    out_path_cap, out);                       \
+    }
+BOLT_CSR_SHORTEST_ENTRY(CsrGraph64)
+BOLT_CSR_SHORTEST_ENTRY(CsrGraph32)
+#undef BOLT_CSR_SHORTEST_ENTRY
 
 }  // namespace kernels
 }  // namespace bolt

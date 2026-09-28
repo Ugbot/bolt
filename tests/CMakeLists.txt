@@ -860,6 +860,15 @@ target_compile_definitions(test_bolt_csr_shortest PRIVATE
 bolt_apply_hardening(test_bolt_csr_shortest)
 add_test(NAME test_bolt_csr_shortest COMMAND test_bolt_csr_shortest)
 
+# Compact CSR (uint32 arrays over a node window) walks identically to int64.
+add_executable(test_bolt_csr_compact test_bolt_csr_compact.cpp)
+target_link_libraries(test_bolt_csr_compact
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_csr_compact PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_csr_compact)
+add_test(NAME test_bolt_csr_compact COMMAND test_bolt_csr_compact)
+
 # Variable-width payload column — Layer 1.1 of the parse / JSON / doc work.
 add_executable(test_bolt_var_column test_bolt_var_column.cpp)
 target_link_libraries(test_bolt_var_column
