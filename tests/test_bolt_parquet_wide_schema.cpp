@@ -46,8 +46,8 @@ namespace {
 
 using namespace bolt::ingest::parquet;
 
-// 110 > kPqMaxColumns's realistic real-world neighborhood and matches the
-// ticket's "105+" bar while staying under kPqMaxColumns (128).
+// 110 columns: past the parquet writer's inline descriptor array, and the
+// ticket's "105+" bar.
 constexpr std::uint32_t kCols = 110;
 constexpr std::int64_t  kRows = 4000;
 constexpr std::int64_t  kRowGroupRows = 800;  // -> 5 row groups
@@ -166,15 +166,18 @@ std::vector<std::uint8_t> write_wide_fixture(const char* tag) {
     }
 
     ParquetWriteOpts o{};
-    o.n_columns = kCols;
+    std::vector<ParquetWriteColumn> wide(kCols);
+    ParquetWriteColumn* cols = pw_opts_columns(&o, kCols, wide.data());
+    EXPECT_NE(cols, nullptr);
+    if (cols == nullptr) return {};
     o.compression = 1;  // SNAPPY -- matches a real ClickBench-shaped file
     o.emit_statistics = true;
     o.row_group_max_rows = kRowGroupRows;
     for (std::uint32_t c = 0; c < kCols; ++c) {
         std::snprintf(name, sizeof(name), "col%03u", c);
-        std::strncpy(o.columns[c].name, name, sizeof(o.columns[c].name) - 1);
-        o.columns[c].type = type_of(c);
-        o.columns[c].nullable = (c % 4u) == 3u;
+        std::strncpy(cols[c].name, name, sizeof(cols[c].name) - 1);
+        cols[c].type = type_of(c);
+        cols[c].nullable = (c % 4u) == 3u;
     }
     const std::string path =
         std::string("test_bolt_parquet_wide_schema_") + tag + ".parquet";

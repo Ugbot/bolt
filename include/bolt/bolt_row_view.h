@@ -21,10 +21,8 @@
 //      released, the owner will spin in `wait_drained` / eviction will
 //      skip the slot — memory safety preserved, but progress stalls.
 //
-// Size: with `kMaxFixedColumns = 256` (RowView's own cap — see below;
-// deliberately NOT the raised `kMaxBatchColumns = 1024`, an assert
-// ceiling, not RowView storage) this is ~2.6 KiB, measured `sizeof(RowView)`
-// = 2624 bytes on bolt 7e4dcf6. Within Bolt's norm for stack POD —
+// Size: with `kRowViewMaxColumns = 256` this is ~2.6 KiB, measured
+// `sizeof(RowView)` = 2624 bytes on bolt 7e4dcf6. Within Bolt's norm for stack POD —
 // `BoltBatch` itself is only 128 bytes on stack post-G2FEAT-47 (its
 // `columns[2]` are arena pointers, not inline storage; see bolt_column.h).
 // Callers with fewer columns still only pay for the columns they fill;
@@ -38,7 +36,7 @@
 
 #pragma once
 
-#include "bolt/bolt_column.h"   // kMaxBatchColumns
+#include "bolt/bolt_column.h"
 #include "bolt/bolt_port.h"
 
 #include <cstdint>
@@ -53,6 +51,11 @@ enum class RowViewPinKind : uint8_t {
     // Reserved for future owners (PDX cluster cache, etc.).
 };
 
+// RowView is the zero-copy point-get FAST PATH and a fixed C-ABI size
+// (marbledb's MDB_ROW_VIEW_BYTES), so it keeps an inline capacity,
+// kRowViewMaxColumns (bolt_column_limits.h). A row wider than this is not an
+// error: producers return "no view" and the caller takes the copying get()
+// path, which has no column cap below kMaxColumns.
 struct alignas(64) RowView {
     // Row metadata — populated by the producer on hit.
     int64_t     key;
@@ -61,11 +64,8 @@ struct alignas(64) RowView {
     // Column pointers + sizes, indexed 0..ncols-1. Positions beyond
     // `ncols` are undefined (do not read). Producers must match the
     // schema's column order.
-    // G2FEAT-47: sized to kMaxFixedColumns (256), not the raised in-memory
-    // kMaxBatchColumns — RowView is the point-get / KV row-materialisation
-    // shape (schema-narrow), so it keeps the compact historical cap.
-    const void* col_ptrs[kMaxFixedColumns];
-    uint16_t    col_sizes[kMaxFixedColumns];
+    const void* col_ptrs[kRowViewMaxColumns];
+    uint16_t    col_sizes[kRowViewMaxColumns];
     uint32_t    ncols;
 
     // Opaque pin state. Consumers MUST NOT interpret these fields
@@ -85,8 +85,8 @@ struct alignas(64) RowView {
 // stable for ABI-minded callers.
 static_assert(sizeof(RowView) <=
                   (sizeof(int64_t) * 2 +
-                   sizeof(void*) * kMaxFixedColumns +
-                   sizeof(uint16_t) * kMaxFixedColumns +
+                   sizeof(void*) * kRowViewMaxColumns +
+                   sizeof(uint16_t) * kRowViewMaxColumns +
                    sizeof(uint32_t) * 2 +
                    sizeof(uint64_t) +
                    sizeof(void*) +

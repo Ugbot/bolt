@@ -93,11 +93,9 @@ inline constexpr size_t kWireSchemaEntrySize = 72;
 inline constexpr size_t kWireDescSize        = 56;
 inline constexpr size_t kWireAlign           = 64;
 
-// Hard cap mirrors kMaxBatchColumns so we never underestimate bounds.
-// G2FEAT-47: the wire codec keeps the historical 256-col cap (see
-// kMaxFixedColumns) — decoupled from the in-memory kMaxBatchColumns (1024) so
-// the fixed serialize scratch + WireStream framing stay compact.
-inline constexpr uint32_t kWireMaxCols = kMaxFixedColumns;
+// A frame carries up to bolt::kMaxColumns columns (num_cols is a u32 in the
+// header; the serializer keeps no per-column scratch, so width costs nothing).
+inline constexpr uint32_t kWireMaxCols = kMaxColumns;
 
 // ===========================================================================
 // Internal helpers
@@ -276,61 +274,39 @@ BOLT_FORCE_INLINE int64_t read_i64_le(const uint8_t* p) noexcept {
     int64_t v; memcpy(&v, p, sizeof(v)); return v;
 }
 
-// Compute the total buffer-region size (summed, each aligned to 64) and
-// report per-column buffer lengths. Returns 0 on unsupported column.
-inline size_t collect_column_sizes(const BoltBatch* b,
-                                   size_t* out_b0_len,
-                                   size_t* out_b1_len,
-                                   size_t* out_b2_len) noexcept {
-    assert(b != nullptr);
-    assert(out_b0_len != nullptr);
-
-    size_t total = 0;
-    const uint32_t n = b->num_cols;
-    for (uint32_t i = 0; i < n && i < kWireMaxCols; ++i) {
-        const BoltColumn& c = b->col(i);
-        if (!is_supported_format_pair(c.type, c.format)) return 0;
-
-        const size_t v_len = c.validity ? validity_bytes(c.length) : 0;
-        size_t d_len = 0;
-        size_t s_len = 0;
-
-        if (c.format == ColumnFormat::VarBinary) {
-            // b1 = (length+1) Int32 offsets; b2 = `offsets[length]` payload bytes.
-            d_len = static_cast<size_t>(c.length + 1) * sizeof(int32_t);
-            if (c.length > 0 && c.dict_child != nullptr &&
-                c.dict_child->data != nullptr) {
-                const int32_t* offs =
-                    static_cast<const int32_t*>(c.dict_child->data);
-                const int32_t total_payload = offs[c.length];
-                if (total_payload < 0) return 0;
-                s_len = static_cast<size_t>(total_payload);
-            } else if (c.length == 0) {
-                s_len = 0;
-            } else {
-                return 0;            // length > 0 but no offsets
-            }
-        } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
-            size_t min_off_unused = 0;
-            flat_utf8_sizes(c, &d_len, &s_len, &min_off_unused);
-            if (s_len > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
-        } else {
-            // Flat numeric / Bool / Embedding. Embedding uses the 3-arg
-            // overload so the runtime-dynamic stride (dim * 4) is taken
-            // from `c.type_size_bytes` rather than the 0 sentinel in
-            // `kTypeSize[]`.
-            d_len = data_buffer_size(c.type, c.length, c.type_size_bytes);
+// One column's three buffer lengths (validity, data/offsets/views, payload)
+// and, for Flat Utf8, the lowest spilled offset the payload span starts at.
+// Returns false on an unsupported or malformed column.
+inline bool column_wire_sizes(const BoltColumn& c, size_t* out_b0,
+                              size_t* out_b1, size_t* out_b2,
+                              size_t* out_utf8_min_off) noexcept {
+    assert(out_b0 != nullptr && out_b1 != nullptr);
+    assert(out_b2 != nullptr && out_utf8_min_off != nullptr);
+    *out_utf8_min_off = 0;
+    if (!is_supported_format_pair(c.type, c.format)) return false;
+    *out_b0 = c.validity ? validity_bytes(c.length) : 0;
+    *out_b2 = 0;
+    if (c.format == ColumnFormat::VarBinary) {
+        // b1 = (length+1) Int32 offsets; b2 = `offsets[length]` payload bytes.
+        *out_b1 = static_cast<size_t>(c.length + 1) * sizeof(int32_t);
+        if (c.length > 0 && c.dict_child != nullptr &&
+            c.dict_child->data != nullptr) {
+            const int32_t* offs = static_cast<const int32_t*>(c.dict_child->data);
+            const int32_t payload = offs[c.length];
+            if (payload < 0) return false;
+            *out_b2 = static_cast<size_t>(payload);
+        } else if (c.length != 0) {
+            return false;            // length > 0 but no offsets
         }
-
-        out_b0_len[i] = v_len;
-        out_b1_len[i] = d_len;
-        out_b2_len[i] = s_len;
-
-        total += detail::align_up(v_len, kWireAlign);
-        total += detail::align_up(d_len, kWireAlign);
-        total += detail::align_up(s_len, kWireAlign);
+    } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
+        flat_utf8_sizes(c, out_b1, out_b2, out_utf8_min_off);
+        if (*out_b2 > 0 && c.str_overflow_base == nullptr) return false;
+    } else {
+        // Flat numeric / Bool / Embedding: the 3-arg overload takes the
+        // runtime stride (dim * 4) from `c.type_size_bytes`.
+        *out_b1 = data_buffer_size(c.type, c.length, c.type_size_bytes);
     }
-    return total;
+    return true;
 }
 
 }  // namespace detail
@@ -343,25 +319,15 @@ inline size_t collect_column_sizes(const BoltBatch* b,
 /// serializable (unsupported column format / type, too many columns).
 inline size_t bolt_wire_size(const BoltBatch* b) noexcept {
     assert(b != nullptr);
-    assert(b->num_cols <= kWireMaxCols);
-
     if (b->num_cols > kWireMaxCols) return 0;
 
-    size_t b0[kWireMaxCols], b1[kWireMaxCols], b2[kWireMaxCols];
-    memset(b0, 0, sizeof(b0));
-    memset(b1, 0, sizeof(b1));
-    memset(b2, 0, sizeof(b2));
-
-    const size_t data_bytes = detail::collect_column_sizes(b, b0, b1, b2);
-    if (data_bytes == 0 && b->num_cols > 0) {
-        // Only "no supported columns" is an error here. A legitimately
-        // empty (zero-row, zero-byte) set of columns would still produce
-        // data_bytes == 0 but should succeed — so additionally verify
-        // that every column is supported.
-        for (uint32_t i = 0; i < b->num_cols; ++i) {
-            const BoltColumn& c = b->col(i);
-            if (!detail::is_supported_format_pair(c.type, c.format)) return 0;
-        }
+    size_t data_bytes = 0;
+    for (uint32_t i = 0; i < b->num_cols; ++i) {   // bounded: num_cols <= kWireMaxCols
+        size_t l0 = 0, l1 = 0, l2 = 0, moff = 0;
+        if (!detail::column_wire_sizes(b->col(i), &l0, &l1, &l2, &moff)) return 0;
+        data_bytes += detail::align_up(l0, kWireAlign);
+        data_bytes += detail::align_up(l1, kWireAlign);
+        data_bytes += detail::align_up(l2, kWireAlign);
     }
 
     size_t off = kWireHeaderSize;
@@ -369,6 +335,7 @@ inline size_t bolt_wire_size(const BoltBatch* b) noexcept {
     off += static_cast<size_t>(b->num_cols) * kWireDescSize;
     off = detail::align_up(off, kWireAlign);
     off += data_bytes;
+    assert(off >= kWireHeaderSize);
     return off;
 }
 
@@ -381,42 +348,6 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
 
     if (out_buf == nullptr) return 0;
     if (b->num_cols > kWireMaxCols) return 0;
-
-    size_t b0[kWireMaxCols], b1[kWireMaxCols], b2[kWireMaxCols];
-    size_t utf8_min_off[kWireMaxCols];   // only meaningful for Flat+Utf8 cols
-    memset(b0, 0, sizeof(b0));
-    memset(b1, 0, sizeof(b1));
-    memset(b2, 0, sizeof(b2));
-    memset(utf8_min_off, 0, sizeof(utf8_min_off));
-
-    // Collect sizes + validate supported formats.
-    for (uint32_t i = 0; i < b->num_cols; ++i) {
-        const BoltColumn& c = b->col(i);
-        if (!detail::is_supported_format_pair(c.type, c.format)) return 0;
-        b0[i] = c.validity ? detail::validity_bytes(c.length) : 0;
-        if (c.format == ColumnFormat::VarBinary) {
-            b1[i] = static_cast<size_t>(c.length + 1) * sizeof(int32_t);
-            if (c.length > 0 && c.dict_child != nullptr &&
-                c.dict_child->data != nullptr) {
-                const int32_t* offs =
-                    static_cast<const int32_t*>(c.dict_child->data);
-                const int32_t payload = offs[c.length];
-                if (payload < 0) return 0;
-                b2[i] = static_cast<size_t>(payload);
-            } else if (c.length == 0) {
-                b2[i] = 0;
-            } else {
-                return 0;
-            }
-        } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
-            detail::flat_utf8_sizes(c, &b1[i], &b2[i], &utf8_min_off[i]);
-            if (b2[i] > 0 && c.str_overflow_base == nullptr) return 0;  // malformed
-        } else {
-            b1[i] = detail::data_buffer_size(c.type, c.length,
-                                              c.type_size_bytes);
-            b2[i] = 0;
-        }
-    }
 
     const size_t total = bolt_wire_size(b);
     if (total == 0 || total > buf_capacity) return 0;
@@ -477,18 +408,20 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
     for (uint32_t i = 0; i < b->num_cols; ++i) {
         uint8_t* d = buf + desc_off + i * kWireDescSize;
         const BoltColumn& c = b->col(i);
+        size_t b0 = 0, b1 = 0, b2 = 0, moff = 0;
+        if (!detail::column_wire_sizes(c, &b0, &b1, &b2, &moff)) return 0;
 
-        const size_t aln0 = detail::align_up(b0[i], kWireAlign);
-        const size_t aln1 = detail::align_up(b1[i], kWireAlign);
-        const size_t aln2 = detail::align_up(b2[i], kWireAlign);
+        const size_t aln0 = detail::align_up(b0, kWireAlign);
+        const size_t aln1 = detail::align_up(b1, kWireAlign);
+        const size_t aln2 = detail::align_up(b2, kWireAlign);
         const size_t off0 = cursor;                      cursor += aln0;
         const size_t off1 = cursor;                      cursor += aln1;
         const size_t off2 = cursor;                      cursor += aln2;
         assert(cursor <= total);
 
-        detail::write_u64_le(d +  0, off0); detail::write_u64_le(d +  8, b0[i]);
-        detail::write_u64_le(d + 16, off1); detail::write_u64_le(d + 24, b1[i]);
-        detail::write_u64_le(d + 32, off2); detail::write_u64_le(d + 40, b2[i]);
+        detail::write_u64_le(d +  0, off0); detail::write_u64_le(d +  8, b0);
+        detail::write_u64_le(d + 16, off1); detail::write_u64_le(d + 24, b1);
+        detail::write_u64_le(d + 32, off2); detail::write_u64_le(d + 40, b2);
         d[48] = static_cast<uint8_t>(c.format);
 
         // G2ICE-141: `wr{0,1,2}` = bytes actually copied into each span; the
@@ -496,33 +429,32 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         // pointer was absent) is zeroed by zero_wire_gap below, keeping the
         // wire image byte-identical to the old whole-buffer memset.
         size_t wr0 = 0, wr1 = 0, wr2 = 0;
-        if (b0[i] && c.validity) { memcpy(buf + off0, c.validity, b0[i]); wr0 = b0[i]; }
+        if (b0 && c.validity) { memcpy(buf + off0, c.validity, b0); wr0 = b0; }
         if (c.format == ColumnFormat::VarBinary) {
             // b1 = offsets array; b2 = payload bytes.
-            if (b1[i] > 0 && c.dict_child != nullptr &&
+            if (b1 > 0 && c.dict_child != nullptr &&
                 c.dict_child->data != nullptr) {
-                memcpy(buf + off1, c.dict_child->data, b1[i]);
-                wr1 = b1[i];
+                memcpy(buf + off1, c.dict_child->data, b1);
+                wr1 = b1;
             }
-            if (b2[i] > 0 && c.data != nullptr) {
-                memcpy(buf + off2, c.data, b2[i]);
-                wr2 = b2[i];
+            if (b2 > 0 && c.data != nullptr) {
+                memcpy(buf + off2, c.data, b2);
+                wr2 = b2;
             }
         } else if (c.format == ColumnFormat::Flat && c.type == BoltType::Utf8) {
             // b1 = StringView row array; b2 = spilled bytes. G2FEAT-308/311:
             // `c` may be a SLICE of a larger column (a chunked/windowed
             // batch), so spilled rows' `ref.offset` can be far from 0 —
-            // b2 was sized as [utf8_min_off[i], utf8_min_off[i]+b2[i]) by
-            // flat_utf8_sizes, NOT [0, b2[i]). Copy that span (not a [0,..)
-            // prefix) and REBASE each spilled row's offset by -utf8_min_off[i]
+            // b2 was sized as [moff, moff+b2) by
+            // flat_utf8_sizes, NOT [0, b2). Copy that span (not a [0,..)
+            // prefix) and REBASE each spilled row's offset by -moff
             // so it resolves correctly against the copied span; inline rows
             // (length <= 12, no ref.offset) pass through untouched. When
-            // utf8_min_off[i] == 0 (the common whole-column case) every
+            // moff == 0 (the common whole-column case) every
             // rebased offset equals the original — no behavior change there.
-            if (b1[i] && c.data) {
+            if (b1 && c.data) {
                 const auto* src_rows = static_cast<const StringView*>(c.data);
                 auto* dst_rows = reinterpret_cast<StringView*>(buf + off1);
-                const size_t moff = utf8_min_off[i];
                 for (int64_t r = 0; r < c.length; ++r) {
                     StringView v = src_rows[r];
                     if (v.length > 12u) {
@@ -531,16 +463,16 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
                     }
                     dst_rows[r] = v;
                 }
-                wr1 = b1[i];
+                wr1 = b1;
             }
-            if (b2[i] && c.str_overflow_base) {
+            if (b2 && c.str_overflow_base) {
                 memcpy(buf + off2,
-                      static_cast<const uint8_t*>(c.str_overflow_base) + utf8_min_off[i],
-                      b2[i]);
-                wr2 = b2[i];
+                      static_cast<const uint8_t*>(c.str_overflow_base) + moff,
+                      b2);
+                wr2 = b2;
             }
         } else {
-            if (b1[i] && c.data) { memcpy(buf + off1, c.data, b1[i]); wr1 = b1[i]; }
+            if (b1 && c.data) { memcpy(buf + off1, c.data, b1); wr1 = b1; }
         }
 
         // G2ICE-141: zero the unwritten remainder of every span.

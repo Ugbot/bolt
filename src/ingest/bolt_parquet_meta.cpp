@@ -685,9 +685,16 @@ bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
                 uint8_t et; uint32_t n;
                 if (!tc_list(c, &et, &n)) return false;
                 if (et != kTcStruct) return false;
-                if (n > kPqMaxColumns) return false;
+                if (n > kMaxColumns) return false;
                 for (uint32_t i = 0; i < n; ++i) {
-                    if (m->n_chunks >= m->chunks_cap) return false;
+                    if (m->n_chunks >= m->chunks_cap) {
+                        // Schema came after the row groups (legal, rare): we
+                        // cannot size exactly, so ask for double.
+                        const uint64_t want = static_cast<uint64_t>(m->chunks_cap) * 2u + n;
+                        m->need_chunks = want > UINT32_MAX ? UINT32_MAX
+                                                           : static_cast<uint32_t>(want);
+                        return false;
+                    }
                     if (!parse_column_chunk(c, &m->chunks[m->n_chunks])) {
                         return false;
                     }
@@ -758,6 +765,9 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
     assert(out != nullptr);
     if (meta == nullptr || meta_len == 0) return false;
     if (out->chunks == nullptr || out->chunks_cap == 0) return false;
+    if (out->columns == nullptr || out->columns_cap == 0) return false;
+    out->need_columns = 0;
+    out->need_chunks = 0;
     out->num_rows = 0;
     out->n_columns = 0;
     out->n_row_groups = 0;
@@ -778,7 +788,12 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
             case 2: {   // schema: list<SchemaElement>; FLAT only
                 uint8_t et; uint32_t n;
                 if (!tc_list(&c, &et, &n)) return false;
-                if (et != kTcStruct || n == 0 || n > kPqMaxColumns + 1) {
+                if (et != kTcStruct || n == 0) return false;
+                // Leaves <= elements - 1 (the root). Checked before any
+                // column is written so a too-small array fails cleanly.
+                if (n - 1u > kMaxColumns) return false;
+                if (n - 1u > out->columns_cap) {
+                    out->need_columns = n - 1u;
                     return false;
                 }
                 // Depth-first walk of the schema tree. SchemaElements are
@@ -887,7 +902,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     // applies to a leaf past kPqMaxRepLevels (G2PQ-15): its
                     // max_rep records the real depth so the assembler refuses
                     // it by name, but sibling columns still open.
-                    if (out->n_columns >= kPqMaxColumns) return false;
+                    if (out->n_columns >= out->columns_cap) return false;
                     PqColumn col = se.col;
                     col.max_def = def;
                     col.max_rep = rep;
@@ -937,6 +952,15 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                 uint8_t et; uint32_t n;
                 if (!tc_list(&c, &et, &n)) return false;
                 if (et != kTcStruct || n > kPqMaxRowGroups) return false;
+                if (out->n_columns != 0u) {
+                    const uint64_t want = static_cast<uint64_t>(n) * out->n_columns;
+                    if (want > out->chunks_cap) {
+                        out->need_chunks = want > UINT32_MAX
+                                               ? UINT32_MAX
+                                               : static_cast<uint32_t>(want);
+                        return false;
+                    }
+                }
                 for (uint32_t i = 0; i < n; ++i) {
                     if (!parse_row_group(&c, out,
                                          &out->row_groups[i])) return false;

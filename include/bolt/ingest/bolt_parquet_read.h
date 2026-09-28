@@ -134,9 +134,9 @@ bool parquet_schema_from_meta(const PqMeta* meta, BoltSchema* out,
 bool parquet_column_int_range(const PqMeta* meta, uint32_t col_idx,
                               int64_t* out_min, int64_t* out_max) noexcept;
 
-// Locate the footer and parse FileMetaData. The chunk table behind
-// out->chunks is allocated from `arena` (sized 4096 first, retried once
-// at the kPqMaxRowGroups * kPqMaxColumns hard cap for chunk-heavy files).
+// Locate the footer and parse FileMetaData. The column and chunk tables
+// behind out->columns / out->chunks are allocated from `arena`, sized to
+// the file (a first guess, re-parsed at the file's exact counts).
 bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
                        PqMeta* out) noexcept;
 

@@ -102,17 +102,15 @@ namespace bolt { struct BoltBatch; struct BoltColumn; }
 
 namespace bolt::ingest {
 
-// Bounded surface. 64 columns matches the Arrow C-Data export cap.
-inline constexpr std::uint16_t kIpcMaxCols   = 64;
+// Top-level columns per stream: the one bolt::kMaxColumns ceiling. The
+// writer sizes its descriptor table, flatbuffer scratch and per-batch layout
+// to the declared schema at open(), so a narrow stream pays nothing for it.
+inline constexpr std::uint16_t kIpcMaxCols   = static_cast<std::uint16_t>(kMaxColumns);
 inline constexpr std::uint32_t kIpcNameCap   = 64;   // per-field name bytes
-inline constexpr std::uint32_t kIpcFbCap     = 1u << 15;  // flatbuffer scratch
-
-// Total flattened field budget: kIpcMaxCols top-level columns plus every
-// List/Struct descendant (a List's one element field; a Struct's field
-// list, and THEIR descendants, recursively). Bounded so the writer's
-// per-field bookkeeping (ArrowIpcWriter::desc, BatchLayout::nodes/buffers)
-// stays a fixed-size array — no allocation, no unbounded recursion.
-inline constexpr std::uint16_t kIpcMaxFields    = 256;
+// Total flattened fields (top-level columns plus every List/Struct
+// descendant): the uint16 field index the descriptors use.
+inline constexpr std::uint32_t kIpcMaxFields    = 65535;
+// Fields per Struct: kIpcMaxStructChildren (bolt_column_limits.h).
 // Maximum List/Struct nesting depth (a bare leaf column is depth 0).
 inline constexpr std::uint16_t kIpcMaxNestDepth = 8;
 
@@ -121,7 +119,7 @@ inline constexpr std::uint16_t kIpcMaxNestDepth = 8;
 /// List's element field, or one Struct field.
 ///
 /// `children`/`n_children` matter only when `type == List` (exactly 1
-/// child: the element type) or `type == Struct` (1..kIpcMaxCols children:
+/// child: the element type) or `type == Struct` (1..kIpcMaxStructChildren children:
 /// the fields, in schema order) — every other `type` must leave both
 /// nullptr/0. arrow_ipc_open_nested() rejects the mismatched shape at
 /// open() (fail closed) rather than silently ignoring extra/missing
@@ -157,14 +155,22 @@ struct IpcFieldDesc {
     std::uint8_t  decimal_scale;   // Decimal128 leaves only
 };
 
+// Zero-initialize before the first open() (calloc or `{}`); open()
+// allocates the schema-sized scratch below and close() frees it, so one
+// writer can be reused across streams.
 struct ArrowIpcWriter {
     std::FILE*    f;                       // borrowed; caller closes
     std::uint16_t n_cols;                  // top-level column count
     std::uint16_t n_desc;                  // total flattened field count
     std::uint16_t open;                    // 1 between open() and close()
     std::uint16_t failed;                  // latched on any write error
-    IpcFieldDesc  desc[kIpcMaxFields];
-    std::uint8_t  fb[kIpcFbCap];           // flatbuffer build scratch
+    void*         mem;                     // owns every array below
+    IpcFieldDesc* desc;                    // n_desc entries
+    std::int64_t* nodes;                   // 2 * n_desc (per-batch layout)
+    std::int64_t* buffers;                 // 6 * n_desc (per-batch layout)
+    std::int64_t* varlen_total;            // n_desc     (per-batch layout)
+    std::uint8_t* fb;                      // flatbuffer build scratch
+    std::uint32_t fb_cap;
 };
 
 /// Begin a stream: validate the schema (fail closed on any unsupported
@@ -206,7 +212,8 @@ bool arrow_ipc_write_batch(ArrowIpcWriter* w,
 
 /// Write the end-of-stream marker and flush. The FILE* stays open
 /// (borrowed). Returns false if the stream previously failed or the
-/// final write fails; the writer is closed either way.
+/// final write fails; the writer is closed (and its scratch freed) either
+/// way.
 bool arrow_ipc_close(ArrowIpcWriter* w) noexcept;
 
 }  // namespace bolt::ingest

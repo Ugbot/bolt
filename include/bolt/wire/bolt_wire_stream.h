@@ -79,27 +79,13 @@ struct WireStream {
     uint32_t desc_off;       // schema_off + num_cols * kWireSchemaEntrySize
     uint32_t data_off;       // align_up(desc_off + num_cols * kWireDescSize, 64)
 
-    // Per-column absolute offsets + lengths captured during append.
-    // Indexed by column index; filled into the descriptor block at finalize.
-    // G2FEAT-47: sized to the wire cap (kMaxFixedColumns=256), not the raised
-    // in-memory kMaxBatchColumns — keeps WireStream inside its 16 KB budget and
-    // matches the kWireMaxCols guards below.
-    uint64_t col_b0_off[wire::kWireMaxCols];
-    uint64_t col_b0_len[wire::kWireMaxCols];
-    uint64_t col_b1_off[wire::kWireMaxCols];
-    uint64_t col_b1_len[wire::kWireMaxCols];
-    uint64_t col_b2_off[wire::kWireMaxCols];
-    uint64_t col_b2_len[wire::kWireMaxCols];
-    uint8_t  col_format[wire::kWireMaxCols];  // always Flat in Phase 1
+    // Each column's descriptor is written straight into `out` at append
+    // time (its slot is fixed at begin_file), so the stream carries no
+    // per-column state and any width up to kWireMaxCols costs nothing here.
 };
 
-// WireStream is ~12.5 KB at kWireMaxCols=kMaxFixedColumns=256 (NOT
-// kMaxBatchColumns=1024 — the wire format deliberately stays on the
-// compact 256-column cap; see the G2FEAT-47 note on col_b0_off[] etc.
-// above). Pass it by pointer always. This guard makes an accidental
-// by-value parameter or return a hard error.
-static_assert(sizeof(WireStream) <= 16u * 1024u,
-              "WireStream layout blew past 16 KB — audit kWireMaxCols");
+static_assert(sizeof(WireStream) <= 128u,
+              "WireStream holds no per-column state");
 static_assert(alignof(WireStream) >= alignof(uint64_t),
               "WireStream must be 8-byte aligned for u64 offset arrays");
 
@@ -256,17 +242,22 @@ inline bool wire_stream_append_column(WireStream* BOLT_RESTRICT s,
     }
     // s_len == 0 for now; when Utf8 lands, a third buffer copy goes here.
 
-    s->col_b0_off[i] = off0; s->col_b0_len[i] = v_len;
-    s->col_b1_off[i] = off1; s->col_b1_len[i] = d_len;
-    s->col_b2_off[i] = off2; s->col_b2_len[i] = s_len;
-    s->col_format[i] = static_cast<uint8_t>(ColumnFormat::Flat);
+    uint8_t* d = s->out + s->desc_off + static_cast<size_t>(i) * wire::kWireDescSize;
+    wire::detail::write_u64_le(d +  0, off0);
+    wire::detail::write_u64_le(d +  8, v_len);
+    wire::detail::write_u64_le(d + 16, off1);
+    wire::detail::write_u64_le(d + 24, d_len);
+    wire::detail::write_u64_le(d + 32, off2);
+    wire::detail::write_u64_le(d + 40, s_len);
+    d[48] = static_cast<uint8_t>(ColumnFormat::Flat);
+    // bytes 49..55 already zeroed by begin_file's memset.
 
     s->pos = cursor;
     ++s->cols_written;
     return true;
 }
 
-/// Patch descriptor block + header num_rows. Returns total bytes written,
+/// Patch header num_rows (descriptors were written at append). Returns total bytes written,
 /// or 0 on error (sticky `ok=false` or partial column count).
 inline size_t wire_stream_finalize(WireStream* BOLT_RESTRICT s) noexcept {
     assert(s != nullptr);
@@ -279,18 +270,6 @@ inline size_t wire_stream_finalize(WireStream* BOLT_RESTRICT s) noexcept {
     wire::detail::write_i64_le(s->out + 12,
                                s->num_rows_set ? s->num_rows : 0);
 
-    // Write the descriptor block in one pass.
-    for (uint32_t i = 0; i < s->num_cols; ++i) {
-        uint8_t* d = s->out + s->desc_off + i * wire::kWireDescSize;
-        wire::detail::write_u64_le(d +  0, s->col_b0_off[i]);
-        wire::detail::write_u64_le(d +  8, s->col_b0_len[i]);
-        wire::detail::write_u64_le(d + 16, s->col_b1_off[i]);
-        wire::detail::write_u64_le(d + 24, s->col_b1_len[i]);
-        wire::detail::write_u64_le(d + 32, s->col_b2_off[i]);
-        wire::detail::write_u64_le(d + 40, s->col_b2_len[i]);
-        d[48] = s->col_format[i];
-        // bytes 49..55 already zeroed by begin_file's memset.
-    }
     return s->pos;
 }
 

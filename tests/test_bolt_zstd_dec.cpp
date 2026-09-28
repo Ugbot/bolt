@@ -317,7 +317,7 @@ TEST(ZstdParquet, GoldenZstdFileReadsWithExactValues) {
 
     int64_t seen = 0;
     for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
-        bolt::BoltColumn cols[kPqMaxColumns];
+        bolt::BoltColumn cols[256];
         int64_t rows = 0;
         ASSERT_TRUE(parquet_read_row_group(buf.data(), buf.size(), meta, g,
                                            &arena, cols, &rows))
@@ -366,7 +366,7 @@ TEST(ZstdParquet, ProjectionPushdownMatchesFullDecode) {
     std::memset(meta, 0, sizeof(*meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &arena, meta));
     for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
-        bolt::BoltColumn full[kPqMaxColumns];
+        bolt::BoltColumn full[256];
         int64_t full_rows = 0;
         ASSERT_TRUE(parquet_read_row_group(buf.data(), buf.size(), meta, g,
                                            &arena, full, &full_rows));

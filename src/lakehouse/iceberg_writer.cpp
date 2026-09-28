@@ -36,6 +36,7 @@
 #include <chrono>
 #include <filesystem>
 #include <system_error>
+#include <vector>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -317,24 +318,21 @@ const char* bolt_type_iceberg_name(BoltType t) noexcept {
     }
 }
 
-ingest::parquet::ParquetWriteOpts make_pq_opts(const Schema* sch,
-                                                const WriteOptions* w) noexcept {
-    ingest::parquet::ParquetWriteOpts po{};
-    assert(sch != nullptr);
-    // COLUMN-WIDTH NORMALIZATION (2026-08-03) — STACK BUFFER OVERFLOW FIX.
-    // `po.columns` is `ParquetWriteColumn[kMaxFixedColumns]` (256) on a
-    // STACK-LOCAL struct, but this clamped to kMaxBatchColumns (1024). Correct
-    // while both were 256; raising kMaxBatchColumns to 1024 (G2FEAT-47) made
-    // any 257..1024-field schema overflow `po` on the stack. Clamp to the
-    // destination array's real size. `n_columns` below is set to this clamped
-    // n, so an over-wide schema surfaces downstream as a short column list
-    // rather than corrupting the frame; parquet_write_open additionally
-    // rejects anything past kPwMaxColumns (== kMaxFixedColumns).
-    const uint32_t n =
-        sch->n_fields < kMaxFixedColumns ? sch->n_fields : kMaxFixedColumns;
+// Fills `po` for `sch`. A schema wider than the inline descriptor array
+// uses `wide` as its storage, so `wide` must outlive the writer open.
+bool make_pq_opts(const Schema* sch, const WriteOptions* w,
+                  ingest::parquet::ParquetWriteOpts* po,
+                  std::vector<ingest::parquet::ParquetWriteColumn>* wide) noexcept {
+    assert(sch != nullptr && po != nullptr);
+    assert(wide != nullptr);
+    *po = ingest::parquet::ParquetWriteOpts{};
+    const uint32_t n = sch->n_fields;
+    if (n > ingest::parquet::kPwInlineColumns) wide->resize(n);
+    ingest::parquet::ParquetWriteColumn* cols =
+        ingest::parquet::pw_opts_columns(po, n, wide->data());
+    if (cols == nullptr) return false;
     for (uint32_t i = 0; i < n; ++i) {
-        std::strncpy(po.columns[i].name, sch->fields[i].name,
-                     sizeof(po.columns[i].name) - 1u);
+        std::strncpy(cols[i].name, sch->fields[i].name, sizeof(cols[i].name) - 1u);
         // Map iceberg type string back to BoltType for the writer.
         const char* t = sch->fields[i].type;
         BoltType bt = BoltType::Utf8;
@@ -345,16 +343,15 @@ ingest::parquet::ParquetWriteOpts make_pq_opts(const Schema* sch,
         else if (std::strcmp(t, "boolean") == 0) bt = BoltType::Bool;
         else if (std::strcmp(t, "date") == 0)    bt = BoltType::Date32;
         else if (std::strcmp(t, "timestamp") == 0) bt = BoltType::Timestamp;
-        po.columns[i].type     = bt;
-        po.columns[i].nullable = !sch->fields[i].required;
+        cols[i].type     = bt;
+        cols[i].nullable = !sch->fields[i].required;
     }
-    po.n_columns              = n;
-    po.row_group_target_bytes = w ? static_cast<uint32_t>(
+    po->row_group_target_bytes = w ? static_cast<uint32_t>(
         w->target_row_group_rows ? w->target_row_group_rows * 64u : 1u << 20)
-                                  : (1u << 20);
-    po.compression            = 1;  // SNAPPY
-    po.emit_statistics        = w ? w->emit_stats : true;
-    return po;
+                                   : (1u << 20);
+    po->compression            = 1;  // SNAPPY
+    po->emit_statistics        = w ? w->emit_stats : true;
+    return true;
 }
 
 }  // namespace
@@ -1102,9 +1099,9 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
     // original field layout instead of the one just evolved to.
     const Schema* write_sch = metadata_current_schema(&th->meta);
     if (write_sch == nullptr) return false;
-    // make_pq_opts clamps to the writer's column array: refuse, never drop.
-    if (write_sch->n_fields > kMaxFixedColumns) return false;
-    ingest::parquet::ParquetWriteOpts po = make_pq_opts(write_sch, nullptr);
+    ingest::parquet::ParquetWriteOpts po{};
+    std::vector<ingest::parquet::ParquetWriteColumn> wide;
+    if (!make_pq_opts(write_sch, nullptr, &po, &wide)) return false;
     auto* w = ingest::parquet::parquet_write_open(full, &po);
     if (w == nullptr) return false;
     int64_t total_rows = 0;
@@ -1545,7 +1542,9 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     }
     Schema dsch{};
     if (!position_delete_schema(a, &dsch)) return false;
-    ingest::parquet::ParquetWriteOpts po = make_pq_opts(&dsch, nullptr);
+    ingest::parquet::ParquetWriteOpts po{};
+    std::vector<ingest::parquet::ParquetWriteColumn> wide;
+    if (!make_pq_opts(&dsch, nullptr, &po, &wide)) return false;
     // G2ICE-117 — stamp the spec-RESERVED field ids into the physical
     // parquet footer, not only into `dsch` (which only ever reached the
     // Iceberg-level manifest/metadata, never the file bolt's own writer

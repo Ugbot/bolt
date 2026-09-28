@@ -170,8 +170,7 @@ enum class ColumnFormat : uint8_t {
 // work: a typed list needs offsets in ELEMENTS *and* a typed child, which is
 // two things, and `dict_child` is one slot already spoken for three ways
 // (dictionary values, RLE run-ends, VarBinary byte offsets). Adding a second
-// pointer field would grow BoltColumn, and BoltBatch embeds
-// columns[2][kMaxBatchColumns], so a pointer costs kilobytes per batch.
+// pointer field would grow BoltColumn, which every batch holds num_cols x 2 of.
 // Pointing `data` at a child ARRAY costs nothing: no existing format uses
 // `data` as anything but a value buffer, and `type_size_bytes == 0` already
 // marks a column as having no value buffer.
@@ -1129,22 +1128,9 @@ struct BoltColumn {
 // BoltBatch — double-buffered, COW, Venus tick-tock pattern
 // ============================================================================
 
-// Upper BOUND on a batch's column count — an assertion cap, NOT an allocation
-// size. G2FEAT-47: columns are now dynamically right-sized to `num_cols` via
-// `alloc_columns()`, so a wide bound costs nothing when unused. (Was 256 as a
-// fixed inline `columns[2][256]` that over-allocated ~151 KB per batch.)
-static constexpr uint32_t kMaxBatchColumns = 1024;
-
-// Column cap for the FIXED-INLINE auxiliary framing structs that predate the
-// dynamic-columns change and still embed `[N]` column arrays: the wire codec
-// (WireStream / serialize scratch), RowView, and the Parquet write column
-// table. Kept at the historical kMaxBatchColumns value (256) so those structs
-// stay compact — decoupling them from the in-memory batch bound (raised to
-// 1024) avoids ballooning them 4× and keeps WireStream inside its 16 KB budget.
-// Consequence (non-regressing): a batch wider than kMaxFixedColumns can live in
-// memory (right-sized) but cannot cross the wire / be Parquet-row-group-written
-// — the exact prior behaviour, since batches were capped at 256 before.
-static constexpr uint32_t kMaxFixedColumns = 256;
+// Upper bound on a batch's column count: the one bolt::kMaxColumns ceiling.
+// Columns are arena-allocated to `num_cols`, so the bound costs nothing.
+static constexpr uint32_t kMaxBatchColumns = kMaxColumns;
 
 struct alignas(64) BoltBatch {
     // Double-buffered columns — two tick-tock epochs, each a pointer to an
@@ -1247,7 +1233,12 @@ struct alignas(64) BoltBatch {
     static bool alloc_columns_impl(BoltBatch* b, Arena* arena, uint32_t n_cols,
                                    bool with_cow) noexcept {
         assert(b != nullptr);
-        assert(n_cols <= kMaxBatchColumns);
+        if (n_cols > kMaxBatchColumns) {   // caller-supplied width: release-enforced
+            b->num_cols = 0;
+            b->columns[0] = nullptr;
+            b->columns[1] = nullptr;
+            return false;
+        }
         b->arena       = arena;
         b->num_cols    = n_cols;
         b->dirty_mask  = nullptr;

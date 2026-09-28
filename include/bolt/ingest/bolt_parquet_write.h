@@ -107,9 +107,10 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
-#include "bolt/bolt_types.h"      // BoltType, kMaxBatchColumns
+#include "bolt/bolt_types.h"      // BoltType, kMaxColumns
 #include "bolt/bolt_column.h"     // BoltBatch / BoltColumn
 
 namespace bolt {
@@ -165,7 +166,7 @@ enum class PqWriteEncoding : std::uint8_t {
 // not a smaller one.
 //
 // Sizing note: column_kv lives inside ParquetWriteColumn, which is itself an
-// array member of ParquetWriteOpts (kMaxFixedColumns=256 slots) -- several
+// array member of ParquetWriteOpts (kPwInlineColumns slots) -- several
 // existing callers declare a whole ParquetWriteOpts as a plain stack local
 // (e.g. bolt/lakehouse/delta_writer.cpp), and macOS defaults a non-main
 // pthread to a 512 KiB stack. These caps are kept deliberately small (a few
@@ -291,12 +292,16 @@ struct ParquetSortingColumn {
 // at the API edge is the rule this writer otherwise holds to everywhere else.
 inline constexpr std::uint32_t kPwMaxSortingColumns = 16;
 
+// Column descriptors a ParquetWriteOpts holds inline: the small-schema fast
+// path that keeps the struct stack-sized. A wider schema passes its
+// descriptors through `wide_columns` (any width up to bolt::kMaxColumns).
+inline constexpr std::uint32_t kPwInlineColumns = 64;
+
 // Writer options. POD; copied into the writer at open.
 struct ParquetWriteOpts {
-    // G2FEAT-47: kMaxFixedColumns (256), decoupled from the raised in-memory
-    // kMaxBatchColumns; kPwMaxColumns (impl) matches. A batch wider than this
-    // cannot be Parquet-row-group-written — the exact prior 256-col behaviour.
-    ParquetWriteColumn columns[kMaxFixedColumns];
+    // n_columns <= kPwInlineColumns: descriptors here. Wider: set
+    // `wide_columns` instead (then this array is ignored).
+    ParquetWriteColumn columns[kPwInlineColumns];
     std::uint32_t      n_columns;
     std::uint32_t      row_group_target_bytes;   // capped at 64 MiB internally.
                                                  // NOTE: advisory only today —
@@ -432,7 +437,36 @@ struct ParquetWriteOpts {
     // (the zero-init default) writes no field 5 at all.
     ParquetFileKeyValue file_kv[kPwFileKvMaxPairs];
     std::uint32_t       n_file_kv;
+
+    // When non-null, all n_columns descriptors (up to bolt::kMaxColumns).
+    // Borrowed only for the parquet_write_open*() call: the writer copies
+    // them. nullptr (zero-init) = use the inline `columns` array.
+    const ParquetWriteColumn* wide_columns;
 };
+
+// Writable descriptor slots for `n` columns: the inline array when n fits,
+// else `wide` (caller storage of >= n entries, which must outlive the open
+// call), wired into o->wide_columns. Sets n_columns and zeroes the slots.
+// nullptr when n is 0 or past kMaxColumns, or wide is needed but null.
+inline ParquetWriteColumn* pw_opts_columns(ParquetWriteOpts* o, std::uint32_t n,
+                                           ParquetWriteColumn* wide) noexcept {
+    assert(o != nullptr);
+    if (n == 0u || n > kMaxColumns) return nullptr;
+    ParquetWriteColumn* slots = n <= kPwInlineColumns ? o->columns : wide;
+    if (slots == nullptr) return nullptr;
+    for (std::uint32_t i = 0; i < n; ++i) slots[i] = ParquetWriteColumn{};
+    o->wide_columns = (slots == wide) ? wide : nullptr;
+    o->n_columns = n;
+    return slots;
+}
+
+// Column `i` of `o`, whichever storage holds it.
+inline const ParquetWriteColumn& pw_opts_column(const ParquetWriteOpts& o,
+                                                std::uint32_t i) noexcept {
+    assert(i < o.n_columns);
+    assert(o.wide_columns != nullptr || i < kPwInlineColumns);
+    return o.wide_columns != nullptr ? o.wide_columns[i] : o.columns[i];
+}
 
 // Defaults referenced by the option comments above.
 inline constexpr std::uint32_t kPwDefaultPageBytes = 1u << 20;   // 1 MiB

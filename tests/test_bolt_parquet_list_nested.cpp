@@ -436,6 +436,9 @@ TEST(BoltParquetListNested, MaxRepPastCapRefusedDirectly) {
     // ately left null -- it is never dereferenced on this path.
     bolt::Arena a;
     PqMeta meta{};
+    PqColumn col0{};
+    meta.columns = &col0;
+    meta.columns_cap = 1;
     meta.n_columns = 1;
     meta.n_row_groups = 1;
     std::strcpy(meta.columns[0].name, "d");

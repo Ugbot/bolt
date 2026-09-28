@@ -7,6 +7,7 @@
 // Plus corrupt-input fuzzing: truncations and byte flips over the footer
 // region must return false, never crash (run under ASAN in CI).
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 
 #include <gtest/gtest.h>
@@ -42,10 +43,12 @@ std::string data_path(const char* name) {
 
 void parse_ok(const std::vector<uint8_t>& buf, PqMeta* m,
               std::vector<PqChunk>* chunks) {
-    chunks->resize(kPqMaxColumns * 64);
+    chunks->resize(64 * 64);
     std::memset(m, 0, sizeof(*m));
     m->chunks = chunks->data();
     m->chunks_cap = static_cast<uint32_t>(chunks->size());
+    m->columns = pq_test_columns();
+    m->columns_cap = kPqTestColumns;
     uint64_t off = 0;
     uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(buf.data(), buf.size(), &off, &len));
@@ -121,9 +124,11 @@ TEST(BoltParquetMeta, CorruptInputsNeverCrash) {
     const auto buf = slurp(data_path("golden_flat.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     PqMeta m{};
-    std::vector<PqChunk> chunks(kPqMaxColumns * 64);
+    std::vector<PqChunk> chunks(64 * 64);
     m.chunks = chunks.data();
     m.chunks_cap = static_cast<uint32_t>(chunks.size());
+    m.columns = pq_test_columns();
+    m.columns_cap = kPqTestColumns;
 
     uint64_t off = 0;
     uint32_t len = 0;

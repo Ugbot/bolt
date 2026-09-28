@@ -4,6 +4,7 @@
 // file-level fixture against a REAL pyarrow.parquet.read_metadata() (a
 // strictly stronger oracle than a hand-rolled thrift decoder).
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 
@@ -85,6 +86,8 @@ void parse_file(const char* path, PqMeta* m, std::vector<PqChunk>* chunks) {
     std::memset(m, 0, sizeof(*m));
     m->chunks = chunks->data();
     m->chunks_cap = static_cast<std::uint32_t>(chunks->size());
+    m->columns = pq_test_columns();
+    m->columns_cap = kPqTestColumns;
     std::uint64_t off = 0;
     std::uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(buf.data(), buf.size(), &off, &len));
@@ -193,6 +196,8 @@ TEST(BoltParquetWriteKvMetadata, MemSinkRoundTrips) {
     std::memset(&m, 0, sizeof(m));
     m.chunks = chunks.data();
     m.chunks_cap = static_cast<std::uint32_t>(chunks.size());
+    m.columns = pq_test_columns();
+    m.columns_cap = kPqTestColumns;
     std::uint64_t off = 0;
     std::uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(out, out_len, &off, &len));

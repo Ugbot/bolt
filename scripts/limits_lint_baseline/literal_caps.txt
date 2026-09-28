@@ -6,14 +6,11 @@ include/bolt/bolt_arrow.h::kMaxOwned
 include/bolt/bolt_branchless.h::kFilterInListMaxVals
 include/bolt/bolt_budget.h::kBudgetMaxDepth
 include/bolt/bolt_budget.h::kMemBudgetCapBytes
-include/bolt/bolt_column.h::kMaxBatchColumns
-include/bolt/bolt_column.h::kMaxFixedColumns
 include/bolt/bolt_column.h::kSketchCap
 include/bolt/bolt_disruptor.h::kDisruptorMaxConsumers
 include/bolt/bolt_ribbon.h::kMaxRetries
 include/bolt/bolt_tensor.h::kTensorMaxDims
 include/bolt/bolt_topology.h::kTopologyMaxCpus
-include/bolt/bolt_types.h::kMaxColumns
 include/bolt/bolt_types.h::kMaxFieldName
 include/bolt/bolt_variant_column.h::kVariantMaxVariants
 include/bolt/compute_idot.h::kIdotInt8QMax
@@ -29,8 +26,6 @@ include/bolt/crypto/sigv4.h::kSigV4MaxService
 include/bolt/crypto/sigv4.h::kSigV4MaxToken
 include/bolt/doc/bolt_jsonb.h::kMaxBytes
 include/bolt/doc/bolt_jsonb.h::kMaxDepth
-include/bolt/ingest/bolt_arrow_ipc.h::kIpcFbCap
-include/bolt/ingest/bolt_arrow_ipc.h::kIpcMaxCols
 include/bolt/ingest/bolt_arrow_ipc.h::kIpcMaxFields
 include/bolt/ingest/bolt_arrow_ipc.h::kIpcMaxNestDepth
 include/bolt/ingest/bolt_arrow_ipc.h::kIpcNameCap
@@ -42,7 +37,6 @@ include/bolt/ingest/bolt_parquet_bloom.h::kPqBloomMaxBytes
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxColKv
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxColKvKeyBytes
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxColKvValBytes
-include/bolt/ingest/bolt_parquet_meta.h::kPqMaxColumns
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxFileKv
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxFileKvKeyBytes
 include/bolt/ingest/bolt_parquet_meta.h::kPqMaxFileKvValBytes

@@ -2276,3 +2276,17 @@ add_test(NAME test_bolt_graph_algo_fuzz
                  --harness $<TARGET_FILE:graph_algo_fuzz_harness>
                  --seed 20260928 --cases 300)
 set_tests_properties(test_bolt_graph_algo_fuzz PROPERTIES SKIP_RETURN_CODE 2)
+
+# L6 (limits review): every column surface takes any width up to
+# bolt::kMaxColumns. scripts/l6_wide_columns_check.py adds the pyarrow oracle.
+add_executable(test_bolt_l6_wide_columns test_bolt_l6_wide_columns.cpp)
+target_link_libraries(test_bolt_l6_wide_columns
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_l6_wide_columns)
+add_test(NAME test_bolt_l6_wide_columns COMMAND test_bolt_l6_wide_columns)
+add_test(NAME test_bolt_l6_wide_columns_pyarrow
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/l6_wide_columns_check.py
+                 ${CMAKE_CURRENT_BINARY_DIR} $<TARGET_FILE:test_bolt_l6_wide_columns>)
+set_tests_properties(test_bolt_l6_wide_columns PROPERTIES FIXTURES_SETUP l6_wide_files)
+set_tests_properties(test_bolt_l6_wide_columns_pyarrow PROPERTIES
+    FIXTURES_REQUIRED l6_wide_files SKIP_RETURN_CODE 77)

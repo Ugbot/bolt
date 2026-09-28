@@ -25,6 +25,7 @@
 // Plus hostile-input fuzzing (truncations + byte flips over the index and
 // bloom slices) and synthetic-buffer unit tests for the helpers.
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_bloom.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_pageindex.h"
@@ -68,10 +69,12 @@ struct ParsedFile {
 void parse_file(const char* name, ParsedFile* pf) {
     pf->buf = slurp(data_path(name).c_str());
     ASSERT_FALSE(pf->buf.empty()) << name;
-    pf->chunks.resize(kPqMaxColumns * 64);
+    pf->chunks.resize(64 * 64);
     std::memset(&pf->meta, 0, sizeof(pf->meta));
     pf->meta.chunks = pf->chunks.data();
     pf->meta.chunks_cap = static_cast<uint32_t>(pf->chunks.size());
+    pf->meta.columns = pq_test_columns();
+    pf->meta.columns_cap = kPqTestColumns;
     uint64_t off = 0;
     uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(pf->buf.data(), pf->buf.size(), &off, &len));

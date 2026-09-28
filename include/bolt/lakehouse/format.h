@@ -42,7 +42,7 @@ enum class PredicateOp : uint8_t {
 static constexpr uint32_t kLakeMaxColName  = 64u;
 static constexpr uint32_t kLakeMaxValBytes = 64u;
 static constexpr uint32_t kLakeMaxPredicates = 16u;
-// Matches bolt::ingest::parquet::kPqMaxColumns (bolt_parquet_meta.h) — the
+// Width of the column_prune_plan helper's fixed arrays — the
 // source-schema width a lakehouse scan must be able to project/prune,
 // coherently with what the Parquet reader beneath it can decode. Raised
 // from 64 for G2FEAT-47-class real-data widths (ClickBench `hits` is a

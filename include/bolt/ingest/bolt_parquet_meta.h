@@ -26,6 +26,7 @@
 #include <cstring>
 
 #include "bolt/bolt_port.h"
+#include "bolt/bolt_types.h"   // kMaxColumns
 
 namespace bolt {
 namespace ingest {
@@ -127,12 +128,6 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept;
 
 // ---- parquet metadata subset ----------------------------------------------
 
-inline constexpr uint32_t kPqMaxColumns   = 128;   // flat leaf columns
-                                                    // (bumped 64->128 for
-                                                    // ClickBench's 105-col
-                                                    // `hits` table; PqMeta
-                                                    // stays arena-only, see
-                                                    // bolt_parquet_read.cpp)
 inline constexpr uint32_t kPqMaxRowGroups = 4096;
 inline constexpr uint32_t kPqMaxNameBytes = 64;
 inline constexpr uint32_t kPqMaxStatBytes = 64;    // min/max value bytes kept
@@ -382,12 +377,18 @@ struct PqMeta {
     uint32_t    n_row_groups;
     uint32_t    n_chunks;             // n_row_groups * n_columns
     int32_t     version;
-    PqColumn    columns[kPqMaxColumns];
+    // Leaf columns and column chunks live OUT-OF-LINE, sized to the file:
+    // the caller supplies both arrays (parquet_read_meta does it from an
+    // arena). A file with more of either than the capacity given fails the
+    // parse with need_columns / need_chunks set to what it needs, so the
+    // caller can retry at the exact size. Any width up to bolt::kMaxColumns.
+    PqColumn*   columns;
+    uint32_t    columns_cap;
+    uint32_t    need_columns;         // set on a capacity failure, else 0
     PqRowGroup  row_groups[kPqMaxRowGroups];
-    // chunks live OUT-OF-LINE (kPqMaxRowGroups * kPqMaxColumns PqChunk
-    // would be ~100 MB inline): the caller supplies the array.
     PqChunk*    chunks;
     uint32_t    chunks_cap;
+    uint32_t    need_chunks;          // set on a capacity failure, else 0
     // FileMetaData field 5 (G2PQ-23). n_file_kv = 0 when absent or when
     // every pair present overflowed the cap (see kPqMaxFileKv* above).
     PqFileKeyValue file_kv[kPqMaxFileKv];
@@ -400,10 +401,11 @@ struct PqMeta {
 bool pq_locate_footer(const uint8_t* buf, uint64_t len,
                       uint64_t* meta_off, uint32_t* meta_len) noexcept;
 
-// Parse FileMetaData (the located slice) into *out. `out->chunks` /
-// `chunks_cap` must be set by the caller beforehand. Returns false on any
-// corrupt/unsupported shape (nested schema, too many columns/row groups,
-// chunk overflow) — never UB on hostile input.
+// Parse FileMetaData (the located slice) into *out. `out->columns` /
+// `columns_cap` and `out->chunks` / `chunks_cap` must be set by the caller
+// beforehand. Returns false on any corrupt/unsupported shape — never UB on
+// hostile input. A false return with need_columns > columns_cap or
+// need_chunks > chunks_cap means only that the arrays were too small.
 bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         PqMeta* out) noexcept;
 

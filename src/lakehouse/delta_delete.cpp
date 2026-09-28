@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_branchless.h"
@@ -447,20 +448,25 @@ bool pick_new_rel_path(TableHandle* th, uint64_t seq, char* out_rel,
     return false;
 }
 
+// A schema wider than the inline descriptor array uses `wide` as its
+// storage, so `wide` must outlive the writer open.
 bool build_write_opts(const BoltSchema* schema, uint32_t n_cols,
-                      Compression compression, pq::ParquetWriteOpts* opts) noexcept {
+                      Compression compression, pq::ParquetWriteOpts* opts,
+                      std::vector<pq::ParquetWriteColumn>* wide) noexcept {
     assert(schema != nullptr && opts != nullptr);
-    assert(n_cols <= bolt::kMaxFixedColumns);
-    std::memset(opts, 0, sizeof(*opts));
-    opts->n_columns = n_cols;
+    assert(wide != nullptr);
+    *opts = pq::ParquetWriteOpts{};
+    if (n_cols > pq::kPwInlineColumns) wide->resize(n_cols);
+    pq::ParquetWriteColumn* cols = pq::pw_opts_columns(opts, n_cols, wide->data());
+    if (cols == nullptr) return false;
     opts->row_group_target_bytes = 1u << 20;
     opts->compression = parquet_codec_byte(compression);
     opts->emit_statistics = false;  // Delta-log stats built separately below.
     for (uint32_t c = 0; c < n_cols; ++c) {
         const BoltField& f = schema->field(static_cast<int>(c));
-        str_copy_cstr(opts->columns[c].name, sizeof(opts->columns[c].name), f.name);
-        opts->columns[c].type = f.type;
-        opts->columns[c].nullable = f.nullable;
+        str_copy_cstr(cols[c].name, sizeof(cols[c].name), f.name);
+        cols[c].type = f.type;
+        cols[c].nullable = f.nullable;
     }
     return true;
 }
@@ -486,7 +492,9 @@ bool write_rewritten_file(TableHandle* th, const pq::PqMeta* meta,
     ensure_parent_dir(abs_path);
 
     pq::ParquetWriteOpts wopts{};
-    if (!build_write_opts(wschema, meta->n_columns, Compression::kSnappy, &wopts))
+    std::vector<pq::ParquetWriteColumn> wide;
+    if (!build_write_opts(wschema, meta->n_columns, Compression::kSnappy, &wopts,
+                          &wide))
         return false;
     pq::ParquetWriter* w = pq::parquet_write_open(abs_path, &wopts);
     if (w == nullptr) return false;
@@ -580,7 +588,11 @@ bool delta_table_delete(TableHandle* th, const Predicate* pred) noexcept {
         const uint8_t* fbody = nullptr;
         uint64_t flen = 0;
         if (os_get(&th->os, key, &file_arena, &fbody, &flen) != kOsOk) return false;
-        pq::PqMeta meta{};
+        // PqMeta carries its row-group table inline (~0.7 MiB): never a stack local.
+        pq::PqMeta* meta_p = file_arena.allocate_array<pq::PqMeta>(1);
+        if (meta_p == nullptr) return false;
+        std::memset(meta_p, 0, sizeof(*meta_p));
+        pq::PqMeta& meta = *meta_p;
         if (!pq::parquet_read_meta(fbody, flen, &file_arena, &meta)) return false;
         const int32_t pred_col = find_col(&meta, pred->column);
         if (pred_col < 0) continue;  // column absent here -> cannot match

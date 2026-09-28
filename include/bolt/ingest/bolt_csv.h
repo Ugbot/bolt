@@ -17,14 +17,18 @@
 namespace bolt {
 namespace ingest {
 
-inline constexpr uint32_t kCsvMaxCols = kMaxBatchColumns;
+// Columns a CSV schema may declare: the one bolt::kMaxColumns ceiling.
+inline constexpr uint32_t kCsvMaxCols = kMaxColumns;
+// Columns CsvSchema holds inline (the small-schema fast path that keeps the
+// struct stack-sized). A wider schema passes `wide_types` / `wide_scales`.
+inline constexpr uint32_t kCsvInlineCols = 1024;
 
 struct CsvSchema {
-    BoltType col_types[kCsvMaxCols];
+    BoltType col_types[kCsvInlineCols];
     // Per-column scale. Only meaningful for Decimal128 columns: the parser
     // multiplies parsed values up to (or truncates down to) this scale.
     // Range: [0..38]. Ignored for all other types. Zero-init friendly.
-    uint8_t  col_scales[kCsvMaxCols];
+    uint8_t  col_scales[kCsvInlineCols];
     uint32_t num_cols;
     char     delimiter;   // typically ';' or ','
     bool     has_header;  // skip first line if true
@@ -32,7 +36,25 @@ struct CsvSchema {
     // declared scale cause parse_csv to fail. If false (default), extra
     // fractional digits are silently truncated (DuckDB CSV default).
     bool     strict_decimal_scale;
+    // When non-null, all num_cols types (and scales; wide_scales may be null
+    // when no column is decimal), replacing the inline arrays. Borrowed for
+    // the parse call.
+    const BoltType* wide_types;
+    const uint8_t*  wide_scales;
 };
+
+inline BoltType csv_type(const CsvSchema& s, uint32_t c) noexcept {
+    return s.wide_types != nullptr ? s.wide_types[c] : s.col_types[c];
+}
+inline uint8_t csv_scale(const CsvSchema& s, uint32_t c) noexcept {
+    if (s.wide_types != nullptr) return s.wide_scales != nullptr ? s.wide_scales[c] : 0;
+    return s.col_scales[c];
+}
+// A schema is usable when its width fits the storage it names.
+inline bool csv_schema_width_ok(const CsvSchema& s) noexcept {
+    if (s.num_cols == 0 || s.num_cols > kCsvMaxCols) return false;
+    return s.wide_types != nullptr || s.num_cols <= kCsvInlineCols;
+}
 
 // Parse a contiguous CSV buffer into columns. The buffer is owned by the
 // caller; column data is allocated from `arena`. Returns false on:

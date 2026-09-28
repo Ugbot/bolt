@@ -160,7 +160,7 @@ TEST(BoltParquetRead, RowGroupGranularRead) {
     // verify the rows land with group-local offsets.
     int64_t first = 0;
     for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
-        bolt::BoltColumn cols[kPqMaxColumns];
+        bolt::BoltColumn cols[256];
         int64_t rows = 0;
         ASSERT_TRUE(parquet_read_row_group(buf.data(), buf.size(), meta, g,
                                            &arena, cols, &rows));
@@ -170,7 +170,7 @@ TEST(BoltParquetRead, RowGroupGranularRead) {
     }
     ASSERT_EQ(first, 1000);
     // Out-of-range group is rejected.
-    bolt::BoltColumn cols[kPqMaxColumns];
+    bolt::BoltColumn cols[256];
     int64_t rows = 0;
     EXPECT_FALSE(parquet_read_row_group(buf.data(), buf.size(), meta,
                                         meta->n_row_groups, &arena, cols,
@@ -192,7 +192,7 @@ TEST(BoltParquetRead, RowGroupProjectedRead) {
     ASSERT_EQ(meta->n_columns, 5u);
     for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
         // Reference: full decode.
-        bolt::BoltColumn full[kPqMaxColumns];
+        bolt::BoltColumn full[256];
         int64_t full_rows = 0;
         ASSERT_TRUE(parquet_read_row_group(buf.data(), buf.size(), meta, g,
                                            &arena, full, &full_rows));

@@ -14,7 +14,9 @@
 #include "bolt/ingest/bolt_arrow_ipc.h"
 
 #include <cassert>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "bolt/bolt_arrow.h"     // bolt::arrow::detail::var_at — the ONE
@@ -61,7 +63,7 @@ constexpr std::uint32_t kContinuation  = 0xFFFFFFFFu;
 constexpr std::uint16_t kFbMaxSlots = 8;
 
 struct Fb {
-    std::uint8_t* buf;        // capacity kIpcFbCap, filled from the end
+    std::uint8_t* buf;        // capacity `cap`, filled from the end
     std::uint32_t cap;
     std::uint32_t used;       // bytes written, measured from the end
     std::uint32_t minalign;
@@ -308,13 +310,13 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
 // default (top-level "cN"; a List's sole child "item"; a Struct's Kth
 // child "fK").
 bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
-                    std::uint16_t n_cols,
-                    char name_buf[kIpcMaxFields][kIpcNameCap]) noexcept {
+                    std::uint16_t n_cols, char (*name_buf)[kIpcNameCap],
+                    const FieldSpec** src, std::uint16_t* depth,
+                    std::uint32_t n_total) noexcept {
     assert(w != nullptr && top != nullptr && name_buf != nullptr);
+    assert(src != nullptr && depth != nullptr);
     if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
 
-    const FieldSpec* src[kIpcMaxFields];
-    std::uint16_t depth[kIpcMaxFields];
     w->n_desc = n_cols;
     for (std::uint16_t i = 0; i < n_cols; ++i) {
         src[i] = &top[i];
@@ -334,7 +336,7 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         if (is_list) {
             if (s->n_children != 1 || s->children == nullptr) return false;
         } else if (is_struct) {
-            if (s->n_children == 0 || s->n_children > kIpcMaxCols ||
+            if (s->n_children == 0 || s->n_children > kIpcMaxStructChildren ||
                 s->children == nullptr) {
                 return false;
             }
@@ -357,9 +359,8 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         if (static_cast<std::uint32_t>(depth[i]) + 1 > kIpcMaxNestDepth) {
             return false;
         }
-        if (static_cast<std::uint32_t>(w->n_desc) + s->n_children >
-                kIpcMaxFields) {
-            return false;
+        if (static_cast<std::uint32_t>(w->n_desc) + s->n_children > n_total) {
+            return false;   // count_fields() and this walk disagree
         }
         fd.first_child = w->n_desc;
         for (std::uint16_t k = 0; k < s->n_children; ++k) {
@@ -390,9 +391,9 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
 // position. Returns false (fail closed) on flatbuffer overflow or an
 // unsupported type.
 bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
-                      const char name_buf[kIpcMaxFields][kIpcNameCap],
+                      const char (*name_buf)[kIpcNameCap],
                       std::uint32_t empty_children,
-                      std::uint32_t field_pos[kIpcMaxFields]) noexcept {
+                      std::uint32_t* field_pos) noexcept {
     assert(b != nullptr && w != nullptr);
     for (std::uint16_t ii = 0; ii < w->n_desc; ++ii) {
         const std::uint16_t i =
@@ -400,8 +401,8 @@ bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
         const IpcFieldDesc& fd = w->desc[i];
         std::uint32_t children_vec = empty_children;
         if (fd.n_children > 0) {
-            if (fd.n_children > kIpcMaxCols) return false;  // defensive
-            std::uint32_t kids[kIpcMaxCols];
+            if (fd.n_children > kIpcMaxStructChildren) return false;  // defensive
+            std::uint32_t kids[kIpcMaxStructChildren];
             for (std::uint16_t k = 0; k < fd.n_children; ++k) {
                 kids[k] = field_pos[fd.first_child + k];
                 if (kids[k] == 0) return false;
@@ -573,15 +574,17 @@ bool write_bool_bits(std::FILE* f, const BoltColumn& col,
     return true;
 }
 
+// Per-batch layout over the writer's schema-sized arrays (w->nodes,
+// w->buffers, w->varlen_total: 2, 6 and 1 entries per field).
 struct BatchLayout {
-    std::int64_t nodes[kIpcMaxFields * 2];        // (length, null_count), preorder
-    std::int64_t buffers[kIpcMaxFields * 3 * 2];  // (offset, length), preorder
+    std::int64_t* nodes;          // (length, null_count), preorder
+    std::int64_t* buffers;        // (offset, length), preorder
     std::uint32_t n_nodes;
     std::uint32_t n_buffers;
-    std::int64_t  varlen_total[kIpcMaxFields];    // Utf8/Binary leaf packed-byte
-                                                   // total, indexed by the SAME
-                                                   // preorder position n_nodes
-                                                   // assigned that leaf.
+    std::uint32_t max_nodes;      // == w->n_desc
+    std::int64_t* varlen_total;   // Utf8/Binary leaf packed-byte total, indexed
+                                  // by the SAME preorder position n_nodes
+                                  // assigned that leaf.
     std::int64_t  body_len;
 };
 
@@ -612,7 +615,7 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     if (n < 0 || col.length < n) return false;
     const IpcFieldDesc& fd = w->desc[desc_idx];
     if (static_cast<std::uint16_t>(col.type) != fd.type) return false;
-    if (L->n_nodes >= kIpcMaxFields) return false;
+    if (L->n_nodes >= L->max_nodes) return false;
 
     const std::int64_t nulls = count_nulls(col.validity, n);
     const std::uint32_t node_idx = L->n_nodes++;
@@ -620,7 +623,7 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     L->nodes[node_idx * 2 + 1] = nulls;
 
     auto add_buf = [&](std::int64_t len) noexcept -> bool {
-        if (L->n_buffers >= kIpcMaxFields * 3) return false;
+        if (L->n_buffers >= L->max_nodes * 3u) return false;
         L->buffers[L->n_buffers * 2]     = L->body_len;
         L->buffers[L->n_buffers * 2 + 1] = len;
         L->n_buffers++;
@@ -779,6 +782,53 @@ bool write_batch_body(const ArrowIpcWriter* w, const BoltBatch* batch,
     return true;
 }
 
+// Total fields of `n` specs and all their descendants, or 0 when the tree
+// is deeper than kIpcMaxNestDepth or wider than kIpcMaxFields. Shape errors
+// (child counts, types) are flatten_fields' job; this only sizes.
+std::uint32_t count_fields(const FieldSpec* specs, std::uint32_t n,
+                           std::uint32_t depth) noexcept {
+    assert(specs != nullptr || n == 0);
+    if (depth > kIpcMaxNestDepth) return 0;
+    std::uint32_t total = n;
+    for (std::uint32_t i = 0; i < n; ++i) {                // bounded: n <= kIpcMaxCols
+        const FieldSpec& s = specs[i];
+        if (s.n_children == 0 || s.children == nullptr) continue;
+        const std::uint32_t sub = count_fields(s.children, s.n_children, depth + 1);
+        if (sub == 0) return 0;
+        total += sub;
+        if (total > kIpcMaxFields) return 0;
+    }
+    return total;
+}
+
+// Flatbuffer bytes one field costs, generously: its Field table + vtable,
+// type table, name string, children vector entry, and (per batch) its node
+// and three buffer structs. Overflow is detected by the builder and fails
+// the call, so this only has to be an upper bound for real schemas.
+constexpr std::uint32_t kIpcFbBytesPerField = 256u + kIpcNameCap;
+constexpr std::uint32_t kIpcFbBaseBytes     = 4096u;
+
+void release_scratch(ArrowIpcWriter* w) noexcept {
+    assert(w != nullptr);
+    std::free(w->mem);
+    w->mem = nullptr;
+    w->desc = nullptr;
+    w->nodes = nullptr;
+    w->buffers = nullptr;
+    w->varlen_total = nullptr;
+    w->fb = nullptr;
+    w->fb_cap = 0;
+}
+
+template <typename T>
+T* carve(std::uint8_t** cursor, std::size_t n) noexcept {
+    std::size_t p = reinterpret_cast<std::uintptr_t>(*cursor);
+    p = (p + alignof(std::max_align_t) - 1) & ~(alignof(std::max_align_t) - 1);
+    T* out = reinterpret_cast<T*>(p);
+    *cursor = reinterpret_cast<std::uint8_t*>(p + n * sizeof(T));
+    return out;
+}
+
 }  // namespace
 
 // ---- public API ----------------------------------------------------------
@@ -789,17 +839,43 @@ bool arrow_ipc_open_nested(ArrowIpcWriter* w, std::FILE* f,
     assert(w != nullptr);
     if (f == nullptr || fields == nullptr) return false;
     if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
+    release_scratch(w);                       // a previous stream never closed
     std::memset(w, 0, sizeof(*w));
     w->f = f;
     w->n_cols = n_cols;
 
-    // Transient — used only during this call, never retained on `w`.
-    // ~16 KB: bounded, and this runs once per stream open, never per-row.
-    char name_buf[kIpcMaxFields][kIpcNameCap];
-    if (!flatten_fields(w, fields, n_cols, name_buf)) return false;
+    const std::uint32_t n_total = count_fields(fields, n_cols, 0);
+    if (n_total == 0) return false;
+    // One allocation for the stream: retained arrays (desc, per-batch layout,
+    // fb) then open-only ones (names, walk stacks, field positions).
+    const std::size_t fb_cap = kIpcFbBaseBytes +
+        static_cast<std::size_t>(n_total) * kIpcFbBytesPerField;
+    const std::size_t bytes = 16 * alignof(std::max_align_t) +
+        n_total * (sizeof(IpcFieldDesc) + 9 * sizeof(std::int64_t) +
+                   kIpcNameCap + sizeof(const FieldSpec*) +
+                   sizeof(std::uint16_t) + sizeof(std::uint32_t)) + fb_cap;
+    w->mem = std::malloc(bytes);
+    if (w->mem == nullptr) return false;
+    std::uint8_t* cur = static_cast<std::uint8_t*>(w->mem);
+    w->desc = carve<IpcFieldDesc>(&cur, n_total);
+    w->nodes = carve<std::int64_t>(&cur, 2u * n_total);
+    w->buffers = carve<std::int64_t>(&cur, 6u * n_total);
+    w->varlen_total = carve<std::int64_t>(&cur, n_total);
+    w->fb = carve<std::uint8_t>(&cur, fb_cap);
+    w->fb_cap = static_cast<std::uint32_t>(fb_cap);
+    char (*name_buf)[kIpcNameCap] = carve<char[kIpcNameCap]>(&cur, n_total);
+    const FieldSpec** src = carve<const FieldSpec*>(&cur, n_total);
+    std::uint16_t* depth = carve<std::uint16_t>(&cur, n_total);
+    std::uint32_t* field_pos = carve<std::uint32_t>(&cur, n_total);
+    assert(cur <= static_cast<std::uint8_t*>(w->mem) + bytes);
+
+    if (!flatten_fields(w, fields, n_cols, name_buf, src, depth, n_total)) {
+        release_scratch(w);
+        return false;
+    }
 
     Fb b{};
-    fb_init(&b, w->fb, kIpcFbCap);
+    fb_init(&b, w->fb, w->fb_cap);
     // One shared empty children vector (pyarrow wants children present
     // even for a leaf field).
     const std::uint32_t zero = 0;
@@ -807,8 +883,8 @@ bool arrow_ipc_open_nested(ArrowIpcWriter* w, std::FILE* f,
     fb_push(&b, &zero, 4);
     const std::uint32_t empty_children = b.used;
 
-    std::uint32_t field_pos[kIpcMaxFields];
     if (!build_all_fields(&b, w, name_buf, empty_children, field_pos)) {
+        release_scratch(w);
         return false;
     }
 
@@ -818,8 +894,10 @@ bool arrow_ipc_open_nested(ArrowIpcWriter* w, std::FILE* f,
     const std::uint32_t schema_pos = fb_end_table(&b);
     const std::uint32_t size = build_message(&b, kHeaderSchema,
                                              schema_pos, 0);
-    if (size == 0) return false;
-    if (!write_framed(f, w->fb + (kIpcFbCap - size), size)) return false;
+    if (size == 0 || !write_framed(f, w->fb + (w->fb_cap - size), size)) {
+        release_scratch(w);
+        return false;
+    }
     w->open = 1;
     return true;
 }
@@ -843,7 +921,9 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
             return false;
         }
     }
-    FieldSpec specs[kIpcMaxCols];
+    FieldSpec* specs = static_cast<FieldSpec*>(
+        std::malloc(sizeof(FieldSpec) * n_cols));
+    if (specs == nullptr) return false;
     for (std::uint16_t c = 0; c < n_cols; ++c) {
         specs[c].type = types[c];
         specs[c].name = (names != nullptr) ? names[c] : nullptr;
@@ -852,7 +932,9 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
         specs[c].n_children = 0;
         specs[c].children = nullptr;
     }
-    return arrow_ipc_open_nested(w, f, specs, n_cols);
+    const bool ok = arrow_ipc_open_nested(w, f, specs, n_cols);
+    std::free(specs);
+    return ok;
 }
 
 bool arrow_ipc_write_batch(ArrowIpcWriter* w,
@@ -865,13 +947,15 @@ bool arrow_ipc_write_batch(ArrowIpcWriter* w,
         return false;
     }
 
-    // ~18.5 KB: bounded, well under any thread's stack budget (matches
-    // the original ~4.6 KB local's own reasoning at kIpcMaxCols scale).
     BatchLayout L{};
+    L.nodes = w->nodes;
+    L.buffers = w->buffers;
+    L.varlen_total = w->varlen_total;
+    L.max_nodes = w->n_desc;
     if (!layout_batch(w, batch, &L)) { w->failed = 1; return false; }
 
     Fb b{};
-    fb_init(&b, w->fb, kIpcFbCap);
+    fb_init(&b, w->fb, w->fb_cap);
     const std::uint32_t bufs_vec =
         fb_struct16_vector(&b, L.buffers, L.n_buffers);
     const std::uint32_t nodes_vec =
@@ -887,7 +971,7 @@ bool arrow_ipc_write_batch(ArrowIpcWriter* w,
                                              L.body_len);
     if (size == 0) { w->failed = 1; return false; }
 
-    if (!write_framed(w->f, w->fb + (kIpcFbCap - size), size) ||
+    if (!write_framed(w->f, w->fb + (w->fb_cap - size), size) ||
         !write_batch_body(w, batch, &L)) {
         w->failed = 1;
         return false;
@@ -899,6 +983,7 @@ bool arrow_ipc_close(ArrowIpcWriter* w) noexcept {
     assert(w != nullptr);
     const bool was_ok = (w->open == 1 && w->failed == 0);
     w->open = 0;
+    release_scratch(w);
     if (!was_ok) return false;
     const std::uint32_t zero = 0;
     if (std::fwrite(&kContinuation, 4, 1, w->f) != 1) return false;

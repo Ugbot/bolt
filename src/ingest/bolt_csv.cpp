@@ -357,7 +357,7 @@ static bool alloc_columns(const CsvSchema& schema, int64_t row_count,
     assert(out != nullptr);
 
     for (uint32_t c = 0; c < schema.num_cols; ++c) {
-        const BoltType t = schema.col_types[c];
+        const BoltType t = csv_type(schema, c);
         if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8 &&
             t != BoltType::Date32 && t != BoltType::Decimal128 &&
             t != BoltType::Decimal64) {
@@ -395,7 +395,7 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
     size_t flen = static_cast<size_t>(f_end - f_start);
     if (flen > 0 && f_start[flen - 1] == '\r') flen -= 1;  // CRLF strip
 
-    const BoltType t = schema.col_types[c];
+    const BoltType t = csv_type(schema, c);
     if (t == BoltType::Int32) {
         int32_t v = field_to_int32(f_start, static_cast<int>(flen));
         static_cast<int32_t*>(cols[c].data)[row] = v;
@@ -409,7 +409,7 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
     } else if (t == BoltType::Decimal128) {
         Decimal128 v{0, 0};
         if (!field_to_decimal128(f_start, flen,
-                                 schema.col_scales[c],
+                                 csv_scale(schema, c),
                                  schema.strict_decimal_scale, &v)) {
             return false;
         }
@@ -422,7 +422,7 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
         // the parse — same strictness contract as Date32 above.
         Decimal128 v{0, 0};
         if (!field_to_decimal128(f_start, flen,
-                                 schema.col_scales[c],
+                                 csv_scale(schema, c),
                                  schema.strict_decimal_scale, &v)) {
             return false;
         }
@@ -490,7 +490,7 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
     assert(arena != nullptr);
     assert(out_batch != nullptr);
 
-    if (schema.num_cols == 0 || schema.num_cols > kCsvMaxCols) return false;
+    if (!csv_schema_width_ok(schema)) return false;
     if (schema.delimiter == '\n' || schema.delimiter == '\r') return false;
 
     const int64_t row_count = compute_row_count(buf, buf_len, schema.has_header);
@@ -510,7 +510,7 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
     size_t overflow_cursor = 0;
     bool any_utf8 = false;
     for (uint32_t c = 0; c < schema.num_cols; ++c) {
-        if (schema.col_types[c] == BoltType::Utf8) { any_utf8 = true; break; }
+        if (csv_type(schema, c) == BoltType::Utf8) { any_utf8 = true; break; }
     }
     if (any_utf8 && buf_len > 0 && row_count > 0) {
         overflow_cap = buf_len;
@@ -520,7 +520,7 @@ bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
         // can resolve >12-char (spilled) StringViews (sv_bytes/sv_compare/
         // sv_like). buf_idx is always 0 here (single overflow buffer).
         for (uint32_t c = 0; c < schema.num_cols; ++c) {
-            if (schema.col_types[c] == BoltType::Utf8) {
+            if (csv_type(schema, c) == BoltType::Utf8) {
                 cols[c].str_overflow_base = overflow_buf;
             }
         }
@@ -634,7 +634,7 @@ bool parse_csv_parallel(const char* BOLT_RESTRICT buf, size_t buf_len,
     if (sched == nullptr || buf_len < 4 * kCsvParChunkBytes) {
         return parse_csv(buf, buf_len, schema, arena, out_batch);
     }
-    if (schema.num_cols == 0 || schema.num_cols > kCsvMaxCols) return false;
+    if (!csv_schema_width_ok(schema)) return false;
     if (schema.delimiter == '\n' || schema.delimiter == '\r') return false;
 
     // Data section starts after the optional header line.
@@ -718,14 +718,14 @@ bool parse_csv_parallel(const char* BOLT_RESTRICT buf, size_t buf_len,
 
     bool any_utf8 = false;
     for (uint32_t c = 0; c < schema.num_cols; ++c) {
-        if (schema.col_types[c] == BoltType::Utf8) { any_utf8 = true; break; }
+        if (csv_type(schema, c) == BoltType::Utf8) { any_utf8 = true; break; }
     }
     char* overflow_buf = nullptr;
     if (any_utf8 && row_count > 0) {
         overflow_buf = static_cast<char*>(arena->allocate(data_len, 1));
         if (overflow_buf == nullptr) return false;
         for (uint32_t c = 0; c < schema.num_cols; ++c) {
-            if (schema.col_types[c] == BoltType::Utf8) {
+            if (csv_type(schema, c) == BoltType::Utf8) {
                 cols[c].str_overflow_base = overflow_buf;
             }
         }
