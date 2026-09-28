@@ -59,20 +59,35 @@ inline double promql_quantile(double* BOLT_RESTRICT vals, int64_t n,
     return vals[lo] * (1.0 - weight) + vals[hi] * weight;
 }
 
-// Population variance (Welford / Prometheus stdvarOverTime). NaN poisons.
+// Prometheus kahanSumInc: Neumaier-compensated sum + inc.
+inline void promql_kahan_inc(double inc, double* sum, double* c) noexcept {
+    assert(sum != nullptr && c != nullptr);
+    const double t = *sum + inc;
+    if (std::isinf(t)) {
+        *c = 0.0;
+    } else if (std::fabs(*sum) >= std::fabs(inc)) {
+        *c += (*sum - t) + inc;
+    } else {
+        *c += (inc - t) + *sum;
+    }
+    *sum = t;
+}
+
+// Population variance exactly as Prometheus varianceOverTime: Welford with
+// Kahan-compensated mean and M2. NaN poisons.
 inline double promql_stdvar(const double* BOLT_RESTRICT vals, int64_t n) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
     if (n <= 0) return promql_no_sample();
-    double mean = 0.0, m2 = 0.0;
+    double mean = 0.0, c_mean = 0.0, aux = 0.0, c_aux = 0.0;
     for (int64_t i = 0; i < n; ++i) {
         const double v = vals[i];
         const double count = static_cast<double>(i + 1);
-        const double delta = v - mean;
-        mean += delta / count;
-        m2 += delta * (v - mean);
+        const double delta = v - (mean + c_mean);
+        promql_kahan_inc(delta / count, &mean, &c_mean);
+        promql_kahan_inc(delta * (v - (mean + c_mean)), &aux, &c_aux);
     }
-    return m2 / static_cast<double>(n);
+    return (aux + c_aux) / static_cast<double>(n);
 }
 
 inline double promql_stddev(const double* BOLT_RESTRICT vals, int64_t n) noexcept {

@@ -239,3 +239,49 @@ TEST(BoltFloatChars, OracleParse) {
     }
 }
 #endif
+
+namespace {
+std::string fixed(double v) {
+    char buf[400];
+    const uint32_t n = fc::f64_to_chars_fixed(buf, sizeof(buf), v);
+    EXPECT_GT(n, 0u);
+    return std::string(buf, n);
+}
+}  // namespace
+
+// Expected strings are Go's strconv.FormatFloat(v, 'f', -1, 64).
+TEST(FloatCharsFixed, MatchesGoFormatFloatF) {
+    EXPECT_EQ(fixed(219.28128227751534), "219.28128227751534");
+    EXPECT_EQ(fixed(0.1), "0.1");
+    EXPECT_EQ(fixed(1.0), "1");
+    EXPECT_EQ(fixed(-0.0), "-0");
+    EXPECT_EQ(fixed(0.0), "0");
+    EXPECT_EQ(fixed(1e21), "1000000000000000000000");
+    EXPECT_EQ(fixed(1.2345678901234568e20), "123456789012345680000");
+    EXPECT_EQ(fixed(1e-7), "0.0000001");
+    EXPECT_EQ(fixed(-2.5e-3), "-0.0025");
+    EXPECT_EQ(fixed(1700000000.5), "1700000000.5");
+    EXPECT_EQ(fixed(std::nan("")), "NaN");
+    EXPECT_EQ(fixed(std::numeric_limits<double>::infinity()), "+Inf");
+    EXPECT_EQ(fixed(-std::numeric_limits<double>::infinity()), "-Inf");
+    const std::string tiny = fixed(5e-324);
+    EXPECT_EQ(tiny.size(), 2u + 323u + 1u);
+    EXPECT_EQ(tiny.substr(0, 3), "0.0");
+    EXPECT_EQ(tiny.back(), '5');
+    const std::string huge = fixed(std::numeric_limits<double>::max());
+    EXPECT_EQ(huge.size(), 309u);
+    EXPECT_EQ(huge.substr(0, 17), "17976931348623157");
+}
+
+TEST(FloatCharsFixed, RoundTripsAndRefusesSmallCap) {
+    std::mt19937_64 rng(319);
+    for (int i = 0; i < 20000; ++i) {
+        const double d = from_bits(rng());
+        if (!std::isfinite(d)) continue;
+        const std::string s = fixed(d);
+        EXPECT_EQ(s.find('e'), std::string::npos);
+        EXPECT_EQ(std::strtod(s.c_str(), nullptr), d) << s;
+    }
+    char small[4];
+    EXPECT_EQ(fc::f64_to_chars_fixed(small, sizeof(small), 12345.0), 0u);
+}
