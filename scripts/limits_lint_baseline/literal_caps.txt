@@ -94,7 +94,6 @@ include/bolt/kernels/bolt_fst.h::kFstMaxKeyLen
 include/bolt/kernels/bolt_json_path.h::kMaxKeyLen
 include/bolt/kernels/bolt_json_path.h::kMaxPathSegs
 include/bolt/kernels/bolt_json_path.h::kMaxSkipDepth
-include/bolt/kernels/bolt_kmeans.h::kKmeansMaxDim
 include/bolt/kernels/bolt_kmeans.h::kKmeansMaxK
 include/bolt/kernels/bolt_kmerge.h::kKMergeMaxInputs
 include/bolt/kernels/bolt_parallel.h::kGroupbyMergeRadixMax
@@ -114,9 +113,7 @@ include/bolt/kernels/bolt_regex.h::kRe2MaxInsts
 include/bolt/kernels/bolt_regex.h::kRe2MaxRepeat
 include/bolt/kernels/bolt_smallsort.h::kSmallSortCap
 include/bolt/kernels/bolt_utf8.h::kInlineInMaxVals
-include/bolt/kernels/bolt_vector_bond.h::kBondMaxDim
 include/bolt/kernels/bolt_vector_distance_f16.h::kBondMaxZones
-include/bolt/kernels/bolt_vector_kmeans.h::kVectorKmeansMaxDim
 include/bolt/kernels/bolt_vector_kmeans.h::kVectorKmeansMaxK
 include/bolt/kernels/fintech/almgren_chriss.h::kAlmgrenChrissMaxSlices
 include/bolt/kernels/fintech/monotonic_deque.h::kMaxIndexRingCap

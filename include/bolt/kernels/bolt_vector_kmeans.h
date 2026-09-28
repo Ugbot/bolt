@@ -24,6 +24,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/kernels/bolt_topk.h"             // argmin_f32
+#include "bolt/kernels/bolt_vector_limits.h"
 
 #include <cassert>
 #include <cmath>
@@ -36,7 +37,7 @@ namespace vec {
 
 // Hard upper bounds. Match `bolt_kmeans.h` (kKmeansMaxDim / kKmeansMaxK)
 // so the two paths can be swapped without surprise.
-inline constexpr uint32_t kVectorKmeansMaxDim = 4096;
+inline constexpr uint32_t kVectorKmeansMaxDim = kMaxVectorDim;
 inline constexpr uint32_t kVectorKmeansMaxK   = 4096;
 
 // ===========================================================================

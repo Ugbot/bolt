@@ -47,4 +47,17 @@ TEST(BoltTlsScratch, ThreadsGetTheirOwnTable) {
     EXPECT_EQ(mine[0], 1u);
 }
 
+TEST(BoltTlsGrow, GrowsPastAnyFixedSizeAndReuses) {
+    struct GrowTag {};
+    uint32_t* a = bolt::tls_grow<GrowTag, uint32_t>(16);
+    ASSERT_NE(a, nullptr);
+    a[15] = 7u;
+    EXPECT_EQ((bolt::tls_grow<GrowTag, uint32_t>(8)), a);   // no shrink, reused
+    uint32_t* b = bolt::tls_grow<GrowTag, uint32_t>(1u << 20);
+    ASSERT_NE(b, nullptr);
+    b[(1u << 20) - 1u] = 9u;                               // whole span writable
+    EXPECT_EQ((bolt::tls_grow<GrowTag, uint32_t>(1u << 20)), b);
+    EXPECT_EQ((bolt::tls_grow<GrowTag, uint32_t>(SIZE_MAX)), nullptr);
+}
+
 }  // namespace
