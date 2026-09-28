@@ -80,7 +80,7 @@ constexpr std::uint32_t kPwMaxRowGroups     = 4096u;
 // builder and the DELTA scratch, so this bounds peak encode memory
 // independently of how wide the pool or the schema is.
 constexpr std::uint32_t kPwMaxEncodeWave    = 64u;
-constexpr std::uint32_t kPwMaxColumns       = kMaxFixedColumns;  // G2FEAT-47
+constexpr std::uint32_t kPwMaxColumns       = kMaxColumns;
 
 // Parquet enum codes we emit (parquet.thrift).
 constexpr std::int32_t kPtBoolean   = 0;
@@ -415,6 +415,9 @@ struct ParquetWriter {
     // memory sink.
     char              path[kPwMaxPathLen];
     ParquetWriteOpts  opts;
+    // The column descriptors, copied out of whichever storage the caller's
+    // opts used (inline or wide_columns). opts.columns is not read after open.
+    std::vector<ParquetWriteColumn> cols;
     std::int64_t      file_pos;        // bytes written
     bool              failed;
     // Footer accumulators.
@@ -2508,7 +2511,7 @@ void write_row_group(TcOut* o, const ParquetWriter* w,
     tc_put_list_hdr(o, kFStruct, rg.chunk_count);
     for (std::uint32_t i = 0; i < rg.chunk_count; ++i) {
         const std::uint32_t ci = rg.chunk_off + i;
-        write_column_chunk_struct(o, w, w->opts.columns[i],
+        write_column_chunk_struct(o, w, w->cols[i],
                                   w->chunks[ci]);
     }
     tc_put_field(o, 2, kFI64);
@@ -2556,15 +2559,15 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     tc_put_field(&o, 2, kFList);
     std::uint32_t n_elems = 1u;                // the root
     for (std::uint32_t i = 0; i < n; ++i) {
-        n_elems += schema_element_count(w->opts.columns[i]);
+        n_elems += schema_element_count(w->cols[i]);
     }
     tc_put_list_hdr(&o, kFStruct, n_elems);
     write_schema_element_root(&o, n);
     for (std::uint32_t i = 0; i < n; ++i) {
-        if (w->opts.columns[i].type == BoltType::List) {
-            write_schema_elements_list(&o, w->opts.columns[i]);
+        if (w->cols[i].type == BoltType::List) {
+            write_schema_elements_list(&o, w->cols[i]);
         } else {
-            write_schema_element_col(&o, w->opts.columns[i]);
+            write_schema_element_col(&o, w->cols[i]);
         }
     }
     // 3 num_rows
@@ -2618,7 +2621,7 @@ bool sorting_columns_valid(const ParquetWriteOpts* opts) noexcept {
     for (std::uint32_t i = 0; i < opts->n_sorting_columns; ++i) {
         const ParquetSortingColumn& sc = opts->sorting_columns[i];
         if (sc.column_idx >= opts->n_columns) return false;
-        switch (opts->columns[sc.column_idx].type) {
+        switch (pw_opts_column(*opts, sc.column_idx).type) {
             case BoltType::Int32:
             case BoltType::Int64:
             case BoltType::Float32:
@@ -2638,6 +2641,20 @@ bool sorting_columns_valid(const ParquetWriteOpts* opts) noexcept {
 
 }  // namespace
 
+namespace {
+
+void pw_copy_columns(ParquetWriter* w, const ParquetWriteOpts* opts) noexcept {
+    assert(w != nullptr && opts != nullptr);
+    assert(opts->n_columns >= 1u && opts->n_columns <= kPwMaxColumns);
+    w->cols.resize(opts->n_columns);
+    for (std::uint32_t i = 0; i < opts->n_columns; ++i) {   // bounded: kPwMaxColumns
+        w->cols[i] = pw_opts_column(*opts, i);
+    }
+    w->opts.wide_columns = nullptr;
+}
+
+}  // namespace
+
 // ===== public API =========================================================
 
 ParquetWriter* parquet_write_open(const char* path,
@@ -2646,16 +2663,19 @@ ParquetWriter* parquet_write_open(const char* path,
     assert(opts != nullptr);
     if (path == nullptr || opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
+    if (opts->wide_columns == nullptr && opts->n_columns > kPwInlineColumns) {
+        return nullptr;   // wider than the inline array: caller must use wide_columns
+    }
     // Reject unsupported codecs up-front.
     if (!pw_codec_supported(opts->compression)) return nullptr;
     if (!file_kv_valid(*opts)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
-        if (!type_supported(opts->columns[i])) return nullptr;
-        if (!column_kv_valid(opts->columns[i])) return nullptr;
+        if (!type_supported(pw_opts_column(*opts, i))) return nullptr;
+        if (!column_kv_valid(pw_opts_column(*opts, i))) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly
         // writing PLAIN instead would hide the caller's bug in a file that
         // reads back fine.
-        if (opts->columns[i].encoding > static_cast<std::uint8_t>(
+        if (pw_opts_column(*opts, i).encoding > static_cast<std::uint8_t>(
                 PqWriteEncoding::ByteStreamSplit)) {
             return nullptr;
         }
@@ -2663,8 +2683,8 @@ ParquetWriter* parquet_write_open(const char* path,
         // rather than writing a file whose schema lies about its bytes.
         {
             const BoltLogical lg =
-                static_cast<BoltLogical>(opts->columns[i].logical);
-            const BoltType ct = opts->columns[i].type;
+                static_cast<BoltLogical>(pw_opts_column(*opts, i).logical);
+            const BoltType ct = pw_opts_column(*opts, i).type;
             if (lg == BoltLogical::Json && ct != BoltType::Utf8) return nullptr;
             if (lg == BoltLogical::Bson && ct != BoltType::Binary &&
                 ct != BoltType::Utf8) {
@@ -2674,16 +2694,16 @@ ParquetWriter* parquet_write_open(const char* path,
             // String. UNKNOWN's whole point is "every value is null", which
             // a REQUIRED (non-nullable) column can never satisfy.
             if (lg == BoltLogical::Enum && ct != BoltType::Utf8) return nullptr;
-            if (lg == BoltLogical::Unknown && !opts->columns[i].nullable) {
+            if (lg == BoltLogical::Unknown && !pw_opts_column(*opts, i).nullable) {
                 return nullptr;
             }
-            if (opts->columns[i].logical >
+            if (pw_opts_column(*opts, i).logical >
                 static_cast<std::uint8_t>(BoltLogical::Unknown)) {
                 return nullptr;
             }
         }
         {
-            const ParquetWriteColumn& pc = opts->columns[i];
+            const ParquetWriteColumn& pc = pw_opts_column(*opts, i);
             BoltType et = pc.type;
             if (pc.type == BoltType::List) {
                 // G2PQ-27: validate against the CHAIN's terminal leaf type,
@@ -2711,6 +2731,7 @@ ParquetWriter* parquet_write_open(const char* path,
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
     w->opts = *opts;
+    pw_copy_columns(w, opts);
     if (w->opts.row_group_target_bytes == 0u ||
         w->opts.row_group_target_bytes > kPwMaxRowGroupBytes) {
         w->opts.row_group_target_bytes = kPwMaxRowGroupBytes;
@@ -2740,15 +2761,18 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     assert(opts != nullptr);
     if (opts == nullptr) return nullptr;
     if (opts->n_columns == 0u || opts->n_columns > kPwMaxColumns) return nullptr;
+    if (opts->wide_columns == nullptr && opts->n_columns > kPwInlineColumns) {
+        return nullptr;   // wider than the inline array: caller must use wide_columns
+    }
     if (!pw_codec_supported(opts->compression)) return nullptr;
     if (!file_kv_valid(*opts)) return nullptr;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {
-        if (!type_supported(opts->columns[i])) return nullptr;
-        if (!column_kv_valid(opts->columns[i])) return nullptr;
+        if (!type_supported(pw_opts_column(*opts, i))) return nullptr;
+        if (!column_kv_valid(pw_opts_column(*opts, i))) return nullptr;
         // Reject an encoding the column's type cannot carry, loudly. Quietly
         // writing PLAIN instead would hide the caller's bug in a file that
         // reads back fine.
-        if (opts->columns[i].encoding > static_cast<std::uint8_t>(
+        if (pw_opts_column(*opts, i).encoding > static_cast<std::uint8_t>(
                 PqWriteEncoding::ByteStreamSplit)) {
             return nullptr;
         }
@@ -2756,8 +2780,8 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
         // rather than writing a file whose schema lies about its bytes.
         {
             const BoltLogical lg =
-                static_cast<BoltLogical>(opts->columns[i].logical);
-            const BoltType ct = opts->columns[i].type;
+                static_cast<BoltLogical>(pw_opts_column(*opts, i).logical);
+            const BoltType ct = pw_opts_column(*opts, i).type;
             if (lg == BoltLogical::Json && ct != BoltType::Utf8) return nullptr;
             if (lg == BoltLogical::Bson && ct != BoltType::Binary &&
                 ct != BoltType::Utf8) {
@@ -2767,16 +2791,16 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
             // String. UNKNOWN's whole point is "every value is null", which
             // a REQUIRED (non-nullable) column can never satisfy.
             if (lg == BoltLogical::Enum && ct != BoltType::Utf8) return nullptr;
-            if (lg == BoltLogical::Unknown && !opts->columns[i].nullable) {
+            if (lg == BoltLogical::Unknown && !pw_opts_column(*opts, i).nullable) {
                 return nullptr;
             }
-            if (opts->columns[i].logical >
+            if (pw_opts_column(*opts, i).logical >
                 static_cast<std::uint8_t>(BoltLogical::Unknown)) {
                 return nullptr;
             }
         }
         {
-            const ParquetWriteColumn& pc = opts->columns[i];
+            const ParquetWriteColumn& pc = pw_opts_column(*opts, i);
             BoltType et = pc.type;
             if (pc.type == BoltType::List) {
                 ParquetListLevel chain[kPwMaxListDepth];
@@ -2795,6 +2819,7 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     ParquetWriter* w = new (std::nothrow) ParquetWriter();
     if (w == nullptr) return nullptr;
     w->opts = *opts;
+    pw_copy_columns(w, opts);
     if (w->opts.row_group_target_bytes == 0u ||
         w->opts.row_group_target_bytes > kPwMaxRowGroupBytes) {
         w->opts.row_group_target_bytes = kPwMaxRowGroupBytes;
@@ -2930,14 +2955,14 @@ void encode_wave_task(void* user, std::uint32_t lo, std::uint32_t hi,
         const std::uint32_t c = e->base + i;
         assert(c < e->w->opts.n_columns);
         const BoltColumn sc = slice_column(e->cols[c],
-                                           e->w->opts.columns[c].type,
+                                           e->w->cols[c].type,
                                            e->start, e->rows,
                                            &e->w->ws[i].off_slice);
         // Failure is recorded on the output (ChunkOut::ok) rather than
         // returned: a pool task has nowhere to return a status to, and the
         // placement pass checks every slot before writing anything.
         (void)write_column_chunk(e->w, &e->w->ws[i], &e->w->outs[i], sc,
-                                 e->w->opts.columns[c], e->rows);
+                                 e->w->cols[c], e->rows);
     }
 }
 
@@ -3156,7 +3181,7 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     for (std::uint32_t i = 0; i < w->opts.n_sorting_columns; ++i) {
         const ParquetSortingColumn& sc = w->opts.sorting_columns[i];
         assert(sc.column_idx < w->opts.n_columns);   // enforced at open
-        const BoltType t = w->opts.columns[sc.column_idx].type;
+        const BoltType t = w->cols[sc.column_idx].type;
         if (!verify_sort_claim(cols[sc.column_idx], t, start, rows,
                                sc.descending, sc.nulls_first)) {
             return false;
@@ -3192,11 +3217,11 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
             for (std::uint32_t i = 0; i < n; ++i) {
                 const std::uint32_t c = base + i;
                 const BoltColumn sc = slice_column(cols[c],
-                                                   w->opts.columns[c].type,
+                                                   w->cols[c].type,
                                                    start, rows,
                                                    &w->ws[i].off_slice);
                 if (!write_column_chunk(w, &w->ws[i], &w->outs[i], sc,
-                                        w->opts.columns[c], rows)) {
+                                        w->cols[c], rows)) {
                     return false;
                 }
             }
@@ -3280,7 +3305,7 @@ bool parquet_write_row_group(ParquetWriter* w,
     // strictly worse than a refusal. Failing here also means the file never
     // gains a half-written row group. G2ICE-87.
     for (std::uint32_t c = 0; c < w->opts.n_columns; ++c) {
-        const BoltType t = w->opts.columns[c].type;
+        const BoltType t = w->cols[c].type;
         if (t != BoltType::Utf8 && t != BoltType::Binary) continue;
         const ColumnFormat f = cols[c].format;
         if (f == ColumnFormat::VarBinary) {

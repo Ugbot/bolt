@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "bolt/bolt_column_limits.h"
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -407,14 +408,8 @@ struct BoltField {
     }
 };
 
-// One honest assertion ceiling for column/field counts across bolt (G2FEAT-47).
-// Used ONLY in asserts/rejects — NEVER to size an array or a bitmask. Schemas and
-// batches are arena-allocated right-sized to their real column count; this bound
-// only stops a pathological / corrupt count. (Replaces the old fixed
-// `kMaxSchemaFields`/`kMaxBatchColumns` inline-array sizes.)
-static constexpr uint32_t kMaxColumns = 4096;
-// Deprecated back-compat aliases — existing call sites still name these. They are
-// now assertion ceilings, not allocation sizes. New code should use kMaxColumns.
+// kMaxColumns lives in bolt_column_limits.h.
+// Back-compat alias; same bound.
 static constexpr uint32_t kMaxSchemaFields = kMaxColumns;
 
 /// Schema: a dynamically-sized, arena-backed list of fields (G2FEAT-47). No heap

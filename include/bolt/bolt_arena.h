@@ -51,12 +51,12 @@ inline constexpr size_t kArenaOsBlockMaxAlign = 4096;
 /// group) bigger than any reasonable max_block_size -- each such request
 /// takes the oversize lane (bolt_arena.h's allocate_slow), which mints a
 /// bespoke block and consumes ONE block-table slot regardless of how large
-/// max_block_size is configured. With kPqMaxColumns (128) worth of columns
+/// max_block_size is configured. With 128 (ClickBench-width) columns
 /// to decode into one arena, 32 slots is simply too few table entries,
 /// independent of row count or block size -- confirmed by injection: raising
 /// max_block_size from 1 GB to 4 GB only moved the wall to a higher peak
 /// (num_blocks_ pinned at exactly 32 either way). 256 gives roughly 2 oversize
-/// slots per column at kPqMaxColumns scale, plus headroom for the normal-lane
+/// slots per column at that width, plus headroom for the normal-lane
 /// growing blocks and the reader's small fixed-size metadata allocations.
 static constexpr uint32_t kArenaMaxBlocks = 256;
 

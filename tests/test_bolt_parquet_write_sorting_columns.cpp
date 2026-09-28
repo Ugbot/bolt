@@ -17,6 +17,7 @@
 // cases never produce a file at all (parquet_write_row_group returns
 // false), so they are asserted purely in this gtest binary.
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/ingest/bolt_parquet_read.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
@@ -134,10 +135,12 @@ void build_str_batch(bolt::Arena* arena, const std::vector<std::string>& vals,
 
 void parse_footer(const std::vector<std::uint8_t>& buf, PqMeta* m,
                   std::vector<PqChunk>* chunks) {
-    chunks->resize(kPqMaxColumns * 64);
+    chunks->resize(64 * 64);
     std::memset(m, 0, sizeof(*m));
     m->chunks = chunks->data();
     m->chunks_cap = static_cast<std::uint32_t>(chunks->size());
+    m->columns = pq_test_columns();
+    m->columns_cap = kPqTestColumns;
     std::uint64_t off = 0;
     std::uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(buf.data(), buf.size(), &off, &len));

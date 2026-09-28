@@ -43,6 +43,7 @@ constexpr uint32_t kPqReadPageLoopBound = 1u << 16;  // generic bounded-loop cap
 constexpr uint32_t kPqMaxDictEntries   = 1u << 24;
 constexpr int64_t  kPqMaxPageBytes     = int64_t{1} << 30;
 constexpr uint32_t kPqMetaChunksFirst  = 4096;
+constexpr uint32_t kPqMetaColumnsFirst = 128;   // first guess; retried at the file's exact width
 
 // parquet::PageType / Encoding / ConvertedType values we consume.
 constexpr int32_t kPageData = 0, kPageIndex = 1, kPageDict = 2,
@@ -2812,17 +2813,27 @@ bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
     uint64_t off = 0;
     uint32_t mlen = 0;
     if (!pq_locate_footer(buf, len, &off, &mlen)) return false;
-    // First pass with a modest chunk table; retry once at the hard cap
-    // (chunk-heavy files). A corrupt footer re-fails identically.
-    out->chunks = arena->allocate_array<PqChunk>(kPqMetaChunksFirst);
-    out->chunks_cap = (out->chunks != nullptr) ? kPqMetaChunksFirst : 0;
-    if (out->chunks == nullptr) return false;
-    if (pq_parse_file_meta(buf + off, mlen, out)) return true;
-    const uint32_t cap = kPqMaxRowGroups * kPqMaxColumns;
-    out->chunks = arena->allocate_array<PqChunk>(cap);
-    if (out->chunks == nullptr) return false;
-    out->chunks_cap = cap;
-    return pq_parse_file_meta(buf + off, mlen, out);
+    // Modest first guess; a file that needs more reports its exact width
+    // (need_columns) or chunk count (need_chunks) and is re-parsed once per
+    // array at that size. A corrupt footer re-fails identically.
+    uint32_t col_cap = kPqMetaColumnsFirst;
+    uint32_t chunk_cap = kPqMetaChunksFirst;
+    for (uint32_t attempt = 0; attempt < 4u; ++attempt) {   // bounded: <= 2 regrows
+        out->columns = arena->allocate_array<PqColumn>(col_cap);
+        out->columns_cap = (out->columns != nullptr) ? col_cap : 0;
+        out->chunks = arena->allocate_array<PqChunk>(chunk_cap);
+        out->chunks_cap = (out->chunks != nullptr) ? chunk_cap : 0;
+        if (out->columns == nullptr || out->chunks == nullptr) return false;
+        if (pq_parse_file_meta(buf + off, mlen, out)) return true;
+        if (out->need_columns > col_cap) {
+            col_cap = out->need_columns;
+        } else if (out->need_chunks > chunk_cap) {
+            chunk_cap = out->need_chunks;
+        } else {
+            return false;                                  // not a capacity miss
+        }
+    }
+    return false;
 }
 
 bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
@@ -2835,7 +2846,7 @@ bool parquet_read_row_group(const uint8_t* buf, uint64_t len,
     if (row_group >= meta->n_row_groups) return false;
     const PqRowGroup* rg = &meta->row_groups[row_group];
     if (rg->num_rows < 0) return false;
-    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kMaxColumns
         ColCtx cx;
         if (!init_col_ctx(meta, c, row_group, row_group + 1, rg->num_rows,
                           arena, &out_cols[c], &cx)) {
@@ -3267,7 +3278,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     // list<int64> column could not be opened by the obvious call at all.
     bool* is_list = arena->allocate_array<bool>(meta->n_columns);
     if (is_list == nullptr) return false;
-    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kPqMaxColumns (128)
+    for (uint32_t c = 0; c < meta->n_columns; ++c) {    // bounded: <= kMaxColumns
         is_list[c] = (meta->columns[c].max_rep != 0u);
         if (is_list[c]) {
             // Up to kPqMaxRepLevels of repetition (G2PQ-15). build_list_column

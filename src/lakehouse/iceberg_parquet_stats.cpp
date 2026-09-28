@@ -189,12 +189,12 @@ bool file_stats_from_parquet_meta(const pq::PqMeta* meta,
                                   FileStats* out) noexcept {
     assert(out != nullptr);
     if (meta == nullptr || field_ids == nullptr || out == nullptr) return false;
-    if (meta->n_columns > pq::kPqMaxColumns) return false;
+    if (meta->n_columns > kMaxColumns) return false;
     if (meta->n_row_groups > pq::kPqMaxRowGroups) return false;
     if (meta->n_row_groups > 0u && meta->chunks == nullptr) return false;
     out->n_cols = 0;
     const uint32_t nc = meta->n_columns < n_field_ids ? meta->n_columns : n_field_ids;
-    for (uint32_t c = 0; c < nc; ++c) {                     // bounded: kPqMaxColumns
+    for (uint32_t c = 0; c < nc; ++c) {                     // bounded: kMaxColumns
         if (field_ids[c] <= 0) continue;
         if (out->n_cols >= kIcebergMaxStatCols) break;      // degrades pruning only
         const pq::PqColumn& col = meta->columns[c];

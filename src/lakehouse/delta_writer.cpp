@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <ctime>
 #include <filesystem>
 
@@ -203,30 +204,19 @@ bool parquet_write_batch_to_path(const char* abs_path, const BoltBatch* batch,
     assert(abs_path != nullptr && batch != nullptr && wopts != nullptr);
     using namespace bolt::ingest::parquet;
     ParquetWriteOpts opts{};
-    opts.n_columns = static_cast<uint32_t>(batch->num_cols);
+    const uint32_t ncol = static_cast<uint32_t>(batch->num_cols);
+    std::vector<ParquetWriteColumn> wide;
+    if (ncol > kPwInlineColumns) wide.resize(ncol);
+    ParquetWriteColumn* cols = pw_opts_columns(&opts, ncol, wide.data());
+    if (cols == nullptr) return false;
     opts.row_group_target_bytes = 1u << 20;
     opts.compression = parquet_codec_byte(wopts->compression);
     opts.emit_statistics = wopts->emit_stats;
-    // COLUMN-WIDTH NORMALIZATION (2026-08-03) — STACK BUFFER OVERFLOW FIX.
-    // This loop was bounded by kMaxBatchColumns while writing into
-    // `opts.columns`, which is `ParquetWriteColumn[kMaxFixedColumns]` (256) on
-    // a STACK-LOCAL struct. The bound was correct while both constants were
-    // 256; raising kMaxBatchColumns to 1024 (G2FEAT-47) silently turned this
-    // into an out-of-bounds write for any 257..1024-column batch, corrupting
-    // the adjacent fields of `opts` (n_columns, row_group_target_bytes,
-    // compression, ...) and past the struct. parquet_write_open's own
-    // `n_columns > kPwMaxColumns` guard runs AFTER this loop, so it could never
-    // prevent the corruption — and may itself read already-corrupted fields.
-    // Bound by the destination array's real size and fail closed instead;
-    // n_columns keeps the TRUE width so parquet_write_open rejects rather than
-    // silently writing a truncated schema.
-    if (opts.n_columns > kMaxFixedColumns) return false;
-    for (uint32_t i = 0; i < opts.n_columns; ++i) {
+    for (uint32_t i = 0; i < ncol; ++i) {
         const auto& f = batch->schema.field(static_cast<int>(i));
-        str_copy_cstr(opts.columns[i].name, sizeof(opts.columns[i].name),
-                      f.name);
-        opts.columns[i].type     = f.type;
-        opts.columns[i].nullable = f.nullable;
+        str_copy_cstr(cols[i].name, sizeof(cols[i].name), f.name);
+        cols[i].type     = f.type;
+        cols[i].nullable = f.nullable;
     }
     ParquetWriter* w = parquet_write_open(abs_path, &opts);
     if (w == nullptr) return false;

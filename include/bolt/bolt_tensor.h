@@ -23,7 +23,7 @@
 //     and never frees.
 //   - Fixed-rank dims[4]/strides[4] (GGML_MAX_DIMS-style), not a
 //     dynamic-rank shape — matches this codebase's "hard upper bounds on
-//     everything" rule (bolt_row_view.h's fixed col_ptrs[kMaxFixedColumns]).
+//     everything" rule (bolt_row_view.h's fixed col_ptrs[kRowViewMaxColumns]).
 //     NOTE: BoltSchema::fields is a `BoltField*` arena pointer post-G2FEAT-47
 //     (set via `BoltSchema::set_storage`, bounded by its caller-supplied
 //     `cap`, not a fixed inline array) — it is no longer the fixed-array

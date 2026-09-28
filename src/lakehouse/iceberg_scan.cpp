@@ -576,21 +576,19 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
     pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
     if (meta == nullptr) return false;
     std::memset(meta, 0, sizeof(*meta));
-    meta->chunks = s->scratch->allocate_array<pq::PqChunk>(pq::kPqMaxColumns * 16u);
-    meta->chunks_cap = pq::kPqMaxColumns * 16u;
     if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) return false;
 
-    BoltColumn* cols = s->scratch->allocate_array<BoltColumn>(pq::kPqMaxColumns);
+    BoltColumn* cols = s->scratch->allocate_array<BoltColumn>(meta->n_columns);
     if (cols == nullptr) return false;
     for (uint32_t rg = 0; rg < meta->n_row_groups && rg < kLakeMaxRowGroups; ++rg) {
-        std::memset(cols, 0, sizeof(BoltColumn) * pq::kPqMaxColumns);
+        std::memset(cols, 0, sizeof(BoltColumn) * meta->n_columns);
         int64_t rows = 0;
         if (!pq::parquet_read_row_group(body, blen, meta, rg, s->scratch,
                                         cols, &rows)) {
             return false;
         }
         int32_t path_ci = -1, pos_ci = -1;
-        for (uint32_t c = 0; c < meta->n_columns && c < pq::kPqMaxColumns; ++c) {
+        for (uint32_t c = 0; c < meta->n_columns; ++c) {
             if (std::strcmp(meta->columns[c].name, "file_path") == 0) path_ci = static_cast<int32_t>(c);
             else if (std::strcmp(meta->columns[c].name, "pos") == 0) pos_ci = static_cast<int32_t>(c);
         }

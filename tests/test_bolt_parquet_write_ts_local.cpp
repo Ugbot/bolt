@@ -2,6 +2,7 @@
 // (isAdjustedToUTC=false, MICROS, no ConvertedType). The default stays the
 // UTC-adjusted TIMESTAMP_MICROS form. Read back through bolt's footer parser.
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 
@@ -46,6 +47,8 @@ void write_and_parse(bool ts_local, PqMeta* m, std::vector<PqChunk>* chunks,
     std::memset(m, 0, sizeof(*m));
     m->chunks = chunks->data();
     m->chunks_cap = static_cast<std::uint32_t>(chunks->size());
+    m->columns = pq_test_columns();
+    m->columns_cap = kPqTestColumns;
     std::uint64_t off = 0;
     std::uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(out, out_len, &off, &len));

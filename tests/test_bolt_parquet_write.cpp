@@ -11,6 +11,7 @@
 //      (never a truncated — i.e. invalid — bound), and the reader treats
 //      absent stats as unprunable.
 
+#include "pq_test_columns.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/ingest/bolt_parquet_read.h"
 #include "bolt/ingest/bolt_parquet_stats.h"
@@ -367,6 +368,8 @@ void write_and_parse_stats_file(const std::string& path,
     chunks->resize(16);
     meta->chunks = chunks->data();
     meta->chunks_cap = 16;
+    meta->columns = pq_test_columns();
+    meta->columns_cap = kPqTestColumns;
     ASSERT_TRUE(pq_parse_file_meta(file->data() + moff, mlen, meta));
     ASSERT_EQ(meta->n_row_groups, 2u);
     ASSERT_EQ(meta->n_columns, 2u);
@@ -505,6 +508,8 @@ void parse_footer(const char* path, std::vector<std::uint8_t>* file,
     chunks->resize(64);
     meta->chunks = chunks->data();
     meta->chunks_cap = 64;
+    meta->columns = pq_test_columns();
+    meta->columns_cap = kPqTestColumns;
     ASSERT_TRUE(pq_parse_file_meta(file->data() + moff, mlen, meta));
 }
 
