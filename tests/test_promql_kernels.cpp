@@ -280,6 +280,15 @@ TEST(PromqlRate, TooFewSamplesIsNan) {
 }
 
 // functions.test: stdvar_over_time(metric[2m]) of 0,8,8,2,3 => 10.56
+// Prometheus 3.5 stddev_over_time over these samples prints
+// 0.844954831139907; uncompensated Welford gives ...9074 (G2GRAPH-319).
+TEST(PromqlOverTime, StddevIsKahanCompensatedLikePrometheus) {
+    double a[3] = {-23.0, -21.063, -21.4};
+    EXPECT_EQ(bolt::promql::promql_stddev(a, 3), 0.844954831139907);
+    double n[2] = {1.0, std::nan("")};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_stdvar(n, 2)));
+}
+
 TEST(PromqlOverTime, StdvarStddevQuantileMad) {
     double a[5] = {0, 8, 8, 2, 3};
     EXPECT_NEAR(bolt::promql::promql_stdvar(a, 5), 10.56, 1e-10);
