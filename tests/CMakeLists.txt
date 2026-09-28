@@ -2232,3 +2232,24 @@ target_link_libraries(test_bolt_workers_kind_b
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_workers_kind_b)
 add_test(NAME test_bolt_workers_kind_b COMMAND test_bolt_workers_kind_b)
+
+# G2GRAPH-343 — CSR algorithm kernels (pagerank, wcc, scc, dijkstra, degree,
+# similarity) and Reach path semantics: pinned cases, then a seeded
+# random-graph property fuzz against networkx and a brute-force path
+# enumerator. The campaign form is `graph_algo_fuzz.py --cases 20000` under
+# the fuzz lock; exit 2 (networkx missing) reports SKIPPED, never passed.
+add_executable(test_bolt_csr_algo test_bolt_csr_algo.cpp)
+target_link_libraries(test_bolt_csr_algo
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csr_algo)
+add_test(NAME test_bolt_csr_algo COMMAND test_bolt_csr_algo)
+
+add_executable(graph_algo_fuzz_harness graph_algo_fuzz_harness.cpp)
+target_link_libraries(graph_algo_fuzz_harness PRIVATE bolt::bolt)
+bolt_apply_hardening(graph_algo_fuzz_harness)
+add_test(NAME test_bolt_graph_algo_fuzz
+         COMMAND ${BOLT_ORACLE_PYTHON}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/graph_algo_fuzz.py
+                 --harness $<TARGET_FILE:graph_algo_fuzz_harness>
+                 --seed 20260928 --cases 300)
+set_tests_properties(test_bolt_graph_algo_fuzz PROPERTIES SKIP_RETURN_CODE 2)

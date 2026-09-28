@@ -94,11 +94,24 @@ constexpr int32_t k_csr_bfs_max_hops = 15;
 //            because its one-hop endpoint IS its start node).
 //   Trail  — never reuse a RELATIONSHIP already on the current path.
 //   Simple — never revisit a NODE already on the current path.
+//   Reach  — SET semantics (SPARQL 1.1 ALP, `p*` / `p+`): one row per node v
+//            reachable from s by a walk of length in [min_hops, max_hops],
+//            once, however many walks reach it. min_hops is 0 or 1. With
+//            min_hops == 1 the start itself is a row iff a cycle (or
+//            self-loop) of length <= max_hops returns to it. Level-
+//            synchronous BFS with a visited bitmap: memory is O(n_nodes),
+//            never O(paths), so max_hops may be unbounded
+//            (k_csr_reach_unbounded). Rows come out in BFS discovery order,
+//            the start last when min_hops == 1. out_hops must be null.
 enum class CsrPathSemantics : uint8_t {
     Walk   = 0,
     Trail  = 1,
     Simple = 2,
+    Reach  = 3,
 };
+
+// Reach only: "no hop bound". Any max_hops >= n_nodes behaves the same.
+constexpr int32_t k_csr_reach_unbounded = INT32_MAX;
 
 // Status. Ok covers every normal outcome INCLUDING suspension; use
 // csr_bfs_done() to tell "this call filled up" from "the whole run finished".
@@ -137,14 +150,29 @@ struct CsrBfsParams {
 // Caller-owned DFS scratch. Each array needs csr_bfs_scratch_slots(max_hops)
 // int64 slots. The KERNEL owns the layout (what each array means and how it
 // is indexed); the CALLER owns the memory (arena, stack, wherever).
+//
+// Reach uses `seen` + `queue` instead and ignores path/epath/iter (which may
+// then be null). `seen` must be ZEROED before the first call; the kernel
+// clears exactly the bits it set when a source completes, so a run leaves it
+// zeroed again. After a non-Ok status the caller re-zeroes before reuse.
 struct CsrBfsScratch {
-    int64_t* path;    // path[0..depth]   — nodes on the current path
-    int64_t* epath;   // epath[0..depth-1]— relationship ids on the current path
-    int64_t* iter;    // iter[d]          — next CSR index to try at depth d
+    int64_t*  path;    // path[0..depth]   — nodes on the current path
+    int64_t*  epath;   // epath[0..depth-1]— relationship ids on the current path
+    int64_t*  iter;    // iter[d]          — next CSR index to try at depth d
+    uint64_t* seen;    // Reach: csr_reach_seen_words(n_nodes) words
+    int64_t*  queue;   // Reach: csr_reach_queue_slots(n_nodes) slots
 };
 
 constexpr int64_t csr_bfs_scratch_slots(int32_t max_hops) noexcept {
     return static_cast<int64_t>(max_hops) + 1;
+}
+
+constexpr int64_t csr_reach_seen_words(int64_t n_nodes) noexcept {
+    return (n_nodes + 63) / 64;
+}
+
+constexpr int64_t csr_reach_queue_slots(int64_t n_nodes) noexcept {
+    return n_nodes;
 }
 
 // Resume point. Caller ZERO-INITIALISES before the first call and then passes
@@ -156,7 +184,18 @@ struct CsrBfsCursor {
     int32_t depth;             // current DFS depth (valid iff active)
     uint8_t active;            // 1 => mid-source, the stack in scratch is live
     uint8_t pending_emit;      // 1 => path[depth] still owes an output row
-    uint8_t _pad[2];
+    uint8_t r_phase;           // Reach: 0 expand, 1 emit queue, 2 emit start
+    uint8_t r_self;            // Reach: a cycle returned to the start
+    // Reach resume point: queue[r_scan] is being expanded from CSR slot
+    // r_edge (< 0 => not started); [.., r_lvl_end) holds level r_level;
+    // queue[r_emit..r_tail) still owes rows.
+    int64_t r_scan;
+    int64_t r_edge;
+    int64_t r_tail;
+    int64_t r_lvl_end;
+    int64_t r_emit;
+    int32_t r_level;
+    int32_t _pad2;
 };
 
 // The whole run is finished when this is true on return.
@@ -303,6 +342,125 @@ BOLT_FORCE_INLINE CsrBfsStep csr_bfs_run_source(
     return CsrBfsStep::SourceDone;
 }
 
+// ---------------------------------------------------------------------------
+// Reach (set semantics)
+// ---------------------------------------------------------------------------
+
+BOLT_FORCE_INLINE bool csr_reach_test_set(uint64_t* BOLT_RESTRICT seen,
+                                          int64_t v) noexcept {
+    assert(seen != nullptr && v >= 0);
+    const uint64_t bit = uint64_t{1} << (static_cast<uint64_t>(v) & 63u);
+    uint64_t& w = seen[v >> 6];
+    const bool was = (w & bit) != 0;
+    w |= bit;
+    return was;
+}
+
+// Expand queue[r_scan..] level by level until the frontier is exhausted, the
+// hop bound stops it, or the budget runs out. Each node is enqueued once
+// (the bitmap), so the queue never exceeds n_nodes.
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE CsrBfsStep csr_reach_expand(
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
+        const CsrBfsParams* BOLT_RESTRICT p, CsrBfsCursor* BOLT_RESTRICT c,
+        int64_t* BOLT_RESTRICT budget) noexcept {
+    assert(g != nullptr && sc != nullptr && p != nullptr && c != nullptr);
+    assert(c->r_phase == 0 && c->r_tail <= g->n_nodes);
+    const int64_t s = sc->queue[0];
+    while (c->r_scan < c->r_tail) {
+        if (c->r_scan == c->r_lvl_end) { ++c->r_level; c->r_lvl_end = c->r_tail; }
+        if (c->r_level >= p->max_hops) break;
+        const int64_t u = sc->queue[c->r_scan];
+        int64_t b = 0;
+        int64_t e = 0;
+        csr_graph_block(g, u, &b, &e);
+        int64_t j = (c->r_edge < 0) ? b : c->r_edge;
+        assert(j >= b && j <= e);
+        for (; j < e; ++j) {
+            if (*budget <= 0) { c->r_edge = j; return CsrBfsStep::Suspended; }
+            --(*budget);
+            if (csr_edge_label_keep(g->edge_labels, g->want_label, j) == 0)
+                continue;
+            const int64_t v = static_cast<int64_t>(g->neighbors[j]);
+            if (v < 0 || v >= g->n_nodes) return CsrBfsStep::BadGraph;
+            c->r_self = static_cast<uint8_t>(c->r_self | (v == s));
+            if (csr_reach_test_set(sc->seen, v)) continue;
+            assert(c->r_tail < g->n_nodes && "csr_reach: queue overflow");
+            sc->queue[c->r_tail++] = v;
+        }
+        c->r_edge = -1;
+        ++c->r_scan;
+    }
+    c->r_phase = 1;
+    return CsrBfsStep::SourceDone;
+}
+
+// Emit one (s, v) row; false when the output is full, the cap would be
+// exceeded (*cap_hit set) or the budget is spent after the row.
+BOLT_FORCE_INLINE bool csr_reach_emit(
+        const CsrBfsParams* BOLT_RESTRICT p, CsrBfsCursor* BOLT_RESTRICT c,
+        int64_t s, int64_t v, int64_t* BOLT_RESTRICT out_src,
+        int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
+        int64_t* BOLT_RESTRICT w, int64_t* BOLT_RESTRICT budget,
+        bool* BOLT_RESTRICT cap_hit) noexcept {
+    assert(p != nullptr && c != nullptr && w != nullptr && cap_hit != nullptr);
+    assert(s >= 0 && v >= 0);
+    if (*w >= out_cap) return false;
+    if (c->emitted_for_src >= p->per_source_cap) { *cap_hit = true; return false; }
+    if (out_src != nullptr) out_src[*w] = s;
+    if (out_dst != nullptr) out_dst[*w] = v;
+    ++(*w);
+    ++c->emitted_for_src;
+    return --(*budget) > 0;
+}
+
+// One source under Reach: expand, then emit the queue (the start first when
+// min_hops == 0, last and only if a cycle returned to it when min_hops == 1),
+// then clear the bits this source set.
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE CsrBfsStep csr_reach_run_source(
+        const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g, CsrBfsScratch* BOLT_RESTRICT sc,
+        const CsrBfsParams* BOLT_RESTRICT p, CsrBfsCursor* BOLT_RESTRICT c,
+        int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_dst,
+        int64_t out_cap, int64_t* BOLT_RESTRICT w,
+        int64_t* BOLT_RESTRICT budget) noexcept {
+    assert(g != nullptr && sc != nullptr && sc->queue != nullptr);
+    assert(c != nullptr && c->active == 1 && p->min_hops <= 1);
+    if (c->r_phase == 0) {
+        const CsrBfsStep st = csr_reach_expand(g, sc, p, c, budget);
+        if (st != CsrBfsStep::SourceDone) return st;
+        if (c->r_emit == 0 && p->min_hops == 1) c->r_emit = 1;
+    }
+    const int64_t s = sc->queue[0];
+    bool cap_hit = false;
+    if (c->r_phase == 1) {
+        while (c->r_emit < c->r_tail) {
+            const int64_t v = sc->queue[c->r_emit];
+            const int64_t w0 = *w;
+            const bool more = csr_reach_emit(p, c, s, v, out_src, out_dst,
+                                             out_cap, w, budget, &cap_hit);
+            if (*w != w0) ++c->r_emit;
+            if (cap_hit) return CsrBfsStep::CapHit;
+            if (!more) return CsrBfsStep::Suspended;
+        }
+        c->r_phase = 2;
+    }
+    if (c->r_phase == 2 && p->min_hops == 1 && c->r_self != 0) {
+        const int64_t w0 = *w;
+        const bool more = csr_reach_emit(p, c, s, s, out_src, out_dst, out_cap,
+                                         w, budget, &cap_hit);
+        if (*w != w0) c->r_self = 0;
+        if (cap_hit) return CsrBfsStep::CapHit;
+        if (!more && c->r_self != 0) return CsrBfsStep::Suspended;
+    }
+    for (int64_t i = 0; i < c->r_tail; ++i) {
+        const int64_t v = sc->queue[i];
+        sc->seen[v >> 6] &= ~(uint64_t{1} << (static_cast<uint64_t>(v) & 63u));
+    }
+    c->depth = -1;
+    return CsrBfsStep::SourceDone;
+}
+
 // Contract validation shared by both public kernels. Cheap, always on.
 template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE bool csr_bfs_args_ok(
@@ -316,13 +474,39 @@ BOLT_FORCE_INLINE bool csr_bfs_args_ok(
         return false;
     if (n > 0 && src_ids == nullptr) return false;
     if (g->off == nullptr || g->n_nodes <= 0) return false;
+    if (p->per_source_cap <= 0 || p->visit_budget <= 0) return false;
+    if (p->semantics == CsrPathSemantics::Reach) {
+        if (sc->seen == nullptr || sc->queue == nullptr) return false;
+        return p->min_hops >= 0 && p->min_hops <= 1 &&
+               p->max_hops >= p->min_hops;
+    }
+    if (static_cast<uint8_t>(p->semantics) > 3) return false;
     if (sc->path == nullptr || sc->epath == nullptr || sc->iter == nullptr)
         return false;
     if (p->min_hops < 0 || p->max_hops < p->min_hops ||
         p->max_hops > k_csr_bfs_max_hops)
         return false;
-    if (p->per_source_cap <= 0 || p->visit_budget <= 0) return false;
     return true;
+}
+
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE void csr_reach_start(int64_t s, CsrBfsScratch* sc,
+                                       CsrBfsCursor* c) noexcept {
+    assert(sc != nullptr && c != nullptr && s >= 0);
+    assert(sc->seen != nullptr && sc->queue != nullptr);
+    const bool was = csr_reach_test_set(sc->seen, s);
+    assert(!was && "csr_reach: seen bitmap not clear at source start");
+    (void)was;
+    sc->queue[0]   = s;
+    c->r_phase     = 0;
+    c->r_self      = 0;
+    c->r_scan      = 0;
+    c->r_edge      = -1;
+    c->r_tail      = 1;
+    c->r_lvl_end   = 1;
+    c->r_emit      = 0;
+    c->r_level     = 0;
+    c->depth       = 0;
 }
 
 // Begin the source at cursor->src_index. Returns false for a source id that
@@ -336,15 +520,19 @@ BOLT_FORCE_INLINE bool csr_bfs_start_source(
     assert(g != nullptr && p != nullptr && sc != nullptr);
     const int64_t s = src_ids[cursor->src_index];
     if (s < 0 || s >= g->n_nodes) return false;
+    cursor->emitted_for_src = 0;
+    cursor->active          = 1;
+    if (p->semantics == CsrPathSemantics::Reach) {
+        csr_reach_start<Nbr, Eid>(s, sc, cursor);
+        return true;
+    }
     int64_t s_begin = 0;
     int64_t s_end   = 0;
     csr_graph_block(g, s, &s_begin, &s_end);
     sc->path[0]             = s;
     sc->iter[0]             = s_begin;
     cursor->depth           = 0;
-    cursor->emitted_for_src = 0;
     cursor->pending_emit    = (p->min_hops == 0) ? uint8_t{1} : uint8_t{0};
-    cursor->active          = 1;
     return true;
 }
 
@@ -392,6 +580,8 @@ inline CsrBfsStatus csr_bfs_expand_t(
     *out_rows = 0;
     if (!csr_bfs_args_ok(src_ids, n, g, p, sc, cursor) || out_cap < 0)
         return CsrBfsStatus::InvalidArgument;
+    if (p->semantics == CsrPathSemantics::Reach && out_hops != nullptr)
+        return CsrBfsStatus::InvalidArgument;
     // out_cap == 0 is a no-op poll and returns BEFORE touching the cursor, so
     // a zero-capacity call can never burn budget on work it cannot emit.
     if (out_cap == 0) return CsrBfsStatus::Ok;
@@ -404,8 +594,12 @@ inline CsrBfsStatus csr_bfs_expand_t(
             *out_rows = w;
             return CsrBfsStatus::InvalidArgument;
         }
-        const CsrBfsStep step = csr_bfs_run_source(
-            g, sc, p, cursor, out_src, out_dst, out_hops, out_cap, &w, &budget);
+        const CsrBfsStep step =
+            (p->semantics == CsrPathSemantics::Reach)
+                ? csr_reach_run_source(g, sc, p, cursor, out_src, out_dst,
+                                       out_cap, &w, &budget)
+                : csr_bfs_run_source(g, sc, p, cursor, out_src, out_dst,
+                                     out_hops, out_cap, &w, &budget);
         if (step == CsrBfsStep::CapHit) {
             *out_rows = w;
             return CsrBfsStatus::PerSourceCapExceeded;
@@ -457,9 +651,12 @@ inline CsrBfsStatus csr_bfs_count_t(
         if (cursor->active == 0 &&
             !csr_bfs_start_source(src_ids, g, p, sc, cursor))
             return CsrBfsStatus::InvalidArgument;
-        const CsrBfsStep step = csr_bfs_run_source(
-            g, sc, p, cursor, nullptr, nullptr, nullptr, INT64_MAX,
-            &sink, &budget);
+        const CsrBfsStep step =
+            (p->semantics == CsrPathSemantics::Reach)
+                ? csr_reach_run_source(g, sc, p, cursor, nullptr, nullptr,
+                                       INT64_MAX, &sink, &budget)
+                : csr_bfs_run_source(g, sc, p, cursor, nullptr, nullptr,
+                                     nullptr, INT64_MAX, &sink, &budget);
         if (step == CsrBfsStep::CapHit) return CsrBfsStatus::PerSourceCapExceeded;
         if (step == CsrBfsStep::BadGraph) return CsrBfsStatus::MalformedGraph;
         if (step == CsrBfsStep::Suspended) break;
