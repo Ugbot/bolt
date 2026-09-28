@@ -392,10 +392,11 @@ BOLT_FORCE_INLINE int64_t csr_expand_graph(
         const int64_t* BOLT_RESTRICT src_ids, int64_t n,
         const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
         const int64_t* BOLT_RESTRICT excluded, int32_t n_excl,
-        const int64_t* BOLT_RESTRICT dst_bounds, bool dst_sorted,
+        const int64_t* BOLT_RESTRICT dst_bounds,
         int64_t* BOLT_RESTRICT out_src, int64_t* BOLT_RESTRICT out_edge,
         int64_t* BOLT_RESTRICT out_dst, int64_t out_cap,
-        CsrExpandCursor* BOLT_RESTRICT cursor) noexcept {
+        CsrExpandCursor* BOLT_RESTRICT cursor,
+        bool dst_sorted = false) noexcept {
     assert(cursor != nullptr && n >= 0 && out_cap >= 0);
     assert(n == 0 || (src_ids != nullptr && g != nullptr && g->off != nullptr));
     assert(n_excl >= 0 && n_excl <= k_csr_expand_max_excluded);
@@ -470,8 +471,8 @@ BOLT_FORCE_INLINE int64_t csr_expand_bounded_sorted(
     g.n_nodes     = n_nodes;
     g.want_label  = want_label;
     return csr_expand_graph(src_ids, n, &g, excluded, n_excl, dst_bounds,
-                            dst_sorted, out_src, out_edge, out_dst, out_cap,
-                            cursor);
+                            out_src, out_edge, out_dst, out_cap, cursor,
+                            dst_sorted);
 }
 
 // Bound-destination walk over blocks in insertion (unsorted) order — the
