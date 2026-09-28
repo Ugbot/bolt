@@ -2156,7 +2156,8 @@ void write_schema_element_col(TcOut* o,
                              ? kConvJson
                              : (lg == BoltLogical::Bson) ? kConvBson
                                                           : kConvEnum);
-    } else if (has_converted(c.type)) {
+    } else if (has_converted(c.type) &&
+               !(c.type == BoltType::Timestamp && c.ts_local)) {
         tc_put_field(o, 6, kFI32);
         tc_put_zigzag(o, bolt_to_pq_converted(c.type));
     }
@@ -2179,6 +2180,17 @@ void write_schema_element_col(TcOut* o,
         tc_put_field(o, 10, kFStruct);
         tc_put_field(o, (lg == BoltLogical::Enum) ? 4 : 11, kFStruct);
         tc_put_stop(o);                      // empty EnumType / NullType
+        tc_put_stop(o);                      // end LogicalType union
+    }
+    if (c.type == BoltType::Timestamp && c.ts_local) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, 8, kFStruct);        // TIMESTAMP
+        tc_put_field(o, 1, kFFalse);         // isAdjustedToUTC
+        tc_put_field(o, 2, kFStruct);        // unit
+        tc_put_field(o, 2, kFStruct);        // MICROS
+        tc_put_stop(o);                      // empty MicroSeconds
+        tc_put_stop(o);                      // end TimeUnit union
+        tc_put_stop(o);                      // end TimestampType
         tc_put_stop(o);                      // end LogicalType union
     }
     // 9 field_id — see ParquetWriteColumn::has_field_id's doc comment

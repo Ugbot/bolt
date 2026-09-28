@@ -1069,6 +1069,11 @@ target_link_libraries(test_bolt_float_chars PRIVATE bolt::bolt GTest::gtest_main
 bolt_apply_hardening(test_bolt_float_chars PRIVATE)
 add_test(NAME bolt_float_chars COMMAND test_bolt_float_chars)
 
+add_executable(test_bolt_parquet_write_ts_local test_bolt_parquet_write_ts_local.cpp)
+target_link_libraries(test_bolt_parquet_write_ts_local PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_ts_local PRIVATE)
+add_test(NAME bolt_parquet_write_ts_local COMMAND test_bolt_parquet_write_ts_local)
+
 # Lock-free queue zoo (Wave: morsel-distribution substrate).
 # Borrowed from chukonu-v1 lockfree_queue.h, stripped of Arrow / shared_ptr
 # and rebuilt to Bolt's Tiger-Style header-only rules.

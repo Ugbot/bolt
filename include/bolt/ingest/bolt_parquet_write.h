@@ -267,6 +267,11 @@ struct ParquetWriteColumn {
     // annotation like this is conventionally identical across row groups.
     ParquetColumnKeyValue column_kv[kPwColKvMaxPairs];
     std::uint32_t         n_column_kv;
+    // Timestamp only: true writes LogicalType TIMESTAMP(isAdjustedToUTC=false,
+    // MICROS) and no ConvertedType (TIMESTAMP_MICROS implies UTC), i.e. a SQL
+    // TIMESTAMP WITHOUT TIME ZONE / Iceberg `timestamp`. false (zero-init)
+    // keeps the UTC-adjusted form every existing caller writes.
+    bool                  ts_local;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
