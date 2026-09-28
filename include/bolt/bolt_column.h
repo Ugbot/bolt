@@ -1913,9 +1913,14 @@ inline BoltColumn BoltColumn::materialize(Arena* arena_in) const noexcept {
 
     if (format == ColumnFormat::Flat) return clone_into(arena_in);
 
-    // For Dictionary the outer type_size_bytes is the key width, not the
-    // logical value width — consult the type-size table instead.
-    size_t tsz = (format == ColumnFormat::Dictionary)
+    // For Dictionary the outer type_size_bytes is the key width, and for
+    // Sequence / Constant it is the width of the stored seed value (always 8
+    // for a sequence), not the logical value width — so those consult the
+    // type-size table. A Flat result must be as wide as its type says.
+    const bool logical_width = format == ColumnFormat::Dictionary ||
+                               format == ColumnFormat::Sequence ||
+                               format == ColumnFormat::Constant;
+    size_t tsz = (logical_width && bolt::type_size(type) != 0)
         ? bolt::type_size(type)
         : (type_size_bytes ? (size_t)type_size_bytes : bolt::type_size(type));
     if (tsz == 0) return make_empty();

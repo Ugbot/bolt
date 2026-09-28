@@ -847,6 +847,21 @@ target_link_libraries(test_bolt_csr_isect
 bolt_apply_hardening(test_bolt_csr_isect)
 add_test(NAME test_bolt_csr_isect COMMAND test_bolt_csr_isect)
 
+# G2GRAPH-359 (GF1) — CSR kernels against a plain edge-list model (seeded;
+# BOLT_CSR_FUZZ_SEED / _ITERS / _FIRST replay).
+add_executable(test_bolt_csr_fuzz test_bolt_csr_fuzz.cpp)
+target_link_libraries(test_bolt_csr_fuzz
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_csr_fuzz)
+add_test(NAME test_bolt_csr_fuzz COMMAND test_bolt_csr_fuzz)
+
+# G2GRAPH-359 — materialize() of encoded Int32 columns is Int32-wide.
+add_executable(test_bolt_materialize_width test_bolt_materialize_width.cpp)
+target_link_libraries(test_bolt_materialize_width
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_materialize_width)
+add_test(NAME test_bolt_materialize_width COMMAND test_bolt_materialize_width)
+
 # Variable-length CSR traversal (bolt_csr_bfs.h): WALK/TRAIL/SIMPLE expansion
 # and the aggregate-pushdown count twin. Expected values come from
 # tests/csr_bfs_enumerate.py and (for the randomized graph) networkx.
