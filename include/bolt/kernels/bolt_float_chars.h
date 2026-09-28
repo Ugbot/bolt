@@ -307,6 +307,53 @@ inline uint32_t f64_to_chars(char* out, uint32_t cap, double v) noexcept {
     return n;
 }
 
+// Formats v like Go's strconv.FormatFloat(v, 'f', -1, 64): the shortest
+// round-trip digits, always in fixed notation (never an exponent), a large
+// value padded with zeros after those digits. NaN / +Inf / -Inf spelled as Go
+// does. Returns the byte count, or 0 when cap is too small (a finite double
+// needs at most 330 bytes).
+inline uint32_t f64_to_chars_fixed(char* out, uint32_t cap, double v) noexcept {
+    assert(out != nullptr);
+    assert(cap <= (1u << 20));
+    if (std::isnan(v)) {
+        if (cap < 3) return 0;
+        std::memcpy(out, "NaN", 3);
+        return 3;
+    }
+    if (std::isinf(v)) {
+        if (cap < 4) return 0;
+        std::memcpy(out, v < 0.0 ? "-Inf" : "+Inf", 4);
+        return 4;
+    }
+    uint32_t n = 0;
+    auto put = [&](char c) noexcept { if (n < cap) out[n] = c; ++n; };
+    if (std::signbit(v)) put('-');
+    if (v == 0.0) {
+        put('0');
+    } else {
+        char d[20];
+        int32_t k = 0;   // |v| ~= 0.d1..dn * 10^k
+        const uint32_t nd = detail::shortest_digits(std::fabs(v), d, &k);
+        assert(nd >= 1 && nd <= 17);
+        if (k <= 0) {
+            put('0');
+            put('.');
+            for (int32_t i = 0; i < -k; ++i) put('0');          // <= 323
+            for (uint32_t i = 0; i < nd; ++i) put(d[i]);
+        } else if (static_cast<uint32_t>(k) >= nd) {
+            for (uint32_t i = 0; i < nd; ++i) put(d[i]);
+            for (int32_t i = static_cast<int32_t>(nd); i < k; ++i) put('0');  // <= 309
+        } else {
+            const uint32_t uk = static_cast<uint32_t>(k);
+            for (uint32_t i = 0; i < uk; ++i) put(d[i]);
+            put('.');
+            for (uint32_t i = uk; i < nd; ++i) put(d[i]);
+        }
+    }
+    assert(n <= 400);
+    return n <= cap ? n : 0;
+}
+
 }  // namespace float_chars
 }  // namespace kernels
 }  // namespace bolt
