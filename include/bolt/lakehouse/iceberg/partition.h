@@ -41,6 +41,18 @@ bool partition_passes(const DataFileRef* f, const PartitionSpec* spec,
                       const ::bolt::lakehouse::Predicate* preds,
                       uint32_t n_preds) noexcept;
 
+struct ManifestListEntry;
+
+// Manifest-level pruning from the manifest list's partition summaries
+// (G2ICE-234): false only when the summaries PROVE no file in the manifest
+// can satisfy the conjunction `preds`. Identity, day and hour transforms over
+// integral sources; anything else (or a missing/undecodable summary) keeps
+// the manifest.
+bool manifest_may_match(const ManifestListEntry* e, const PartitionSpec* spec,
+                        const Schema* schema,
+                        const ::bolt::lakehouse::Predicate* preds,
+                        uint32_t n_preds) noexcept;
+
 }  // namespace iceberg
 }  // namespace lakehouse
 }  // namespace bolt

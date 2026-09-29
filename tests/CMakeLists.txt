@@ -1900,6 +1900,16 @@ target_compile_definitions(test_bolt_iceberg_real_scan PRIVATE
 bolt_apply_hardening(test_bolt_iceberg_real_scan)
 add_test(NAME test_bolt_iceberg_real_scan COMMAND test_bolt_iceberg_real_scan)
 
+# G2ICE-234 — manifest-list partition-summary pruning + the Avro union
+# logical-type branch, over a pyiceberg-written day-partitioned table.
+add_executable(test_bolt_iceberg_manifest_pruning test_bolt_iceberg_manifest_pruning.cpp)
+target_link_libraries(test_bolt_iceberg_manifest_pruning
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_iceberg_manifest_pruning PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_iceberg_manifest_pruning)
+add_test(NAME test_bolt_iceberg_manifest_pruning COMMAND test_bolt_iceberg_manifest_pruning)
+
 # W5 — Iceberg write path.
 add_executable(test_bolt_lakehouse_iceberg_write test_bolt_lakehouse_iceberg_write.cpp)
 target_link_libraries(test_bolt_lakehouse_iceberg_write
