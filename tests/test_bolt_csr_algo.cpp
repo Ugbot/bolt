@@ -10,6 +10,7 @@
 #include "bolt/kernels/bolt_csr_bfs.h"
 #include "bolt/kernels/bolt_csr_components.h"
 #include "bolt/kernels/bolt_csr_dijkstra.h"
+#include "bolt/kernels/bolt_csr_levels.h"
 #include "bolt/kernels/bolt_csr_pagerank.h"
 #include "bolt/kernels/bolt_csr_similarity.h"
 
@@ -221,4 +222,23 @@ TEST(CsrAlgo, ScratchIsBudgetCharged) {
     EXPECT_EQ(budget.used(), 800u);
     alloc.release();
     EXPECT_EQ(budget.used(), 0u);
+}
+
+TEST(CsrAlgo, BfsLevelsDepthBoundAndUnreached) {
+    // 0->1->2->3, 0->2 shortcut, 4->0 (0 cannot reach 4), 3->3 self-loop.
+    Graph g(5, {{0, 1}, {1, 2}, {2, 3}, {0, 2}, {4, 0}, {3, 3}});
+    int64_t depth[5], q[5], reached = 0;
+    ASSERT_EQ(bk::csr_bfs_levels(&g.g, 0, -1, depth, q, &reached), bk::CsrAlgoStatus::Ok);
+    const int64_t want[5] = {0, 1, 1, 2, -1};
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(depth[i], want[i]) << i;
+    EXPECT_EQ(reached, 4);
+    ASSERT_EQ(bk::csr_bfs_levels(&g.g, 0, 1, depth, q, &reached), bk::CsrAlgoStatus::Ok);
+    EXPECT_EQ(depth[3], -1);
+    EXPECT_EQ(reached, 3);
+    ASSERT_EQ(bk::csr_bfs_levels(&g.g, 0, 0, depth, q, &reached), bk::CsrAlgoStatus::Ok);
+    EXPECT_EQ(reached, 1);
+    EXPECT_EQ(bk::csr_bfs_levels(&g.g, 5, -1, depth, q, &reached),
+              bk::CsrAlgoStatus::InvalidArgument);
+    EXPECT_EQ(bk::csr_bfs_levels(&g.g, 0, -1, depth, nullptr, &reached),
+              bk::CsrAlgoStatus::InvalidArgument);
 }

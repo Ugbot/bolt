@@ -17,6 +17,7 @@
 #include "bolt/kernels/bolt_csr_bfs.h"
 #include "bolt/kernels/bolt_csr_components.h"
 #include "bolt/kernels/bolt_csr_dijkstra.h"
+#include "bolt/kernels/bolt_csr_levels.h"
 #include "bolt/kernels/bolt_csr_pagerank.h"
 #include "bolt/kernels/bolt_csr_similarity.h"
 
@@ -266,6 +267,20 @@ void run_case(const Case& c) {
             std::printf("MISMATCH dijkstra compact\n");
         std::printf("dj %" PRId64 " %d", src, st);
         for (double x : d) std::printf(" %.17g", x);
+        std::printf("\n");
+    }
+    for (int64_t src = 0; src < c.n; ++src) {
+        std::vector<int64_t> dep(static_cast<size_t>(c.n)), dep32(dep.size()),
+            q(dep.size());
+        int64_t got = 0, got32 = 0;
+        const int st = static_cast<int>(
+            bk::csr_bfs_levels(&g, src, c.max_hops - 1, dep.data(), q.data(), &got));
+        const int st32 = static_cast<int>(
+            bk::csr_bfs_levels(&g32, src, c.max_hops - 1, dep32.data(), q.data(), &got32));
+        if (dep != dep32 || st != st32 || got != got32)
+            std::printf("MISMATCH bfs levels compact\n");
+        std::printf("lv %" PRId64 " %d %" PRId64, src, st, got);
+        for (int64_t x : dep) std::printf(" %" PRId64, x);
         std::printf("\n");
     }
     for (int k = 0; k < 2; ++k) {

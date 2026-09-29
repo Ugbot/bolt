@@ -6,7 +6,8 @@ edges, disconnected pieces, two relationship labels), feeds them to
 graph_algo_fuzz_harness, and checks every answer against an engine that
 shares no code with bolt:
 
-  degree, pagerank, wcc, scc, dijkstra   networkx (MultiDiGraph)
+  degree, pagerank, wcc, scc, dijkstra,
+  bfs levels                             networkx (MultiDiGraph)
   jaccard / overlap                      set arithmetic on successor sets
   walk / trail / simple / reach paths    a brute-force path enumerator
 
@@ -139,9 +140,12 @@ def parse_output(text):
         if not parts:
             continue
         if parts[0] == "case":
-            cur = {"id": int(parts[1]), "dj": {}, "paths": {}}
+            cur = {"id": int(parts[1]), "dj": {}, "lv": {}, "paths": {}}
         elif parts[0] == "end":
             cases.append(cur)
+        elif parts[0] == "lv":
+            cur["lv"][int(parts[1])] = (int(parts[2]), int(parts[3]),
+                                        [int(x) for x in parts[4:]])
         elif parts[0] == "dj":
             cur["dj"][int(parts[1])] = (int(parts[2]), [float(x) for x in parts[3:]])
         elif parts[0] == "path":
@@ -184,6 +188,14 @@ def check(case, got):
         if st != 0 or any(not (d == e or close(d, e, 1e-12))
                           for d, e in zip(dist, exp)):
             errs.append(f"dijkstra from {s}: {st} {dist} want {exp}")
+    cut = case["max_hops"] - 1                   # -1 = unbounded
+    for s in range(n):
+        st, reached, dep = got["lv"][s]
+        want = nx.single_source_shortest_path_length(
+            g, s, cutoff=None if cut < 0 else cut)
+        exp = [want.get(i, -1) for i in range(n)]
+        if st != 0 or dep != exp or reached != len(want):
+            errs.append(f"bfs levels from {s} cut={cut}: {st} {reached} {dep} want {exp}")
     succ = [set(v for _, v in g.out_edges(i)) for i in range(n)]
     k = 0
     for a in range(n):
