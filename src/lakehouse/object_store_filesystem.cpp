@@ -62,6 +62,30 @@ int fs_get(void* impl, const char* key, Arena* arena,
     return kOsOk;
 }
 
+int fs_get_range(void* impl, const char* key, uint64_t offset, uint64_t len,
+                 uint8_t* dst, uint64_t* out_len) noexcept {
+    assert(impl != nullptr && key != nullptr);
+    assert(out_len != nullptr && (dst != nullptr || len == 0));
+    *out_len = 0;
+    FilesystemObjectStore* fs = static_cast<FilesystemObjectStore*>(impl);
+    char path[kOsMaxRoot + kOsMaxKey + 2u];
+    if (!join_path(fs->root, key, path, sizeof(path))) return kOsBadArg;
+    std::FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return kOsNotFound;
+    if (offset > static_cast<uint64_t>(INT64_MAX) ||
+        std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
+        std::fclose(f);
+        return kOsBadArg;
+    }
+    const size_t got = len == 0 ? 0u : std::fread(dst, 1, static_cast<size_t>(len), f);
+    const bool err = std::ferror(f) != 0;
+    std::fclose(f);
+    if (err) return kOsIoError;
+    *out_len = got;
+    assert(*out_len <= len);
+    return kOsOk;
+}
+
 int fs_put(void* impl, const char* key, const uint8_t* data,
            uint64_t len) noexcept {
     assert(impl != nullptr);
@@ -284,6 +308,7 @@ int fs_put_if_absent(void* impl, const char* key, const uint8_t* data,
 
 const ObjectStoreVT kFilesystemVT = {
     fs_get, fs_put, fs_list, fs_delete, fs_head, fs_put_if_absent,
+    fs_get_range,
 };
 
 }  // namespace

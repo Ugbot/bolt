@@ -80,7 +80,7 @@ bool s3_target(const S3ObjectStore* s3, const char* key, const char* query,
 int s3_send(S3ObjectStore* s3, const char* method, const char* key,
             const char* query, const uint8_t* body, uint64_t len,
             bool if_none_match, Arena* arena,
-            net::HttpResponse* resp) noexcept {
+            net::HttpResponse* resp, const char* range = nullptr) noexcept {
     assert(s3 != nullptr && method != nullptr && key != nullptr);
     assert(arena != nullptr && resp != nullptr);
     if (len > net::kHttpMaxBody) return kOsBadArg;
@@ -144,6 +144,7 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
     if (len == 0 && std::strcmp(method, "PUT") == 0) {
         ok = ok && net::http_request_add_header(&req, "Content-Length", "0");
     }
+    if (range != nullptr) ok = ok && net::http_request_add_header(&req, "Range", range);
     if (!ok) return kOsBadArg;
     return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
 }
@@ -162,6 +163,40 @@ int s3_get(void* impl, const char* key, Arena* arena,
     if (st != kOsOk) return st;
     *out_data = resp.body;
     *out_len = resp.body_len;
+    return kOsOk;
+}
+
+// Ranged GET. A 206 carries exactly the range; a server that ignores Range
+// answers 200 with the whole object, from which the range is cut.
+int s3_get_range(void* impl, const char* key, uint64_t offset, uint64_t len,
+                 uint8_t* dst, uint64_t* out_len) noexcept {
+    assert(impl != nullptr && key != nullptr);
+    assert(out_len != nullptr && (dst != nullptr || len == 0));
+    *out_len = 0;
+    if (len == 0) return kOsOk;
+    if (offset > UINT64_MAX - len) return kOsBadArg;
+    char range[64];
+    std::snprintf(range, sizeof(range), "bytes=%llu-%llu",
+                  static_cast<unsigned long long>(offset),
+                  static_cast<unsigned long long>(offset + len - 1u));
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "GET", key, "",
+                           nullptr, 0, false, &scratch, &resp, range);
+    if (rc != kOsOk) return rc;
+    if (resp.status == 416) return kOsOk;               // offset at/after end
+    const int st = oshttp::map_status(resp.status);
+    if (st != kOsOk) return st;
+    const uint8_t* src = resp.body;
+    uint64_t n = resp.body_len;
+    if (resp.status == 200) {                           // Range ignored
+        if (offset >= n) return kOsOk;
+        src += offset;
+        n -= offset;
+    }
+    if (n > len) n = len;
+    std::memcpy(dst, src, static_cast<size_t>(n));
+    *out_len = n;
     return kOsOk;
 }
 
@@ -285,6 +320,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head, s3_put_if_absent,
+    s3_get_range,
 };
 
 // Bounded config-field copy. Returns false on overflow.

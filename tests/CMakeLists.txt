@@ -2258,6 +2258,15 @@ target_link_libraries(test_bolt_lakehouse_growth
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_lakehouse_growth)
 add_test(NAME test_bolt_lakehouse_growth COMMAND test_bolt_lakehouse_growth)
+# G2ICE-235: ranged GET on the object-store trait (filesystem + S3 Range over
+# a local HTTP server that honours or ignores it). POSIX sockets.
+if(NOT WIN32)
+    add_executable(test_bolt_object_store_range test_bolt_object_store_range.cpp)
+    target_link_libraries(test_bolt_object_store_range
+        PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_object_store_range)
+    add_test(NAME test_bolt_object_store_range COMMAND test_bolt_object_store_range)
+endif()
 # Scale proof vs pyiceberg/DuckDB; skipped unless BOLT_L5_SCALE_DIR names the
 # output of scripts/l5_iceberg_scale.py.
 add_executable(test_bolt_lakehouse_scale test_bolt_lakehouse_scale.cpp)
