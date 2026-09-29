@@ -76,6 +76,14 @@ struct ObjectStoreVT {
     // then reports kOsNotImplemented) — it must never be emulated.
     int (*put_if_absent)(void* impl, const char* key,
                          const uint8_t* data, uint64_t len) noexcept;
+
+    // GET bytes [offset, offset + len) of `key` into the caller's `dst`
+    // (capacity `len`); *out_len gets the bytes read, short only at the end
+    // of the object. One request per call, so a caller reading a large
+    // object bounds its buffer and chooses its request size. Null on a store
+    // without ranged reads (os_get_range reports kOsNotImplemented).
+    int (*get_range)(void* impl, const char* key, uint64_t offset,
+                     uint64_t len, uint8_t* dst, uint64_t* out_len) noexcept;
 };
 
 struct ObjectStore {
@@ -142,6 +150,15 @@ inline int os_put_if_absent(ObjectStore* s, const char* key, const uint8_t* d,
     assert(key != nullptr && (d != nullptr || n == 0));
     if (s->vt->put_if_absent == nullptr) return kOsNotImplemented;
     return s->vt->put_if_absent(s->impl, key, d, n);
+}
+
+inline int os_get_range(ObjectStore* s, const char* key, uint64_t offset,
+                        uint64_t len, uint8_t* dst, uint64_t* out_len) noexcept {
+    assert(s != nullptr && s->vt != nullptr);
+    assert(key != nullptr && out_len != nullptr && (dst != nullptr || len == 0));
+    *out_len = 0;
+    if (s->vt->get_range == nullptr) return kOsNotImplemented;
+    return s->vt->get_range(s->impl, key, offset, len, dst, out_len);
 }
 
 // ---------------------------------------------------------------------------
