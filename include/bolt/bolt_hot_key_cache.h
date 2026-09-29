@@ -72,6 +72,7 @@ template <typename K, uint32_t RowBytes, uint32_t Capacity,
 struct alignas(64) HotKeyCache {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity power of 2");
     static_assert(RowBytes >= 8 && RowBytes <= 256, "RowBytes bound");
+    static_assert(RowBytes % 8u == 0u, "payload is copied in 8-byte words");
 
     struct alignas(64) Slot {
         // Packed: [63..16] = key bits (K fits in 48 bits minimum),
@@ -96,8 +97,9 @@ struct alignas(64) HotKeyCache {
         // store by a write is treated as a miss (caller reads the store)
         // rather than serving a stale row. Written under the seqlock.
         uint64_t              commit_lsn;
-        // Row data copy.
-        uint8_t               row_data[RowBytes];
+        // Row data copy. Payload words go through atomic_ref (relaxed): the
+        // seqlock tolerates a torn read, the C++ memory model does not.
+        alignas(8) uint8_t    row_data[RowBytes];
     };
     static_assert(sizeof(Slot) <= 384, "Slot exceeds 384B — bump padding math");
 
@@ -116,14 +118,53 @@ struct alignas(64) HotKeyCache {
 
     static constexpr uint32_t kMask = Capacity - 1;
     static constexpr uint64_t kKeyMask48 = 0xFFFFFFFFFFFFull;
+    // Bounded wait for another writer to leave a slot before giving up the
+    // insert (a skipped insert only costs a cache miss).
+    static constexpr uint32_t kWriterSpin = 1024u;
+
+    static BOLT_FORCE_INLINE uint64_t ld64(const uint64_t& x) noexcept {
+        return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(x))
+            .load(std::memory_order_relaxed);
+    }
+    static BOLT_FORCE_INLINE void st64(uint64_t& x, uint64_t v) noexcept {
+        std::atomic_ref<uint64_t>(x).store(v, std::memory_order_relaxed);
+    }
+
+    // `len` bytes out of a slot payload, word by word.
+    static BOLT_FORCE_INLINE void payload_load(uint8_t* dst, const uint8_t* src,
+                                               uint32_t len) noexcept {
+        assert(len <= RowBytes);
+        assert((reinterpret_cast<uintptr_t>(src) & 7u) == 0u);
+        uint32_t i = 0;
+        for (; i + 8u <= len; i += 8u) {
+            const uint64_t w = ld64(*reinterpret_cast<const uint64_t*>(src + i));
+            std::memcpy(dst + i, &w, 8u);
+        }
+        if (i < len) {
+            const uint64_t w = ld64(*reinterpret_cast<const uint64_t*>(src + i));
+            std::memcpy(dst + i, &w, len - i);
+        }
+    }
+
+    // A full RowBytes payload from `len` source bytes, zero-padded.
+    static BOLT_FORCE_INLINE void payload_store(uint8_t* dst, const uint8_t* src,
+                                                uint32_t len) noexcept {
+        assert(len <= RowBytes);
+        assert((reinterpret_cast<uintptr_t>(dst) & 7u) == 0u);
+        for (uint32_t i = 0; i < RowBytes; i += 8u) {
+            uint64_t w = 0u;
+            if (i < len) std::memcpy(&w, src + i, (len - i) < 8u ? (len - i) : 8u);
+            st64(*reinterpret_cast<uint64_t*>(dst + i), w);
+        }
+    }
 
     BOLT_FORCE_INLINE void init() noexcept {
         for (uint32_t i = 0; i < Capacity; ++i) {
             slots[i].key_tag.store(0, std::memory_order_relaxed);
             slots[i].seq.store(0, std::memory_order_relaxed);
             slots[i].access_count.store(0, std::memory_order_relaxed);
-            slots[i].layout_gen = 0;
-            slots[i].commit_lsn = 0;
+            st64(slots[i].layout_gen, 0u);
+            st64(slots[i].commit_lsn, 0u);
             std::memset(slots[i].row_data, 0, RowBytes);
         }
         access_tick.store_relaxed(0);
@@ -150,7 +191,7 @@ struct alignas(64) HotKeyCache {
                 continue;
             }
             const uint64_t slot_key = tag >> 16;
-            if (slot_key == (ku & 0xFFFFFFFFFFFFu) && s.layout_gen == layout_gen) {
+            if (slot_key == (ku & 0xFFFFFFFFFFFFu) && ld64(s.layout_gen) == layout_gen) {
                 s.access_count.fetch_add(1, std::memory_order_relaxed);
                 return s.row_data;
             }
@@ -196,7 +237,7 @@ struct alignas(64) HotKeyCache {
                 continue;
             }
             if ((tag1 >> 16) != (ku & kKeyMask48) ||
-                s.layout_gen != layout_gen) {
+                ld64(s.layout_gen) != layout_gen) {
                 idx = (idx + 1) & kMask;
                 continue;
             }
@@ -208,8 +249,8 @@ struct alignas(64) HotKeyCache {
             if ((s1 & 1u) != 0u) return false;   // write in progress → miss
             // Freshness gate: the row read here is consistent (tag1/seq stable,
             // so commit_lsn is from a completed insert, validated by s2 below).
-            if (s.commit_lsn < min_commit_lsn) return false;   // lagging → miss
-            std::memcpy(dst, s.row_data, len);
+            if (ld64(s.commit_lsn) < min_commit_lsn) return false;   // lagging → miss
+            payload_load(dst, s.row_data, len);
             // Full barrier: an ACQUIRE fence only stops later ops from moving
             // BEFORE it — it would NOT stop the row_data copy (prior loads)
             // from sinking BELOW the tag2 reload on weak memory (ARM), which
@@ -279,8 +320,17 @@ struct alignas(64) HotKeyCache {
         // a concurrent insert is always detected — ABA-free, unlike the 8-bit
         // tag "version" below which wraps after 256 inserts (a reader preempted
         // mid-copy while 256 inserts land could see tag2==tag1 on a torn row).
-        const uint32_t s0 = v.seq.load(std::memory_order_relaxed);
-        v.seq.store(s0 + 1u, std::memory_order_relaxed);   // odd
+        // Writers take the slot by moving seq even -> odd with a CAS: two
+        // inserts landing on one slot must not interleave their payloads
+        // under one even sequence (a reader would accept the mix).
+        uint32_t s0 = v.seq.load(std::memory_order_relaxed);
+        for (uint32_t spin = 0; ; ++spin) {
+            if ((s0 & 1u) == 0u &&
+                v.seq.compare_exchange_weak(s0, s0 + 1u, std::memory_order_relaxed,
+                                            std::memory_order_relaxed)) break;
+            if (spin >= kWriterSpin) return;
+            s0 = v.seq.load(std::memory_order_relaxed);
+        }
         const uint64_t ver =
             (write_seq.fetch_add(1, std::memory_order_relaxed) + 1u) & 0xFFu;
         const uint64_t key_bits = (ku & kKeyMask48) << 16;
@@ -296,12 +346,9 @@ struct alignas(64) HotKeyCache {
         // changed sequence (and its s2==s1 re-check fails → miss). Pairs with
         // lookup_copy's seq_cst fence on the read side.
         std::atomic_thread_fence(std::memory_order_release);
-        v.layout_gen = layout_gen;
-        v.commit_lsn = commit_lsn;
-        std::memcpy(v.row_data, row, row_len);
-        if (row_len < RowBytes) {
-            std::memset(v.row_data + row_len, 0, RowBytes - row_len);
-        }
+        st64(v.layout_gen, layout_gen);
+        st64(v.commit_lsn, commit_lsn);
+        payload_store(v.row_data, row, row_len);
         v.access_count.store(1, std::memory_order_relaxed);
         const uint64_t stable_tag = key_bits |
             (static_cast<uint64_t>(kHotKeyFlagOccupied) << 8) | ver;
