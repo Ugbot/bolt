@@ -157,6 +157,8 @@ include/bolt/lakehouse/iceberg/delete_file.h::kIcebergMaxDeleteFiles
 include/bolt/lakehouse/iceberg/delete_file.h::kIcebergMaxPath
 include/bolt/lakehouse/iceberg/manifest.h::kIcebergMaxManifestEntries
 include/bolt/lakehouse/iceberg/manifest.h::kIcebergMaxManifestsPerList
+include/bolt/lakehouse/iceberg/manifest.h::kIcebergMaxSummaries
+include/bolt/lakehouse/iceberg/manifest.h::kIcebergMaxSummaryBound
 include/bolt/lakehouse/iceberg/metadata.h::kIcebergMaxLocation
 include/bolt/lakehouse/iceberg/metadata.h::kIcebergMaxMetadataLog
 include/bolt/lakehouse/iceberg/metadata.h::kIcebergMaxTypeName
