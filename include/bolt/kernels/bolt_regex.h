@@ -11,28 +11,33 @@
 //   literal chars          matched verbatim
 //   .                       any single character (one UTF-8 code point)
 //   [abc] / [^abc] / [a-z]  character class over ASCII, optional negation,
-//                           ranges; a negated class matches any non-ASCII
-//                           character whole
-//   ?  *  +                 quantifier on the PRECEDING atom (greedy)
+//                           ranges, escapes and \d \w \s inside; a negated
+//                           class matches any non-ASCII character whole
+//   \d \w \s \D \W \S         RE2's ASCII Perl classes
+//   ?  *  +  {m} {m,} {m,n}  quantifier on the PRECEDING atom or group
+//                           (greedy; a `?` suffix makes it lazy), m,n <= 1000
 //   ( ... )                 capturing group (up to kMaxGroups - 1, 1-based)
 //   (?: ... )                non-capturing group
 //   ^  $                    anchor start / end of string
-//   \.  \\  \(  \)  \[  \]  \+  \*  \?  \^  \$   escaped metacharacter
+//   \n \t \r \f \v         control characters
+//   \<punctuation>          that character literally
+//   {                        literal when not repetition syntax (as RE2)
 //
-// NOT supported (documented gap, not attempted): alternation `|`, backrefs
-// INSIDE the pattern, lazy quantifiers (`*?`), bounded repeat `{m,n}`,
-// lookaround, Unicode character classes (`\d`/`\w`/`\s`), non-ASCII
-// bytes inside `[...]`, a quantifier on a non-ASCII literal (it would bind to
-// the character's last byte). A pattern using unsupported syntax fails to compile
-// (returns false), which the SQL layer surfaces as a clean InvalidInput
-// rather than a wrong match.
+// NOT supported: alternation `|`, back-references, word boundaries (`\b`),
+// lookaround, flags `(?i)`, POSIX classes `[[:alpha:]]`, Unicode classes,
+// non-ASCII bytes inside `[...]`, a quantifier on a non-ASCII literal (it
+// would bind to the character's last byte). Every byte of a pattern is either
+// understood or refused: an unsupported construct, a repetition operator with
+// no argument (`*a`, `a**`) or an invalid count (`a{2,1}`) fails to compile
+// (returns false), which the SQL layer surfaces as a clean InvalidInput rather
+// than a wrong match.
 //
 // Compile once (at SQL lowering / plan-build time, NOT per row) into a
 // fixed-size CompiledPattern; match/substitute run per row against that
 // compiled form — no per-row parsing, no per-row allocation. Backtracking
 // is bounded by an explicit step budget (Tiger Style: no unbounded work) —
-// a pathological pattern/input combination degrades to "no match" rather
-// than hanging.
+// a pathological pattern/input combination sets MatchResult::exhausted,
+// which callers turn into an error rather than a "no match".
 //
 // Tiger Style: noexcept, no exceptions, no heap allocation, fixed caps,
 // >=2 asserts/fn, functions <=70 lines (split via small helpers where the
@@ -55,6 +60,7 @@
 #include <cstring>
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/bolt_regex_limits.h"
 #include "bolt/kernels/bolt_utf8_cp.h"
 
 namespace bolt {
@@ -93,6 +99,7 @@ struct Node {
     uint8_t    group_id;                    // GroupStart: 0 = non-capturing
     uint8_t    negate;                      // Class
     uint8_t    n_ranges;                     // Class
+    uint8_t    lazy;                         // quantifier prefers fewest reps
     ClassRange ranges[kMaxClassRanges];      // Class
     uint16_t   min_rep;                      // quantifier lower bound
     uint16_t   max_rep;                      // quantifier upper bound (kUnbounded)
@@ -109,9 +116,82 @@ struct CompiledPattern {
 // Compile
 // ---------------------------------------------------------------------
 
+// Add ranges [lo,hi] to a class node; false when the node is full.
+inline bool regex_class_add(Node* n, std::uint8_t lo, std::uint8_t hi) noexcept {
+    assert(n != nullptr);
+    assert(lo <= hi);
+    if (n->n_ranges >= kMaxClassRanges) return false;
+    n->ranges[n->n_ranges].lo = lo;
+    n->ranges[n->n_ranges].hi = hi;
+    n->n_ranges += 1;
+    return true;
+}
+
+// `\d \w \s` (RE2/Perl ASCII classes) added to a class node.
+inline bool regex_class_add_perl(Node* n, char e) noexcept {
+    assert(n != nullptr);
+    assert(e == 'd' || e == 'w' || e == 's');
+    switch (e) {
+        case 'd': return regex_class_add(n, '0', '9');
+        case 'w': return regex_class_add(n, '0', '9') && regex_class_add(n, 'A', 'Z') &&
+                         regex_class_add(n, '_', '_') && regex_class_add(n, 'a', 'z');
+        default:  return regex_class_add(n, '\t', '\n') && regex_class_add(n, '\f', '\r') &&
+                         regex_class_add(n, ' ', ' ');
+    }
+}
+
+// Byte a single-character escape `\e` stands for, or -1 when `e` is not a
+// literal escape (`\d`-style classes, word boundaries, back-references and
+// every other letter/digit are not literals).
+inline int regex_escape_literal(char e) noexcept {
+    const auto u = static_cast<std::uint8_t>(e);
+    switch (e) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        default: break;
+    }
+    const bool alnum = (e >= '0' && e <= '9') || (e >= 'A' && e <= 'Z') ||
+                       (e >= 'a' && e <= 'z');
+    if (alnum || u >= 0x80u) return -1;
+    return static_cast<int>(u);
+}
+
+// One class member at `*io`: a byte, an escape, or `\d\w\s`. Writes the
+// member byte to `*out_b` (or 0x100 after adding a Perl class). False on
+// anything outside the subset (POSIX `[:..:]`, non-ASCII, bad escape).
+inline bool regex_class_member(const char* pat, uint32_t len, uint32_t* io,
+                               Node* n, uint32_t* out_b) noexcept {
+    assert(pat != nullptr && io != nullptr && n != nullptr && out_b != nullptr);
+    assert(*io < len);
+    const char c = pat[*io];
+    if (c == '[' && *io + 1 < len &&
+        (pat[*io + 1] == ':' || pat[*io + 1] == '=' || pat[*io + 1] == '.')) {
+        return false;
+    }
+    if (c != '\\') {
+        *out_b = static_cast<std::uint8_t>(c);
+        *io += 1;
+        return *out_b < 0x80u;
+    }
+    if (*io + 1 >= len) return false;
+    const char e = pat[*io + 1];
+    *io += 2;
+    if (e == 'd' || e == 'w' || e == 's') {
+        *out_b = 0x100u;
+        return regex_class_add_perl(n, e);
+    }
+    const int lit = regex_escape_literal(e);
+    if (lit < 0) return false;
+    *out_b = static_cast<uint32_t>(lit);
+    return true;
+}
+
 // Parse one character-class body `[...]` starting at `*io` (pointing just
 // past '['); writes ranges into `n`, advances `*io` past the closing ']'.
-// Returns false on malformed input (unterminated class, too many ranges).
+// Returns false on malformed or unsupported input.
 inline bool regex_compile_class(const char* pat, uint32_t len, uint32_t* io,
                                 Node* n) noexcept {
     assert(pat != nullptr && io != nullptr && n != nullptr);
@@ -121,46 +201,156 @@ inline bool regex_compile_class(const char* pat, uint32_t len, uint32_t* io,
     n->n_ranges = 0;
     uint32_t i = *io;
     if (i < len && pat[i] == '^') { n->negate = 1; ++i; }
-    bool any_ranges = false;
     while (i < len && pat[i] != ']') {
-        if (n->n_ranges >= kMaxClassRanges) return false;
-        std::uint8_t lo = static_cast<std::uint8_t>(pat[i]);
-        std::uint8_t hi = lo;
-        ++i;
+        uint32_t lo = 0;
+        if (!regex_class_member(pat, len, &i, n, &lo)) return false;
+        if (lo == 0x100u) continue;
+        uint32_t hi = lo;
         if (i + 1 < len && pat[i] == '-' && pat[i + 1] != ']') {
-            hi = static_cast<std::uint8_t>(pat[i + 1]);
-            i += 2;
+            ++i;
+            if (!regex_class_member(pat, len, &i, n, &hi)) return false;
+            if (hi == 0x100u || hi < lo) return false;
         }
-        if (lo >= 0x80u || hi >= 0x80u) return false;   // byte ranges only
-        n->ranges[n->n_ranges].lo = lo;
-        n->ranges[n->n_ranges].hi = hi;
-        n->n_ranges += 1;
-        any_ranges = true;
+        if (!regex_class_add(n, static_cast<std::uint8_t>(lo),
+                             static_cast<std::uint8_t>(hi))) {
+            return false;
+        }
     }
     if (i >= len || pat[i] != ']') return false;   // unterminated
     *io = i + 1;
-    return any_ranges;
+    return n->n_ranges > 0;
 }
 
-// Parse a trailing quantifier (?, *, +, or none) at `*io`; sets min/max on
-// `n` and advances `*io` past the quantifier char if present.
-inline void regex_compile_quantifier(const char* pat, uint32_t len,
+// `{m}`, `{m,}` or `{m,n}` at `*io` (pointing at '{'). Returns 1 and sets
+// min/max when it is a counted repetition, 0 when the brace is not repetition
+// syntax (RE2 then reads '{' as a literal), -1 when it is repetition syntax
+// with an invalid count (RE2: "invalid repetition size").
+inline int regex_parse_brace(const char* pat, uint32_t len, uint32_t* io,
+                             uint16_t* mn, uint16_t* mx) noexcept {
+    assert(pat != nullptr && io != nullptr && mn != nullptr && mx != nullptr);
+    assert(*io < len && pat[*io] == '{');
+    uint32_t i = *io + 1;
+    uint32_t v[2] = {0, 0};
+    uint32_t digits[2] = {0, 0};
+    bool comma = false;
+    for (int part = 0; part < 2; ++part) {
+        while (i < len && pat[i] >= '0' && pat[i] <= '9') {
+            if (v[part] <= kRegexMaxRepeat) v[part] = v[part] * 10u + static_cast<uint32_t>(pat[i] - '0');
+            ++digits[part];
+            ++i;
+        }
+        if (part == 0) {
+            if (digits[0] == 0) return 0;
+            if (i < len && pat[i] == ',') { comma = true; ++i; continue; }
+            break;
+        }
+    }
+    if (i >= len || pat[i] != '}') return 0;
+    const uint32_t lo = v[0];
+    const uint32_t hi = !comma ? lo : (digits[1] == 0 ? uint32_t{kUnbounded} : v[1]);
+    if (lo > kRegexMaxRepeat) return -1;
+    if (hi != kUnbounded && (hi > kRegexMaxRepeat || hi < lo)) return -1;
+    *mn = static_cast<uint16_t>(lo);
+    *mx = static_cast<uint16_t>(hi);
+    *io = i + 1;
+    return 1;
+}
+
+// Parse a trailing quantifier (?, *, +, {m,n}, each optionally lazy with a
+// `?` suffix) at `*io`; sets min/max/lazy on `n`. Returns false when the
+// quantifier is invalid or is followed by another repetition operator
+// (`a**`, `a*+`, `a{1}{2}`: RE2 "bad repetition operator").
+inline bool regex_compile_quantifier(const char* pat, uint32_t len,
                                      uint32_t* io, Node* n) noexcept {
     assert(pat != nullptr && io != nullptr && n != nullptr);
-    n->min_rep = 1; n->max_rep = 1;
-    if (*io >= len) return;
+    assert(*io <= len);
+    n->min_rep = 1; n->max_rep = 1; n->lazy = 0;
+    if (*io >= len) return true;
     switch (pat[*io]) {
         case '?': n->min_rep = 0; n->max_rep = 1;          ++(*io); break;
         case '*': n->min_rep = 0; n->max_rep = kUnbounded; ++(*io); break;
         case '+': n->min_rep = 1; n->max_rep = kUnbounded; ++(*io); break;
-        default: break;
+        case '{': {
+            const int b = regex_parse_brace(pat, len, io, &n->min_rep, &n->max_rep);
+            if (b < 0) return false;
+            if (b == 0) return true;
+            break;
+        }
+        default: return true;
     }
+    if (*io < len && pat[*io] == '?') { n->lazy = 1; ++(*io); }
+    if (*io >= len) return true;
+    const char c = pat[*io];
+    if (c == '*' || c == '+' || c == '?') return false;
+    if (c == '{') {
+        uint32_t j = *io;
+        uint16_t a = 0, b = 0;
+        if (regex_parse_brace(pat, len, &j, &a, &b) != 0) return false;
+    }
+    return true;
+}
+
+// True when a repetition operator sits where an atom is expected (pattern
+// start, after '(' / '^' / '|'): RE2 "missing argument to repetition
+// operator". A '{' that is not repetition syntax is a literal.
+inline bool regex_dangling_quantifier(const char* pat, uint32_t len,
+                                      uint32_t i) noexcept {
+    assert(pat != nullptr);
+    assert(i < len);
+    const char c = pat[i];
+    if (c == '*' || c == '+' || c == '?') return true;
+    if (c != '{') return false;
+    uint16_t a = 0, b = 0;
+    return regex_parse_brace(pat, len, &i, &a, &b) != 0;
+}
+
+// One escape atom `\e` at `*io` into `n`. False on a trailing '\' or an
+// escape outside the subset (`\b`, `\1`, `\p{..}`, `\x..`, ...).
+inline bool regex_compile_escape(const char* pat, uint32_t len, uint32_t* io,
+                                 Node* n) noexcept {
+    assert(pat != nullptr && io != nullptr && n != nullptr);
+    assert(*io < len && pat[*io] == '\\');
+    if (*io + 1 >= len) return false;
+    const char e = pat[*io + 1];
+    *io += 2;
+    if (e == 'd' || e == 'w' || e == 's' || e == 'D' || e == 'W' || e == 'S') {
+        n->kind = NodeKind::Class;
+        const bool neg = (e == 'D' || e == 'W' || e == 'S');
+        n->negate = neg ? 1 : 0;
+        return regex_class_add_perl(n, static_cast<char>(neg ? e + ('a' - 'A') : e));
+    }
+    const int lit = regex_escape_literal(e);
+    if (lit < 0) return false;
+    n->kind = NodeKind::Char;
+    n->ch = static_cast<std::uint8_t>(lit);
+    return true;
+}
+
+// '(' at `*io`: opens a capturing or `(?:` group. False past the nesting or
+// group cap, or on any other `(?` form (flags, lookaround, named groups).
+inline bool regex_compile_open(const char* pat, uint32_t len, uint32_t* io,
+                               Node* n, uint8_t* next_group_id) noexcept {
+    assert(pat != nullptr && io != nullptr && n != nullptr && next_group_id != nullptr);
+    assert(*io < len && pat[*io] == '(');
+    n->kind = NodeKind::GroupStart;
+    uint32_t i = *io + 1;
+    if (i < len && pat[i] == '?') {
+        if (i + 1 >= len || pat[i + 1] != ':') return false;
+        n->group_id = 0;
+        i += 2;
+    } else {
+        if (*next_group_id >= kMaxGroups) return false;
+        n->group_id = (*next_group_id)++;
+    }
+    *io = i;
+    return true;
 }
 
 // Compile `pat[0..pat_len)` into `out`. Returns false on any unsupported
 // construct or a pattern too large for kMaxNodes/kMaxGroups (the caller
 // treats this as a clean compile-time InvalidInput, never a silent
-// mismatch). Tiger Style: single bounded forward pass, no recursion.
+// mismatch). Every byte is either understood or refused: an unknown
+// metacharacter is never read as a literal. Single bounded forward pass.
 inline bool regex_compile(const char* pat, uint32_t pat_len,
                           CompiledPattern* out) noexcept {
     assert(pat != nullptr || pat_len == 0);
@@ -170,25 +360,29 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
     uint8_t  stack_n = 0;
     uint8_t  next_group_id = 1;
     uint32_t i = 0;
+    bool atom_expected = true;   // a repetition operator here has no argument
     while (i < pat_len) {
         if (out->n_nodes >= kMaxNodes) return false;
         Node* n = &out->nodes[out->n_nodes];
         std::memset(n, 0, sizeof(*n));
+        n->min_rep = 1; n->max_rep = 1;
         const char c = pat[i];
-        if (c == '^') { n->kind = NodeKind::AnchorStart; ++i; out->n_nodes++; continue; }
-        if (c == '$') { n->kind = NodeKind::AnchorEnd;   ++i; out->n_nodes++; continue; }
+        if (atom_expected && regex_dangling_quantifier(pat, pat_len, i)) return false;
+        if (c == '*' || c == '+' || c == '?') return false;
+        if (c == '|') return false;   // alternation: documented unsupported
+        if (c == '^' || c == '$') {
+            n->kind = (c == '^') ? NodeKind::AnchorStart : NodeKind::AnchorEnd;
+            ++i;
+            out->n_nodes++;
+            atom_expected = true;
+            continue;
+        }
         if (c == '(') {
             if (stack_n >= 8) return false;
-            n->kind = NodeKind::GroupStart;
-            ++i;
-            if (i + 1 < pat_len && pat[i] == '?' && pat[i + 1] == ':') {
-                n->group_id = 0; i += 2;              // non-capturing
-            } else {
-                if (next_group_id >= kMaxGroups) return false;
-                n->group_id = next_group_id++;
-            }
+            if (!regex_compile_open(pat, pat_len, &i, n, &next_group_id)) return false;
             group_stack[stack_n++] = out->n_nodes;
             out->n_nodes++;
+            atom_expected = true;
             continue;   // quantifier (if any) attaches once ')' closes
         }
         if (c == ')') {
@@ -197,41 +391,34 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
             n->kind = NodeKind::GroupEnd;
             n->group_id = out->nodes[start_idx].group_id;
             ++i;
-            out->nodes[start_idx].match_group_end =
-                static_cast<uint16_t>(out->n_nodes);
-            regex_compile_quantifier(pat, pat_len, &i, &out->nodes[start_idx]);
+            Node* gs = &out->nodes[start_idx];
+            gs->match_group_end = static_cast<uint16_t>(out->n_nodes);
+            if (!regex_compile_quantifier(pat, pat_len, &i, gs)) return false;
+            if (gs->min_rep > kRegexMaxGroupReps) return false;
             out->n_nodes++;
+            atom_expected = false;
             continue;
         }
         if (c == '[') {
             ++i;
             if (!regex_compile_class(pat, pat_len, &i, n)) return false;
-            regex_compile_quantifier(pat, pat_len, &i, n);
-            out->n_nodes++;
-            continue;
-        }
-        if (c == '.') {
+        } else if (c == '.') {
             n->kind = NodeKind::Any;
             ++i;
-            regex_compile_quantifier(pat, pat_len, &i, n);
-            out->n_nodes++;
-            continue;
-        }
-        if (c == '\\' && i + 1 < pat_len) {
+        } else if (c == '\\') {
+            if (!regex_compile_escape(pat, pat_len, &i, n)) return false;
+        } else {
             n->kind = NodeKind::Char;
-            n->ch = static_cast<std::uint8_t>(pat[i + 1]);
-            i += 2;
-            regex_compile_quantifier(pat, pat_len, &i, n);
-            out->n_nodes++;
-            continue;
+            n->ch = static_cast<std::uint8_t>(c);
+            ++i;
         }
-        if (c == '|') return false;   // alternation: documented unsupported
-        n->kind = NodeKind::Char;
-        n->ch = static_cast<std::uint8_t>(c);
-        ++i;
-        regex_compile_quantifier(pat, pat_len, &i, n);
-        if (n->ch >= 0x80u && (n->min_rep != 1 || n->max_rep != 1)) return false;
+        if (!regex_compile_quantifier(pat, pat_len, &i, n)) return false;
+        if (n->kind == NodeKind::Char && n->ch >= 0x80u &&
+            (n->min_rep != 1 || n->max_rep != 1)) {
+            return false;   // would bind to the character's last byte
+        }
         out->n_nodes++;
+        atom_expected = false;
     }
     if (stack_n != 0) return false;   // unbalanced groups
     out->n_groups = static_cast<std::uint8_t>(next_group_id - 1);
@@ -246,6 +433,9 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
 
 struct MatchResult {
     bool    matched;
+    // The backtracking budget ran out: `matched` is false but the pattern
+    // may still match. Callers must fail loudly, never report "no match".
+    bool    exhausted;
     int32_t g_start[kMaxGroups];   // group 0 = whole match; -1 = unset
     int32_t g_end[kMaxGroups];
 };
@@ -294,6 +484,36 @@ bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
                      uint16_t node_i, uint16_t outer_hi,
                      int32_t pos, int32_t* out_pos) noexcept;
 
+// Lazy form of regex_match_atom_rep: fewest repetitions first, adding one
+// at a time while the continuation fails.
+inline bool regex_match_atom_lazy(const CompiledPattern* cp, MatchState* st,
+                                  uint16_t node_i, uint16_t outer_hi,
+                                  int32_t pos, int32_t* out_pos) noexcept {
+    assert(cp != nullptr && st != nullptr && out_pos != nullptr);
+    assert(pos >= 0 && pos <= st->len);
+    const Node& n = cp->nodes[node_i];
+    const bool wide = n.kind != NodeKind::Char;
+    const uint32_t len = static_cast<uint32_t>(st->len);
+    uint32_t k = static_cast<uint32_t>(pos);
+    int32_t reps = 0;
+    for (;;) {
+        if (reps >= n.min_rep) {
+            if (--st->steps_left <= 0) return false;
+            if (regex_match_seq(cp, st, static_cast<uint16_t>(node_i + 1), outer_hi,
+                                static_cast<int32_t>(k), out_pos)) {
+                return true;
+            }
+            if (st->steps_left <= 0) return false;
+        }
+        if (n.max_rep != kUnbounded && reps >= n.max_rep) return false;
+        if (k >= len || !regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k]))) {
+            return false;
+        }
+        k += wide ? utf8::utf8_unit_len(st->text, len, k) : 1u;
+        ++reps;
+    }
+}
+
 // Try `count` in [min_rep, max_rep] repetitions of one atom (Char/Any/Class)
 // at `node_i`, greedy-then-backtrack, then continue matching
 // nodes[node_i+1 .. outer_hi) from the resulting position. Any/Class consume
@@ -304,6 +524,7 @@ inline bool regex_match_atom_rep(const CompiledPattern* cp, MatchState* st,
     assert(cp != nullptr && st != nullptr && out_pos != nullptr);
     assert(pos >= 0 && pos <= st->len);
     const Node& n = cp->nodes[node_i];
+    if (n.lazy != 0) return regex_match_atom_lazy(cp, st, node_i, outer_hi, pos, out_pos);
     const bool wide = n.kind != NodeKind::Char;
     const uint32_t len = static_cast<uint32_t>(st->len);
     uint32_t k = static_cast<uint32_t>(pos);
@@ -327,10 +548,35 @@ inline bool regex_match_atom_rep(const CompiledPattern* cp, MatchState* st,
     }
 }
 
+// Collect the end offsets of up to max_rep successive matches of the group
+// body [body_lo, body_hi) from `pos` into positions[0..*n_pos) (positions[0]
+// = pos, zero reps). Running out of the kRegexMaxGroupReps slots while the
+// body still matches exhausts the search (steps_left = 0): a shorter match
+// would be a wrong answer.
+inline void regex_group_positions(const CompiledPattern* cp, MatchState* st,
+                                  const Node& gs, uint16_t body_lo, uint16_t body_hi,
+                                  int32_t pos, int32_t* positions, int32_t* n_pos) noexcept {
+    assert(cp != nullptr && st != nullptr && positions != nullptr && n_pos != nullptr);
+    assert(body_lo <= body_hi);
+    int32_t np = 0;
+    positions[np++] = pos;
+    int32_t cur = pos;
+    while (gs.max_rep == kUnbounded || np <= gs.max_rep) {
+        if (--st->steps_left <= 0) break;
+        int32_t nxt = 0;
+        if (!regex_match_seq(cp, st, body_lo, body_hi, cur, &nxt)) break;
+        if (nxt == cur) break;   // no progress: stop (avoid infinite loop)
+        if (np > kRegexMaxGroupReps) { st->steps_left = 0; break; }
+        cur = nxt;
+        positions[np++] = cur;
+    }
+    *n_pos = np;
+}
+
 // Try `count` repetitions of a GROUP's sub-sequence [body_lo, body_hi) as a
-// unit, greedy-then-backtrack (bounded: at most `kMaxStepsPerByte * len`
-// total attempts across the whole match via st->steps_left), recording
-// capture bounds on the LAST successful repetition (SQL/PCRE convention).
+// unit, greedy-then-backtrack (or fewest-first when lazy), bounded by
+// st->steps_left, recording capture bounds on the LAST successful repetition
+// (SQL/PCRE convention).
 inline bool regex_match_group_rep(const CompiledPattern* cp, MatchState* st,
                                   uint16_t start_i, uint16_t outer_hi,
                                   int32_t pos, int32_t* out_pos) noexcept {
@@ -339,25 +585,16 @@ inline bool regex_match_group_rep(const CompiledPattern* cp, MatchState* st,
     const uint16_t body_lo = static_cast<uint16_t>(start_i + 1);
     const uint16_t body_hi = gs.match_group_end;
     const uint16_t after   = static_cast<uint16_t>(body_hi + 1);
-    // Collect up to max_rep positions by repeatedly matching the body from
-    // the current position; each successful body match must advance pos
-    // (empty-body infinite loop guard).
-    int32_t positions[kMaxNodes];
+    assert(body_hi < outer_hi);
+    int32_t positions[kRegexMaxGroupReps + 1];
     int32_t n_pos = 0;
-    positions[n_pos++] = pos;
-    int32_t cur = pos;
-    while (n_pos < kMaxNodes &&
-           (gs.max_rep == kUnbounded || n_pos <= gs.max_rep)) {
-        if (--st->steps_left <= 0) break;
-        int32_t nxt = 0;
-        if (!regex_match_seq(cp, st, body_lo, body_hi, cur, &nxt)) break;
-        if (nxt == cur) break;   // no progress: stop (avoid infinite loop)
-        cur = nxt;
-        positions[n_pos++] = cur;
-    }
+    regex_group_positions(cp, st, gs, body_lo, body_hi, pos, positions, &n_pos);
+    if (st->steps_left <= 0) return false;
     const int32_t reps_available = n_pos - 1;   // positions[0] = 0 reps
     if (reps_available < gs.min_rep) return false;
-    for (int32_t reps = reps_available; reps >= gs.min_rep; --reps) {
+    const int32_t n_try = reps_available - gs.min_rep + 1;
+    for (int32_t t = 0; t < n_try; ++t) {
+        const int32_t reps = gs.lazy ? gs.min_rep + t : reps_available - t;
         if (--st->steps_left <= 0) return false;
         const int32_t at = positions[reps];
         // Re-run the LAST rep once more to stamp capture-group bounds for
@@ -367,9 +604,9 @@ inline bool regex_match_group_rep(const CompiledPattern* cp, MatchState* st,
             (void)regex_match_seq(cp, st, body_lo, body_hi, positions[reps - 1],
                                   &restamp);
         }
-        if (gs.group_id > 0) {
-            st->mr->g_start[gs.group_id] = positions[reps > 0 ? reps - 1 : 0];
-            st->mr->g_end[gs.group_id]   = at;
+        if (gs.group_id > 0) {   // zero repetitions leave the group unset
+            st->mr->g_start[gs.group_id] = reps > 0 ? positions[reps - 1] : -1;
+            st->mr->g_end[gs.group_id]   = reps > 0 ? at : -1;
         }
         if (regex_match_seq(cp, st, after, outer_hi, at, out_pos)) return true;
     }
@@ -422,6 +659,8 @@ inline bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
 // pattern starts with '^' the match is naturally pinned to position 0 by
 // AnchorStart's own check, so the search loop's later starts just fail
 // fast. Fills `*out` with the first (leftmost) match, or matched=false.
+// Exhausting one start's step budget stops the search with out->exhausted
+// set: a later start's match would not be the leftmost one.
 inline bool regex_search(const CompiledPattern* cp, const char* text,
                          int32_t n, MatchResult* out) noexcept {
     assert(cp != nullptr && out != nullptr);
@@ -430,6 +669,10 @@ inline bool regex_search(const CompiledPattern* cp, const char* text,
     for (int g = 0; g < kMaxGroups; ++g) { out->g_start[g] = -1; out->g_end[g] = -1; }
     const bool anchored = (cp->n_nodes > 0 &&
                           cp->nodes[0].kind == NodeKind::AnchorStart);
+    const int32_t budget = kRegexMinStepBudget +
+        ((n < (INT32_MAX - kRegexMinStepBudget) / kMaxStepsPerByte - 1)
+             ? kMaxStepsPerByte * (n + 1)
+             : INT32_MAX - kRegexMinStepBudget);
     for (int32_t start = 0; start <= n; ++start) {
         if (start > 0 && start < n &&
             utf8::utf8_is_cont(static_cast<std::uint8_t>(text[start]))) {
@@ -437,8 +680,9 @@ inline bool regex_search(const CompiledPattern* cp, const char* text,
         }
         MatchState st{};
         st.text = text; st.len = n;
-        st.steps_left = kMaxStepsPerByte * (n + 1);
+        st.steps_left = budget;
         st.mr = out;
+        for (int g = 1; g < kMaxGroups; ++g) { out->g_start[g] = -1; out->g_end[g] = -1; }
         int32_t end_pos = 0;
         if (regex_match_seq(cp, &st, 0, cp->n_nodes, start, &end_pos)) {
             out->matched = true;
@@ -446,6 +690,7 @@ inline bool regex_search(const CompiledPattern* cp, const char* text,
             out->g_end[0]   = end_pos;
             return true;
         }
+        if (st.steps_left <= 0) { out->exhausted = true; return false; }
         if (anchored) break;   // '^' can only match at position 0
     }
     return false;

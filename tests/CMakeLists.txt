@@ -1997,6 +1997,13 @@ target_link_libraries(test_bolt_regex_re2
 bolt_apply_hardening(test_bolt_regex_re2)
 add_test(NAME test_bolt_regex_re2 COMMAND test_bolt_regex_re2)
 
+# G2CHK-341: the capture-group backtracking engine vs DuckDB (RE2) answers.
+add_executable(test_bolt_regex_backtrack test_bolt_regex_backtrack.cpp)
+target_link_libraries(test_bolt_regex_backtrack
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_regex_backtrack)
+add_test(NAME test_bolt_regex_backtrack COMMAND test_bolt_regex_backtrack)
+
 # BLLM-12 (N0) — device-generic tensor primitive (bolt_tensor.h). Substrate
 # boltllm::quant::QTensor generalizes into: proves the Tensor POD layout,
 # arena/caller-owned (no-alloc) construction, and per-row-scale
