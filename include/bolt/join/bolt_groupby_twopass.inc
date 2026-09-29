@@ -217,24 +217,26 @@ BOLT_FORCE_INLINE int32_t gb_probe_hash(GroupbyTypedState* st, uint64_t h,
         }
         if (eq) return cg;
     }
-    int32_t found = st->table->find(h);
-    if (found >= 0) {
-        const GbCell16* row =
-            st->keys_flat + static_cast<size_t>(found) * st->n_keys;
-        bool eq = true;
-        for (uint32_t k = 0; k < NK; ++k) {
-            eq = eq && (static_cast<uint64_t>(row[k].a) == a[k]) &&
-                       (static_cast<uint64_t>(row[k].b) == b[k]);
-        }
-        if (!eq) found = -1;
-    }
+    uint64_t ins_h = h;
+    int32_t found = gb_table_find(st->table, h,
+        [&](uint32_t g) {
+            const GbCell16* row =
+                st->keys_flat + static_cast<size_t>(g) * st->n_keys;
+            bool eq = true;
+            for (uint32_t k = 0; k < NK; ++k) {
+                eq = eq && (static_cast<uint64_t>(row[k].a) == a[k]) &&
+                           (static_cast<uint64_t>(row[k].b) == b[k]);
+            }
+            return eq;
+        }, &ins_h);
+    if (found == -2) { st->oom = true; return -1; }
     if (found < 0) {
         GbCell16 canon[NK];
         for (uint32_t k = 0; k < NK; ++k) {
             canon[k] = GbCell16{static_cast<int64_t>(a[k]),
                                 static_cast<int64_t>(b[k])};
         }
-        found = gb_pass1_insert(st, h, canon);
+        found = gb_pass1_insert(st, ins_h, canon);
         if (found < 0) return -1;   // oom
     }
     st->gid_cache_h[ci] = h;
