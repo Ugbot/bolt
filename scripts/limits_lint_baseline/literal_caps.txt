@@ -74,6 +74,7 @@ include/bolt/join/bolt_hashjoin.h::kHJMaxKeys
 include/bolt/join/bolt_joinkernel.h::kJkMaxBuildRows
 include/bolt/join/bolt_joinkernel.h::kJkP1MaxChunks
 include/bolt/join/bolt_joinkernel.h::kJkProbeWindowMax
+include/bolt/join/bolt_swiss.h::kGbHashChainMax
 include/bolt/join/bolt_swiss.h::kSwissMaxProbeCaps
 include/bolt/join/bolt_swiss.h::kSwissMinCapacity
 include/bolt/kernels/bolt_argsort.h::kArgsortInsertionCap

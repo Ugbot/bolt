@@ -53,7 +53,10 @@
     X(max_vector_dim, kInvariant, "dims", 65535, 65535, 65535, nullptr,         \
       nullptr, "vector dimension validation ceiling (bolt::kMaxVectorDim)")      \
     X(max_columns, kInvariant, "columns", 32768, 32768, 32768, nullptr,         \
-      nullptr, "column-count validation ceiling (bolt::kMaxColumns)")
+      nullptr, "column-count validation ceiling (bolt::kMaxColumns)")           \
+    X(gb_hash_chain_max, kInvariant, "links", 64, 64, 64, nullptr, nullptr,     \
+      "group-by hash table: bounded probe chain a colliding hash follows "     \
+      "before the query is refused (kGbHashChainMax)")
 
 namespace bolt {
 
