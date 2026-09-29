@@ -2316,3 +2316,11 @@ add_test(NAME test_bolt_l6_wide_columns_pyarrow
 set_tests_properties(test_bolt_l6_wide_columns PROPERTIES FIXTURES_SETUP l6_wide_files)
 set_tests_properties(test_bolt_l6_wide_columns_pyarrow PROPERTIES
     FIXTURES_REQUIRED l6_wide_files SKIP_RETURN_CODE 77)
+
+# L8 (G2CHK-339): seeded fuzzer over the kind-B worker/topology surface —
+# BOLT_WORKERS-style override validation, scheduler sizing + range coverage,
+# EBR shard sizing + retire safety. --seed N replays a failure.
+add_executable(fuzz_workers_kind_b fuzz_workers_kind_b.cpp)
+target_link_libraries(fuzz_workers_kind_b PRIVATE bolt::bolt)
+bolt_apply_hardening(fuzz_workers_kind_b)
+add_test(NAME fuzz_workers_kind_b COMMAND fuzz_workers_kind_b --count 500)
