@@ -1157,3 +1157,94 @@ TEST(BoltGroupbyTypedG2chk295, ManyDistinctPerGroupCountsExactly) {
 }
 
 }  // namespace g2chk295
+
+// G2GRAPH-382: (Int64 NULL, Utf8 NULL) and (0, '') hash to the same 64-bit
+// value (both composite hashes cancel to 0). The table held one gid per hash
+// and the colliding insert overwrote it, so the NULL group split in two.
+// DuckDB: GROUP BY over (NULL,NULL),(0,''),(NULL,NULL) -> 2 groups.
+namespace g2graph382 {
+
+StringView sv_empty() noexcept {
+    StringView v{};
+    v.length = 0;
+    return v;
+}
+
+struct Rows {
+    int64_t    w[4];
+    StringView s[4];
+    uint8_t    wv[1];
+    uint8_t    sv[1];
+};
+
+void fill(Rows* r) {
+    const int64_t junk[4] = {77, 0, 99, 0};
+    for (int i = 0; i < 4; ++i) { r->w[i] = junk[i]; r->s[i] = sv_empty(); }
+    r->s[0].length = 3;                      // a null slot's bytes are junk
+    r->wv[0] = 0b00001010;                   // rows 0 and 2: w NULL
+    r->sv[0] = 0b00001010;                   // rows 0 and 2: s NULL
+}
+
+void check_groups(const BoltColumn* ok, const BoltColumn* oa, uint32_t ng,
+                  int64_t want_null, int64_t want_zero) {
+    ASSERT_EQ(ng, 2u);
+    const auto* cnt = static_cast<const int64_t*>(oa[0].data);
+    int64_t got_null = -1, got_zero = -1;
+    for (uint32_t g = 0; g < ng; ++g) {
+        const bool wnull = ok[0].validity != nullptr &&
+            ((ok[0].validity[g >> 3] >> (g & 7)) & 1) == 0;
+        if (wnull) got_null = cnt[g]; else got_zero = cnt[g];
+    }
+    EXPECT_EQ(got_null, want_null);
+    EXPECT_EQ(got_zero, want_zero);
+}
+
+TEST(BoltGroupbyTypedG2graph382, NullNullAndZeroEmptyStayTwoGroups) {
+    Arena a;
+    Rows r{};
+    fill(&r);
+    BoltColumn keys[2] = {
+        BoltColumn::make_flat(r.w, r.wv, 4, BoltType::Int64),
+        BoltColumn::make_flat(r.s, r.sv, 4, BoltType::Utf8)};
+    BoltColumn val = BoltColumn::make_flat(r.w, nullptr, 4, BoltType::Int64);
+    AggSpec spec = make_spec(AggKind::CountStar, 0);
+    BoltColumn ok[2], oa[1];
+    uint32_t ng = 0;
+    // rows: (NULL,NULL) (0,'') (NULL,NULL) (0,'')
+    ASSERT_TRUE(groupby_agg_multi_key_typed(keys, 2, &val, 1, &spec, 1, 4,
+                                            ok, oa, &ng, &a, /*hint=*/8));
+    check_groups(ok, oa, ng, 2, 2);
+}
+
+TEST(BoltGroupbyTypedG2graph382, CollidingGroupsSurviveMergeAndGrow) {
+    Arena a;
+    Rows r{};
+    fill(&r);
+    AggSpec spec = make_spec(AggKind::CountStar, 0);
+    GroupbyTypedState p[2]{};
+    for (int m = 0; m < 2; ++m) {
+        // partial m sees rows [2m, 2m+2): (NULL,NULL) then (0,'')
+        BoltColumn kd[2] = {
+            BoltColumn::make_flat(r.w, nullptr, 0, BoltType::Int64),
+            BoltColumn::make_flat(r.s, nullptr, 0, BoltType::Utf8)};
+        BoltColumn vd = BoltColumn::make_flat(r.w, nullptr, 0, BoltType::Int64);
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&p[m], &a, kd, 2, &vd, 1,
+                                                      &spec, 1, 2));
+        p[m].grow_cap = 1u << 10;
+        uint8_t wv[1] = {0b00000010}, sv[1] = {0b00000010};
+        BoltColumn k[2] = {
+            BoltColumn::make_flat(r.w + 2 * m, wv, 2, BoltType::Int64),
+            BoltColumn::make_flat(r.s + 2 * m, sv, 2, BoltType::Utf8)};
+        BoltColumn v = BoltColumn::make_flat(r.w + 2 * m, nullptr, 2,
+                                             BoltType::Int64);
+        groupby_agg_multi_key_typed_ingest(&p[m], k, &v, nullptr, 0, 2);
+        ASSERT_FALSE(p[m].oom);
+    }
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&p[0], &p[1]));
+    BoltColumn ok[2], oa[1];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&p[0], ok, oa, &ng));
+    check_groups(ok, oa, ng, 2, 2);
+}
+
+}  // namespace g2graph382

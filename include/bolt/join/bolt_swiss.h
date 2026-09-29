@@ -718,4 +718,43 @@ struct SwissTableSalted {
     }
 };
 
+// G2GRAPH-382: the group table maps hash -> gid, one gid per hash, and a
+// 64-bit hash is not a key: (0, '') and (NULL, NULL) both hash to 0. A key
+// whose hash is taken by a different key moves along a fixed chain of derived
+// hashes. Groups are never removed while a table is live, so a lookup stops
+// at the first absent link. Every find/insert on a group table goes through
+// these two.
+inline constexpr uint32_t kGbHashChainMax = 64;
+
+BOLT_FORCE_INLINE uint64_t gb_chain_next(uint64_t h) noexcept {
+    return swiss_mix_wyhash3(h ^ 0xC2B2AE3D27D4EB4FULL) ^ 0x165667B19E3779F9ULL;
+}
+
+// The gid whose stored key `eq` accepts, else -1 with *free_h the first absent
+// link (insert there), else -2 when the chain is exhausted (refuse).
+template <class Eq>
+BOLT_FORCE_INLINE int32_t gb_table_find(const SwissTable* t, uint64_t h,
+                                        Eq&& eq, uint64_t* free_h) noexcept {
+    assert(t != nullptr);
+    assert(free_h != nullptr);
+    for (uint32_t i = 0; i < kGbHashChainMax; ++i) {
+        const int32_t g = t->find(h);
+        if (g < 0) { *free_h = h; return -1; }
+        if (eq(static_cast<uint32_t>(g))) return g;
+        h = gb_chain_next(h);
+    }
+    return -2;
+}
+
+// Insert a gid whose key is known absent (rehash, dense-merge insert).
+BOLT_FORCE_INLINE bool gb_table_insert(SwissTable* t, uint64_t h,
+                                       uint32_t gid) noexcept {
+    assert(t != nullptr);
+    for (uint32_t i = 0; i < kGbHashChainMax; ++i) {
+        if (t->find(h) < 0) return t->insert(h, gid);
+        h = gb_chain_next(h);
+    }
+    return false;
+}
+
 }  // namespace bolt

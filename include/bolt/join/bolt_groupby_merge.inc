@@ -69,7 +69,7 @@ inline bool gb_merge_insert_group(GroupbyTypedState* dst,
         return false;
     }
     const uint32_t slot = dst->entry_count++;
-    if (!dst->table->insert(h, slot)) { dst->oom = true; return false; }
+    if (!gb_table_insert(dst->table, h, slot)) { dst->oom = true; return false; }
     const uint32_t n_keys = dst->n_keys;
     GbCell16* drow = dst->keys_flat + static_cast<size_t>(slot) * n_keys;
     const GbCell16* srow = src->keys_flat + static_cast<size_t>(sgid) * n_keys;
@@ -187,15 +187,15 @@ inline bool groupby_agg_multi_key_typed_merge_class(
     for (uint32_t g = 0; g < n_src; ++g) {
         const uint64_t h = gb_merge_hash_stored(src, g);
         if (n_classes > 1u && (h % n_classes) != class_idx) continue;
-        int32_t found = dst->table->find(h);
-        if (found >= 0 &&
-            !gb_merge_keys_equal(dst, static_cast<uint32_t>(found), src, g)) {
-            found = -1;   // 64-bit hash collision: mirror ingest (dup entry)
-        }
+        uint64_t ins_h = h;
+        const int32_t found = gb_table_find(dst->table, h,
+            [&](uint32_t d) { return gb_merge_keys_equal(dst, d, src, g); },
+            &ins_h);
+        if (found == -2) { dst->oom = true; return false; }
         uint32_t slot;
         if (found >= 0) {
             slot = static_cast<uint32_t>(found);
-        } else if (!gb_merge_insert_group(dst, src, g, h, &slot)) {
+        } else if (!gb_merge_insert_group(dst, src, g, ins_h, &slot)) {
             return false;
         }
         if (!gb_merge_combine(dst, slot, src, g)) return false;
@@ -242,15 +242,15 @@ inline bool groupby_agg_multi_key_typed_merge_list(
         assert(g < src->entry_count);
         const uint64_t h = hashes_by_gid[g];
         assert(h == gb_merge_hash_stored(src, g));
-        int32_t found = dst->table->find(h);
-        if (found >= 0 &&
-            !gb_merge_keys_equal(dst, static_cast<uint32_t>(found), src, g)) {
-            found = -1;   // 64-bit hash collision: mirror ingest (dup entry)
-        }
+        uint64_t ins_h = h;
+        const int32_t found = gb_table_find(dst->table, h,
+            [&](uint32_t d) { return gb_merge_keys_equal(dst, d, src, g); },
+            &ins_h);
+        if (found == -2) { dst->oom = true; return false; }
         uint32_t slot;
         if (found >= 0) {
             slot = static_cast<uint32_t>(found);
-        } else if (!gb_merge_insert_group(dst, src, g, h, &slot)) {
+        } else if (!gb_merge_insert_group(dst, src, g, ins_h, &slot)) {
             return false;
         }
         if (!gb_merge_combine(dst, slot, src, g)) return false;

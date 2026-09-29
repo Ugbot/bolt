@@ -1686,14 +1686,13 @@ inline void gb_ingest_fallback(
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = (sel != nullptr)
             ? static_cast<int64_t>(sel[start + i]) : (start + i);
-        const uint64_t h = gb_detail::hash_keys(keys, n_keys, r);
-        int32_t found = state->table->find(h);
-        if (found >= 0 && !gb_detail::keys_equal(keys, n_keys, r,
-                                                 state->keys_flat,
-                                                 static_cast<uint32_t>(found),
-                                                 state->key_str_buf)) {
-            found = -1;
-        }
+        uint64_t h = gb_detail::hash_keys(keys, n_keys, r);
+        const int32_t found = gb_table_find(state->table, h,
+            [&](uint32_t g) {
+                return gb_detail::keys_equal(keys, n_keys, r, state->keys_flat,
+                                             g, state->key_str_buf);
+            }, &h);
+        if (found == -2) { state->oom = true; return; }
         uint32_t slot;
         if (found >= 0) {
             slot = static_cast<uint32_t>(found);
@@ -2007,7 +2006,7 @@ inline bool gb_grow(GroupbyTypedState* st) noexcept {
     if (ndc16 != nullptr) st->distinct_cells16 = ndc16;
     st->cap       = ncap;
     for (uint32_t g = 0; g < n; ++g) {
-        const bool ok = nt->insert(gb_merge_hash_stored(st, g), g);
+        const bool ok = gb_table_insert(nt, gb_merge_hash_stored(st, g), g);
         assert(ok && "grow rehash cannot overflow a strictly larger table");
         if (!ok) { st->oom = true; return false; }
     }
@@ -2387,14 +2386,13 @@ inline bool groupby_agg_multi_key_typed(
         return false;
     }
     for (int64_t r = 0; r < n_rows; ++r) {
-        const uint64_t h = gb_detail::hash_keys(keys, static_cast<uint32_t>(n_keys), r);
-        int32_t found = ht->find(h);
-        if (found >= 0 && !gb_detail::keys_equal(keys, static_cast<uint32_t>(n_keys),
-                                                 r, keys_flat,
-                                                 static_cast<uint32_t>(found),
-                                                 in_bases)) {
-            found = -1;   // hash collision on different key — Tiger: drop row
-        }
+        uint64_t h = gb_detail::hash_keys(keys, static_cast<uint32_t>(n_keys), r);
+        const int32_t found = gb_table_find(ht, h,
+            [&](uint32_t g) {
+                return gb_detail::keys_equal(keys, static_cast<uint32_t>(n_keys),
+                                             r, keys_flat, g, in_bases);
+            }, &h);
+        if (found == -2) return false;
         uint32_t slot;
         if (found >= 0) {
             slot = static_cast<uint32_t>(found);
