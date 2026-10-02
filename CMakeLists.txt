@@ -165,10 +165,11 @@ if(BOLT_BUILD_IO)
     bolt_apply_simd(bolt_io ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io)
 
-    # bolt::io_file — the one part of bolt::io that does file I/O: the aligned
-    # (direct-I/O) page writer of MSEG K9. Kept out of bolt_io so that library
+    # bolt::io_file — the part of bolt::io that does file I/O: the aligned
+    # (direct-I/O) page writer of MSEG K9 and the reads of B6. Kept out of bolt_io so that library
     # stays pure compute.
-    add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp)
+    add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp src/io/bolt_file_io.cpp
+                src/io/bolt_read_batch.cpp)
     add_library(bolt::io_file ALIAS bolt_io_file)
     target_link_libraries(bolt_io_file PUBLIC bolt::core bolt::io)
     target_include_directories(bolt_io_file PUBLIC
@@ -995,6 +996,10 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/parallel_scan.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
+if(NOT TARGET bolt::io_file)
+    message(FATAL_ERROR "BOLT_BUILD_LAKEHOUSE needs BOLT_BUILD_IO (bolt::io_file file reads)")
+endif()
+target_link_libraries(bolt_lakehouse PUBLIC bolt::io_file)
 if(TARGET bolt::parse)
     target_link_libraries(bolt_lakehouse PUBLIC bolt::parse)
 endif()

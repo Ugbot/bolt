@@ -1,7 +1,10 @@
 // bolt/lakehouse/object_store_filesystem.cpp — local-filesystem ObjectStore.
-// Uses portable C stdio + std::filesystem for listing. No POSIX-only headers.
+// Reads go through bolt::io file reads (pread); writes use C stdio, listing
+// std::filesystem. No POSIX-only headers.
 
 #include "bolt/lakehouse/object_store.h"
+
+#include "bolt/io/bolt_file_io.h"
 
 #include <atomic>
 #include <cerrno>
@@ -45,20 +48,19 @@ int fs_get(void* impl, const char* key, Arena* arena,
     FilesystemObjectStore* fs = static_cast<FilesystemObjectStore*>(impl);
     char path[kOsMaxRoot + kOsMaxKey + 2u];
     if (!join_path(fs->root, key, path, sizeof(path))) return kOsBadArg;
-    std::FILE* f = std::fopen(path, "rb");
-    if (f == nullptr) return kOsNotFound;
-    std::fseek(f, 0, SEEK_END);
-    const long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (n < 0) { std::fclose(f); return kOsIoError; }
-    uint8_t* buf = arena->allocate_array<uint8_t>(n == 0 ? 1u :
-                                                  static_cast<size_t>(n));
-    if (buf == nullptr) { std::fclose(f); return kOsIoError; }
-    const size_t got = std::fread(buf, 1, static_cast<size_t>(n), f);
-    std::fclose(f);
-    if (got != static_cast<size_t>(n)) return kOsIoError;
+    io::ReadFile f{};
+    if (io::file_open_read(path, false, &f) != io::FileIoStatus::kOk) return kOsNotFound;
+    uint8_t* buf = arena->allocate_array<uint8_t>(f.size == 0 ? 1u :
+                                                  static_cast<size_t>(f.size));
+    uint64_t got = 0;
+    const bool ok = buf != nullptr &&
+                    io::file_pread(f, 0, buf, f.size, &got) == io::FileIoStatus::kOk &&
+                    got == f.size;
+    const uint64_t n = f.size;
+    io::file_close(&f);
+    if (!ok) return kOsIoError;
     *out_data = buf;
-    *out_len = static_cast<uint64_t>(n);
+    *out_len = n;
     return kOsOk;
 }
 
@@ -70,17 +72,13 @@ int fs_get_range(void* impl, const char* key, uint64_t offset, uint64_t len,
     FilesystemObjectStore* fs = static_cast<FilesystemObjectStore*>(impl);
     char path[kOsMaxRoot + kOsMaxKey + 2u];
     if (!join_path(fs->root, key, path, sizeof(path))) return kOsBadArg;
-    std::FILE* f = std::fopen(path, "rb");
-    if (f == nullptr) return kOsNotFound;
-    if (offset > static_cast<uint64_t>(INT64_MAX) ||
-        std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
-        std::fclose(f);
-        return kOsBadArg;
-    }
-    const size_t got = len == 0 ? 0u : std::fread(dst, 1, static_cast<size_t>(len), f);
-    const bool err = std::ferror(f) != 0;
-    std::fclose(f);
-    if (err) return kOsIoError;
+    if (offset > static_cast<uint64_t>(INT64_MAX)) return kOsBadArg;
+    io::ReadFile f{};
+    if (io::file_open_read(path, false, &f) != io::FileIoStatus::kOk) return kOsNotFound;
+    uint64_t got = 0;
+    const io::FileIoStatus s = io::file_pread(f, offset, dst, len, &got);
+    io::file_close(&f);
+    if (s != io::FileIoStatus::kOk) return kOsIoError;
     *out_len = got;
     assert(*out_len <= len);
     return kOsOk;

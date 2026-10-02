@@ -908,6 +908,12 @@ if(BOLT_BUILD_IO)
     bolt_apply_hardening(test_bolt_aligned_writer)
     add_test(NAME test_bolt_aligned_writer COMMAND test_bolt_aligned_writer)
 
+    add_executable(test_bolt_file_io test_bolt_file_io.cpp)
+    target_link_libraries(test_bolt_file_io
+        PRIVATE bolt::bolt bolt::io bolt::io_file GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_file_io)
+    add_test(NAME test_bolt_file_io COMMAND test_bolt_file_io)
+
     add_executable(test_bolt_crc64nvme test_bolt_crc64nvme.cpp)
     target_link_libraries(test_bolt_crc64nvme
         PRIVATE bolt::bolt bolt::io GTest::gtest GTest::gtest_main)
