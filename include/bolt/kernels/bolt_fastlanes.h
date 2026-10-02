@@ -73,6 +73,14 @@ BOLT_FORCE_INLINE uint32_t transpose(uint32_t i) noexcept {
     return (i % 16u) * 64u + kOrder[(i / 16u) % 8u] * 8u + i / 128u;
 }
 
+/// Inverse of transpose(): transpose(untranspose(p)) == p.
+BOLT_FORCE_INLINE uint32_t untranspose(uint32_t p) noexcept {
+    assert(p < kBlockValues);
+    const uint32_t i = (p % 8u) * 128u + kOrder[(p / 8u) % 8u] * 16u + p / 64u;
+    assert(i < kBlockValues);
+    return i;
+}
+
 /// (row, lane) of value index i: the inverse of index() for type U.
 template <class U>
 BOLT_FORCE_INLINE void row_lane(uint32_t i, uint32_t* row, uint32_t* lane) noexcept {
@@ -156,6 +164,28 @@ BOLT_FORCE_INLINE size_t delta_bytes(uint32_t t_bits, int64_t n, uint32_t w) noe
     return static_cast<size_t>(blocks(n)) * (kBlockValues / 8u) * (w + 1u);
 }
 
+/// Blocks holding stream rows [first, first + n).
+BOLT_FORCE_INLINE int64_t span_blocks(int64_t first, int64_t n) noexcept {
+    assert(first >= 0 && n >= 0);
+    return n == 0 ? 0 : (first + n - 1) / kBlockValues - first / kBlockValues + 1;
+}
+
+/// Bytes of the BitPacked / FrameOfRef blocks a row range spans.
+BOLT_FORCE_INLINE size_t packed_span_bytes(uint32_t t_bits, int64_t first, int64_t n,
+                                           uint32_t w) noexcept {
+    assert(t_bits == 8 || t_bits == 16 || t_bits == 32 || t_bits == 64);
+    assert(w <= t_bits);
+    return static_cast<size_t>(span_blocks(first, n)) * (kBlockValues / 8u) * w;
+}
+
+/// Bytes of the DeltaFOR blocks a row range spans.
+BOLT_FORCE_INLINE size_t delta_span_bytes(uint32_t t_bits, int64_t first, int64_t n,
+                                          uint32_t w) noexcept {
+    assert(t_bits == 8 || t_bits == 16 || t_bits == 32 || t_bits == 64);
+    assert(w <= t_bits);
+    return static_cast<size_t>(span_blocks(first, n)) * (kBlockValues / 8u) * (w + 1u);
+}
+
 /// Bits needed for an unsigned value (0 for 0).
 BOLT_FORCE_INLINE uint32_t width_of(uint64_t v) noexcept {
     uint32_t w = 0;
@@ -204,21 +234,46 @@ inline void encode_for(const V* BOLT_RESTRICT v, int64_t n, int64_t ref, uint32_
     }
 }
 
+/// Decode stream rows [first, first + n) of a BitPacked / FrameOfRef buffer
+/// into out[0, n); only the blocks the range touches are read.
+template <class V>
+inline void decode_for_range(const void* BOLT_RESTRICT in, int64_t first, int64_t n,
+                             int64_t ref, uint32_t w, V* BOLT_RESTRICT out) noexcept {
+    using U = unsigned_of<V>;
+    assert(out != nullptr || n == 0);
+    assert(first >= 0 && n >= 0 && w <= bits<U>());
+    if (n == 0) return;
+    const auto* src = static_cast<const U*>(in);
+    const U r = static_cast<U>(ref);
+    const int64_t end = first + n;
+    for (int64_t b = first / kBlockValues; b < blocks(end); ++b) {
+        const U* blk = src + static_cast<size_t>(b) * lanes<U>() * w;
+        const int64_t base = b * kBlockValues;
+        const uint32_t lo = first > base ? static_cast<uint32_t>(first - base) : 0u;
+        const uint32_t hi = end - base < kBlockValues ? static_cast<uint32_t>(end - base)
+                                                      : kBlockValues;
+        for (uint32_t i = lo; i < hi; ++i)
+            out[base + i - first] = static_cast<V>(static_cast<U>(unpack_one<U>(blk, w, i) + r));
+    }
+}
+
 template <class V>
 inline void decode_for(const void* BOLT_RESTRICT in, int64_t n, int64_t ref, uint32_t w,
                        V* BOLT_RESTRICT out) noexcept {
+    decode_for_range<V>(in, 0, n, ref, w, out);
+}
+
+/// Stream row `row` of a BitPacked / FrameOfRef buffer (decode on access).
+template <class V>
+BOLT_FORCE_INLINE V for_value(const void* BOLT_RESTRICT in, int64_t row, int64_t ref,
+                              uint32_t w) noexcept {
     using U = unsigned_of<V>;
-    assert(out != nullptr || n == 0);
-    assert(w <= bits<U>());
-    const auto* src = static_cast<const U*>(in);
-    const U r = static_cast<U>(ref);
-    for (int64_t b = 0; b < blocks(n); ++b) {
-        const U* blk = src + static_cast<size_t>(b) * lanes<U>() * w;
-        const int64_t base = b * kBlockValues;
-        const uint32_t m = n - base < kBlockValues ? static_cast<uint32_t>(n - base) : kBlockValues;
-        for (uint32_t i = 0; i < m; ++i)
-            out[base + i] = static_cast<V>(static_cast<U>(unpack_one<U>(blk, w, i) + r));
-    }
+    assert(in != nullptr || w == 0);
+    assert(row >= 0 && w <= bits<U>());
+    const int64_t b = row / kBlockValues;
+    const U* blk = static_cast<const U*>(in) + static_cast<size_t>(b) * lanes<U>() * w;
+    const uint32_t i = static_cast<uint32_t>(row - b * kBlockValues);
+    return static_cast<V>(static_cast<U>(unpack_one<U>(blk, w, i) + static_cast<U>(ref)));
 }
 
 namespace detail {
@@ -296,16 +351,20 @@ inline void encode_delta_for(const V* BOLT_RESTRICT v, int64_t n, int64_t dref, 
     }
 }
 
+/// Decode stream rows [first, first + n) of a DeltaFOR buffer into
+/// out[0, n); each touched block's lane chains are walked whole.
 template <class V>
-inline void decode_delta_for(const void* BOLT_RESTRICT in, int64_t n, int64_t dref, uint32_t w,
-                             V* BOLT_RESTRICT out) noexcept {
+inline void decode_delta_for_range(const void* BOLT_RESTRICT in, int64_t first, int64_t n,
+                                   int64_t dref, uint32_t w, V* BOLT_RESTRICT out) noexcept {
     using U = unsigned_of<V>;
     assert(out != nullptr || n == 0);
-    assert(w <= bits<U>());
+    assert(first >= 0 && n >= 0 && w <= bits<U>());
+    if (n == 0) return;
     constexpr uint32_t L = lanes<U>();
     const auto* src = static_cast<const U*>(in);
     const U dr = static_cast<U>(dref);
-    for (int64_t b = 0; b < blocks(n); ++b) {
+    const int64_t end = first + n;
+    for (int64_t b = first / kBlockValues; b < blocks(end); ++b) {
         const U* bases = src + static_cast<size_t>(b) * L * (w + 1u);
         const int64_t base = b * kBlockValues;
         for (uint32_t lane = 0; lane < L; ++lane) {
@@ -314,10 +373,36 @@ inline void decode_delta_for(const void* BOLT_RESTRICT in, int64_t n, int64_t dr
                 const uint32_t i = index(row, lane);
                 prev = static_cast<U>(prev + dr + unpack_one<U>(bases + L, w, i));
                 const int64_t k = base + transpose(i);
-                if (k < n) out[k] = static_cast<V>(prev);
+                if (k >= first && k < end) out[k - first] = static_cast<V>(prev);
             }
         }
     }
+}
+
+template <class V>
+inline void decode_delta_for(const void* BOLT_RESTRICT in, int64_t n, int64_t dref, uint32_t w,
+                             V* BOLT_RESTRICT out) noexcept {
+    decode_delta_for_range<V>(in, 0, n, dref, w, out);
+}
+
+/// Stream row `row` of a DeltaFOR buffer: walks its lane chain up to the
+/// row (at most T steps).
+template <class V>
+inline V delta_for_value(const void* BOLT_RESTRICT in, int64_t row, int64_t dref,
+                         uint32_t w) noexcept {
+    using U = unsigned_of<V>;
+    assert(in != nullptr);
+    assert(row >= 0 && w <= bits<U>());
+    constexpr uint32_t L = lanes<U>();
+    const int64_t b = row / kBlockValues;
+    const U* bases = static_cast<const U*>(in) + static_cast<size_t>(b) * L * (w + 1u);
+    uint32_t r = 0, lane = 0;
+    row_lane<U>(untranspose(static_cast<uint32_t>(row - b * kBlockValues)), &r, &lane);
+    U prev = bases[lane];
+    const U dr = static_cast<U>(dref);
+    for (uint32_t k = 0; k <= r; ++k)
+        prev = static_cast<U>(prev + dr + unpack_one<U>(bases + L, w, index(k, lane)));
+    return static_cast<V>(prev);
 }
 
 }  // namespace fastlanes

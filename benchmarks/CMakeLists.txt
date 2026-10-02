@@ -263,3 +263,11 @@ add_executable(bench_wire_serialize bench_wire_serialize.cpp)
 target_link_libraries(bench_wire_serialize PRIVATE bolt::bolt)
 bolt_apply_hardening(bench_wire_serialize)
 bolt_apply_bench_tuning(bench_wire_serialize)
+
+# -----------------------------------------------------------------------
+# FastLanes BitPacked / FrameOfRef / DeltaFOR scalar decode (MSEG B1)
+# -----------------------------------------------------------------------
+add_executable(bench_encodings bench_encodings.cpp)
+target_link_libraries(bench_encodings PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_encodings)
+bolt_apply_bench_tuning(bench_encodings)
