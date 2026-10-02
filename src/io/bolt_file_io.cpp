@@ -93,7 +93,7 @@ int64_t read_call(intptr_t h, uint8_t* p, uint64_t len, uint64_t off) noexcept {
     ov.Offset = static_cast<DWORD>(off);
     ov.OffsetHigh = static_cast<DWORD>(off >> 32);
     DWORD done = 0;
-    if (!ReadFile(reinterpret_cast<HANDLE>(h), p, static_cast<DWORD>(len), &done, &ov))
+    if (!::ReadFile(reinterpret_cast<HANDLE>(h), p, static_cast<DWORD>(len), &done, &ov))
         return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
     return static_cast<int64_t>(done);
 }

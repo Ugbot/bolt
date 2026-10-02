@@ -137,7 +137,11 @@ struct IoRange {
 struct CoalescedRange {
     uint64_t off;
     uint64_t len;      // <= max_request
-    uint32_t first;    // inputs [first, first + count) overlap this request
+    // [first, first + count) is the tightest index range holding every input
+    // that overlaps this request; first and first + count - 1 overlap it. An
+    // input inside the range may miss the request only when an earlier input
+    // spans past it (nested inputs), so a scatter must clip to the request.
+    uint32_t first;
     uint32_t count;
 };
 

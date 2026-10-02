@@ -217,6 +217,14 @@ void check_coalesce(const std::vector<IoRange>& in, uint64_t max_req, uint64_t m
         if (k > 0) ASSERT_GE(c.off, out[k - 1].off + out[k - 1].len) << "sorted, disjoint";
         ASSERT_GE(c.count, 1u);
         ASSERT_LE(c.first + c.count, in.size());
+        const uint64_t ce = c.off + c.len;
+        auto hits = [&](const IoRange& r) { return r.len != 0 && r.off < ce && r.off + r.len > c.off; };
+        ASSERT_TRUE(hits(in[c.first])) << "first input misses request " << k;
+        ASSERT_TRUE(hits(in[c.first + c.count - 1])) << "last input misses request " << k;
+        for (size_t i = 0; i < in.size(); ++i) {
+            const bool listed = i >= c.first && i < size_t(c.first) + c.count;
+            if (hits(in[i])) ASSERT_TRUE(listed) << "input " << i << " overlaps request " << k;
+        }
         for (uint64_t b = c.off; b < c.off + c.len; ++b) have[b] = 1;
         ASSERT_EQ(want[c.off], 1) << "request starts on input bytes";
         ASSERT_EQ(want[c.off + c.len - 1], 1) << "request ends on input bytes";
@@ -271,6 +279,20 @@ TEST(RangeCoalesce, FixedCases) {
     EXPECT_EQ(o[0].len, 25u);
     o = coalesce({}, M, G);
     EXPECT_TRUE(o.empty());
+    // An input straddling a split is listed under both requests; a short input
+    // inside the first request is listed there only.
+    const std::vector<IoRange> straddle = {{0, 8}, {5, 10}, {6, 1}};
+    o = coalesce(straddle, 10, 2);
+    ASSERT_EQ(o.size(), 2u);
+    EXPECT_EQ(o[0].off, 0u);
+    EXPECT_EQ(o[0].len, 8u);
+    EXPECT_EQ(o[0].first, 0u);
+    EXPECT_EQ(o[0].count, 3u);
+    EXPECT_EQ(o[1].off, 8u);
+    EXPECT_EQ(o[1].len, 7u);
+    EXPECT_EQ(o[1].first, 1u);
+    EXPECT_EQ(o[1].count, 1u);
+    check_coalesce(straddle, 10, 2, o);
 }
 
 TEST(RangeCoalesce, RejectsBadInputAndShortOutput) {

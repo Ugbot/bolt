@@ -23,50 +23,73 @@ struct CoalesceSink {
     uint64_t n;           // requests produced (may exceed cap)
 };
 
-void emit(CoalesceSink* s, uint64_t off, uint64_t len, uint32_t first, uint32_t last) noexcept {
+// first/count are filled afterwards by coalesce_index.
+void emit(CoalesceSink* s, uint64_t off, uint64_t len) noexcept {
     assert(len != 0);
-    assert(first <= last);
-    if (s->out != nullptr && s->n < s->cap) s->out[s->n] = CoalescedRange{off, len, first, last - first + 1};
+    assert(s->n < UINT64_MAX);
+    if (s->out != nullptr && s->n < s->cap) s->out[s->n] = CoalescedRange{off, len, 0, 0};
     ++s->n;
 }
 
-// Open request [s, e) built from inputs [first, last].
+// Open request [s, e).
 struct OpenReq {
     uint64_t s, e;
-    uint32_t first, last;
     bool open;
 };
 
 // Start requests at lo for input i ending at end: whole max_request pieces,
 // then leave the remainder open.
-void start_at(CoalesceSink* sink, OpenReq* r, uint64_t lo, uint64_t end, uint64_t max_req,
-              uint32_t i) noexcept {
+void start_at(CoalesceSink* sink, OpenReq* r, uint64_t lo, uint64_t end,
+              uint64_t max_req) noexcept {
     assert(lo < end);
     assert(!r->open);
     const uint64_t pieces = (end - lo - 1) / max_req;
-    for (uint64_t k = 0; k < pieces; ++k, lo += max_req) emit(sink, lo, max_req, i, i);
+    for (uint64_t k = 0; k < pieces; ++k, lo += max_req) emit(sink, lo, max_req);
     assert(end - lo <= max_req);
-    *r = OpenReq{lo, end, i, i, true};
+    *r = OpenReq{lo, end, true};
 }
 
 void coalesce_core(const IoRange* in, uint32_t n, uint64_t max_req, uint64_t max_gap,
                    CoalesceSink* sink) noexcept {
     assert(max_req > max_gap);
-    OpenReq r{0, 0, 0, 0, false};
+    OpenReq r{0, 0, false};
     for (uint32_t i = 0; i < n; ++i) {
         if (in[i].len == 0) continue;
         const uint64_t end = in[i].off + in[i].len;
         uint64_t lo = in[i].off;
         if (r.open) {
-            if (end <= r.e) { r.last = i; continue; }  // already covered
+            if (end <= r.e) continue;  // already covered
             if (lo < r.e) lo = r.e;
-            if (lo - r.e <= max_gap && end - r.s <= max_req) { r.e = end; r.last = i; continue; }
-            emit(sink, r.s, r.e - r.s, r.first, r.last);
+            if (lo - r.e <= max_gap && end - r.s <= max_req) { r.e = end; continue; }
+            emit(sink, r.s, r.e - r.s);
             r.open = false;
         }
-        start_at(sink, &r, lo, end, max_req, i);
+        start_at(sink, &r, lo, end, max_req);
     }
-    if (r.open) emit(sink, r.s, r.e - r.s, r.first, r.last);
+    if (r.open) emit(sink, r.s, r.e - r.s);
+}
+
+bool overlaps(const IoRange& a, uint64_t s, uint64_t e) noexcept {
+    return a.len != 0 && a.off < e && a.off + a.len > s;
+}
+
+// Tight [first, last] over the inputs overlapping each request. Requests are
+// sorted and disjoint, so the lowest overlapping index never moves back.
+void coalesce_index(const IoRange* in, uint32_t n, CoalescedRange* out, uint32_t m) noexcept {
+    assert(n != 0 || m == 0);
+    uint32_t f = 0;  // lowest index whose end may pass the request start
+    uint32_t p = 0;  // inputs with off < request end
+    for (uint32_t k = 0; k < m; ++k) {
+        const uint64_t s = out[k].off, e = s + out[k].len;
+        while (f < n && !overlaps(in[f], s, UINT64_MAX)) ++f;
+        while (p < n && in[p].off < e) ++p;
+        assert(f < p && overlaps(in[f], s, e));
+        uint32_t last = p - 1;
+        while (!overlaps(in[last], s, e)) --last;
+        assert(last >= f);
+        out[k].first = f;
+        out[k].count = last - f + 1;
+    }
 }
 
 bool coalesce_args_ok(const IoRange* in, uint32_t n, uint64_t max_req,
@@ -91,6 +114,8 @@ FileIoStatus range_coalesce(const IoRange* in, uint32_t n, uint64_t max_request,
     CoalesceSink sink{out, out_cap, 0};
     coalesce_core(in, n, max_request, max_gap, &sink);
     if (sink.n > UINT32_MAX) return FileIoStatus::kTooLarge;
+    if (out != nullptr)
+        coalesce_index(in, n, out, static_cast<uint32_t>(sink.n < out_cap ? sink.n : out_cap));
     *out_n = static_cast<uint32_t>(sink.n);
     return sink.n <= out_cap ? FileIoStatus::kOk : FileIoStatus::kTooLarge;
 }
