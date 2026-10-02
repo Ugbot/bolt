@@ -18,6 +18,7 @@
 
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_fastlanes.h"
+#include "bolt/kernels/bolt_rle.h"
 #include "bolt/bolt_types.h"
 #include <cstdint>
 #include <cstring>
@@ -919,10 +920,9 @@ inline void bitmap_or(const uint64_t* BOLT_RESTRICT a,
 // past ~4 rows/run on modern CPUs).
 // ============================================================================
 
-/// Run-native `filter_eq`: walks `num_runs` (value, run_end) pairs and emits
-/// every row index where `values[i] == scalar`. O(num_runs) compares and
-/// O(matching_rows) stores — no per-row compare. The per-run inner loop
-/// is a tight `for` that compiles to `rep stosd`-equivalent on x86.
+/// Run-native `filter_eq` (no validity): every row index where
+/// `values[i] == scalar`. O(num_runs) compares, O(matching_rows) stores.
+/// The general form (all compare ops, IN, validity, ranges) is bolt_rle.h.
 template <typename T>
 inline int64_t filter_eq_rle(const T* BOLT_RESTRICT values,
                               const int32_t* BOLT_RESTRICT run_ends,
@@ -932,19 +932,7 @@ inline int64_t filter_eq_rle(const T* BOLT_RESTRICT values,
     assert(values   != nullptr || num_runs == 0);
     assert(run_ends != nullptr || num_runs == 0);
     assert(out      != nullptr || num_runs == 0);
-    assert(num_runs >= 0);
-
-    int64_t count = 0;
-    int32_t prev = 0;
-    for (int64_t i = 0; i < num_runs; ++i) {
-        const int32_t end = run_ends[i];
-        assert(end >= prev);
-        if (values[i] == scalar) {
-            for (int32_t r = prev; r < end; ++r) out[count++] = r;
-        }
-        prev = end;
-    }
-    return count;
+    return rle::filter_sel(values, run_ends, num_runs, nullptr, rle::CmpOp::Eq, scalar, out);
 }
 
 /// Run-native `sum` over an RLE column: Σ values[i] * run_length[i].
