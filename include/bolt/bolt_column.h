@@ -148,11 +148,9 @@ enum class ColumnFormat : uint8_t {
                       // `seq_step` = W, `seq_offset` = delta reference.
 };
 // The format byte is persisted (MSEG PageEntry.format, wire descriptors):
-// the FastLanes ids are part of the bytes.
-static_assert(static_cast<uint8_t>(ColumnFormat::BitPacked) == 6 &&
-              static_cast<uint8_t>(ColumnFormat::FrameOfRef) == 7 &&
-              static_cast<uint8_t>(ColumnFormat::DeltaFOR) == 10,
-              "FastLanes ColumnFormat ids are persisted");
+// the FastLanes ids are part of the bytes. Pinned once, for all ten
+// ColumnFormat values together, in wire/bolt_wire_layout.h — don't
+// re-pin a subset here too, or the two lists can drift out of sync.
 
 // ---------------------------------------------------------------------------
 // ColumnFormat::Nested

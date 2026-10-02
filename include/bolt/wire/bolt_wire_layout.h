@@ -80,7 +80,8 @@ static_assert(static_cast<uint8_t>(ColumnFormat::Flat) == 0 &&
               static_cast<uint8_t>(ColumnFormat::BitPacked) == 6 &&
               static_cast<uint8_t>(ColumnFormat::FrameOfRef) == 7 &&
               static_cast<uint8_t>(ColumnFormat::VarBinary) == 8 &&
-              static_cast<uint8_t>(ColumnFormat::Nested) == 9,
+              static_cast<uint8_t>(ColumnFormat::Nested) == 9 &&
+              static_cast<uint8_t>(ColumnFormat::DeltaFOR) == 10,
               "ColumnFormat byte values are persisted (MSEG PageEntry.format)");
 
 // Fixed-width row strides that sit in b1 buffers on disk.
