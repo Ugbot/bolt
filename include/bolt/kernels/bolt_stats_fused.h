@@ -243,7 +243,7 @@ inline StatsStatus stats_fused_merge(const FusedStats& a, const FusedStats& b,
         o.flags |= kStatsExtremesValid;
         std::memcpy(o.min, (!hb || (both && detail::cmp_slot(k, a.min, b.min) <= 0)) ? a.min : b.min, 16);
         std::memcpy(o.max, (!hb || (both && detail::cmp_slot(k, a.max, b.max) >= 0)) ? a.max : b.max, 16);
-        if (!nan && std::memcmp(o.min, o.max, 16) == 0) o.flags |= kStatsConstant;
+        if (!nan && std::memcmp(o.min, o.max, 16) == 0) o.flags |= kStatsConstant;  // sv-memcmp-ok: min/max are fixed uint8_t[16] numeric slots, zero-padded, never a StringView
     }
     if ((a.flags & b.flags & kStatsSortedAsc) && !nan &&
         (!both || detail::cmp_sorted(k, a.max, b.min) <= 0)) o.flags |= kStatsSortedAsc;
