@@ -530,6 +530,17 @@ target_link_libraries(test_bolt_wire_validity
 bolt_apply_hardening(test_bolt_wire_validity)
 add_test(NAME test_bolt_wire_validity COMMAND test_bolt_wire_validity)
 
+# B5 (MSEG): persisted wire bytes match bolt_wire_layout.h.
+add_executable(test_bolt_wire_layout test_bolt_wire_layout.cpp)
+target_link_libraries(test_bolt_wire_layout
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_wire_layout)
+add_test(NAME test_bolt_wire_layout COMMAND test_bolt_wire_layout)
+
 # Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
 # both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
 add_executable(test_bolt_setop test_bolt_setop.cpp)
