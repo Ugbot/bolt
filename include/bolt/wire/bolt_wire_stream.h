@@ -231,7 +231,8 @@ inline bool wire_stream_append_column(WireStream* BOLT_RESTRICT s,
     // Zero alignment padding so the buffer stays reproducible (matches the
     // non-streaming serializer, which memsets the full buffer first).
     if (v_len > 0) {
-        memcpy(s->out + off0, col->validity, v_len);
+        wire::detail::copy_validity_bits(s->out + off0, col->validity,
+                                         col->validity_offset, col->length);
         const size_t pad = wire_stream_detail::align_up_64(v_len) - v_len;
         if (pad > 0) memset(s->out + off0 + v_len, 0, pad);
     }
