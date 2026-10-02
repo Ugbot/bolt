@@ -11,6 +11,7 @@
 
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_arena.h"
+#include "bolt/kernels/bolt_fastlanes.h"
 
 #include <cassert>
 #include <cstdint>
@@ -130,10 +131,10 @@ enum class ColumnFormat : uint8_t {
     RLE        = 5,   // Run-length: `data` = values[num_runs];
                       // `dict_child` = int32 run_ends[num_runs]
                       // where run i covers [run_ends[i-1], run_ends[i]).
-    BitPacked  = 6,   // Bit-packed: `data` = uint64 words, each value uses
-                      // `seq_step` bits (reused from union). Width ∈ [1,32].
-    FrameOfRef = 7,   // FOR = base + bit-packed deltas: `data` = delta words,
-                      // `seq_offset` = base value, `seq_step` = bit width.
+    BitPacked  = 6,   // FastLanes 1,024-value blocks (bolt_fastlanes.h): `data` =
+                      // packed T-bit words (T = the type's width), `seq_step` =
+                      // bit width W in [0, T]. value = packed.
+    FrameOfRef = 7,   // As BitPacked; `seq_offset` = reference. value = ref + packed.
     VarBinary  = 8,   // Variable-width payload (Utf8 / Binary / JSONB / etc.).
                       // `data`  = flat byte buffer (concatenated payloads).
                       // `dict_child` = Flat Int32 column of length+1 offsets.
@@ -142,7 +143,16 @@ enum class ColumnFormat : uint8_t {
                       // `type_size_bytes` = 0 (variable width).
     Nested     = 9,   // LIST / MAP / STRUCT (and VARIANT, which is a STRUCT).
                       // `type` says which. See the note below.
+    DeltaFOR   = 10,  // FastLanes transposed delta blocks (bolt_fastlanes.h):
+                      // per block [LANES bases][LANES * W packed words];
+                      // `seq_step` = W, `seq_offset` = delta reference.
 };
+// The format byte is persisted (MSEG PageEntry.format, wire descriptors):
+// the FastLanes ids are part of the bytes.
+static_assert(static_cast<uint8_t>(ColumnFormat::BitPacked) == 6 &&
+              static_cast<uint8_t>(ColumnFormat::FrameOfRef) == 7 &&
+              static_cast<uint8_t>(ColumnFormat::DeltaFOR) == 10,
+              "FastLanes ColumnFormat ids are persisted");
 
 // ---------------------------------------------------------------------------
 // ColumnFormat::Nested
@@ -884,53 +894,61 @@ struct BoltColumn {
         utf8_at(row, out_data, out_len);
     }
 
-    /// Bit-packed column (B3). `packed_words` holds `total_rows * bit_width`
-    /// bits LSB-first, each value using `bit_width` ∈ [1,32] bits. Caller
-    /// owns the buffer lifetime. `type` determines the output integer type
-    /// at materialise time (must be a ≤32-bit signed or unsigned int).
-    static BoltColumn make_bitpacked(const uint64_t* packed_words,
-                                      uint8_t bit_width, int64_t total_rows,
-                                      BoltType type, Arena* arena) noexcept {
-        assert(arena != nullptr);
-        assert(bit_width >= 1 && bit_width <= 32);
-        assert(total_rows >= 0);
-        if (total_rows > 0 && packed_words == nullptr) return make_empty();
+    /// True for the integer-shaped types the FastLanes formats carry: the
+    /// value is a T-bit integer, T = 8 / 16 / 32 / 64.
+    static bool fastlanes_type(BoltType t) noexcept {
+        const size_t sz = bolt::type_size(t);
+        if (sz != 1 && sz != 2 && sz != 4 && sz != 8) return false;
+        return bolt::is_integer(t) || t == BoltType::Bool || t == BoltType::Date32 ||
+               t == BoltType::Date64 || t == BoltType::Timestamp ||
+               t == BoltType::Duration || t == BoltType::Decimal64;
+    }
 
+    /// BitPacked / FrameOfRef / DeltaFOR over a caller-owned FastLanes buffer
+    /// (bolt_fastlanes.h encode_for / encode_delta_for write it). `ref` is the
+    /// frame of reference (FrameOfRef) or the delta reference (DeltaFOR); 0
+    /// for BitPacked. Returns make_empty() on a bad shape.
+    static BoltColumn make_fastlanes(ColumnFormat fmt, const void* packed, uint8_t bit_width,
+                                     int64_t ref, int64_t total_rows, BoltType type,
+                                     Arena* arena) noexcept {
+        assert(fmt == ColumnFormat::BitPacked || fmt == ColumnFormat::FrameOfRef ||
+               fmt == ColumnFormat::DeltaFOR);
+        assert(total_rows >= 0);
+        if (!fastlanes_type(type)) return make_empty();
+        if (bit_width > 8u * bolt::type_size(type)) return make_empty();
+        if (total_rows > 0 && packed == nullptr &&
+            (bit_width != 0 || fmt == ColumnFormat::DeltaFOR)) return make_empty();
+        if (fmt == ColumnFormat::BitPacked && ref != 0) return make_empty();
         BoltColumn c = make_empty();
         c.type = type;
         c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
         c.length = total_rows;
-        c.format = ColumnFormat::BitPacked;
+        c.format = fmt;
         c.arena = arena;
-        c.data = const_cast<uint64_t*>(packed_words);
-        c.seq_offset = 0;  // unused for BitPacked
-        c.seq_step   = static_cast<int64_t>(bit_width);
+        c.data = const_cast<void*>(packed);
+        c.seq_offset = ref;
+        c.seq_step = static_cast<int64_t>(bit_width);
         c.stats.all_valid = true;
         return c;
     }
 
-    /// Frame-of-reference column (B4). Logical value[i] = base + delta[i],
-    /// where delta[] is bit-packed at `bit_width` bits per delta.
-    static BoltColumn make_frame_of_ref(const uint64_t* packed_deltas,
-                                         uint8_t bit_width, int64_t base,
-                                         int64_t total_rows,
-                                         BoltType type, Arena* arena) noexcept {
-        assert(arena != nullptr);
-        assert(bit_width >= 1 && bit_width <= 32);
-        assert(total_rows >= 0);
-        if (total_rows > 0 && packed_deltas == nullptr) return make_empty();
+    static BoltColumn make_bitpacked(const void* packed, uint8_t bit_width,
+                                     int64_t total_rows, BoltType type, Arena* arena) noexcept {
+        return make_fastlanes(ColumnFormat::BitPacked, packed, bit_width, 0, total_rows,
+                              type, arena);
+    }
 
-        BoltColumn c = make_empty();
-        c.type = type;
-        c.type_size_bytes = static_cast<uint16_t>(bolt::type_size(type));
-        c.length = total_rows;
-        c.format = ColumnFormat::FrameOfRef;
-        c.arena = arena;
-        c.data = const_cast<uint64_t*>(packed_deltas);
-        c.seq_offset = base;
-        c.seq_step   = static_cast<int64_t>(bit_width);
-        c.stats.all_valid = true;
-        return c;
+    static BoltColumn make_frame_of_ref(const void* packed, uint8_t bit_width, int64_t base,
+                                        int64_t total_rows, BoltType type,
+                                        Arena* arena) noexcept {
+        return make_fastlanes(ColumnFormat::FrameOfRef, packed, bit_width, base, total_rows,
+                              type, arena);
+    }
+
+    static BoltColumn make_delta_for(const void* blocks, uint8_t bit_width, int64_t delta_ref,
+                                     int64_t total_rows, BoltType type, Arena* arena) noexcept {
+        return make_fastlanes(ColumnFormat::DeltaFOR, blocks, bit_width, delta_ref, total_rows,
+                              type, arena);
     }
 
     static BoltColumn make_view(const BoltColumn& parent, int64_t offset,
@@ -1019,9 +1037,14 @@ struct BoltColumn {
                 const size_t valid_bytes = validity ? (static_cast<size_t>(length) + 7) / 8 : 0;
                 return payload + offsets_bytes + valid_bytes;
             }
-            case ColumnFormat::RLE:
             case ColumnFormat::BitPacked:
             case ColumnFormat::FrameOfRef:
+                return fastlanes::packed_bytes(8u * type_size_bytes, length,
+                                               static_cast<uint32_t>(seq_step));
+            case ColumnFormat::DeltaFOR:
+                return fastlanes::delta_bytes(8u * type_size_bytes, length,
+                                              static_cast<uint32_t>(seq_step));
+            case ColumnFormat::RLE:
                 return 0;  // existing TODO; sized by their own buffers
         }
         return 0;
@@ -1119,6 +1142,10 @@ struct BoltColumn {
 
     /// Materialize non-Flat formats to Flat (arena-allocated)
     BoltColumn materialize(Arena* arena) const noexcept;
+
+    /// Decode a BitPacked / FrameOfRef / DeltaFOR column into `out`
+    /// (length * tsz bytes). False on a bad width or type.
+    bool fastlanes_materialize(void* out, size_t tsz) const noexcept;
 
     /// Ensure a `BitmapIndex` is attached to this column, building it lazily
     /// on first call from `arena`. The index lives on the `bitmap_index`
@@ -1919,6 +1946,40 @@ inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
 }
 
 // ============================================================================
+// BoltColumn::fastlanes_materialize (MSEG B1 scalar reference decode)
+// ============================================================================
+
+namespace detail {
+template <class U>
+inline void fastlanes_decode(const BoltColumn& c, void* out) noexcept {
+    assert(out != nullptr || c.length == 0);
+    assert(c.seq_step >= 0 && c.seq_step <= static_cast<int64_t>(8 * sizeof(U)));
+    const uint32_t w = static_cast<uint32_t>(c.seq_step);
+    if (c.format == ColumnFormat::DeltaFOR)
+        fastlanes::decode_delta_for<U>(c.data, c.length, c.seq_offset, w, static_cast<U*>(out));
+    else
+        fastlanes::decode_for<U>(c.data, c.length, c.seq_offset, w, static_cast<U*>(out));
+}
+}  // namespace detail
+
+inline bool BoltColumn::fastlanes_materialize(void* out, size_t tsz) const noexcept {
+    assert(format == ColumnFormat::BitPacked || format == ColumnFormat::FrameOfRef ||
+           format == ColumnFormat::DeltaFOR);
+    assert(out != nullptr || length == 0);
+    if (!fastlanes_type(type) || tsz != bolt::type_size(type)) return false;
+    if (seq_step < 0 || seq_step > static_cast<int64_t>(8 * tsz)) return false;
+    if (length > 0 && data == nullptr && (seq_step != 0 || format == ColumnFormat::DeltaFOR))
+        return false;
+    switch (tsz) {
+        case 1: detail::fastlanes_decode<uint8_t>(*this, out); return true;
+        case 2: detail::fastlanes_decode<uint16_t>(*this, out); return true;
+        case 4: detail::fastlanes_decode<uint32_t>(*this, out); return true;
+        case 8: detail::fastlanes_decode<uint64_t>(*this, out); return true;
+        default: return false;
+    }
+}
+
+// ============================================================================
 // BoltColumn::materialize
 // ============================================================================
 
@@ -1985,35 +2046,9 @@ inline BoltColumn BoltColumn::materialize(Arena* arena_in) const noexcept {
             }
             out.validity = nval;
         }
-    } else if (format == ColumnFormat::BitPacked ||
-               format == ColumnFormat::FrameOfRef) {
-        // B3/B4 unpack — read `bit_width` bits at a time from `data` and
-        // store each decoded value (plus base for FOR) into the Flat buffer.
-        if (!data) return make_empty();
-        const uint64_t* words = static_cast<const uint64_t*>(data);
-        const int64_t  bw = seq_step;      // bit_width
-        if (bw < 1 || bw > 32) return make_empty();
-        const int64_t base = (format == ColumnFormat::FrameOfRef) ? seq_offset : 0;
-        const uint64_t mask = (bw == 64) ? ~uint64_t{0}
-                                         : ((uint64_t{1} << bw) - 1u);
-        for (int64_t i = 0; i < length; ++i) {
-            const uint64_t bit_off     = static_cast<uint64_t>(i) * static_cast<uint64_t>(bw);
-            const uint64_t word_off    = bit_off >> 6;
-            const uint64_t bit_in_word = bit_off & 63u;
-            uint64_t v = words[word_off] >> bit_in_word;
-            if (bit_in_word + static_cast<uint64_t>(bw) > 64u) {
-                v |= words[word_off + 1] << (64u - bit_in_word);
-            }
-            v &= mask;
-            const int64_t  full = base + static_cast<int64_t>(v);
-            uint8_t*       dst  = static_cast<uint8_t*>(buf) + (size_t)i * tsz;
-            // Narrow to the target type's width (all supported widths are ≤8).
-            if      (tsz == 1) { uint8_t  t = static_cast<uint8_t>(full);  memcpy(dst, &t, 1); }
-            else if (tsz == 2) { uint16_t t = static_cast<uint16_t>(full); memcpy(dst, &t, 2); }
-            else if (tsz == 4) { uint32_t t = static_cast<uint32_t>(full); memcpy(dst, &t, 4); }
-            else if (tsz == 8) { int64_t  t = full;                        memcpy(dst, &t, 8); }
-            else return make_empty();
-        }
+    } else if (format == ColumnFormat::BitPacked || format == ColumnFormat::FrameOfRef ||
+               format == ColumnFormat::DeltaFOR) {
+        if (!fastlanes_materialize(buf, tsz)) return make_empty();
     } else if (format == ColumnFormat::RLE) {
         // Expand runs: for each run i, memset/memcpy `values[i]` into
         // `out[run_ends[i-1] .. run_ends[i])`.  Values buffer sits at

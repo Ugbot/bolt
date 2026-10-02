@@ -17,6 +17,7 @@
 #pragma once
 
 #include "bolt/bolt_port.h"
+#include "bolt/kernels/bolt_fastlanes.h"
 #include "bolt/bolt_types.h"
 #include <cstdint>
 #include <cstring>
@@ -968,103 +969,82 @@ inline int64_t sum_rle_i64(const T* BOLT_RESTRICT values,
 }
 
 // ============================================================================
-// Run-native kernels for BitPacked + FrameOfRef (I1 / I2) — decode on the
-// fly into a stack scratch buffer, compare/aggregate, emit.  Avoids the
-// full-column materialise traffic that a materialise-then-filter path
-// would pay when the caller only needs a selection vector or a sum.
+// Run-native kernels for BitPacked + FrameOfRef over the FastLanes block
+// layout (bolt_fastlanes.h, MSEG B1) — decode one 1,024-value block at a time
+// into a stack scratch, compare / aggregate, emit. Scalar reference; the
+// SIMD versions are M4.
 // ============================================================================
 
-// Internal helper: unpack `count` values (≤ stride_max) from the packed
-// buffer starting at logical index `start` into `out[]`. Caller ensures
-// `out` is sized to `count`. Same bit-unpack shape used in
-// BoltColumn::materialize's BitPacked branch.
-BOLT_FORCE_INLINE void bolt_bitpacked_unpack_range(
-        const uint64_t* BOLT_RESTRICT words, int64_t start, int64_t count,
-        uint8_t bit_width, int32_t* BOLT_RESTRICT out) noexcept {
-    assert(words != nullptr || count == 0);
-    assert(out   != nullptr || count == 0);
-    assert(bit_width >= 1 && bit_width <= 32);
-    const uint64_t mask = (bit_width == 64) ? ~uint64_t{0}
-                                            : ((uint64_t{1} << bit_width) - 1u);
-    for (int64_t i = 0; i < count; ++i) {
-        const uint64_t bit_off     = static_cast<uint64_t>(start + i)
-                                   * static_cast<uint64_t>(bit_width);
-        const uint64_t word_off    = bit_off >> 6;
-        const uint64_t bit_in_word = bit_off & 63u;
-        uint64_t v = words[word_off] >> bit_in_word;
-        if (bit_in_word + static_cast<uint64_t>(bit_width) > 64u) {
-            v |= words[word_off + 1] << (64u - bit_in_word);
-        }
-        out[i] = static_cast<int32_t>(v & mask);
-    }
+namespace detail {
+// Unpack block b of a uint32-shaped BitPacked buffer; returns its row count.
+BOLT_FORCE_INLINE uint32_t bitpacked_block_u32(const uint32_t* BOLT_RESTRICT packed,
+                                               int64_t length, uint8_t bit_width, int64_t b,
+                                               uint32_t* BOLT_RESTRICT scratch) noexcept {
+    assert(b >= 0 && b < fastlanes::blocks(length));
+    assert(bit_width <= 32);
+    const int64_t base = b * fastlanes::kBlockValues;
+    fastlanes::unpack_block<uint32_t>(
+        packed + static_cast<size_t>(b) * fastlanes::lanes<uint32_t>() * bit_width,
+        bit_width, scratch);
+    return length - base < fastlanes::kBlockValues ? static_cast<uint32_t>(length - base)
+                                                   : fastlanes::kBlockValues;
 }
+}  // namespace detail
 
-/// Run-native `filter_gt` over a BitPacked uint32-shaped column.
-/// Unpacks 64 values at a time into a stack buffer, compares scalar-
-/// branchless, emits indices. Emitted indices are absolute (0..length).
-inline int64_t filter_gt_bitpacked(const uint64_t* BOLT_RESTRICT words,
+/// Run-native `filter_gt` over a BitPacked uint32-shaped column. Emitted
+/// indices are absolute (0..length).
+inline int64_t filter_gt_bitpacked(const uint32_t* BOLT_RESTRICT packed,
                                    int64_t length, uint8_t bit_width,
                                    int32_t scalar,
                                    int32_t* BOLT_RESTRICT out) noexcept {
-    assert(words != nullptr || length == 0);
-    assert(out   != nullptr || length == 0);
-    assert(length >= 0);
-    assert(bit_width >= 1 && bit_width <= 32);
-    constexpr int64_t kChunk = 64;
-    alignas(64) int32_t scratch[kChunk];
+    assert(packed != nullptr || length == 0 || bit_width == 0);
+    assert(out != nullptr || length == 0);
+    assert(length >= 0 && bit_width <= 32);
+    alignas(64) uint32_t scratch[fastlanes::kBlockValues];
     int64_t count = 0;
-    for (int64_t s = 0; s < length; s += kChunk) {
-        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
-        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
-        for (int64_t i = 0; i < n; ++i) {
-            out[count] = static_cast<int32_t>(s + i);
-            count += (scratch[i] > scalar);
+    for (int64_t b = 0; b < fastlanes::blocks(length); ++b) {
+        const uint32_t n = detail::bitpacked_block_u32(packed, length, bit_width, b, scratch);
+        const int64_t base = b * fastlanes::kBlockValues;
+        for (uint32_t i = 0; i < n; ++i) {
+            out[count] = static_cast<int32_t>(base + i);
+            count += (static_cast<int32_t>(scratch[i]) > scalar);
         }
     }
     return count;
 }
 
-/// Run-native `filter_eq` over a BitPacked column.
-inline int64_t filter_eq_bitpacked(const uint64_t* BOLT_RESTRICT words,
+/// Run-native `filter_eq` over a BitPacked uint32-shaped column.
+inline int64_t filter_eq_bitpacked(const uint32_t* BOLT_RESTRICT packed,
                                    int64_t length, uint8_t bit_width,
                                    int32_t scalar,
                                    int32_t* BOLT_RESTRICT out) noexcept {
-    assert(words != nullptr || length == 0);
-    assert(out   != nullptr || length == 0);
-    assert(length >= 0);
-    assert(bit_width >= 1 && bit_width <= 32);
-    constexpr int64_t kChunk = 64;
-    alignas(64) int32_t scratch[kChunk];
+    assert(packed != nullptr || length == 0 || bit_width == 0);
+    assert(out != nullptr || length == 0);
+    assert(length >= 0 && bit_width <= 32);
+    alignas(64) uint32_t scratch[fastlanes::kBlockValues];
     int64_t count = 0;
-    for (int64_t s = 0; s < length; s += kChunk) {
-        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
-        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
-        for (int64_t i = 0; i < n; ++i) {
-            out[count] = static_cast<int32_t>(s + i);
-            count += (scratch[i] == scalar);
+    for (int64_t b = 0; b < fastlanes::blocks(length); ++b) {
+        const uint32_t n = detail::bitpacked_block_u32(packed, length, bit_width, b, scratch);
+        const int64_t base = b * fastlanes::kBlockValues;
+        for (uint32_t i = 0; i < n; ++i) {
+            out[count] = static_cast<int32_t>(base + i);
+            count += (static_cast<int32_t>(scratch[i]) == scalar);
         }
     }
     return count;
 }
 
-/// Run-native `sum` over a FrameOfRef column: base * n + Σ(deltas).
-/// Unpacks deltas in 64-value chunks; scalar add hoisted, so the hot
-/// loop is a straight `acc += scratch[i]`.
-inline int64_t sum_frame_of_ref(const uint64_t* BOLT_RESTRICT words,
+/// Run-native `sum` over a uint32-shaped FrameOfRef column: base * n + sum(packed).
+inline int64_t sum_frame_of_ref(const uint32_t* BOLT_RESTRICT packed,
                                 int64_t length, uint8_t bit_width,
                                 int64_t base) noexcept {
-    assert(words != nullptr || length == 0);
-    assert(length >= 0);
-    assert(bit_width >= 1 && bit_width <= 32);
-    constexpr int64_t kChunk = 64;
-    alignas(64) int32_t scratch[kChunk];
+    assert(packed != nullptr || length == 0 || bit_width == 0);
+    assert(length >= 0 && bit_width <= 32);
+    alignas(64) uint32_t scratch[fastlanes::kBlockValues];
     int64_t delta_sum = 0;
-    for (int64_t s = 0; s < length; s += kChunk) {
-        const int64_t n = (length - s < kChunk) ? (length - s) : kChunk;
-        bolt_bitpacked_unpack_range(words, s, n, bit_width, scratch);
-        for (int64_t i = 0; i < n; ++i) {
-            delta_sum += static_cast<int64_t>(scratch[i]);
-        }
+    for (int64_t b = 0; b < fastlanes::blocks(length); ++b) {
+        const uint32_t n = detail::bitpacked_block_u32(packed, length, bit_width, b, scratch);
+        for (uint32_t i = 0; i < n; ++i) delta_sum += static_cast<int64_t>(scratch[i]);
     }
     return base * length + delta_sum;
 }
