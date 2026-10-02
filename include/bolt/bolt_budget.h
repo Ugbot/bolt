@@ -30,6 +30,7 @@
 #include "bolt/bolt_system_memory.h"
 #include "bolt/bolt_types.h"
 #include "bolt/kernels/bolt_vector_limits.h"
+#include "bolt/wire/bolt_wire_limits.h"
 
 // ---------------------------------------------------------------------------
 // bolt's own Limits table.
@@ -56,7 +57,19 @@
       nullptr, "column-count validation ceiling (bolt::kMaxColumns)")           \
     X(gb_hash_chain_max, kInvariant, "links", 64, 64, 64, nullptr, nullptr,     \
       "group-by hash table: bounded probe chain a colliding hash follows "     \
-      "before the query is refused (kGbHashChainMax)")
+      "before the query is refused (kGbHashChainMax)")                         \
+    X(wire_buf_align, kInvariant, "bytes", BOLT_WIRE_BUF_ALIGN,                 \
+      BOLT_WIRE_BUF_ALIGN, BOLT_WIRE_BUF_ALIGN, nullptr, nullptr,              \
+      "frame / buffer alignment this build writes (recorded per file)")        \
+    X(wire_chunk_align, kInvariant, "bytes", BOLT_WIRE_CHUNK_ALIGN,             \
+      BOLT_WIRE_CHUNK_ALIGN, BOLT_WIRE_CHUNK_ALIGN, nullptr, nullptr,          \
+      "frame-file index/footer alignment this build writes (recorded per file)") \
+    X(wire_stripe_align, kInvariant, "bytes", BOLT_WIRE_STRIPE_ALIGN,           \
+      BOLT_WIRE_STRIPE_ALIGN, BOLT_WIRE_STRIPE_ALIGN, nullptr, nullptr,        \
+      "segment data-region alignment this build writes (recorded per file)")   \
+    X(wire_io_align, kInvariant, "bytes", BOLT_WIRE_IO_ALIGN,                   \
+      BOLT_WIRE_IO_ALIGN, BOLT_WIRE_IO_ALIGN, nullptr, nullptr,                \
+      "writer I/O unit this build records (informational)")
 
 namespace bolt {
 

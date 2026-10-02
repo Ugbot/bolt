@@ -541,6 +541,17 @@ target_link_libraries(test_bolt_wire_layout
 bolt_apply_hardening(test_bolt_wire_layout)
 add_test(NAME test_bolt_wire_layout COMMAND test_bolt_wire_layout)
 
+# B2 (MSEG): checksummed frames + multi-frame container (WAL / L0 / spill / shuffle).
+add_executable(test_bolt_wire_frame test_bolt_wire_frame.cpp)
+target_link_libraries(test_bolt_wire_frame
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_wire_frame)
+add_test(NAME test_bolt_wire_frame COMMAND test_bolt_wire_frame)
+
 # Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
 # both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
 add_executable(test_bolt_setop test_bolt_setop.cpp)
