@@ -519,6 +519,17 @@ bolt_apply_hardening(test_bolt_wire_stream)
 
 add_test(NAME test_bolt_wire_stream COMMAND test_bolt_wire_stream)
 
+# B4 (MSEG): the wire serializers honour BoltColumn::validity_offset.
+add_executable(test_bolt_wire_validity test_bolt_wire_validity.cpp)
+target_link_libraries(test_bolt_wire_validity
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_wire_validity)
+add_test(NAME test_bolt_wire_validity COMMAND test_bolt_wire_validity)
+
 # Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
 # both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
 add_executable(test_bolt_setop test_bolt_setop.cpp)

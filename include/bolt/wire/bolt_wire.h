@@ -248,6 +248,36 @@ BOLT_FORCE_INLINE size_t validity_bytes(int64_t n) noexcept {
     return static_cast<size_t>((n + 7) / 8);
 }
 
+// Copy `n` validity bits starting at bit `bit_off` of `src` into `dst` at bit
+// 0 (B4: a sliced column's bitmap starts at `validity_offset`, not bit 0).
+// Bits past `n` in the last byte are written as zero, so the wire bytes are a
+// function of the logical nulls only (stable CRCs and dedup).
+inline void copy_validity_bits(uint8_t* BOLT_RESTRICT dst,
+                               const uint8_t* BOLT_RESTRICT src,
+                               int64_t bit_off, int64_t n) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(bit_off >= 0 && n >= 0);
+    const size_t nbytes = validity_bytes(n);
+    if (nbytes == 0) return;
+    const uint8_t* s = src + (bit_off >> 3);
+    const unsigned sh = static_cast<unsigned>(bit_off & 7);
+    if (sh == 0) {
+        memcpy(dst, s, nbytes);
+    } else {
+        // Byte i of the output takes the high (8 - sh) bits of s[i] and the
+        // low sh bits of s[i + 1]; s[i + 1] exists only while it holds a bit
+        // below n.
+        const size_t src_bytes = validity_bytes(n + static_cast<int64_t>(sh));
+        for (size_t i = 0; i < nbytes; ++i) {        // bounded: nbytes
+            unsigned v = static_cast<unsigned>(s[i]) >> sh;
+            if (i + 1 < src_bytes) v |= static_cast<unsigned>(s[i + 1]) << (8 - sh);
+            dst[i] = static_cast<uint8_t>(v);
+        }
+    }
+    const unsigned tail = static_cast<unsigned>(n & 7);
+    if (tail != 0) dst[nbytes - 1] &= static_cast<uint8_t>((1u << tail) - 1u);
+}
+
 BOLT_FORCE_INLINE void write_u32_le(uint8_t* p, uint32_t v) noexcept {
     assert(p != nullptr);
     memcpy(p, &v, sizeof(v));
@@ -429,7 +459,11 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         // pointer was absent) is zeroed by zero_wire_gap below, keeping the
         // wire image byte-identical to the old whole-buffer memset.
         size_t wr0 = 0, wr1 = 0, wr2 = 0;
-        if (b0 && c.validity) { memcpy(buf + off0, c.validity, b0); wr0 = b0; }
+        if (b0 && c.validity) {
+            detail::copy_validity_bits(buf + off0, c.validity,
+                                       c.validity_offset, c.length);
+            wr0 = b0;
+        }
         if (c.format == ColumnFormat::VarBinary) {
             // b1 = offsets array; b2 = payload bytes.
             if (b1 > 0 && c.dict_child != nullptr &&
