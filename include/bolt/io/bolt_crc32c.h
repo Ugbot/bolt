@@ -39,6 +39,10 @@
 //
 // API:
 //   uint32_t crc32c(data, len, seed = 0)      — core; seed = 0 for fresh.
+//                                                >= 3 lanes: crc32c_3way.
+//   uint32_t crc32c_3way(data, len, seed)     — interleaved hardware path.
+//   uint32_t crc32c_extend_zeros(crc, n)      — crc continued over n zeros.
+//   uint32_t page_crc32c(page, len, padded)   — page CRC incl. zero padding.
 //   uint32_t crc32c_update(crc, data, len)    — streaming continue; same
 //                                                as crc32c(data, len, crc).
 //
@@ -50,6 +54,7 @@
 #pragma once
 
 #include "bolt/bolt_port.h"
+#include "bolt/io/bolt_io_limits.h"
 
 #include <cassert>
 #include <cstddef>
@@ -196,6 +201,120 @@ BOLT_FORCE_INLINE uint32_t crc32c_hw_arm(const void* BOLT_RESTRICT data,
 #endif  // BOLT_CRC32C_HW_ARM
 
 // ---------------------------------------------------------------------------
+// GF(2) arithmetic modulo the Castagnoli polynomial, reflected (bit 31 is the
+// x^0 coefficient). A raw CRC state s followed by n zero bytes becomes
+// s * x^(8n) mod P, and raw CRCs are linear, so the CRC of A||B is
+// shift(crc(A), |B|) ^ crc_raw(B). Used to recombine interleaved lanes and to
+// extend a CRC over zero padding without materialising it.
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+inline constexpr uint32_t kCrc32cPolyReflected = 0x82F63B78u;
+
+constexpr uint32_t crc32c_multmodp(uint32_t a, uint32_t b) noexcept {
+    uint32_t p = 0;
+    for (int i = 0; i < 32; ++i) {
+        if (a & (0x80000000u >> i)) p ^= b;
+        b = (b & 1u) ? ((b >> 1) ^ kCrc32cPolyReflected) : (b >> 1);
+    }
+    return p;
+}
+
+// x^(2^k) mod P for k = 0..63.
+struct Crc32cPow2 { uint32_t v[64]; };
+constexpr Crc32cPow2 crc32c_make_pow2() noexcept {
+    Crc32cPow2 t{};
+    uint32_t x = 0x40000000u;  // x^1
+    for (int k = 0; k < 64; ++k) { t.v[k] = x; x = crc32c_multmodp(x, x); }
+    return t;
+}
+inline constexpr Crc32cPow2 kCrc32cPow2 = crc32c_make_pow2();
+
+// x^(8 * n) mod P.
+constexpr uint32_t crc32c_x8n(uint64_t n) noexcept {
+    uint32_t r = 0x80000000u;  // x^0
+    uint64_t e = n;
+    for (int k = 3; e != 0 && k < 64; ++k, e >>= 1)
+        if (e & 1u) r = crc32c_multmodp(kCrc32cPow2.v[k], r);
+    return r;
+}
+
+// Byte-sliced table of "shift by one lane": shift(s) = xor of T[k][byte k].
+struct Crc32cShiftTable { uint32_t t[4][256]; };
+constexpr Crc32cShiftTable crc32c_make_shift(uint64_t n_bytes) noexcept {
+    Crc32cShiftTable s{};
+    const uint32_t m = crc32c_x8n(n_bytes);
+    for (int k = 0; k < 4; ++k)
+        for (uint32_t b = 0; b < 256u; ++b) s.t[k][b] = crc32c_multmodp(m, b << (8 * k));
+    return s;
+}
+inline constexpr Crc32cShiftTable kCrc32cLaneShift = crc32c_make_shift(kCrc32cLaneBytes);
+
+BOLT_FORCE_INLINE uint32_t crc32c_lane_shift(uint32_t s) noexcept {
+    return kCrc32cLaneShift.t[0][s & 0xFFu] ^ kCrc32cLaneShift.t[1][(s >> 8) & 0xFFu] ^
+           kCrc32cLaneShift.t[2][(s >> 16) & 0xFFu] ^ kCrc32cLaneShift.t[3][s >> 24];
+}
+
+}  // namespace detail
+
+/// CRC32C of `crc`'s stream followed by `n` zero bytes, in O(log n) without
+/// touching memory. Equal to crc32c_update(crc, zeros, n).
+inline uint32_t crc32c_extend_zeros(uint32_t crc, uint64_t n) noexcept {
+    assert(n <= (uint64_t(1) << 60));
+    const uint32_t raw = detail::crc32c_multmodp(detail::crc32c_x8n(n), ~crc);
+    assert(n != 0 || raw == ~crc);
+    return ~raw;
+}
+
+// ---------------------------------------------------------------------------
+// 3-way interleaved hardware CRC: three independent lanes hide the crc
+// instruction's latency; lanes are recombined with the shift table. Same
+// result as the serial loop for every input.
+// ---------------------------------------------------------------------------
+
+#if BOLT_CRC32C_HW_X86 || BOLT_CRC32C_HW_ARM
+
+namespace detail {
+BOLT_FORCE_INLINE uint32_t crc32c_raw_u64(uint32_t s, const uint8_t* p) noexcept {
+    uint64_t v;
+    std::memcpy(&v, p, sizeof(v));
+#if BOLT_CRC32C_HW_X86
+    return static_cast<uint32_t>(_mm_crc32_u64(s, v));
+#else
+    return __crc32cd(s, v);
+#endif
+}
+}  // namespace detail
+
+inline uint32_t crc32c_3way(const void* BOLT_RESTRICT data, size_t len,
+                            uint32_t seed = 0u) noexcept {
+    assert(data != nullptr || len == 0);
+    assert(len <= (static_cast<size_t>(1) << 48));
+    constexpr size_t L = kCrc32cLaneBytes;
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t s = ~seed;  // raw running state
+    while (len >= 3 * L) {
+        uint32_t a = s, b = 0, c = 0;
+        for (size_t i = 0; i < L; i += 8) {
+            a = detail::crc32c_raw_u64(a, p + i);
+            b = detail::crc32c_raw_u64(b, p + L + i);
+            c = detail::crc32c_raw_u64(c, p + 2 * L + i);
+        }
+        s = detail::crc32c_lane_shift(detail::crc32c_lane_shift(a) ^ b) ^ c;
+        p += 3 * L;
+        len -= 3 * L;
+    }
+#if BOLT_CRC32C_HW_X86
+    return crc32c_hw_x86(p, len, ~s);
+#else
+    return crc32c_hw_arm(p, len, ~s);
+#endif
+}
+
+#endif  // HW
+
+// ---------------------------------------------------------------------------
 // Public entry — picks the hardware path at compile time.
 // ---------------------------------------------------------------------------
 
@@ -204,6 +323,9 @@ BOLT_FORCE_INLINE uint32_t crc32c(const void* BOLT_RESTRICT data,
                                   uint32_t seed = 0u) noexcept {
     assert(data != nullptr || len == 0);
     assert(len <= (static_cast<size_t>(1) << 48));  // sanity upper bound
+#if BOLT_CRC32C_HW_X86 || BOLT_CRC32C_HW_ARM
+    if (len >= kCrc32c3WayMinBytes) return crc32c_3way(data, len, seed);
+#endif
 #if BOLT_CRC32C_HW_X86
     return crc32c_hw_x86(data, len, seed);
 #elif BOLT_CRC32C_HW_ARM
@@ -222,6 +344,18 @@ BOLT_FORCE_INLINE uint32_t crc32c_update(uint32_t crc,
     assert(data != nullptr || len == 0);
     assert(len <= (static_cast<size_t>(1) << 48));  // sanity upper bound
     return crc32c(data, len, crc);
+}
+
+/// Page CRC (MSEG §6.1.1): CRC32C over the page's `payload_len` bytes and
+/// the zero padding up to `padded_len` (the page's end on its alignment
+/// unit). The padding is not read: a page held unpadded in memory has the
+/// same CRC as its padded bytes on disk.
+inline uint32_t page_crc32c(const void* BOLT_RESTRICT page, size_t payload_len,
+                            size_t padded_len, uint32_t seed = 0u) noexcept {
+    assert(page != nullptr || payload_len == 0);
+    assert(padded_len >= payload_len);
+    const uint32_t c = crc32c(page, payload_len, seed);
+    return crc32c_extend_zeros(c, padded_len - payload_len);
 }
 
 }  // namespace io

@@ -164,6 +164,19 @@ if(BOLT_BUILD_IO)
     bolt_apply_hardening(bolt_io)
     bolt_apply_simd(bolt_io ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io)
+
+    # bolt::io_file — the one part of bolt::io that does file I/O: the aligned
+    # (direct-I/O) page writer of MSEG K9. Kept out of bolt_io so that library
+    # stays pure compute.
+    add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp)
+    add_library(bolt::io_file ALIAS bolt_io_file)
+    target_link_libraries(bolt_io_file PUBLIC bolt::core bolt::io)
+    target_include_directories(bolt_io_file PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    bolt_apply_hardening(bolt_io_file)
+    bolt_apply_simd(bolt_io_file ${BOLT_SIMD_TIER})
+    target_link_libraries(bolt INTERFACE bolt::io_file)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1139,7 +1152,7 @@ install(DIRECTORY include/bolt
 set(_bolt_exportable
     bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt
     bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
-    bolt_io bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
+    bolt_io bolt_io_file bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)
 ## BLLM-99: bolt_rocm is an IMPORTED target (built via a direct clang++
 ## invocation, not enable_language(HIP) -- see that block's own comment) --
