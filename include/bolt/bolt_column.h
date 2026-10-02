@@ -1124,6 +1124,31 @@ struct BoltColumn {
     static void noop_release_array(ArrowArray*) noexcept {}
 };
 
+// B5 (MSEG): the descriptor is never persisted (pages carry buffers, the
+// reader rebuilds descriptors), but batches hold num_cols x 2 of them, it is
+// memcpy'd everywhere, and the C ABI hands it across language boundaries.
+// A size or layout change must be a deliberate edit here.
+static_assert(sizeof(void*) == 8, "bolt targets 64-bit platforms only");
+static_assert(sizeof(BoltColumn) == 256, "BoltColumn layout drift");
+static_assert(alignof(BoltColumn) == 64, "BoltColumn alignment drift");
+static_assert(std::is_trivially_copyable_v<BoltColumn>,
+              "BoltColumn is memcpy'd and must stay trivially copyable");
+static_assert(std::is_standard_layout_v<BoltColumn>,
+              "BoltColumn crosses the C ABI and must stay standard layout");
+static_assert(offsetof(BoltColumn, data) == 0 &&
+              offsetof(BoltColumn, validity) == 8 &&
+              offsetof(BoltColumn, validity_offset) == 16 &&
+              offsetof(BoltColumn, length) == 24 &&
+              offsetof(BoltColumn, format) == 32 &&
+              offsetof(BoltColumn, type) == 33 &&
+              offsetof(BoltColumn, type_size_bytes) == 34 &&
+              offsetof(BoltColumn, stats) == 64 &&
+              offsetof(BoltColumn, inline_value) == 176 &&
+              offsetof(BoltColumn, dict_child) == 192 &&
+              offsetof(BoltColumn, str_overflow_base) == 200 &&
+              offsetof(BoltColumn, arena) == 208,
+              "BoltColumn field offsets drift");
+
 // ============================================================================
 // BoltBatch — double-buffered, COW, Venus tick-tock pattern
 // ============================================================================
@@ -1341,17 +1366,9 @@ struct alignas(64) BoltBatch {
     /// Zero-copy for Flat columns. Constant/Sequence must be materialized first.
     void fill_arrow_schema(ArrowSchema* out) const noexcept;
 
-    // =====================================================================
-    // IPC serialization (Bolt wire format, Arrow-layout-compatible data)
-    // =====================================================================
-
-    /// Serialize to contiguous buffer. Returns bytes written, 0 on error.
-    /// Layout: header + column data (Arrow-compatible buffers).
-    size_t serialize(void* out_buf, size_t buf_capacity) const noexcept;
-
-    /// Deserialize from buffer into arena. Returns false on error.
-    static bool deserialize(const void* buf, size_t buf_len,
-                            BoltBatch* out, Arena* arena) noexcept;
+    // Serialisation is bolt::wire (bolt_wire_serialize / bolt_wire_view);
+    // a batch has no member serialize/deserialize (B5: the declared pair was
+    // never defined).
 
 private:
     void mark_dirty(uint32_t col_idx) noexcept {

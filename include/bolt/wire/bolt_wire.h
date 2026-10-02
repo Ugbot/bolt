@@ -75,6 +75,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
+#include "bolt/wire/bolt_wire_layout.h"
 
 namespace bolt {
 namespace wire {
@@ -96,6 +97,11 @@ inline constexpr size_t kWireAlign           = 64;
 // A frame carries up to bolt::kMaxColumns columns (num_cols is a u32 in the
 // header; the serializer keeps no per-column scratch, so width costs nothing).
 inline constexpr uint32_t kWireMaxCols = kMaxColumns;
+
+static_assert(kWireHeaderSize == layout::kHeaderBytes, "wire header size");
+static_assert(kWireSchemaEntrySize == layout::kSchemaEntryBytes, "schema entry size");
+static_assert(kWireDescSize == layout::kDescBytes, "descriptor size");
+static_assert(kWireAlign == 64 && kWireDescSize % 8 == 0, "wire alignment");
 
 // ===========================================================================
 // Internal helpers
@@ -417,20 +423,20 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         uint8_t* e = buf + schema_off + i * kWireSchemaEntrySize;
         const BoltField& f = b->schema.fields[i];
         memcpy(e, f.name, kMaxFieldName + 1);
-        e[64] = static_cast<uint8_t>(f.type);
-        e[65] = static_cast<uint8_t>(b->col(i).format);
-        e[66] = f.nullable ? 1u : 0u;
+        e[layout::kSchemaTypeOff] = static_cast<uint8_t>(f.type);
+        e[layout::kSchemaFormatOff] = static_cast<uint8_t>(b->col(i).format);
+        e[layout::kSchemaNullableOff] = f.nullable ? 1u : 0u;
         // G2ICE-143: byte 67 was always-zero "reserved" -- repurposed to
         // carry Decimal128/Decimal64 scale (BoltColumn::decimal_scale is
         // the value that travels with the data, so it's the source here,
         // not BoltField's copy). 0 for every non-decimal column, so old
         // payloads stay byte-identical.
-        e[67] = b->col(i).decimal_scale;
+        e[layout::kSchemaScaleOff] = b->col(i).decimal_scale;
         // bytes 68..71: fixed_size (Embedding dim or FixedSizeBinary
         // width). Zero for all other types — old readers see zeroes
         // and ignore the field; new readers consult it for vector
         // round-trip.
-        detail::write_u32_le(e + 68, f.fixed_size);
+        detail::write_u32_le(e + layout::kSchemaFixedOff, f.fixed_size);
     }
 
     // --- Column descriptors + data copy ---
@@ -452,7 +458,7 @@ inline size_t bolt_wire_serialize(const BoltBatch* b,
         detail::write_u64_le(d +  0, off0); detail::write_u64_le(d +  8, b0);
         detail::write_u64_le(d + 16, off1); detail::write_u64_le(d + 24, b1);
         detail::write_u64_le(d + 32, off2); detail::write_u64_le(d + 40, b2);
-        d[48] = static_cast<uint8_t>(c.format);
+        d[layout::kDescFormatOff] = static_cast<uint8_t>(c.format);
 
         // G2ICE-141: `wr{0,1,2}` = bytes actually copied into each span; the
         // uncovered remainder (alignment pad, or a whole span whose source
@@ -595,19 +601,19 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
         memset(&f, 0, sizeof(f));
         memcpy(f.name, e, kMaxFieldName);
         f.name[kMaxFieldName] = '\0';
-        f.type     = static_cast<BoltType>(e[64]);
-        f.nullable = (e[66] != 0);
+        f.type     = static_cast<BoltType>(e[layout::kSchemaTypeOff]);
+        f.nullable = (e[layout::kSchemaNullableOff] != 0);
         // G2ICE-143: byte 67 is decimal_scale (Decimal128/Decimal64); 0 for
         // every other type, matching the always-zero "reserved" byte old
         // (pre-v4) payloads wrote there.
-        f.decimal_scale = e[67];
+        f.decimal_scale = e[layout::kSchemaScaleOff];
         // bytes 68..71 carry fixed_size (Embedding dim / FixedSizeBinary
         // width). Old writers wrote zero into the trailing pad, so
         // pre-vector schemas decode as fixed_size = 0 — matches the
         // default-initialised BoltField.
-        f.fixed_size = detail::read_u32_le(e + 68);
+        f.fixed_size = detail::read_u32_le(e + layout::kSchemaFixedOff);
         const ColumnFormat schema_fmt =
-            static_cast<ColumnFormat>(e[65]);
+            static_cast<ColumnFormat>(e[layout::kSchemaFormatOff]);
         if (!detail::is_supported_format_pair(f.type, schema_fmt)) return false;
         // Embedding columns require a non-zero dim; reject corrupt /
         // pre-vector payloads that label a column Embedding without
@@ -621,7 +627,7 @@ inline bool bolt_wire_parse(const void* buf, size_t buf_len,
         const uint64_t l1 = detail::read_u64_le(d + 24);
         const uint64_t o2 = detail::read_u64_le(d + 32);
         const uint64_t l2 = detail::read_u64_le(d + 40);
-        const ColumnFormat fm = static_cast<ColumnFormat>(d[48]);
+        const ColumnFormat fm = static_cast<ColumnFormat>(d[layout::kDescFormatOff]);
         if (fm != schema_fmt) return false;
         if (!detail::is_supported_format_pair(f.type, fm)) return false;
         if (o0 + l0 > buf_len || o1 + l1 > buf_len ||
