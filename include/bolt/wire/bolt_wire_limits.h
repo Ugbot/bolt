@@ -59,6 +59,9 @@ inline constexpr uint8_t kFrameIoAlignLog2Hi     = 20;   // 1 MiB
 inline constexpr uint32_t kFrameMaxZones = kMaxColumns;
 // A frame's wire payload length is a u32 on disk.
 inline constexpr uint64_t kFrameMaxPayloadBytes = 0xFFFFFFFFull;
+// Nesting depth of a wire blob: Nested children and Dictionary values are
+// serialised as sub-blobs, recursively (bounded recursion).
+inline constexpr uint32_t kWireMaxNestDepth = 16;
 // Frames in one container (FrameIndexEntry count is a u32 on disk).
 inline constexpr uint32_t kFrameFileMaxFrames = 0xFFFFFFFFu;
 

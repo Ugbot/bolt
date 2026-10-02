@@ -296,7 +296,8 @@ inline FrameZoneKind frame_zone_kind_for(const BoltColumn& c) noexcept {
     assert(c.length >= 0);
     const BoltType t = c.type;
     if (c.format == ColumnFormat::VarBinary) return FrameZoneKind::kStr8;
-    if (c.format != ColumnFormat::Flat) return FrameZoneKind::kNone;
+    if (c.format != ColumnFormat::Flat && c.format != ColumnFormat::View)
+        return FrameZoneKind::kNone;
     switch (t) {
         case BoltType::Bool: case BoltType::Int8: case BoltType::Int16:
         case BoltType::Int32: case BoltType::Int64: case BoltType::Date32:
@@ -308,7 +309,8 @@ inline FrameZoneKind frame_zone_kind_for(const BoltColumn& c) noexcept {
             return FrameZoneKind::kU64;
         case BoltType::Float32: return FrameZoneKind::kF32;
         case BoltType::Float64: return FrameZoneKind::kF64;
-        case BoltType::Utf8:    return FrameZoneKind::kStr8;
+        case BoltType::Utf8: case BoltType::Binary: case BoltType::Symbol:
+            return FrameZoneKind::kStr8;
         default:                return FrameZoneKind::kNone;
     }
 }

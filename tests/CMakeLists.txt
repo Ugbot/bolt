@@ -552,6 +552,17 @@ target_link_libraries(test_bolt_wire_frame
 bolt_apply_hardening(test_bolt_wire_frame)
 add_test(NAME test_bolt_wire_frame COMMAND test_bolt_wire_frame)
 
+# B3 (MSEG): wire ids for the hot column kinds and the missing types.
+add_executable(test_bolt_wire_kinds test_bolt_wire_kinds.cpp)
+target_link_libraries(test_bolt_wire_kinds
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_wire_kinds)
+add_test(NAME test_bolt_wire_kinds COMMAND test_bolt_wire_kinds)
+
 # Two-input sorted-merge set operations (UNION/INTERSECT/EXCEPT,
 # both DISTINCT and ALL). Companion to bolt_kmerge for k = 2.
 add_executable(test_bolt_setop test_bolt_setop.cpp)
