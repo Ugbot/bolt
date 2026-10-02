@@ -161,4 +161,54 @@ BOLT_FORCE_INLINE size_t sbbf_size_bytes(const SplitBlockBloom& sbf) noexcept {
     return (static_cast<size_t>(sbf.num_blocks_mask) + 1u) * sizeof(SbbfBlock);
 }
 
+// ---- Fastrange variant: any block count ---------------------------------
+// The Parquet spec's own block selection: block = (hi32(h) * num_blocks)
+// >> 32. No power-of-two rounding, so a filter is sized exactly to its
+// bits-per-key target (MSEG StripeBlooms: 65,536 keys x 10 bits = 2,560
+// blocks, 80 KiB, where the pow2 form takes 4,096). Same lane masks and
+// probe cost as SplitBlockBloom; the two index forms are not interchangeable.
+struct SplitBlockBloomFr {
+    SbbfBlock* blocks;            // num_blocks entries
+    uint32_t   num_blocks;        // >= 1, any value
+};
+
+// Blocks for n keys at bits_per_key, rounded up to a multiple of `multiple`
+// (a caller keeping 64 B block runs passes 2). Never 0.
+BOLT_FORCE_INLINE uint32_t sbbf_fr_blocks_for(uint64_t n_keys, uint32_t bits_per_key,
+                                              uint32_t multiple) noexcept {
+    assert(bits_per_key > 0 && bits_per_key <= 64);
+    assert(multiple >= 1 && multiple <= 64);
+    uint64_t b = (n_keys * bits_per_key + 255u) / 256u;
+    if (b == 0) b = 1;
+    b = (b + multiple - 1) / multiple * multiple;
+    assert(b <= UINT32_MAX);
+    return static_cast<uint32_t>(b);
+}
+
+BOLT_FORCE_INLINE uint32_t sbbf_fr_block_index(const SplitBlockBloomFr& sbf,
+                                               uint64_t mixed_hash) noexcept {
+    assert(sbf.num_blocks != 0);
+    const uint32_t i = static_cast<uint32_t>(((mixed_hash >> 32) * sbf.num_blocks) >> 32);
+    assert(i < sbf.num_blocks);
+    return i;
+}
+
+BOLT_FORCE_INLINE void sbbf_fr_add(SplitBlockBloomFr& sbf, uint64_t mixed_hash) noexcept {
+    assert(sbf.blocks != nullptr);
+    uint32_t mask[8];
+    sbbf_compute_mask(static_cast<uint32_t>(mixed_hash), mask);
+    SbbfBlock& blk = sbf.blocks[sbbf_fr_block_index(sbf, mixed_hash)];
+    for (int l = 0; l < 8; ++l) blk.lane[l] |= mask[l];
+}
+
+BOLT_FORCE_INLINE bool sbbf_fr_test(const SplitBlockBloomFr& sbf, uint64_t mixed_hash) noexcept {
+    assert(sbf.blocks != nullptr);
+    uint32_t mask[8];
+    sbbf_compute_mask(static_cast<uint32_t>(mixed_hash), mask);
+    const SbbfBlock& blk = sbf.blocks[sbbf_fr_block_index(sbf, mixed_hash)];
+    uint32_t missing = 0;
+    for (int l = 0; l < 8; ++l) missing |= (mask[l] & ~blk.lane[l]);
+    return missing == 0u;
+}
+
 }  // namespace bolt

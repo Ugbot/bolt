@@ -674,6 +674,33 @@ TEST(BoltSbbf, SizingAtTenBitsPerKey) {
     EXPECT_LE(sbbf_size_bytes(sbf), 4096u);
 }
 
+TEST(BoltSbbf, FastrangeExactSizeNoFalseNegatives) {
+    // 65,536 keys at 10 bits/key: 2,560 blocks (80 KiB), not 4,096.
+    EXPECT_EQ(sbbf_fr_blocks_for(65536, 10, 2), 2560u);
+    EXPECT_EQ(sbbf_fr_blocks_for(1, 10, 2), 2u);
+    EXPECT_EQ(sbbf_fr_blocks_for(0, 10, 1), 1u);
+    Arena arena;
+    SplitBlockBloomFr sbf{};
+    sbf.num_blocks = sbbf_fr_blocks_for(65536, 10, 2);
+    sbf.blocks = static_cast<SbbfBlock*>(
+        arena.allocate_zeroed(sbf.num_blocks * sizeof(SbbfBlock), 64));
+    ASSERT_NE(sbf.blocks, nullptr);
+    std::mt19937_64 rng(0xF4A5);
+    std::vector<uint64_t> keys(65536);
+    for (auto& k : keys) { k = rng() | 1ULL; sbbf_fr_add(sbf, swiss_mix(k)); }
+    std::vector<uint32_t> hit(sbf.num_blocks, 0);
+    for (uint64_t k : keys) {
+        EXPECT_TRUE(sbbf_fr_test(sbf, swiss_mix(k)));
+        ++hit[sbbf_fr_block_index(sbf, swiss_mix(k))];
+    }
+    uint32_t used = 0;
+    for (uint32_t h : hit) used += h != 0;
+    EXPECT_GT(used, sbf.num_blocks * 95 / 100) << "fastrange must reach every block";
+    int fps = 0;
+    for (int i = 0; i < 20000; ++i) fps += sbbf_fr_test(sbf, swiss_mix(rng() & ~1ULL));
+    EXPECT_LT(fps, 20000 * 2 / 100) << "FPR at 10 bits/key: " << fps;
+}
+
 // Collision-heavy stress — hash_mix is deterministic, but we can force
 // a crowded group by hand-picking keys whose `swiss_mix` falls in the
 // same 16-wide group. Drives the linear-probe chain past the initial
