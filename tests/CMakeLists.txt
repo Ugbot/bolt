@@ -536,6 +536,17 @@ target_link_libraries(test_bolt_rle
 bolt_apply_hardening(test_bolt_rle)
 add_test(NAME test_bolt_rle COMMAND test_bolt_rle)
 
+# K4 (MSEG): constant / all-null page detection.
+add_executable(test_bolt_constant_detect test_bolt_constant_detect.cpp)
+target_link_libraries(test_bolt_constant_detect
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_constant_detect)
+add_test(NAME test_bolt_constant_detect COMMAND test_bolt_constant_detect)
+
 add_executable(test_bolt_wire test_bolt_wire.cpp)
 
 target_link_libraries(test_bolt_wire

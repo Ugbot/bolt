@@ -1,5 +1,5 @@
 // bolt_stats_limits.h — capacities of the fused page/stripe stats kernel
-// (MSEG K7, kernels/bolt_stats_fused.h).
+// (MSEG K7, kernels/bolt_stats_fused.h) and of K4's page-kind detectors.
 #pragma once
 
 #include <cstdint>
@@ -16,10 +16,16 @@ inline constexpr uint32_t kStatsSumLanes = 8;
 // kStatsSumLanes. Tuning only; results do not depend on it.
 inline constexpr uint32_t kStatsBlockRows = 1024;
 
+// K4 (kernels/bolt_page_detect.h): rows a detector compares per step while the
+// page is still a Constant candidate; once a value differs the rest of the
+// page is only copied. Tuning only; results do not depend on it.
+inline constexpr uint32_t kPageDetectBlockRows = 256;
+
 // Rows one FusedStats can describe (row_count / null_count are uint32).
 inline constexpr uint64_t kStatsMaxRows = 0xFFFFFFFFull;
 
 static_assert(kStatsBlockRows % kStatsSumLanes == 0, "block must hold whole lane groups");
+static_assert(kPageDetectBlockRows > 0, "detection steps through whole blocks");
 static_assert((kStatsSumLanes & (kStatsSumLanes - 1)) == 0, "lane count is a power of two");
 
 }  // namespace bolt::stats
