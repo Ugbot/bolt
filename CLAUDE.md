@@ -71,6 +71,22 @@ https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md
 - **Compile-time type dispatch via X-macros.** One runtime switch at the
   boundary, fully specialized template in the inner loop.
 
+### Scale is tunable (1 thread to 200 cores)
+Bolt owns the machinery every repo scales with, so it must work at both ends.
+The worker count, pinning, NUMA binding and grain come from one run-time scale
+profile (built on `SchedulerConfig` / `TuneProfile`, registered in the Limits
+table in `bolt_budget.h`), never from a constant or a `hardware_concurrency()`
+default inside a kernel. **1 worker is first-class:** a `Scheduler` with one
+worker must run tasks inline on the caller (no worker thread, no channel hop,
+no `parallel_*` dispatch), and `parallel_*` wrappers fall through to the
+serial kernel (today it starts a thread at 1 worker: G2CHK-448). At N:
+per-core arenas and pools allocated on the worker's NUMA node (`CpuTopology`
+drives placement), per-worker EBR shards, SPSC channels between pinned stages,
+no shared counter on a per-row path. A kernel or primitive perf claim reports
+the 1-thread ns/row and the scaling curve (1, 2, 4, 8, ... up to the box).
+Gestalt2 `docs/ENGINEERING.md` §5a has the full rule; the audit of hardcoded
+parallelism is Gestalt2 `docs/research/scale-tunability-audit-2026-10.md`.
+
 ### Multiple implementations, one default
 - **The general-case implementation is the default.** Multiple
   implementations of the same primitive may live in the library
