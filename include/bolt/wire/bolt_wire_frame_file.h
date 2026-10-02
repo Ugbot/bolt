@@ -11,6 +11,14 @@
 // alignment units) and, when present, the footer and index CRC; then
 // frame_file_frame parses frame i through the index. An unsealed file opens
 // with sealed == false; frame_file_recover lists its frames.
+//
+// Every frame, index and footer CRC in a file is seeded with the header's
+// CRC (frame_file_seed), and the header covers a caller-chosen incarnation,
+// so bytes left by an earlier file in a recycled, non-zeroed buffer (an old
+// footer, an old frame past the new tail) never validate. The caller must
+// pass a different incarnation for every file it creates (a counter, a clock
+// reading, random bits). All offsets read from the file are bounds-checked
+// without overflow: the file is untrusted input.
 
 #pragma once
 
@@ -44,6 +52,13 @@ inline size_t frame_align_up(size_t x, uint32_t unit) noexcept {
 
 }  // namespace detail
 
+/// The CRC seed of every frame, the index and the footer of a file.
+inline uint32_t frame_file_seed(const FrameFileHeader& h) noexcept {
+    assert(h.version != 0 || h.magic[0] == 0);
+    assert(h.buf_align_log2 < 32);
+    return h.header_crc32c;
+}
+
 /// Read and validate a container header: magic, version, CRC, alignment
 /// units (the status names the failing unit), frames_off.
 inline FrameStatus frame_file_read_header(const void* buf, size_t len,
@@ -51,6 +66,7 @@ inline FrameStatus frame_file_read_header(const void* buf, size_t len,
     assert(out != nullptr);
     assert(buf != nullptr || len == 0);
     if (len < sizeof(FrameFileHeader)) return FrameStatus::kTruncated;
+    if ((reinterpret_cast<uintptr_t>(buf) & 63u) != 0) return FrameStatus::kUnaligned;
     memcpy(out, buf, sizeof(*out));
     if (memcmp(out->magic, "BWFF", 4) != 0) return FrameStatus::kBadMagic;
     if (detail::frame_file_header_crc(*out) != out->header_crc32c) return FrameStatus::kBadCrc;
@@ -87,6 +103,8 @@ struct FrameFileWriter {
     FrameFileHeader  header;
     uint64_t         total_rows;
     uint64_t         lsn_min, lsn_max;
+    uint32_t         seed;           // frame_file_seed(header)
+    uint32_t         _pad2;
 };
 
 namespace detail {
@@ -154,7 +172,7 @@ inline void frame_file_terminate(FrameFileWriter* w) noexcept {
 inline FrameStatus frame_file_record(FrameFileWriter* w, const FrameView& v,
                                      size_t off) noexcept {
     assert(w != nullptr);
-    assert(off % 64u == 0);
+    assert(off % (1u << w->header.buf_align_log2) == 0);
     if (w->n_frames >= w->index_cap) return FrameStatus::kCapacity;
     FrameIndexEntry& e = w->index[w->n_frames];
     memset(&e, 0, sizeof(e));
@@ -184,7 +202,7 @@ inline FrameStatus frame_file_record(FrameFileWriter* w, const FrameView& v,
 /// entries; `rollup`/`rollup_kind` (nullable) hold the per-column rollup.
 inline FrameStatus frame_file_begin_with(FrameFileWriter* w, void* buf, size_t cap,
                                          const FrameAlign& a, FrameFilePurpose purpose,
-                                         uint64_t id0, uint64_t id1,
+                                         uint64_t id0, uint64_t id1, uint64_t incarnation,
                                          FrameIndexEntry* index, uint32_t index_cap,
                                          ZoneMap* rollup, uint8_t* rollup_kind,
                                          uint32_t rollup_cap) noexcept {
@@ -206,8 +224,10 @@ inline FrameStatus frame_file_begin_with(FrameFileWriter* w, void* buf, size_t c
     h.io_align_log2 = a.io_log2;
     h.id0 = id0;
     h.id1 = id1;
+    h.incarnation = incarnation;
     h.frames_off = detail::frame_align_up(sizeof(FrameFileHeader), kFrameBufAlign);
     h.header_crc32c = detail::frame_file_header_crc(h);
+    w->seed = frame_file_seed(h);
     memcpy(w->buf, &h, sizeof(h));
     memset(w->buf + sizeof(h), 0, h.frames_off - sizeof(h));
     w->pos = h.frames_off;
@@ -218,13 +238,14 @@ inline FrameStatus frame_file_begin_with(FrameFileWriter* w, void* buf, size_t c
 /// frame_file_begin_with this build's units (bolt_wire_limits.h).
 inline FrameStatus frame_file_begin(FrameFileWriter* w, void* buf, size_t cap,
                                     FrameFilePurpose purpose, uint64_t id0, uint64_t id1,
+                                    uint64_t incarnation,
                                     FrameIndexEntry* index, uint32_t index_cap,
                                     ZoneMap* rollup, uint8_t* rollup_kind,
                                     uint32_t rollup_cap) noexcept {
     assert(w != nullptr);
     assert(buf != nullptr || cap == 0);
     return frame_file_begin_with(w, buf, cap, frame_align_default(), purpose, id0, id1,
-                                 index, index_cap, rollup, rollup_kind, rollup_cap);
+                                 incarnation, index, index_cap, rollup, rollup_kind, rollup_cap);
 }
 
 /// Append one frame (see frame_write for zone modes).
@@ -236,10 +257,12 @@ inline FrameStatus frame_file_append(FrameFileWriter* w, const BoltBatch* b,
     if (w->sealed) return FrameStatus::kBadLayout;
     if (w->n_frames >= w->index_cap) return FrameStatus::kCapacity;
     FrameStatus st = FrameStatus::kOk;
-    const size_t len = frame_write(b, m, zm, zones, kinds, w->buf + w->pos, w->cap - w->pos, &st);
+    FrameMeta sm = m;
+    sm.crc_seed = w->seed;
+    const size_t len = frame_write(b, sm, zm, zones, kinds, w->buf + w->pos, w->cap - w->pos, &st);
     if (len == 0) return st;
     FrameView v;
-    st = frame_parse(w->buf + w->pos, len, false, &v);
+    st = frame_parse(w->buf + w->pos, len, false, &v, w->seed);
     assert(st == FrameStatus::kOk);
     if (st != FrameStatus::kOk) return st;
     st = detail::frame_file_record(w, v, w->pos);
@@ -291,8 +314,8 @@ inline size_t frame_file_seal(FrameFileWriter* w) noexcept {
     f.lsn_max = w->lsn_max;
     f.n_frames = w->n_frames;
     f.n_rollup = n_roll;
-    f.index_crc32c = io::crc32c(p + index_off, index_len);
-    f.footer_crc32c = io::crc32c(&f, offsetof(FrameFileFooter, footer_crc32c));
+    f.index_crc32c = io::crc32c(p + index_off, index_len, w->seed);
+    f.footer_crc32c = io::crc32c(&f, offsetof(FrameFileFooter, footer_crc32c), w->seed);
     memcpy(p + file_len - sizeof(f), &f, sizeof(f));
     w->sealed = 1;
     assert(file_len % chunk == 0);
@@ -313,8 +336,9 @@ struct FrameFileView {
     const uint8_t*         rollup_kind;
     uint32_t               n_frames;
     uint32_t               n_rollup;
+    uint32_t               seed;         // frame_file_seed(header)
     uint8_t                sealed;
-    uint8_t                _pad[7];
+    uint8_t                _pad[3];
 };
 
 namespace detail {
@@ -325,17 +349,19 @@ inline FrameStatus frame_file_read_footer(FrameFileView* v) noexcept {
     FrameFileFooter& f = v->footer;
     memcpy(&f, v->base + v->len - sizeof(f), sizeof(f));
     if (f.magic != kFrameFooterMagic) { memset(&f, 0, sizeof(f)); return FrameStatus::kEnd; }
-    if (io::crc32c(&f, offsetof(FrameFileFooter, footer_crc32c)) != f.footer_crc32c)
+    if (io::crc32c(&f, offsetof(FrameFileFooter, footer_crc32c), v->seed) != f.footer_crc32c)
         return FrameStatus::kBadCrc;
     if (f.version != kFrameFileVersion) return FrameStatus::kBadVersion;
+    if (f.n_rollup > kFrameMaxZones) return FrameStatus::kBadLayout;
     const uint32_t chunk = 1u << v->header.chunk_align_log2;
     const size_t ent = sizeof(FrameIndexEntry) * static_cast<size_t>(f.n_frames);
     const size_t need = ent + frame_align64(33u * static_cast<size_t>(f.n_rollup));
-    if (f.index_off % chunk != 0 || f.index_len != need || f.n_rollup > kFrameMaxZones ||
-        f.index_off < v->header.frames_off ||
-        f.index_off + f.index_len + sizeof(f) > v->len)
+    const size_t body = v->len - sizeof(f);      // len >= 128 (asserted above)
+    if (f.index_off % chunk != 0 || f.index_len != need ||
+        f.index_off < v->header.frames_off || f.index_off > body ||
+        f.index_len > body - f.index_off)
         return FrameStatus::kBadLayout;
-    if (io::crc32c(v->base + f.index_off, f.index_len) != f.index_crc32c)
+    if (io::crc32c(v->base + f.index_off, f.index_len, v->seed) != f.index_crc32c)
         return FrameStatus::kBadCrc;
     v->index = reinterpret_cast<const FrameIndexEntry*>(v->base + f.index_off);
     v->rollup = reinterpret_cast<const ZoneMap*>(v->base + f.index_off + ent);
@@ -348,7 +374,11 @@ inline FrameStatus frame_file_read_footer(FrameFileView* v) noexcept {
 
 }  // namespace detail
 
-/// Open a container. kOk with sealed == 0 means no footer (recover it).
+/// Open a container. kOk with sealed == 0 means no footer (recover it). A
+/// footer that fails validation is an error, but v->base is still set (the
+/// header is good), so a recovery path may walk the frames: a footer that
+/// fails its seeded CRC is most often one left by an earlier file in a
+/// recycled buffer.
 inline FrameStatus frame_file_open(const void* buf, size_t len, FrameFileView* v) noexcept {
     assert(v != nullptr);
     assert(buf != nullptr || len == 0);
@@ -357,6 +387,7 @@ inline FrameStatus frame_file_open(const void* buf, size_t len, FrameFileView* v
     if (hs != FrameStatus::kOk) return hs;
     v->base = static_cast<const uint8_t*>(buf);
     v->len = len;
+    v->seed = frame_file_seed(v->header);
     if (len < 2 * sizeof(FrameFileHeader)) return FrameStatus::kOk;
     const FrameStatus fs = detail::frame_file_read_footer(v);
     return fs == FrameStatus::kEnd ? FrameStatus::kOk : fs;
@@ -369,8 +400,11 @@ inline FrameStatus frame_file_frame(const FrameFileView& v, uint32_t i, bool ver
     assert(v.sealed);
     if (i >= v.n_frames) return FrameStatus::kBadLayout;
     const FrameIndexEntry& e = v.index[i];
-    if (e.off % 64u != 0 || e.off + e.len > v.footer.index_off) return FrameStatus::kBadLayout;
-    const FrameStatus s = frame_parse(v.base + e.off, e.len, verify_crc, out);
+    const uint64_t unit = 1u << v.header.buf_align_log2;
+    if (e.off % unit != 0 || e.off < v.header.frames_off || e.off > v.footer.index_off ||
+        e.len > v.footer.index_off - e.off)
+        return FrameStatus::kBadLayout;
+    const FrameStatus s = frame_parse(v.base + e.off, e.len, verify_crc, out, v.seed);
     if (s != FrameStatus::kOk) return s;
     if (out->frame_len != e.len || out->header.crc32c != e.crc32c) return FrameStatus::kBadLayout;
     return FrameStatus::kOk;
@@ -387,12 +421,13 @@ inline int64_t frame_file_recover(const FrameFileView& v, FrameIndexEntry* out, 
     assert(end != nullptr && why != nullptr);
     assert(out != nullptr || cap == 0);
     const size_t limit = v.sealed ? static_cast<size_t>(v.footer.index_off) : v.len;
+    const uint32_t unit = 1u << v.header.buf_align_log2;
     size_t off = v.header.frames_off;
     uint32_t n = 0;
     *why = FrameStatus::kEnd;
-    while (off + sizeof(FrameHeader) <= limit) {          // advances >= 128 B per frame
+    while (off <= limit && limit - off >= sizeof(FrameHeader)) {   // advances >= 128 B per frame
         FrameView fv;
-        const FrameStatus s = frame_parse(v.base + off, limit - off, true, &fv);
+        const FrameStatus s = frame_parse(v.base + off, limit - off, true, &fv, v.seed);
         if (s != FrameStatus::kOk) { *why = s; break; }
         if (n >= cap) { *end = off; return -1; }
         FrameIndexEntry& e = out[n++];
@@ -402,16 +437,19 @@ inline int64_t frame_file_recover(const FrameFileView& v, FrameIndexEntry* out, 
         e.lsn_min = fv.trailer.lsn_min; e.lsn_max = fv.trailer.lsn_max;
         e.ts_min = fv.trailer.ts_min; e.ts_max = fv.trailer.ts_max;
         e.crc32c = fv.header.crc32c; e.n_zones = fv.n_zones;
-        off += fv.frame_len;
+        off = detail::frame_align_up(off + fv.frame_len, unit);
     }
-    *end = off;
+    *end = off < limit ? off : limit;
     return n;
 }
 
 /// Reopen an unsealed container (a crash before seal) for appending and
 /// sealing: validates the header, walks and CRC-checks the frames, rebuilds
 /// the index and rollup, and positions the writer after the last good frame
-/// (a torn tail is overwritten by the next append or the seal).
+/// (a torn tail is overwritten by the next append or the seal). A footer
+/// that does not validate under this file's seed (a stale one from an
+/// earlier file in the same buffer) is ignored; a valid footer means the
+/// file is sealed and is refused. The writer only appends at a 64 B unit.
 inline FrameStatus frame_file_resume(FrameFileWriter* w, void* buf, size_t cap,
                                      FrameIndexEntry* index, uint32_t index_cap,
                                      ZoneMap* rollup, uint8_t* rollup_kind,
@@ -422,14 +460,16 @@ inline FrameStatus frame_file_resume(FrameFileWriter* w, void* buf, size_t cap,
                                     rollup, rollup_kind, rollup_cap);
     FrameFileView v;
     const FrameStatus os = frame_file_open(buf, cap, &v);
-    if (os != FrameStatus::kOk) return os;
-    if (v.sealed) return FrameStatus::kBadLayout;
+    if (os != FrameStatus::kOk && v.base == nullptr) return os;   // header refused
+    if (os == FrameStatus::kOk && v.sealed) return FrameStatus::kBadLayout;
+    if ((1u << v.header.buf_align_log2) != kFrameBufAlign) return FrameStatus::kBadBufAlign;
     w->header = v.header;
+    w->seed = v.seed;
     size_t off = v.header.frames_off;
     for (uint64_t guard = 0; guard <= cap / 128u; ++guard) {   // each frame >= 128 B
         FrameView fv;
-        if (off + sizeof(FrameHeader) > cap ||
-            frame_parse(w->buf + off, cap - off, true, &fv) != FrameStatus::kOk) break;
+        if (off > cap || cap - off < sizeof(FrameHeader) ||
+            frame_parse(w->buf + off, cap - off, true, &fv, w->seed) != FrameStatus::kOk) break;
         const FrameStatus rs = detail::frame_file_record(w, fv, off);
         if (rs != FrameStatus::kOk) return rs;
         off += fv.frame_len;

@@ -263,7 +263,7 @@ TEST(WireFrameFile, AppendSealOpenReadEveryFrame) {
     Buf file(4 << 20);
     FileFixture fx;
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kWalSegment, 7, 9,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kWalSegment, 7, 9, 0x5eedull,
                                fx.index.data(), 64, fx.rollup.data(), fx.kinds.data(), 16),
               FrameStatus::kOk);
     int64_t mn = INT64_MAX, mx = INT64_MIN;
@@ -321,7 +321,7 @@ TEST(WireFrameFile, RollupDroppedWhenSchemaChanges) {
     Buf file(1 << 20);
     FileFixture fx;
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kSpill, 0, 0,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kSpill, 0, 0, 0x5eedull,
                                fx.index.data(), 64, fx.rollup.data(), fx.kinds.data(), 16),
               FrameStatus::kOk);
     BoltBatch b;
@@ -342,7 +342,7 @@ TEST(WireFrameFile, CrashBeforeSealRecoverResumeSeal) {
     Buf file(2 << 20);
     FileFixture fx;
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kWalSegment, 1, 2,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kWalSegment, 1, 2, 0x5eedull,
                                fx.index.data(), 64, fx.rollup.data(), fx.kinds.data(), 16),
               FrameStatus::kOk);
     for (int f = 0; f < 5; ++f) {
@@ -392,7 +392,7 @@ TEST(WireFrameFile, HeaderUnitsValidatedAndNamed) {
     Buf file(1 << 16);
     FileFixture fx;
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kGeneric, 0, 0,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kGeneric, 0, 0, 0x5eedull,
                                fx.index.data(), 64, nullptr, nullptr, 0), FrameStatus::kOk);
     const size_t len = frame_file_seal(&w);
     ASSERT_GT(len, 0u);
@@ -445,7 +445,7 @@ TEST(WireFrameFile, AlignmentMatrixReadsIdentically) {
         Buf file(1 << 20);
         FileFixture fx;
         FrameFileWriter w;
-        ASSERT_EQ(frame_file_begin_with(&w, file.p, file.n, u, FrameFilePurpose::kL0Run, 0, 0,
+        ASSERT_EQ(frame_file_begin_with(&w, file.p, file.n, u, FrameFilePurpose::kL0Run, 0, 0, 0x5eedull,
                                         fx.index.data(), 64, fx.rollup.data(), fx.kinds.data(), 16),
                   FrameStatus::kOk);
         for (int f = 0; f < 3; ++f) {
@@ -479,10 +479,10 @@ TEST(WireFrameFile, AlignmentMatrixReadsIdentically) {
     FileFixture fx;
     FrameFileWriter w;
     EXPECT_EQ(frame_file_begin_with(&w, file.p, file.n, FrameAlign{7, 14, 16, 12},
-                                    FrameFilePurpose::kGeneric, 0, 0, fx.index.data(), 64,
+                                    FrameFilePurpose::kGeneric, 0, 0, 0x5eedull, fx.index.data(), 64,
                                     nullptr, nullptr, 0), FrameStatus::kBadBufAlign);
     EXPECT_EQ(frame_file_begin_with(&w, file.p, file.n, FrameAlign{6, 17, 16, 12},
-                                    FrameFilePurpose::kGeneric, 0, 0, fx.index.data(), 64,
+                                    FrameFilePurpose::kGeneric, 0, 0, 0x5eedull, fx.index.data(), 64,
                                     nullptr, nullptr, 0), FrameStatus::kBadStripeAlign);
 }
 
@@ -491,7 +491,7 @@ TEST(WireFrameFile, IndexCorruptionAndCapacity) {
     Buf file(1 << 20);
     FileFixture fx;
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kShuffle, 0, 0,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kShuffle, 0, 0, 0x5eedull,
                                fx.index.data(), 2, nullptr, nullptr, 0), FrameStatus::kOk);
     BoltBatch b;
     build_batch(&b, &a, 8, 0);
@@ -513,4 +513,392 @@ TEST(WireFrameFile, LimitsAreRegistered) {
     const FrameAlign d = frame_align_default();
     EXPECT_EQ(frame_align_validate(d), FrameStatus::kOk);
     EXPECT_EQ(1u << d.chunk_log2, 16384u);
+}
+
+// ---------------------------------------------------------------------------
+// Review additions (2026-10-02): truncation at every byte, random-schema
+// container fuzz, recycled-file stale frames, recorded buf unit, hostile
+// offsets, NaN zones, unaligned buffers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Rng {
+    uint64_t s;
+    uint64_t next() { s = s * 6364136223846793005ull + 1442695040888963407ull; return s >> 11; }
+    uint64_t below(uint64_t n) { return n ? next() % n : 0; }
+};
+
+// A random batch: 1..8 columns of fixed-width, Flat Utf8 (inline + spilled)
+// and VarBinary Utf8, random nulls and NaNs, 0..max_rows rows.
+void random_batch(BoltBatch* b, Arena* a, Rng* r, int64_t max_rows) {
+    static const BoltType kTypes[] = {
+        BoltType::Int8, BoltType::Int16, BoltType::Int32, BoltType::Int64, BoltType::UInt8,
+        BoltType::UInt16, BoltType::UInt32, BoltType::UInt64, BoltType::Float32,
+        BoltType::Float64, BoltType::Bool, BoltType::Date32, BoltType::Timestamp,
+        BoltType::Decimal64, BoltType::Decimal128, BoltType::Utf8, BoltType::Utf8};
+    const uint32_t nc = 1 + static_cast<uint32_t>(r->below(8));
+    const int64_t n = static_cast<int64_t>(r->below(static_cast<uint64_t>(max_rows) + 1));
+    BoltBatch::init_empty(b);
+    ASSERT_TRUE(BoltBatch::alloc_columns(b, a, nc));
+    b->num_rows = n;
+    b->schema.num_fields = nc;
+    for (uint32_t c = 0; c < nc; ++c) {
+        const size_t ti = r->below(sizeof(kTypes) / sizeof(kTypes[0]));
+        const BoltType t = kTypes[ti];
+        char name[16];
+        std::snprintf(name, sizeof(name), "c%u", c);
+        set_field(b, c, name, t);
+        const bool varbin = (t == BoltType::Utf8) && (ti == 16);
+        BoltColumn col;
+        if (t == BoltType::Utf8 && !varbin) {
+            col = BoltColumn::make_flat_alloc(n, t, a);
+            char* pool = static_cast<char*>(a->allocate(static_cast<size_t>(n) * 40 + 1, 64));
+            uint32_t used = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                char tmp[40];
+                const int len = static_cast<int>(r->below(30));
+                for (int k = 0; k < len; ++k) tmp[k] = static_cast<char>('a' + r->below(26));
+                tmp[len] = '\0';
+                StringView sv = StringView::from_cstr(tmp);
+                if (len > 12) {
+                    std::memcpy(pool + used, tmp, static_cast<size_t>(len));
+                    sv.ref.buf_idx = 0;
+                    sv.ref.offset = used;
+                    used += static_cast<uint32_t>(len);
+                }
+                static_cast<StringView*>(col.data)[i] = sv;
+            }
+            col.str_overflow_base = pool;
+        } else if (varbin) {
+            int32_t* offs = static_cast<int32_t*>(a->allocate(sizeof(int32_t) * (n + 1), 64));
+            uint8_t* pay = static_cast<uint8_t*>(a->allocate(static_cast<size_t>(n) * 20 + 1, 64));
+            offs[0] = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const int len = static_cast<int>(r->below(20));
+                for (int k = 0; k < len; ++k) pay[offs[i] + k] = static_cast<uint8_t>(r->next());
+                offs[i + 1] = offs[i] + len;
+            }
+            col = BoltColumn::make_var_binary(pay, nullptr, offs, n, t, a);
+        } else {
+            col = BoltColumn::make_flat_alloc(n, t, a);
+            uint8_t* d = static_cast<uint8_t*>(col.data);
+            for (size_t k = 0; k < static_cast<size_t>(n) * col.type_size_bytes; ++k)
+                d[k] = static_cast<uint8_t>(r->next());
+            if (t == BoltType::Bool)
+                for (int64_t i = 0; i < n; ++i) d[i] &= 1u;
+            if (t == BoltType::Float64 && n > 0 && r->below(3) == 0)
+                static_cast<double*>(col.data)[r->below(static_cast<uint64_t>(n))] = std::nan("");
+        }
+        if (n > 0 && r->below(2) == 0) {
+            const size_t vb = static_cast<size_t>((n + 7) / 8);
+            uint8_t* v = static_cast<uint8_t*>(a->allocate(vb, 64));
+            for (size_t k = 0; k < vb; ++k) v[k] = static_cast<uint8_t>(r->next() | r->next());
+            col.validity = v;
+            col.stats.all_valid = false;
+        }
+        b->columns[0][c] = col;
+        b->columns[1][c] = col;
+    }
+}
+
+FrameMeta rmeta(Rng* r, uint64_t lsn) {
+    FrameMeta m = meta(lsn, static_cast<int64_t>(lsn) * 3);
+    m.kind = static_cast<FrameOpKind>(1 + r->below(4));
+    m.flags = static_cast<uint16_t>(r->next());
+    return m;
+}
+
+}  // namespace
+
+// Every frame of a random-schema container reads back as the bytes
+// bolt_wire_serialize writes for its source batch, with zones equal to a
+// recomputation; the sealed index equals the walk of the same file, and the
+// walk of the unsealed file equals the writer's index. Starts and padding
+// are checked on every frame. BOLT_FRAME_FUZZ_FRAMES scales the run.
+TEST(WireFrameFile, RandomSchemaContainerFuzz) {
+    const char* env = std::getenv("BOLT_FRAME_FUZZ_FRAMES");
+    const uint64_t target = env ? std::strtoull(env, nullptr, 10) : 1200u;
+    uint64_t frames_done = 0;
+    for (uint64_t seed = 1; frames_done < target; ++seed) {
+        Rng r{seed * 0x9E3779B97F4A7C15ull};
+        Arena a;
+        const uint32_t nframes = 1 + static_cast<uint32_t>(r.below(64));
+        Buf file(8 << 20);
+        std::vector<FrameIndexEntry> idx(64);
+        std::vector<ZoneMap> roll(16);
+        std::vector<uint8_t> rk(16);
+        FrameFileWriter w;
+        ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kL0Run, seed, 0,
+                                   seed ^ 0xABCDull, idx.data(), 64, roll.data(), rk.data(), 16),
+                  FrameStatus::kOk);
+        std::vector<std::vector<uint8_t>> wire(nframes);
+        std::vector<BoltBatch> src(nframes);
+        for (uint32_t f = 0; f < nframes; ++f) {
+            random_batch(&src[f], &a, &r, 200);
+            wire[f].resize(bolt_wire_size(&src[f]));
+            ASSERT_EQ(bolt_wire_serialize(&src[f], wire[f].data(), wire[f].size()), wire[f].size());
+            ASSERT_EQ(frame_file_append(&w, &src[f], rmeta(&r, 10 + 3ull * f),
+                                        r.below(4) ? FrameZones::kCompute : FrameZones::kNone,
+                                        nullptr, nullptr), FrameStatus::kOk) << "seed " << seed;
+        }
+        // Footer absent: the walk equals the writer's own index.
+        FrameFileView uv;
+        ASSERT_EQ(frame_file_open(file.p, file.n, &uv), FrameStatus::kOk);
+        ASSERT_FALSE(uv.sealed);
+        std::vector<FrameIndexEntry> walk(64);
+        size_t end = 0;
+        FrameStatus why;
+        ASSERT_EQ(frame_file_recover(uv, walk.data(), 64, &end, &why), int64_t(nframes));
+        EXPECT_EQ(why, FrameStatus::kEnd);
+        EXPECT_EQ(std::memcmp(walk.data(), idx.data(), nframes * sizeof(FrameIndexEntry)), 0);
+        const size_t len = frame_file_seal(&w);
+        ASSERT_GT(len, 0u);
+        FrameFileView v;
+        ASSERT_EQ(frame_file_open(file.p, len, &v), FrameStatus::kOk);
+        ASSERT_TRUE(v.sealed);
+        ASSERT_EQ(v.n_frames, nframes);
+        ASSERT_EQ(frame_file_recover(v, walk.data(), 64, &end, &why), int64_t(nframes));
+        EXPECT_EQ(std::memcmp(walk.data(), v.index, nframes * sizeof(FrameIndexEntry)), 0);
+        for (uint32_t f = 0; f < nframes; ++f) {
+            FrameView fv;
+            ASSERT_EQ(frame_file_frame(v, f, true, &fv), FrameStatus::kOk);
+            EXPECT_EQ(v.index[f].off % 64, 0u);
+            ASSERT_EQ(fv.payload_len, wire[f].size());
+            ASSERT_EQ(std::memcmp(fv.payload, wire[f].data(), wire[f].size()), 0);
+            const size_t pad_end = sizeof(FrameHeader) + ((fv.payload_len + 63) & ~size_t(63));
+            for (size_t k = sizeof(FrameHeader) + fv.payload_len; k < pad_end; ++k)
+                ASSERT_EQ(file.p[v.index[f].off + k], 0u);
+            BoltBatch d;
+            ASSERT_TRUE(bolt_wire_view(fv.payload, fv.payload_len, &d, &a));
+            ASSERT_EQ(d.num_rows, src[f].num_rows);
+            for (uint32_t z = 0; z < fv.n_zones; ++z) {
+                ZoneMap want;
+                const FrameZoneKind k = frame_zone_for_column(d.col(z), &want);
+                ASSERT_EQ(fv.zone_kinds[z], uint8_t(k));
+                ASSERT_EQ(std::memcmp(&fv.zones[z], &want, sizeof(ZoneMap)), 0)
+                    << "seed " << seed << " frame " << f << " col " << z;
+            }
+        }
+        frames_done += nframes;
+    }
+}
+
+// Cut the file at every byte of the last frame (absent tail, and a garbage
+// tail): recovery keeps exactly the whole frames before it, resume + seal
+// produce a file that reads back.
+TEST(WireFrameFile, TruncationAtEveryByteOfTheLastFrame) {
+    Arena a;
+    Buf file(1 << 18);
+    FileFixture fx;
+    FrameFileWriter w;
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kWalSegment, 1, 1, 42,
+                               fx.index.data(), 64, fx.rollup.data(), fx.kinds.data(), 16),
+              FrameStatus::kOk);
+    for (int f = 0; f < 4; ++f) {
+        BoltBatch b;
+        build_batch(&b, &a, 6 + f, f);
+        ASSERT_EQ(frame_file_append(&w, &b, meta(uint64_t(f) + 1, f), FrameZones::kCompute,
+                                    nullptr, nullptr), FrameStatus::kOk);
+    }
+    const FrameIndexEntry last = fx.index[3];
+    const size_t full = static_cast<size_t>(last.off + last.len);
+    std::vector<uint8_t> good(file.p, file.p + full + 64);
+    uint64_t cuts = 0;
+    for (size_t t = static_cast<size_t>(last.off); t < full; ++t) {
+        for (int garbage = 0; garbage < 2; ++garbage) {
+            Buf cut(full + 40000);
+            std::memcpy(cut.p, good.data(), t);
+            std::memset(cut.p + t, garbage ? 0xA5 : 0x00, cut.n - t);
+            const size_t len = garbage ? cut.n : t;
+            FrameFileView v;
+            ASSERT_EQ(frame_file_open(cut.p, len, &v), FrameStatus::kOk) << t;
+            std::vector<FrameIndexEntry> rec(8);
+            size_t end = 0;
+            FrameStatus why;
+            ASSERT_EQ(frame_file_recover(v, rec.data(), 8, &end, &why), 3) << "cut " << t;
+            ASSERT_EQ(end, static_cast<size_t>(last.off));
+            ASSERT_EQ(std::memcmp(rec.data(), fx.index.data(), 3 * sizeof(FrameIndexEntry)), 0);
+            FileFixture fx2;
+            FrameFileWriter w2;
+            ASSERT_EQ(frame_file_resume(&w2, cut.p, len, fx2.index.data(), 64,
+                                        fx2.rollup.data(), fx2.kinds.data(), 16), FrameStatus::kOk);
+            ASSERT_EQ(w2.n_frames, 3u) << "cut " << t << " garbage " << garbage;
+            if (garbage && t % 97 == 0) {   // reseal a sample: the file reads back whole
+                const size_t sl = frame_file_seal(&w2);
+                ASSERT_GT(sl, 0u);
+                FrameFileView sv;
+                ASSERT_EQ(frame_file_open(cut.p, sl, &sv), FrameStatus::kOk);
+                ASSERT_TRUE(sv.sealed);
+                ASSERT_EQ(sv.n_frames, 3u);
+            }
+            ++cuts;
+        }
+    }
+    EXPECT_EQ(cuts, 2 * last.len);
+}
+
+// A recycled, non-zeroed buffer: file B is begun over sealed file A. B's
+// frames are byte-for-byte the same batches as A's, so an unseeded CRC would
+// accept A's old frames and A's old footer as B's. The seeded CRC refuses
+// both even when B's terminating zero slot was lost.
+TEST(WireFrameFile, RecycledBufferStaleFramesAndFooterRefused) {
+    Arena a;
+    Buf file(1 << 18);
+    BoltBatch batches[5];
+    for (int f = 0; f < 5; ++f) build_batch(&batches[f], &a, 20, f);
+    FileFixture fa;
+    FrameFileWriter wa;
+    ASSERT_EQ(frame_file_begin(&wa, file.p, file.n, FrameFilePurpose::kWalSegment, 3, 7, 1,
+                               fa.index.data(), 64, nullptr, nullptr, 0), FrameStatus::kOk);
+    for (int f = 0; f < 5; ++f)
+        ASSERT_EQ(frame_file_append(&wa, &batches[f], meta(uint64_t(f) + 1, 1), FrameZones::kNone,
+                                    nullptr, nullptr), FrameStatus::kOk);
+    const size_t alen = frame_file_seal(&wa);
+    ASSERT_GT(alen, 0u);
+    std::vector<uint8_t> a_bytes(file.p, file.p + alen);
+
+    // Same ids, same batches, new incarnation; two frames, then a crash in
+    // which the zeroing of the next header slot did not reach the media.
+    FileFixture fb;
+    FrameFileWriter wb;
+    ASSERT_EQ(frame_file_begin(&wb, file.p, file.n, FrameFilePurpose::kWalSegment, 3, 7, 2,
+                               fb.index.data(), 64, nullptr, nullptr, 0), FrameStatus::kOk);
+    for (int f = 0; f < 2; ++f)
+        ASSERT_EQ(frame_file_append(&wb, &batches[f], meta(uint64_t(f) + 1, 1), FrameZones::kNone,
+                                    nullptr, nullptr), FrameStatus::kOk);
+    ASSERT_EQ(wb.pos, fa.index[2].off);
+    std::memcpy(file.p + wb.pos, a_bytes.data() + wb.pos, sizeof(FrameHeader));
+
+    FrameFileView v;
+    EXPECT_EQ(frame_file_open(file.p, alen, &v), FrameStatus::kBadCrc);   // A's footer
+    ASSERT_NE(v.base, nullptr);
+    std::vector<FrameIndexEntry> rec(64);
+    size_t end = 0;
+    FrameStatus why;
+    EXPECT_EQ(frame_file_recover(v, rec.data(), 64, &end, &why), 2);
+    EXPECT_EQ(why, FrameStatus::kBadCrc);
+    FileFixture fr;
+    FrameFileWriter wr;
+    ASSERT_EQ(frame_file_resume(&wr, file.p, alen, fr.index.data(), 64, nullptr, nullptr, 0),
+              FrameStatus::kOk);
+    EXPECT_EQ(wr.n_frames, 2u);
+    // A genuinely sealed file is still refused by resume.
+    std::memcpy(file.p, a_bytes.data(), alen);
+    EXPECT_EQ(frame_file_resume(&wr, file.p, alen, fr.index.data(), 64, nullptr, nullptr, 0),
+              FrameStatus::kBadLayout);
+}
+
+// A reader honours a recorded buf unit larger than 64 B: frames on 128 B
+// boundaries with zero gaps are all found; the 64 B writer refuses to resume.
+TEST(WireFrameFile, ReaderHonoursRecordedBufUnit) {
+    Arena a;
+    Buf file(1 << 16);
+    FrameFileHeader h;
+    std::memset(&h, 0, sizeof(h));
+    std::memcpy(h.magic, "BWFF", 4);
+    h.version = kFrameFileVersion;
+    h.buf_align_log2 = 7;
+    h.chunk_align_log2 = 14;
+    h.stripe_align_log2 = 16;
+    h.io_align_log2 = 12;
+    h.incarnation = 9;
+    h.frames_off = 128;
+    h.header_crc32c = io::crc32c(&h, 60);
+    std::memcpy(file.p, &h, sizeof(h));
+    size_t off = 128;
+    for (int f = 0; f < 3; ++f) {
+        BoltBatch b;
+        build_batch(&b, &a, 5 + f, f);
+        FrameMeta m = meta(uint64_t(f) + 1, 1);
+        m.crc_seed = h.header_crc32c;
+        FrameStatus st;
+        const size_t n = frame_write(&b, m, FrameZones::kNone, nullptr, nullptr, file.p + off,
+                                     file.n - off, &st);
+        ASSERT_GT(n, 0u);
+        off += (n + 127) & ~size_t(127);
+    }
+    FrameFileView v;
+    ASSERT_EQ(frame_file_open(file.p, file.n, &v), FrameStatus::kOk);
+    std::vector<FrameIndexEntry> rec(8);
+    size_t end = 0;
+    FrameStatus why;
+    EXPECT_EQ(frame_file_recover(v, rec.data(), 8, &end, &why), 3);
+    EXPECT_EQ(end, off);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(rec[i].off % 128, 0u);
+    FileFixture fx;
+    FrameFileWriter w;
+    EXPECT_EQ(frame_file_resume(&w, file.p, file.n, fx.index.data(), 64, nullptr, nullptr, 0),
+              FrameStatus::kBadBufAlign);
+}
+
+// Offsets near 2^64 in a footer or an index entry (CRCs recomputed, as a
+// hostile writer would) are refused, never wrapped into a read.
+TEST(WireFrameFile, HostileOffsetsRefusedWithoutOverflow) {
+    Arena a;
+    Buf file(1 << 18);
+    FileFixture fx;
+    FrameFileWriter w;
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kGeneric, 0, 0, 5,
+                               fx.index.data(), 64, nullptr, nullptr, 0), FrameStatus::kOk);
+    BoltBatch b;
+    build_batch(&b, &a, 10, 1);
+    ASSERT_EQ(frame_file_append(&w, &b, meta(1, 1), FrameZones::kNone, nullptr, nullptr), FrameStatus::kOk);
+    const size_t len = frame_file_seal(&w);
+    FrameFileView v;
+    ASSERT_EQ(frame_file_open(file.p, len, &v), FrameStatus::kOk);
+    const uint32_t seed = v.seed;
+    FrameFileFooter f = v.footer;
+    const FrameFileFooter good = f;
+    for (uint64_t bad_off : {~0ull - 16383ull, ~0ull - 65535ull, uint64_t(1) << 63}) {
+        f = good;
+        f.index_off = bad_off;
+        f.footer_crc32c = io::crc32c(&f, 60, seed);
+        std::memcpy(file.p + len - 64, &f, 64);
+        EXPECT_EQ(frame_file_open(file.p, len, &v), FrameStatus::kBadLayout) << bad_off;
+    }
+    std::memcpy(file.p + len - 64, &good, 64);
+    FrameIndexEntry e;
+    std::memcpy(&e, file.p + good.index_off, sizeof(e));
+    e.off = ~0ull - 63ull;
+    std::memcpy(file.p + good.index_off, &e, sizeof(e));
+    f = good;
+    f.index_crc32c = io::crc32c(file.p + good.index_off, good.index_len, seed);
+    f.footer_crc32c = io::crc32c(&f, 60, seed);
+    std::memcpy(file.p + len - 64, &f, 64);
+    ASSERT_EQ(frame_file_open(file.p, len, &v), FrameStatus::kOk);
+    FrameView fv;
+    EXPECT_EQ(frame_file_frame(v, 0, true, &fv), FrameStatus::kBadLayout);
+}
+
+TEST(WireFrame, NaNNeverSeedsAZone) {
+    Arena a;
+    BoltColumn c = BoltColumn::make_flat_alloc(4, BoltType::Float64, &a);
+    double* d = static_cast<double*>(c.data);
+    d[0] = std::nan(""); d[1] = 5.0; d[2] = 7.5; d[3] = std::nan("");
+    ZoneMap z;
+    ASSERT_EQ(frame_zone_for_column(c, &z), FrameZoneKind::kF64);
+    EXPECT_EQ(zone_min_f64(&z), 5.0);
+    EXPECT_EQ(zone_max_f64(&z), 7.5);
+    d[1] = std::nan(""); d[2] = std::nan("");
+    EXPECT_EQ(frame_zone_for_column(c, &z), FrameZoneKind::kNone);   // no bound, not [0, 0]
+}
+
+TEST(WireFrame, UnalignedReaderBufferRefused) {
+    Arena a;
+    BoltBatch src;
+    build_batch(&src, &a, 9, 1);
+    const size_t need = frame_size(&src, true);
+    Buf buf(need + 64);
+    FrameStatus st;
+    EXPECT_EQ(frame_write(&src, meta(1, 1), FrameZones::kCompute, nullptr, nullptr, buf.p + 8,
+                          need, &st), 0u);
+    EXPECT_EQ(st, FrameStatus::kUnaligned);
+    ASSERT_EQ(frame_write(&src, meta(1, 1), FrameZones::kCompute, nullptr, nullptr, buf.p,
+                          need, &st), need);
+    std::memmove(buf.p + 8, buf.p, need);
+    FrameView v;
+    EXPECT_EQ(frame_parse(buf.p + 8, need, true, &v), FrameStatus::kUnaligned);
+    FrameFileView fv;
+    EXPECT_EQ(frame_file_open(buf.p + 8, need, &fv), FrameStatus::kUnaligned);
 }

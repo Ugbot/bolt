@@ -22,7 +22,11 @@
 //   crc32c covers bytes [4, frame_len): the rest of the header, the payload
 //   with its padding, and the trailer. The checksum lives in the block that
 //   is read first, so a torn or misdirected write fails before any byte of
-//   the payload is interpreted.
+//   the payload is interpreted. It is seeded: a frame inside a container is
+//   checksummed with the container's seed (its header CRC, which covers a
+//   per-file incarnation), so a stale frame left in a recycled, non-zeroed
+//   file fails its CRC instead of being replayed. A standalone frame uses
+//   seed 0.
 //
 // Container (FrameFile, bolt_wire_frame_file.h):
 //
@@ -40,7 +44,13 @@
 //
 //   A file with no valid footer (a crash before seal) is recovered by
 //   walking frames from frames_off, stopping at the first zero header or the
-//   first frame whose CRC fails (frame_file_recover).
+//   first frame whose CRC fails (frame_file_recover). Frames start on the
+//   recorded buf unit: the walk advances by the frame length rounded up to
+//   it (this writer's unit is 64 B, so frames are back to back).
+//
+//   Readers take a buffer that starts on a 64 B boundary (an mmap, an
+//   aligned cache slot); the zone, index and rollup arrays are handed out as
+//   typed pointers into it.
 //
 // Alignment (§6.1.1, U36): the header records buf/chunk/stripe/io units; a
 // reader validates them (powers of two in range, buf <= chunk <= stripe) and
@@ -133,8 +143,10 @@ struct FrameFileHeader {            // 64 B at file offset 0
     uint32_t flags;                 // 12
     uint64_t id0, id1;              // 16, 24 caller ids (table / segment / run)
     uint64_t frames_off;            // 32 first frame
-    uint8_t  _reserved[20];         // 40
-    uint32_t header_crc32c;         // 60 over [0, 60)
+    uint64_t incarnation;           // 40 differs per file creation (seeds every CRC)
+    uint8_t  _reserved[12];         // 48
+    uint32_t header_crc32c;         // 60 over [0, 60); the seed of every frame,
+                                    //    index and footer CRC in the file
 };
 
 struct FrameIndexEntry {            // 64 B
@@ -169,7 +181,8 @@ static_assert(sizeof(FrameHeader) == 64 && sizeof(FrameTrailer) == 64 &&
 static_assert(offsetof(FrameHeader, bytes) == 28 && offsetof(FrameHeader, key_max) == 56,
               "FrameHeader layout (decision §8.0)");
 static_assert(offsetof(FrameTrailer, trailer_bytes) == 56, "FrameTrailer layout");
-static_assert(offsetof(FrameFileHeader, header_crc32c) == 60, "FrameFileHeader layout");
+static_assert(offsetof(FrameFileHeader, header_crc32c) == 60 &&
+              offsetof(FrameFileHeader, incarnation) == 40, "FrameFileHeader layout");
 static_assert(offsetof(FrameIndexEntry, n_zones) == 60, "FrameIndexEntry layout");
 static_assert(offsetof(FrameFileFooter, footer_crc32c) == 60, "FrameFileFooter layout");
 
@@ -195,6 +208,7 @@ enum class FrameStatus : uint8_t {
     kBadIoAlign,
     kCapacity,        // caller buffer too small
     kUnsupported,     // batch the wire format refuses
+    kUnaligned,       // reader buffer does not start on a 64 B boundary
 };
 
 inline const char* frame_status_name(FrameStatus s) noexcept {
@@ -212,6 +226,7 @@ inline const char* frame_status_name(FrameStatus s) noexcept {
         case FrameStatus::kBadIoAlign:     return "invalid io_align unit";
         case FrameStatus::kCapacity:       return "buffer too small";
         case FrameStatus::kUnsupported:    return "unsupported batch";
+        case FrameStatus::kUnaligned:      return "buffer not 64 B aligned";
     }
     return "unknown";
 }
@@ -321,8 +336,9 @@ inline uint64_t frame_read_u64(const BoltColumn& c, int64_t r) noexcept {
     }
 }
 
-// Fold row r (known valid) into z.
-inline void frame_zone_observe(ZoneMap* z, FrameZoneKind k, const BoltColumn& c,
+// Fold row r (known valid) into z. False when the value carries no bound
+// (NaN), so the caller does not treat the zone as seeded.
+inline bool frame_zone_observe(ZoneMap* z, FrameZoneKind k, const BoltColumn& c,
                                int64_t r, bool first) noexcept {
     assert(z != nullptr);
     assert(r >= 0 && r < c.length);
@@ -336,12 +352,12 @@ inline void frame_zone_observe(ZoneMap* z, FrameZoneKind k, const BoltColumn& c,
         if (first || v > static_cast<uint64_t>(z->max_value)) memcpy(&z->max_value, &v, 8);
     } else if (k == FrameZoneKind::kF32) {
         float v; memcpy(&v, static_cast<const float*>(c.data) + r, 4);
-        if (v != v) return;                       // NaN carries no bound
+        if (v != v) return false;                 // NaN carries no bound
         if (first || v < zone_min_f32(z)) zone_set_min_f32(z, v);
         if (first || v > zone_max_f32(z)) zone_set_max_f32(z, v);
     } else if (k == FrameZoneKind::kF64) {
         double v; memcpy(&v, static_cast<const double*>(c.data) + r, 8);
-        if (v != v) return;
+        if (v != v) return false;
         if (first || v < zone_min_f64(z)) memcpy(&z->min_value, &v, 8);
         if (first || v > zone_max_f64(z)) memcpy(&z->max_value, &v, 8);
     } else {
@@ -350,6 +366,7 @@ inline void frame_zone_observe(ZoneMap* z, FrameZoneKind k, const BoltColumn& c,
         c.utf8_at(r, &p, &n);
         zone_str8_observe(z, p, n);
     }
+    return true;
 }
 
 }  // namespace detail
@@ -370,8 +387,7 @@ inline FrameZoneKind frame_zone_for_column(const BoltColumn& c, ZoneMap* z) noex
     for (int64_t r = 0; r < c.length; ++r) {          // bounded: c.length
         if (c.is_null(r)) { ++nulls; continue; }
         if (k == FrameZoneKind::kNone) continue;
-        detail::frame_zone_observe(z, k, c, r, !seen);
-        seen = true;
+        if (detail::frame_zone_observe(z, k, c, r, !seen)) seen = true;
     }
     if (!seen && k != FrameZoneKind::kNone) {
         k = FrameZoneKind::kNone;
@@ -421,7 +437,7 @@ inline void frame_zone_merge(ZoneMap* dst, const ZoneMap& src, FrameZoneKind k) 
 struct FrameMeta {
     FrameOpKind kind;
     uint16_t    flags;
-    uint32_t    _pad;
+    uint32_t    crc_seed;   // 0 standalone; a container's seed inside a file
     uint64_t    lsn_min, lsn_max;
     int64_t     ts_min, ts_max;
     uint64_t    txn_id;
@@ -491,8 +507,9 @@ inline void frame_fill_trailer(FrameTrailer* t, const FrameMeta& m, uint32_t row
 
 }  // namespace detail
 
-/// Write one frame for `b` into out[0, cap). Returns the frame length, or 0
-/// with *st set (kUnsupported, kCapacity, kBadLayout). Every padding byte is
+/// Write one frame for `b` into out[0, cap) (out on a 64 B boundary). Returns
+/// the frame length, or 0 with *st set (kUnsupported, kCapacity, kBadLayout,
+/// kUnaligned). Every padding byte is
 /// zero, so the same batch and meta give the same bytes (deterministic
 /// writer, G11).
 inline size_t frame_write(const BoltBatch* b, const FrameMeta& m, FrameZones zm,
@@ -504,6 +521,8 @@ inline size_t frame_write(const BoltBatch* b, const FrameMeta& m, FrameZones zm,
     if (m.kind == FrameOpKind::kNone || m.lsn_min > m.lsn_max || m.ts_min > m.ts_max) return 0;
     if (zm == FrameZones::kProvided && (zones == nullptr || kinds == nullptr)) return 0;
     if (b->num_rows < 0 || b->num_rows > static_cast<int64_t>(UINT32_MAX)) return 0;
+    *st = FrameStatus::kUnaligned;
+    if ((reinterpret_cast<uintptr_t>(out) & 63u) != 0) return 0;
     const bool with_zones = zm != FrameZones::kNone;
     const size_t total = frame_size(b, with_zones);
     *st = total == 0 ? FrameStatus::kUnsupported : FrameStatus::kCapacity;
@@ -532,7 +551,7 @@ inline size_t frame_write(const BoltBatch* b, const FrameMeta& m, FrameZones zm,
     }
     detail::frame_fill_header(reinterpret_cast<FrameHeader*>(p), m, rows,
                               static_cast<uint32_t>(payload));
-    const uint32_t crc = io::crc32c(p + 4, total - 4);
+    const uint32_t crc = io::crc32c(p + 4, total - 4, m.crc_seed);
     memcpy(p, &crc, 4);
     *st = FrameStatus::kOk;
     assert(tr_off + tr_len == total);
@@ -585,18 +604,20 @@ inline FrameStatus frame_parse_shape(const uint8_t* p, size_t len, FrameView* v)
 
 }  // namespace detail
 
-/// Parse the frame at p[0, len). With verify_crc the checksum is checked
-/// before anything is returned. kEnd for a zero header.
+/// Parse the frame at p[0, len) (p on a 64 B boundary). With verify_crc the
+/// checksum (seeded with `crc_seed`, the writer's FrameMeta::crc_seed) is
+/// checked before anything is returned. kEnd for a zero header.
 inline FrameStatus frame_parse(const void* buf, size_t len, bool verify_crc,
-                               FrameView* out) noexcept {
+                               FrameView* out, uint32_t crc_seed = 0) noexcept {
     assert(out != nullptr);
     assert(buf != nullptr || len == 0);
     memset(out, 0, sizeof(*out));
     if (len < sizeof(FrameHeader)) return FrameStatus::kTruncated;
+    if ((reinterpret_cast<uintptr_t>(buf) & 63u) != 0) return FrameStatus::kUnaligned;
     const uint8_t* p = static_cast<const uint8_t*>(buf);
     const FrameStatus s = detail::frame_parse_shape(p, len, out);
     if (s != FrameStatus::kOk) return s;
-    if (verify_crc && io::crc32c(p + 4, out->frame_len - 4) != out->header.crc32c)
+    if (verify_crc && io::crc32c(p + 4, out->frame_len - 4, crc_seed) != out->header.crc32c)
         return FrameStatus::kBadCrc;
     return FrameStatus::kOk;
 }
