@@ -8,9 +8,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <thread>
+#include <vector>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_arena_ring.h"
@@ -134,4 +137,50 @@ TEST(ArenaRingLifecycle, DestroyThenDestructIsSafe) {
     ring->destroy();
     delete ring;
     SUCCEED();
+}
+
+// Threads hammer acquire/release. Each slot is held by one thread at a time
+// (a holder count per slot), and under ThreadSanitizer the free-list link
+// read by a pop that loses its CAS must not race the new holder's write.
+template <typename Pool, typename Get, typename Put, typename Idx>
+void hammer(Pool* p, Get get, Put put, Idx idx) {
+    constexpr int kThreads = 8, kRounds = 20000;
+    std::atomic<int> holders[kSlots] = {};
+    std::atomic<int> bad{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < kRounds; ++i) {
+                auto* s = get(p);
+                if (s == nullptr) continue;
+                const uint32_t k = idx(p, s);
+                if (holders[k].fetch_add(1) != 0) bad.fetch_add(1);
+                holders[k].fetch_sub(1);
+                put(p, s);
+            }
+        });
+    for (std::thread& t : ts) t.join();
+    EXPECT_EQ(bad.load(), 0);
+}
+
+TEST(TypedBatchPoolConcurrency, OneHolderPerSlot) {
+    using Pool = bolt::TypedBatchPool<kSlots>;
+    auto* p = new Pool();
+    p->init(small_cfg());
+    hammer(p, [](Pool* q) { return q->acquire(); }, [](Pool* q, bolt::TypedBatchPoolSlot* s) { q->release(s); },
+           [](Pool* q, bolt::TypedBatchPoolSlot* s) { return static_cast<uint32_t>(s - &q->slots[0]); });
+    delete p;
+}
+
+TEST(ArenaRingConcurrency, OneHolderPerSlot) {
+    using Pool = bolt::ArenaRing<kSlots>;
+    auto* p = new Pool();
+    p->init(small_cfg());
+    hammer(p, [](Pool* q) { return q->acquire(); }, [](Pool* q, bolt::Arena* a) { q->release(a); },
+           [](Pool* q, bolt::Arena* a) {
+               for (uint32_t i = 0; i < kSlots; ++i)
+                   if (&q->slots[i].arena == a) return i;
+               return 0u;
+           });
+    delete p;
 }
