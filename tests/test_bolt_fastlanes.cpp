@@ -276,3 +276,136 @@ TEST(FastLanes, PartialBlockPadsWithTheLastValue) {
     EXPECT_EQ(dref2, dref);
     EXPECT_EQ(w2, w);
 }
+
+// ---------------------------------------------------------------------------
+// Review additions (2026-10-02).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Golden { uint32_t t, w, kind; uint64_t fnv; uint32_t len; };
+const Golden kGolden[] = {
+#include "data/fastlanes_crate_golden.inc"
+};
+
+uint64_t fnv1a(const void* p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; ++i) { h ^= static_cast<const uint8_t*>(p)[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
+uint64_t lcg(uint64_t* x) {
+    *x = *x * 6364136223846793005ull + 1442695040888963407ull;
+    return *x >> 11;
+}
+
+// The inputs the Rust generator used (same LCG and seeds).
+template <class U>
+void golden_input(uint32_t w, uint32_t kind, U* in) {
+    constexpr uint32_t T = sizeof(U) * 8;
+    const uint64_t mask = w >= 64 ? ~0ull : ((1ull << w) - 1);
+    if (kind == 0) {
+        uint64_t x = 1000ull * T + w;
+        for (int i = 0; i < 1024; ++i) in[i] = static_cast<U>(lcg(&x) & mask);
+        return;
+    }
+    uint64_t x = 7000ull * T + w;
+    const uint64_t step_mask = w == 0 ? 0 : (mask >> (w > 10 ? 10 : 0));
+    U acc = static_cast<U>(lcg(&x) & 0xff);
+    for (int i = 0; i < 1024; ++i) { acc = static_cast<U>(acc + (lcg(&x) & step_mask)); in[i] = acc; }
+}
+
+template <class U>
+void check_golden(const Golden& gd, bool flip) {
+    constexpr uint32_t T = sizeof(U) * 8, L = 1024 / T;
+    std::vector<U> in(1024);
+    std::vector<uint8_t> out(gd.len + 64, 0);
+    if (gd.kind == 0) {
+        golden_input<U>(gd.w, 0, in.data());
+        fl::pack_block<U>(in.data(), gd.w, reinterpret_cast<U*>(out.data()));
+    } else {
+        // The generator's input index for this row is its own width slot.
+        // Rows are grouped per T: T + 1 BitPacked rows, then T + 1 DeltaFOR
+        // rows whose generator seed is the slot (W is the width it needed).
+        const uint32_t base = T == 8 ? 0u : T == 16 ? 18u : T == 32 ? 52u : 118u;
+        const uint32_t slot = static_cast<uint32_t>(&gd - kGolden) - base - (T + 1);
+        ASSERT_LE(slot, T);
+        golden_input<U>(slot, 1, in.data());
+        fl::encode_delta_for<U>(in.data(), 1024, 0, gd.w, out.data());
+    }
+    ASSERT_EQ(gd.len, gd.kind == 0 ? 128u * gd.w : sizeof(U) * L + 128u * gd.w);
+    if (flip && gd.len == 0) return;   // nothing to flip
+    if (flip) out[gd.len / 2] ^= 1u;
+    const bool same = fnv1a(out.data(), gd.len) == gd.fnv;
+    EXPECT_EQ(same, !flip) << "T=" << T << " W=" << gd.w << " kind=" << gd.kind;
+}
+
+template <class V>
+void round_trip_n(std::mt19937_64& g, int64_t n, int kind) {
+    using U = std::make_unsigned_t<V>;
+    constexpr uint32_t T = sizeof(V) * 8;
+    Arena a;
+    const BoltType bt = bolt_type_of(sizeof(V), std::is_signed_v<V>);
+    const std::vector<V> v = make_values<V>(kind, n, g);
+    int64_t ref = 0;
+    uint32_t w = 0;
+    fl::choose_for<V>(v.data(), n, &ref, &w);
+    std::vector<uint8_t> buf(fl::packed_bytes(T, n, w) + 1);
+    fl::encode_for<V>(v.data(), n, ref, w, buf.data());
+    BoltColumn c = BoltColumn::make_frame_of_ref(buf.data(), uint8_t(w), ref, n, bt, &a);
+    ASSERT_EQ(c.byte_size(), fl::packed_bytes(T, n, w));
+    BoltColumn f = c.materialize(&a);
+    ASSERT_EQ(std::memcmp(f.data, v.data(), sizeof(V) * size_t(n)), 0) << "FOR n=" << n;
+    int64_t dref = 0;
+    fl::choose_delta<V>(v.data(), n, &dref, &w);
+    std::vector<uint8_t> dbuf(fl::delta_bytes(T, n, w) + 1);
+    fl::encode_delta_for<V>(v.data(), n, dref, w, dbuf.data());
+    BoltColumn d = BoltColumn::make_delta_for(dbuf.data(), uint8_t(w), dref, n, bt, &a);
+    ASSERT_EQ(d.byte_size(), fl::delta_bytes(T, n, w));
+    BoltColumn df = d.materialize(&a);
+    ASSERT_EQ(std::memcmp(df.data, v.data(), sizeof(V) * size_t(n)), 0) << "DeltaFOR n=" << n;
+    (void)sizeof(U);
+}
+
+}  // namespace
+
+// Golden bytes from the actual Rust crate (fastlanes 0.7.2): BitPacked
+// blocks for every T and every W 0..T, DeltaFOR blocks (dref 0) for every T.
+// A single flipped bit in our output must fail the comparison.
+TEST(FastLanes, GoldenBytesFromTheRustCrate) {
+    ASSERT_EQ(sizeof(kGolden) / sizeof(kGolden[0]), 2u * (9 + 17 + 33 + 65));
+    for (const Golden& gd : kGolden) {
+        for (bool flip : {false, true}) {
+            switch (gd.t) {
+                case 8:  check_golden<uint8_t>(gd, flip); break;
+                case 16: check_golden<uint16_t>(gd, flip); break;
+                case 32: check_golden<uint32_t>(gd, flip); break;
+                default: check_golden<uint64_t>(gd, flip); break;
+            }
+        }
+    }
+}
+
+// >= 20 seeds: every width 0..T of every lane type, and columns of
+// 1..64 blocks (up to 65,536 values) round trip through FOR and DeltaFOR.
+TEST(FastLanes, TwentySeedsEveryWidthAndUpToSixtyFourBlocks) {
+    for (uint64_t seed = 0; seed < 20; ++seed) {
+        check_layout_all_widths<uint8_t>(1000 + seed);
+        check_layout_all_widths<uint16_t>(2000 + seed);
+        check_layout_all_widths<uint32_t>(3000 + seed);
+        check_layout_all_widths<uint64_t>(4000 + seed);
+        std::mt19937_64 g(seed);
+        const int64_t n = seed == 0 ? 65536 : 1 + static_cast<int64_t>(g() % 65536);
+        const int kind = static_cast<int>(seed % 6);
+        switch (seed % 8) {
+            case 0: round_trip_n<int8_t>(g, n, kind); break;
+            case 1: round_trip_n<uint8_t>(g, n, kind); break;
+            case 2: round_trip_n<int16_t>(g, n, kind); break;
+            case 3: round_trip_n<uint16_t>(g, n, kind); break;
+            case 4: round_trip_n<int32_t>(g, n, kind); break;
+            case 5: round_trip_n<uint32_t>(g, n, kind); break;
+            case 6: round_trip_n<int64_t>(g, n, kind); break;
+            default: round_trip_n<uint64_t>(g, n, kind); break;
+        }
+    }
+}
