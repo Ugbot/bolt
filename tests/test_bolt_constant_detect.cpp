@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -184,6 +185,55 @@ PageKind run_detector(const Page& pg, Gen& g, uint8_t value[16], std::vector<uin
     return fixed_detect_finish(stf, value);
 }
 
+// Strings fed in random chunks, each chunk with its own overflow buffer laid out
+// from offset 0, so long refs repeat across chunks with other bytes behind them.
+// Checks the kind, the null count and the null-masked copy of the chunk views.
+void check_chunked_overflow(const Page& pg, Gen& g) {
+    SCOPED_TRACE("chunked overflow n=" + std::to_string(pg.n));
+    std::vector<std::vector<char>> bufs;   // alive until finish (first value's bytes)
+    bufs.reserve(pg.n);
+    std::vector<StringView> views(pg.n), dst(pg.n);
+    SvDetectState st;
+    sv_detect_init(&st);
+    for (uint32_t at = 0; at < pg.n;) {
+        const uint32_t c = std::min<uint32_t>(pg.n - at, 1 + uint32_t(g.below(g.below(2) ? 5 : 900)));
+        bufs.emplace_back();
+        std::vector<char>& ov = bufs.back();
+        std::vector<std::string> distinct;   // the chunk's long strings, laid out shuffled
+        for (uint32_t r = at; r < at + c; ++r)
+            if (pg.valid(r) && pg.strs[r].size() > 12 &&
+                std::find(distinct.begin(), distinct.end(), pg.strs[r]) == distinct.end())
+                distinct.push_back(pg.strs[r]);
+        for (size_t k = distinct.size(); k > 1; --k) std::swap(distinct[k - 1], distinct[g.below(k)]);
+        std::vector<uint32_t> off;
+        for (const std::string& x : distinct) { off.push_back(uint32_t(ov.size())); ov.insert(ov.end(), x.begin(), x.end()); }
+        for (uint32_t r = at; r < at + c; ++r) {
+            std::memcpy(&views[r], &pg.data[size_t(r) * 16], 16);
+            if (!pg.valid(r) || views[r].length <= 12) continue;
+            const size_t k = size_t(std::find(distinct.begin(), distinct.end(), pg.strs[r]) - distinct.begin());
+            views[r].ref.buf_idx = 0;
+            views[r].ref.offset = off[k];
+        }
+        ov.push_back('\0');   // never empty: data() stays non-null
+        ASSERT_EQ(sv_detect_update(&st, views.data() + at, pg.vptr(), at, c, dst.data() + at, ov.data()),
+                  DetectStatus::kOk);
+        at += c;
+    }
+    StringView v;
+    ASSERT_EQ(sv_detect_finish(st, &v), ref_kind(pg));
+    uint32_t nulls = 0;
+    for (uint32_t r = 0; r < pg.n; ++r) {
+        if (!pg.valid(r)) {
+            ++nulls;
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(&dst[r]);
+            for (uint32_t b = 0; b < 16; ++b) ASSERT_EQ(d[b], 0) << "null slot " << r;
+        } else {
+            ASSERT_EQ(std::memcmp(&dst[r], &views[r], 16), 0) << "row " << r;
+        }
+    }
+    ASSERT_EQ(st.nulls, nulls);
+}
+
 std::string row_bytes(const Page& pg, uint32_t r) {
     if (is_str(pg.type)) return pg.strs[r];
     return std::string(reinterpret_cast<const char*>(&pg.data[size_t(r) * pg.w]), pg.w);
@@ -253,6 +303,7 @@ void check_page(const Page& pg, Gen& g, const char* what) {
     const PageKind got = run_detector(pg, g, value, &dst, &nulls);
     ASSERT_EQ(got, ref_kind(pg));
     check_copy(pg, dst);
+    if (is_str(pg.type)) check_chunked_overflow(pg, g);
     if (got != PageKind::kFlat) check_emit(pg, got, value, nulls);
     const stats::StatsKind k = stats::stats_kind(pg.type);
     if (!is_str(pg.type) && (k == stats::StatsKind::kSigned || k == stats::StatsKind::kUnsigned ||
@@ -366,4 +417,33 @@ TEST(ConstantDetect, EmptyPageIsFlatAndBadWidthsRefused) {
     sv_detect_init(&sv);
     StringView v;
     EXPECT_EQ(sv_detect_finish(sv, &v), PageKind::kFlat);
+}
+
+// Two long views with one ref {0,0} fed with different overflow buffers: the
+// second resolves to other bytes, so the page is not Constant.
+TEST(ConstantDetect, SameRefDifferentOverflowAcrossChunksIsFlat) {
+    const std::string a(40, 'a');
+    const std::string b = "aaaa" + std::string(36, 'b');
+    std::vector<char> ov1(a.begin(), a.end()), ov2(b.begin(), b.end());
+    StringView s1;
+    std::memset(&s1, 0, sizeof(s1));
+    s1.length = 40;
+    std::memcpy(s1.prefix, "aaaa", 4);
+    s1.ref.buf_idx = 0;
+    s1.ref.offset = 0;
+    const StringView s2 = s1;
+    StringView d[2];
+    SvDetectState st;
+    sv_detect_init(&st);
+    ASSERT_EQ(sv_detect_update(&st, &s1, nullptr, 0, 1, &d[0], ov1.data()), DetectStatus::kOk);
+    ASSERT_EQ(sv_detect_update(&st, &s2, nullptr, 1, 1, &d[1], ov2.data()), DetectStatus::kOk);
+    StringView v;
+    EXPECT_EQ(sv_detect_finish(st, &v), PageKind::kFlat);
+
+    // Same bytes behind the same ref in another buffer: still Constant.
+    std::vector<char> ov3(a.begin(), a.end());
+    sv_detect_init(&st);
+    ASSERT_EQ(sv_detect_update(&st, &s1, nullptr, 0, 1, &d[0], ov1.data()), DetectStatus::kOk);
+    ASSERT_EQ(sv_detect_update(&st, &s2, nullptr, 1, 1, &d[1], ov3.data()), DetectStatus::kOk);
+    EXPECT_EQ(sv_detect_finish(st, &v), PageKind::kConstant);
 }

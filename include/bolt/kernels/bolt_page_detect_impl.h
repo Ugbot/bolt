@@ -334,17 +334,18 @@ inline void sv_set_first(SvDetectState* st, const StringView& v, const char* ove
     const uint32_t len = v.length;
     st->hdr_mask = byte_mask(4 + (len < 4 ? len : 4));
     st->tail_mask = len <= 12 ? byte_mask(len > 4 ? len - 4 : 0) : 0;
-    st->first_bytes = len <= 12 ? st->first.prefix : overflow + v.ref.offset;
     assert(len <= 12 || overflow != nullptr);
+    st->first_bytes = len <= 12 ? st->first.prefix : overflow + v.ref.offset;
 }
 
-// A long view equal to first in length + prefix but with another reference.
+// A long view equal to first in length + prefix. The same ref can name other
+// bytes in another update's overflow, so resolve it; buf_idx is not read (the
+// wire carries one overflow buffer per column).
 inline bool sv_long_differs(const SvDetectState* st, const StringView& v,
                             const char* overflow) noexcept {
     assert(v.length == st->first.length && v.length > 12);
     assert(overflow != nullptr);
-    if (v.ref.offset == st->first.ref.offset && overflow + v.ref.offset == st->first_bytes)
-        return false;
+    if (overflow + v.ref.offset == st->first_bytes) return false;
     return std::memcmp(overflow + v.ref.offset, st->first_bytes, v.length) != 0;
 }
 
@@ -380,7 +381,7 @@ inline void sv_rows_long(SvDetectState* st, const StringView* s, const uint8_t* 
         std::memcpy(x, s + i, sizeof(x));
         x[0] &= m; x[1] &= m;
         if (d != nullptr) std::memcpy(d + i, x, sizeof(x));
-        if (m != 0) differs = x[0] != f[0] || (x[1] != f[1] && sv_long_differs(st, s[i], overflow));
+        if (m != 0) differs = x[0] != f[0] || sv_long_differs(st, s[i], overflow);
         if (differs) {
             if (i + 1 < n && d != nullptr)
                 masked_copy_rows<sizeof(StringView)>(reinterpret_cast<const uint8_t*>(s + i + 1),
