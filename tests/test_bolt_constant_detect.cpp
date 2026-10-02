@@ -88,11 +88,15 @@ void fixed_pool(BoltType t, uint32_t w, Gen& r, std::vector<std::vector<uint8_t>
     } else {
         const uint64_t edge[] = {0, 1, ~0ull, 0x80ull << 56, 0x7Full};
         for (uint64_t e : edge) { uint8_t b[16]; std::memcpy(b, &e, 8); std::memcpy(b + 8, &e, 8); put(b); }
+        for (uint64_t hi : {1ull, 0x80ull << 56}) {   // same low half as an edge, another high half
+            uint8_t b[16] = {}; std::memcpy(b + 8, &hi, 8); put(b);
+        }
         for (int k = 0; k < 3; ++k) { uint8_t b[16]; for (auto& x : b) x = uint8_t(r.g()); put(b); }
     }
 }
 
-const char* kStrPool[] = {"", "a", "abc", "abcd", "abcde", "hello world!", "hello world!!",
+const char* kStrPool[] = {"", "a", "abc", "abcd", "abcde", "abcdf", "hello world!", "hello world?",
+                          "hello world!!",
                           "a long string of forty characters......", "a long string of forty characters.....!",
                           "!a long string of forty characters......"};
 constexpr uint32_t kStrPoolN = sizeof(kStrPool) / sizeof(kStrPool[0]);
@@ -148,9 +152,9 @@ Page make_page(BoltType t, uint32_t n, int shape, uint32_t pos, Gen& g) {
 
 // Feeds the page in random chunks; returns the kind, fills value and dst.
 PageKind run_detector(const Page& pg, Gen& g, uint8_t value[16], std::vector<uint8_t>* dst,
-                      uint32_t* nulls) {
+                      uint32_t* nulls, bool generic = false) {
     dst->assign(pg.data.size() + 16, 0xAB);
-    const bool k7 = !is_str(pg.type) && stats::stats_kind(pg.type) != stats::StatsKind::kNone;
+    const bool k7 = !generic && !is_str(pg.type) && stats::stats_kind(pg.type) != stats::StatsKind::kNone;
     stats::StatsFusedState st7; FixedDetectState stf; SvDetectState sts;
     if (k7) EXPECT_EQ(stats::stats_fused_init(&st7, pg.type), stats::StatsStatus::kOk);
     else if (is_str(pg.type)) sv_detect_init(&sts);
@@ -250,6 +254,16 @@ void check_page(const Page& pg, Gen& g, const char* what) {
     ASSERT_EQ(got, ref_kind(pg));
     check_copy(pg, dst);
     if (got != PageKind::kFlat) check_emit(pg, got, value, nulls);
+    const stats::StatsKind k = stats::stats_kind(pg.type);
+    if (!is_str(pg.type) && (k == stats::StatsKind::kSigned || k == stats::StatsKind::kUnsigned ||
+                             k == stats::StatsKind::kD128)) {   // the bitwise detector agrees on ints
+        uint8_t v2[16]; uint32_t n2 = 0;
+        std::vector<uint8_t> dst2;
+        ASSERT_EQ(run_detector(pg, g, v2, &dst2, &n2, true), got) << "generic";
+        check_copy(pg, dst2);
+        ASSERT_EQ(n2, nulls);
+        if (got == PageKind::kConstant) ASSERT_EQ(std::memcmp(v2, value, 16), 0);
+    }
 }
 
 const BoltType kTypes[] = {BoltType::Int8, BoltType::Int16, BoltType::Int32, BoltType::Int64,
@@ -296,6 +310,8 @@ TEST(ConstantDetect, OneDifferingValueAtEveryPositionIsFlat) {
                     SCOPED_TRACE("type=" + std::to_string(int(t)) + " n=" + std::to_string(n) +
                                  " pos=" + std::to_string(p) + " nulls=" + std::to_string(with_nulls));
                     ASSERT_EQ(run_detector(pg, g, value, &dst, &nulls), PageKind::kFlat);
+                    if (!is_str(t) && t != BoltType::Float32 && t != BoltType::Float64)
+                        ASSERT_EQ(run_detector(pg, g, value, &dst, &nulls, true), PageKind::kFlat) << "generic";
                 }
             }
         }

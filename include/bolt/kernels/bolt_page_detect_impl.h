@@ -2,6 +2,8 @@
 // Include bolt_page_detect.h, not this file.
 #pragma once
 
+#include "bolt/bolt_port.h"
+
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -70,20 +72,72 @@ BOLT_FORCE_INLINE typename UintOf<W>::T row_diff(const uint8_t* BOLT_RESTRICT s,
     }
 }
 
-// Dense rows (no bitmap): copy (when d) and OR the differences; vectorises.
+// Dense 16 B rows: one 16 B lane per row; the copy and the compare share the
+// load (a separate memcpy + scan reads the page twice).
+template <bool kCopy>
+inline uint64_t dense_rows16(const uint8_t* BOLT_RESTRICT s, uint32_t n, uint8_t* BOLT_RESTRICT d,
+                             uint64_t f0, uint64_t f1, uint64_t hm, uint64_t tm) noexcept {
+    assert(kCopy == (d != nullptr));
+    assert(n > 0 && s != nullptr);
+    uint64_t a[2] = {0, 0};  // (a & m) | (b & m) == (a | b) & m: mask once
+#if BOLT_SIMD_NEON
+    const uint64x2_t f = vcombine_u64(vcreate_u64(f0), vcreate_u64(f1));
+    uint64x2_t c[4] = {vdupq_n_u64(0), vdupq_n_u64(0), vdupq_n_u64(0), vdupq_n_u64(0)};
+    uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) {  // bounded: n / 4; four chains hide the OR latency
+        for (uint32_t j = 0; j < 4; ++j) {  // bounded: 4
+            const uint8x16_t x = vld1q_u8(s + static_cast<size_t>(i + j) * 16);
+            if (kCopy) vst1q_u8(d + static_cast<size_t>(i + j) * 16, x);
+            c[j] = vorrq_u64(c[j], veorq_u64(vreinterpretq_u64_u8(x), f));
+        }
+    }
+    for (; i < n; ++i) {  // bounded: n
+        const uint8x16_t x = vld1q_u8(s + static_cast<size_t>(i) * 16);
+        if (kCopy) vst1q_u8(d + static_cast<size_t>(i) * 16, x);
+        c[0] = vorrq_u64(c[0], veorq_u64(vreinterpretq_u64_u8(x), f));
+    }
+    const uint64x2_t acc = vorrq_u64(vorrq_u64(c[0], c[1]), vorrq_u64(c[2], c[3]));
+    vst1q_u64(a, acc);
+#elif BOLT_ARCH_X86
+    const __m128i f = _mm_set_epi64x(static_cast<long long>(f1), static_cast<long long>(f0));
+    __m128i acc[4] = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128()};
+    for (uint32_t i = 0; i < n; ++i) {  // bounded: n
+        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + static_cast<size_t>(i) * 16));
+        if (kCopy) _mm_storeu_si128(reinterpret_cast<__m128i*>(d + static_cast<size_t>(i) * 16), x);
+        acc[i & 3] = _mm_or_si128(acc[i & 3], _mm_xor_si128(x, f));
+    }
+    const __m128i all = _mm_or_si128(_mm_or_si128(acc[0], acc[1]), _mm_or_si128(acc[2], acc[3]));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(a), all);
+#else
+    for (uint32_t i = 0; i < n; ++i) {  // bounded: n
+        uint64_t x[2];
+        std::memcpy(x, s + static_cast<size_t>(i) * 16, 16);
+        if (kCopy) std::memcpy(d + static_cast<size_t>(i) * 16, x, 16);
+        a[0] |= x[0] ^ f0;
+        a[1] |= x[1] ^ f1;
+    }
+#endif
+    return (a[0] & hm) | (a[1] & tm);
+}
+
+// Dense rows (no bitmap): copy (when d) and OR the differences.
 template <uint32_t W, bool kCopy>
 inline uint64_t dense_rows(const uint8_t* BOLT_RESTRICT s, uint32_t n, uint8_t* BOLT_RESTRICT d,
                            uint64_t f0, uint64_t f1, uint64_t hm, uint64_t tm) noexcept {
     using T = typename UintOf<W>::T;
     assert(kCopy == (d != nullptr));
     assert(n > 0 && s != nullptr);
-    T diff = 0;
-    for (uint32_t i = 0; i < n; ++i) {  // bounded: n
-        const uint8_t* p = s + static_cast<size_t>(i) * W;
-        if (kCopy) std::memcpy(d + static_cast<size_t>(i) * W, p, W);
-        diff = static_cast<T>(diff | row_diff<W>(p, f0, f1, hm, tm));
+    if constexpr (W == 16) {
+        return dense_rows16<kCopy>(s, n, d, f0, f1, hm, tm);
+    } else {
+        T diff = 0;
+        for (uint32_t i = 0; i < n; ++i) {  // bounded: n
+            const uint8_t* p = s + static_cast<size_t>(i) * W;
+            if (kCopy) std::memcpy(d + static_cast<size_t>(i) * W, p, W);
+            diff = static_cast<T>(diff | row_diff<W>(p, f0, f1, hm, tm));
+        }
+        return diff;
     }
-    return diff;
 }
 
 template <uint32_t W>
@@ -91,10 +145,10 @@ BOLT_FORCE_INLINE void masked_row(const uint8_t* BOLT_RESTRICT s, uint8_t* BOLT_
                                   uint64_t m) noexcept {
     uint64_t lo = 0, hi = 0;
     std::memcpy(&lo, s, W < 8 ? W : 8);
-    if (W > 8) std::memcpy(&hi, s + 8, W - 8);
+    if constexpr (W > 8) std::memcpy(&hi, s + 8, W - 8);
     lo &= m; hi &= m;
     std::memcpy(d, &lo, W < 8 ? W : 8);
-    if (W > 8) std::memcpy(d + 8, &hi, W - 8);
+    if constexpr (W > 8) std::memcpy(d + 8, &hi, W - 8);
 }
 
 // The copy alone, null slots zeroed (8 rows per validity byte).
@@ -119,27 +173,101 @@ inline void masked_copy_rows(const uint8_t* s, const uint8_t* v, uint64_t voff, 
                       bit_mask(v, voff + i));
 }
 
-// Rows with a bitmap: copy, flag each row that differs (ignoring validity;
-// vectorises), then AND the flags with the validity 8 rows at a time.
+// 16 B rows with a bitmap, one pass: 8 rows per validity byte, each row's
+// loads feed the masked copy and the masked compare.
+template <bool kCopy>
+inline uint64_t masked_rows16(const uint8_t* s, const uint8_t* v, uint64_t voff, uint32_t n,
+                              uint8_t* d, uint64_t f0, uint64_t f1, uint64_t hm,
+                              uint64_t tm) noexcept {
+    assert(v != nullptr && s != nullptr);
+    assert(kCopy == (d != nullptr) && n > 0);
+    uint64_t a0 = 0, a1 = 0;
+    uint32_t i = 0;
+    auto row = [&](uint32_t r, uint64_t m) {
+        uint64_t lo, hi;
+        std::memcpy(&lo, s + static_cast<size_t>(r) * 16, 8);
+        std::memcpy(&hi, s + static_cast<size_t>(r) * 16 + 8, 8);
+        lo &= m; hi &= m;
+        if (kCopy) {
+            std::memcpy(d + static_cast<size_t>(r) * 16, &lo, 8);
+            std::memcpy(d + static_cast<size_t>(r) * 16 + 8, &hi, 8);
+        }
+        a0 |= (lo ^ f0) & m;
+        a1 |= (hi ^ f1) & m;
+    };
+    for (; i + 8 <= n; i += 8) {  // bounded: n / 8
+        const uint32_t bits = valid_byte(v, voff + i);
+        for (uint32_t j = 0; j < 8; ++j) row(i + j, 0ull - ((bits >> j) & 1u));  // bounded: 8
+    }
+    for (; i < n; ++i) row(i, bit_mask(v, voff + i));  // bounded: n
+    return (a0 & hm) | (a1 & tm);
+}
+
+// Lane masks of a 64-bit word holding 8 / W rows of width W: entry b has the
+// lanes of the rows whose bit is set in b all ones.
+template <uint32_t W>
+struct LaneMasks {
+    static constexpr uint32_t kLanes = 8 / W;
+    static constexpr uint64_t kLane = W == 8 ? ~0ull : ((1ull << (8 * W)) - 1);
+    uint64_t m[1u << kLanes];
+    constexpr LaneMasks() : m{} {
+        for (uint32_t b = 0; b < (1u << kLanes); ++b)  // bounded: 2^lanes
+            for (uint32_t l = 0; l < kLanes; ++l)      // bounded: lanes
+                if ((b >> l) & 1u) m[b] |= kLane << (8 * W * l);
+    }
+};
+template <uint32_t W> inline constexpr LaneMasks<W> kLaneMasks{};
+
+// Narrow rows (W <= 8) with a bitmap, one pass: 8 rows = W words, each
+// word's validity lanes from a table, then masked copy + masked compare.
+template <uint32_t W, bool kCopy>
+inline uint64_t masked_rows_narrow(const uint8_t* s, const uint8_t* v, uint64_t voff,
+                                   uint32_t n, uint8_t* d, uint64_t f0) noexcept {
+    using L = LaneMasks<W>;
+    assert(v != nullptr && s != nullptr);
+    assert(kCopy == (d != nullptr) && n > 0);
+    uint64_t fw = 0;
+    for (uint32_t l = 0; l < L::kLanes; ++l) fw |= (f0 & L::kLane) << (8 * W * l);  // bounded: lanes
+    uint64_t diff = 0;
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {  // bounded: n / 8
+        const uint32_t bits = valid_byte(v, voff + i);
+        for (uint32_t k = 0; k < W; ++k) {  // bounded: W words per 8 rows
+            const uint64_t m = kLaneMasks<W>.m[(bits >> (k * L::kLanes)) & ((1u << L::kLanes) - 1)];
+            uint64_t x;
+            std::memcpy(&x, s + static_cast<size_t>(i) * W + 8 * k, 8);
+            x &= m;
+            if (kCopy) std::memcpy(d + static_cast<size_t>(i) * W + 8 * k, &x, 8);
+            diff |= (x ^ fw) & m;
+        }
+    }
+    for (; i < n; ++i) {  // bounded: n
+        const uint64_t m = bit_mask(v, voff + i) & L::kLane;
+        uint64_t x = 0;
+        std::memcpy(&x, s + static_cast<size_t>(i) * W, W);
+        x &= m;
+        if (kCopy) std::memcpy(d + static_cast<size_t>(i) * W, &x, W);
+        diff |= (x ^ f0) & m;
+    }
+    return diff;
+}
+
+// Rows with a bitmap.
 template <uint32_t W>
 inline uint64_t masked_rows(const uint8_t* s, const uint8_t* v, uint64_t voff, uint32_t n,
                             uint8_t* d, uint64_t f0, uint64_t f1, uint64_t hm,
                             uint64_t tm) noexcept {
     assert(v != nullptr && s != nullptr);
     assert(n > 0 && n <= stats::kPageDetectBlockRows);
-    if (d != nullptr) masked_copy_rows<W>(s, v, voff, n, d);
-    alignas(8) uint8_t ne[stats::kPageDetectBlockRows];
-    for (uint32_t i = 0; i < n; ++i)  // bounded: n
-        ne[i] = row_diff<W>(s + static_cast<size_t>(i) * W, f0, f1, hm, tm) != 0;
-    uint64_t diff = 0;
-    uint32_t i = 0;
-    for (; i + 8 <= n; i += 8) {  // bounded: n / 8
-        uint64_t x;
-        std::memcpy(&x, ne + i, 8);
-        diff |= ((x * 0x0102040810204080ull) >> 56) & valid_byte(v, voff + i);
+    if constexpr (W == 16) {
+        return d != nullptr ? masked_rows16<true>(s, v, voff, n, d, f0, f1, hm, tm)
+                            : masked_rows16<false>(s, v, voff, n, nullptr, f0, f1, hm, tm);
+    } else {
+        assert(hm == ~0ull);  // narrow rows are fixed widths: every byte counts
+        (void)f1; (void)tm;
+        return d != nullptr ? masked_rows_narrow<W, true>(s, v, voff, n, d, f0)
+                            : masked_rows_narrow<W, false>(s, v, voff, n, nullptr, f0);
     }
-    for (; i < n; ++i) diff |= ne[i] & (bit_mask(v, voff + i) & 1u);  // bounded: n
-    return diff;
 }
 
 // One block of at most kPageDetectBlockRows rows.

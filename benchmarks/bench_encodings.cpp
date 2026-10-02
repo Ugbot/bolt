@@ -3,7 +3,7 @@
 // decode-on-access (fastlanes_value) for a view. Scalar reference only; the
 // NEON / AVX2 kernels are M4.
 //
-// Usage: bench_encodings [runs=5] [min_ms_per_run=20]
+// Usage: bench_encodings [runs=5] [min_ms_per_run=20] [detect]   (detect: K4 cases only)
 //        bench_encodings detect <case 0..12> <copy|detect> <n> <iters>
 // Prints one row per (format, T, W, n): median ns/value over `runs`.
 
@@ -240,7 +240,8 @@ int main(int argc, char** argv) {
     }
     const int runs = argc > 1 ? std::max(1, std::atoi(argv[1])) : 5;
     const double min_ms = argc > 2 ? std::max(1.0, std::atof(argv[2])) : 20.0;
-    for (int fmt = 0; fmt < 3; ++fmt)
+    const bool detect_only = argc > 3 && std::strcmp(argv[3], "detect") == 0;
+    for (int fmt = 0; fmt < 3 && !detect_only; ++fmt)
         for (uint32_t w : {3u, 11u, 20u})
             for (int64_t n : {1024, 4096, 16384, 65536}) {
                 bench_one<int32_t>(fmt, w, n, runs, min_ms);
