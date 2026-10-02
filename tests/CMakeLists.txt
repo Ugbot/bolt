@@ -504,6 +504,17 @@ target_link_libraries(test_bolt_fastlanes
 bolt_apply_hardening(test_bolt_fastlanes)
 add_test(NAME test_bolt_fastlanes COMMAND test_bolt_fastlanes)
 
+# K7 (MSEG): fused copy + page stats.
+add_executable(test_bolt_stats_fused test_bolt_stats_fused.cpp)
+target_link_libraries(test_bolt_stats_fused
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_stats_fused)
+add_test(NAME test_bolt_stats_fused COMMAND test_bolt_stats_fused)
+
 add_executable(test_bolt_wire test_bolt_wire.cpp)
 
 target_link_libraries(test_bolt_wire
