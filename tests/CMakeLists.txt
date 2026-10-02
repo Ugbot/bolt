@@ -525,6 +525,17 @@ target_link_libraries(test_bolt_stats_fused
 bolt_apply_hardening(test_bolt_stats_fused)
 add_test(NAME test_bolt_stats_fused COMMAND test_bolt_stats_fused)
 
+# K3 (MSEG): ColumnFormat::RLE encode/decode + run-granular predicates.
+add_executable(test_bolt_rle test_bolt_rle.cpp)
+target_link_libraries(test_bolt_rle
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_rle)
+add_test(NAME test_bolt_rle COMMAND test_bolt_rle)
+
 add_executable(test_bolt_wire test_bolt_wire.cpp)
 
 target_link_libraries(test_bolt_wire

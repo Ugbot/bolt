@@ -271,3 +271,9 @@ add_executable(bench_encodings bench_encodings.cpp)
 target_link_libraries(bench_encodings PRIVATE bolt::bolt)
 bolt_apply_hardening(bench_encodings)
 bolt_apply_bench_tuning(bench_encodings)
+
+# MSEG K3: RLE encode/decode/filter kernels, 1 thread, ns/value per page size.
+add_executable(bench_rle_encodings bench_rle_encodings.cpp)
+target_link_libraries(bench_rle_encodings PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_rle_encodings)
+bolt_apply_bench_tuning(bench_rle_encodings)
