@@ -665,6 +665,17 @@ bolt_apply_hardening(test_bolt_kmerge)
 
 add_test(NAME test_bolt_kmerge COMMAND test_bolt_kmerge)
 
+# B10 (MSEG): k-way merge and merge join over order-preserving byte keys.
+add_executable(test_bolt_kmerge_bytes test_bolt_kmerge_bytes.cpp)
+target_link_libraries(test_bolt_kmerge_bytes
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_kmerge_bytes)
+add_test(NAME test_bolt_kmerge_bytes COMMAND test_bolt_kmerge_bytes)
+
 add_executable(test_bolt_kernels test_bolt_kernels.cpp)
 
 target_link_libraries(test_bolt_kernels
