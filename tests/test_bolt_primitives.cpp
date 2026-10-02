@@ -10,6 +10,7 @@
 #include "bolt/bolt_channel.h"
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_column.h"
+#include "bolt/kernels/bolt_fastlanes.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1049,19 +1050,13 @@ TEST(BoltColumn, RLESingleRun) {
     for (int i = 0; i < 7; ++i) EXPECT_EQ(out[i], 42);
 }
 
-// B3 — BitPacked round-trip. 12 values, 3 bits each (range 0-7).
+// B3 — BitPacked round-trip (FastLanes layout, MSEG B1). 12 values, 3 bits.
 TEST(BoltColumn, BitPackedRoundTrip3Bit) {
     Arena a;
-    // Packing 12 × 3-bit values = 36 bits, fits in one uint64.
-    // Values: 0,1,2,3,4,5,6,7,0,1,2,3
     const uint32_t vals[12] = {0,1,2,3,4,5,6,7,0,1,2,3};
-    uint64_t word = 0;
-    for (int i = 0; i < 12; ++i) word |= uint64_t(vals[i]) << (i * 3);
-    uint64_t packed[2] = {word, 0};  // second word just safe read-ahead pad
-
-    BoltColumn bp = BoltColumn::make_bitpacked(
-        packed, /*bit_width=*/3, /*total_rows=*/12,
-        BoltType::Int32, &a);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, 12, 3) / 4);
+    fastlanes::encode_for<uint32_t>(vals, 12, 0, 3, packed.data());
+    BoltColumn bp = BoltColumn::make_bitpacked(packed.data(), 3, 12, BoltType::Int32, &a);
     ASSERT_EQ(bp.length, 12);
     BoltColumn flat = bp.materialize(&a);
     ASSERT_EQ(flat.length, 12);
@@ -1071,49 +1066,35 @@ TEST(BoltColumn, BitPackedRoundTrip3Bit) {
 
 TEST(BoltColumn, BitPacked17BitCrossesWordBoundary) {
     Arena a;
-    // 5 × 17-bit values = 85 bits; crosses a uint64 boundary after the 3rd.
     const uint32_t vals[5] = {0x0AAAA, 0x15555, 0x1FFFF, 0x00001, 0x10000};
-    uint64_t words[3] = {0, 0, 0};
-    for (int i = 0; i < 5; ++i) {
-        uint64_t bit_off = uint64_t(i) * 17;
-        uint64_t bit_in  = bit_off & 63u;
-        words[bit_off >> 6] |= uint64_t(vals[i]) << bit_in;
-        if (bit_in + 17 > 64) {
-            words[(bit_off >> 6) + 1] |= uint64_t(vals[i]) >> (64 - bit_in);
-        }
-    }
-    BoltColumn bp = BoltColumn::make_bitpacked(
-        words, 17, 5, BoltType::Int32, &a);
-    BoltColumn flat = bp.materialize(&a);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, 5, 17) / 4);
+    fastlanes::encode_for<uint32_t>(vals, 5, 0, 17, packed.data());
+    BoltColumn flat = BoltColumn::make_bitpacked(packed.data(), 17, 5, BoltType::Int32, &a)
+                          .materialize(&a);
     const int32_t* out = static_cast<const int32_t*>(flat.data);
     for (int i = 0; i < 5; ++i) EXPECT_EQ(out[i], static_cast<int32_t>(vals[i])) << "i=" << i;
 }
 
-// B3 edge widths: 1-bit (smallest) and 32-bit (largest supported).
 TEST(BoltColumn, BitPacked1BitEdge) {
     Arena a;
-    // 70 bits → 2 words. Pattern: alternating 1,0,1,0,...
-    uint64_t packed[2] = {0xAAAAAAAAAAAAAAAAULL, 0x2AULL /*70th..64th bits*/};
-    BoltColumn bp = BoltColumn::make_bitpacked(packed, 1, 70, BoltType::Int32, &a);
-    BoltColumn flat = bp.materialize(&a);
+    std::vector<uint32_t> vals(70);
+    for (size_t i = 0; i < 70; ++i) vals[i] = uint32_t(i & 1);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, 70, 1) / 4);
+    fastlanes::encode_for<uint32_t>(vals.data(), 70, 0, 1, packed.data());
+    BoltColumn flat = BoltColumn::make_bitpacked(packed.data(), 1, 70, BoltType::Int32, &a)
+                          .materialize(&a);
     ASSERT_EQ(flat.length, 70);
     const int32_t* out = static_cast<const int32_t*>(flat.data);
-    for (int i = 0; i < 64; ++i) EXPECT_EQ(out[i], (i & 1) ? 1 : 0) << "i=" << i;
-    // Bits 64..69 are the low 6 bits of 0x2A = 0b101010 → 0,1,0,1,0,1.
-    const int32_t tail[6] = {0,1,0,1,0,1};
-    for (int i = 0; i < 6; ++i) EXPECT_EQ(out[64 + i], tail[i]) << "i=" << 64+i;
+    for (int i = 0; i < 70; ++i) EXPECT_EQ(out[i], i & 1) << "i=" << i;
 }
 
 TEST(BoltColumn, BitPacked32BitEdge) {
     Arena a;
-    // 4 × 32-bit values pack into 2 uint64 words (exactly).
     const uint32_t vals[4] = {0x00000000u, 0xFFFFFFFFu, 0xCAFEBABEu, 0x12345678u};
-    uint64_t words[3] = {0, 0, 0};
-    for (int i = 0; i < 4; ++i) {
-        words[i / 2] |= uint64_t(vals[i]) << ((i & 1) * 32);
-    }
-    BoltColumn bp = BoltColumn::make_bitpacked(words, 32, 4, BoltType::Int32, &a);
-    BoltColumn flat = bp.materialize(&a);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, 4, 32) / 4);
+    fastlanes::encode_for<uint32_t>(vals, 4, 0, 32, packed.data());
+    BoltColumn flat = BoltColumn::make_bitpacked(packed.data(), 32, 4, BoltType::Int32, &a)
+                          .materialize(&a);
     ASSERT_EQ(flat.length, 4);
     const int32_t* out = static_cast<const int32_t*>(flat.data);
     for (int i = 0; i < 4; ++i) EXPECT_EQ(static_cast<uint32_t>(out[i]), vals[i]) << "i=" << i;
@@ -1149,26 +1130,20 @@ TEST(BoltColumn, RLELongRunList) {
     }
 }
 
-// B4 — FrameOfReference round-trip.  base + bit-packed deltas.
+// B4 — FrameOfReference round-trip (FastLanes layout, MSEG B1).
 TEST(BoltColumn, FrameOfReferenceRoundTrip) {
     Arena a;
-    // Simulate monotonic timestamps: 1_000_000 + {0, 5, 12, 20, 31, 48, 63}.
     const int64_t base = 1'000'000;
-    const uint32_t deltas[7] = {0, 5, 12, 20, 31, 48, 63};
-    uint64_t word = 0;
-    for (int i = 0; i < 7; ++i) word |= uint64_t(deltas[i]) << (i * 6);
-    uint64_t packed[2] = {word, 0};
-
-    BoltColumn fr = BoltColumn::make_frame_of_ref(
-        packed, /*bit_width=*/6, base, /*total_rows=*/7,
-        BoltType::Int64, &a);
+    const int64_t vals[7] = {base + 0, base + 5, base + 12, base + 20, base + 31, base + 48,
+                             base + 63};
+    std::vector<uint64_t> packed(fastlanes::packed_bytes(64, 7, 6) / 8);
+    fastlanes::encode_for<int64_t>(vals, 7, base, 6, packed.data());
+    BoltColumn fr = BoltColumn::make_frame_of_ref(packed.data(), 6, base, 7, BoltType::Int64, &a);
     ASSERT_EQ(fr.length, 7);
     BoltColumn flat = fr.materialize(&a);
     ASSERT_EQ(flat.length, 7);
     const int64_t* out = static_cast<const int64_t*>(flat.data);
-    for (int i = 0; i < 7; ++i) {
-        EXPECT_EQ(out[i], base + deltas[i]) << "i=" << i;
-    }
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(out[i], vals[i]) << "i=" << i;
 }
 
 TEST(BoltBatchArrow, FillSchemaStruct) {

@@ -7,6 +7,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_branchless.h"
+#include "bolt/kernels/bolt_fastlanes.h"
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_dictionary.h"
 #include "bolt/kernels/bolt_dict_filter.h"
@@ -215,42 +216,35 @@ TEST(BitmapIndexPopcount, ProbablyAbsentForUnusedKeys) {
 // ============================================================================
 
 TEST(BitPackedKernels, FilterGtMatchesUnpackThenFilter) {
-    // 20 × 5-bit values = 100 bits → 2 words.
-    constexpr int64_t N = 20;
-    uint32_t vals[N];
+    // 2,500 x 5-bit values: three FastLanes blocks, the last partial.
+    constexpr int64_t N = 2500;
+    std::vector<uint32_t> vals(N);
     std::mt19937 rng{0xBEEFu};
     std::uniform_int_distribution<uint32_t> dist{0, 31};
     for (auto& v : vals) v = dist(rng);
-
-    uint64_t packed[3] = {0, 0, 0};
-    for (int i = 0; i < N; ++i) {
-        uint64_t bit_off = uint64_t(i) * 5;
-        uint64_t bit_in  = bit_off & 63u;
-        packed[bit_off >> 6] |= uint64_t(vals[i]) << bit_in;
-        if (bit_in + 5 > 64) packed[(bit_off >> 6) + 1] |= uint64_t(vals[i]) >> (64 - bit_in);
-    }
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, N, 5) / 4);
+    fastlanes::encode_for<uint32_t>(vals.data(), N, 0, 5, packed.data());
 
     const int32_t scalar = 15;
-    // Reference: unpack then filter.
     int64_t ref_count = 0;
-    for (int i = 0; i < N; ++i) if (int32_t(vals[i]) > scalar) ++ref_count;
+    for (size_t i = 0; i < size_t(N); ++i) if (int32_t(vals[i]) > scalar) ++ref_count;
 
-    int32_t got[N] = {};
-    int64_t n = branchless::filter_gt_bitpacked(packed, N, /*bw=*/5, scalar, got);
+    std::vector<int32_t> got(N);
+    int64_t n = branchless::filter_gt_bitpacked(packed.data(), N, /*bw=*/5, scalar, got.data());
     ASSERT_EQ(n, ref_count);
-    for (int64_t i = 0; i < n; ++i) {
-        EXPECT_GT(int32_t(vals[got[i]]), scalar) << "row " << got[i];
+    for (size_t i = 0; i < size_t(n); ++i) {
+        EXPECT_GT(int32_t(vals[size_t(got[i])]), scalar) << "row " << got[i];
+        if (i) EXPECT_LT(got[i - 1], got[i]);
     }
 }
 
 TEST(BitPackedKernels, FilterEqMatchesExpected) {
-    // Hand-constructed 12 × 3-bit values {0..7, 0,1,2,3}.
     const uint32_t vals[12] = {0,1,2,3,4,5,6,7, 0,1,2,3};
-    uint64_t packed[1] = {0};
-    for (int i = 0; i < 12; ++i) packed[0] |= uint64_t(vals[i]) << (i * 3);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, 12, 3) / 4);
+    fastlanes::encode_for<uint32_t>(vals, 12, 0, 3, packed.data());
 
     int32_t got[12] = {};
-    int64_t n = branchless::filter_eq_bitpacked(packed, 12, /*bw=*/3, /*scalar=*/3, got);
+    int64_t n = branchless::filter_eq_bitpacked(packed.data(), 12, /*bw=*/3, /*scalar=*/3, got);
     ASSERT_EQ(n, 2);
     EXPECT_EQ(got[0], 3);
     EXPECT_EQ(got[1], 11);
@@ -261,19 +255,16 @@ TEST(BitPackedKernels, FilterEqMatchesExpected) {
 // ============================================================================
 
 TEST(FrameOfRefKernel, SumMatchesMaterialisedSum) {
-    // Simulate sparse-rise timestamps: base = 1_000_000, 16 × 4-bit deltas.
-    constexpr int64_t N = 16;
+    constexpr int64_t N = 1500;
     const int64_t base = 1'000'000;
-    const uint32_t deltas[N] = {0,1,2,3,4,5,6,7, 8,9,10,11,12,13,14,15};
-    uint64_t packed[2] = {0, 0};
-    for (int i = 0; i < N; ++i) {
-        uint64_t bit_off = uint64_t(i) * 4;
-        packed[bit_off >> 6] |= uint64_t(deltas[i]) << (bit_off & 63u);
-    }
+    std::vector<uint32_t> vals(N);
+    for (size_t i = 0; i < size_t(N); ++i) vals[i] = uint32_t(base) + uint32_t(i % 16);
+    std::vector<uint32_t> packed(fastlanes::packed_bytes(32, N, 4) / 4);
+    fastlanes::encode_for<uint32_t>(vals.data(), N, base, 4, packed.data());
 
     int64_t ref = 0;
-    for (int i = 0; i < N; ++i) ref += base + int64_t(deltas[i]);
-    int64_t got = branchless::sum_frame_of_ref(packed, N, /*bw=*/4, base);
+    for (size_t i = 0; i < size_t(N); ++i) ref += int64_t(vals[i]);
+    int64_t got = branchless::sum_frame_of_ref(packed.data(), N, /*bw=*/4, base);
     EXPECT_EQ(got, ref);
 }
 

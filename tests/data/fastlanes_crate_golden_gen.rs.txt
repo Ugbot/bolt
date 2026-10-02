@@ -1,0 +1,60 @@
+use fastlanes::{BitPacking, Delta, Transpose, FastLanes};
+
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
+fn lcg(x: &mut u64) -> u64 {
+    *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *x >> 11
+}
+
+macro_rules! golden {
+    ($T:ty, $bits:expr) => {{
+        // BitPacked: input i = lcg & mask(w), seed = 1000*T + w.
+        for w in 0..=$bits {
+            let mut x: u64 = 1000 * $bits + w as u64;
+            let mask: u64 = if w >= 64 { !0 } else { (1u64 << w) - 1 };
+            let mut input = [0 as $T; 1024];
+            for i in 0..1024 { input[i] = (lcg(&mut x) & mask) as $T; }
+            let mut out = vec![0 as $T; 128 * w / std::mem::size_of::<$T>()];
+            if w > 0 { unsafe { <$T as BitPacking>::unchecked_pack(w, &input, &mut out); } }
+            let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
+            println!("    {{{}, {}, 0, 0x{:016x}ull, {}u}},", $bits, w, fnv(&bytes), bytes.len());
+        }
+        // DeltaFOR, dref = 0: sorted input with steps < 2^w.
+        for w in 0..=$bits {
+            let mut x: u64 = 7000 * $bits + w as u64;
+            let mask: u64 = if w >= 64 { !0 } else { (1u64 << w) - 1 };
+            // keep the total within T bits: step mask shrinks so 1023 steps fit
+            let step_mask: u64 = if w == 0 { 0 } else { mask >> (if w > 10 { 10 } else { 0 }) };
+            let mut input = [0 as $T; 1024];
+            let mut acc: $T = (lcg(&mut x) & 0xff) as $T;
+            for i in 0..1024 { acc = acc.wrapping_add((lcg(&mut x) & step_mask) as $T); input[i] = acc; }
+            let mut t = [0 as $T; 1024];
+            <$T as Transpose>::transpose(&input, &mut t);
+            const L: usize = 1024 / $bits;
+            let mut base = [0 as $T; L];
+            for l in 0..L { base[l] = t[l]; }  // index(0, lane) = lane
+            let mut d = [0 as $T; 1024];
+            <$T as Delta>::delta::<L>(&t, &base, &mut d);
+            // width actually needed
+            let mut need = 0usize;
+            for v in d.iter() { let b = ($bits as u32 - v.leading_zeros()) as usize; if b > need { need = b; } }
+            let mut out = vec![0 as $T; 128 * need / std::mem::size_of::<$T>()];
+            if need > 0 { unsafe { <$T as BitPacking>::unchecked_pack(need, &d, &mut out); } }
+            let mut bytes: Vec<u8> = base.iter().flat_map(|v| v.to_le_bytes()).collect();
+            bytes.extend(out.iter().flat_map(|v| v.to_le_bytes()));
+            println!("    {{{}, {}, 1, 0x{:016x}ull, {}u}},", $bits, need, fnv(&bytes), bytes.len());
+        }
+    }};
+}
+
+fn main() {
+    golden!(u8, 8);
+    golden!(u16, 16);
+    golden!(u32, 32);
+    golden!(u64, 64);
+}
