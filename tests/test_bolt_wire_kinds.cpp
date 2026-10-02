@@ -5,7 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -66,8 +68,8 @@ std::string value_at(const BoltColumn& c, int64_t r) {
         }
         case ColumnFormat::RLE: {
             const int32_t* ends = static_cast<const int32_t*>(c.dict_child->data);
-            int64_t i = 0;
-            while (ends[i] <= r) ++i;
+            const int64_t i = std::upper_bound(ends, ends + c.dict_child->length,
+                                               static_cast<int32_t>(r)) - ends;
             return std::string(static_cast<const char*>(c.data) + static_cast<size_t>(i) * tsz, tsz);
         }
         case ColumnFormat::Dictionary: {
@@ -420,7 +422,7 @@ TEST(WireKinds, KindsRideInFrames) {
     std::vector<ZoneMap> roll(64);
     std::vector<uint8_t> kinds(64);
     FrameFileWriter w;
-    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kSpill, 0, 0, idx.data(), 4,
+    ASSERT_EQ(frame_file_begin(&w, file.p, file.n, FrameFilePurpose::kSpill, 0, 0, 1, idx.data(), 4,
                                roll.data(), kinds.data(), 64), FrameStatus::kOk);
     FrameMeta m;
     std::memset(&m, 0, sizeof(m));
@@ -435,4 +437,317 @@ TEST(WireKinds, KindsRideInFrames) {
     BoltBatch dst;
     ASSERT_TRUE(bolt_wire_view(fv.payload, fv.payload_len, &dst, &a));
     expect_same(src, dst);
+}
+
+// ---------------------------------------------------------------------------
+// Review additions (2026-10-02): a 20-seed sweep of every new kind / type
+// over 0..65,536 rows with and without validity, Nested three levels deep
+// with nulls at every level, make_view slices, hostile blobs.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Rng {
+    uint64_t s;
+    uint64_t next() { s = s * 6364136223846793005ull + 1442695040888963407ull; return s >> 11; }
+    uint64_t below(uint64_t n) { return n ? next() % n : 0; }
+};
+
+uint8_t* rand_bitmap(Arena* a, Rng* r, int64_t n) {
+    const size_t vb = static_cast<size_t>((n + 7) / 8) + 8;
+    auto* v = static_cast<uint8_t*>(a->allocate(vb, 64));
+    for (size_t i = 0; i < vb; ++i) v[i] = static_cast<uint8_t>(r->next() | r->next());
+    return v;
+}
+
+// One column of kind `kind` (0..12) and n rows; `nulls` adds a validity bitmap.
+BoltColumn make_kind(Kit* k, Rng* r, int kind, int64_t n, bool nulls, char* pool,
+                     uint32_t* used) {
+    Arena& a = k->a;
+    BoltColumn c = BoltColumn::make_empty();
+    switch (kind) {
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: {
+            const BoltType ts[7] = {BoltType::Date64, BoltType::Duration, BoltType::UUID,
+                                    BoltType::IPv4, BoltType::FixedSizeBinary,
+                                    BoltType::Decimal256, BoltType::Float16};
+            c = BoltColumn::make_flat_alloc(n, ts[kind], &a);
+            auto* d = static_cast<uint8_t*>(c.data);
+            for (size_t i = 0; i < static_cast<size_t>(n) * c.type_size_bytes; ++i)
+                d[i] = static_cast<uint8_t>(r->next());
+            if (ts[kind] == BoltType::FixedSizeBinary) {
+                c.fixed_width = static_cast<uint8_t>(1 + r->below(16));
+                for (int64_t row = 0; row < n; ++row)
+                    std::memset(d + row * 16 + c.fixed_width, 0, 16u - c.fixed_width);
+            }
+            break;
+        }
+        case 7: {   // Flat Binary / Symbol strings
+            c = BoltColumn::make_flat_alloc(n, BoltType::Utf8, &a);
+            c.type = r->below(2) ? BoltType::Binary : BoltType::Symbol;
+            for (int64_t row = 0; row < n; ++row) {
+                std::string v(static_cast<size_t>(r->below(24)), char('a' + r->below(26)));
+                static_cast<StringView*>(c.data)[row] = k->str(v, pool, used);
+            }
+            c.str_overflow_base = pool;
+            break;
+        }
+        case 8: {   // Constant: int, long string, or all-null
+            const uint64_t which = r->below(3);
+            if (which == 0) {
+                c = BoltColumn::make_constant<int64_t>(static_cast<int64_t>(r->next()), n,
+                                                       BoltType::Int64);
+            } else if (which == 1) {
+                StringView sv = k->str(std::string(13 + r->below(40), 'q'), pool, used);
+                c = BoltColumn::make_constant(sv, n, BoltType::Utf8);
+                c.str_overflow_base = pool;
+            } else {
+                c = BoltColumn::make_constant<int32_t>(0, n, BoltType::Int32);
+                if (n > 0) {
+                    c.validity = static_cast<uint8_t*>(a.allocate(static_cast<size_t>((n + 7) / 8) + 1, 64));
+                    std::memset(c.validity, 0, static_cast<size_t>((n + 7) / 8) + 1);
+                    c.stats.all_valid = false;
+                }
+            }
+            return c;   // a constant's nulls are all-or-nothing here
+        }
+        case 9:
+            return BoltColumn::make_sequence(static_cast<int64_t>(r->next() % 1000), 3, n,
+                                             BoltType::Int64);
+        case 10: {   // RLE int64, random run lengths
+            auto* vals = a.allocate_array<int64_t>(static_cast<size_t>(n) + 1);
+            auto* ends = a.allocate_array<int32_t>(static_cast<size_t>(n) + 1);
+            int64_t runs = 0, at = 0;
+            while (at < n) {
+                at += 1 + static_cast<int64_t>(r->below(9));
+                if (at > n) at = n;
+                vals[runs] = static_cast<int64_t>(r->next());
+                ends[runs++] = static_cast<int32_t>(at);
+            }
+            c = BoltColumn::make_rle(vals, runs, ends, n, BoltType::Int64, &a);
+            break;
+        }
+        case 11: {   // Dictionary, key width 1 / 2 / 4, Int64 values
+            const uint16_t kw = uint16_t(1u << r->below(3));
+            const int64_t nd = 1 + static_cast<int64_t>(r->below(kw == 1 ? 200 : 3000));
+            BoltColumn* dv = a.allocate_array<BoltColumn>(1);
+            *dv = BoltColumn::make_flat_alloc(nd, BoltType::Int64, &a);
+            for (int64_t i = 0; i < nd; ++i) static_cast<int64_t*>(dv->data)[i] = i * 7 - 3;
+            c.format = ColumnFormat::Dictionary;
+            c.type = BoltType::Int64;
+            c.length = n;
+            c.type_size_bytes = kw;
+            c.data = a.allocate(static_cast<size_t>(n) * kw + 8, 64);
+            for (int64_t row = 0; row < n; ++row) {
+                const uint32_t key = static_cast<uint32_t>(r->below(static_cast<uint64_t>(nd)));
+                std::memcpy(static_cast<uint8_t*>(c.data) + row * kw, &key, kw);
+            }
+            c.dict_child = dv;
+            break;
+        }
+        default: {   // List<Int64>
+            auto* offs = a.allocate_array<int32_t>(static_cast<size_t>(n) + 1);
+            offs[0] = 0;
+            for (int64_t row = 0; row < n; ++row) offs[row + 1] = offs[row] + int32_t(r->below(4));
+            BoltColumn e = BoltColumn::make_flat_alloc(offs[n], BoltType::Int64, &a);
+            for (int32_t i = 0; i < offs[n]; ++i) static_cast<int64_t*>(e.data)[i] = int64_t(r->next());
+            c = BoltColumn::make_list(&e, offs, n, nullptr, &a);
+            break;
+        }
+    }
+    if (nulls && n > 0) {
+        c.validity = rand_bitmap(&a, r, n);
+        c.stats.all_valid = false;
+    }
+    return c;
+}
+
+}  // namespace
+
+TEST(WireKinds, TwentySeedSweepToSixtyFiveThousandRows) {
+    static const int64_t kLens[] = {0, 1, 2, 7, 63, 64, 65, 1023, 1024, 4095, 4096, 65535, 65536};
+    const int kSeeds = 20;
+    for (int seed = 0; seed < kSeeds; ++seed) {
+        Rng r{0xC0FFEEull + static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ull};
+        const int64_t lens[2] = {kLens[seed % 13],
+                                 1 + static_cast<int64_t>(r.below(65536))};
+        for (int64_t n : lens) {
+            for (int nulls = 0; nulls < 2; ++nulls) {
+                Kit k;
+                k.n = n;
+                char* pool = static_cast<char*>(k.a.allocate(static_cast<size_t>(n) * 64 + 64, 64));
+                uint32_t used = 0;
+                for (int kind = 0; kind <= 12; ++kind) {
+                    char name[16];
+                    std::snprintf(name, sizeof(name), "k%d", kind);
+                    k.add(name, make_kind(&k, &r, kind, n, nulls != 0, pool, &used));
+                }
+                BoltBatch src;
+                k.batch(&src);
+                const size_t need = bolt_wire_size(&src);
+                ASSERT_GT(need, 0u) << "seed " << seed << " n " << n;
+                Buf buf(need);
+                ASSERT_EQ(bolt_wire_serialize(&src, buf.p, buf.n), need);
+                Arena out;
+                BoltBatch copy, view;
+                ASSERT_TRUE(bolt_wire_deserialize(buf.p, need, &copy, &out)) << seed << " " << n;
+                ASSERT_TRUE(bolt_wire_view(buf.p, need, &view, &out)) << seed << " " << n;
+                expect_same(src, copy);
+                expect_same(src, view);
+                // Re-serialising either result gives the same bytes (bit exact).
+                std::vector<uint8_t> again(bolt_wire_size(&view));
+                ASSERT_EQ(bolt_wire_serialize(&view, again.data(), again.size()), need);
+                ASSERT_EQ(std::memcmp(again.data(), buf.p, need), 0) << seed << " " << n;
+            }
+        }
+    }
+}
+
+// List<Struct{Int32, List<Utf8>}> with a null at the outer list, the struct,
+// the inner list and its elements.
+TEST(WireKinds, NestedThreeLevelsWithNullsAtEveryLevel) {
+    Kit k;
+    Rng r{77};
+    const int64_t n = k.n = 300;
+    char* pool = static_cast<char*>(k.a.allocate(1 << 20, 64));
+    uint32_t used = 0;
+    // Level 3: Utf8 leaves.
+    auto* o3 = k.a.allocate_array<int32_t>(4096);
+    const int64_t n_struct = 700;
+    o3[0] = 0;
+    for (int64_t i = 0; i < n_struct; ++i) o3[i + 1] = o3[i] + int32_t(r.below(4));
+    BoltColumn leaf = BoltColumn::make_flat_alloc(o3[n_struct], BoltType::Utf8, &k.a);
+    for (int32_t i = 0; i < o3[n_struct]; ++i)
+        static_cast<StringView*>(leaf.data)[i] =
+            k.str(std::string(r.below(20), char('a' + i % 26)), pool, &used);
+    leaf.str_overflow_base = pool;
+    leaf.validity = rand_bitmap(&k.a, &r, o3[n_struct]);
+    leaf.stats.all_valid = false;
+    BoltColumn inner = BoltColumn::make_list(&leaf, o3, n_struct, rand_bitmap(&k.a, &r, n_struct), &k.a);
+    // Level 2: Struct{Int32, inner list}.
+    BoltColumn f[2];
+    f[0] = BoltColumn::make_flat_alloc(n_struct, BoltType::Int32, &k.a);
+    for (int64_t i = 0; i < n_struct; ++i) static_cast<int32_t*>(f[0].data)[i] = int32_t(i);
+    f[0].validity = rand_bitmap(&k.a, &r, n_struct);
+    f[0].stats.all_valid = false;
+    f[1] = inner;
+    BoltColumn st = BoltColumn::make_struct(f, 2, n_struct, rand_bitmap(&k.a, &r, n_struct), &k.a);
+    // Level 1: the outer list over the structs.
+    auto* o1 = k.a.allocate_array<int32_t>(static_cast<size_t>(n) + 1);
+    o1[0] = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        int32_t step = int32_t(r.below(5));
+        if (o1[i] + step > n_struct) step = int32_t(n_struct - o1[i]);
+        o1[i + 1] = o1[i] + step;
+    }
+    o1[n] = int32_t(n_struct);   // the last list takes the rest
+    ASSERT_GE(o1[n], o1[n - 1]);
+    k.add("deep", BoltColumn::make_list(&st, o1, n, rand_bitmap(&k.a, &r, n), &k.a));
+    BoltBatch src;
+    k.batch(&src);
+    const size_t need = bolt_wire_size(&src);
+    ASSERT_GT(need, 0u);
+    Buf buf(need);
+    ASSERT_EQ(bolt_wire_serialize(&src, buf.p, buf.n), need);
+    Arena out;
+    BoltBatch copy, view;
+    ASSERT_TRUE(bolt_wire_deserialize(buf.p, need, &copy, &out));
+    ASSERT_TRUE(bolt_wire_view(buf.p, need, &view, &out));
+    expect_same(src, copy);
+    expect_same(src, view);
+    // Each level kept its own nulls.
+    const BoltColumn* s2 = static_cast<const BoltColumn*>(view.col(0).data);
+    const BoltColumn* l3 = static_cast<const BoltColumn*>(s2[0].data) + 1;
+    const BoltColumn* lf = static_cast<const BoltColumn*>(l3->data);
+    EXPECT_NE(view.col(0).validity, nullptr);
+    EXPECT_NE(s2[0].validity, nullptr);
+    EXPECT_NE(l3->validity, nullptr);
+    EXPECT_NE(lf->validity, nullptr);
+}
+
+// make_view slices of Flat Utf8 keep their overflow base and serialise; a
+// spilled column with no base is refused rather than written dangling.
+TEST(WireKinds, ViewSlicesOfStringsRoundTrip) {
+    Kit k;
+    k.n = 40;
+    char* pool = static_cast<char*>(k.a.allocate(8192, 64));
+    uint32_t used = 0;
+    BoltColumn s = BoltColumn::make_flat_alloc(100, BoltType::Utf8, &k.a);
+    for (int64_t i = 0; i < 100; ++i)
+        static_cast<StringView*>(s.data)[i] = k.str(std::string(5 + i % 20, char('A' + i % 26)), pool, &used);
+    s.str_overflow_base = pool;
+    s.decimal_scale = 0;
+    k.add("v", BoltColumn::make_view(s, 37, 40));
+    BoltBatch src;
+    k.batch(&src);
+    std::vector<uint8_t> buf(bolt_wire_size(&src));
+    ASSERT_GT(buf.size(), 0u);
+    ASSERT_EQ(bolt_wire_serialize(&src, buf.data(), buf.size()), buf.size());
+    Arena out;
+    BoltBatch dst;
+    ASSERT_TRUE(bolt_wire_deserialize(buf.data(), buf.size(), &dst, &out));
+    expect_same(src, dst);
+    src.columns[0][0].str_overflow_base = nullptr;
+    src.columns[1][0].str_overflow_base = nullptr;
+    EXPECT_EQ(bolt_wire_size(&src), 0u);
+}
+
+// Hostile blobs: random byte flips and truncations of a blob of every kind
+// never crash the parser (ASan/UBSan), and the specific overflow shapes are
+// refused.
+TEST(WireKinds, HostileBlobsAreRefusedNotRead) {
+    Kit k;
+    build_all_kinds(&k);
+    BoltBatch src;
+    k.batch(&src);
+    std::vector<uint8_t> good(bolt_wire_size(&src));
+    ASSERT_EQ(bolt_wire_serialize(&src, good.data(), good.size()), good.size());
+    Buf work(good.size());
+    Rng r{12345};
+    const char* env = std::getenv("BOLT_WIRE_FUZZ_ITERS");
+    const uint64_t iters = env ? std::strtoull(env, nullptr, 10) : 20000u;
+    for (uint64_t it = 0; it < iters; ++it) {
+        std::memcpy(work.p, good.data(), good.size());
+        const size_t flips = 1 + r.below(4);
+        for (size_t f = 0; f < flips; ++f)
+            work.p[r.below(good.size())] ^= static_cast<uint8_t>(1u << r.below(8));
+        const size_t len = r.below(8) == 0 ? r.below(good.size()) : good.size();
+        Arena a;
+        BoltBatch d;
+        (void)bolt_wire_deserialize(work.p, len, &d, &a);
+        Arena b;
+        (void)bolt_wire_view(work.p, len, &d, &b);
+    }
+    // rows near 2^62 with a Constant / Sequence column: refused by the cap.
+    std::vector<uint8_t> bad = good;
+    const int64_t huge = int64_t(1) << 62;
+    std::memcpy(bad.data() + 12, &huge, 8);
+    Arena a;
+    BoltBatch d;
+    EXPECT_FALSE(bolt_wire_deserialize(bad.data(), bad.size(), &d, &a));
+    // A Flat column whose b1 is shorter than rows x stride.
+    Kit f;
+    f.n = 16;
+    BoltColumn i64 = BoltColumn::make_flat_alloc(16, BoltType::Int64, &f.a);
+    std::memset(i64.data, 3, 128);
+    f.add("i", i64);
+    BoltBatch fb;
+    f.batch(&fb);
+    std::vector<uint8_t> fl(bolt_wire_size(&fb));
+    ASSERT_EQ(bolt_wire_serialize(&fb, fl.data(), fl.size()), fl.size());
+    const size_t d0 = kWireHeaderSize + kWireSchemaEntrySize;
+    const uint64_t short_len = 64;
+    std::memcpy(fl.data() + d0 + 24, &short_len, 8);
+    EXPECT_FALSE(bolt_wire_deserialize(fl.data(), fl.size(), &d, &a));
+    // A dictionary code past the dictionary, and a run end out of order.
+    std::vector<uint8_t> dict = good;
+    const size_t desc0 = kWireHeaderSize + src.num_cols * kWireSchemaEntrySize;
+    uint64_t o1; std::memcpy(&o1, dict.data() + desc0 + 5 * kWireDescSize + 16, 8);
+    const uint16_t code = 9;
+    std::memcpy(dict.data() + o1, &code, 2);
+    EXPECT_FALSE(bolt_wire_deserialize(dict.data(), dict.size(), &d, &a));
+    std::vector<uint8_t> rle = good;
+    uint64_t o2; std::memcpy(&o2, rle.data() + desc0 + 4 * kWireDescSize + 32, 8);
+    const int32_t back = 60;
+    std::memcpy(rle.data() + o2, &back, 4);
+    EXPECT_FALSE(bolt_wire_deserialize(rle.data(), rle.size(), &d, &a));
 }

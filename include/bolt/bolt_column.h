@@ -946,6 +946,13 @@ struct BoltColumn {
             c.data = static_cast<uint8_t*>(parent.data) + offset * parent.type_size_bytes;
             c.validity = parent.validity;
             c.validity_offset = parent.validity_offset + offset;
+            // What the rows mean travels with them: spilled StringView refs
+            // resolve against the parent's overflow, and decimal scale,
+            // logical tag and fixed width describe the values.
+            c.str_overflow_base = parent.str_overflow_base;
+            c.decimal_scale = parent.decimal_scale;
+            c.logical = parent.logical;
+            c.fixed_width = parent.fixed_width;
         } else if (parent.format == ColumnFormat::Constant) {
             c = parent;
             c.length = length;

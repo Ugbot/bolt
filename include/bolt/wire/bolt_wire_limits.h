@@ -62,6 +62,10 @@ inline constexpr uint64_t kFrameMaxPayloadBytes = 0xFFFFFFFFull;
 // Nesting depth of a wire blob: Nested children and Dictionary values are
 // serialised as sub-blobs, recursively (bounded recursion).
 inline constexpr uint32_t kWireMaxNestDepth = 16;
+// Rows a wire blob may claim. Constant / Sequence columns cost O(1) bytes
+// for any row count, so the header's i64 is not bounded by the blob length;
+// this cap keeps every rows x stride / validity product far from overflow.
+inline constexpr int64_t kWireMaxRows = int64_t(1) << 40;
 // Frames in one container (FrameIndexEntry count is a u32 on disk).
 inline constexpr uint32_t kFrameFileMaxFrames = 0xFFFFFFFFu;
 

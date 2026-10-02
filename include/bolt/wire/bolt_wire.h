@@ -34,6 +34,14 @@
 //     v1..v4.
 //   - BitPacked / FrameOfRef / DeltaFOR have no wire id yet (B3 remainder,
 //     after their layout is fixed by B1) and must be materialized first.
+//   - Readers treat the blob as untrusted: every span is bounds-checked
+//     without overflow and (in an aligned blob, which every writer emits)
+//     64 B aligned; rows <= kWireMaxRows; a Flat b1 is exactly rows x
+//     stride; RLE run ends strictly increase to rows; Dictionary codes are
+//     below the dictionary length; List/Map offsets are monotone; a long
+//     Constant string carries exactly its bytes. Flat StringView rows and
+//     VarBinary offsets are NOT walked (O(rows) on the hot read path): the
+//     frame CRC is what guards those bytes.
 //   - Little-endian target only (x86 / ARM64). Flag bit 0 records this.
 //   - Deserialize copies each column buffer into the caller-provided Arena.
 //     Zero-copy-over-mmap is a future goal; the 64-byte alignment in the blob
@@ -376,6 +384,17 @@ inline size_t cols_wire_write(const BoltColumn* cols, const BoltField* fields, u
                               int64_t rows, uint8_t* buf, size_t cap,
                               uint32_t depth) noexcept;
 
+// True if a valid row of a StringView column is longer than 12 bytes (needs
+// str_overflow_base). Walked only when the base is absent.
+inline bool sv_rows_spill(const BoltColumn& c) noexcept {
+    assert(is_sv_string(c.type));
+    assert(c.data != nullptr || c.length == 0);
+    const auto* rows = static_cast<const StringView*>(c.data);
+    for (int64_t r = 0; r < c.length; ++r)            // bounded: length
+        if (rows[r].length > 12u && !c.is_null(r)) return true;
+    return false;
+}
+
 inline bool constant_all_null(const BoltColumn& c) noexcept {
     assert(c.format == ColumnFormat::Constant);
     assert(c.length >= 0);
@@ -488,9 +507,10 @@ inline bool column_wire_plan(const BoltColumn& c, uint32_t depth, ColWire* w) no
         return true;
     }
     if (c.format == ColumnFormat::Flat || c.format == ColumnFormat::View) {
+        if (c.length > 0 && c.data == nullptr) return false;
         if (is_sv_string(c.type)) {
             flat_utf8_sizes(c, &w->b1, &w->b2, &w->moff);
-            return !(w->b2 > 0 && c.str_overflow_base == nullptr);
+            return c.str_overflow_base != nullptr || !sv_rows_spill(c);
         }
         w->b1 = data_buffer_size(c.type, c.length, c.type_size_bytes);
         return true;
@@ -779,6 +799,20 @@ template <bool kView>
 inline bool parse_cols(const uint8_t* p, size_t len, BoltBatch* out, Arena* arena,
                        uint32_t depth) noexcept;
 
+// Every dictionary code is below the dictionary length (a branch-free max).
+inline bool dict_codes_in_range(const uint8_t* keys, uint32_t kw, int64_t rows,
+                                int64_t dict_len) noexcept {
+    assert(kw == 1 || kw == 2 || kw == 4);
+    assert(keys != nullptr || rows == 0);
+    uint32_t mx = 0;
+    for (int64_t r = 0; r < rows; ++r) {              // bounded: rows
+        uint32_t k = 0;
+        memcpy(&k, keys + static_cast<size_t>(r) * kw, kw);
+        mx = k > mx ? k : mx;
+    }
+    return rows == 0 || static_cast<int64_t>(mx) < dict_len;
+}
+
 // Dictionary values (one-column sub-blob in b2) and Nested children
 // (sub-blob in b1, element offsets in b2 for List/Map).
 template <bool kView>
@@ -796,7 +830,9 @@ inline bool build_child_set(const uint8_t* p, const WireDesc& d, const BoltField
         c->data = wire_span<kView>(p, d.o[1], d.l[1], arena);
         c->type_size_bytes = static_cast<uint16_t>(kw);
         c->dict_child = &sub.columns[0][0];
-        return sub.columns[0][0].type == f.type;
+        if (sub.columns[0][0].type != f.type) return false;
+        return dict_codes_in_range(static_cast<const uint8_t*>(c->data), kw, rows,
+                                   sub.num_rows);
     }
     if (!parse_cols<kView>(p + d.o[1], d.l[1], &sub, arena, depth + 1) ||
         sub.num_cols != d.p32 || sub.num_cols == 0) return false;
@@ -827,6 +863,11 @@ inline bool build_encoded(const uint8_t* p, const WireDesc& d, const BoltField& 
         if (d.l[1] != sizeof(c->inline_value) || d.p32 > sizeof(c->inline_value)) return false;
         memcpy(c->inline_value, p + d.o[1], sizeof(c->inline_value));
         c->type_size_bytes = static_cast<uint16_t>(d.p32);
+        // A long string constant carries exactly its bytes in b2, at offset 0.
+        StringView sv;
+        memcpy(&sv, c->inline_value, sizeof(sv));
+        const bool spilled = is_sv_string(f.type) && sv.length > 12u;
+        if (spilled ? (d.l[2] != sv.length || sv.ref.offset != 0) : d.l[2] != 0) return false;
         if (d.l[2]) c->str_overflow_base = wire_span<kView>(p, d.o[2], d.l[2], arena);
         if (d.flags & kDescFlagAllNull) {
             c->validity = static_cast<uint8_t*>(arena->allocate(validity_bytes(rows) + 1, 64));
@@ -851,6 +892,11 @@ inline bool build_encoded(const uint8_t* p, const WireDesc& d, const BoltField& 
         c->data = wire_span<kView>(p, d.o[1], d.l[1], arena);
         auto* ends = static_cast<int32_t*>(wire_span<kView>(p, d.o[2], d.l[2], arena));
         if (runs != 0 && (ends == nullptr || ends[runs - 1] != rows)) return false;
+        int64_t prev = 0;
+        for (uint64_t i = 0; i < runs; ++i) {         // bounded: runs
+            if (ends[i] <= prev) return false;        // strictly increasing, > 0
+            prev = ends[i];
+        }
         BoltColumn* rc = arena->allocate_array<BoltColumn>(1);
         if (rc == nullptr) return false;
         *rc = BoltColumn::make_flat(ends, nullptr, static_cast<int64_t>(runs), BoltType::Int32);
@@ -902,7 +948,12 @@ inline bool build_column(const uint8_t* p, const WireDesc& d, const BoltField& f
             c.type_size_bytes = static_cast<uint16_t>(
                 is_sv_string(f.type) ? sizeof(StringView) : type_size(f.type));
         }
-        if (f.type == BoltType::FixedSizeBinary) c.fixed_width = static_cast<uint8_t>(f.fixed_size);
+        if (f.type == BoltType::FixedSizeBinary) {
+            if (f.fixed_size > type_size(BoltType::FixedSizeBinary)) return false;
+            c.fixed_width = static_cast<uint8_t>(f.fixed_size);
+        }
+        // b1 holds exactly rows x stride bytes (rows <= kWireMaxRows).
+        if (d.l[1] != static_cast<uint64_t>(rows) * c.type_size_bytes) return false;
         if (d.l[1]) {
             c.data = wire_span<kView>(p, d.o[1], d.l[1], arena);
             if (!c.data) return false;
@@ -922,13 +973,15 @@ inline bool build_column(const uint8_t* p, const WireDesc& d, const BoltField& f
 }
 
 // Read and bounds-check descriptor i.
-inline bool read_desc(const uint8_t* dp, size_t buf_len, WireDesc* d) noexcept {
+inline bool read_desc(const uint8_t* dp, size_t buf_len, bool aligned, WireDesc* d) noexcept {
     assert(dp != nullptr && d != nullptr);
     assert(buf_len > 0);
     for (int k = 0; k < 3; ++k) {
         d->o[k] = read_u64_le(dp + 16 * k);
         d->l[k] = read_u64_le(dp + 16 * k + 8);
         if (d->o[k] > buf_len || d->l[k] > buf_len - d->o[k]) return false;
+        // Typed spans (int32 offsets / run ends, keys) are read in place.
+        if (aligned && (d->o[k] & (kWireAlign - 1)) != 0) return false;
     }
     d->fm = static_cast<ColumnFormat>(dp[layout::kDescFormatOff]);
     d->flags = dp[kDescFlagsOff];
@@ -962,7 +1015,7 @@ inline bool read_entry(const uint8_t* e, uint32_t version, BoltField* f,
 
 // Validate the header; fills the counts.
 inline bool read_header(const uint8_t* p, size_t len, uint32_t* version, int64_t* rows,
-                        uint32_t* n, uint32_t* data_off) noexcept {
+                        uint32_t* n, uint32_t* data_off, bool* aligned) noexcept {
     assert(version != nullptr && rows != nullptr);
     assert(n != nullptr && data_off != nullptr);
     if (p == nullptr || len < kWireHeaderSize) return false;
@@ -972,11 +1025,14 @@ inline bool read_header(const uint8_t* p, size_t len, uint32_t* version, int64_t
     // than the header's version.
     *version = read_u32_le(p + 4);
     if (*version < 1u || *version > kWireVersionLatest) return false;
-    if (!(read_u32_le(p + 8) & kWireFlagLE)) return false;
+    const uint32_t flags = read_u32_le(p + 8);
+    if (!(flags & kWireFlagLE)) return false;
+    *aligned = (flags & kWireFlagAln) != 0;
+    if (*version >= kWireVersionEncoded && !*aligned) return false;
     *rows = read_i64_le(p + 12);
     *n = read_u32_le(p + 20);
     *data_off = read_u32_le(p + 28);
-    if (*n > kWireMaxCols || *rows < 0) return false;
+    if (*n > kWireMaxCols || *rows < 0 || *rows > kWireMaxRows) return false;
     if (read_u32_le(p + 24) != kWireHeaderSize) return false;
     if ((*data_off & (kWireAlign - 1)) != 0 || *data_off > len) return false;
     return kWireHeaderSize + static_cast<size_t>(*n) * (kWireSchemaEntrySize + kWireDescSize)
@@ -990,7 +1046,9 @@ inline bool parse_cols(const uint8_t* p, size_t len, BoltBatch* out, Arena* aren
     assert(depth <= kWireMaxNestDepth + 1);
     uint32_t version = 0, n = 0, data_off = 0;
     int64_t rows = 0;
-    if (depth > kWireMaxNestDepth || !read_header(p, len, &version, &rows, &n, &data_off))
+    bool aligned = false;
+    if (depth > kWireMaxNestDepth ||
+        !read_header(p, len, &version, &rows, &n, &data_off, &aligned))
         return false;
     BoltBatch::init_empty(out);
     // G2FEAT-47: right-size the column arrays (sets num_cols + arena).
@@ -1005,7 +1063,8 @@ inline bool parse_cols(const uint8_t* p, size_t len, BoltBatch* out, Arena* aren
         if (!read_entry(p + kWireHeaderSize + i * kWireSchemaEntrySize, version, &f, &fm, &lg))
             return false;
         WireDesc d;
-        if (!read_desc(p + desc_off + i * kWireDescSize, len, &d) || d.fm != fm) return false;
+        if (!read_desc(p + desc_off + i * kWireDescSize, len, aligned, &d) || d.fm != fm)
+            return false;
         BoltColumn c;
         if (!build_column<kView>(p, d, f, lg, rows, arena, depth, &c)) return false;
         out->columns[0][i] = c;
