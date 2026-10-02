@@ -154,6 +154,18 @@ target_link_libraries(bolt INTERFACE
 # aarch64 at the default -march=armv8-a, i.e. exactly a manylinux wheel.
 option(BOLT_BUILD_IO "Build bolt::io compiled library" ON)
 
+# bolt::file_read — B6 file reads (pread, mmap, batched reads, range_coalesce).
+# Core-only and always built: bolt::lakehouse needs it even where a consumer
+# turns BOLT_BUILD_IO off (boltapi's vendored build does).
+add_library(bolt_file_read STATIC src/io/bolt_file_io.cpp src/io/bolt_read_batch.cpp)
+add_library(bolt::file_read ALIAS bolt_file_read)
+target_link_libraries(bolt_file_read PUBLIC bolt::core)
+target_include_directories(bolt_file_read PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_file_read)
+target_link_libraries(bolt INTERFACE bolt::file_read)
+
 if(BOLT_BUILD_IO)
     add_library(bolt_io STATIC src/io/bolt_crc32c.cpp src/io/bolt_crc64nvme.cpp)
     add_library(bolt::io ALIAS bolt_io)
@@ -165,12 +177,12 @@ if(BOLT_BUILD_IO)
     bolt_apply_simd(bolt_io ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io)
 
-    # bolt::io_file — the one part of bolt::io that does file I/O: the aligned
-    # (direct-I/O) page writer of MSEG K9. Kept out of bolt_io so that library
-    # stays pure compute.
+    # bolt::io_file — the part of bolt::io that does file I/O: the aligned
+    # (direct-I/O) page writer of MSEG K9, plus the B6 reads. Kept out of
+    # bolt_io so that library stays pure compute.
     add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp)
     add_library(bolt::io_file ALIAS bolt_io_file)
-    target_link_libraries(bolt_io_file PUBLIC bolt::core bolt::io)
+    target_link_libraries(bolt_io_file PUBLIC bolt::core bolt::io bolt::file_read)
     target_include_directories(bolt_io_file PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
@@ -995,6 +1007,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/parallel_scan.cpp)
 add_library(bolt::lakehouse ALIAS bolt_lakehouse)
 target_link_libraries(bolt_lakehouse PUBLIC bolt::core bolt::crypto bolt::net)
+target_link_libraries(bolt_lakehouse PUBLIC bolt::file_read)
 if(TARGET bolt::parse)
     target_link_libraries(bolt_lakehouse PUBLIC bolt::parse)
 endif()
@@ -1152,7 +1165,7 @@ install(DIRECTORY include/bolt
 set(_bolt_exportable
     bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt
     bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
-    bolt_io bolt_io_file bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
+    bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)
 ## BLLM-99: bolt_rocm is an IMPORTED target (built via a direct clang++
 ## invocation, not enable_language(HIP) -- see that block's own comment) --
