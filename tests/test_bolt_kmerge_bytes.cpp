@@ -85,7 +85,7 @@ TEST(KMergeBytes, CompareMatchesStdString) {
 TEST(KMergeBytes, MatchesStableSortModel) {
     std::mt19937_64 g(42);
     for (int trial = 0; trial < 300; ++trial) {
-        const uint32_t k = 1 + static_cast<uint32_t>(g() % 12);
+        const uint32_t k = trial % 50 == 0 ? kKMergeMaxInputs : 1 + static_cast<uint32_t>(g() % kKMergeMaxInputs);
         const int mode = trial % 3;
         std::vector<KeyRun> runs(k);
         std::vector<Ref> model;
@@ -252,4 +252,177 @@ TEST(MergeJoinBytes, MatchesNestedLoopModelAllKinds) {
             ASSERT_EQ(got, want) << "trial " << trial << " kind " << int(kk);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The version comparator (review, 2026-10-02): equal keys are ordered by the
+// store's one version order — (seq, lsn) newest first here — not by input
+// slot. Rows are dealt to inputs at random, so a newer version is as likely
+// to sit in a later slot as an earlier one; slot order is wrong and the
+// comparator is what makes the newest-wins winners right.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct VRow {
+    std::string key;
+    int64_t seq;
+    uint64_t lsn;    // unique across all rows (no two versions share an LSN)
+};
+
+struct VRun {
+    std::vector<VRow> rows;   // sorted (key asc, version newest first)
+    KeyRun kr;
+};
+
+bool newer(const VRow& a, const VRow& b) {
+    return a.seq != b.seq ? a.seq > b.seq : a.lsn > b.lsn;
+}
+
+struct VCtx {
+    const std::vector<VRun>* runs;
+    bool ascending;   // injection: oldest first
+};
+
+int vcmp(const void* ctx, uint32_t ia, int64_t ra, uint32_t ib, int64_t rb) noexcept {
+    const VCtx* c = static_cast<const VCtx*>(ctx);
+    const VRow& a = (*c->runs)[ia].rows[static_cast<size_t>(ra)];
+    const VRow& b = (*c->runs)[ib].rows[static_cast<size_t>(rb)];
+    if (a.seq == b.seq && a.lsn == b.lsn) return 0;
+    const int r = newer(a, b) ? -1 : 1;
+    return c->ascending ? -r : r;
+}
+
+// Run the merge; returns (input, row) in output order.
+std::vector<std::pair<uint32_t, int64_t>> run_merge(std::vector<VRun>& runs, KMergeVersionOrder v,
+                                                    int64_t cap, uint64_t* ties) {
+    std::vector<KMergeBytesInput> in(runs.size());
+    for (uint32_t s = 0; s < runs.size(); ++s) in[s] = KMergeBytesInput{runs[s].kr.col, 0, s, 0};
+    KMergeBytes m;
+    EXPECT_TRUE(kmerge_bytes_init_versioned(&m, in.data(), static_cast<uint32_t>(in.size()), v));
+    std::vector<int32_t> id(static_cast<size_t>(cap));
+    std::vector<int64_t> row(static_cast<size_t>(cap));
+    std::vector<std::pair<uint32_t, int64_t>> out;
+    for (int guard = 0; guard < 1000000; ++guard) {
+        const int64_t got = kmerge_bytes_next(&m, id.data(), row.data(), nullptr, cap);
+        if (got == 0) break;
+        for (int64_t e = 0; e < got; ++e)
+            out.emplace_back(static_cast<uint32_t>(id[static_cast<size_t>(e)]), row[static_cast<size_t>(e)]);
+    }
+    if (ties) *ties = m.version_ties;
+    return out;
+}
+
+}  // namespace
+
+TEST(KMergeBytes, VersionComparatorDecidesEqualKeysUpTo64Inputs) {
+    int slot_order_wrong = 0;
+    int trials = 0;
+    for (uint64_t seed = 1; seed <= 24; ++seed) {
+        std::mt19937_64 g(seed * 7919);
+        for (int t = 0; t < 12; ++t, ++trials) {
+            const uint32_t k = (t == 0) ? kKMergeMaxInputs : 1 + static_cast<uint32_t>(g() % kKMergeMaxInputs);
+            const int mode = static_cast<int>(g() % 3);
+            // A small key space so keys repeat across and within inputs.
+            std::vector<std::string> space;
+            for (int i = 0; i < 12; ++i) space.push_back(random_key(g, mode));
+            std::vector<VRun> runs(k);
+            std::vector<VRow> all;
+            uint64_t lsn = 1000;
+            const int n = static_cast<int>(g() % 600);
+            for (int i = 0; i < n; ++i) {
+                VRow r{space[g() % space.size()], static_cast<int64_t>(g() % 3), lsn += 1 + g() % 5};
+                runs[g() % k].rows.push_back(r);
+                all.push_back(r);
+            }
+            for (auto& run : runs) {
+                std::sort(run.rows.begin(), run.rows.end(), [](const VRow& a, const VRow& b) {
+                    return a.key != b.key ? a.key < b.key : newer(a, b);
+                });
+                for (auto& r : run.rows) run.kr.keys.push_back(r.key);
+                // finish() re-sorts keys with std::sort; keys are already in
+                // order, and equal keys are interchangeable bytes.
+                run.kr.finish();
+            }
+            VCtx ctx{&runs, false};
+            const KMergeVersionOrder v{vcmp, &ctx};
+            for (uint32_t s = 0; s < k; ++s) ASSERT_TRUE(kmerge_bytes_check_sorted(runs[s].kr.col, v, s));
+            std::sort(all.begin(), all.end(), [](const VRow& a, const VRow& b) {
+                return a.key != b.key ? a.key < b.key : newer(a, b);
+            });
+            const int64_t cap = 1 + static_cast<int64_t>(g() % 17);
+            uint64_t ties = 0;
+            const auto got = run_merge(runs, v, cap, &ties);
+            ASSERT_EQ(got.size(), all.size());
+            EXPECT_EQ(ties, 0u);
+            for (size_t i = 0; i < got.size(); ++i) {
+                const VRow& r = runs[got[i].first].rows[static_cast<size_t>(got[i].second)];
+                ASSERT_EQ(r.key, all[i].key) << "seed " << seed << " at " << i;
+                ASSERT_EQ(r.lsn, all[i].lsn) << "seed " << seed << " at " << i;
+            }
+            // Slot order (no comparator) picks a different winner somewhere.
+            const auto slot = run_merge(runs, KMergeVersionOrder{nullptr, nullptr}, cap, nullptr);
+            for (size_t i = 0; i < slot.size(); ++i) {
+                const VRow& r = runs[slot[i].first].rows[static_cast<size_t>(slot[i].second)];
+                if (r.lsn != all[i].lsn) { ++slot_order_wrong; break; }
+            }
+            // Injection: the comparator reversed (oldest first) must be caught
+            // by the newest-wins check whenever some key has two versions.
+            // (Needs a key whose versions sit in two inputs: within a run the
+            // order is the run's own, newest first.)
+            bool dup = false;
+            for (size_t i = 0; i < got.size() && !dup; ++i)
+                for (size_t j = i + 1; j < got.size() && !dup; ++j) {
+                    const VRow& a = runs[got[i].first].rows[static_cast<size_t>(got[i].second)];
+                    const VRow& b = runs[got[j].first].rows[static_cast<size_t>(got[j].second)];
+                    if (a.key != b.key) break;
+                    dup = got[i].first != got[j].first;
+                }
+            if (dup) {
+                VCtx rev{&runs, true};
+                const auto bad = run_merge(runs, KMergeVersionOrder{vcmp, &rev}, cap, nullptr);
+                bool caught = false;
+                for (size_t i = 0; i < bad.size() && !caught; ++i) {
+                    const VRow& r = runs[bad[i].first].rows[static_cast<size_t>(bad[i].second)];
+                    const bool first_of_key = i == 0 || all[i - 1].key != all[i].key;
+                    caught = first_of_key && r.lsn != all[i].lsn;
+                }
+                ASSERT_TRUE(caught) << "seed " << seed << " trial " << t;
+            }
+        }
+    }
+    EXPECT_GE(trials, 20 * 12);
+    EXPECT_GT(slot_order_wrong, trials / 2);
+}
+
+TEST(KMergeBytes, CheckSortedRefusesOldestFirstRunsAndCountsTies) {
+    std::vector<VRun> runs(2);
+    for (uint64_t l : {5ull, 9ull}) runs[0].rows.push_back(VRow{"k", 0, l});   // oldest first
+    for (auto& r : runs[0].rows) runs[0].kr.keys.push_back(r.key);
+    runs[0].kr.finish();
+    VCtx ctx{&runs, false};
+    const KMergeVersionOrder v{vcmp, &ctx};
+    EXPECT_FALSE(kmerge_bytes_check_sorted(runs[0].kr.col, v, 0));
+    EXPECT_TRUE(kmerge_bytes_check_sorted(runs[0].kr.col));   // keys alone are sorted
+    // The same (key, version) in two inputs is a committer bug: counted.
+    runs[0].rows = {VRow{"k", 0, 9}};
+    runs[1].rows = {VRow{"k", 0, 9}};
+    for (auto& run : runs) {
+        run.kr.keys.assign(1, "k");
+        run.kr.finish();
+    }
+    uint64_t ties = 0;
+    const auto out = run_merge(runs, v, 4, &ties);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].first, 0u);   // equal versions fall back to slot order
+    EXPECT_GT(ties, 0u);
+}
+
+TEST(KMergeBytes, IntegerColumnsAreNotKeyBytes) {
+    Arena arena;
+    KeyBytesColumn k;
+    BoltColumn i64 = BoltColumn::make_flat_alloc(4, BoltType::Int64, &arena);
+    EXPECT_FALSE(key_bytes_from_column(i64, &k));   // LE bytes do not sort as values
+    BoltColumn d = BoltColumn::make_flat_alloc(4, BoltType::Decimal128, &arena);
+    EXPECT_FALSE(key_bytes_from_column(d, &k));
 }
