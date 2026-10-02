@@ -147,6 +147,12 @@ enum class ColumnFormat : uint8_t {
                       // per block [LANES bases][LANES * W packed words];
                       // `seq_step` = W, `seq_offset` = delta reference.
 };
+// The format byte is persisted (MSEG PageEntry.format, wire descriptors):
+// the FastLanes ids are part of the bytes.
+static_assert(static_cast<uint8_t>(ColumnFormat::BitPacked) == 6 &&
+              static_cast<uint8_t>(ColumnFormat::FrameOfRef) == 7 &&
+              static_cast<uint8_t>(ColumnFormat::DeltaFOR) == 10,
+              "FastLanes ColumnFormat ids are persisted");
 
 // ---------------------------------------------------------------------------
 // ColumnFormat::Nested
