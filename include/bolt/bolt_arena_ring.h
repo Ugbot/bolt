@@ -46,7 +46,9 @@ namespace bolt {
 // Union: see TypedBatchPoolSlot — Arena is constructed only by `acquire`.
 struct alignas(64) ArenaRingSlot {
     union { Arena arena; };
-    uint32_t next_free_idx;   // UINT32_MAX = end-of-stack
+    // Atomic: a pop that lost the CAS race reads it while its new holder
+    // clears it; the generation tag discards that read.
+    std::atomic<uint32_t> next_free_idx;   // UINT32_MAX = end-of-stack
     uint8_t  initialized;
     uint8_t  _pad[3];
 
@@ -87,7 +89,7 @@ struct alignas(64) ArenaRing {
         slots_used.store(0u, std::memory_order_relaxed);
         for (uint32_t i = 0; i < Capacity; ++i) {
             slots[i].initialized   = 0u;
-            slots[i].next_free_idx = kArenaRingEmptyIdx;
+            slots[i].next_free_idx.store(kArenaRingEmptyIdx, std::memory_order_relaxed);
         }
     }
 
@@ -96,7 +98,7 @@ struct alignas(64) ArenaRing {
         for (;;) {
             const uint32_t idx = arena_ring_head_idx(head);
             if (idx == kArenaRingEmptyIdx) return kArenaRingEmptyIdx;
-            const uint32_t next = slots[idx].next_free_idx;
+            const uint32_t next = slots[idx].next_free_idx.load(std::memory_order_relaxed);
             const uint32_t gen  = static_cast<uint32_t>(head >> 32);
             const uint64_t new_head = arena_ring_pack(next, gen + 1u);
             if (free_head.compare_exchange_weak(
@@ -113,7 +115,7 @@ struct alignas(64) ArenaRing {
         uint64_t head = free_head.load(std::memory_order_acquire);
         for (;;) {
             const uint32_t cur = arena_ring_head_idx(head);
-            slots[idx].next_free_idx = cur;
+            slots[idx].next_free_idx.store(cur, std::memory_order_relaxed);
             const uint32_t gen = static_cast<uint32_t>(head >> 32);
             const uint64_t new_head = arena_ring_pack(idx, gen + 1u);
             if (free_head.compare_exchange_weak(
@@ -144,7 +146,7 @@ struct alignas(64) ArenaRing {
             new (&s->arena) Arena(arena_cfg);
             s->initialized = 1u;
         }
-        s->next_free_idx = kArenaRingEmptyIdx;
+        s->next_free_idx.store(kArenaRingEmptyIdx, std::memory_order_relaxed);
         return &s->arena;
     }
 

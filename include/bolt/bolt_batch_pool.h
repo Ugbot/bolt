@@ -56,7 +56,9 @@ namespace bolt {
 struct alignas(64) TypedBatchPoolSlot {
     union { Arena arena; };
     BoltBatch batch;
-    uint32_t  next_free_idx;     // valid when slot is on the freelist
+    // Atomic: a pop that lost the CAS race reads it while its new holder
+    // clears it; the generation tag discards that read.
+    std::atomic<uint32_t> next_free_idx;   // valid when slot is on the freelist
     uint8_t   initialized;       // 0 until first acquire
     uint8_t   _pad[3];
 
@@ -103,7 +105,7 @@ struct alignas(64) TypedBatchPool {
         slots_used.store(0u, std::memory_order_relaxed);
         for (uint32_t i = 0; i < Capacity; ++i) {
             slots[i].initialized   = 0u;
-            slots[i].next_free_idx = kTypedBatchPoolEmpty;
+            slots[i].next_free_idx.store(kTypedBatchPoolEmpty, std::memory_order_relaxed);
         }
     }
 
@@ -113,7 +115,7 @@ struct alignas(64) TypedBatchPool {
         for (;;) {
             const uint32_t idx = typed_batch_pool_head_idx(head);
             if (idx == kTypedBatchPoolEmpty) return kTypedBatchPoolEmpty;
-            const uint32_t next = slots[idx].next_free_idx;
+            const uint32_t next = slots[idx].next_free_idx.load(std::memory_order_relaxed);
             const uint32_t gen  = static_cast<uint32_t>(head >> 32);
             const uint64_t new_head = typed_batch_pool_pack(next, gen + 1u);
             if (free_head.compare_exchange_weak(
@@ -131,7 +133,7 @@ struct alignas(64) TypedBatchPool {
         uint64_t head = free_head.load(std::memory_order_acquire);
         for (;;) {
             const uint32_t cur = typed_batch_pool_head_idx(head);
-            slots[idx].next_free_idx = cur;
+            slots[idx].next_free_idx.store(cur, std::memory_order_relaxed);
             const uint32_t gen = static_cast<uint32_t>(head >> 32);
             const uint64_t new_head = typed_batch_pool_pack(idx, gen + 1u);
             if (free_head.compare_exchange_weak(
@@ -181,7 +183,7 @@ struct alignas(64) TypedBatchPool {
         }
         BoltBatch::init_empty(&s->batch);
         s->batch.arena = &s->arena;
-        s->next_free_idx = kTypedBatchPoolEmpty;
+        s->next_free_idx.store(kTypedBatchPoolEmpty, std::memory_order_relaxed);
         return s;
     }
 
