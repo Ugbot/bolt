@@ -204,7 +204,8 @@ struct BoltColumn {
     // --- Data pointers (interpretation depends on format) ---
     void*     data;             // Raw typed data / keys / inline constant
     uint8_t*  validity;         // Null bitmap (Arrow format: 1=valid)
-    int64_t   validity_offset;  // Bit offset for views
+    int64_t   validity_offset;  // Bit offset for views; for BitPacked / FrameOfRef /
+                                // DeltaFOR also the first packed-stream row
     int64_t   length;           // Row count
 
     // --- Format + type ---
@@ -892,6 +893,24 @@ struct BoltColumn {
         utf8_at(row, out_data, out_len);
     }
 
+    static bool is_fastlanes_format(ColumnFormat f) noexcept {
+        return f == ColumnFormat::BitPacked || f == ColumnFormat::FrameOfRef ||
+               f == ColumnFormat::DeltaFOR;
+    }
+
+    /// Row i of a BitPacked / FrameOfRef / DeltaFOR column (or a view of
+    /// one), decoded on access. V is the logical integer of the type's width.
+    template <class V> V fastlanes_value(int64_t i) const noexcept {
+        static_assert(std::is_integral_v<V>, "FastLanes values are integers");
+        assert(is_fastlanes_format(format) && sizeof(V) == type_size_bytes);
+        assert(i >= 0 && i < length);
+        const int64_t row = validity_offset + i;
+        const uint32_t w = static_cast<uint32_t>(seq_step);
+        if (format == ColumnFormat::DeltaFOR)
+            return fastlanes::delta_for_value<V>(data, row, seq_offset, w);
+        return fastlanes::for_value<V>(data, row, seq_offset, w);
+    }
+
     /// True for the integer-shaped types the FastLanes formats carry: the
     /// value is a T-bit integer, T = 8 / 16 / 32 / 64.
     static bool fastlanes_type(BoltType t) noexcept {
@@ -976,6 +995,18 @@ struct BoltColumn {
             c.format = ColumnFormat::Sequence;
             c.seq_offset = parent.seq_offset + offset * parent.seq_step;
             c.seq_step = parent.seq_step;
+        } else if (is_fastlanes_format(parent.format)) {
+            // Zero-copy: same blocks, the row origin moves (a FOR-aware
+            // consumer reads the packed words; others decode on access).
+            c.format = parent.format;
+            c.data = parent.data;
+            c.validity = parent.validity;
+            c.validity_offset = parent.validity_offset + offset;
+            c.seq_offset = parent.seq_offset;
+            c.seq_step = parent.seq_step;
+            c.decimal_scale = parent.decimal_scale;
+            c.logical = parent.logical;
+            c.arena = parent.arena;
         }
 
         // Inherit stats (conservative — min/max still valid for subsets)
@@ -1037,11 +1068,11 @@ struct BoltColumn {
             }
             case ColumnFormat::BitPacked:
             case ColumnFormat::FrameOfRef:
-                return fastlanes::packed_bytes(8u * type_size_bytes, length,
-                                               static_cast<uint32_t>(seq_step));
+                return fastlanes::packed_span_bytes(8u * type_size_bytes, validity_offset,
+                                                    length, static_cast<uint32_t>(seq_step));
             case ColumnFormat::DeltaFOR:
-                return fastlanes::delta_bytes(8u * type_size_bytes, length,
-                                              static_cast<uint32_t>(seq_step));
+                return fastlanes::delta_span_bytes(8u * type_size_bytes, validity_offset,
+                                                   length, static_cast<uint32_t>(seq_step));
             case ColumnFormat::RLE:
                 return 0;  // existing TODO; sized by their own buffers
         }
@@ -1953,10 +1984,13 @@ inline void fastlanes_decode(const BoltColumn& c, void* out) noexcept {
     assert(out != nullptr || c.length == 0);
     assert(c.seq_step >= 0 && c.seq_step <= static_cast<int64_t>(8 * sizeof(U)));
     const uint32_t w = static_cast<uint32_t>(c.seq_step);
+    assert(c.validity_offset >= 0);
     if (c.format == ColumnFormat::DeltaFOR)
-        fastlanes::decode_delta_for<U>(c.data, c.length, c.seq_offset, w, static_cast<U*>(out));
+        fastlanes::decode_delta_for_range<U>(c.data, c.validity_offset, c.length, c.seq_offset, w,
+                                             static_cast<U*>(out));
     else
-        fastlanes::decode_for<U>(c.data, c.length, c.seq_offset, w, static_cast<U*>(out));
+        fastlanes::decode_for_range<U>(c.data, c.validity_offset, c.length, c.seq_offset, w,
+                                       static_cast<U*>(out));
 }
 }  // namespace detail
 
