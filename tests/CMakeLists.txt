@@ -719,6 +719,17 @@ target_link_libraries(test_bolt_kmerge_bytes
 bolt_apply_hardening(test_bolt_kmerge_bytes)
 add_test(NAME test_bolt_kmerge_bytes COMMAND test_bolt_kmerge_bytes)
 
+# MSEG §6.5 (G2CHK-482): canonical key_encode bytes for every key kind.
+add_executable(test_bolt_key_encode test_bolt_key_encode.cpp)
+target_link_libraries(test_bolt_key_encode
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_key_encode)
+add_test(NAME test_bolt_key_encode COMMAND test_bolt_key_encode)
+
 add_executable(test_bolt_kernels test_bolt_kernels.cpp)
 
 target_link_libraries(test_bolt_kernels

@@ -1,10 +1,10 @@
 // bolt_kmerge_bytes.h — k-way merge of sorted runs of variable-length,
 // order-preserving byte keys (MSEG B10).
 //
-// MarbleDB stores every primary key as canonical key_encode() bytes: fixed
-// cells big-endian with the sign bit flipped, then an optional var-length
-// final cell, so a composite key of any kinds orders correctly under
-// memcmp. A multi-column merge is therefore a merge over these bytes; the
+// MarbleDB stores every primary key as canonical key_encode() bytes
+// (bolt_key_encode.h: fixed cells big-endian with the sign bit flipped, text
+// cells 0x00-escaped and terminated), so a composite key of any kinds orders
+// correctly under memcmp. A multi-column merge is therefore a merge over these bytes; the
 // i64/u64 kmerge (bolt_kmerge.h) covers single integer keys only.
 //
 // Order: bytes ascending under memcmp, a proper prefix before any longer key
