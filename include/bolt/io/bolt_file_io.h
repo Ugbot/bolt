@@ -111,6 +111,9 @@ enum class Advice : uint8_t { kNormal = 0, kSequential, kRandom, kWillNeed, kDon
 FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept;
 /// Idempotent.
 void mapped_file_close(MappedFile* m) noexcept;
+/// Close the file (and Windows mapping) handle; the view stays valid until
+/// mapped_file_close. A mapped reader then holds no descriptor. Idempotent.
+void mapped_file_release_handle(MappedFile* m) noexcept;
 
 /// A view of [off, off + len) and its page-aligned extent. kBadArg past the
 /// end of the file; len is clamped at it.

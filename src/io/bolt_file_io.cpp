@@ -305,6 +305,15 @@ FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept {
     return FileIoStatus::kOk;
 }
 
+void mapped_file_release_handle(MappedFile* m) noexcept {
+    assert(m != nullptr);
+    if (m->mapping != kClosedHandle) close_handle(m->mapping);
+    if (m->handle != kClosedHandle) close_handle(m->handle);
+    m->mapping = kClosedHandle;
+    m->handle = kClosedHandle;
+    assert(m->handle == kClosedHandle);
+}
+
 void mapped_file_close(MappedFile* m) noexcept {
     assert(m != nullptr);
     if (m->base != nullptr) UnmapViewOfFile(m->base);
@@ -354,6 +363,13 @@ FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept {
     m->base = static_cast<const uint8_t*>(p);
     assert((reinterpret_cast<uintptr_t>(m->base) & (m->page - 1)) == 0);
     return FileIoStatus::kOk;
+}
+
+void mapped_file_release_handle(MappedFile* m) noexcept {
+    assert(m != nullptr);
+    if (m->handle != kClosedHandle) close_handle(m->handle);
+    m->handle = kClosedHandle;
+    assert(m->handle == kClosedHandle);
 }
 
 void mapped_file_close(MappedFile* m) noexcept {
