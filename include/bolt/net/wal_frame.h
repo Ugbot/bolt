@@ -15,7 +15,7 @@
 //   0   frame_len:u32   total bytes (header + payload), incl. this field
 //   4   checksum:u64    FNV-1a-64 over buf[12 .. frame_len)
 //   12  lsn:u64         PRIMARY WAL lsn (honored on apply → idempotent replay)
-//   20  table_id:u32    marbledb tid (1..0xFFFF)
+//   20  table_id:u32    marbledb tid (u32; 0 = invalid)
 //   24  schema_fp:u64   schema fingerprint
 //   32  trace_id:u64    G2CHK-90: gateway request correlation id; 0 = none.
 //                       Opaque to marbledb/apply — carried purely so a
@@ -147,7 +147,7 @@ inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noex
     if (frame_len != kFrameHeaderBytes + payload_len) return false;
     if (frame_len > len)                              return false;
     if (payload_len > kRecvMaxPayloadBytes)           return false;
-    if (table_id == 0u || table_id > 0xFFFFu)         return false;
+    if (table_id == 0u)                               return false;
     if (frame_checksum(buf + kChecksumCoverStart, frame_len - kChecksumCoverStart)
             != checksum)                              return false;
 
