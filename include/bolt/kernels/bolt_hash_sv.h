@@ -5,7 +5,9 @@
 // filters, depend on it). An inline row (<= 12 bytes) is read from the view
 // as one 8-byte word plus a masked tail, with no byte loop and no pointer
 // chase; the length seed is recomputed only when the length changes. A
-// spilled row goes through hash_bytes.
+// spilled row goes through hash_bytes, at overflow + ref.offset: one
+// overflow buffer for the whole column (ref.buf_idx is not consulted), the
+// layout marbledb's sv_bytes assumes too.
 
 #pragma once
 
