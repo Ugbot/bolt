@@ -10,5 +10,8 @@ namespace bolt {
 inline constexpr uint32_t kKeyEncodeMaxBytes = 1u << 20;
 // Cells (pk columns) in one key.
 inline constexpr uint32_t kKeyEncodeMaxCells = 64;
+// Overflow bytes of one key_encode_column call: StringView offsets are u32.
+inline constexpr uint64_t kKeyEncodeMaxOverflowBytes = UINT32_MAX;
+static_assert(kKeyEncodeMaxOverflowBytes <= UINT32_MAX);
 
 }  // namespace bolt

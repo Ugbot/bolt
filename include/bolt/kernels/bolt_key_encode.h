@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -36,11 +37,13 @@
 
 namespace bolt {
 
+static_assert(std::endian::native == std::endian::little, "key_encode stores little-endian cells");
+
 enum class KeyEncodeStatus : uint8_t {
     kOk = 0,
     kNull,          // a key cell is NULL
     kUnsupported,   // a type / format with no key encoding
-    kNoRoom,        // dst too small, or the key past kKeyEncodeMaxBytes
+    kNoRoom,        // dst too small, a key past kKeyEncodeMaxBytes, or overflow past its cap
     kNoMemory,
 };
 
@@ -242,9 +245,11 @@ inline KeyEncodeStatus key_encode_row(const BoltColumn* cols, const uint32_t* ke
 // owned. Two passes: lengths (into the views), then bytes.
 inline KeyEncodeStatus key_encode_column(const BoltColumn* cols, const uint32_t* key_cols,
                                          uint32_t n_key, int64_t rows, Arena* ar,
-                                         BoltColumn* out) noexcept {
+                                         BoltColumn* out,
+                                         uint64_t overflow_cap = kKeyEncodeMaxOverflowBytes) noexcept {
     assert(cols != nullptr && key_cols != nullptr && ar != nullptr && out != nullptr);
     assert(rows >= 0);
+    assert(overflow_cap <= kKeyEncodeMaxOverflowBytes);
     if (n_key == 0 || n_key > kKeyEncodeMaxCells) return KeyEncodeStatus::kUnsupported;
     auto* v = static_cast<StringView*>(ar->allocate_zeroed(static_cast<size_t>(rows) * sizeof(StringView) + 16, 16));
     if (v == nullptr) return KeyEncodeStatus::kNoMemory;
@@ -260,6 +265,7 @@ inline KeyEncodeStatus key_encode_column(const BoltColumn* cols, const uint32_t*
         if (n > kKeyEncodeMaxBytes) return KeyEncodeStatus::kNoRoom;
         v[r].length = static_cast<uint32_t>(n);
         over += n > 12u ? n : 0u;
+        if (over > overflow_cap) return KeyEncodeStatus::kNoRoom;
     }
     auto* ob = static_cast<uint8_t*>(ar->allocate(static_cast<size_t>(over) + 16, 16));
     if (ob == nullptr) return KeyEncodeStatus::kNoMemory;

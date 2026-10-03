@@ -189,4 +189,21 @@ TEST(KeyEncode, ColumnHelperMatchesRowsAndRefusesNull) {
     EXPECT_EQ(bolt::key_encode_column(&list, kc, 1, static_cast<int64_t>(n), &ar, &out), KeyEncodeStatus::kUnsupported);
 }
 
+TEST(KeyEncode, ColumnHelperRefusesOverflowPastItsCap) {
+    bolt::Arena ar;
+    const size_t n = 40;
+    std::vector<int64_t> a(n), b(n);
+    for (size_t r = 0; r < n; ++r) { a[r] = static_cast<int64_t>(r); b[r] = -static_cast<int64_t>(r); }
+    BoltColumn cols[2];
+    cols[0] = BoltColumn::make_flat(a.data(), nullptr, static_cast<int64_t>(n), BoltType::Int64);
+    cols[1] = BoltColumn::make_flat(b.data(), nullptr, static_cast<int64_t>(n), BoltType::Int64);
+    const uint32_t kc[2] = {0, 1};
+    BoltColumn out;
+    const uint64_t total = n * 16;   // 16-byte keys all spill to overflow
+    static_assert(bolt::kKeyEncodeMaxOverflowBytes <= UINT32_MAX);
+    EXPECT_EQ(bolt::key_encode_column(cols, kc, 2, static_cast<int64_t>(n), &ar, &out, total), KeyEncodeStatus::kOk);
+    EXPECT_EQ(bolt::key_encode_column(cols, kc, 2, static_cast<int64_t>(n), &ar, &out, total - 1), KeyEncodeStatus::kNoRoom);
+    EXPECT_EQ(bolt::key_encode_column(cols, kc, 1, static_cast<int64_t>(n), &ar, &out, 0), KeyEncodeStatus::kOk);
+}
+
 }  // namespace
