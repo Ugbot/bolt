@@ -2445,3 +2445,14 @@ add_executable(fuzz_workers_kind_b fuzz_workers_kind_b.cpp)
 target_link_libraries(fuzz_workers_kind_b PRIVATE bolt::bolt)
 bolt_apply_hardening(fuzz_workers_kind_b)
 add_test(NAME fuzz_workers_kind_b COMMAND fuzz_workers_kind_b --count 500)
+
+# G2CHK-485 — replication frames carry u32 marbledb table ids.
+add_executable(test_bolt_wal_frame_tid test_bolt_wal_frame_tid.cpp)
+target_link_libraries(test_bolt_wal_frame_tid
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_wal_frame_tid)
+add_test(NAME test_bolt_wal_frame_tid COMMAND test_bolt_wal_frame_tid)
