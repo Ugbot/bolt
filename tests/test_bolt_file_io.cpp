@@ -176,6 +176,27 @@ TEST(FileIo, MappedViewsArePageAligned) {
     std::remove(path.c_str());
 }
 
+// A mapping outlives its released handle: the view still reads the file
+// and closing it twice is safe.
+TEST(FileIo, MappingSurvivesReleasedHandle) {
+    const std::string path = tmp_path("release");
+    const size_t n = 3u << 20;
+    const std::vector<uint8_t> bytes = random_bytes(n, 11);
+    write_file(path, bytes);
+    MappedFile m{};
+    ASSERT_EQ(mapped_file_open(path.c_str(), &m), FileIoStatus::kOk);
+    ASSERT_NE(m.handle, -1);
+    mapped_file_release_handle(&m);
+    mapped_file_release_handle(&m);
+    EXPECT_EQ(m.handle, -1);
+    ASSERT_NE(m.base, nullptr);
+    EXPECT_EQ(std::memcmp(m.base, bytes.data(), n), 0);
+    EXPECT_EQ(mapped_advise(m, 0, n, Advice::kWillNeed), FileIoStatus::kOk);
+    mapped_file_close(&m);
+    EXPECT_EQ(m.base, nullptr);
+    std::remove(path.c_str());
+}
+
 #if !defined(_WIN32)
 TEST(FileIo, EvictDropsResidency) {
     const std::string path = tmp_path("evict");
