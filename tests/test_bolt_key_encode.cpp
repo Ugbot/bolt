@@ -206,4 +206,39 @@ TEST(KeyEncode, ColumnHelperRefusesOverflowPastItsCap) {
     EXPECT_EQ(bolt::key_encode_column(cols, kc, 1, static_cast<int64_t>(n), &ar, &out, 0), KeyEncodeStatus::kOk);
 }
 
+// A FixedSizeBinary width past its slot would read past the cell: refused.
+TEST(KeyEncode, FixedWidthPastSlotRefused) {
+    uint8_t slot[2][8] = {{1, 2, 3, 4, 5, 6, 7, 8}, {}};
+    BoltColumn c = BoltColumn::make_flat(slot, nullptr, 1, BoltType::FixedSizeBinary);
+    c.type_size_bytes = 8;
+    c.fixed_width = 8;
+    uint8_t buf[64];
+    uint32_t n = 0;
+    ASSERT_EQ(bolt::key_encode_cell(c, 0, buf, sizeof(buf), &n), KeyEncodeStatus::kOk);
+    EXPECT_EQ(n, 8u);
+    c.fixed_width = 9;
+    EXPECT_EQ(bolt::key_encode_cell(c, 0, buf, sizeof(buf), &n), KeyEncodeStatus::kUnsupported);
+    EXPECT_EQ(bolt::key_cell_len(c, 0), 0u);
+}
+
+// Null cells follow BoltColumn::is_null, validity_offset included, in
+// every format.
+TEST(KeyEncode, NullHonoursValidityOffsetForConstant) {
+    BoltColumn c = BoltColumn::make_flat(nullptr, nullptr, 4, BoltType::Int64);
+    c.format = bolt::ColumnFormat::Constant;
+    c.type_size_bytes = 8;
+    const int64_t v = 7;
+    std::memcpy(c.inline_value, &v, sizeof(v));
+    uint8_t valid[1] = {0x16};   // offset 1: rows 0,1,3 valid, row 2 null
+    c.validity = valid;
+    c.validity_offset = 1;
+    uint8_t buf[16];
+    uint32_t n = 0;
+    for (int64_t r = 0; r < 4; ++r)
+        EXPECT_EQ(bolt::key_encode_cell(c, r, buf, sizeof(buf), &n),
+                  c.is_null(r) ? KeyEncodeStatus::kNull : KeyEncodeStatus::kOk) << r;
+    EXPECT_TRUE(c.is_null(2));
+    EXPECT_FALSE(c.is_null(0));
+}
+
 }  // namespace

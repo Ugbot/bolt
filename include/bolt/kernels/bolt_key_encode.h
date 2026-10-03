@@ -149,9 +149,8 @@ inline bool key_cell_text(const BoltColumn& c, int64_t r, const uint8_t** p, uin
 
 BOLT_FORCE_INLINE bool key_cell_null(const BoltColumn& c, int64_t r) noexcept {
     assert(r >= 0 && r < c.length);
-    if (c.validity == nullptr) return false;
-    const int64_t b = r + (c.format == ColumnFormat::Flat ? c.validity_offset : 0);
-    return ((c.validity[b >> 3] >> (b & 7)) & 1u) == 0;
+    assert(c.validity_offset >= 0);
+    return c.is_null(r);
 }
 
 // Fixed cell value bytes (little-endian slot) of row r, and the slot width.
@@ -160,7 +159,7 @@ inline const uint8_t* key_cell_fixed(const BoltColumn& c, int64_t r, uint32_t* w
     assert(r >= 0 && r < c.length);
     const uint32_t slot = c.type_size_bytes ? c.type_size_bytes : static_cast<uint32_t>(type_size(c.type));
     *w = (c.type == BoltType::FixedSizeBinary && c.fixed_width) ? c.fixed_width : slot;
-    if (slot == 0 || slot > 32u) return nullptr;
+    if (slot == 0 || slot > 32u || *w > slot) return nullptr;
     if (c.format == ColumnFormat::Constant) return slot <= 16u ? c.inline_value : nullptr;
     if (c.format != ColumnFormat::Flat || c.data == nullptr) return nullptr;
     return static_cast<const uint8_t*>(c.data) + static_cast<size_t>(r) * slot;
