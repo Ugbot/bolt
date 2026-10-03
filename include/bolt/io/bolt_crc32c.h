@@ -276,6 +276,14 @@ inline uint32_t crc32c_extend_zeros(uint32_t crc, uint64_t n) noexcept {
 #if BOLT_CRC32C_HW_X86 || BOLT_CRC32C_HW_ARM
 
 namespace detail {
+BOLT_FORCE_INLINE uint32_t crc32c_raw_v64(uint32_t s, uint64_t v) noexcept {
+#if BOLT_CRC32C_HW_X86
+    return static_cast<uint32_t>(_mm_crc32_u64(s, v));
+#else
+    return __crc32cd(s, v);
+#endif
+}
+
 BOLT_FORCE_INLINE uint32_t crc32c_raw_u64(uint32_t s, const uint8_t* p) noexcept {
     uint64_t v;
     std::memcpy(&v, p, sizeof(v));
@@ -296,10 +304,18 @@ inline uint32_t crc32c_3way(const void* BOLT_RESTRICT data, size_t len,
     uint32_t s = ~seed;  // raw running state
     while (len >= 3 * L) {
         uint32_t a = s, b = 0, c = 0;
-        for (size_t i = 0; i < L; i += 8) {
-            a = detail::crc32c_raw_u64(a, p + i);
-            b = detail::crc32c_raw_u64(b, p + L + i);
-            c = detail::crc32c_raw_u64(c, p + 2 * L + i);
+        static_assert(L % 16 == 0, "lanes step 16 bytes");
+        for (size_t i = 0; i < L; i += 16) {          // bounded: L / 16; one 16 B load per lane
+            uint64_t x[2], y[2], z[2];
+            std::memcpy(x, p + i, 16);
+            std::memcpy(y, p + L + i, 16);
+            std::memcpy(z, p + 2 * L + i, 16);
+            a = detail::crc32c_raw_v64(a, x[0]);
+            b = detail::crc32c_raw_v64(b, y[0]);
+            c = detail::crc32c_raw_v64(c, z[0]);
+            a = detail::crc32c_raw_v64(a, x[1]);
+            b = detail::crc32c_raw_v64(b, y[1]);
+            c = detail::crc32c_raw_v64(c, z[1]);
         }
         s = detail::crc32c_lane_shift(detail::crc32c_lane_shift(a) ^ b) ^ c;
         p += 3 * L;

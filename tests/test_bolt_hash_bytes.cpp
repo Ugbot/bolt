@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "bolt/bolt_hash.h"
+#include "bolt/kernels/bolt_hash_sv.h"
 
 using bolt::hash_bytes;
 
@@ -121,4 +122,35 @@ TEST(BoltHashBytes, ComposesWithSwissMix) {
     EXPECT_NE(bolt::swiss_mix(hx), bolt::swiss_mix(hy));
     // Idempotent across repeated mixing calls.
     EXPECT_EQ(bolt::swiss_mix(hx), bolt::swiss_mix(hx));
+}
+
+// hash_bytes_sv is hash_bytes over each view's bytes, bit for bit: every
+// length 0..40, garbage past the length in the inline bytes, lengths that
+// change row to row (the seed cache), spilled rows, both entry points.
+TEST(BoltHashBytes, StringViewRowsMatchHashBytes) {
+    uint64_t x = 0x243F6A8885A308D3ULL;
+    auto next = [&x] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    std::vector<uint8_t> over(1 << 16);
+    for (auto& b : over) b = static_cast<uint8_t>(next());
+    std::vector<bolt::StringView> rows;
+    std::vector<std::string> bytes;
+    for (int i = 0; i < 4000; ++i) {
+        const uint32_t len = i < 41 * 4 ? static_cast<uint32_t>(i / 4) : static_cast<uint32_t>(next() % 41);
+        bolt::StringView v;
+        std::memset(&v, 0xA5 ^ i, sizeof(v));   // junk past the length must not count
+        v.length = len;
+        const size_t off = static_cast<size_t>(next() % (over.size() - 64));
+        std::string s(reinterpret_cast<const char*>(over.data() + off), len);
+        if (len <= 12) std::memcpy(v.prefix, s.data(), len);
+        else { std::memcpy(v.prefix, s.data(), 4); v.ref.buf_idx = 0; v.ref.offset = static_cast<uint32_t>(off); }
+        rows.push_back(v);
+        bytes.push_back(s);
+    }
+    std::vector<uint64_t> out(rows.size());
+    bolt::hash_bytes_sv(rows.data(), rows.size(), over.data(), out.data());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const uint64_t want = hash_bytes(bytes[i].data(), bytes[i].size());
+        ASSERT_EQ(out[i], want) << "row " << i << " len " << bytes[i].size();
+        ASSERT_EQ(bolt::hash_bytes_sv(rows[i], over.data()), want) << "row " << i;
+    }
 }
