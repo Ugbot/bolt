@@ -48,6 +48,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -71,6 +72,11 @@ struct alignas(64) Disruptor {
     Sequence* consumer_cursors[kDisruptorMaxConsumers];
     uint32_t  num_consumers;
     uint32_t  _pad_consumers;
+    // How long a producer spins on an unpublished predecessor before it
+    // parks (G2CHK-656). Longer: lower commit latency when predecessors
+    // are mid-copy, more CPU burnt when they are off CPU. INT64_MAX spins
+    // forever (the pre-G2CHK-656 behaviour).
+    int64_t   publish_spin_ns;
     // The ring. Cache-line-padded between cursor/published and slots
     // so producer/consumer cursor traffic doesn't trash slot lines.
     alignas(64) T slots[Capacity];
@@ -82,6 +88,7 @@ struct alignas(64) Disruptor {
         cursor.store_relaxed(0);
         published.store_relaxed(0);
         num_consumers = 0;
+        publish_spin_ns = kPublishSpinNsDefault;
         for (uint32_t i = 0; i < kDisruptorMaxConsumers; ++i) {
             consumer_cursors[i] = nullptr;
         }
@@ -141,14 +148,13 @@ struct alignas(64) Disruptor {
 
     // Publish a single slot — this is the MP-safe commit step. We can
     // only advance `published` past `seq` when all predecessors are
-    // also published. Producer spin-waits for predecessors under
-    // contention; this is PostgreSQL's insert-LSN discipline.
+    // also published (PostgreSQL's insert-LSN discipline). A sole
+    // producer never waits. Otherwise it spins briefly, yields, then
+    // parks on `published` (every publish notifies), so a predecessor
+    // that is off CPU costs the waiters no CPU (G2CHK-656).
     BOLT_FORCE_INLINE void publish(uint64_t seq) noexcept {
-        // Wait for predecessor to publish first.
-        while (published.load_acquire() < seq) {
-            BOLT_PAUSE();
-        }
-        // We are the next in line; advance.
+        if (published.load_acquire() < seq) wait_published(seq);
+        assert(published.load_acquire() == seq);
         published.store_release(seq + 1);
         published.notify_all();
     }
@@ -156,11 +162,40 @@ struct alignas(64) Disruptor {
     // Batch-publish a claimed range [lo, hi] (inclusive).
     BOLT_FORCE_INLINE void publish_range(uint64_t lo, uint64_t hi) noexcept {
         assert(hi >= lo);
-        while (published.load_acquire() < lo) {
-            BOLT_PAUSE();
-        }
+        if (published.load_acquire() < lo) wait_published(lo);
+        assert(published.load_acquire() == lo);
         published.store_release(hi + 1);
         published.notify_all();
+    }
+
+    // A producer waiting on its predecessor spins for up to publish_spin_ns,
+    // then parks. A predecessor that is mid-copy publishes within the spin
+    // (no wake latency, and no yield: on a loaded box a yield can give the
+    // core away for a whole quantum); one that is off CPU costs the waiters
+    // no CPU past it.
+    static constexpr uint32_t kPublishPauses = 128;
+    static constexpr int64_t  kPublishSpinNsDefault = 50000;
+
+    // Wait until published >= seq. Off the sole-producer path.
+    BOLT_NOINLINE void wait_published(uint64_t seq) noexcept {
+        for (uint32_t i = 0; i < kPublishPauses; ++i) {
+            if (published.load_acquire() >= seq) return;
+            BOLT_PAUSE();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto spin = std::chrono::nanoseconds(publish_spin_ns);
+        // Bounded by publish_spin_ns (or by the predecessors at INT64_MAX).
+        while (std::chrono::steady_clock::now() - t0 < spin) {
+            for (uint32_t i = 0; i < kPublishPauses; ++i) {
+                if (published.load_acquire() >= seq) return;
+                BOLT_PAUSE();
+            }
+        }
+        // Bounded by the predecessors: each publish advances `published`
+        // and wakes us.
+        for (uint64_t p = published.load_acquire(); p < seq; p = published.load_acquire()) {
+            published.wait(p);
+        }
     }
 
     // Consumer: wait until published >= min_seq. Returns the max

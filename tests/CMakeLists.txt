@@ -2467,3 +2467,11 @@ target_link_libraries(test_bolt_wal_frame_tid
 )
 bolt_apply_hardening(test_bolt_wal_frame_tid)
 add_test(NAME test_bolt_wal_frame_tid COMMAND test_bolt_wal_frame_tid)
+
+# G2CHK-656: Disruptor publish stays in sequence order when waiting producers
+# park on an off-CPU predecessor.
+add_executable(test_bolt_disruptor test_bolt_disruptor.cpp)
+target_link_libraries(test_bolt_disruptor
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_disruptor)
+add_test(NAME test_bolt_disruptor COMMAND test_bolt_disruptor)
