@@ -28,8 +28,10 @@ using Ring = bolt::Disruptor<Item, 1024>;
 
 uint64_t mix(uint64_t s) { return s * 0x9E3779B97F4A7C15ull + 7u; }
 
-void run(Ring* d, int producers, uint64_t per, uint32_t sleep_every) {
+void run(Ring* d, int producers, uint64_t per, uint32_t sleep_every,
+         int64_t spin_ns = Ring::kPublishSpinNsDefault) {
     d->init();
+    d->publish_spin_ns = spin_ns;
     bolt::Sequence consumed;
     const uint32_t cid = d->register_consumer(&consumed);
     ASSERT_EQ(cid, 0u);
@@ -82,6 +84,12 @@ TEST(BoltDisruptor, ManyProducersSpinPath) {
 TEST(BoltDisruptor, ManyProducersParkOnSleepingPredecessor) {
     auto* d = new Ring;
     run(d, 8, 2000, 64);
+    delete d;
+}
+
+TEST(BoltDisruptor, ZeroSpinParksAndStaysInOrder) {
+    auto* d = new Ring;
+    run(d, 8, 5000, 0, 0);
     delete d;
 }
 
