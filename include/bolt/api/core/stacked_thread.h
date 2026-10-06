@@ -44,6 +44,14 @@
 #include <utility>
 
 #if defined(_WIN32)
+// This header can precede the network headers through worker_pool.h.
+// Keep windows.h from importing legacy winsock.h before Winsock2 arrives.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <process.h>  // _beginthreadex
 #include <windows.h>
 #else
