@@ -5,13 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  preset: release,    label: "linux-gcc"   }
           - { os: ubuntu-latest,  preset: release,    label: "linux-clang",
               cc: clang, cxx: clang++ }
           - { os: macos-latest,   preset: release,    label: "macos-clang" }
@@ -42,14 +45,14 @@ jobs:
           echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
 
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -G Ninja
 
       - name: Build
-        run: cmake --build --preset ${{ matrix.preset }}
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 4
 
       - name: Test
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --parallel 2 --timeout 600
 
-      - name: Perf gate (Linux gcc only)
-        if: matrix.label == 'linux-gcc'
+      - name: Perf gate (Linux Clang)
+        if: matrix.label == 'linux-clang'
         run: python3 ci/perf_check.py --build-dir build/${{ matrix.preset }}

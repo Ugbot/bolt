@@ -84,8 +84,9 @@ FileIoStatus file_pread_aligned(const ReadFile& f, uint64_t off, void* dst, uint
 FileIoStatus file_advise_willneed(const ReadFile& f, uint64_t off, uint64_t len) noexcept;
 
 /// Drop the file's pages from the OS page cache (benchmarks and cold-path
-/// tests): msync(MS_INVALIDATE) on a shared mapping (macOS), then
-/// POSIX_FADV_DONTNEED where it exists. kUnsupported on Windows.
+/// tests): msync(MS_SYNC | MS_INVALIDATE) on a shared mapping, then
+/// POSIX_FADV_DONTNEED where it exists.
+/// kUnsupported on Windows.
 FileIoStatus file_evict_cache(const char* path) noexcept;
 
 // --- mmap ------------------------------------------------------------------------

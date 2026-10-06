@@ -751,3 +751,123 @@ TEST(WireKinds, HostileBlobsAreRefusedNotRead) {
     std::memcpy(rle.data() + o2, &back, 4);
     EXPECT_FALSE(bolt_wire_deserialize(rle.data(), rle.size(), &d, &a));
 }
+
+TEST(WireKinds, HostileRowExpansionRefusedBeforeAllocation) {
+    Kit k;
+    build_all_kinds(&k);
+    BoltBatch src;
+    k.batch(&src);
+    Buf blob(bolt_wire_size(&src));
+    ASSERT_EQ(bolt_wire_serialize(&src, blob.p, blob.n), blob.n);
+    const int64_t hostile_rows = (int64_t(1) << 35) + 50;
+    std::memcpy(blob.p + 12, &hostile_rows, sizeof(hostile_rows));
+    uint64_t unlimited = UINT64_MAX;
+    EXPECT_FALSE(bolt::wire::detail::preflight_cols(blob.p, blob.n, 0, &unlimited));
+    Arena owning, viewing;
+    BoltBatch out;
+    EXPECT_FALSE(bolt_wire_deserialize(blob.p, blob.n, &out, &owning));
+    EXPECT_FALSE(bolt_wire_view(blob.p, blob.n, &out, &viewing));
+    EXPECT_EQ(owning.total_allocated(), 0u);
+    EXPECT_EQ(viewing.total_allocated(), 0u);
+}
+
+TEST(WireKinds, NullExpansionBudgetAggregatesBeforeAllocation) {
+    Kit k;
+    k.n = 8;
+    BoltColumn c = BoltColumn::make_constant<int32_t>(0, k.n, BoltType::Int32);
+    c.validity = k.bitmap(0);
+    c.stats.all_valid = false;
+    k.add("a", c);
+    k.add("b", c);
+    BoltBatch src;
+    k.batch(&src);
+    Buf blob(bolt_wire_size(&src));
+    ASSERT_EQ(bolt_wire_serialize(&src, blob.p, blob.n), blob.n);
+    uint64_t budget = 4; // two one-byte bitmaps plus one safety byte each
+    EXPECT_TRUE(bolt::wire::detail::preflight_cols(blob.p, blob.n, 0, &budget));
+    EXPECT_EQ(budget, 0u);
+    budget = 3;
+    EXPECT_FALSE(bolt::wire::detail::preflight_cols(blob.p, blob.n, 0, &budget));
+    // The same allowance is shared by nested children and sibling columns.
+    Kit nested;
+    nested.n = k.n;
+    BoltColumn children[] = {c, c};
+    nested.add("nested", BoltColumn::make_struct(children, 2, nested.n, nullptr, &nested.a));
+    nested.add("sibling", c);
+    BoltBatch nested_src;
+    nested.batch(&nested_src);
+    Buf nested_blob(bolt_wire_size(&nested_src));
+    ASSERT_EQ(bolt_wire_serialize(&nested_src, nested_blob.p, nested_blob.n), nested_blob.n);
+    budget = 6;
+    EXPECT_TRUE(bolt::wire::detail::preflight_cols(nested_blob.p, nested_blob.n, 0, &budget));
+    EXPECT_EQ(budget, 0u);
+    budget = 5;
+    EXPECT_FALSE(bolt::wire::detail::preflight_cols(nested_blob.p, nested_blob.n, 0, &budget));
+    const int64_t rows = static_cast<int64_t>(kWireMaxNullBitmapBytes) * 8;
+    std::memcpy(blob.p + 12, &rows, sizeof(rows));
+    Arena a;
+    BoltBatch out;
+    EXPECT_FALSE(bolt_wire_deserialize(blob.p, blob.n, &out, &a));
+    EXPECT_FALSE(bolt_wire_view(blob.p, blob.n, &out, &a));
+    EXPECT_EQ(a.total_allocated(), 0u);
+    // Compact non-null constants remain independent of row materialization.
+    const size_t desc = kWireHeaderSize + 2 * kWireSchemaEntrySize;
+    blob.p[desc + 49] = 0;
+    blob.p[desc + kWireDescSize + 49] = 0;
+    EXPECT_TRUE(bolt_wire_deserialize(blob.p, blob.n, &out, &a));
+    EXPECT_EQ(out.num_rows, rows);
+}
+
+TEST(WireKinds, VarBinaryOffsetsValidatedBeforeAllocation) {
+    Kit k;
+    k.n = 2;
+    int32_t offsets[] = {0, 1, 2};
+    uint8_t data[] = {'a', 'b'};
+    k.add("s", BoltColumn::make_var_binary(data, nullptr, offsets, k.n, BoltType::Utf8, &k.a));
+    BoltBatch src;
+    k.batch(&src);
+    Buf blob(bolt_wire_size(&src));
+    ASSERT_EQ(bolt_wire_serialize(&src, blob.p, blob.n), blob.n);
+    const size_t desc = kWireHeaderSize + kWireSchemaEntrySize;
+    const uint64_t short_length = sizeof(int32_t);
+    std::memcpy(blob.p + desc + 24, &short_length, sizeof(short_length));
+    Arena a;
+    BoltBatch out;
+    EXPECT_FALSE(bolt_wire_deserialize(blob.p, blob.n, &out, &a));
+    EXPECT_FALSE(bolt_wire_view(blob.p, blob.n, &out, &a));
+    EXPECT_EQ(a.total_allocated(), 0u);
+    ASSERT_EQ(bolt_wire_serialize(&src, blob.p, blob.n), blob.n);
+    uint64_t offset_location = 0;
+    std::memcpy(&offset_location, blob.p + desc + 16, sizeof(offset_location));
+    const int32_t bad_offset = -1;
+    std::memcpy(blob.p + offset_location + sizeof(int32_t), &bad_offset, sizeof(bad_offset));
+    EXPECT_FALSE(bolt_wire_deserialize(blob.p, blob.n, &out, &a));
+    EXPECT_FALSE(bolt_wire_view(blob.p, blob.n, &out, &a));
+    EXPECT_EQ(a.total_allocated(), 0u);
+}
+
+TEST(WireKinds, VarBinaryNonzeroOriginRoundTrips) {
+    Kit k;
+    k.n = 1;
+    int32_t offsets[] = {1, 2};
+    uint8_t data[] = {'x', 'a'};
+    k.add("s", BoltColumn::make_var_binary(data, nullptr, offsets, k.n, BoltType::Utf8, &k.a));
+    BoltBatch src;
+    k.batch(&src);
+    Buf blob(bolt_wire_size(&src));
+    ASSERT_EQ(bolt_wire_serialize(&src, blob.p, blob.n), blob.n);
+    Arena owning, viewing;
+    BoltBatch decoded, viewed;
+    ASSERT_TRUE(bolt_wire_deserialize(blob.p, blob.n, &decoded, &owning));
+    ASSERT_TRUE(bolt_wire_view(blob.p, blob.n, &viewed, &viewing));
+    for (const BoltBatch* batch : {&decoded, &viewed}) {
+        const uint8_t* value = nullptr;
+        int32_t size = 0;
+        batch->columns[0][0].var_binary_at(0, &value, &size);
+        ASSERT_EQ(size, 1);
+        ASSERT_NE(value, nullptr);
+        EXPECT_EQ(value[0], 'a');
+        ASSERT_NE(batch->columns[0][0].dict_child, nullptr);
+        EXPECT_EQ(static_cast<const int32_t*>(batch->columns[0][0].dict_child->data)[0], 1);
+    }
+}

@@ -39,9 +39,8 @@
 //     64 B aligned; rows <= kWireMaxRows; a Flat b1 is exactly rows x
 //     stride; RLE run ends strictly increase to rows; Dictionary codes are
 //     below the dictionary length; List/Map offsets are monotone; a long
-//     Constant string carries exactly its bytes. Flat StringView rows and
-//     VarBinary offsets are NOT walked (O(rows) on the hot read path): the
-//     frame CRC is what guards those bytes.
+//     Constant string carries exactly its bytes. VarBinary offsets are bounded and monotone before allocation. Flat
+//     StringView rows are NOT walked: the frame CRC guards those bytes.
 //   - Little-endian target only (x86 / ARM64). Flag bit 0 records this.
 //   - Deserialize copies each column buffer into the caller-provided Arena.
 //     Zero-copy-over-mmap is a future goal; the 64-byte alignment in the blob
@@ -1039,6 +1038,71 @@ inline bool read_header(const uint8_t* p, size_t len, uint32_t* version, int64_t
            <= len;
 }
 
+// Validate row-dependent storage before any ownership allocation. Compressed
+// columns can precede a malformed Flat column; building in descriptor order
+// would otherwise expand its null bitmap before noticing the impossible rows.
+inline bool row_storage_valid(const uint8_t* p, const WireDesc& d,
+                              const BoltField& f, int64_t rows) noexcept {
+    assert(p != nullptr);
+    assert(rows >= 0 && rows <= kWireMaxRows);
+    if (d.l[0] && d.l[0] < validity_bytes(rows)) return false;
+    if (d.fm == ColumnFormat::Flat) {
+        const size_t stride = is_vector(f.type) ? embedding_stride_for_type(f.type, f.fixed_size)
+            : (is_sv_string(f.type) ? sizeof(StringView) : type_size(f.type));
+        return stride != 0 && stride <= UINT16_MAX &&
+               d.l[1] == static_cast<uint64_t>(rows) * stride;
+    }
+    if (d.fm == ColumnFormat::VarBinary) {
+        if (d.l[1] != static_cast<uint64_t>(rows + 1) * sizeof(int32_t)) return false;
+        int32_t previous = 0;
+        for (int64_t r = 0; r <= rows; ++r) { // bounded by the validated offsets span
+            int32_t offset = 0;
+            memcpy(&offset, p + d.o[1] + static_cast<size_t>(r) * sizeof(offset), sizeof(offset));
+            if (offset < previous || static_cast<uint64_t>(offset) > d.l[2]) return false;
+            previous = offset;
+        }
+        return static_cast<uint64_t>(previous) == d.l[2];
+    }
+    if (d.fm == ColumnFormat::Dictionary)
+        return (d.p8 == 1 || d.p8 == 2 || d.p8 == 4) &&
+               d.l[1] == static_cast<uint64_t>(rows) * d.p8;
+    if (d.fm == ColumnFormat::Nested && f.type != BoltType::Struct)
+        return d.l[2] == static_cast<uint64_t>(rows + 1) * sizeof(int32_t);
+    return true;
+}
+
+inline bool preflight_cols(const uint8_t* p, size_t len, uint32_t depth,
+                           uint64_t* null_bytes_remaining) noexcept {
+    assert(null_bytes_remaining != nullptr);
+    assert(depth <= kWireMaxNestDepth + 1);
+    uint32_t version = 0, n = 0, data_off = 0;
+    int64_t rows = 0;
+    bool aligned = false;
+    if (depth > kWireMaxNestDepth ||
+        !read_header(p, len, &version, &rows, &n, &data_off, &aligned)) return false;
+    const size_t desc_off = kWireHeaderSize + static_cast<size_t>(n) * kWireSchemaEntrySize;
+    assert(desc_off <= len);
+    for (uint32_t i = 0; i < n; ++i) {
+        BoltField f;
+        ColumnFormat fm;
+        BoltLogical lg;
+        WireDesc d;
+        if (!read_entry(p + kWireHeaderSize + i * kWireSchemaEntrySize, version, &f, &fm, &lg) ||
+            !read_desc(p + desc_off + i * kWireDescSize, len, aligned, &d) || d.fm != fm ||
+            !row_storage_valid(p, d, f, rows)) return false;
+        if (fm == ColumnFormat::Constant && (d.flags & kDescFlagAllNull)) {
+            const uint64_t bytes = validity_bytes(rows) + 1;
+            if (bytes > *null_bytes_remaining) return false;
+            *null_bytes_remaining -= bytes;
+        }
+        if (fm == ColumnFormat::Nested || fm == ColumnFormat::Dictionary) {
+            const uint32_t child = fm == ColumnFormat::Nested ? 1 : 2;
+            if (!preflight_cols(p + d.o[child], d.l[child], depth + 1, null_bytes_remaining)) return false;
+        }
+    }
+    return true;
+}
+
 template <bool kView>
 inline bool parse_cols(const uint8_t* p, size_t len, BoltBatch* out, Arena* arena,
                        uint32_t depth) noexcept {
@@ -1047,8 +1111,10 @@ inline bool parse_cols(const uint8_t* p, size_t len, BoltBatch* out, Arena* aren
     uint32_t version = 0, n = 0, data_off = 0;
     int64_t rows = 0;
     bool aligned = false;
+    uint64_t null_bytes_remaining = kWireMaxNullBitmapBytes;
     if (depth > kWireMaxNestDepth ||
-        !read_header(p, len, &version, &rows, &n, &data_off, &aligned))
+        !read_header(p, len, &version, &rows, &n, &data_off, &aligned) ||
+        (depth == 0 && !preflight_cols(p, len, depth, &null_bytes_remaining)))
         return false;
     BoltBatch::init_empty(out);
     // G2FEAT-47: right-size the column arrays (sets num_cols + arena).

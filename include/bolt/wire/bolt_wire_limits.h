@@ -4,7 +4,8 @@
 // The RULE is in the bytes: every frame file records the units it was written
 // with, and a reader validates them and never assumes its own. The DEFAULTS
 // below are per-build constants: override with -DBOLT_WIRE_CHUNK_ALIGN=4096
-// etc. A file written by one build is readable by every build.
+// etc. Alignment choices do not prevent another build from reading the file;
+// the separate decoder expansion budget below can refuse oversized batches.
 //
 //   unit    default            valid range        applies to
 //   buf     64 B               [64 B, 4 KiB]      every buffer, prelude, frame start
@@ -37,6 +38,12 @@
 #endif
 #endif
 
+// Aggregate expansion budget per decode for compressed all-null Constants.
+// Exceeding it returns false before allocation; override at compile time.
+#ifndef BOLT_WIRE_MAX_NULL_BITMAP_BYTES
+#define BOLT_WIRE_MAX_NULL_BITMAP_BYTES (64ull * 1024ull * 1024ull)
+#endif
+
 namespace bolt {
 namespace wire {
 
@@ -66,6 +73,7 @@ inline constexpr uint32_t kWireMaxNestDepth = 16;
 // for any row count, so the header's i64 is not bounded by the blob length;
 // this cap keeps every rows x stride / validity product far from overflow.
 inline constexpr int64_t kWireMaxRows = int64_t(1) << 40;
+inline constexpr uint64_t kWireMaxNullBitmapBytes = BOLT_WIRE_MAX_NULL_BITMAP_BYTES;
 // Frames in one container (FrameIndexEntry count is a u32 on disk).
 inline constexpr uint32_t kFrameFileMaxFrames = 0xFFFFFFFFu;
 

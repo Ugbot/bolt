@@ -850,7 +850,9 @@ TEST(WireFrameFile, HostileOffsetsRefusedWithoutOverflow) {
     const uint32_t seed = v.seed;
     FrameFileFooter f = v.footer;
     const FrameFileFooter good = f;
-    for (uint64_t bad_off : {~0ull - 16383ull, ~0ull - 65535ull, uint64_t(1) << 63}) {
+    constexpr uint64_t bad_offsets[] = {
+        ~uint64_t{0} - 16383u, ~uint64_t{0} - 65535u, uint64_t{1} << 63};
+    for (uint64_t bad_off : bad_offsets) {
         f = good;
         f.index_off = bad_off;
         f.footer_crc32c = io::crc32c(&f, 60, seed);

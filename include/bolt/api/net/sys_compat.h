@@ -194,9 +194,9 @@ inline ssize_t send_bytes(SOCKET fd, const void* buf, size_t len) noexcept {
     return ::send(fd, static_cast<const char*>(buf), static_cast<int>(len), 0);
 }
 
-/// Put a socket into non-blocking mode (POSIX fcntl(O_NONBLOCK) equivalent).
-inline int set_nonblocking(SOCKET fd) noexcept {
-    u_long mode = 1;
+/// Select nonblocking mode; false restores blocking mode, preserving other flags.
+inline int set_nonblocking(SOCKET fd, bool enabled = true) noexcept {
+    u_long mode = enabled ? 1ul : 0ul;
     return ::ioctlsocket(fd, FIONBIO, &mode);
 }
 
@@ -236,10 +236,11 @@ inline ssize_t send_bytes(int fd, const void* buf, size_t len) noexcept {
     return ::write(fd, buf, len);
 }
 
-inline int set_nonblocking(int fd) noexcept {
-    int flags = ::fcntl(fd, F_GETFL, 0);
+inline int set_nonblocking(int fd, bool enabled = true) noexcept {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const int mode = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    return ::fcntl(fd, F_SETFL, mode);
 }
 
 }  // namespace sys
