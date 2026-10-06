@@ -150,6 +150,9 @@ Comparative analysis (validates the choices above):
 
 Synthesized into the design doc [`../BOLT_DATAFLOW.md`](../BOLT_DATAFLOW.md).
 
+- [Wire decoder bounds](wire-decoder-bounds.md): validate complete descriptor
+  trees before allocation and bound aggregate all-null bitmap expansion.
+
 ## How to add a new entry
 
 1. Create `docs/research/<topic-slug>.md`.
