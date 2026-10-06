@@ -45,13 +45,13 @@ jobs:
           echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
 
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: cmake --preset ${{ matrix.preset }} -G Ninja
 
       - name: Build
-        run: cmake --build --preset ${{ matrix.preset }}
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 4
 
       - name: Test
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --parallel 2 --timeout 600
 
       - name: Perf gate (Linux Clang)
         if: matrix.label == 'linux-clang'
