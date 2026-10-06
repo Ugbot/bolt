@@ -201,14 +201,21 @@ FileIoStatus file_evict_cache(const char* path) noexcept {
         if (p == MAP_FAILED) {
             s = FileIoStatus::kIoError;
         } else {
-            if (::msync(p, n, MS_INVALIDATE) != 0) s = FileIoStatus::kIoError;
-            ::munmap(p, n);
+            // DONTNEED cannot discard dirty pages. Wait for writeback before
+            // eviction; MS_INVALIDATE alone is asynchronous on Linux.
+            if (::msync(p, n, MS_SYNC | MS_INVALIDATE) != 0) s = FileIoStatus::kIoError;
+            if (::munmap(p, n) != 0) s = FileIoStatus::kIoError;
         }
 #if defined(POSIX_FADV_DONTNEED)
-        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        // A read-only mapping need not write back buffered file writes.
+        // Synchronize the file itself before asking Linux to evict its pages.
+        if (s == FileIoStatus::kOk && ::fsync(fd) != 0) s = FileIoStatus::kIoError;
+        if (s == FileIoStatus::kOk &&
+            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+            s = FileIoStatus::kIoError;
 #endif
     }
-    ::close(fd);
+    if (::close(fd) != 0) s = FileIoStatus::kIoError;
     return s;
 }
 
