@@ -449,11 +449,10 @@ BOLT_FORCE_INLINE int64_t csr_expand_graph(
     int64_t w = 0;                              // rows written this call
     while (cursor->src_index < n && w < out_cap) {
         const int64_t s = src_ids[cursor->src_index];
-        assert(s >= 0 && s < g->n_nodes &&
-               "csr_expand: source id out of CSR range (non-dense?)");
-        // G2CHK-92: real check, not just the assert above — a `s` outside
-        // [0, n_nodes) is not a node of this graph. Fail closed.
+        // Prior-operator output is runtime input: reject invalid sources
+        // before asserting the validated range, in every build mode.
         if (s < 0 || s >= g->n_nodes) return kCsrExpandOutOfRange;
+        assert(s >= 0 && s < g->n_nodes);
         int64_t begin = 0;
         int64_t end   = 0;
         csr_graph_block(g, s, &begin, &end);

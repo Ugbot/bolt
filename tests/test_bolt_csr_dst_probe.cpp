@@ -147,10 +147,13 @@ TEST(CsrDstProbe, SortedFlagIsTrusted) {
 TEST(CsrDstProbe, OutOfRangeSourceStillFailsClosed) {
     const Graph g = fixed_graph();
     Query q;
-    q.srcs = {9};
     q.bounds = {2};
     q.cap = 4;
-    EXPECT_TRUE(run(g, q, true).failed);
+    for (const int64_t invalid : {int64_t{-1}, g.n_nodes, int64_t{9}}) {
+        q.srcs = {invalid};
+        EXPECT_TRUE(run(g, q, true).failed) << "source=" << invalid;
+        EXPECT_TRUE(run(g, q, false).failed) << "source=" << invalid;
+    }
 }
 
 // Fuzz: seeded, deterministic. A failure prints the seed and iteration.
