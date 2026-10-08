@@ -124,6 +124,46 @@ TEST(BoltHashBytes, ComposesWithSwissMix) {
     EXPECT_EQ(bolt::swiss_mix(hx), bolt::swiss_mix(hx));
 }
 
+// Independently generated integer reference vectors: byte i = (17*i+3)%256,
+// blocks/tails packed little-endian. Pin the fold state and every historical
+// finalizer, rather than obtaining expected values from production helpers.
+TEST(BoltHashBytes, ExplicitV1GoldensAndGenericTierArePinned) {
+    struct Vector { uint32_t len; uint64_t state, wyhash3, xxh3, murmur3; };
+    constexpr Vector vectors[] = {
+        {0u, 0x9e3779b97f4a7c15ull, 0xacfb261e473d9c3aull, 0x1309a4ec498bddf4ull, 0x9ca066f1a4ab2eeaull},
+        {1u, 0x1d0fd20836cbd034ull, 0x7d4696075e71df53ull, 0xb868b9ebfb14d86full, 0xf61851252e4f5bd7ull},
+        {3u, 0x47ab1fa4e44a71aeull, 0x41d7ace54bc51e6bull, 0xa91294703e56f8cbull, 0xcb905d931007442aull},
+        {7u, 0xbf94d85836f7edafull, 0x1bb52558424ce715ull, 0xc5d8a1a1b2d543a4ull, 0xb345a96798deea5eull},
+        {8u, 0x22bbf74041e78950ull, 0xbb8d0a7eac9f5dceull, 0x006bc270cf7ae1eaull, 0x7b2a3ca4dac6e31bull},
+        {9u, 0x9586d4c4f436c7e2ull, 0x4057c50e0b01948cull, 0xf1325efde16b91d9ull, 0x56b64daba71fb237ull},
+        {12u, 0x984097e078bf0255ull, 0x3e325093f37f0944ull, 0x0be1cddb1dc79e41ull, 0xc83f4888b72f6545ull},
+        {16u, 0x78d8c249807d510dull, 0xaaa8c71b0adf5c37ull, 0xa13adee6c4b67ac1ull, 0xffe38051470fefc6ull},
+        {24u, 0x168e9b95f4f1188dull, 0x85294ecb5959ab43ull, 0xf55679f45e49da3dull, 0x01c6d3ac106a7b40ull},
+        {33u, 0x518cfcdf74184d03ull, 0x8706091677a88e22ull, 0x12f5ef69f9631ad4ull, 0x5a2d8d609eb4ceb6ull},
+        {39u, 0x0594e3ff54f9c148ull, 0xa6bccff9d8c98574ull, 0x241259bc2bb2f023ull, 0xb204ec91620bd7b1ull},
+    };
+    uint8_t bytes[48];
+    for (uint32_t i = 0; i < 48; ++i) bytes[i] = static_cast<uint8_t>(17u * i + 3u);
+    for (const auto& v : vectors) {
+        SCOPED_TRACE(v.len);
+        EXPECT_EQ(bolt::hash_bytes_accumulate_v1(bytes, v.len), v.state);
+        EXPECT_EQ(bolt::hash_bytes_wyhash3_v1(bytes, v.len), v.wyhash3);
+        EXPECT_EQ(bolt::swiss_mix_wyhash3(v.state), v.wyhash3);
+        EXPECT_EQ(bolt::swiss_mix_xxh3(v.state), v.xxh3);
+        EXPECT_EQ(bolt::swiss_mix_murmur3(v.state), v.murmur3);
+#if defined(BOLT_HASH_TIER_XXH3) && BOLT_HASH_TIER_XXH3
+        EXPECT_EQ(hash_bytes(bytes, v.len), v.xxh3);
+#elif defined(BOLT_HASH_TIER_MURMUR3) && BOLT_HASH_TIER_MURMUR3
+        EXPECT_EQ(hash_bytes(bytes, v.len), v.murmur3);
+#else
+        EXPECT_EQ(hash_bytes(bytes, v.len), v.wyhash3);
+#endif
+    }
+    EXPECT_EQ(bolt::hash_bytes_wyhash3_v1(nullptr, 0), vectors[0].wyhash3);
+    EXPECT_EQ(bolt::hash_bytes_wyhash3_v1("mseg-bloom-golden", 17), 0x3983ea84822c3d7dull);
+    EXPECT_EQ(bolt::hash_bytes_wyhash3_v1("ab\0", 3), 0x53024485f99fec79ull);
+}
+
 // hash_bytes_sv is hash_bytes over each view's bytes, bit for bit: every
 // length 0..40, garbage past the length in the inline bytes, lengths that
 // change row to row (the seed cache), spilled rows, both entry points.
@@ -146,11 +186,15 @@ TEST(BoltHashBytes, StringViewRowsMatchHashBytes) {
         rows.push_back(v);
         bytes.push_back(s);
     }
-    std::vector<uint64_t> out(rows.size());
+    std::vector<uint64_t> out(rows.size()), fixed(rows.size());
     bolt::hash_bytes_sv(rows.data(), rows.size(), over.data(), out.data());
+    bolt::hash_bytes_sv_wyhash3_v1(rows.data(), rows.size(), over.data(), fixed.data());
     for (size_t i = 0; i < rows.size(); ++i) {
         const uint64_t want = hash_bytes(bytes[i].data(), bytes[i].size());
         ASSERT_EQ(out[i], want) << "row " << i << " len " << bytes[i].size();
         ASSERT_EQ(bolt::hash_bytes_sv(rows[i], over.data()), want) << "row " << i;
+        const uint64_t persisted = bolt::hash_bytes_wyhash3_v1(bytes[i].data(), bytes[i].size());
+        ASSERT_EQ(fixed[i], persisted) << "fixed row " << i;
+        ASSERT_EQ(bolt::hash_bytes_sv_wyhash3_v1(rows[i], over.data()), persisted) << "fixed row " << i;
     }
 }

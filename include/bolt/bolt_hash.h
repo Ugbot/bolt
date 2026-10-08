@@ -112,7 +112,9 @@ BOLT_FORCE_INLINE uint64_t swiss_mix(uint64_t k) noexcept {
 //
 // DETERMINISTIC: blocks are read little-endian on every platform via
 // `bolt_load_u64_le`, so the hash is identical on x86 and big-endian targets.
-// STABLE: a SINGLE scalar implementation — there is deliberately NO SIMD path.
+// A SINGLE scalar implementation per selected finalizer — deliberately no SIMD path.
+// The generic digest follows BOLT_HASH_TIER; persisted callers use the explicit
+// hash_bytes_wyhash3_v1 contract below, which never follows that switch.
 // The predecessor shipped a scalar+SIMD pair whose outputs diverged and
 // silently corrupted hash joins; we do not reintroduce that risk.
 //
@@ -146,8 +148,12 @@ BOLT_FORCE_INLINE uint64_t hash_load_u64_le(const uint8_t* BOLT_RESTRICT p) noex
     return v;
 }
 
-BOLT_FORCE_INLINE uint64_t hash_bytes(const void* BOLT_RESTRICT data,
-                                      size_t len) noexcept {
+// Fixed v1 byte-fold state before finalization. Its seed, little-endian block
+// order and tail packing are persistence contracts: change them only in a new
+// version. Legacy storage formats may derive each historical finalizer from
+// this state without rereading the bytes. No allocation, one bounded byte pass.
+BOLT_FORCE_INLINE uint64_t hash_bytes_accumulate_v1(const void* BOLT_RESTRICT data,
+                                                    size_t len) noexcept {
     // Precondition: non-null payload whenever there are bytes to read, and a
     // sane upper bound (anything past 4 GiB is a corrupt length, not data).
     assert(data != nullptr || len == 0);
@@ -176,11 +182,27 @@ BOLT_FORCE_INLINE uint64_t hash_bytes(const void* BOLT_RESTRICT data,
         h = swiss_mix_wyhash3(h ^ tail);
     }
 
-    // Final avalanche through the SwissTable-composing mixer.
-    const uint64_t out = swiss_mix(h);
-    assert(len != 0 || out == swiss_mix(0x9E3779B97F4A7C15ULL ^
-                                        swiss_mix_wyhash3(0)));  // len-0 stable
-    return out;
+    assert(len != 0 || h == (0x9E3779B97F4A7C15ULL ^ swiss_mix_wyhash3(0)));
+    return h;
+}
+
+// Generic in-memory hash keeps its original configurable finalizer, bit for
+// bit. A configured hash tier is not an on-disk algorithm identifier.
+BOLT_FORCE_INLINE uint64_t hash_bytes(const void* BOLT_RESTRICT data,
+                                      size_t len) noexcept {
+    assert(data != nullptr || len == 0);
+    assert(len <= (size_t)0xFFFFFFFFULL);
+    return swiss_mix(hash_bytes_accumulate_v1(data, len));
+}
+
+// Persisted byte hash v1: fixed byte-fold v1 followed by fixed WYHASH3.
+// Never switch this finalizer with BOLT_HASH_TIER or CPU dispatch; revisions
+// require a new persisted algorithm tag. Generic hash_bytes stays configurable.
+BOLT_FORCE_INLINE uint64_t hash_bytes_wyhash3_v1(const void* BOLT_RESTRICT data,
+                                                size_t len) noexcept {
+    assert(data != nullptr || len == 0);
+    assert(len <= (size_t)0xFFFFFFFFULL);
+    return swiss_mix_wyhash3(hash_bytes_accumulate_v1(data, len));
 }
 
 }  // namespace bolt

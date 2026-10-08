@@ -9,6 +9,11 @@ compatibility at I/O boundaries.
 Header-only C++20, built directly by the consumer — including MSVC on
 Windows, with no package manager or prebuilt dependency.
 
+Stable persisted byte hashing: `bolt_hash.h` supplies explicit WYHASH3-v1
+scalar/accumulator helpers; `kernels/bolt_hash_sv.h` supplies scalar/batch
+StringView equivalents. Generic hashing remains tier-selected.
+[Contract and three-tier tests](research/persisted-byte-hash-v1-2026-10-08.md).
+
 ## Directory Layout
 
 ```

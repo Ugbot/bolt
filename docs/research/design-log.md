@@ -2243,3 +2243,8 @@ none foreseen — the two contracts are disjoint by workload shape.
 **Follow-up:** Windows IOCP (`event_loop_iocp.cpp`, `async_io_iocp.cpp`
 `associated` map) takes the same registry when a Windows build box is in the
 loop; `async_io_epoll.cpp`'s dead `<unordered_map>` include was removed.
+
+
+## Persisted byte hashes — fixed v1 alongside configurable in-memory hashes
+
+**2026-10-08.** A downstream Bloom-reader review exposed that persisted hash kind1 did not encode `BOLT_HASH_TIER`. Kept configurable generic hash behavior unchanged and added explicit fixed WYHASH3-v1 byte/SV/batch helpers. Pinning only the reader would lose keys from files written under another tier; the consumer instead conservatively ORs the three supported historical finalizers for legacy files and writes a new explicit stable tag. Nine tests pass under each tier; no isolated kernel speedup is claimed. See [contract and verification](persisted-byte-hash-v1-2026-10-08.md).
