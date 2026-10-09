@@ -829,6 +829,288 @@ TEST(BoltColumn, CloneIntoFlatUtf8AllInlineHasNoOverflowPointer) {
     delete[] ovf;
 }
 
+// G2CHK-714: clone the referenced bytes, not the source overflow prefix.
+TEST(BoltColumn, CloneIntoUtf8ScatteredBoundAndRebasedValidity) {
+    constexpr char a[] = "AAAAAAAAAAAAAAAAAAAA";
+    constexpr char b[] = "BBBBBBBBBBBBBBBBBB";
+    for (bool view : {false, true}) {
+        char pool[8300]{};
+        std::memcpy(pool + 4096, a, 20);
+        std::memcpy(pool + 8192, b, 18);
+        StringView rows[4] = {make_spilled_sv(a, 20, 4096),
+                             make_spilled_sv(b, 18, 8192),
+                             make_inline_sv("", 0), {}};
+        std::memset(&rows[3], 0xAB, sizeof(StringView));
+        rows[0].ref.buf_idx = 7; // Owned utf8_at resolves a single spill base.
+        uint8_t validity[2] = {0x80, 0x03}; // offset 7: valid,valid,valid,NULL
+        auto col = BoltColumn::make_flat(rows, validity, 4, BoltType::Utf8);
+        col.validity_offset = 7;
+        if (view) col.format = ColumnFormat::View;
+        col.str_overflow_base = pool;
+        col.logical = BoltLogical::Json;
+        col.decimal_scale = 3;
+        col.stats.max_string_len = 20;
+        col.sidecars = {pool, pool, pool, pool, pool};
+        col.dict_child = &col; // advisory only; must not remain source-owned
+        Arena dst;
+        auto clone = col.clone_into(&dst);
+        ASSERT_EQ(clone.length, 4);
+        ASSERT_NE(clone.str_overflow_base, nullptr);
+        EXPECT_EQ(dst.total_allocated(), sizeof(rows) + 1u + 38u);
+        EXPECT_EQ(rows[0].ref.offset, 4096u);
+        EXPECT_EQ(rows[1].ref.offset, 8192u);
+        EXPECT_EQ(rows[0].ref.buf_idx, 7u);
+        EXPECT_EQ(static_cast<const StringView*>(clone.data)[0].ref.buf_idx, 0u);
+        EXPECT_EQ(clone.format, ColumnFormat::Flat);
+        EXPECT_EQ(clone.validity_offset, 0);
+        ASSERT_NE(clone.validity, nullptr);
+        EXPECT_EQ(clone.validity[0] & 15u, 7u);
+        EXPECT_EQ(clone.logical, col.logical);
+        EXPECT_EQ(clone.decimal_scale, 3);
+        EXPECT_EQ(clone.stats.max_string_len, 20u);
+        EXPECT_EQ(clone.dict_child, nullptr);
+        EXPECT_EQ(clone.sidecars.bitmap_index, nullptr);
+        EXPECT_EQ(clone.sidecars.hash_index, nullptr);
+        EXPECT_EQ(clone.sidecars.sort_index, nullptr);
+        EXPECT_EQ(clone.sidecars.bloom_filter, nullptr);
+        EXPECT_EQ(clone.sidecars.vector_stats, nullptr);
+        std::memset(pool, 'x', sizeof(pool));
+        std::memset(rows, 0xDD, sizeof(rows));
+        std::memset(validity, 0, sizeof(validity));
+        const uint8_t* text = nullptr;
+        int32_t len = 0;
+        clone.utf8_at(0, &text, &len);
+        EXPECT_EQ(len, 20u);
+        EXPECT_EQ(std::memcmp(text, a, static_cast<size_t>(len)), 0);
+        clone.utf8_at(1, &text, &len);
+        EXPECT_EQ(len, 18u);
+        EXPECT_EQ(std::memcmp(text, b, static_cast<size_t>(len)), 0);
+        EXPECT_EQ((clone.validity[0] >> 3) & 1u, 0u);
+    }
+}
+
+TEST(BoltColumn, CloneIntoUtf8DuplicateAndOverlapBound) {
+    constexpr char text[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    constexpr uint32_t offsets[4][4] = {
+        {0, 0, 0, 0}, {4000, 4000, 4000, 4000},
+        {4000, 4004, 4008, 4000}, {1000, 8000, 1000, 8000}};
+    constexpr uint64_t copied[4] = {20, 20, 28, 80};
+    for (uint32_t scenario = 0; scenario < 4; ++scenario) {
+        char pool[8100]{};
+        StringView rows[4]{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            // Fill shared/overlapping ranges with one consistent source.
+            for (uint32_t j = 0; j < 20; ++j)
+                pool[offsets[scenario][i] + j] = text[(offsets[scenario][i] + j) % 36];
+        }
+        char expected[4][20]{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            const auto off = offsets[scenario][i];
+            rows[i] = make_spilled_sv(pool + off, 20, off);
+            std::memcpy(expected[i], pool + off, 20);
+        }
+        auto col = BoltColumn::make_flat(rows, nullptr, 4, BoltType::Utf8);
+        col.str_overflow_base = pool;
+        Arena dst;
+        auto clone = col.clone_into(&dst);
+        ASSERT_EQ(clone.length, 4);
+        EXPECT_EQ(dst.total_allocated(), sizeof(rows) + copied[scenario]);
+        for (uint32_t i = 0; i < 4; ++i)
+            EXPECT_EQ(rows[i].ref.offset, offsets[scenario][i]);
+        std::memset(pool, 'x', sizeof(pool));
+        for (uint32_t i = 0; i < 4; ++i) {
+            const uint8_t* bytes = nullptr;
+            int32_t len = 0;
+            clone.utf8_at(i, &bytes, &len);
+            EXPECT_EQ(len, 20u);
+            EXPECT_EQ(std::memcmp(bytes, expected[i], 20), 0);
+        }
+    }
+}
+
+TEST(BoltColumn, CloneIntoUtf8ThousandSharedRowsDoNotExpand) {
+    char pool[4200]{};
+    std::memset(pool + 4000, 'a', 100);
+    StringView rows[1000]{};
+    for (auto& row : rows) row = make_spilled_sv(pool + 4000, 100, 4000);
+    auto col = BoltColumn::make_flat(rows, nullptr, 1000, BoltType::Utf8);
+    col.str_overflow_base = pool;
+    Arena dst;
+    auto clone = col.clone_into(&dst);
+    ASSERT_EQ(clone.length, 1000);
+    EXPECT_EQ(dst.total_allocated(), sizeof(rows) + 100u);
+    EXPECT_EQ(rows[999].ref.offset, 4000u);
+    EXPECT_EQ(static_cast<const StringView*>(clone.data)[999].ref.offset, 0u);
+}
+
+TEST(BoltColumn, CloneIntoUtf8ConstantNullAndZeroRows) {
+    char pool[4200]{};
+    std::memset(pool + 4000, 'a', 20);
+    for (bool all_null : {false, true}) {
+        StringView row = make_spilled_sv(pool + 4000, 20, 4000);
+        if (all_null) std::memset(&row, 0xAB, sizeof(row));
+        auto col = BoltColumn::make_constant(row, 3, BoltType::Utf8);
+        uint8_t validity[2] = {0, static_cast<uint8_t>(all_null ? 0 : 4)};
+        col.validity = validity;
+        col.validity_offset = 9; // Only logical row 1 is valid, at source bit 10.
+        col.str_overflow_base = pool;
+        Arena dst;
+        auto clone = col.clone_into(&dst);
+        ASSERT_EQ(clone.length, 3);
+        EXPECT_EQ(clone.format, ColumnFormat::Constant);
+        ASSERT_NE(clone.validity, nullptr);
+        EXPECT_EQ(clone.validity[0], all_null ? 0u : 2u);
+        EXPECT_EQ(clone.validity_offset, 0);
+        EXPECT_EQ(dst.total_allocated(), all_null ? 1u : 21u);
+        if (all_null) EXPECT_EQ(clone.str_overflow_base, nullptr);
+        else {
+            const auto sv = clone.get_constant<StringView>();
+            EXPECT_EQ(sv.ref.offset, 0u);
+            EXPECT_EQ(sv.ref.buf_idx, 0u);
+            EXPECT_EQ(std::memcmp(clone.str_overflow_base, pool + 4000, 20), 0);
+        }
+    }
+    StringView garbage{};
+    std::memset(&garbage, 0xAB, sizeof(garbage));
+    uint8_t nulls[2]{};
+    auto col = BoltColumn::make_flat(&garbage, nulls, 1, BoltType::Utf8);
+    col.validity_offset = 9;
+    col.str_overflow_base = pool;
+    Arena dst;
+    auto clone = col.clone_into(&dst);
+    ASSERT_EQ(clone.length, 1);
+    EXPECT_EQ(clone.str_overflow_base, nullptr);
+    col.length = 0;
+    col.format = ColumnFormat::View;
+    clone = col.clone_into(&dst);
+    EXPECT_EQ(clone.length, 0);
+    EXPECT_EQ(clone.data, nullptr);
+    EXPECT_EQ(clone.validity, nullptr);
+    EXPECT_EQ(clone.str_overflow_base, nullptr);
+    EXPECT_EQ(clone.format, ColumnFormat::Flat);
+}
+
+TEST(BoltColumn, CloneIntoUtf8DictionaryOwnsKeysChildAndValidity) {
+    char pool[4200]{};
+    std::memset(pool + 4000, 'a', 20);
+    StringView row = make_spilled_sv(pool + 4000, 20, 4000);
+    auto child = BoltColumn::make_flat(&row, nullptr, 1, BoltType::Utf8);
+    child.str_overflow_base = pool;
+    int32_t keys[2] = {0, 0};
+    uint8_t validity[2] = {0, 2}; // source bit 9 valid, bit 10 NULL
+    auto col = BoltColumn::make_flat(keys, validity, 2, BoltType::Int32);
+    col.type = BoltType::Utf8;
+    col.format = ColumnFormat::Dictionary;
+    col.dict_child = &child;
+    col.validity_offset = 9;
+    Arena dst;
+    auto clone = col.clone_into(&dst);
+    ASSERT_EQ(clone.length, 2);
+    ASSERT_NE(clone.dict_child, nullptr);
+    EXPECT_NE(clone.dict_child, &child);
+    EXPECT_EQ(clone.type_size_bytes, sizeof(int32_t));
+    EXPECT_EQ(clone.validity[0], 1u);
+    EXPECT_EQ(clone.validity_offset, 0);
+    std::memset(pool, 'x', sizeof(pool));
+    keys[0] = 100;
+    EXPECT_EQ(static_cast<const int32_t*>(clone.data)[0], 0);
+    const uint8_t* bytes = nullptr;
+    int32_t len = 0;
+    clone.dict_child->utf8_at(0, &bytes, &len);
+    EXPECT_EQ(len, 20);
+    EXPECT_EQ(bytes[0], 'a');
+}
+
+TEST(BoltColumn, CloneIntoRejectsInvalidShapeBeforeReadingPayload) {
+    Arena dst;
+    StringView row{};
+    auto col = BoltColumn::make_flat(&row, nullptr, 1, BoltType::Utf8);
+    col.length = -1;
+    EXPECT_EQ(col.clone_into(&dst).length, 0);
+    col.length = 1;
+    col.validity_offset = -1;
+    EXPECT_EQ(col.clone_into(&dst).length, 0);
+    col.validity_offset = INT64_MAX;
+    EXPECT_EQ(col.clone_into(&dst).length, 0);
+    col.validity_offset = 0;
+    col.length = INT64_MAX;
+    EXPECT_EQ(col.clone_into(&dst).length, 0);
+    col.length = 1;
+    col.type_size_bytes = 4;
+    EXPECT_EQ(col.clone_into(&dst).length, 0);
+    col.type_size_bytes = sizeof(StringView);
+    row = make_spilled_sv("abcdefghijklmnop", 16, 0);
+    EXPECT_EQ(col.clone_into(&dst).length, 0); // missing spill base
+    EXPECT_EQ(dst.total_allocated(), 0u);
+}
+
+TEST(BoltColumn, CloneIntoSpillAndDictionaryRefusalIsAtomic) {
+    char pool[300]{};
+    StringView row = make_spilled_sv(pool, sizeof(pool), 0);
+    auto child = BoltColumn::make_flat(&row, nullptr, 1, BoltType::Utf8);
+    child.str_overflow_base = pool;
+    int32_t key = 0;
+    auto dict = BoltColumn::make_flat(&key, nullptr, 1, BoltType::Int32);
+    dict.type = BoltType::Utf8;
+    dict.format = ColumnFormat::Dictionary;
+    dict.dict_child = &child;
+    for (bool nested : {false, true}) {
+        ArenaConfig cfg{};
+        cfg.initial_block_size = 4096;
+        cfg.max_block_size = 4096;
+        Arena dst{cfg};
+        for (uint32_t i = 1; i < kArenaMaxBlocks; ++i)
+            ASSERT_NE(dst.allocate(5000), nullptr);
+        ASSERT_EQ(dst.num_blocks(), kArenaMaxBlocks);
+        // Leave exactly enough normal-block space for the descriptor/key and
+        // child object, but not the 300-byte spill. No reset/rollback is allowed.
+        const size_t need = nested ? 64 + sizeof(BoltColumn) + 64 : 64;
+        ASSERT_NE(dst.allocate(4096 - need), nullptr);
+        const auto before = dst.total_allocated();
+        auto clone = (nested ? dict : child).clone_into(&dst);
+        EXPECT_EQ(clone.length, 0);
+        EXPECT_EQ(clone.data, nullptr);
+        EXPECT_GT(dst.total_allocated(), before);
+        EXPECT_EQ(dst.num_blocks(), kArenaMaxBlocks);
+        EXPECT_EQ(row.ref.offset, 0u);
+        EXPECT_EQ(child.str_overflow_base, pool);
+        EXPECT_EQ(dict.dict_child, &child);
+    }
+}
+
+TEST(BoltUtf8Clone, CheckedArithmeticPlansWithoutLargeAllocations) {
+    size_t bytes = 0;
+    EXPECT_FALSE(detail::clone_byte_extent(UINT64_MAX, 16, &bytes));
+    EXPECT_FALSE(detail::clone_byte_extent(SIZE_MAX, 1, &bytes));
+    EXPECT_FALSE(detail::clone_validity_extent(1, INT64_MAX, &bytes));
+    detail::Utf8ClonePlan plan{};
+    EXPECT_FALSE(detail::utf8_clone_add_range(&plan, UINT64_MAX, 1));
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, UINT32_MAX));
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, UINT32_MAX));
+    EXPECT_TRUE(detail::utf8_clone_finish_plan(&plan));
+    EXPECT_EQ(plan.bytes, static_cast<uint64_t>(UINT32_MAX));
+    // A final tail can end beyond 4 GiB; only its START must fit uint32.
+    plan = {};
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, UINT32_MAX, 32));
+    EXPECT_TRUE(detail::utf8_clone_finish_plan(&plan));
+    EXPECT_EQ(plan.bytes, 32u);
+    plan = {};
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, UINT32_MAX - 20ull));
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, UINT32_MAX, 100));
+    EXPECT_TRUE(detail::utf8_clone_finish_plan(&plan));
+    EXPECT_FALSE(plan.span);
+    EXPECT_EQ(plan.bytes, static_cast<uint64_t>(UINT32_MAX) + 80u);
+    plan = {};
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, UINT32_MAX));
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, 32));
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 1ull << 40, 32));
+    EXPECT_FALSE(detail::utf8_clone_finish_plan(&plan)); // packed start overflow
+    plan = {};
+    EXPECT_TRUE(detail::utf8_clone_add_range(&plan, 0, UINT64_MAX));
+    EXPECT_FALSE(detail::utf8_clone_add_range(&plan, 0, 1)); // checked sum
+    EXPECT_FALSE(detail::utf8_clone_finish_plan(&plan)); // ptrdiff/size bound
+}
+
 // G2CHK-247: a VarBinary clone must own its validity bitmap too. It used to
 // keep the source pointer, so a source arena reused by the next MarbleDB
 // scan_next() rewrote the clone's NULL bits (TPC-H lineitem read thousands of

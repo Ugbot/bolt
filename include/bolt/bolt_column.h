@@ -12,6 +12,7 @@
 #include "bolt/bolt_types.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/kernels/bolt_fastlanes.h"
+#include "bolt/kernels/bolt_utf8_clone.h"
 
 #include <cassert>
 #include <cstdint>
@@ -1790,187 +1791,164 @@ inline void utf8_overflow_span(const StringView* rows, int64_t n,
 
 }  // namespace detail
 
+namespace detail {
+
+inline bool clone_fixed_payload(BoltColumn* dst, const BoltColumn& src,
+                                 Arena* arena) noexcept {
+    assert(dst != nullptr && arena != nullptr);
+    assert(src.length >= 0);
+    size_t bytes = 0;
+    if (!clone_byte_extent(static_cast<uint64_t>(src.length), src.type_size_bytes,
+                           &bytes)) return false;
+    if (src.length > 0 && src.data == nullptr) return false;
+    dst->data = bytes == 0 ? nullptr : arena->allocate(bytes, 64);
+    if (bytes > 0 && dst->data == nullptr) return false;
+    if (bytes > 0) std::memcpy(dst->data, src.data, bytes);
+    if (src.format == ColumnFormat::View) dst->format = ColumnFormat::Flat;
+    return true;
+}
+
+inline bool clone_var_binary_payload(BoltColumn* dst, const BoltColumn& src,
+                                      Arena* arena) noexcept {
+    assert(dst != nullptr && arena != nullptr);
+    assert(src.length >= 0);
+    if (src.length == 0) {
+        dst->data = nullptr;
+        dst->dict_child = nullptr;
+        return true;
+    }
+    if (src.dict_child == nullptr || src.dict_child->data == nullptr ||
+        src.length == INT64_MAX) return false;
+    size_t obytes = 0;
+    if (!clone_byte_extent(static_cast<uint64_t>(src.length) + 1,
+                           sizeof(int32_t), &obytes)) return false;
+    const auto* offs = static_cast<const int32_t*>(src.dict_child->data);
+    if (offs[src.length] < 0) return false;
+    size_t nbytes = 0;
+    if (!clone_byte_extent(static_cast<uint64_t>(offs[src.length]), 1, &nbytes))
+        return false;
+    if (nbytes > 0 && src.data == nullptr) return false;
+    dst->data = nbytes == 0 ? nullptr : arena->allocate(nbytes, 64);
+    void* noffs = arena->allocate(obytes, 64);
+    auto* child = arena->allocate_array<BoltColumn>(1);
+    if ((nbytes > 0 && dst->data == nullptr) || noffs == nullptr || child == nullptr)
+        return false;
+    if (nbytes > 0) std::memcpy(dst->data, src.data, nbytes);
+    std::memcpy(noffs, offs, obytes);
+    *child = BoltColumn::make_flat(static_cast<int32_t*>(noffs), nullptr,
+                                   src.length + 1, BoltType::Int32);
+    dst->dict_child = child;
+    return true;
+}
+
+inline bool clone_dictionary_payload(BoltColumn* dst, const BoltColumn& src,
+                                      Arena* arena) noexcept {
+    assert(dst != nullptr && arena != nullptr);
+    assert(src.length >= 0);
+    if (!clone_fixed_payload(dst, src, arena)) return false;
+    if (src.dict_child == nullptr) return src.length == 0;
+    auto* child = arena->allocate_array<BoltColumn>(1);
+    if (child == nullptr) return false;
+    *child = src.dict_child->clone_into(arena);
+    if (src.dict_child->length != 0 && child->length == 0) return false;
+    dst->dict_child = child;
+    dst->str_overflow_base = nullptr; // Payload is integer keys, never StringViews.
+    return true;
+}
+
+inline bool clone_utf8_preflight(const BoltColumn& src,
+                                 Utf8ClonePlan* plan) noexcept {
+    assert(plan != nullptr);
+    assert(src.length >= 0 && src.validity_offset >= 0);
+    const bool direct = src.format == ColumnFormat::Flat ||
+                        src.format == ColumnFormat::View ||
+                        src.format == ColumnFormat::Constant;
+    if (src.type != BoltType::Utf8 || !direct) return true;
+    if (src.type_size_bytes != sizeof(StringView)) return false;
+    int64_t count = src.length;
+    const uint8_t* validity = src.validity;
+    int64_t offset = src.validity_offset;
+    const auto* rows = static_cast<const StringView*>(src.data);
+    if (src.format == ColumnFormat::Constant) {
+        // One physical descriptor, usable if ANY logical row is non-NULL.
+        count = 0;
+        for (int64_t i = 0; i < src.length; ++i) {
+            if (clone_row_valid(validity, offset, i)) { count = 1; break; }
+        }
+        rows = reinterpret_cast<const StringView*>(src.inline_value);
+        validity = nullptr;
+        offset = 0;
+    }
+    if (count > 0 && rows == nullptr) return false;
+    return utf8_clone_plan(rows, count, validity, offset, src.str_overflow_base, plan);
+}
+
+inline bool clone_utf8_payload(BoltColumn* dst, const BoltColumn& src,
+                               const Utf8ClonePlan& plan, Arena* arena) noexcept {
+    assert(dst != nullptr && arena != nullptr);
+    assert(plan.bytes <= plan.sum);
+    const bool direct = dst->format == ColumnFormat::Flat ||
+                        dst->format == ColumnFormat::Constant;
+    if (src.type != BoltType::Utf8 || !direct) return true;
+    dst->str_overflow_base = nullptr;
+    if (!plan.any) return true;
+    auto* spill = static_cast<char*>(arena->allocate(plan.bytes, 64));
+    if (spill == nullptr) return false;
+    const bool constant = dst->format == ColumnFormat::Constant;
+    auto* rows = constant ? reinterpret_cast<StringView*>(dst->inline_value)
+                          : static_cast<StringView*>(dst->data);
+    const auto* validity = constant ? nullptr : dst->validity;
+    const int64_t count = constant ? 1 : dst->length;
+    const auto* base = static_cast<const char*>(src.str_overflow_base);
+    if (plan.span) utf8_clone_copy_span(rows, count, validity, 0, spill, base, plan);
+    else utf8_clone_copy_packed(rows, count, validity, 0, spill, base, plan);
+    dst->str_overflow_base = spill;
+    return true;
+}
+
+} // namespace detail
+
 inline BoltColumn BoltColumn::clone_into(Arena* arena_in) const noexcept {
     assert(arena_in != nullptr);
-    assert(length >= 0);
+    size_t vbytes = 0;
+    if (!detail::clone_validity_extent(length, validity_offset, &vbytes))
+        return make_empty();
+    detail::Utf8ClonePlan plan{};
+    if (!detail::clone_utf8_preflight(*this, &plan)) return make_empty();
     BoltColumn c = *this;
     c.arena = arena_in;
-    // G2FEAT-152: a NON-Dictionary column may carry an ADVISORY dictionary hint
-    // on `dict_child` (the parquet reader publishes one for Utf8 so a consumer
-    // can hash each dictionary entry once instead of re-hashing every row's
-    // content). It points into the SOURCE arena, so a clone must DROP it rather
-    // than deep-copy it: correctness never depends on the hint, and a hint
-    // dangling into a reset arena is precisely the G2FEAT-307 use-after-free
-    // class. The Dictionary case below owns its child for real and still
-    // deep-copies it.
-    if (format != ColumnFormat::Dictionary &&
-        format != ColumnFormat::VarBinary) {
-        c.dict_child = nullptr;
-    }
-
+    c.sidecars = {}; // Ephemeral, source-owned advisory indexes are not cloned.
+    if (format != ColumnFormat::Dictionary && format != ColumnFormat::VarBinary)
+        c.dict_child = nullptr; // G2FEAT-152 advisory dictionary hint.
     switch (format) {
-        case ColumnFormat::VarBinary: {
-            // A VarBinary column's OFFSETS live on `dict_child` — they are
-            // load-bearing, not the advisory dictionary hint the comment
-            // above describes. Before this case existed, the switch matched
-            // nothing: `data` was carried over UNCOPIED (a dangling pointer
-            // into the source arena the moment it reset — precisely the
-            // G2FEAT-307 use-after-free class) and the blanket
-            // `dict_child = nullptr` above threw the offsets away, so
-            // `var_binary_at` null-dereferenced on the first read.
-            //
-            // Reached by every MarbleDB-scanned Utf8/Binary column: the scan
-            // op deep-copies each column into the fragment's own arena
-            // (G2FEAT-307), and MarbleDB hands strings back as VarBinary.
-            if (length <= 0 || dict_child == nullptr ||
-                dict_child->data == nullptr) {
-                return make_empty();
-            }
-            const int32_t* offs = static_cast<const int32_t*>(dict_child->data);
-            const int64_t  nbytes = static_cast<int64_t>(offs[length]);
-            void* ndata = nullptr;
-            if (nbytes > 0) {
-                if (data == nullptr) return make_empty();
-                ndata = arena_in->copy_into(data, static_cast<size_t>(nbytes));
-                if (ndata == nullptr) return make_empty();
-            }
-            void* noffs = arena_in->copy_into(
-                offs, static_cast<size_t>(length + 1) * sizeof(int32_t));
-            if (noffs == nullptr) return make_empty();
-            BoltColumn* oc = arena_in->allocate_array<BoltColumn>(1);
-            if (oc == nullptr) return make_empty();
-            *oc = BoltColumn::make_flat(static_cast<int32_t*>(noffs), nullptr,
-                                        length + 1, BoltType::Int32);
-            c.data       = ndata;
-            c.dict_child = oc;
-            // The validity bitmap is source-owned too: rebase it to bit 0 in
-            // our arena, or a reused source arena rewrites this clone's NULLs.
-            if (validity != nullptr) {
-                const size_t vbytes = (static_cast<size_t>(length) + 7u) / 8u;
-                uint8_t* nval =
-                    static_cast<uint8_t*>(arena_in->allocate_zeroed(vbytes));
-                if (nval == nullptr) return make_empty();
-                for (int64_t i = 0; i < length; ++i) {
-                    const int64_t s = validity_offset + i;
-                    const uint8_t bit = (validity[s >> 3] >> (s & 7)) & 1u;
-                    nval[i >> 3] |= static_cast<uint8_t>(bit << (i & 7));
-                }
-                c.validity = nval;
-            }
-            c.validity_offset = 0;
-            assert(c.validity == nullptr || c.validity != validity);
+        case ColumnFormat::Flat:
+        case ColumnFormat::View:
+            if (!detail::clone_fixed_payload(&c, *this, arena_in)) return make_empty();
             break;
-        }
-        case ColumnFormat::Flat: {
-            if (length > 0 && type_size_bytes > 0 && data) {
-                size_t bytes = (size_t)length * (size_t)type_size_bytes;
-                void* ndata = arena_in->copy_into(data, bytes);
-                if (!ndata) return make_empty();
-                c.data = ndata;
-            } else {
-                c.data = nullptr;
-            }
-            if (validity && length > 0) {
-                size_t vbytes = ((size_t)length + 7) / 8;
-                void* nval = arena_in->copy_into(validity, vbytes);
-                if (!nval) return make_empty();
-                c.validity = static_cast<uint8_t*>(nval);
-                c.validity_offset = 0;
-            } else {
-                c.validity = nullptr;
-                c.validity_offset = 0;
-            }
+        case ColumnFormat::VarBinary:
+            if (!detail::clone_var_binary_payload(&c, *this, arena_in)) return make_empty();
             break;
-        }
-        case ColumnFormat::Constant: {
-            // inline_value is part of the struct; the shallow copy already
-            // captured the 16 bytes. Repoint data → our own inline_value.
+        case ColumnFormat::Dictionary:
+            if (!detail::clone_dictionary_payload(&c, *this, arena_in)) return make_empty();
+            break;
+        case ColumnFormat::Constant:
             c.data = c.inline_value;
             break;
-        }
-        case ColumnFormat::Sequence: {
-            // seq_offset/seq_step covered by shallow copy.
+        case ColumnFormat::Sequence:
             c.data = nullptr;
             break;
-        }
-        case ColumnFormat::View: {
-            // Promote view → flat by materializing, then deep-copying.
-            // Caller semantics: clone should be self-contained.
-            if (length > 0 && type_size_bytes > 0 && data) {
-                size_t bytes = (size_t)length * (size_t)type_size_bytes;
-                void* ndata = arena_in->copy_into(data, bytes);
-                if (!ndata) return make_empty();
-                c.data = ndata;
-                c.format = ColumnFormat::Flat;
-            }
-            if (validity) {
-                // Shift bits so validity_offset becomes 0.
-                size_t vbytes = ((size_t)length + 7) / 8;
-                uint8_t* nval = static_cast<uint8_t*>(
-                    arena_in->allocate_zeroed(vbytes));
-                if (!nval) return make_empty();
-                for (int64_t i = 0; i < length; ++i) {
-                    int64_t srcbit = validity_offset + i;
-                    uint8_t bit = (validity[srcbit >> 3] >> (srcbit & 7)) & 1u;
-                    nval[i >> 3] |= (uint8_t)(bit << (i & 7));
-                }
-                c.validity = nval;
-                c.validity_offset = 0;
-            }
-            break;
-        }
-        case ColumnFormat::Dictionary: {
-            // Copy keys buffer (sizeof determined by type_size_bytes on the
-            // dictionary column's data field).
-            if (length > 0 && type_size_bytes > 0 && data) {
-                size_t bytes = (size_t)length * (size_t)type_size_bytes;
-                void* ndata = arena_in->copy_into(data, bytes);
-                if (!ndata) return make_empty();
-                c.data = ndata;
-            }
-            if (dict_child) {
-                BoltColumn* nc = arena_in->allocate_array<BoltColumn>(1);
-                if (!nc) return make_empty();
-                *nc = dict_child->clone_into(arena_in);
-                c.dict_child = nc;
-            }
-            // NOTE: a Dictionary-format column's own `data` holds integer
-            // keys, not StringViews, even when its logical `type` is Utf8 —
-            // the real StringView payload (and str_overflow_base) lives on
-            // `dict_child`, already deep-copied above. Do not run the Utf8
-            // overflow walk below against key data.
-            return c;
-        }
+        default: break; // Other encodings retain their existing dispatch.
     }
-
-    // Utf8 spilled-string overflow deep-copy (G2FEAT-307 bug class): Flat
-    // (including View, promoted to Flat above) and Constant are the only
-    // formats whose `data`/`inline_value` are StringView-shaped. Every other
-    // format either can't carry Utf8 payload directly (Dictionary handled
-    // via `return c` above) or is numeric-only (Sequence/RLE/BitPacked/
-    // FrameOfRef) — str_overflow_base stays whatever the shallow copy gave
-    // it (normally nullptr) for those.
-    if (type == BoltType::Utf8 && str_overflow_base != nullptr) {
-        size_t used = 0;
-        if (c.format == ColumnFormat::Flat) {
-            const auto* rows = static_cast<const StringView*>(c.data);
-            used = detail::utf8_overflow_used_bytes(rows, c.length, c.validity,
-                                                    c.validity_offset);
-        } else if (c.format == ColumnFormat::Constant) {
-            const auto* row = reinterpret_cast<const StringView*>(c.inline_value);
-            used = detail::utf8_overflow_used_bytes(row, 1, nullptr, 0);
-        }
-        if (used > 0) {
-            void* nspill = arena_in->copy_into(str_overflow_base, used);
-            if (!nspill) return make_empty();
-            c.str_overflow_base = nspill;
-        } else {
-            // No row actually references the spill buffer (all inline, or
-            // every referencing row was null) — do not carry a stale
-            // pointer into the destination arena's lifetime.
-            c.str_overflow_base = nullptr;
-        }
+    c.validity = nullptr;
+    c.validity_offset = 0;
+    if (validity != nullptr && length > 0) {
+        c.validity = static_cast<uint8_t*>(arena_in->allocate_zeroed(vbytes, 64));
+        if (c.validity == nullptr) return make_empty();
+        detail::clone_validity_copy(c.validity, validity, validity_offset, length);
     }
+    if (!detail::clone_utf8_payload(&c, *this, plan, arena_in)) return make_empty();
+    assert(c.arena == arena_in && c.validity_offset == 0);
+    assert(c.validity == nullptr || c.validity != validity);
     return c;
 }
 

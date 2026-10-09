@@ -31,6 +31,7 @@ bolt/
 │   ├── kernels/
 │   │   ├── bolt_binsearch.h           Branchless binary search (i64/u64/f64) —
 │   │   │                               exact + lower_bound + upper_bound, cmov loop
+│   │   ├── bolt_utf8_clone.h          Checked min(span,sum) single-base spill clone (G2CHK-714)
 │   │   ├── bolt_numeric.h             Numeric kernel matrix: filter/agg/arith/cast (Wave A4)
 │   │   ├── promql.h                   PromQL kernels aggregator (rate/deriv/histogram)
 │   │   ├── promql_rate.h              rate/increase/delta/irate/idelta/resets/changes —
@@ -204,3 +205,5 @@ ctest --test-dir build -C Release --output-on-failure
 Presets: `release`, `debug`, `msvc`, `ninja-msvc`, `clang-cl`. GTest is fetched
 via `FetchContent` when not found locally, so the build is self-contained on
 Windows without vcpkg.
+
+G2CHK-714 clone bounds and format/refusal contracts: [Utf8 clone copy bound](research/utf8-clone-copy-bound.md).

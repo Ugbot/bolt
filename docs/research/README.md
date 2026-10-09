@@ -10,6 +10,8 @@ or plan prose. New topic → new file + add an entry below.
 
 ## Index
 
+- [utf8-clone-copy-bound.md](utf8-clone-copy-bound.md) — G2CHK-714: checked min(span,sum) spill-copy bound, duplicate/NULL/format contracts and lifetime limits.
+
 ### Foundational technique catalogue
 
 - [pirk-techniques.md](pirk-techniques.md) — Holger Pirk et al. (cracking,
