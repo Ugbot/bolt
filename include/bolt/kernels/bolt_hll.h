@@ -2,7 +2,7 @@
 //
 // Fixed-size POD sketch for approximate COUNT(DISTINCT) over 64-bit
 // hashes. Precision P selects m = 2^P registers (1 byte each, holding
-// 6-bit values 0..64). Standard error is ~1.04/sqrt(m); P=14 → ~0.81%
+// values 0..65-P). Standard error is ~1.04/sqrt(m); P=14 → ~0.81%
 // standard error with a 16 KiB sketch.
 //
 // Estimator:
@@ -44,7 +44,7 @@ struct HllPp {
     static constexpr uint32_t k_num_registers = 1u << P;
     static constexpr uint64_t k_idx_mask      = (1ull << P) - 1ull;
 
-    // 1 byte per register; max value is 64 (count of leading zeros in
+    // 1 byte per register; max value is 65-P (count of leading zeros in
     // the (64-P) low bits, plus 1). 6 bits would suffice; we trade
     // memory for branchless updates and a trivial merge loop.
     uint8_t registers[k_num_registers];
@@ -142,7 +142,10 @@ void hll_merge(HllPp<P>* dst, const HllPp<P>* src) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// hll_estimate — cardinality estimate.
+// hll_estimate — trusted approximate cardinality estimate, not an exact
+// count or a bound. Requires a non-null sketch with every register <=65-P;
+// use hll_estimate_checked for untrusted registers. Rounds to nearest integer
+// and saturates at UINT64_MAX before conversion.
 //
 //   Z       = sum_i 2^(-R[i])
 //   E_raw   = alpha_m * m^2 / Z
@@ -211,7 +214,33 @@ uint64_t hll_estimate(const HllPp<P>* sketch) noexcept {
             std::log(static_cast<double>(m) / static_cast<double>(zeros));
     }
     if (e < 0.0) e = 0.0;
-    return static_cast<uint64_t>(e + 0.5);
+    const double rounded = e + 0.5;
+    // UINT64_MAX rounds to 2^64 as double: conversion at/above it is unsafe.
+    if (rounded >= static_cast<double>(UINT64_MAX)) return UINT64_MAX;
+    return static_cast<uint64_t>(rounded);
+}
+
+// ---------------------------------------------------------------------------
+// hll_estimate_checked — validate untrusted registers before any table lookup,
+// then reuse the trusted estimator. Returns false for null inputs or a rank
+// above 65-P. Output must be writable uint64_t storage disjoint from the sketch.
+// A non-null output is zero on failure; success has the same
+// approximate, rounded, saturating result as hll_estimate (not a bound).
+// ---------------------------------------------------------------------------
+template <uint8_t P>
+bool hll_estimate_checked(const HllPp<P>* sketch, uint64_t* estimate) noexcept {
+    if (estimate == nullptr) return false;
+    *estimate = 0;
+    if (sketch == nullptr) return false;
+    assert(estimate != nullptr);
+    assert(sketch != nullptr);
+    constexpr uint8_t max_rank = 65u - P;
+    constexpr uint32_t m = HllPp<P>::k_num_registers;
+    for (uint32_t i = 0; i < m; ++i) {
+        if (sketch->registers[i] > max_rank) return false;
+    }
+    *estimate = hll_estimate(sketch);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

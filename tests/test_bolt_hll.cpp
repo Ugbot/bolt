@@ -28,6 +28,7 @@ using bolt::kernels::hll::hll_init;
 using bolt::kernels::hll::hll_add_batch;
 using bolt::kernels::hll::hll_add_hash;
 using bolt::kernels::hll::hll_estimate;
+using bolt::kernels::hll::hll_estimate_checked;
 using bolt::kernels::hll::hll_merge;
 
 // Deterministic distinct-key stream: i in [0, n) hashed once per call.
@@ -88,6 +89,129 @@ TEST(BoltHll, SmallExactRange) {
     // at 10 distinct hashes on 16384 buckets.
     EXPECT_GE(est, 9u);
     EXPECT_LE(est, 11u);
+}
+
+// ---------------------------------------------------------------------------
+// Checked estimation for persisted/untrusted sketches.
+// ---------------------------------------------------------------------------
+
+template <uint8_t P>
+static void check_empty_estimate() {
+    HllPp<P> s;
+    hll_init(&s);
+    uint64_t estimate = UINT64_MAX;
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, 0u);
+}
+
+TEST(BoltHll, CheckedEmptySketchEstimatesZero) {
+    check_empty_estimate<4>();
+    check_empty_estimate<12>();
+    check_empty_estimate<14>();
+    check_empty_estimate<18>();
+}
+
+TEST(BoltHll, CheckedNullInputsReject) {
+    HllPp<14> s;
+    hll_init(&s);
+    uint64_t estimate = UINT64_MAX;
+    EXPECT_FALSE(hll_estimate_checked<14>(nullptr, &estimate));
+    EXPECT_EQ(estimate, 0u);
+    EXPECT_FALSE(hll_estimate_checked(&s, nullptr));
+    EXPECT_FALSE(hll_estimate_checked<14>(nullptr, nullptr));
+}
+
+template <uint8_t P>
+static void check_generated_estimate() {
+    HllPp<P> s;
+    hll_init(&s);
+    // Exercise both linear counting and the raw estimator with fixed keys.
+    for (uint64_t i = 0; i < 100; ++i) hll_add_u64(&s, i + 0xC0FFEEu);
+    uint64_t estimate = 0;
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, hll_estimate(&s));
+    EXPECT_GT(estimate, 0u);
+    for (uint64_t i = 100; i < 50'000; ++i) hll_add_u64(&s, i + 0xC0FFEEu);
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, hll_estimate(&s));
+    EXPECT_LT(estimate, UINT64_MAX);
+}
+
+TEST(BoltHll, CheckedGeneratedEstimatesMatchTrusted) {
+    check_generated_estimate<12>();
+    check_generated_estimate<14>();
+}
+
+template <uint8_t P>
+static void check_invalid_registers() {
+    HllPp<P> s;
+    constexpr uint32_t m = HllPp<P>::k_num_registers;
+    constexpr uint8_t invalid_ranks[] = {66u - P, 65u, 255u};
+    constexpr uint32_t positions[] = {0u, m / 2u, m - 1u};
+    for (uint8_t rank : invalid_ranks) {
+        for (uint32_t position : positions) {
+            SCOPED_TRACE(::testing::Message() << "P=" << unsigned(P)
+                         << " rank=" << unsigned(rank) << " index=" << position);
+            hll_init(&s);
+            s.registers[position] = rank;
+            uint64_t estimate = UINT64_MAX;
+            EXPECT_FALSE(hll_estimate_checked(&s, &estimate));
+            EXPECT_EQ(estimate, 0u);
+        }
+    }
+}
+
+TEST(BoltHll, CheckedInvalidRegistersReject) {
+    check_invalid_registers<4>();
+    check_invalid_registers<12>();
+    check_invalid_registers<14>();
+    check_invalid_registers<18>();
+}
+
+template <uint8_t P>
+static void check_high_rank_estimates() {
+    HllPp<P> s;
+    constexpr uint8_t max_rank = 65u - P;
+    std::memset(s.registers, max_rank, sizeof(s.registers));
+    uint64_t estimate = 0;
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, UINT64_MAX);
+    EXPECT_EQ(hll_estimate(&s), UINT64_MAX);
+    // One rank lower stays within uint64_t and must not saturate early.
+    std::memset(s.registers, max_rank - 1u, sizeof(s.registers));
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, hll_estimate(&s));
+    EXPECT_GT(estimate, UINT64_MAX / 2u);
+    EXPECT_LT(estimate, UINT64_MAX);
+}
+
+TEST(BoltHll, ValidHighRanksSaturateWithoutPrematureClamping) {
+    check_high_rank_estimates<4>();
+    check_high_rank_estimates<12>();
+    check_high_rank_estimates<14>();
+    check_high_rank_estimates<18>();
+}
+
+template <uint8_t P>
+static void check_mixed_valid_registers() {
+    HllPp<P> s;
+    constexpr uint32_t m = HllPp<P>::k_num_registers;
+    for (uint32_t i = 0; i < m; ++i) s.registers[i] = uint8_t(i % 9u);
+    s.registers[0] = 65u - P;
+    s.registers[m / 2u] = 65u - P;
+    s.registers[m - 1u] = 65u - P;
+    uint64_t estimate = 0;
+    ASSERT_TRUE(hll_estimate_checked(&s, &estimate));
+    EXPECT_EQ(estimate, hll_estimate(&s));
+    EXPECT_GT(estimate, m);
+    EXPECT_LT(estimate, 32u * m);
+}
+
+TEST(BoltHll, CheckedMixedValidRegistersRemainOrdinary) {
+    check_mixed_valid_registers<4>();
+    check_mixed_valid_registers<12>();
+    check_mixed_valid_registers<14>();
+    check_mixed_valid_registers<18>();
 }
 
 // ---------------------------------------------------------------------------
