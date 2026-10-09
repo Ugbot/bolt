@@ -30,6 +30,7 @@ using bolt::kernels::hll::hll_add_hash;
 using bolt::kernels::hll::hll_estimate;
 using bolt::kernels::hll::hll_estimate_checked;
 using bolt::kernels::hll::hll_merge;
+using bolt::kernels::hll::hll_merge_registers;
 
 // Deterministic distinct-key stream: i in [0, n) hashed once per call.
 // Insert each distinct key 3x to stress register-update idempotence.
@@ -226,6 +227,107 @@ TEST(BoltHll, ErrorRate_100M)       { EXPECT_LT(measure_error<14>(100'000'000), 
 // ---------------------------------------------------------------------------
 // Merge correctness + associativity.
 // ---------------------------------------------------------------------------
+
+// Heap-backed test sketches keep P=18 within the Windows default stack.
+// The source itself is byte storage offset from a 16-byte-aligned base.
+template <uint8_t P>
+static void check_byte_merge_patterns() {
+    constexpr uint32_t m = HllPp<P>::k_num_registers;
+    constexpr uint8_t max_rank = 65u - P;
+    std::vector<HllPp<P>> sketches(3);
+    alignas(16) uint8_t storage[m + 2u];
+    uint8_t* const source = storage + 1u;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(source) % 16u, 1u);
+    for (uint32_t pattern = 0; pattern < 4; ++pattern) {
+        SCOPED_TRACE(::testing::Message() << "P=" << unsigned(P)
+                     << " pattern=" << pattern);
+        std::memset(storage, 0xA5, sizeof(storage));
+        std::vector<uint8_t> expected(m);
+        for (uint32_t i = 0; i < m; ++i) {
+            uint8_t rank = 0;
+            if (pattern == 1u && (i == 0u || i == m / 2u || i == m - 1u)) {
+                rank = max_rank;
+            } else if (pattern == 2u) {
+                rank = static_cast<uint8_t>(1u + i % max_rank);
+            } else if (pattern == 3u) {
+                rank = max_rank;
+            }
+            source[i] = rank;
+            sketches[0].registers[i] = rank;
+            const uint8_t initial = static_cast<uint8_t>((7u * i + 11u) % (max_rank + 1u));
+            sketches[1].registers[i] = initial;
+            sketches[2].registers[i] = initial;
+            // Independent oracle: update only where the source is greater.
+            expected[i] = initial;
+            if (rank > expected[i]) expected[i] = rank;
+        }
+        const std::vector<uint8_t> original(source, source + m);
+        for (uint32_t repeat = 0; repeat < 2; ++repeat) {
+            hll_merge(&sketches[1], &sketches[0]);
+            hll_merge_registers(&sketches[2], source);
+            EXPECT_EQ(std::memcmp(sketches[1].registers, expected.data(), m), 0);
+            EXPECT_EQ(std::memcmp(sketches[2].registers, expected.data(), m), 0);
+            EXPECT_EQ(std::memcmp(source, original.data(), m), 0);
+            EXPECT_EQ(std::memcmp(sketches[0].registers, original.data(), m), 0);
+            EXPECT_EQ(storage[0], 0xA5u);
+            EXPECT_EQ(storage[m + 1u], 0xA5u);
+        }
+    }
+}
+
+TEST(BoltHll, ByteMergeUnalignedPatternsMatchOracleAndTyped) {
+    check_byte_merge_patterns<4>();
+    check_byte_merge_patterns<12>();
+    check_byte_merge_patterns<14>();
+    check_byte_merge_patterns<18>();
+}
+
+template <uint8_t P>
+static void check_byte_merge_union() {
+    constexpr uint32_t m = HllPp<P>::k_num_registers;
+    constexpr uint64_t n = 4096;
+    SCOPED_TRACE(::testing::Message() << "P=" << unsigned(P));
+    std::vector<HllPp<P>> sketches(4);
+    for (uint32_t i = 0; i < 4; ++i) hll_init(&sketches[i]);
+    for (uint64_t key = 0; key < n; ++key) {
+        hll_add_u64(&sketches[0], key);
+        hll_add_u64(&sketches[1], key);
+    }
+    for (uint64_t key = n / 2u; key < 3u * n / 2u; ++key) {
+        hll_add_u64(&sketches[2], key);
+    }
+    for (uint64_t key = 0; key < 3u * n / 2u; ++key) {
+        hll_add_u64(&sketches[3], key);
+    }
+    alignas(16) uint8_t storage[m + 2u];
+    std::memset(storage, 0xA5, sizeof(storage));
+    uint8_t* const source = storage + 1u;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(source) % 16u, 1u);
+    std::memcpy(source, sketches[2].registers, m);
+    const std::vector<uint8_t> original(source, source + m);
+    std::vector<uint8_t> expected(sketches[0].registers, sketches[0].registers + m);
+    for (uint32_t i = 0; i < m; ++i) {
+        if (source[i] > expected[i]) expected[i] = source[i];
+    }
+    for (uint32_t repeat = 0; repeat < 3; ++repeat) {
+        hll_merge(&sketches[0], &sketches[2]);
+        hll_merge_registers(&sketches[1], source);
+        EXPECT_EQ(std::memcmp(sketches[0].registers, expected.data(), m), 0);
+        EXPECT_EQ(std::memcmp(sketches[1].registers, expected.data(), m), 0);
+        EXPECT_EQ(std::memcmp(sketches[1].registers, sketches[3].registers, m), 0);
+        EXPECT_EQ(std::memcmp(source, original.data(), m), 0);
+        EXPECT_EQ(std::memcmp(sketches[2].registers, original.data(), m), 0);
+        EXPECT_EQ(storage[0], 0xA5u);
+        EXPECT_EQ(storage[m + 1u], 0xA5u);
+    }
+}
+
+TEST(BoltHll, ByteMergeRepeatedOverlappingKeyUnionMatchesTyped) {
+    check_byte_merge_union<4>();
+    check_byte_merge_union<12>();
+    check_byte_merge_union<14>();
+    check_byte_merge_union<18>();
+}
 
 TEST(BoltHll, MergeMatchesUnion) {
     // Build A over [0, N), B over [N/2, 3N/2). Merge(A, B) should

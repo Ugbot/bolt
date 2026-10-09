@@ -124,21 +124,42 @@ void hll_add_batch(HllPp<P>* sketch,
 }
 
 // ---------------------------------------------------------------------------
-// hll_merge — register-wise max into dst. Both sketches must share P.
+// hll_merge_registers — trusted register-wise max into a live writable dst.
+// src supplies exactly 2^P readable bytes; no alignment or HllPp object is
+// required. Both pointers must be nonnull and their accessed ranges disjoint.
+// The caller establishes compatible precision/hash semantics and valid ranks
+// (0..65-P) before entry; this kernel does not validate or estimate them.
+// ---------------------------------------------------------------------------
+template <uint8_t P>
+void hll_merge_registers(HllPp<P>* dst, const uint8_t* src) noexcept {
+    assert(dst != nullptr);
+    assert(src != nullptr);
+    uint8_t* BOLT_RESTRICT d       = dst->registers;
+    const uint8_t* BOLT_RESTRICT s = src;
+    constexpr uint32_t m           = HllPp<P>::k_num_registers;
+    [[maybe_unused]] const uintptr_t d_address = reinterpret_cast<uintptr_t>(d);
+    [[maybe_unused]] const uintptr_t s_address = reinterpret_cast<uintptr_t>(s);
+    // Subtract ordered integer addresses instead of adding m (may overflow)
+    // or ordering unrelated C++ pointers. No register-validation pass.
+    assert(d_address <= s_address ? s_address - d_address >= m
+                                  : d_address - s_address >= m);
+    for (uint32_t i = 0; i < m; ++i) {
+        const uint8_t a = d[i];
+        const uint8_t b = s[i];
+        d[i] = (a > b) ? a : b;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hll_merge — register-wise max into dst. Both sketches must share P and
+// compatible hash semantics; nonnull sketches must be distinct and disjoint.
 // ---------------------------------------------------------------------------
 template <uint8_t P>
 void hll_merge(HllPp<P>* dst, const HllPp<P>* src) noexcept {
     assert(dst != nullptr);
     assert(src != nullptr);
     assert(dst != src);
-    uint8_t* BOLT_RESTRICT d       = dst->registers;
-    const uint8_t* BOLT_RESTRICT s = src->registers;
-    constexpr uint32_t m           = HllPp<P>::k_num_registers;
-    for (uint32_t i = 0; i < m; ++i) {
-        const uint8_t a = d[i];
-        const uint8_t b = s[i];
-        d[i] = (a > b) ? a : b;
-    }
+    hll_merge_registers(dst, src->registers);
 }
 
 // ---------------------------------------------------------------------------
