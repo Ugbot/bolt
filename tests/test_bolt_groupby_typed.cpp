@@ -1248,3 +1248,90 @@ TEST(BoltGroupbyTypedG2graph382, CollidingGroupsSurviveMergeAndGrow) {
 }
 
 }  // namespace g2graph382
+
+// G2CHK-736: literal raw coefficients isolate scale capping from overflow.
+// Decimal64 high scales are synthetic physical-lane coverage, not SQL declarations.
+void check_decimal_avg_output(const BoltColumn& keys, const BoltColumn& avg,
+                              uint32_t ng, uint8_t scale, int64_t positive) {
+    ASSERT_EQ(ng, 4u);
+    EXPECT_EQ(avg.type, BoltType::Decimal128);
+    EXPECT_EQ(avg.decimal_scale, scale);
+    const auto* ks = static_cast<const int64_t*>(keys.data);
+    const auto* raw = static_cast<const dec::Decimal128*>(avg.data);
+    uint32_t seen = 0;
+    for (uint32_t r = 0; r < 4; ++r) {
+        ASSERT_GE(ks[r], 0); ASSERT_LT(ks[r], 4);
+        seen |= 1u << ks[r];
+        const int64_t expected = ks[r] == 0 ? positive : ks[r] == 1 ? -positive : 0;
+        EXPECT_EQ(raw[r].lo, expected) << "group=" << ks[r];
+        EXPECT_EQ(raw[r].hi, expected < 0 ? -1 : 0) << "group=" << ks[r];
+    }
+    EXPECT_EQ(seen, 15u);
+}
+
+TEST(BoltGroupbyTypedG2chk736, DecimalAvgScaleCeilingAllFinalizers) {
+    constexpr uint8_t scales[] = {2, 34, 35, 36, 37, 38};
+    constexpr int64_t expected[] = {25000, 25000, 2500, 250, 25, 2};
+    int64_t ks[] = {0,0,0,1,1,1,2,2,2,3,3,3};
+    int64_t v64[] = {1,4,99,-1,-4,99,1,-1,99,99,99,99};
+    dec::Decimal128 v128[12];
+    for (uint32_t i = 0; i < 12; ++i) v128[i] = dec::d128_from_i64(v64[i]);
+    uint8_t valid[] = {0xdb, 0}; // valid: 0,1,3,4,6,7; NULLs never enter sum/count.
+    uint32_t first[] = {0,2,4,6,8,10}, second[] = {1,3,5,7,9,11};
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        for (uint32_t s = 0; s < 6; ++s) {
+            for (uint32_t path = 0; path < 3; ++path) {
+                SCOPED_TRACE(::testing::Message() << "lane=" << lane << " scale=" << +scales[s] << " path=" << path);
+                Arena arena;
+                BoltColumn key = BoltColumn::make_flat(ks, nullptr, 12, BoltType::Int64);
+                BoltColumn val = BoltColumn::make_flat(lane ? static_cast<void*>(v128) : v64,
+                    valid, 12, lane ? BoltType::Decimal128 : BoltType::Decimal64);
+                val.decimal_scale = scales[s];
+                AggSpec spec = make_spec(AggKind::Avg, 0);
+                BoltColumn out_keys[1], out_avg[1]; uint32_t ng = 0;
+                if (path == 0) {
+                    ASSERT_TRUE(groupby_agg_multi_key_typed(&key,1,&val,1,&spec,1,12,
+                        out_keys,out_avg,&ng,&arena,8));
+                } else {
+                    GroupbyTypedState dst{}, src{};
+                    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&dst,&arena,&key,1,&val,1,&spec,1,8));
+                    groupby_agg_multi_key_typed_ingest(&dst,&key,&val,first,6,12);
+                    ASSERT_FALSE(dst.oom);
+                    if (path == 1) {
+                        groupby_agg_multi_key_typed_ingest(&dst,&key,&val,second,6,12);
+                    } else {
+                        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&src,&arena,&key,1,&val,1,&spec,1,8));
+                        groupby_agg_multi_key_typed_ingest(&src,&key,&val,second,6,12);
+                        ASSERT_FALSE(src.oom);
+                        ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&dst,&src));
+                    }
+                    ASSERT_FALSE(dst.oom);
+                    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&dst,out_keys,out_avg,&ng));
+                }
+                check_decimal_avg_output(out_keys[0],out_avg[0],ng,s == 0 ? 6 : 38,expected[s]);
+            }
+        }
+    }
+}
+
+TEST(BoltGroupbyTypedG2chk736, DecimalAvgEmptyGrouped) {
+    for (uint32_t path = 0; path < 2; ++path) {
+        Arena arena;
+        int64_t dummy = 0;
+        BoltColumn key = BoltColumn::make_flat(&dummy,nullptr,0,BoltType::Int64);
+        BoltColumn val = BoltColumn::make_flat(&dummy,nullptr,0,BoltType::Decimal64);
+        val.decimal_scale = 38;
+        AggSpec spec = make_spec(AggKind::Avg,0);
+        BoltColumn ok[1], oa[1]; uint32_t ng = 99;
+        if (path == 0) {
+            ASSERT_TRUE(groupby_agg_multi_key_typed(&key,1,&val,1,&spec,1,0,ok,oa,&ng,&arena,8));
+        } else {
+            GroupbyTypedState st{};
+            ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st,&arena,&key,1,&val,1,&spec,1,8));
+            ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st,ok,oa,&ng));
+        }
+        EXPECT_EQ(ng,0u);
+        EXPECT_EQ(oa[0].type,BoltType::Decimal128);
+        EXPECT_EQ(oa[0].decimal_scale,38);
+    }
+}

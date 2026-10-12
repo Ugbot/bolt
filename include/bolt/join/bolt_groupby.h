@@ -17,6 +17,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_branchless.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_decimal_scale.h"
 #include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
@@ -2114,7 +2115,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
         out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
         if (ot == BoltType::Decimal128 || ot == BoltType::Decimal64) {
             out_aggs[j].decimal_scale = (state->specs[j].kind == AggKind::Avg)
-                ? static_cast<uint8_t>(state->agg_in_scales[j] + 4)
+                ? decimal_avg_scale(state->agg_in_scales[j])
                 : state->agg_in_scales[j];
         }
         // G2FEAT-283: spilled Utf8 MIN/MAX winners point into our own per-agg
@@ -2210,7 +2211,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
                 if (ot == BoltType::Decimal128) {
                     dec::Decimal128 s; std::memcpy(&s, &acc, 16);
                     const uint8_t in_s  = state->agg_in_scales[j];
-                    const uint8_t out_s = static_cast<uint8_t>(in_s + 4);
+                    const uint8_t out_s = out_aggs[j].decimal_scale;
                     const dec::Decimal128 num = dec::d128_rescale(s, in_s, out_s);
                     const dec::Decimal128 q   = (cnt > 0)
                         ? dec::d128_div(num, dec::d128_from_i64(cnt))
@@ -2463,10 +2464,10 @@ inline bool groupby_agg_multi_key_typed(
         const BoltType ot = gb_detail::out_type(aggs[j].kind, agg_in_types[j]);
         out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
         if (ot == BoltType::Decimal128 || ot == BoltType::Decimal64) {
-            // AVG widens scale slightly so integer division keeps precision;
+            // AVG retains up to four extra fractional digits, capped at scale 38;
             // SUM/MIN/MAX preserve input scale.
             out_aggs[j].decimal_scale = (aggs[j].kind == AggKind::Avg)
-                ? static_cast<uint8_t>(agg_in_scales[j] + 4)
+                ? decimal_avg_scale(agg_in_scales[j])
                 : agg_in_scales[j];
         }
         if (out_n > 0 && out_aggs[j].data == nullptr) return false;
@@ -2581,7 +2582,7 @@ inline bool groupby_agg_multi_key_typed(
                 if (ot == BoltType::Decimal128) {
                     dec::Decimal128 s; std::memcpy(&s, &acc, 16);
                     const uint8_t in_s  = agg_in_scales[j];
-                    const uint8_t out_s = static_cast<uint8_t>(in_s + 4);
+                    const uint8_t out_s = out_aggs[j].decimal_scale;
                     const dec::Decimal128 num = dec::d128_rescale(s, in_s, out_s);
                     const dec::Decimal128 q   = (cnt > 0)
                         ? dec::d128_div(num, dec::d128_from_i64(cnt))
