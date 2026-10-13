@@ -1062,9 +1062,13 @@ endif()  # BOLT_BUILD_LAKEHOUSE
 add_executable(test_bolt_exact_depth EXCLUDE_FROM_ALL tests/test_bolt_exact_depth.cpp)
 target_link_libraries(test_bolt_exact_depth PRIVATE bolt::bolt)
 bolt_apply_hardening(test_bolt_exact_depth)
+add_executable(test_bolt_byte_reader EXCLUDE_FROM_ALL tests/test_bolt_byte_reader.cpp)
+target_link_libraries(test_bolt_byte_reader PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_byte_reader)
 
 if(BOLT_BUILD_TESTS)
     add_test(NAME test_bolt_exact_depth COMMAND test_bolt_exact_depth)
+    add_test(NAME test_bolt_byte_reader COMMAND test_bolt_byte_reader)
     enable_testing()
     include(BoltGTest)
     add_subdirectory(tests)
