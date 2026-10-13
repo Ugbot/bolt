@@ -225,3 +225,5 @@ via `FetchContent` when not found locally, so the build is self-contained on
 Windows without vcpkg.
 
 G2CHK-714 clone bounds and format/refusal contracts: [Utf8 clone copy bound](research/utf8-clone-copy-bound.md).
+
+Event-loop compile-time allocation bounds live in `include/bolt/api/net/event_loop_limits.h` (kind B): 16 callback pins and 256 readiness events. The registry and epoll/kqueue share these declarations.

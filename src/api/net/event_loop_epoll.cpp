@@ -244,7 +244,7 @@ private:
         return 0;
     }
 
-    static constexpr size_t kEventBatchCapacity = 256;
+    static constexpr size_t kEventBatchCapacity = limits::kEventBatchCapacity;
 
     int epoll_fd_;
     EventHandlerRegistry handlers_;

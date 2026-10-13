@@ -10,6 +10,7 @@
 #include "fd_registry.h"
 
 #include "bolt/api/net/event_loop.h"
+#include "bolt/api/net/event_loop_limits.h"
 
 #include <array>
 #include <cassert>
@@ -38,7 +39,7 @@ struct EventHandlerData {
 
 class EventHandlerRegistry {
 public:
-    static constexpr uint32_t kMaxDispatchDepth = 16;
+    static constexpr uint32_t kMaxDispatchDepth = limits::kMaxDispatchDepth;
 
     EventHandlerRegistry() noexcept = default;
     explicit EventHandlerRegistry(ArenaConfig arena_config) noexcept
