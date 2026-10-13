@@ -16,6 +16,23 @@ StringView equivalents. Generic hashing remains tier-selected.
 
 ## Directory Layout
 
+Shared-state layout is selected by `cmake/BoltAlignment.cmake` and exported
+through `bolt::core`: cache isolation defaults to 64 bytes, with explicit
+128-byte or compiler-target AUTO options; channel slots are independently
+64/128 bytes. Header-only callers also default to 64. Changing the default
+requires fresh consumer memory and tail-latency evidence; the historical
+Apple AUTO policy was not adopted during main convergence. Payload and wire
+layouts keep their existing alignment.
+
+The optional compiled `bolt::reactor` also owns native event loops. Its internal
+`src/api/net/event_handler_registry.h` layers bounded callback pins and
+registration identities over the shared `FdRegistry`. The epoll/kqueue backends
+snapshot identities before dispatch and use fixed 256-event batches; callbacks
+can remove/re-register handlers without destroying an active callable. Nested
+polling returns `EBUSY`. Portable and real-socket tests cover these lifetimes.
+IOCP handler migration still needs a cancel-and-drain protocol; see the
+[platform I/O audit](research/g2chk-85-platform-io-audit.md).
+
 ```
 bolt/
 ├── include/bolt/           ← Headers (the library)

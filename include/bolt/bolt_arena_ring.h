@@ -44,7 +44,7 @@
 namespace bolt {
 
 // Union: see TypedBatchPoolSlot — Arena is constructed only by `acquire`.
-struct alignas(64) ArenaRingSlot {
+struct alignas(bolt::config::kCacheIsolationBytes) ArenaRingSlot {
     union { Arena arena; };
     // Atomic: a pop that lost the CAS race reads it while its new holder
     // clears it; the generation tag discards that read.
@@ -69,11 +69,11 @@ BOLT_FORCE_INLINE uint64_t arena_ring_pack(uint32_t idx, uint32_t gen) noexcept 
 }
 
 template <uint32_t Capacity>
-struct alignas(64) ArenaRing {
+struct alignas(bolt::config::kCacheIsolationBytes) ArenaRing {
     using Slot = ArenaRingSlot;
 
-    alignas(64) std::atomic<uint64_t> free_head;
-    alignas(64) std::atomic<uint32_t> slots_used;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> free_head;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint32_t> slots_used;
     ArenaConfig                       arena_cfg;
     Slot                              slots[Capacity];
 

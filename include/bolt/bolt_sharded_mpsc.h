@@ -29,7 +29,7 @@ namespace bolt {
 
 #ifndef BOLT_KCACHELINE_DEFINED
 #define BOLT_KCACHELINE_DEFINED
-static constexpr size_t kCacheLineSize = 64;
+static constexpr size_t kCacheLineSize = config::kCacheIsolationBytes;
 #endif
 
 // One MPSC shard: bounded ring buffer, multi-producer claim via CAS,
@@ -98,7 +98,7 @@ public:
     }
 
 private:
-    struct alignas(kCacheLineSize) Slot {
+    struct alignas(config::kChannelSlotAlignmentBytes) Slot {
         std::atomic<size_t> seq;
         T data;
     };

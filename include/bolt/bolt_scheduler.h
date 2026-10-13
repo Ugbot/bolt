@@ -286,13 +286,13 @@ static constexpr uint32_t kTaskRingReserveRetries = 64;
 /// reserve a sequence with a CAS on `reserve`, store their slot, then publish
 /// `head` strictly in reservation order, so every slot below `head` is written
 /// and the consumer protocol (copy-then-claim on `tail`) is unchanged.
-struct alignas(64) TaskRing {
+struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
     Task ring[kTaskRingSize];
 
-    alignas(64) std::atomic<uint64_t> head;     // Published: slots < head are written
-    alignas(64) std::atomic<uint64_t> tail;     // Last claimed slot
-    alignas(64) std::atomic<uint64_t> reserve;  // Next sequence a producer may take
-    alignas(64) std::atomic<uint64_t> executed; // Task bodies that have returned
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> head;     // Published: slots < head are written
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> tail;     // Last claimed slot
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> reserve;  // Next sequence a producer may take
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> executed; // Task bodies that have returned
 
     void init() noexcept {
         memset(ring, 0, sizeof(ring));
@@ -519,7 +519,7 @@ struct Scheduler {
     // on Linux — no std::mutex or condition_variable. `submit_seq_` is
     // bumped on every task submission (and on shutdown) so parked
     // workers observing the old value are woken.
-    alignas(64) std::atomic<uint64_t> submit_seq_;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> submit_seq_;
 
     // E2 — adaptive morsel sizing (opt-in feedback).
     //

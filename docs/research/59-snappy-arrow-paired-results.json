@@ -1,0 +1,29 @@
+{
+  "date": "2026-09-21",
+  "host": "Mac17,6 / Apple ARM64 / 18 hardware threads",
+  "source_sha256": "ca0c7ca37a1e02c025df16889681db594186a6dfb7a78799c171d6504e31654e",
+  "binary_sha256": "96ac47e8bec1019b5de1184d44ed61d2193f6d8e37d38de6b8c1b8f19bef52cf",
+  "arrow_version": "21.0.0",
+  "arrow_git": "ee4d09ebef61c663c1efbfa4c18e518a03b798be",
+  "arrow_library_sha256": "89bb91b16f51fcddb3719419fffa91b3723822bf1426df2f85fd33f4feb3432c",
+  "host_load": [
+    "17:36  9 users, load averages: 5.22 3.90 5.47",
+    "17:37  9 users, load averages: 4.29 3.85 5.37"
+  ],
+  "corpora": [
+    {
+      "name": "clickbench",
+      "arguments": "hits.parquet 20 0,2,9,13,39 9",
+      "min_cpu_ratio": 1.1541,
+      "max_cpu_ratio": 1.4542,
+      "raw_output": "validated pages=2222 compressed=771452706 uncompressed=2294794527 max_page=1252525 checksum=061931e9bcd6f680 arrow=21.0.0 compiler=21.0.0 (clang-2100.3.34.2)\npair 0 order=BA bolt_cpu=828.955 arrow_cpu=579.834 bolt_wall=829.775 arrow_wall=580.335 ratio_cpu=1.4296\npair 1 order=AB bolt_cpu=830.534 arrow_cpu=571.142 bolt_wall=831.356 arrow_wall=573.764 ratio_cpu=1.4542\npair 2 order=BA bolt_cpu=830.551 arrow_cpu=579.598 bolt_wall=831.294 arrow_wall=580.638 ratio_cpu=1.4330\npair 3 order=AB bolt_cpu=830.299 arrow_cpu=573.136 bolt_wall=831.216 arrow_wall=576.649 ratio_cpu=1.4487\npair 4 order=BA bolt_cpu=785.746 arrow_cpu=680.853 bolt_wall=787.921 arrow_wall=682.512 ratio_cpu=1.1541\npair 5 order=AB bolt_cpu=932.996 arrow_cpu=663.655 bolt_wall=935.347 arrow_wall=665.111 ratio_cpu=1.4058\npair 6 order=BA bolt_cpu=826.164 arrow_cpu=573.500 bolt_wall=827.272 arrow_wall=574.785 ratio_cpu=1.4406\npair 7 order=AB bolt_cpu=827.438 arrow_cpu=577.834 bolt_wall=828.399 arrow_wall=578.440 ratio_cpu=1.4320\npair 8 order=BA bolt_cpu=826.637 arrow_cpu=578.548 bolt_wall=827.540 arrow_wall=579.276 ratio_cpu=1.4288\nsummary pairs=9 median_arrow_speedup_cpu=1.4320 median_arrow_speedup_wall=1.4317\n"
+    },
+    {
+      "name": "sf10_comment",
+      "arguments": "lineitem.parquet all 15 9",
+      "min_cpu_ratio": 1.3254,
+      "max_cpu_ratio": 1.3505,
+      "raw_output": "validated pages=489 compressed=763144463 uncompressed=1829650322 max_page=3756420 checksum=afc0b0fa41193fe2 arrow=21.0.0 compiler=21.0.0 (clang-2100.3.34.2)\npair 0 order=BA bolt_cpu=1067.521 arrow_cpu=801.802 bolt_wall=1069.147 arrow_wall=803.165 ratio_cpu=1.3314\npair 1 order=AB bolt_cpu=1075.186 arrow_cpu=801.412 bolt_wall=1076.336 arrow_wall=802.294 ratio_cpu=1.3416\npair 2 order=BA bolt_cpu=1077.354 arrow_cpu=797.743 bolt_wall=1078.408 arrow_wall=801.674 ratio_cpu=1.3505\npair 3 order=AB bolt_cpu=1078.701 arrow_cpu=806.148 bolt_wall=1080.122 arrow_wall=806.895 ratio_cpu=1.3381\npair 4 order=BA bolt_cpu=1077.192 arrow_cpu=805.903 bolt_wall=1078.283 arrow_wall=806.738 ratio_cpu=1.3366\npair 5 order=AB bolt_cpu=1073.943 arrow_cpu=805.685 bolt_wall=1077.968 arrow_wall=806.854 ratio_cpu=1.3330\npair 6 order=BA bolt_cpu=1093.785 arrow_cpu=817.503 bolt_wall=1094.878 arrow_wall=818.248 ratio_cpu=1.3380\npair 7 order=AB bolt_cpu=1090.992 arrow_cpu=815.946 bolt_wall=1092.273 arrow_wall=816.757 ratio_cpu=1.3371\npair 8 order=BA bolt_cpu=1084.534 arrow_cpu=818.286 bolt_wall=1087.143 arrow_wall=819.071 ratio_cpu=1.3254\nsummary pairs=9 median_arrow_speedup_cpu=1.3371 median_arrow_speedup_wall=1.3373\n"
+    }
+  ]
+}

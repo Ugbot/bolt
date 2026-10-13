@@ -1,3 +1,21 @@
+add_executable(test_bolt_alignment test_bolt_alignment.cpp)
+target_link_libraries(test_bolt_alignment PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_alignment)
+add_test(NAME test_bolt_alignment COMMAND test_bolt_alignment)
+
+# IOCP's bounded association transaction is portable; actual IOCP stays Windows-only.
+add_executable(test_associated_handle_registry test_associated_handle_registry.cpp)
+target_link_libraries(test_associated_handle_registry
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_associated_handle_registry)
+add_test(NAME test_associated_handle_registry COMMAND test_associated_handle_registry)
+
+add_executable(test_event_handler_registry test_event_handler_registry.cpp)
+target_link_libraries(test_event_handler_registry
+    PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_event_handler_registry)
+add_test(NAME test_event_handler_registry COMMAND test_event_handler_registry)
+
 add_executable(test_bolt_primitives test_bolt_primitives.cpp)
 
 target_link_libraries(test_bolt_primitives
@@ -2230,7 +2248,6 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     target_link_libraries(test_bolt_event_loop
         PRIVATE
             bolt::reactor
-            GTest::gtest
             GTest::gtest_main
     )
     bolt_apply_hardening(test_bolt_event_loop)

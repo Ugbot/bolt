@@ -53,7 +53,7 @@ namespace bolt {
 // `arena` sits in a union so it stays unconstructed until `acquire`
 // placement-news it: a plain member would run Arena() (a 4 MiB block) per
 // slot at pool construction and the placement-new would then drop it.
-struct alignas(64) TypedBatchPoolSlot {
+struct alignas(bolt::config::kCacheIsolationBytes) TypedBatchPoolSlot {
     union { Arena arena; };
     BoltBatch batch;
     // Atomic: a pop that lost the CAS race reads it while its new holder
@@ -80,13 +80,13 @@ BOLT_FORCE_INLINE uint64_t typed_batch_pool_pack(uint32_t idx, uint32_t gen) noe
 }
 
 template <uint32_t Capacity>
-struct alignas(64) TypedBatchPool {
+struct alignas(bolt::config::kCacheIsolationBytes) TypedBatchPool {
     using Slot = TypedBatchPoolSlot;
 
     // Treiber stack head (generation + slot idx) and the "how many
     // slots have we constructed" counter, cache-line padded.
-    alignas(64) std::atomic<uint64_t> free_head;
-    alignas(64) std::atomic<uint32_t> slots_used;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> free_head;
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint32_t> slots_used;
 
     // Stored Arena config for lazy slot initialization.
     ArenaConfig arena_cfg;

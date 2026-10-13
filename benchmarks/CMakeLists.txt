@@ -277,3 +277,12 @@ add_executable(bench_rle_encodings bench_rle_encodings.cpp)
 target_link_libraries(bench_rle_encodings PRIVATE bolt::bolt)
 bolt_apply_hardening(bench_rle_encodings)
 bolt_apply_bench_tuning(bench_rle_encodings)
+
+# Shared-state versus channel-slot alignment, independently selectable.
+add_executable(bench_alignment bench_alignment.cpp)
+target_link_libraries(bench_alignment PRIVATE bolt::bolt)
+if(NOT MSVC)
+    target_link_libraries(bench_alignment PRIVATE Threads::Threads)
+endif()
+bolt_apply_hardening(bench_alignment)
+bolt_apply_bench_tuning(bench_alignment)

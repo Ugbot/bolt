@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include "bolt/bolt_config.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_sequence.h"
 
@@ -37,12 +38,12 @@
 namespace bolt {
 
 template <typename T>
-struct alignas(64) Seqlock {
+struct alignas(bolt::config::kCacheIsolationBytes) Seqlock {
     static_assert(std::is_trivially_copyable_v<T>,
                   "Seqlock<T> requires trivially copyable T");
 
     Sequence          seq;     // even = stable, odd = writing
-    alignas(64) T     value;
+    alignas(bolt::config::kCacheIsolationBytes) T     value;
 
     BOLT_FORCE_INLINE void init(const T& initial) noexcept {
         seq.store_relaxed(0);

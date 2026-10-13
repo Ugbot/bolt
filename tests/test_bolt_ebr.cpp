@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <thread>
 
 using namespace bolt;
@@ -322,9 +323,10 @@ void litmus_jitter(uint32_t n) noexcept {
 
 TEST(BoltEbr, PinStoreBufferingLitmus) {
     constexpr uint32_t kIters = 2000000;
-    auto* e = static_cast<Ebr*>(std::malloc(sizeof(Ebr)));
+    auto* e = new (std::nothrow) Ebr;
     ASSERT_NE(e, nullptr);
-    ebr_init(e, 1);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(e) % alignof(Ebr), 0u);
+    ASSERT_TRUE(ebr_init(e, 1));
 
     alignas(64) std::atomic<uint32_t> ptr_live{1};
     SpinBarrier start, scanned, reset;
@@ -365,5 +367,5 @@ TEST(BoltEbr, PinStoreBufferingLitmus) {
 
     EXPECT_EQ(violations, 0u) << "reader held the pointer while the scan saw no pin";
     ebr_destroy(e);
-    std::free(e);
+    delete e;
 }

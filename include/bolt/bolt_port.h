@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/bolt_config.h"
 // bolt_port.h — portability macros.
 // Compiles cleanly on MSVC, clang, clang-cl, gcc. No POSIX in the core.
 
@@ -175,6 +176,11 @@ BOLT_FORCE_INLINE int bolt_swar_find_byte_u64(uint64_t word, uint8_t b) noexcept
 // Aligned allocation (free-function form, noexcept)
 // ---------------------------------------------------------------------------
 BOLT_FORCE_INLINE void* bolt_aligned_alloc(size_t alignment, size_t size) noexcept {
+    if (alignment < sizeof(void*) || (alignment & (alignment - 1u)) != 0u)
+        return nullptr;
+    if (size > SIZE_MAX - (alignment - 1u)) return nullptr;
+    assert(alignment >= sizeof(void*));
+    assert((alignment & (alignment - 1u)) == 0u);
 #if BOLT_COMPILER_MSVC
     return _aligned_malloc(size, alignment);
 #else
@@ -227,13 +233,16 @@ BOLT_FORCE_INLINE void* bolt_aligned_alloc_huge(size_t size,
                                                 size_t* size_out) noexcept {
     assert(size > 0);
     assert(size_out != nullptr);
-    size_t rounded = (size + kBoltHugePageBytes - 1) &
-                     ~(kBoltHugePageBytes - 1);
+#if defined(BOLT_ENABLE_HUGE_PAGES) && BOLT_ENABLE_HUGE_PAGES != 0 && \
+    (defined(_WIN32) || defined(__linux__))
+    if (size > SIZE_MAX - (kBoltHugePageBytes - 1u)) return nullptr;
+    const size_t rounded = (size + kBoltHugePageBytes - 1) &
+                           ~(kBoltHugePageBytes - 1);
+#endif
 
 #if !defined(BOLT_ENABLE_HUGE_PAGES) || BOLT_ENABLE_HUGE_PAGES == 0
     // Compile-time off: fall back immediately, report the caller-requested
     // size cache-line rounded (64-byte aligned via bolt_aligned_alloc).
-    (void)rounded;
     *size_out = size;
     return bolt_aligned_alloc(64, size);
 #elif defined(_WIN32)

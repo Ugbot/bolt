@@ -1,7 +1,6 @@
 // bolt_sequence.h — cache-line-padded monotonic sequence counter.
 //
-// RULES: No exceptions. No RTTI. POD-ish (has an atomic member). Single
-// cache line (64 B). Zero allocation — embed by value in other structs.
+// RULES: No exceptions. No RTTI. POD-ish (has an atomic member). One configured isolation unit. Zero allocation — embed by value in other structs.
 //
 // Motivation. Every lock-free primitive we build — Disruptor, Seqlock,
 // RetireQueue, the scheduler's park/notify, producer-consumer cursors
@@ -13,7 +12,7 @@
 // a single implementation.
 //
 // Design:
-//   - `alignas(64)` on both the struct and its atomic field guarantees
+//   - `alignas(bolt::config::kCacheIsolationBytes)` on both the struct and its atomic field guarantees
 //     no false sharing across neighbouring Sequences.
 //   - All operations are `inline` and `BOLT_FORCE_INLINE` so the
 //     compiler inlines through to a single atomic op + branch.
@@ -30,8 +29,8 @@
 
 namespace bolt {
 
-struct alignas(64) Sequence {
-    alignas(64) std::atomic<uint64_t> value;
+struct alignas(bolt::config::kCacheIsolationBytes) Sequence {
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint64_t> value;
 
     BOLT_FORCE_INLINE Sequence() noexcept : value(0) {}
 
@@ -75,7 +74,7 @@ struct alignas(64) Sequence {
     Sequence& operator=(Sequence&&)      = delete;
 };
 
-static_assert(sizeof(Sequence) == 64, "Sequence must be cache-line sized");
-static_assert(alignof(Sequence) == 64, "Sequence must be cache-line aligned");
+static_assert(sizeof(Sequence) == config::kCacheIsolationBytes, "Sequence must be cache-line sized");
+static_assert(alignof(Sequence) == config::kCacheIsolationBytes, "Sequence must be cache-line aligned");
 
 }  // namespace bolt

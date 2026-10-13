@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/bolt_config.h"
 
 #include <coroutine>
 #include <exception>
@@ -14,7 +15,7 @@ namespace core {
 // Cache line size for false-sharing avoidance. Previously provided by
 // core/coro_pool.h (cut from the fork); defined here so worker_pool.h /
 // io_dispatcher.h alignas(core::kCacheLineSize) keep working.
-inline constexpr unsigned long long kCacheLineSize = 64;
+inline constexpr unsigned long long kCacheLineSize = bolt::config::kCacheIsolationBytes;
 
 /**
  * C++20 coroutine task type for async operations.

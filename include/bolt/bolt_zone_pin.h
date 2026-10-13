@@ -40,8 +40,8 @@
 
 namespace bolt {
 
-struct alignas(64) ZonePin {
-    alignas(64) std::atomic<uint32_t> readers;
+struct alignas(bolt::config::kCacheIsolationBytes) ZonePin {
+    alignas(bolt::config::kCacheIsolationBytes) std::atomic<uint32_t> readers;
 
     BOLT_FORCE_INLINE void init() noexcept {
         readers.store(0u, std::memory_order_relaxed);
