@@ -1,5 +1,10 @@
 add_executable(bench_bolt bench_bolt.cpp)
 
+add_executable(bench_csr_dijkstra bench_csr_dijkstra.cpp)
+target_link_libraries(bench_csr_dijkstra PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_csr_dijkstra)
+bolt_apply_bench_tuning(bench_csr_dijkstra)
+
 target_link_libraries(bench_bolt PRIVATE bolt::bolt)
 
 if(NOT MSVC)

@@ -16,7 +16,7 @@
 #include "bolt/kernels/bolt_csr.h"
 #include "bolt/kernels/bolt_csr_bfs.h"
 #include "bolt/kernels/bolt_csr_components.h"
-#include "bolt/kernels/bolt_csr_dijkstra.h"
+#include "bolt/kernels/bolt_csr_dijkstra_indexed.h"
 #include "bolt/kernels/bolt_csr_levels.h"
 #include "bolt/kernels/bolt_csr_pagerank.h"
 #include "bolt/kernels/bolt_csr_similarity.h"
@@ -129,8 +129,9 @@ std::vector<double> pagerank(const G& g, int32_t* iters) {
     return r;
 }
 
-template <typename G>
-std::vector<double> dijkstra(const G& g, const Csr& c, int64_t s, int* status) {
+template <typename Nbr, typename Eid>
+std::vector<double> dijkstra(const bk::CsrGraphT<Nbr, Eid>& g, const Csr& c,
+                             int64_t s, int* status) {
     const size_t n = static_cast<size_t>(g.n_nodes);
     std::vector<double> dist(n);
     std::vector<int64_t> par(n), ps(n), scratch(2 * n);
@@ -138,6 +139,17 @@ std::vector<double> dijkstra(const G& g, const Csr& c, int64_t s, int* status) {
     *status = static_cast<int>(bk::csr_dijkstra(&g, c.w.data(), s, -1, dist.data(),
                                                 par.data(), ps.data(),
                                                 scratch.data(), &settled));
+    std::vector<double> property(c.w.size()), indexed(n);
+    const int64_t edges = bk::csr_algo_num_edges(&g);
+    for (int64_t slot = 0; slot < edges; ++slot)
+        property[static_cast<size_t>(g.edge_ids[slot])] = c.w[static_cast<size_t>(slot)];
+    const bk::CsrIndexedWeights<double, Eid> weights{
+        property.data(), nullptr, g.edge_ids, 0, edges};
+    int64_t indexed_settled = 0;
+    const int indexed_status = static_cast<int>(bk::csr_dijkstra_indexed(&g,
+        weights, s, -1, indexed.data(), nullptr, nullptr, scratch.data(), &indexed_settled));
+    if (indexed_status != *status || indexed_settled != settled || indexed != dist)
+        std::printf("MISMATCH dijkstra indexed weights\n");
     // The recorded tree must realise every distance.
     for (size_t v = 0; v < n && *status == 0; ++v) {
         if (static_cast<int64_t>(v) == s || !std::isfinite(dist[v])) continue;

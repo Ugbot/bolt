@@ -2436,7 +2436,7 @@ add_test(NAME test_bolt_workers_kind_b COMMAND test_bolt_workers_kind_b)
 # random-graph property fuzz against networkx and a brute-force path
 # enumerator. The campaign form is `graph_algo_fuzz.py --cases 20000` under
 # the fuzz lock; exit 2 (networkx missing) reports SKIPPED, never passed.
-add_executable(test_bolt_csr_algo test_bolt_csr_algo.cpp)
+add_executable(test_bolt_csr_algo test_bolt_csr_algo.cpp test_bolt_csr_indexed_weights.cpp)
 target_link_libraries(test_bolt_csr_algo
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_csr_algo)
