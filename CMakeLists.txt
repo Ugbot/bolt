@@ -1059,7 +1059,12 @@ endif()  # BOLT_BUILD_LAKEHOUSE
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+add_executable(test_bolt_exact_depth EXCLUDE_FROM_ALL tests/test_bolt_exact_depth.cpp)
+target_link_libraries(test_bolt_exact_depth PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_exact_depth)
+
 if(BOLT_BUILD_TESTS)
+    add_test(NAME test_bolt_exact_depth COMMAND test_bolt_exact_depth)
     enable_testing()
     include(BoltGTest)
     add_subdirectory(tests)
