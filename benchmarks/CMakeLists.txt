@@ -291,3 +291,9 @@ if(NOT MSVC)
 endif()
 bolt_apply_hardening(bench_alignment)
 bolt_apply_bench_tuning(bench_alignment)
+
+# SBE bounded schema primitives versus an independent checked typed decoder.
+add_executable(bench_sbe_decode bench_sbe_decode.cpp)
+target_link_libraries(bench_sbe_decode PRIVATE bolt::core)
+bolt_apply_hardening(bench_sbe_decode)
+bolt_apply_bench_tuning(bench_sbe_decode)

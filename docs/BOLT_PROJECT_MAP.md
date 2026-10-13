@@ -33,6 +33,12 @@ polling returns `EBUSY`. Portable and real-socket tests cover these lifetimes.
 IOCP handler migration still needs a cancel-and-drain protocol; see the
 [platform I/O audit](research/g2chk-85-platform-io-audit.md).
 
+`include/bolt/wire/sbe{,_fields,_groups}.h` adds generic bounded SBE wire
+primitives over `ByteReader`: endian-specialized scalars, header identity,
+version/optional fields, explicit nested-group traversal and bounded variable
+data. This does not yet include an XML compiler, generated codec or BoltBatch
+source. [Contract, evidence and remaining work](research/sbe-bounded-wire.md).
+
 ```
 bolt/
 ├── include/bolt/           ← Headers (the library)

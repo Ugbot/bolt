@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/bolt_port.h"
 #include <bit>
 #include <cassert>
 #include <cstdint>
@@ -17,11 +18,11 @@ struct ByteView {
     std::uint32_t size = 0;
 };
 
-inline bool byte_reader_valid(const ByteReader& reader) noexcept {
+BOLT_FORCE_INLINE bool byte_reader_valid(const ByteReader& reader) noexcept {
     return reader.offset <= reader.size && (reader.data != nullptr || reader.size == 0);
 }
 
-inline bool read_bytes(ByteReader& reader, std::uint32_t count, ByteView& out) noexcept {
+BOLT_FORCE_INLINE bool read_bytes(ByteReader& reader, std::uint32_t count, ByteView& out) noexcept {
     if (!byte_reader_valid(reader) || count > reader.size - reader.offset) return false;
     out = {reader.data == nullptr ? nullptr : reader.data + reader.offset, count};
     reader.offset += count;
@@ -30,7 +31,7 @@ inline bool read_bytes(ByteReader& reader, std::uint32_t count, ByteView& out) n
     return true;
 }
 
-inline bool skip_bytes(ByteReader& reader, std::uint32_t count) noexcept {
+BOLT_FORCE_INLINE bool skip_bytes(ByteReader& reader, std::uint32_t count) noexcept {
     ByteView ignored{};
     if (!read_bytes(reader, count, ignored)) return false;
     assert(reader.offset <= reader.size);
@@ -38,7 +39,7 @@ inline bool skip_bytes(ByteReader& reader, std::uint32_t count) noexcept {
     return true;
 }
 
-template <typename T> inline bool read_le(ByteReader& reader, T& out) noexcept {
+template <typename T> BOLT_FORCE_INLINE bool read_le(ByteReader& reader, T& out) noexcept {
     static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool>);
     static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
     constexpr auto width = static_cast<std::uint32_t>(sizeof(T));
