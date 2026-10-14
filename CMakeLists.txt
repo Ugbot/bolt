@@ -685,6 +685,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_roaring.cpp
         src/ingest/bolt_zstd.cpp
         src/ingest/bolt_zstd_dec.cpp
+        src/ingest/bolt_zstd_stream.cpp
         src/ingest/bolt_gzip.cpp
         src/ingest/bolt_lz4.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)

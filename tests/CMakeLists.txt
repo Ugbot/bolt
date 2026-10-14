@@ -1418,6 +1418,15 @@ target_compile_definitions(test_bolt_zstd_dec PRIVATE
 bolt_apply_hardening(test_bolt_zstd_dec)
 add_test(NAME test_bolt_zstd_dec COMMAND test_bolt_zstd_dec)
 
+# G2FEAT-152: bounded caller-memory incremental Zstandard, shared entropy codec.
+add_executable(test_bolt_zstd_stream test_bolt_zstd_stream.cpp)
+target_link_libraries(test_bolt_zstd_stream
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_zstd_stream PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_zstd_stream)
+add_test(NAME test_bolt_zstd_stream COMMAND test_bolt_zstd_stream)
+
 add_executable(test_bolt_parquet_read test_bolt_parquet_read.cpp)
 target_link_libraries(test_bolt_parquet_read
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

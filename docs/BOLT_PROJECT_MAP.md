@@ -1,5 +1,9 @@
 # Bolt Project Map
 
+`ingest/bolt_zstd_stream.h` adds bounded caller-memory block/history-ring
+decoding with explicit consumption, backpressure, frame integrity and EOF.
+[Contract and scoped native evidence](research/zstd-streaming.md).
+
 `wire/dbn.h` adds borrowed bounded DBN1/2/3 metadata/record framing;
 `wire/fast.h` adds the exact stop-bit/presence-map/dictionary FAST1.1 subset.
 Typed Databento extraction and T7 venue templates remain in Chukonu.
