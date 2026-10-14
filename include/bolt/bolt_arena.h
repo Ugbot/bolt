@@ -107,6 +107,17 @@ public:
     void set_concurrent(bool on) noexcept { concurrent_ = on; }
     bool concurrent() const noexcept { return concurrent_; }
 
+    /// Freeze backing after startup preallocation/warming. Existing blocks,
+    /// including oversized blocks, remain reusable after reset; exhaustion
+    /// returns nullptr instead of allocating another block. Default is true.
+    /// Change policy only while allocation/reset/trim callers are quiescent.
+    void set_growth_enabled(bool enabled) noexcept {
+        assert(num_blocks_ <= kArenaMaxBlocks);
+        growth_enabled_ = enabled;
+        assert(growth_enabled_ == enabled);
+    }
+    bool growth_enabled() const noexcept { return growth_enabled_; }
+
     /// Bump-allocate. Returns nullptr if OOM or block table full.
     /// Cost: ~3ns fast path (pointer arithmetic + branch).
     void* allocate(size_t size, size_t alignment = 0) noexcept {
@@ -262,7 +273,7 @@ private:
     }
 
     bool grow(size_t min_size) noexcept {
-        if (num_blocks_ >= kArenaMaxBlocks) return false;
+        if (!growth_enabled_ || num_blocks_ >= kArenaMaxBlocks) return false;
 
         size_t sz = config_.initial_block_size;
         if (num_blocks_ > 0) {
@@ -331,7 +342,7 @@ private:
                     return reinterpret_cast<void*>(aligned);
                 }
             }
-            if (num_blocks_ >= kArenaMaxBlocks) return nullptr;
+            if (!growth_enabled_ || num_blocks_ >= kArenaMaxBlocks) return nullptr;
             const size_t sz = size + alignment;
             void* block = aligned_alloc_impl(config_.alignment, sz);
             if (block == nullptr) return nullptr;
@@ -413,6 +424,7 @@ private:
     // is set once before any sharing thread runs and cleared after they join,
     // so it needs no atomicity itself; alloc_lock_ serializes the bump.
     bool concurrent_ = false;
+    bool growth_enabled_ = true;
     std::atomic_flag alloc_lock_{};   // C++20: value-init is the clear state
 };
 

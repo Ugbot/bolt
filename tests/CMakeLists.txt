@@ -2212,6 +2212,12 @@ target_link_libraries(test_bolt_arena_concurrent
 bolt_apply_hardening(test_bolt_arena_concurrent)
 add_test(NAME test_bolt_arena_concurrent COMMAND test_bolt_arena_concurrent)
 
+add_executable(test_bolt_arena_frozen test_bolt_arena_frozen.cpp)
+target_link_libraries(test_bolt_arena_frozen
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_frozen)
+add_test(NAME test_bolt_arena_frozen COMMAND test_bolt_arena_frozen)
+
 # G2LAUNCH-35: trimmed arena blocks return to the OS.
 add_executable(test_bolt_arena_os_release test_bolt_arena_os_release.cpp)
 target_link_libraries(test_bolt_arena_os_release

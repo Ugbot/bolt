@@ -10,6 +10,7 @@ or plan prose. New topic → new file + add an entry below.
 
 ## Index
 
+- [arena-frozen-backing.md](arena-frozen-backing.md) — opt-in no-growth backing policy, warm-block reuse, bounded exhaustion and consumer qualification limits.
 - [sbe-bounded-wire.md](sbe-bounded-wire.md) — schema-neutral SBE scalar/header/group/data primitives, independent fixtures, format-parity backlog and honest benchmark boundary.
 - [utf8-clone-copy-bound.md](utf8-clone-copy-bound.md) — G2CHK-714: checked min(span,sum) spill-copy bound, duplicate/NULL/format contracts and lifetime limits.
 
