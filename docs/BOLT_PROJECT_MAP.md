@@ -43,6 +43,13 @@ version/optional fields, explicit nested-group traversal and bounded variable
 data. This does not yet include an XML compiler, generated codec or BoltBatch
 source. [Contract, evidence and remaining work](research/sbe-bounded-wire.md).
 
+`wire/mold_udp64.h` and `wire/soup_bin_tcp.h` provide allocation-free borrowed
+framing for MoldUDP64 downstream datagrams and one SoupBinTCP frame in a TCP
+prefix. Whole UDP frames validate before escape; Soup reports NeedMore versus
+consumed bytes and checks direction/type lengths. No sockets/session lifecycle
+or exchange recovery is implied. Independent framing/overflow tests passed
+Release Clang on 2026-10-14. [Contract](research/market-feed-framing.md).
+
 ```
 bolt/
 ├── include/bolt/           ← Headers (the library)
