@@ -666,6 +666,11 @@ bolt_apply_hardening(test_bolt_filter_null)
 
 add_test(NAME test_bolt_filter_null COMMAND test_bolt_filter_null)
 
+add_executable(test_bolt_integer_filter test_bolt_integer_filter.cpp)
+target_link_libraries(test_bolt_integer_filter PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_integer_filter)
+add_test(NAME test_bolt_integer_filter COMMAND test_bolt_integer_filter)
+
 # Indirect / argsort kernels — return a sorted index permutation (single
 # key + lexicographic multi-key) for the triple-store index build and
 # ORDER BY (sort perm, then gather columns). Stable, allocation-free.

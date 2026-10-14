@@ -1,5 +1,9 @@
 # Bolt Project Map
 
+`kernels/bolt_integer_filter.h` compares exact signed/unsigned widths with
+signed64 literals without narrowing/wrap, including null-mask offsets and
+selected rows. [Scope and evidence](research/integer-literal-filters.md).
+
 `ingest/bolt_zstd_stream.h` adds bounded caller-memory block/history-ring
 decoding with explicit consumption, backpressure, frame integrity and EOF.
 [Contract and scoped native evidence](research/zstd-streaming.md).
