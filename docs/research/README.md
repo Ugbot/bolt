@@ -10,6 +10,7 @@ or plan prose. New topic → new file + add an entry below.
 
 ## Index
 
+- [replica-proof-frame.md](replica-proof-frame.md) — bounded replica coverage envelopes, canonical fields, integrity and the authority/retention boundary.
 - [materialization-transport-primitives.md](materialization-transport-primitives.md) — caller-buffer HTTP response heads, explicit TLS I/O deadlines and scoped loopback evidence/limits.
 - [arena-frozen-backing.md](arena-frozen-backing.md) — opt-in no-growth backing policy, warm-block reuse, bounded exhaustion and consumer qualification limits.
 - [sbe-bounded-wire.md](sbe-bounded-wire.md) — schema-neutral SBE scalar/header/group/data primitives, independent fixtures, format-parity backlog and honest benchmark boundary.

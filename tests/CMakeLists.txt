@@ -2509,3 +2509,9 @@ add_executable(test_bolt_http_response_head test_bolt_http_response_head.cpp)
 target_link_libraries(test_bolt_http_response_head PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_http_response_head)
 add_test(NAME test_bolt_http_response_head COMMAND test_bolt_http_response_head)
+
+# Versioned replica coverage transport; no query admission is inferred here.
+add_executable(test_bolt_replica_proof_frame test_bolt_replica_proof_frame.cpp)
+target_link_libraries(test_bolt_replica_proof_frame PRIVATE bolt::crypto GTest::gtest_main)
+bolt_apply_hardening(test_bolt_replica_proof_frame)
+add_test(NAME test_bolt_replica_proof_frame COMMAND test_bolt_replica_proof_frame)
