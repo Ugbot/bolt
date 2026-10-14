@@ -131,9 +131,15 @@ inline uint32_t frame_serialize(uint64_t lsn, uint32_t table_id, uint64_t schema
 
 // ── frame_parse — parse + verify a frame from buf[0..len). Returns true on a
 // well-formed, checksum-valid frame; out.payload borrows buf. ────────────────
-inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noexcept {
-    assert(buf != nullptr);
+// Existing versioned Marble WAL transaction-envelope kind. Its raw source
+// header uses table0/schemaFP0 and carries target authority inside the payload.
+inline constexpr uint8_t kWalTxnEnvelopeKind = 9u;
+static_assert(kRecvMaxPayloadBytes <= UINT32_MAX - kFrameHeaderBytes);
+namespace wf_detail {
+inline bool parse_frame(const uint8_t* buf, uint32_t len, ParsedFrame& out,
+                        bool source_wal) noexcept {
     if (buf == nullptr || len < kFrameHeaderBytes) return false;
+    assert(buf != nullptr); assert(len >= kFrameHeaderBytes);
 
     const uint32_t frame_len   = wf_detail::rd32(buf + kOffFrameLen);
     const uint64_t checksum    = wf_detail::rd64(buf + kOffChecksum);
@@ -144,10 +150,12 @@ inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noex
     const uint8_t  kind        = buf[kOffKind];
     const uint32_t payload_len = wf_detail::rd32(buf + kOffPayloadLen);
 
+    // Check all bounds before addition/subtraction or checksum reads.
+    if (payload_len > kRecvMaxPayloadBytes || frame_len < kFrameHeaderBytes) return false;
     if (frame_len != kFrameHeaderBytes + payload_len) return false;
     if (frame_len > len)                              return false;
-    if (payload_len > kRecvMaxPayloadBytes)           return false;
-    if (table_id == 0u)                               return false;
+    if (source_wal && frame_len != len)               return false;
+    if (table_id == 0u && (!source_wal || kind != kWalTxnEnvelopeKind || schema_fp != 0)) return false;
     if (frame_checksum(buf + kChecksumCoverStart, frame_len - kChecksumCoverStart)
             != checksum)                              return false;
 
@@ -160,6 +168,16 @@ inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noex
     out.payload_len = payload_len;
     out.payload     = (payload_len > 0u) ? (buf + kFrameHeaderBytes) : nullptr;
     return true;
+}
+} // namespace wf_detail
+inline bool frame_parse(const uint8_t* buf, uint32_t len, ParsedFrame& out) noexcept {
+    return wf_detail::parse_frame(buf, len, out, false);
+}
+// Exact source-WAL syntax/integrity only, never authorization. Allows the
+// unchanged raw transaction table0/schemaFP0 spelling; nonzero-table legacy
+// shapes remain syntax-valid. A bound receiver validates payload authority.
+inline bool frame_parse_source_wal(const uint8_t* buf, uint32_t len, ParsedFrame& out) noexcept {
+    return wf_detail::parse_frame(buf, len, out, true);
 }
 
 // ── frame_make_ack — write a 16-byte ACK into buf (caller: ≥ kAckFrameBytes) ─
