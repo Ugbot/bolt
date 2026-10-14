@@ -1,0 +1,11 @@
+imbalance repeat=0 kernel=0 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=0 kernel=1 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=1 kernel=1 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=1 kernel=0 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=2 kernel=0 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=2 kernel=1 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=3 kernel=1 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=3 kernel=0 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=4 kernel=0 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+imbalance repeat=4 kernel=1 samples=10000 batch=64 batch_p50_ns=167 batch_p99_ns=250 checksum=337440 timer_included=true allocations=0
+Bolt exact depth: depth/arithmetic/format tests passed

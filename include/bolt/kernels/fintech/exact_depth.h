@@ -71,6 +71,37 @@ inline ExactDepthStatus exact_depth(const Level* levels, std::uint32_t count,
     out.consumed = quantity;
     return ExactDepthStatus::Ok;
 }
+// Strict quantity imbalance threshold. Pointers remain caller-owned/non-null;
+// ordering/side quality are caller concerns. Empty sides are Insufficient.
+// Every refusal resets direction; equality is neutral. No floating point.
+template <std::uint32_t Capacity, typename Level>
+inline ExactDepthStatus exact_depth_imbalance(const Level* bids, std::uint32_t bid_count,
+    const Level* asks, std::uint32_t ask_count, std::uint32_t numerator,
+    std::uint32_t denominator, std::int8_t& direction) noexcept {
+    static_assert(Capacity > 0);
+    assert(bids != nullptr);
+    assert(asks != nullptr);
+    direction = 0;
+    if (bid_count > Capacity || ask_count > Capacity || denominator == 0 ||
+        numerator > denominator) return ExactDepthStatus::Invalid;
+    ExactDepthResult bid{}, ask{};
+    auto status = exact_depth<Capacity>(bids, bid_count, 1, bid);
+    if (status != ExactDepthStatus::Ok) return status;
+    status = exact_depth<Capacity>(asks, ask_count, 1, ask);
+    if (status != ExactDepthStatus::Ok) return status;
+    constexpr auto max = std::uint64_t(std::numeric_limits<std::int64_t>::max());
+    if (bid.capacity > max || ask.capacity > max) return ExactDepthStatus::Overflow;
+    const auto b = static_cast<std::int64_t>(bid.capacity);
+    const auto a = static_cast<std::int64_t>(ask.capacity);
+    std::int64_t difference = 0, total = 0, lhs = 0, rhs = 0;
+    if (!exact_sub(b, a, difference) || !exact_add(b, a, total) ||
+        !exact_multiply(difference, denominator, lhs) ||
+        !exact_multiply(total, numerator, rhs)) return ExactDepthStatus::Overflow;
+    assert(rhs >= 0);
+    direction = static_cast<std::int8_t>((lhs > rhs) - (lhs < -rhs));
+    assert(direction >= -1 && direction <= 1);
+    return ExactDepthStatus::Ok;
+}
 // Integer/rational formatting at a decimal quote scale of 100, with at most
 // eight decimals. A repeating fraction is truncated and explicitly not exact.
 inline bool exact_price_text(std::int64_t numerator, std::uint32_t denominator,
