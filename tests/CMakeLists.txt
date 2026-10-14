@@ -2492,3 +2492,9 @@ target_link_libraries(test_bolt_disruptor
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_disruptor)
 add_test(NAME test_bolt_disruptor COMMAND test_bolt_disruptor)
+
+# Explicit nonblocking UDP startup mode; blocking open defaults stay compatible.
+add_executable(test_bolt_udp_nonblocking test_bolt_udp_nonblocking.cpp)
+target_link_libraries(test_bolt_udp_nonblocking PRIVATE bolt::net GTest::gtest_main)
+bolt_apply_hardening(test_bolt_udp_nonblocking)
+add_test(NAME test_bolt_udp_nonblocking COMMAND test_bolt_udp_nonblocking)

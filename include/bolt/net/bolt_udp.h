@@ -62,6 +62,13 @@ bool udp_endpoint_open_at(UdpEndpoint* ep, std::uint32_t bind_ipv4,
                           std::uint16_t port,
                           std::uint32_t recv_timeout_ms) noexcept;
 
+// Set socket-wide nonblocking mode at startup. true makes receive return -1
+// immediately when no datagram is available; false restores blocking mode and
+// the configured SO_RCVTIMEO. Existing open defaults are unchanged. Returns
+// false for a closed endpoint or an OS configuration failure.
+// Preconditions: ep != nullptr; synchronize changes with all endpoint users.
+bool udp_endpoint_set_nonblocking(UdpEndpoint* ep, bool enabled) noexcept;
+
 // Legacy convenience: bind to 127.0.0.1. Equivalent to
 // udp_endpoint_open_at(ep, k_udp_loopback_ipv4, port, recv_timeout_ms).
 bool udp_endpoint_open(UdpEndpoint* ep, std::uint16_t port,
@@ -79,7 +86,7 @@ std::int64_t udp_send_to(const UdpEndpoint* ep, UdpAddr dst,
                          const void* buf, std::uint32_t len) noexcept;
 
 // Receive one datagram into `buf` (capacity `cap`). Blocks until a datagram
-// arrives or the recv timeout elapses. Returns the datagram length (>= 0,
+// arrives or the recv timeout elapses (unless nonblocking mode was set). Returns the datagram length (>= 0,
 // truncated to `cap`), or -1 on timeout/error. `src` (if non-null) gets the
 // sender's address.
 //

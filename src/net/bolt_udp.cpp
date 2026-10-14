@@ -23,6 +23,7 @@ using sock_t = SOCKET;
 constexpr sock_t k_bad_sock = INVALID_SOCKET;
 #else
 #  include <arpa/inet.h>
+#  include <fcntl.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
@@ -131,6 +132,21 @@ bool udp_endpoint_open_at(UdpEndpoint* ep, std::uint32_t bind_ipv4,
                           std::uint32_t recv_timeout_ms) noexcept {
     assert(ep != nullptr);
     return open_bound(ep, bind_ipv4, port, recv_timeout_ms, /*reuse=*/false);
+}
+
+bool udp_endpoint_set_nonblocking(UdpEndpoint* ep, bool enabled) noexcept {
+    assert(ep != nullptr);
+    assert(sizeof(ep->sock) >= sizeof(sock_t));
+    if (ep->sock == k_udp_invalid_sock) return false;
+#if defined(_WIN32)
+    u_long mode = enabled ? 1u : 0u;
+    return ::ioctlsocket(to_native(ep->sock), FIONBIO, &mode) == 0;
+#else
+    const int flags = ::fcntl(to_native(ep->sock), F_GETFL, 0);
+    if (flags < 0) return false;
+    const int desired = enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK;
+    return ::fcntl(to_native(ep->sock), F_SETFL, desired) == 0;
+#endif
 }
 
 bool udp_endpoint_open_reuse(UdpEndpoint* ep, std::uint32_t bind_ipv4,
