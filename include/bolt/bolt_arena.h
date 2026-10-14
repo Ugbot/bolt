@@ -118,6 +118,23 @@ public:
     }
     bool growth_enabled() const noexcept { return growth_enabled_; }
 
+    /// Read-only alias admission over ALL retained backing, including unused,
+    /// reset and oversized blocks. Does not dereference the proposed range.
+    /// Caller MUST exclusively own/quiesce allocation, reset, trim and growth;
+    /// this is not concurrent-growth-safe arena introspection.
+    bool overlaps_backing(const void* address, size_t size) const noexcept {
+        assert(num_blocks_ <= kArenaMaxBlocks);
+        assert(num_blocks_ <= sizeof(blocks_) / sizeof(blocks_[0]));
+        if (address == nullptr || size == 0) return false;
+        const auto begin = reinterpret_cast<uintptr_t>(address);
+        for (uint32_t i = 0; i < num_blocks_; ++i) {
+            const auto block = reinterpret_cast<uintptr_t>(blocks_[i]);
+            if (blocks_[i] == nullptr || block_sizes_[i] == 0) continue;
+            if (begin <= block ? block - begin < size : begin - block < block_sizes_[i]) return true;
+        }
+        return false;
+    }
+
     /// Bump-allocate. Returns nullptr if OOM or block table full.
     /// Cost: ~3ns fast path (pointer arithmetic + branch).
     void* allocate(size_t size, size_t alignment = 0) noexcept {

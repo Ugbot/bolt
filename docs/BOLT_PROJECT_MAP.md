@@ -50,6 +50,12 @@ consumed bytes and checks direction/type lengths. No sockets/session lifecycle
 or exchange recovery is implied. Independent framing/overflow tests passed
 Release Clang on 2026-10-14. [Contract](research/market-feed-framing.md).
 
+`Arena::overlaps_backing` admits cold-path external buffers against every
+retained arena block, including reset/unused/oversize backing. Callers must
+quiesce arena mutation. The bounded scan allocates nothing and does not alter
+allocation/reset behavior; range/overflow tests pass. Materialization capture
+uses it before any scratch reset to refuse aliased input/output (G2FEAT-143).
+
 ```
 bolt/
 ├── include/bolt/           ← Headers (the library)

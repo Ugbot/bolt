@@ -2217,6 +2217,10 @@ target_link_libraries(test_bolt_arena_frozen
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_arena_frozen)
 add_test(NAME test_bolt_arena_frozen COMMAND test_bolt_arena_frozen)
+add_executable(test_bolt_arena_ranges test_bolt_arena_ranges.cpp)
+target_link_libraries(test_bolt_arena_ranges PRIVATE bolt::core GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_ranges)
+add_test(NAME test_bolt_arena_ranges COMMAND test_bolt_arena_ranges)
 
 # G2LAUNCH-35: trimmed arena blocks return to the OS.
 add_executable(test_bolt_arena_os_release test_bolt_arena_os_release.cpp)
