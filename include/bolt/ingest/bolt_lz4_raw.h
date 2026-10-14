@@ -64,5 +64,16 @@ bool lz4_raw_compress(const uint8_t* src, uint64_t src_len,
 bool lz4_raw_decompress(const uint8_t* src, uint64_t src_len,
                         uint8_t* dst, uint64_t dst_cap) noexcept;
 
+// Decode a block whose output size is not carried by its transport. dst_cap is
+// an upper bound; on success *out_len is the actual size (including zero for
+// the encoded empty block). Requires a nonempty encoded block and independent
+// source, destination and out_len storage. No allocation or framing is added.
+// Failure sets *out_len=0; destination bytes are unspecified until success.
+// As for the exact-size decoder, transport integrity/framing is the caller's
+// responsibility. A shorter valid block is not detectable without that metadata.
+bool lz4_raw_decompress_bounded(const uint8_t* src, uint64_t src_len,
+                               uint8_t* dst, uint64_t dst_cap,
+                               uint64_t* out_len) noexcept;
+
 }  // namespace ingest
 }  // namespace bolt

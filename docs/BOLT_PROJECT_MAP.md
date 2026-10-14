@@ -1,5 +1,9 @@
 # Bolt Project Map
 
+Raw LZ4 supports exact decoded length for Parquet and a bounded-output API for
+transports without an uncompressed-size prefix. Both use the same allocation-free
+decoder with compile-time policy. [Contract and tests](research/lz4-bounded-transport.md).
+
 ## Overview
 
 Bolt is a zero-dependency columnar execution library. It is an alternative to

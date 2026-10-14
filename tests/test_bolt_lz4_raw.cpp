@@ -154,6 +154,17 @@ bool roundtrip(const std::vector<std::uint8_t>& in, std::string* why) {
     }
     if (out != in) { *why = "round trip changed the bytes"; return false; }
 
+    // Same compressed bytes, unknown decoded size and a larger admitted buffer.
+    std::vector<std::uint8_t> bounded(in.size() + 17u, 0xA5);
+    std::uint64_t produced = UINT64_MAX;
+    if (!bolt::ingest::lz4_raw_decompress_bounded(comp.data(), comp.size(),
+        bounded.data(), bounded.size(), &produced) || produced != in.size() ||
+        (!in.empty() && std::memcmp(bounded.data(), in.data(), in.size()) != 0)) {
+        *why = "bounded decoder disagreed"; return false;
+    }
+    for (std::size_t i = in.size(); i < bounded.size(); ++i)
+        if (bounded[i] != 0xA5) { *why = "bounded decoder touched unused capacity"; return false; }
+
     // The naive reference decoder must agree, byte for byte. This is what
     // catches a block that our decoder mis-reads in the same way our
     // compressor mis-writes it.
@@ -290,6 +301,31 @@ TEST(BoltLz4Raw, WrongExpectedLengthIsRefused) {
     EXPECT_TRUE(lz4_raw_decompress(c.data(), clen, out.data(), in.size()));
 }
 
+TEST(BoltLz4Raw, BoundedSizeReturnsOnlySuccessfulLengthAndPreservesCanaries) {
+    // Independent literal-only block; no compressor roundtrip assumptions.
+    const std::uint8_t literal[] = {0x50, 'h', 'e', 'l', 'l', 'o'};
+    std::uint8_t output[16]; std::memset(output, 0xA5, sizeof(output));
+    std::uint64_t produced = 123;
+    using bolt::ingest::lz4_raw_decompress_bounded;
+    ASSERT_TRUE(lz4_raw_decompress_bounded(literal, sizeof(literal), output, 15, &produced));
+    EXPECT_EQ(produced, 5u); EXPECT_EQ(std::memcmp(output, "hello", 5), 0);
+    for (std::size_t i = 5; i < sizeof(output); ++i) EXPECT_EQ(output[i], 0xA5);
+    EXPECT_FALSE(lz4_raw_decompress_bounded(literal, sizeof(literal), output, 4, &produced));
+    EXPECT_EQ(produced, 0u); EXPECT_EQ(output[15], 0xA5);
+    produced = 123;
+    EXPECT_FALSE(lz4_raw_decompress_bounded(literal, sizeof(literal)-1, output, 15, &produced));
+    EXPECT_EQ(produced, 0u);
+    const std::uint8_t zero_offset[] = {0x10, 'a', 0, 0};
+    EXPECT_FALSE(lz4_raw_decompress_bounded(zero_offset, sizeof(zero_offset), output, 15, &produced));
+    EXPECT_EQ(produced, 0u);
+    const std::uint8_t empty = 0;
+    EXPECT_TRUE(lz4_raw_decompress_bounded(&empty, 1, nullptr, 0, &produced));
+    EXPECT_EQ(produced, 0u);
+    EXPECT_FALSE(lz4_raw_decompress_bounded(nullptr, 0, nullptr, 0, &produced));
+    EXPECT_FALSE(lz4_raw_decompress_bounded(literal, sizeof(literal), nullptr, 16, &produced));
+    EXPECT_FALSE(lz4_raw_decompress_bounded(literal, sizeof(literal), output, 15, nullptr));
+}
+
 // ---- the gate must discriminate ------------------------------------------
 
 TEST(BoltLz4Raw, DiscriminatingPower) {
@@ -401,6 +437,14 @@ TEST(BoltLz4Raw, DecodesBlocksProducedByLiblz4) {
         ASSERT_TRUE(lz4_raw_decompress(comp, clen, out.data(), raw_len))
             << "bolt refused a block liblz4 produced";
         ASSERT_EQ(out, want) << "bolt decoded a liblz4 block to wrong bytes";
+        out.resize(static_cast<std::size_t>(raw_len) + 31u, 0xA5);
+        std::uint64_t produced = UINT64_MAX;
+        ASSERT_TRUE(bolt::ingest::lz4_raw_decompress_bounded(comp, clen,
+            out.data(), out.size(), &produced));
+        ASSERT_EQ(produced, raw_len);
+        for (std::size_t tail = raw_len; tail < out.size(); ++tail) EXPECT_EQ(out[tail], 0xA5);
+        out.resize(raw_len);
+        ASSERT_EQ(out, want) << "bounded decoder differs from the liblz4 vector";
         ++checked;
     }
     EXPECT_EQ(checked, count);

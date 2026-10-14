@@ -183,9 +183,13 @@ bool lz4_raw_compress(const uint8_t* src, uint64_t src_len,
     return true;
 }
 
-bool lz4_raw_decompress(const uint8_t* src, uint64_t src_len,
-                        uint8_t* dst, uint64_t dst_cap) noexcept {
+namespace {
+template<bool Exact>
+bool decompress_block(const uint8_t* src, uint64_t src_len,
+                      uint8_t* dst, uint64_t dst_cap, uint64_t* out_len) noexcept {
     assert(src != nullptr || src_len == 0);
+    assert(out_len != nullptr);
+    *out_len = 0;
     if (dst == nullptr && dst_cap != 0) return false;
     uint64_t ip = 0, op = 0;
     while (ip < src_len) {                       // bounded: ip strictly grows
@@ -219,10 +223,30 @@ bool lz4_raw_decompress(const uint8_t* src, uint64_t src_len,
         for (uint32_t i = 0; i < ml; ++i) o[i] = m[i];
         op += ml;
     }
-    // Parquet knows the exact uncompressed size; a block that yields anything
-    // else is corrupt, and accepting it would hand the caller a partly
-    // uninitialised buffer.
-    return op == dst_cap;
+    assert(op <= dst_cap);
+    if constexpr (Exact) { if (op != dst_cap) return false; }
+    *out_len = op;
+    return true;
+}
+} // namespace
+
+bool lz4_raw_decompress(const uint8_t* src, uint64_t src_len,
+                        uint8_t* dst, uint64_t dst_cap) noexcept {
+    assert(src != nullptr || src_len == 0);
+    assert(kMinMatch == 4u);
+    uint64_t produced = 0;
+    return decompress_block<true>(src, src_len, dst, dst_cap, &produced);
+}
+
+bool lz4_raw_decompress_bounded(const uint8_t* src, uint64_t src_len,
+                               uint8_t* dst, uint64_t dst_cap,
+                               uint64_t* out_len) noexcept {
+    assert(kMinMatch == 4u);
+    assert(sizeof(uint64_t) == 8u);
+    if (out_len == nullptr) return false;
+    *out_len = 0;
+    if (src == nullptr || src_len == 0u) return false;
+    return decompress_block<false>(src, src_len, dst, dst_cap, out_len);
 }
 
 }  // namespace ingest
