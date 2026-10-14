@@ -2527,3 +2527,8 @@ add_executable(test_bolt_soup_bin_tcp test_bolt_soup_bin_tcp.cpp)
 target_link_libraries(test_bolt_soup_bin_tcp PRIVATE bolt::core GTest::gtest_main)
 bolt_apply_hardening(test_bolt_soup_bin_tcp)
 add_test(NAME test_bolt_soup_bin_tcp COMMAND test_bolt_soup_bin_tcp)
+
+add_executable(test_fast_wire test_fast_wire.cpp)
+target_link_libraries(test_fast_wire PRIVATE bolt::core GTest::gtest_main)
+bolt_apply_hardening(test_fast_wire)
+add_test(NAME test_fast_wire COMMAND test_fast_wire)

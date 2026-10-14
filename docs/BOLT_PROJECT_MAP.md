@@ -1,5 +1,10 @@
 # Bolt Project Map
 
+`wire/dbn.h` adds borrowed bounded DBN1/2/3 metadata/record framing;
+`wire/fast.h` adds the exact stop-bit/presence-map/dictionary FAST1.1 subset.
+Typed Databento extraction and T7 venue templates remain in Chukonu.
+[Contracts, pins and verification scope](research/dbn-fast-wire.md).
+
 Raw LZ4 supports exact decoded length for Parquet and a bounded-output API for
 transports without an uncompressed-size prefix. Both use the same allocation-free
 decoder with compile-time policy. [Contract and tests](research/lz4-bounded-transport.md).
