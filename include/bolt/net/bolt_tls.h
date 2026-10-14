@@ -36,8 +36,9 @@ namespace bolt::net {
 //                         the handshake proceed against self-signed certs.
 // `handshake_timeout_ms`— wall-clock deadline for the connect+handshake
 //                         loop. 0 = library default (5000 ms).
-// `recv_timeout_ms`     — per-call deadline for send/recv. 0 = library
-//                         default (5000 ms).
+// `recv_timeout_ms`     — reserved configuration; legacy send/recv currently
+//                         use their library default (5000 ms). For explicit
+//                         per-call bounds use the timeout APIs below.
 struct TlsConfig {
     char           server_name[256];
     char           ca_path[512];
@@ -72,7 +73,7 @@ bool tls_client_connect(TlsSocket*       out,
                         std::uint16_t    port) noexcept;
 
 // Write `len` bytes. Returns `len` on success, -1 on error.
-// Bounded by cfg.recv_timeout_ms (per WANT_READ/WANT_WRITE re-arm).
+// Uses the library's default per-call deadline; cfg is not retained by socket.
 std::int64_t tls_send_all(const TlsSocket* s,
                           const void*      data,
                           std::uint32_t    len) noexcept;
@@ -88,6 +89,14 @@ bool tls_recv_all(const TlsSocket* s,
 std::int32_t tls_recv_some(const TlsSocket* s,
                            void*            data,
                            std::uint32_t    cap) noexcept;
+
+// Explicit finite per-call I/O deadline. Values 1..60000 ms are accepted;
+// zero/out-of-range/unconnected sockets return -1. TLS verification and
+// handshake behavior are unchanged. Existing APIs keep their defaults.
+std::int64_t tls_send_all_timeout(const TlsSocket*, const void*,
+                                  std::uint32_t len, std::uint32_t timeout_ms) noexcept;
+std::int32_t tls_recv_some_timeout(const TlsSocket*, void*,
+                                   std::uint32_t cap, std::uint32_t timeout_ms) noexcept;
 
 // Tear down: SSL_shutdown → SSL_free → SSL_CTX_free → close fd.
 // Safe to call on a zeroed TlsSocket (no-op).

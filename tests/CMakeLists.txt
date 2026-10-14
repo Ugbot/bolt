@@ -2504,3 +2504,8 @@ add_executable(test_bolt_udp_nonblocking test_bolt_udp_nonblocking.cpp)
 target_link_libraries(test_bolt_udp_nonblocking PRIVATE bolt::net GTest::gtest_main)
 bolt_apply_hardening(test_bolt_udp_nonblocking)
 add_test(NAME test_bolt_udp_nonblocking COMMAND test_bolt_udp_nonblocking)
+
+add_executable(test_bolt_http_response_head test_bolt_http_response_head.cpp)
+target_link_libraries(test_bolt_http_response_head PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_http_response_head)
+add_test(NAME test_bolt_http_response_head COMMAND test_bolt_http_response_head)

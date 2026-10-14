@@ -201,4 +201,90 @@ TEST(BoltTls, PeerResetDoesNotRaiseSigpipe) {
     EVP_PKEY_free(ss.key);
 }
 
+
+// Explicit I/O deadlines against a handshaken peer that produces no data.
+// Reuses the in-process certificate/server setup; never contacts public hosts.
+#include <atomic>
+#include <poll.h>
+namespace {
+struct SilentTlsPeer {
+    SelfSigned certificate{};
+    int listener=-1;
+    std::uint16_t port=0;
+    std::atomic<bool> stop{false},ready{false};
+    std::thread thread;
+    SilentTlsPeer() {
+        if (!make_self_signed(&certificate)) return;
+        listener=::socket(AF_INET,SOCK_STREAM,0); if (listener<0) return;
+        sockaddr_in address{}; address.sin_family=AF_INET;
+        address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        if (::bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))!=0 || ::listen(listener,1)!=0) return;
+        socklen_t bytes=sizeof(address);
+        if (::getsockname(listener,reinterpret_cast<sockaddr*>(&address),&bytes)!=0) return;
+        port=ntohs(address.sin_port);
+        thread=std::thread([this] {
+            pollfd waiting{listener,POLLIN,0}; if (::poll(&waiting,1,2000)<=0) return;
+            const auto fd=::accept(listener,nullptr,nullptr); if (fd<0) return;
+            timeval timeout{}; timeout.tv_sec=1;
+            ::setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+            const int window=4096;
+            if (::setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&window,sizeof(window))!=0) { ::close(fd); return; }
+            SSL_CTX* ctx=SSL_CTX_new(TLS_server_method()); SSL* ssl=nullptr;
+            if (ctx!=nullptr && SSL_CTX_use_certificate(ctx,certificate.cert)==1 && SSL_CTX_use_PrivateKey(ctx,certificate.key)==1) {
+                ssl=SSL_new(ctx);
+                if (ssl!=nullptr && SSL_set_fd(ssl,fd)==1 && SSL_accept(ssl)==1) {
+                    ready=true;
+                    for (auto i=0u;i<4000 && !stop;++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            if (ssl!=nullptr) SSL_free(ssl);
+            if (ctx!=nullptr) SSL_CTX_free(ctx);
+            ::close(fd);
+        });
+    }
+    ~SilentTlsPeer() {
+        stop=true; if (thread.joinable()) thread.join();
+        if (listener>=0) ::close(listener);
+        if (certificate.cert!=nullptr) X509_free(certificate.cert);
+        if (certificate.key!=nullptr) EVP_PKEY_free(certificate.key);
+    }
+    bool connect(bolt::net::TlsSocket& client) {
+        bolt::net::TlsConfig cfg{}; fill_default(&cfg,"localhost");
+        cfg.verify_peer=false; cfg.insecure_skip_verify=true; // local certificate diagnostic only
+        return bolt::net::tls_client_connect(&client,&cfg,INADDR_LOOPBACK,port);
+    }
+};
+}
+TEST(BoltTls, ExplicitReceiveDeadlineUsesRequestedBudget) {
+    SilentTlsPeer peer; ASSERT_NE(peer.port,0);
+    bolt::net::TlsSocket client{}; ASSERT_TRUE(peer.connect(client));
+    char bytes[64]{};
+    EXPECT_EQ(bolt::net::tls_recv_some_timeout(&client,bytes,sizeof(bytes),0),-1);
+    EXPECT_EQ(bolt::net::tls_recv_some_timeout(&client,bytes,sizeof(bytes),60001),-1);
+    const auto start=std::chrono::steady_clock::now();
+    const auto n=bolt::net::tls_recv_some_timeout(&client,bytes,sizeof(bytes),40);
+    const auto elapsed=std::chrono::steady_clock::now()-start;
+    EXPECT_EQ(n,-1); EXPECT_GE(elapsed,std::chrono::milliseconds(20));
+    EXPECT_LT(elapsed,std::chrono::milliseconds(500));
+    std::fprintf(stdout,"explicit TLS receive timeout: budget_ms=40 elapsed_ms=%lld\n",
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+    bolt::net::tls_close(&client); peer.stop=true;
+}
+TEST(BoltTls, ExplicitSendDeadlineBoundsNonReadingPeer) {
+    SilentTlsPeer peer; ASSERT_NE(peer.port,0);
+    bolt::net::TlsSocket client{}; ASSERT_TRUE(peer.connect(client));
+    const int window=4096;
+    EXPECT_EQ(::setsockopt(client.fd,SOL_SOCKET,SO_SNDBUF,&window,sizeof(window)),0);
+    static std::uint8_t bytes[4u*1024u*1024u]{};
+    EXPECT_EQ(bolt::net::tls_send_all_timeout(&client,bytes,sizeof(bytes),0),-1);
+    EXPECT_EQ(bolt::net::tls_send_all_timeout(&client,bytes,sizeof(bytes),60001),-1);
+    const auto start=std::chrono::steady_clock::now();
+    const auto n=bolt::net::tls_send_all_timeout(&client,bytes,sizeof(bytes),40);
+    const auto elapsed=std::chrono::steady_clock::now()-start;
+    EXPECT_EQ(n,-1); EXPECT_LT(elapsed,std::chrono::milliseconds(500));
+    std::fprintf(stdout,"explicit TLS send timeout: budget_ms=40 elapsed_ms=%lld\n",
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+    bolt::net::tls_close(&client); peer.stop=true;
+}
+
 #endif  // BOLT_WITH_TLS && !_WIN32

@@ -129,6 +129,16 @@ static std::int64_t deadline_from(std::uint16_t ms_in, std::uint16_t fallback) n
     return now_ms + static_cast<std::int64_t>(ms);
 }
 
+#if defined(BOLT_WITH_TLS)
+static bool io_deadline_expired(std::int64_t deadline_ms) noexcept {
+    assert(deadline_ms > 0);
+    assert(sizeof(deadline_ms) == 8);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now >= deadline_ms;
+}
+#endif
+
 // Connect a non-blocking TCP socket to (ipv4 in host order, port).
 // Returns kInvalidSock on failure; on success, the returned socket is
 // non-blocking and connected.
@@ -195,6 +205,8 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig*, std::uint32_t,
 std::int64_t tls_send_all(const TlsSocket*, const void*, std::uint32_t) noexcept { return -1; }
 bool         tls_recv_all(const TlsSocket*, void*, std::uint32_t) noexcept       { return false; }
 std::int32_t tls_recv_some(const TlsSocket*, void*, std::uint32_t) noexcept      { return -1; }
+std::int64_t tls_send_all_timeout(const TlsSocket*, const void*, std::uint32_t, std::uint32_t) noexcept { return -1; }
+std::int32_t tls_recv_some_timeout(const TlsSocket*, void*, std::uint32_t, std::uint32_t) noexcept { return -1; }
 void         tls_close(TlsSocket* s) noexcept {
     if (s) std::memset(s, 0, sizeof(*s));
 }
@@ -425,18 +437,22 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
 
 std::int64_t tls_send_all(const TlsSocket* s, const void* data,
                           std::uint32_t len) noexcept {
+    return tls_send_all_timeout(s, data, len, kDefaultRecvMs);
+}
+
+std::int64_t tls_send_all_timeout(const TlsSocket* s, const void* data,
+                          std::uint32_t len, std::uint32_t timeout_ms) noexcept {
     assert(s != nullptr && "tls_send_all: null s");
     assert(data != nullptr && "tls_send_all: null data");
-    if (!s->handshake_done || !s->ssl) return -1;
+    if (!s->handshake_done || !s->ssl || timeout_ms == 0 || timeout_ms > 60000u || len > INT32_MAX) return -1;
     SSL* ssl = static_cast<SSL*>(s->ssl);
     const sock_t fd = static_cast<sock_t>(s->fd);
 
-    // Use a fresh deadline per call (recv_timeout_ms doubles as send deadline).
-    // We can't reach cfg here — pick the library default.
-    const std::int64_t deadline = deadline_from(0, kDefaultRecvMs);
+    const std::int64_t deadline = deadline_from(static_cast<std::uint16_t>(timeout_ms), kDefaultRecvMs);
 
     std::uint32_t off = 0;
     while (off < len) {
+        if (io_deadline_expired(deadline)) return -1;
         const std::uint32_t chunk = len - off;
         const int rc = SSL_write(ssl, static_cast<const char*>(data) + off,
                                  static_cast<int>(chunk));
@@ -480,14 +496,20 @@ bool tls_recv_all(const TlsSocket* s, void* data, std::uint32_t len) noexcept {
 
 std::int32_t tls_recv_some(const TlsSocket* s, void* data,
                            std::uint32_t cap) noexcept {
+    return tls_recv_some_timeout(s, data, cap, kDefaultRecvMs);
+}
+
+std::int32_t tls_recv_some_timeout(const TlsSocket* s, void* data,
+                           std::uint32_t cap, std::uint32_t timeout_ms) noexcept {
     assert(s != nullptr && "tls_recv_some: null s");
     assert(data != nullptr && "tls_recv_some: null data");
-    if (!s->handshake_done || !s->ssl || cap == 0) return -1;
+    if (!s->handshake_done || !s->ssl || cap == 0 || timeout_ms == 0 || timeout_ms > 60000u || cap > INT32_MAX) return -1;
     SSL* ssl = static_cast<SSL*>(s->ssl);
     const sock_t fd = static_cast<sock_t>(s->fd);
-    const std::int64_t deadline = deadline_from(0, kDefaultRecvMs);
+    const std::int64_t deadline = deadline_from(static_cast<std::uint16_t>(timeout_ms), kDefaultRecvMs);
 
     for (int spins = 0; spins < 256; ++spins) {
+        if (io_deadline_expired(deadline)) return -1;
         const int rc = SSL_read(ssl, data, static_cast<int>(cap));
         if (rc > 0) return static_cast<std::int32_t>(rc);
         const int err = SSL_get_error(ssl, rc);
