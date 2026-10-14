@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Owned test schema. Bytes are manually assembled, no Bolt encoder exists. -->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="bolt_test"
+                   id="700" version="2" byteOrder="littleEndian">
+  <types>
+    <composite name="messageHeader">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId" primitiveType="uint16"/>
+      <type name="schemaId" primitiveType="uint16"/>
+      <type name="version" primitiveType="uint16"/>
+    </composite>
+    <composite name="groupSizeEncoding">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint16"/>
+    </composite>
+    <composite name="smallData">
+      <type name="length" primitiveType="uint8" maxValue="254"/>
+      <type name="varData" primitiveType="char" length="0"/>
+    </composite>
+    <composite name="largeData">
+      <type name="length" primitiveType="uint16" maxValue="65534"/>
+      <type name="varData" primitiveType="char" length="0"/>
+    </composite>
+    <enum name="Side" encodingType="uint8">
+      <validValue name="Buy">1</validValue><validValue name="Sell">2</validValue>
+    </enum>
+    <set name="Flags" encodingType="uint8">
+      <choice name="A">0</choice><choice name="B">2</choice>
+    </set>
+  </types>
+  <sbe:message name="Nested" id="7" blockLength="4">
+    <field name="id" id="1" type="uint16"/>
+    <field name="side" id="2" type="Side"/>
+    <field name="flags" id="3" type="Flags" sinceVersion="2"/>
+    <group name="rows" id="4" blockLength="2">
+      <field name="value" id="5" type="int16"/>
+      <group name="samples" id="6" blockLength="4">
+        <field name="sample" id="7" type="float"/>
+      </group>
+      <data name="label" id="8" type="smallData"/>
+    </group>
+    <data name="name" id="9" type="largeData"/>
+  </sbe:message>
+</sbe:messageSchema>

@@ -1,0 +1,7 @@
+# ai-grind cold compiler source pins; relative to ai-grind repository root.
+8a354a3bafb09b7e6af61a80c3811ddd801079999620103e50f0f18f50aa608f  src/devtools_mcp/sbe/__init__.py
+b6967e5844768ceaf0419d2c10a6bdd30528be1a9cb8cbd39e6da9a90ff11c49  src/devtools_mcp/sbe/__main__.py
+00577ae5feaef59f8c9955cf3c500a6bd79e1211022857365535af5295ade6d6  src/devtools_mcp/sbe/codegen.py
+1e7298154d1406d61cbe0ee7701f4fd5b7f2ffd972c2a8f5a1d83275b8b3ce21  src/devtools_mcp/sbe/ir.py
+7b6412cdf9bd64ae73f0c3de92f27d8066441aff4a4d1e13de25a67dabfba320  src/devtools_mcp/sbe/parser.py
+c5d10e44edb0a7a69f106c0a83e59130c82f7cf636d78ddc9942e405a7a07a03  src/devtools_mcp/tools/sbe_tools.py

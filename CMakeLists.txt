@@ -1059,6 +1059,9 @@ endif()  # BOLT_BUILD_LAKEHOUSE
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+add_executable(test_bolt_sbe_codegen EXCLUDE_FROM_ALL tests/test_bolt_sbe_codegen.cpp)
+target_link_libraries(test_bolt_sbe_codegen PRIVATE bolt::core)
+bolt_apply_hardening(test_bolt_sbe_codegen)
 add_executable(test_bolt_exact_depth EXCLUDE_FROM_ALL tests/test_bolt_exact_depth.cpp)
 target_link_libraries(test_bolt_exact_depth PRIVATE bolt::bolt)
 bolt_apply_hardening(test_bolt_exact_depth)
@@ -1070,6 +1073,7 @@ target_link_libraries(test_bolt_sbe PRIVATE bolt::core)
 bolt_apply_hardening(test_bolt_sbe)
 
 if(BOLT_BUILD_TESTS)
+    add_test(NAME test_bolt_sbe_codegen COMMAND test_bolt_sbe_codegen)
     add_test(NAME test_bolt_exact_depth COMMAND test_bolt_exact_depth)
     add_test(NAME test_bolt_byte_reader COMMAND test_bolt_byte_reader)
     add_test(NAME test_bolt_sbe COMMAND test_bolt_sbe)
