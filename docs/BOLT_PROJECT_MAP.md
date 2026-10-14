@@ -64,6 +64,11 @@ bolt/
 │   │   ├── promql_histogram.h         histogram_quantile — classic le-bucket interpolation
 │   │   │                               (Prometheus-exact; oracle-tested test_promql_kernels)
 │   │   └── fintech/
+│   │       ├── book_types.h          Runtime-admitted exact values, scales, cuts and statuses
+│   │       ├── book_l2.h             Price-keyed AVL book, atomic chunked events/replacements
+│   │       ├── book_mbp.h            Distinct ranked MBP, explicit bounded rank shifts
+│   │       ├── book_detail.h         Caller-storage banks, sparse before-images and lifecycle
+│   │       ├── book_l2_tree.h        Array-indexed AVL/ordered-neighbor implementation
 │   │       ├── column_primitives.h   Phase 1: diff/lag/log/sum_of_squares/running_max_drawdown
 │   │       ├── state.h               Phase 2: RollingRing / WelfordAccumulator / EmaState
 │   │       ├── midprice.h            Phase 4a: (bid+ask)/2
