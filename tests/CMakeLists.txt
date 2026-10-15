@@ -1796,6 +1796,14 @@ add_test(NAME test_bolt_tls COMMAND test_bolt_tls)
 # Lakehouse W1 — Avro OCF, Roaring bitmap, codecs (zstd/gzip/lz4), SigV4,
 # ObjectStore + Catalog. (G2CLUS-184)
 # ---------------------------------------------------------------------------
+foreach(_arrow_test IN ITEMS test_bolt_arrow_owner test_bolt_arrow_import)
+    add_executable(${_arrow_test} ${_arrow_test}.cpp)
+    target_link_libraries(${_arrow_test}
+        PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(${_arrow_test})
+    add_test(NAME ${_arrow_test} COMMAND ${_arrow_test})
+endforeach()
+
 if(BOLT_BUILD_INGEST)
     add_executable(test_bolt_avro test_bolt_avro.cpp)
     target_link_libraries(test_bolt_avro
@@ -1817,6 +1825,15 @@ if(BOLT_BUILD_INGEST)
         BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     bolt_apply_hardening(test_bolt_arrow_ipc)
     add_test(NAME test_bolt_arrow_ipc COMMAND test_bolt_arrow_ipc)
+
+    add_executable(test_bolt_arrow_ipc_reader test_bolt_arrow_ipc_reader.cpp)
+    target_link_libraries(test_bolt_arrow_ipc_reader
+        PRIVATE bolt::bolt bolt::ingest bolt::file_read GTest::gtest GTest::gtest_main)
+    target_compile_definitions(test_bolt_arrow_ipc_reader PRIVATE
+        BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    bolt_apply_hardening(test_bolt_arrow_ipc_reader)
+    add_test(NAME test_bolt_arrow_ipc_reader COMMAND test_bolt_arrow_ipc_reader)
+
 
     add_executable(test_bolt_protobuf test_bolt_protobuf.cpp)
     target_link_libraries(test_bolt_protobuf

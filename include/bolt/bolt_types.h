@@ -491,36 +491,4 @@ struct BoltSchema {
 // both orders compile (tests/test_bolt_arrow_guard_order.cpp). bolt code
 // below refers to them unqualified; global-namespace lookup finds these.
 
-#ifndef ARROW_C_DATA_INTERFACE
-#define ARROW_C_DATA_INTERFACE
-
-struct ArrowSchema {
-    const char*    format;
-    const char*    name;
-    const char*    metadata;
-    int64_t        flags;
-    int64_t        n_children;
-    ArrowSchema**  children;
-    ArrowSchema*   dictionary;
-    void (*release)(ArrowSchema*);
-    void*          private_data;
-};
-
-struct ArrowArray {
-    int64_t        length;
-    int64_t        null_count;
-    int64_t        offset;
-    int64_t        n_buffers;
-    int64_t        n_children;
-    const void**   buffers;
-    ArrowArray**   children;
-    ArrowArray*    dictionary;
-    void (*release)(ArrowArray*);
-    void*          private_data;
-};
-
-// Arrow PyCapsule interface names
-#define ARROW_SCHEMA_CAPSULE_NAME "arrow_schema"
-#define ARROW_ARRAY_CAPSULE_NAME  "arrow_array"
-
-#endif  // ARROW_C_DATA_INTERFACE
+#include "bolt/interop/arrow_c.h"

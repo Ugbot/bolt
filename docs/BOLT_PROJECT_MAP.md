@@ -1,5 +1,20 @@
 # Bolt Project Map
 
+`ingest/bolt_arrow_ipc_reader.h` reads bounded Arrow IPC streams and ARROW1
+files through immutable spans or the owned file mapper into reusable typed
+Bolt batches. Unsupported nested/dictionary/compressed shapes refuse explicitly.
+[Contract and independent fixtures](research/arrow-ipc-reader.md).
+
+`interop/arrow_c.h` owns the canonical C Data/C Stream ABI; `arrow_owner.h`
+provides immutable snapshots with independent descriptor leases, and
+`bolt_arrow_import.h` provides bounded exact flat C Data copy ingress.
+`bolt::interop` has no Arrow/Python runtime dependency. Consumer schema sidecars
+must retain precision and temporal kind/unit; generic batches alone do not
+encode every Arrow logical declaration. Native tests cover ownership, limits,
+exact fields and the no-allocation IPC next path. Wider engine integration and
+performance qualification remain separate gates.
+[Interchange ownership, admission and verification](research/arrow-interchange.md).
+
 `kernels/bolt_integer_filter.h` compares exact signed/unsigned widths with
 signed64 literals without narrowing/wrap, including null-mask offsets and
 selected rows. [Scope and evidence](research/integer-literal-filters.md).

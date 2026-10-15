@@ -128,6 +128,16 @@ foreach(mod IN ITEMS kernels join wire arrow)
     target_link_libraries(bolt_${mod} INTERFACE bolt::core)
 endforeach()
 
+# Owned Arrow C Data snapshots and bounded copy ingress. This target has no
+# dependency on libarrow, Python or the IPC/file readers.
+add_library(bolt_interop STATIC
+    src/interop/arrow_owner.cpp
+    src/interop/bolt_arrow_import.cpp)
+add_library(bolt::interop ALIAS bolt_interop)
+target_link_libraries(bolt_interop PUBLIC bolt::core)
+bolt_apply_hardening(bolt_interop)
+target_link_libraries(bolt_arrow INTERFACE bolt::interop)
+
 # Umbrella — pulls core + every sibling. Most consumers link this.
 add_library(bolt INTERFACE)
 add_library(bolt::bolt ALIAS bolt)
@@ -679,6 +689,9 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_write.cpp
         src/ingest/bolt_arrow_ipc.cpp
+        src/ingest/bolt_arrow_ipc_reader.cpp
+        src/ingest/bolt_arrow_ipc_reader_schema.cpp
+        src/ingest/bolt_arrow_ipc_reader_batch.cpp
         src/ingest/bolt_avro.cpp
         src/ingest/bolt_inflate.cpp
         src/ingest/bolt_protobuf.cpp
@@ -689,7 +702,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_gzip.cpp
         src/ingest/bolt_lz4.cpp)
     add_library(bolt::ingest ALIAS bolt_ingest)
-    target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse)
+    target_link_libraries(bolt_ingest PUBLIC bolt::core bolt::parse PRIVATE bolt::file_read)
     target_include_directories(bolt_ingest PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
@@ -1186,7 +1199,7 @@ install(DIRECTORY include/bolt
 # satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
-    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt
     bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)

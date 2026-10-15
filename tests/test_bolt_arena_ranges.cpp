@@ -47,3 +47,20 @@ TEST(BoltArenaRanges, ExtremeAddressAndLengthUseDifferencesWithoutWrapping) {
     EXPECT_TRUE(arena.overlaps_backing(address(1),start));
 }
 } // namespace
+
+TEST(BoltArenaRanges, ContainsRequiresWholeRangeInOneBlockWithoutWraparound) {
+    bolt::Arena arena({4096,4096});
+    auto* bytes = arena.allocate_array<std::uint8_t>(4096); ASSERT_NE(bytes, nullptr);
+    EXPECT_TRUE(arena.contains_backing(bytes,4096));
+    EXPECT_TRUE(arena.contains_backing(bytes+4095,1));
+    EXPECT_FALSE(arena.contains_backing(bytes+4095,2));
+    EXPECT_FALSE(arena.contains_backing(bytes+4096,1));
+    EXPECT_FALSE(arena.contains_backing(nullptr,1));
+    EXPECT_FALSE(arena.contains_backing(bytes,0));
+    EXPECT_FALSE(arena.contains_backing(bytes,SIZE_MAX));
+    EXPECT_FALSE(arena.contains_backing(reinterpret_cast<void*>(UINTPTR_MAX),2));
+    const auto start = reinterpret_cast<std::uintptr_t>(bytes);
+    EXPECT_FALSE(arena.contains_backing(reinterpret_cast<void*>(start-1),2));
+    arena.reset();
+    EXPECT_TRUE(arena.contains_backing(bytes,4096));
+}

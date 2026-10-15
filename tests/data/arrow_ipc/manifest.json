@@ -1,0 +1,43 @@
+{
+  "generator": "PyArrow 21.0.0 official Apache distribution; authored values, not captured vendor traffic",
+  "format_pin": "apache-arrow-21.0.0",
+  "files": {
+    "compressed.arrows": {
+      "bytes": 5016,
+      "sha256": "0f67afa5158c10f84a68ca3f9f539b834d202f77d4409282939700a3ab07ec6c"
+    },
+    "dictionary.arrows": {
+      "bytes": 520,
+      "sha256": "b83904c1db483b600afb9925574f3ca8a540b7ebda5929e2ef811cf13e6ac818"
+    },
+    "empty.arrow": {
+      "bytes": 242,
+      "sha256": "fd965be69121af15ada5ead6ccdd3fd3d67b1fe9fab657e99f19862d748dbd1d"
+    },
+    "flat.arrow": {
+      "bytes": 9850,
+      "sha256": "5def86946af16c42100aef3ac642fd3f8e0646eb482cfc30f1c4e1dada6a6e01"
+    },
+    "flat.arrows": {
+      "bytes": 7352,
+      "sha256": "ccd9fb75b525aff7ed04e58a1586b970c36aeba4119f965e47effb60c9791d6b"
+    },
+    "legacy.arrows": {
+      "bytes": 7340,
+      "sha256": "9e629fdbc6639826c4176a9a05065326a8fd8f861086a0459a38c16fe84f6e2e"
+    },
+    "negative_scale.arrows": {
+      "bytes": 312,
+      "sha256": "09265fe1d10ecd7e6ddd4c5f2fd1a3e9591dbbfd2709195c8f43c90d980ac61b"
+    },
+    "nested.arrows": {
+      "bytes": 416,
+      "sha256": "445e64c907f55c0c83182dbbb5385fff797e15f994dd6f8748514754611b90e0"
+    },
+    "v4.arrows": {
+      "bytes": 7352,
+      "sha256": "a434f8632e913af1df5ce1b9ec4887d3d6d5ed5a8bdeeed4fbe71460279d1f94"
+    }
+  },
+  "generator_sha256": "e79f4d372ee9852a4f4dcb9b694fadf6f22bcb2534c97474337ca1f197459000"
+}

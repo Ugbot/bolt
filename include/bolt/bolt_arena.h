@@ -135,6 +135,22 @@ public:
         return false;
     }
 
+    /// True only when the entire nonempty range fits one retained block.
+    /// Same quiescence requirement as overlaps_backing(); no pointer dereference.
+    bool contains_backing(const void* address, size_t size) const noexcept {
+        assert(num_blocks_ <= kArenaMaxBlocks);
+        assert(num_blocks_ <= sizeof(blocks_) / sizeof(blocks_[0]));
+        if (address == nullptr || size == 0) return false;
+        const auto begin = reinterpret_cast<uintptr_t>(address);
+        for (uint32_t i = 0; i < num_blocks_; ++i) {
+            const auto block = reinterpret_cast<uintptr_t>(blocks_[i]);
+            if (blocks_[i] == nullptr || begin < block) continue;
+            const auto offset = begin - block;
+            if (offset < block_sizes_[i] && size <= block_sizes_[i] - offset) return true;
+        }
+        return false;
+    }
+
     /// Bump-allocate. Returns nullptr if OOM or block table full.
     /// Cost: ~3ns fast path (pointer arithmetic + branch).
     void* allocate(size_t size, size_t alignment = 0) noexcept {
@@ -236,6 +252,7 @@ public:
 
     size_t total_allocated() const noexcept { return total_allocated_; }
     size_t peak_usage()      const noexcept { return peak_usage_; }
+    size_t default_alignment() const noexcept { return config_.alignment; }
     uint32_t num_blocks()    const noexcept { return num_blocks_; }
 
     size_t total_reserved() const noexcept {
