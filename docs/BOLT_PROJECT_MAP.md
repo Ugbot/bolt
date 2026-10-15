@@ -1,5 +1,12 @@
 # Bolt Project Map
 
+`schema/exact_field.h` adds bounded exact descriptor metadata for canonical
+schemas: width, decimal/presence/sentinel, temporal and group interpretation.
+This metadata-only primitive adds no decoder or planner execution capability.
+The metadata layout is defined in [the public header](../include/bolt/schema/exact_field.h).
+`bolt_type_validity.h` validates admitted enum values without using diagnostic
+names; internal Decimal64 is valid while reserved holes and NUM_TYPES refuse.
+
 `ingest/bolt_arrow_ipc_reader.h` reads bounded Arrow IPC streams and ARROW1
 files through immutable spans or the owned file mapper into reusable typed
 Bolt batches. Unsupported nested/dictionary/compressed shapes refuse explicitly.
