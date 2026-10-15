@@ -266,6 +266,20 @@ BOLT_FORCE_INLINE int d128_cmp(Decimal128 a, Decimal128 b) noexcept {
     return (alo == blo) ? 0 : ((alo < blo) ? -1 : 1);
 }
 
+// Cold exact-IO validation. Mantissas must fit the declared base-10 precision.
+inline bool d128_column_fits_precision(const Decimal128* values,int64_t n,
+    const uint8_t* validity,int64_t validity_offset,uint8_t precision) noexcept {
+    assert(values!=nullptr || n==0);assert(n>=0 && n<=INT32_MAX);
+    if(precision<1 || precision>38 || validity_offset<0 || validity_offset>INT64_MAX-n) return false;
+    const auto upper=d128_pow10(precision),lower=d128_neg(upper);
+    for(int64_t i=0;i<n;++i) {
+        const auto bit=validity_offset+i;
+        if(validity && !(validity[bit>>3]&(1u<<(bit&7)))) continue;
+        if(d128_cmp(values[i],upper)>=0 || d128_cmp(values[i],lower)<=0) return false;
+    }
+    return true;
+}
+
 BOLT_FORCE_INLINE bool d128_eq(Decimal128 a, Decimal128 b) noexcept {
     return (a.lo == b.lo) & (a.hi == b.hi);
 }

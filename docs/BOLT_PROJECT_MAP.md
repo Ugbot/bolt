@@ -1,5 +1,11 @@
 # Bolt Project Map
 
+`ingest/bolt_parquet_write.h` admits optional integer width/signedness and
+millisecond/microsecond/nanosecond timestamp annotations over exact physical
+lanes. Unsigned lanes suppress unproved signed statistics; legacy zero metadata
+retains its output policy. `kernels/bolt_decimal.h` also validates complete
+Decimal128 mantissas against declared precision before cold IO.
+
 `schema/exact_field.h` adds bounded exact descriptor metadata for canonical
 schemas: width, decimal/presence/sentinel, temporal and group interpretation.
 This metadata-only primitive adds no decoder or planner execution capability.

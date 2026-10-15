@@ -200,7 +200,7 @@ inline void tc_put_string(TcOut* o, const char* s) noexcept {
 }
 
 // Thrift compact element types we use.
-constexpr std::uint8_t kFI16 = 4, kFI32 = 5, kFI64 = 6, kFBinary = 8,
+constexpr std::uint8_t kFByte = 3, kFI16 = 4, kFI32 = 5, kFI64 = 6, kFBinary = 8,
                       kFList = 9, kFStruct = 12, kFTrue = 1, kFFalse = 2;
 
 // ===== bit / def-level encoding ===========================================
@@ -500,6 +500,8 @@ std::uint32_t list_chain(const ParquetWriteColumn& sch,
 }
 
 bool type_supported(const ParquetWriteColumn& c) noexcept {
+    if(c.integer_bits && !((c.integer_bits==8 || c.integer_bits==16 || c.integer_bits==32) ? c.type==BoltType::Int32 : c.integer_bits==64 && c.type==BoltType::Int64)) return false;
+    if(c.timestamp_unit>3 || (c.timestamp_unit && c.type!=BoltType::Timestamp)) return false;
     switch (c.type) {
         case BoltType::Bool:
         case BoltType::Int32:
@@ -2160,7 +2162,7 @@ void write_schema_element_col(TcOut* o,
                              : (lg == BoltLogical::Bson) ? kConvBson
                                                           : kConvEnum);
     } else if (has_converted(c.type) &&
-               !(c.type == BoltType::Timestamp && c.ts_local)) {
+               !(c.type == BoltType::Timestamp && (c.ts_local || c.timestamp_unit))) {
         tc_put_field(o, 6, kFI32);
         tc_put_zigzag(o, bolt_to_pq_converted(c.type));
     }
@@ -2185,16 +2187,23 @@ void write_schema_element_col(TcOut* o,
         tc_put_stop(o);                      // empty EnumType / NullType
         tc_put_stop(o);                      // end LogicalType union
     }
-    if (c.type == BoltType::Timestamp && c.ts_local) {
+    if (c.type == BoltType::Timestamp && (c.ts_local || c.timestamp_unit)) {
         tc_put_field(o, 10, kFStruct);
         tc_put_field(o, 8, kFStruct);        // TIMESTAMP
-        tc_put_field(o, 1, kFFalse);         // isAdjustedToUTC
+        tc_put_field(o, 1, c.ts_local?kFFalse:kFTrue); // isAdjustedToUTC
         tc_put_field(o, 2, kFStruct);        // unit
-        tc_put_field(o, 2, kFStruct);        // MICROS
+        tc_put_field(o, c.timestamp_unit?c.timestamp_unit:2, kFStruct); // MILLIS/MICROS/NANOS
         tc_put_stop(o);                      // empty MicroSeconds
         tc_put_stop(o);                      // end TimeUnit union
         tc_put_stop(o);                      // end TimestampType
         tc_put_stop(o);                      // end LogicalType union
+    }
+    if(c.integer_bits) {
+        tc_put_field(o,10,kFStruct);
+        tc_put_field(o,10,kFStruct);         // LogicalType.INTEGER
+        tc_put_field(o,1,kFByte);tc_put_u8(o,c.integer_bits);
+        tc_put_field(o,2,c.integer_signed?kFTrue:kFFalse);
+        tc_put_stop(o);tc_put_stop(o);
     }
     // 9 field_id — see ParquetWriteColumn::has_field_id's doc comment
     // (G2ICE-117). Omitted entirely unless a caller explicitly set it, so
@@ -2732,6 +2741,10 @@ ParquetWriter* parquet_write_open(const char* path,
     if (w == nullptr) return nullptr;
     w->opts = *opts;
     pw_copy_columns(w, opts);
+    // Raw signed lanes with unsigned logical annotations must not acquire
+    // signed min/max certificates. Value encoding still preserves every bit.
+    for(std::uint32_t c=0;c<w->opts.n_columns;++c)
+        if(w->cols[c].integer_bits && !w->cols[c].integer_signed) w->opts.emit_statistics=false;
     if (w->opts.row_group_target_bytes == 0u ||
         w->opts.row_group_target_bytes > kPwMaxRowGroupBytes) {
         w->opts.row_group_target_bytes = kPwMaxRowGroupBytes;
@@ -2820,6 +2833,10 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     if (w == nullptr) return nullptr;
     w->opts = *opts;
     pw_copy_columns(w, opts);
+    // Raw signed lanes with unsigned logical annotations must not acquire
+    // signed min/max certificates. Value encoding still preserves every bit.
+    for(std::uint32_t c=0;c<w->opts.n_columns;++c)
+        if(w->cols[c].integer_bits && !w->cols[c].integer_signed) w->opts.emit_statistics=false;
     if (w->opts.row_group_target_bytes == 0u ||
         w->opts.row_group_target_bytes > kPwMaxRowGroupBytes) {
         w->opts.row_group_target_bytes = kPwMaxRowGroupBytes;

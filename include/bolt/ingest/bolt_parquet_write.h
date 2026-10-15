@@ -273,6 +273,12 @@ struct ParquetWriteColumn {
     // TIMESTAMP WITHOUT TIME ZONE / Iceberg `timestamp`. false (zero-init)
     // keeps the UTC-adjusted form every existing caller writes.
     bool                  ts_local;
+    // Exact physical-lane refinements. Zero preserves legacy output.
+    // Integer bit widths 8/16/32 use INT32; 64 uses INT64.
+    std::uint8_t          integer_bits;
+    bool                  integer_signed;
+    // Timestamp unit: 0 legacy microseconds, 1 millis, 2 micros, 3 nanos.
+    std::uint8_t          timestamp_unit;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
