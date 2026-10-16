@@ -3,6 +3,14 @@ target_link_libraries(test_bolt_alignment PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_alignment)
 add_test(NAME test_bolt_alignment COMMAND test_bolt_alignment)
 
+# Read-only xchannel FORMAT4 framing over caller-pinned mapped bytes.
+if(TARGET bolt::io)
+    add_executable(test_xchannel test_xchannel.cpp)
+    target_link_libraries(test_xchannel PRIVATE bolt::core bolt::io GTest::gtest_main)
+    bolt_apply_hardening(test_xchannel)
+    add_test(NAME test_xchannel COMMAND test_xchannel)
+endif()
+
 # IOCP's bounded association transaction is portable; actual IOCP stays Windows-only.
 add_executable(test_associated_handle_registry test_associated_handle_registry.cpp)
 target_link_libraries(test_associated_handle_registry

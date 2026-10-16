@@ -1,5 +1,11 @@
 # Bolt Project Map
 
+`wire/xchannel.h` / `xchannel_format.h` admit bounded FORMAT4 prefixes and
+peek/consume opaque records over caller-pinned mappings, with exact committed
+Roll successor checks. FORMAT3 refuses explicitly. Local framing tests pass;
+actual upstream-writer interoperability remains separate.
+[Contract and qualification](research/xchannel-reader.md).
+
 `ingest/bolt_parquet_write.h` admits optional integer width/signedness and
 millisecond/microsecond/nanosecond timestamp annotations over exact physical
 lanes. Unsigned lanes suppress unproved signed statistics; legacy zero metadata
