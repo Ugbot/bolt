@@ -176,6 +176,54 @@ TEST(FileIo, MappedViewsArePageAligned) {
     std::remove(path.c_str());
 }
 
+TEST(FileIo, BoundedMappingChecksExactExtentAndClosesOnRefusal) {
+    const std::string path = tmp_path("mmap_bounded");
+    const auto bytes = random_bytes(8192, 41);
+    write_file(path, bytes);
+    MappedFile m{};
+    ASSERT_EQ(mapped_file_open_bounded(path.c_str(), bytes.size(), bytes.size(), &m),
+              FileIoStatus::kOk);
+    ASSERT_NE(m.base, nullptr);
+    EXPECT_EQ(std::memcmp(m.base, bytes.data(), bytes.size()), 0);
+    mapped_file_close(&m);
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, bytes.size() - 1, &m),
+              FileIoStatus::kTooLarge);
+    EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.handle, -1); EXPECT_EQ(m.mapping, -1);
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), bytes.size() + 1, bytes.size() + 1, &m),
+              FileIoStatus::kBadArg);
+    EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.handle, -1);
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 2, 1, &m), FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, kFileReadMaxBytes + 1, &m),
+              FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, 0, &m), FileIoStatus::kTooLarge);
+    EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.handle, -1);
+    write_file(path, {});
+    EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, 0, &m), FileIoStatus::kOk);
+    EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.size, 0u);
+    mapped_file_close(&m);
+    ASSERT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST(FileIo, BoundedMappingKeepsAdmittedExtentWhenFileGrows) {
+    const std::string path = tmp_path("mmap_bounded_growth");
+    const auto bytes = random_bytes(8192, 42);
+    write_file(path, bytes);
+    MappedFile m{};
+    ASSERT_EQ(mapped_file_open_bounded(path.c_str(), bytes.size(), bytes.size(), &m),
+              FileIoStatus::kOk);
+    FILE* append = std::fopen(path.c_str(), "ab");
+    ASSERT_NE(append, nullptr);
+    const auto appended = std::fwrite(bytes.data(), 1, bytes.size(), append);
+    const auto closed = std::fclose(append);
+    ASSERT_EQ(appended, bytes.size()); ASSERT_EQ(closed, 0);
+    EXPECT_EQ(m.size, bytes.size());
+    MappedView v{};
+    EXPECT_EQ(mapped_view(m, bytes.size() + 1, 1, &v), FileIoStatus::kBadArg);
+    EXPECT_EQ(std::memcmp(m.base, bytes.data(), bytes.size()), 0);
+    mapped_file_close(&m);
+    ASSERT_EQ(std::remove(path.c_str()), 0);
+}
+
 // A mapping outlives its released handle: the view still reads the file
 // and closing it twice is safe.
 TEST(FileIo, MappingSurvivesReleasedHandle) {

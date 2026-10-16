@@ -291,22 +291,52 @@ FileIoStatus file_pread_aligned(const ReadFile& f, uint64_t off, void* dst, uint
 
 // --- mmap ------------------------------------------------------------------
 
-#if defined(_WIN32)
-
-FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept {
+namespace {
+FileIoStatus prepare_mapping(const char* path, uint64_t min_bytes, uint64_t max_bytes,
+                             MappedFile* m) noexcept {
     assert(path != nullptr && m != nullptr);
     *m = MappedFile{nullptr, 0, kClosedHandle, kClosedHandle, io_page_size(), 0};
+    if (min_bytes > max_bytes || max_bytes > kFileReadMaxBytes || max_bytes > SIZE_MAX)
+        return FileIoStatus::kBadArg;
     uint8_t direct = 0;
     const intptr_t h = open_ro(path, false, &direct);
     if (h == kClosedHandle) return FileIoStatus::kOpenFailed;
     m->handle = h;
     if (!file_size_of(h, &m->size)) { mapped_file_close(m); return FileIoStatus::kIoError; }
+    if (m->size < min_bytes || m->size > max_bytes) {
+        const auto status = m->size > max_bytes ? FileIoStatus::kTooLarge : FileIoStatus::kBadArg;
+        mapped_file_close(m);
+        return status;
+    }
+    assert(m->size >= min_bytes && m->size <= max_bytes);
+    return FileIoStatus::kOk;
+}
+} // namespace
+
+FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept {
+    assert(path != nullptr);
+    assert(m != nullptr);
+    constexpr uint64_t max_bytes = SIZE_MAX < kFileReadMaxBytes ? SIZE_MAX : kFileReadMaxBytes;
+    return mapped_file_open_bounded(path, 0, max_bytes, m);
+}
+
+#if defined(_WIN32)
+
+FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_bytes, uint64_t max_bytes,
+                                    MappedFile* m) noexcept {
+    assert(path != nullptr);
+    assert(m != nullptr);
+    const auto status = prepare_mapping(path, min_bytes, max_bytes, m);
+    if (status != FileIoStatus::kOk) return status;
     if (m->size == 0) return FileIoStatus::kOk;
-    HANDLE mh = CreateFileMappingA(reinterpret_cast<HANDLE>(h), nullptr, PAGE_READONLY, 0, 0,
-                                   nullptr);
+    // Fix the extent even if the writer grows the file after the size check.
+    HANDLE mh = CreateFileMappingA(reinterpret_cast<HANDLE>(m->handle), nullptr, PAGE_READONLY,
+                                   static_cast<DWORD>(m->size >> 32),
+                                   static_cast<DWORD>(m->size), nullptr);
     if (mh == nullptr) { mapped_file_close(m); return FileIoStatus::kIoError; }
     m->mapping = reinterpret_cast<intptr_t>(mh);
-    m->base = static_cast<const uint8_t*>(MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0));
+    m->base = static_cast<const uint8_t*>(MapViewOfFile(
+        mh, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(m->size)));
     if (m->base == nullptr) { mapped_file_close(m); return FileIoStatus::kIoError; }
     assert(m->base != nullptr);
     return FileIoStatus::kOk;
@@ -355,17 +385,15 @@ FileIoStatus mapped_resident_pages(const MappedFile& m, uint64_t off, uint64_t l
 
 #else
 
-FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept {
-    assert(path != nullptr && m != nullptr);
-    *m = MappedFile{nullptr, 0, kClosedHandle, kClosedHandle, io_page_size(), 0};
-    uint8_t direct = 0;
-    const intptr_t h = open_ro(path, false, &direct);
-    if (h == kClosedHandle) return FileIoStatus::kOpenFailed;
-    m->handle = h;
-    if (!file_size_of(h, &m->size)) { mapped_file_close(m); return FileIoStatus::kIoError; }
+FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_bytes, uint64_t max_bytes,
+                                    MappedFile* m) noexcept {
+    assert(path != nullptr);
+    assert(m != nullptr);
+    const auto status = prepare_mapping(path, min_bytes, max_bytes, m);
+    if (status != FileIoStatus::kOk) return status;
     if (m->size == 0) return FileIoStatus::kOk;
     void* p = ::mmap(nullptr, static_cast<size_t>(m->size), PROT_READ, MAP_SHARED,
-                     static_cast<int>(h), 0);
+                     static_cast<int>(m->handle), 0);
     if (p == MAP_FAILED) { mapped_file_close(m); return FileIoStatus::kIoError; }
     m->base = static_cast<const uint8_t*>(p);
     assert((reinterpret_cast<uintptr_t>(m->base) & (m->page - 1)) == 0);

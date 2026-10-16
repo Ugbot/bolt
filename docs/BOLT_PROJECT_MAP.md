@@ -6,6 +6,11 @@ Roll successor checks. FORMAT3 refuses explicitly. Local framing tests pass;
 actual upstream-writer interoperability remains separate.
 [Contract and qualification](research/xchannel-reader.md).
 
+`io/bolt_file_io.h::mapped_file_open_bounded` validates inclusive file-size
+bounds on the same opened handle before mapping its observed extent. Exact
+bounds admit fixed-size inputs without reopening a pathname; later growth
+does not expand the view. Caller-owned lifetime still excludes truncation.
+
 `ingest/bolt_parquet_write.h` admits optional integer width/signedness and
 millisecond/microsecond/nanosecond timestamp annotations over exact physical
 lanes. Unsigned lanes suppress unproved signed statistics; legacy zero metadata

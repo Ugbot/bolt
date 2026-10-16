@@ -110,6 +110,13 @@ struct MappedView {
 enum class Advice : uint8_t { kNormal = 0, kSequential, kRandom, kWillNeed, kDontNeed };
 
 FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept;
+/// Check the size on the same opened handle before mapping its observed extent.
+/// Inclusive bounds; min == max admits only that exact extent. Invalid bounds
+/// return kBadArg, an oversized file kTooLarge, an undersized file kBadArg.
+/// Maximum must fit kFileReadMaxBytes and SIZE_MAX. Failure leaves no live map
+/// or handles. Caller prevents truncation while mapped; growth is not remapped.
+FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_file_bytes,
+                                    uint64_t max_file_bytes, MappedFile* m) noexcept;
 /// Idempotent.
 void mapped_file_close(MappedFile* m) noexcept;
 /// Close the file (and Windows mapping) handle; the view stays valid until
