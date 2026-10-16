@@ -1,5 +1,14 @@
 # Bolt Project Map
 
+`io/bolt_mapped_ring.h` adds a fixed, physically preallocated page-aware event
+ring in `bolt::io_file`: whole-event publication, explicit reader leases,
+lossless backpressure, optional gap-reporting overwrite, live logical caps and
+separate explicit flush progress. `bolt_mapped_ring_batch.h` encodes native
+frames directly into reservations and borrows decoded batches under leases.
+Writable mapping mechanics extend `io/bolt_file_io.h`. Owner-local only;
+independent-process/restart contracts remain separate.
+[API, ownership and measurement scope](research/mapped-event-ring.md).
+
 `wire/xchannel.h` / `xchannel_format.h` admit bounded FORMAT4 prefixes and
 peek/consume opaque records over caller-pinned mappings, with exact committed
 Roll successor checks. FORMAT3 refuses explicitly. Local framing tests pass;

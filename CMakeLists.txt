@@ -191,7 +191,7 @@ if(BOLT_BUILD_IO)
     # bolt::io_file — the part of bolt::io that does file I/O: the aligned
     # (direct-I/O) page writer of MSEG K9, plus the B6 reads. Kept out of
     # bolt_io so that library stays pure compute.
-    add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp)
+    add_library(bolt_io_file STATIC src/io/bolt_aligned_writer.cpp src/io/bolt_mapped_ring.cpp)
     add_library(bolt::io_file ALIAS bolt_io_file)
     target_link_libraries(bolt_io_file PUBLIC bolt::core bolt::io bolt::file_read)
     target_include_directories(bolt_io_file PUBLIC
@@ -200,6 +200,10 @@ if(BOLT_BUILD_IO)
     bolt_apply_hardening(bolt_io_file)
     bolt_apply_simd(bolt_io_file ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io_file)
+
+    add_executable(bench_mapped_ring EXCLUDE_FROM_ALL benchmarks/bench_mapped_ring.cpp)
+    target_link_libraries(bench_mapped_ring PRIVATE bolt::io_file)
+    bolt_apply_hardening(bench_mapped_ring)
 endif()
 
 # ---------------------------------------------------------------------------

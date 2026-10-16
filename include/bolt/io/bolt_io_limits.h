@@ -65,6 +65,8 @@ inline constexpr uint32_t kReadPoolMaxWorkers = BOLT_IO_READ_POOL_MAX_WORKERS;
 inline constexpr uint64_t kMincoreChunkPages = 4096;
 // Requests in one read batch (kind A: the request index is a uint32).
 inline constexpr uint32_t kReadBatchMaxRequests = uint32_t(1) << 24;
+// Mapped event ring reader slots (kind B: fixed metadata allocation at open).
+inline constexpr uint32_t kMappedRingMaxReaders = 64;
 
 static_assert(kCoalesceMaxRequestDefault >= wire::kFrameStripeAlign,
               "BOLT_IO_COALESCE_MAX_REQUEST is at least one stripe");
