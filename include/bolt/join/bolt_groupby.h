@@ -684,6 +684,7 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
     assert(r >= 0);
     GbCell16 out{0, 0};
     switch (c.type) {
+        case BoltType::Bool: out.a = static_cast<const uint8_t*>(c.data)[r] != 0; break;
         case BoltType::Decimal128: {
             const auto* p = static_cast<const kernels::decimal::Decimal128*>(c.data);
             std::memcpy(&out, &p[r], 16);
@@ -791,6 +792,7 @@ inline constexpr int64_t kGbNullKeyTag = static_cast<int64_t>(0x4E554C4C4B45593F
 // `read_cell16` reads with a defined width; the rest stay refused.
 BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
     switch (t) {
+        case BoltType::Bool:
         case BoltType::Int64:     case BoltType::Int32:
         case BoltType::Date32:    case BoltType::Date64:
         case BoltType::Timestamp: case BoltType::Duration:
@@ -2167,6 +2169,8 @@ inline bool groupby_agg_multi_key_typed_finalize(
             const GbCell16 kc =
                 gb_detail::gb_key_out_cell(krow[k], state->key_types[k]);
             switch (state->key_types[k]) {
+                case BoltType::Bool:
+                    static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
                 case BoltType::Int64:
                     static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
@@ -2512,6 +2516,8 @@ inline bool groupby_agg_multi_key_typed(
             const GbCell16 kc =
                 gb_detail::gb_key_out_cell(krow[k], key_types[k]);
             switch (key_types[k]) {
+                case BoltType::Bool:
+                    static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
                 case BoltType::Int64:
                     static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
