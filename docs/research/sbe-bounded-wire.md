@@ -18,6 +18,15 @@ stores raw pairs, source/binary/compiler hashes and DTrace run
 
 ## Contract
 
+`bolt/wire/sbe_writer.h` adds the schema-neutral write side. Caller-owned
+`Writer`/`WriteBlock` support checked scalar conversion, common headers,
+versioned fields, explicit optional presence/nulls, fixed bytes, group dimensions
+and variable data. Offsets, lengths, versions and counts are checked before
+narrowing. Each failed operation preserves bytes and cursor/result descriptors;
+whole-message atomicity requires the generated encoder's complete preflight.
+No XML, allocation or exchange-layout assumptions enter these writers.
+`tests/test_sbe_writer.cpp` contains 18 literal-byte and refusal/alias cases.
+
 Include `bolt/wire/sbe.h`, `sbe_fields.h`, and `sbe_groups.h`.
 Everything is in `bolt::wire::sbe`; the existing `ByteReader`/`ByteView` own
 the bounds/lifetime seam. Input storage is caller-owned, immutable, alive for

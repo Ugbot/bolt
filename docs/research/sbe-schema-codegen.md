@@ -1,5 +1,25 @@
 # Schema-driven bounded SBE decoding
 
+## Native encoding addition (2026-10-16, G2FEAT-213)
+
+The maintained ai-grind compiler now also exposes `generate_encoder_cpp(ir,
+namespace=...)`, CLI `compile ... --encoder`, and the existing MCP callable
+`devtools_sbe_compile(..., emit="encoder")`. Decoder generation remains the
+default. Encoder headers use `namespace::encoder` and may coexist with readers.
+Fixed fields/composites/arrays, enums/sets, explicit optional presence,
+versioned additions, nested groups and variable data use caller-owned inputs.
+Measurement validates domains, declared bounds, versions and budgets; encoding
+also validates every active input/output alias and total capacity before writing.
+Failure preserves all output bytes and the written count. Generated code uses
+`bolt/wire/sbe_writer.h`, with no runtime XML, heap allocation or Arrow library.
+
+Clang-built independent LE/BE literal fixtures and the existing compiler suite
+pass 57 Python cases, including MCP selection/hash/budget refusals. These are
+synthetic schema tests, not current CME certification or a format-speed parity
+claim. Exact production XML, security definitions and real packet oracle tests
+are still required. See ai-grind `docs/sbe-compiler.md` for the strict subset
+and unsupported constrained-header/payload cases.
+
 Implemented 2026-10-14 for G2FEAT-37. The reusable cold compiler is
 `ai-grind/src/devtools_mcp/sbe/`: `compile_schema(bytes, budgets=..., expect_sha256=...)
 -> SchemaIR`, `generate_cpp(ir, namespace=...) -> str`, and
