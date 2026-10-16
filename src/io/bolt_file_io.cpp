@@ -482,5 +482,7 @@ FileIoStatus mapped_view(const MappedFile& m, uint64_t off, uint64_t len,
     return FileIoStatus::kOk;
 }
 
+#include "bolt_mapped_write.inc"
+
 }  // namespace io
 }  // namespace bolt

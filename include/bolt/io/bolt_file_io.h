@@ -138,6 +138,32 @@ FileIoStatus mapped_advise(const MappedFile& m, uint64_t off, uint64_t len,
 FileIoStatus mapped_resident_pages(const MappedFile& m, uint64_t off, uint64_t len,
                                    uint64_t* out_resident, uint64_t* out_pages) noexcept;
 
+// --- fixed writable mappings (cold lifecycle only) ---------------------------
+struct WritableMappedFile {
+    uint8_t* base;
+    uint64_t size;
+    intptr_t handle;
+    intptr_t mapping;
+    uint32_t page;
+    uint32_t granularity;
+};
+
+// Exclusively create a NEW file, physically allocate its full extent, and map
+// shared read/write. Never truncates an existing path. bytes is nonzero and a
+// multiple of max(OS page, mapping granularity), within the file-read cap.
+// Failure closes all handles/maps and removes the newly created file. out must
+// not own a live mapping. Optional prefault touches writable pages at startup;
+// residency remains OS-managed, without a page-pinning guarantee. Ephemeral
+// mappings delete on close (POSIX unlinks immediately after successful mapping).
+FileIoStatus mapped_write_create(const char* path, uint64_t bytes, bool delete_on_close,
+                                 bool prefault, WritableMappedFile* out) noexcept;
+// Validates [off, off+len), flushes intersecting pages synchronously and syncs
+// the file. Zero length is a valid no-op. Visibility alone is not durability.
+// Caller serializes writes, flush and close; these are not hot-path operations.
+FileIoStatus mapped_write_flush(WritableMappedFile* m, uint64_t off, uint64_t len) noexcept;
+// Idempotent; close does not implicitly flush or promise durability.
+void mapped_write_close(WritableMappedFile* m) noexcept;
+
 // --- range_coalesce ----------------------------------------------------------
 
 struct IoRange {
