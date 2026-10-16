@@ -1,5 +1,7 @@
 //! Separate-process interoperability fixture using the actual upstream writer.
 #[cfg(unix)]
+mod replay;
+#[cfg(unix)]
 mod unix {
     use std::env;
     use std::ffi::OsString;
@@ -43,11 +45,11 @@ mod unix {
         checksum: u64,
     }
 
-    fn invalid(message: &str) -> io::Error {
+    pub(crate) fn invalid(message: &str) -> io::Error {
         io::Error::new(ErrorKind::InvalidInput, message)
     }
 
-    fn number(arg: &OsString) -> io::Result<u64> {
+    pub(crate) fn number(arg: &OsString) -> io::Result<u64> {
         let text = arg.to_str().ok_or_else(|| invalid("arguments must be UTF-8"))?;
         if text.is_empty() || text.len() > 20 || !text.bytes().all(|c| c.is_ascii_digit()) {
             return Err(invalid("numeric arguments must be unsigned decimal integers"));
@@ -74,7 +76,7 @@ mod unix {
     }
 
     #[cfg(unix)]
-    fn page_size() -> io::Result<u64> {
+    pub(crate) fn page_size() -> io::Result<u64> {
         // The fixture refuses an unknown page size instead of guessing 4096.
         let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if size <= 0 { return Err(io::Error::last_os_error()); }
@@ -96,7 +98,7 @@ mod unix {
         Ok(config.roll.div_ceil(config.region) * config.region)
     }
 
-    fn fresh_base(base: &Path) -> io::Result<PathBuf> {
+    pub(crate) fn fresh_base(base: &Path) -> io::Result<PathBuf> {
         let text = base.to_str().ok_or_else(|| invalid("base path must be UTF-8"))?;
         if text.is_empty() || text.len() > 4096 { return Err(invalid("base path length must be 1..4096 bytes")); }
         let name = base.file_name().and_then(|v| v.to_str()).ok_or_else(|| invalid("base needs a file name"))?;
@@ -229,7 +231,7 @@ mod unix {
         Ok(())
     }
 
-    fn json_string(text: &str) -> String {
+    pub(crate) fn json_string(text: &str) -> String {
         let mut out = String::with_capacity(6 * text.len() + 2);
         out.push('"');
         for ch in text.chars() {
@@ -276,8 +278,11 @@ mod unix {
 
 #[cfg(unix)]
 fn main() {
-    if let Err(error) = unix::run() {
-        eprintln!("xchannel fixture refused: {error}");
+    let replay_mode = std::env::args_os().nth(1).is_some_and(|arg| arg == "replay");
+    let result = if replay_mode { replay::run() } else { unix::run() };
+    if let Err(error) = result {
+        let mode = if replay_mode { "replay" } else { "fixture" };
+        eprintln!("xchannel {mode} refused: {error}");
         std::process::exit(2);
     }
 }

@@ -142,40 +142,127 @@ strings and the consumer schedule are fixed literals in `main.rs`. Geometry and
 capacity refusals occur before file creation; IO/upstream errors after creation
 leave their observable prefix and never trigger an automatic retry or deletion.
 
-## Reserved replay benchmark contract (not implemented)
-
-Only `fixture` is implemented. A later `replay-v1` mode will use a bounded binary
-frame-input file loaded entirely before opening the channel; it will not generate
-or reinterpret market rows in the publication loop. Intended command:
+## Normalized-record reference replay
 
 ```text
-replay-v1 BASE FRAME_FILE UPDATES_PER_SECOND REPEAT_COUNT REGION_SIZE FILE_ROLL_SIZE
+bolt-xchannel-upstream-producer replay BASE INPUT RATE_UPDATES_PER_SEC REGION_SIZE FILE_ROLL_SIZE GENERATION
 ```
 
-The input format is little-endian: 8-byte magic `BXRP0001`, UInt32 frame count,
-UInt32 reserved0, followed by frame_count entries of UInt32 payload_length,
-UInt16 message_type, UInt16 flags, and exactly payload_length opaque bytes.
-Only flag bit0 (`update_end`) is admitted; the last frame must have it set and
-every complete update must contain at least one frame. No trailing bytes.
-Bounds: at most 10,000 frames, 4,096 bytes/frame and 64 MiB total file; at most
-10,000,000 complete updates/s, repeat count 1..10,000 and checked total committed
-frames <=10,000,000. Reject unknown flags, incomplete final updates, overflow and
-oversized input before channel creation. The retained-file 64 MiB cap still
-applies to the **whole** repeated run; no implicit pruning.
+This mode publishes a preloaded, owned **reference profile** through the same
+actual upstream writer. Channel name is `chukonu-normalized-book-v1`, format v4,
+record index starts at 0, and GENERATION must be a nonzero UInt64. The payload is
+an opaque standalone Bolt frame; this producer does not decode/reconstruct market
+events or validate their exchange clocks. The native consumer owns that codec
+validation. This explicit profile establishes no general client-payload compatibility.
 
-Rate is complete updates/s, not messages/s. Frames inside one complete update
-are contiguous; pace update starts from an absolute scheduled epoch plus update
-ordinal/rate. Record intended schedule separately from actual observations so
-lateness/queueing are visible; do not relabel a closed-loop rate as open-loop.
-Immediately **before each `try_reserve`**, sample the Unix OS
-`libc::clock_gettime(libc::CLOCK_MONOTONIC, ...)` and pass its checked UInt64
-nanoseconds unchanged to `commit(..., user_meta_u64)`. The C++ consumer must name
-and sample that same OS clock immediately after successful record observation.
-Reject failed/negative/overflowing clock readings; other clocks/platforms are
-explicitly unsupported initially. A stamp made after commit cannot describe
-publication latency and is forbidden by this contract. Warmup, CPU placement,
-duration, loss, offered/accepted/completed rates and percentile aggregation remain
-benchmark-owner work; this reservation implements no speculative benchmark loop.
+Input `INPUT` is a regular file, loaded in full before creating the writer.
+The loader admits at most 256MiB, reads exactly its admitted extent and refuses
+an extra byte if the file grows. Keep this owned input immutable during loading.
+No payload Vec is allocated per record: offsets point into the retained input.
+All integers below are little-endian. The header is exactly 64 bytes:
 
-The tool establishes no fsync/power-loss durability, allocation plateau, native
-DataFrame computation, paper action completion or HFT/tail-latency result.
+| Offset | Field | Required value |
+|---:|---|---|
+|0|8-byte magic|literal `BNFEVT1` followed by one zero byte|
+|8|UInt32 header_bytes|64|
+|12|UInt32 record_header_bytes|16|
+|16|UInt64 count|1..65,536|
+|24|UInt64 total_body_bytes|exact remaining file bytes|
+|32|UInt32 max_frame_bytes|exact maximum actual payload length|
+|36|UInt16 message_type|passed unchanged to every upstream commit|
+|38|UInt16 flags|0|
+|40..63|reserved bytes|all zero|
+
+The body has exactly `count` records without inter-record padding. Each has a
+16-byte header: UInt32 payload_length at 0, UInt32 reserved0 at 4, UInt64 contiguous
+index 0..count-1 at 8, followed by exactly payload_length opaque bytes. Every payload
+length must be positive, at most 1MiB and a multiple of 64. Count/body/maximum
+mismatch, overflow, unknown flags/reserved fields, missing bytes or trailing data
+refuse before writer creation. There is no repeat mode or implicit replay.
+
+REGION_SIZE must be at least 4096 and an actual OS-page multiple. v4 Skip length
+is UInt32, so the admitted region must also fit that field. FILE_ROLL_SIZE is
+itself the explicit caller-selected fixed extent budget; it must be positive,
+at least two regions and representable by upstream's OS/usize offsets after
+checked region rounding. There is no inherited fixture-mode 64MiB cap or invented
+256MiB output cap. The root must deliberately choose an appropriate extent;
+the reference configuration is 4MiB regions and 256MiB extent. The exact rounded
+allocation is returned in READY for the consumer's matching admission.
+
+All records are placed before writer creation using v4's 208-byte first header,
+16-byte envelopes, 8-byte alignment, region Skip geometry and 56-byte Roll guard.
+The whole stream must fit in **one file**. Any placement that would trigger a
+file roll refuses before opening the writer. No `roll_file`, helper, background
+prefault, wake or pruning is enabled. Runtime writer ordinal must stay 0 and its
+absolute index must advance once per commit. `set_len` eagerly presizes the
+fixed extent; this is sparse sizing, not physical page allocation, residency or
+a zero-page-latency guarantee. Upstream region mapping/unmapping can still occur
+inside the measured publication attempt.
+
+Fresh-path rules are the same as fixture mode: reject BASE or any dotted-prefix
+sibling, require an existing exclusively owned parent, never clean/delete/retry.
+After input/geometry admission and actual writer creation, stdout emits and
+**flushes** one JSON line with `phase:"READY"`, resolved base, generation, channel
+name, clock, input count/message type/payload bytes, offered rate, admitted
+region/file extents, rounded allocated_file_bytes and predicted region skips.
+No user record has been published at this point. The producer then blocks on
+exactly **one stdin byte `G`**. EOF or any other byte fails explicitly; no timeout,
+implicit readiness delay, automatic start or input retry is inserted. Extra
+stdin bytes are not read. The root opens/readies the separate C++ consumer before
+writing G. Errors after file creation leave the channel prefix for inspection.
+
+RATE_UPDATES_PER_SEC is 0 for unlimited or a positive integer <=10,000,000. One
+complete input record/standalone frame is one offered update; this is not a claim
+that frames, normalized rows and completed Book events have the same cardinality.
+The schedule starts immediately after the G release, using absolute accumulated
+`CLOCK_MONOTONIC` nanosecond deadlines. Startup computes each offset as checked
+`floor(index*1000000000/rate)`, then adds it to the checked start epoch; no periodic
+fractional drift is introduced. Late publication does not reset the schedule,
+drop records,
+sleep per record or discard arrival credit. Pacing spins only as needed, with an
+explicit 1,000,000,000-clock-poll bound per record and fatal timeout if exhausted.
+
+The final clock sample immediately before **`try_reserve`** is copied unchanged
+into `user_meta_u64` at commit. It uses Unix
+`libc::clock_gettime(libc::CLOCK_MONOTONIC, ...)`, not Rust Instant, wall time or
+an input payload/exchange timestamp. The publication-attempt interval includes
+reservation/region mapping, payload copy and commit. The C++ consumer must sample
+that same named OS clock immediately after successful record observation. Failed,
+negative, malformed, backward or overflowing clock readings are errors; no
+negative measurement is clamped and no postcommit timestamp is substituted.
+
+Input storage, record/schedule descriptors and one UInt64 schedule-lag slot per
+record are allocated before READY. Successful publication allocates no harness
+storage and performs no harness file IO: only the actual upstream writer's own
+mapping/publication work remains. Schedule lag is the exact nonnegative
+publish-attempt stamp minus its original offered deadline, stored without
+changing the deadline. A late record means lag >0 ns, with no hidden threshold.
+Unlimited mode explicitly disables schedule-lag sampling, rather than calling
+its zeros a paced result. The producer reports no query/end-to-end latency.
+
+After all commits stdout emits and flushes a second JSON line, `phase:"COMPLETE"`:
+`count`, `total_payload_bytes`, `offered_updates`, `accepted_updates`, `elapsed_ns`,
+`rate_updates_per_second`, `schedule_lag_enabled`, `schedule_lag_sample_count`,
+`late_count`, `max_schedule_lag_ns`, `schedule_start_ns`, `first_attempt_ns`,
+`last_commit_ns`, `offered_arrival_schedule`, `deadline_formula`, named clock and
+file_ordinal 0. `schedule_start_ns` is the exact CLOCK_MONOTONIC epoch taken after
+G release; `first_attempt_ns` is the first unchanged pre-reserve metadata stamp.
+`last_commit_ns` is one named-clock observation immediately after the final
+upstream commit returns, distinct from its pre-reserve metadata stamp. Elapsed
+time is last_commit_ns minus schedule_start_ns, excluding summaries and startup.
+For a positive rate the exact intended arrival is
+`schedule_start_ns + floor(index*1000000000/rate_updates_per_second)`; the native
+consumer can combine this with raw event index, publish-attempt metadata and
+signal-publication clock samples to inspect offered-arrival latency without
+resetting late credit. Rate 0 explicitly has `offered_arrival_schedule=false` and
+`deadline_formula=null`; it carries no offered arrival schedule. Require
+exit 0, the complete final summary and independent native output validation. A
+fatal IO/clock/publication error yields nonzero exit/stderr after any READY line;
+there is no success summary or automatic retry for a partial accepted prefix.
+
+Only fixture and this single-pass replay mode are implemented. New replay build,
+stdin handshake, malformed-input, fixed-extent and cross-process timing behavior
+remain pending root execution. Warmup, CPU placement, sample aggregation, offered/
+accepted/completed rates and query output validation belong to the benchmark
+owner. The tool establishes no fsync/power-loss durability, allocation plateau,
+paper action completion or HFT/tail-latency result.
