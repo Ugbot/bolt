@@ -9,6 +9,10 @@ if(TARGET bolt::io)
     target_link_libraries(test_xchannel PRIVATE bolt::core bolt::io GTest::gtest_main)
     bolt_apply_hardening(test_xchannel)
     add_test(NAME test_xchannel COMMAND test_xchannel)
+    # Explicit external-fixture tool; no implicit Rust download or test execution.
+    add_executable(verify_xchannel_fixture interop/verify_xchannel_fixture.cpp)
+    target_link_libraries(verify_xchannel_fixture PRIVATE bolt::core bolt::io bolt::io_file)
+    bolt_apply_hardening(verify_xchannel_fixture)
 endif()
 
 # IOCP's bounded association transaction is portable; actual IOCP stays Windows-only.

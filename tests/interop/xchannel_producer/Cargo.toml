@@ -1,0 +1,13 @@
+[package]
+name = "bolt-xchannel-upstream-producer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+xchannel = "=7.0.0"
+libc = "=0.2.183"
+
+# Standalone test tool: no Rust dependency enters Bolt's CMake/library graph.
+[workspace]

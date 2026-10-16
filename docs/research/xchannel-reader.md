@@ -36,6 +36,14 @@ tests pass. The test target is registered only when `bolt::io` exists, because
 identity/Roll checks reuse the owned CRC32C primitive. Both enabled and disabled
 IO CMake configurations generate successfully.
 
-Actual upstream Rust-writer/read-only mapped interoperability and deployment
-platform qualification remain separate checks. These framing tests establish
-neither a Chukonu connector nor query/action latency.
+The separate test-only producer under `tests/interop/xchannel_producer` uses
+the actual pinned upstream Rust crate. After that process exited, the native
+`verify_xchannel_fixture` tool read its files through the owned read-only mapper:
+1,200 varied records crossed 123 region Skips and 41 automatic file Rolls;
+300 records crossed 8 Skips and 8 explicitly requested Rolls; 64 zero-length
+records and an empty channel also passed. Every payload, metadata/index and
+successor identity was checked. Total fixture extents stayed below 4 MiB.
+
+This qualifies the recorded finite-file reader profile. Simultaneous live IPC,
+Chukonu normalized-event integration, deployment platform qualification and
+query/action latency remain separate checks. Rust is a test-only dependency.
