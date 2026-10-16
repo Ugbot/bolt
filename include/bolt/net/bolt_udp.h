@@ -94,6 +94,40 @@ std::int64_t udp_send_to(const UdpEndpoint* ep, UdpAddr dst,
 std::int64_t udp_recv_from(const UdpEndpoint* ep, void* buf,
                            std::uint32_t cap, UdpAddr* src) noexcept;
 
+// Checked receive outcomes. Idle includes would-block and receive timeout;
+// Interrupted is reported separately so callers choose their retry policy.
+enum class UdpReceiveStatus : std::uint32_t {
+    Complete,
+    Idle,
+    Interrupted,
+    Truncated,
+    Error,
+};
+
+struct UdpReceiveResult {
+    UdpReceiveStatus status;
+    std::uint32_t bytes;       // usable bytes, valid only for Complete
+    std::int32_t native_error; // native diagnostic code; 0 if none
+};
+static_assert(__is_trivially_copyable(UdpReceiveResult), "receive result must be POD");
+static_assert(sizeof(UdpReceiveResult) == 12, "receive result must stay small");
+
+// Receive one whole IPv4 datagram, using the endpoint's blocking/timeout mode.
+// Complete includes a zero-length datagram; Idle never consumes a datagram.
+// Exactly-capacity datagrams are Complete; oversized datagrams are Truncated.
+// Only Complete writes src (if non-null). All other outcomes return bytes == 0
+// and leave src unchanged. Truncated may leave a partial prefix in buf; none of
+// it is usable. No original wire length or copied count is promised on failure.
+// native_error preserves errno/WSAGetLastError when an OS error occurs. POSIX
+// MSG_TRUNC has native_error == 0; Winsock truncation preserves WSAEMSGSIZE.
+//
+// At most one receive syscall, no retry, allocation or sleep. ep must refer to
+// an open endpoint; buf must be non-null and 0 < cap <= INT_MAX. Invalid arguments are
+// returned as Error (native EINVAL/WSAEINVAL or EBADF/WSAENOTSOCK), not asserted.
+// Socket lifetime and configuration changes must be synchronized by the caller.
+UdpReceiveResult udp_recv_from_checked(const UdpEndpoint* ep, void* buf,
+                                      std::uint32_t cap, UdpAddr* src) noexcept;
+
 // --- Multicast -------------------------------------------------------------
 constexpr std::uint32_t k_udp_mcast_lo = 0xE0000000u;  // 224.0.0.0
 constexpr std::uint32_t k_udp_mcast_hi = 0xEFFFFFFFu;  // 239.255.255.255

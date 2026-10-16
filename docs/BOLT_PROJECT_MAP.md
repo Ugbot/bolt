@@ -91,6 +91,15 @@ consumed bytes and checks direction/type lengths. No sockets/session lifecycle
 or exchange recovery is implied. Independent framing/overflow tests passed
 Release Clang on 2026-10-14. [Contract](research/market-feed-framing.md).
 
+`net/bolt_udp.h` adds `udp_recv_from_checked` alongside the unchanged legacy
+receive API. It admits only whole IPv4 datagrams as Complete, distinguishes
+Idle/Interrupted/Truncated/Error, and publishes peer/count only on Complete.
+The implementation uses at most one receive syscall with no retry or explicit
+allocation: POSIX `recvmsg(..., 0)` checks output MSG_TRUNC; Windows
+`recvfrom(..., 0)` maps WSAEMSGSIZE. Local macOS qualification passed nine
+GTests in one CTest target on 2026-10-16; Windows/Linux native qualification,
+latency and CME sequence/recovery remain separate gates.
+
 `Arena::overlaps_backing` admits cold-path external buffers against every
 retained arena block, including reset/unused/oversize backing. Callers must
 quiesce arena mutation. The bounded scan allocates nothing and does not alter

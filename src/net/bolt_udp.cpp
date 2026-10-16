@@ -10,6 +10,8 @@
 #include "bolt/net/bolt_udp.h"
 
 #include <cassert>
+#include <cerrno>
+#include <climits>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -27,6 +29,7 @@ constexpr sock_t k_bad_sock = INVALID_SOCKET;
 #  include <netinet/in.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
+#  include <sys/uio.h>
 #  include <unistd.h>
 using sock_t = int;
 constexpr sock_t k_bad_sock = -1;
@@ -59,6 +62,43 @@ inline void close_native(sock_t s) noexcept {
 #else
     ::close(s);
 #endif
+}
+
+UdpReceiveResult receive_failure(std::int32_t error) noexcept {
+    assert(error != 0);
+    UdpReceiveStatus status = UdpReceiveStatus::Error;
+#if defined(_WIN32)
+    if (error == WSAEWOULDBLOCK || error == WSAETIMEDOUT) status = UdpReceiveStatus::Idle;
+    if (error == WSAEINTR) status = UdpReceiveStatus::Interrupted;
+    if (error == WSAEMSGSIZE) status = UdpReceiveStatus::Truncated;
+#else
+    if (error == EAGAIN || error == EWOULDBLOCK || error == ETIMEDOUT) {
+        status = UdpReceiveStatus::Idle;
+    }
+    if (error == EINTR) status = UdpReceiveStatus::Interrupted;
+#endif
+    const UdpReceiveResult result{status, 0u, error};
+    assert(result.bytes == 0u);
+    return result;
+}
+
+// Validate the OS address and copied count before publishing any peer/bytes.
+UdpReceiveResult receive_complete(std::uint64_t count, std::uint32_t cap,
+                                  const sockaddr_in& from, std::uint32_t from_len,
+                                  UdpAddr* src) noexcept {
+    assert(cap > 0u);
+    assert(cap <= static_cast<std::uint32_t>(INT_MAX));
+    if (count > cap || from_len != sizeof(from) || from.sin_family != AF_INET) {
+#if defined(_WIN32)
+        return receive_failure(WSAEINVAL);
+#else
+        return receive_failure(EINVAL);
+#endif
+    }
+    if (src != nullptr) {
+        *src = {ntohl(from.sin_addr.s_addr), ntohs(from.sin_port), 0u};
+    }
+    return {UdpReceiveStatus::Complete, static_cast<std::uint32_t>(count), 0};
 }
 
 // Shared bind + buffer/timeout setup. `reuse` sets SO_REUSEADDR (+ SO_REUSEPORT
@@ -212,6 +252,54 @@ std::int64_t udp_recv_from(const UdpEndpoint* ep, void* buf,
         src->_pad = 0;
     }
     return static_cast<std::int64_t>(n);
+}
+
+UdpReceiveResult udp_recv_from_checked(const UdpEndpoint* ep, void* buf,
+                                      std::uint32_t cap, UdpAddr* src) noexcept {
+#if defined(_WIN32)
+    constexpr std::int32_t bad_endpoint = WSAENOTSOCK;
+    constexpr std::int32_t bad_input = WSAEINVAL;
+#else
+    constexpr std::int32_t bad_endpoint = EBADF;
+    constexpr std::int32_t bad_input = EINVAL;
+#endif
+    if (ep == nullptr || ep->sock == k_udp_invalid_sock) return receive_failure(bad_endpoint);
+    if (buf == nullptr || cap == 0u || cap > static_cast<std::uint32_t>(INT_MAX)) {
+        return receive_failure(bad_input);
+    }
+#if defined(_WIN32)
+    if (static_cast<std::uint64_t>(to_native(ep->sock)) != ep->sock) {
+        return receive_failure(bad_endpoint);
+    }
+#else
+    if (ep->sock > static_cast<std::uint64_t>(INT_MAX)) return receive_failure(bad_endpoint);
+#endif
+    assert(cap > 0u);
+    assert(cap <= static_cast<std::uint32_t>(INT_MAX));
+    sockaddr_in from{};
+#if defined(_WIN32)
+    int from_len = sizeof(from);
+    // recvfrom guarantees WSAEMSGSIZE and discarded UDP excess, without
+    // WSARecvFrom's provider-dependent partial-message continuation semantics.
+    const int count = ::recvfrom(to_native(ep->sock), static_cast<char*>(buf),
+        static_cast<int>(cap), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (count == SOCKET_ERROR) return receive_failure(::WSAGetLastError());
+    return receive_complete(static_cast<std::uint64_t>(count), cap, from,
+                            static_cast<std::uint32_t>(from_len), src);
+#else
+    iovec buffer{buf, cap};
+    msghdr message{};
+    message.msg_name = &from;
+    message.msg_namelen = sizeof(from);
+    message.msg_iov = &buffer;
+    message.msg_iovlen = 1;
+    // Inspect output MSG_TRUNC; do not request Linux's original-length extension.
+    const auto count = ::recvmsg(to_native(ep->sock), &message, 0);
+    if (count < 0) return receive_failure(errno);
+    if ((message.msg_flags & MSG_TRUNC) != 0) return {UdpReceiveStatus::Truncated, 0u, 0};
+    return receive_complete(static_cast<std::uint64_t>(count), cap, from,
+                            message.msg_namelen, src);
+#endif
 }
 
 // --- Multicast -------------------------------------------------------------
