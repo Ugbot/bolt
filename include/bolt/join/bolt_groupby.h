@@ -684,6 +684,9 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
     assert(r >= 0);
     GbCell16 out{0, 0};
     switch (c.type) {
+        // Store UInt64 as opaque bits, never a narrowing signed conversion.
+        case BoltType::UInt64:
+            std::memcpy(&out.a, &static_cast<const uint64_t*>(c.data)[r], 8); break;
         case BoltType::Bool: out.a = static_cast<const uint8_t*>(c.data)[r] != 0; break;
         case BoltType::Decimal128: {
             const auto* p = static_cast<const kernels::decimal::Decimal128*>(c.data);
@@ -793,6 +796,7 @@ inline constexpr int64_t kGbNullKeyTag = static_cast<int64_t>(0x4E554C4C4B45593F
 BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
     switch (t) {
         case BoltType::Bool:
+        case BoltType::UInt64:
         case BoltType::Int64:     case BoltType::Int32:
         case BoltType::Date32:    case BoltType::Date64:
         case BoltType::Timestamp: case BoltType::Duration:
@@ -2171,6 +2175,8 @@ inline bool groupby_agg_multi_key_typed_finalize(
             switch (state->key_types[k]) {
                 case BoltType::Bool:
                     static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
+                case BoltType::UInt64:
+                    std::memcpy(&static_cast<uint64_t*>(buf)[r], &kc.a, 8); break;
                 case BoltType::Int64:
                     static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
@@ -2518,6 +2524,8 @@ inline bool groupby_agg_multi_key_typed(
             switch (key_types[k]) {
                 case BoltType::Bool:
                     static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
+                case BoltType::UInt64:
+                    std::memcpy(&static_cast<uint64_t*>(buf)[r], &kc.a, 8); break;
                 case BoltType::Int64:
                     static_cast<int64_t*>(buf)[r] = kc.a; break;
                 case BoltType::Int32:
