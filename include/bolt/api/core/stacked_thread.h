@@ -40,6 +40,8 @@
 #include <cassert>
 #include <cstddef>
 #include <functional>
+#include <limits>
+#include <new>
 #include <tuple>
 #include <utility>
 
@@ -149,6 +151,42 @@ public:
 
     bool joinable() const noexcept { return has_handle_; }
 
+    /// Checked cold-start API: no throwing callable wrapper or startup assert.
+    /// Stack bounds are shared across Windows/POSIX (64 KiB .. UINT_MAX).
+    /// `user` may be null; its lifetime must cover the callback. Callers
+    /// serialize start/join/move and publish the handle before a self-join.
+    bool try_start(std::size_t stack_bytes, void (*fn)(void*) noexcept,
+                   void* user) noexcept {
+        constexpr std::size_t kMinStackBytes = 64u * 1024u;
+        constexpr std::size_t kMaxStackBytes =
+            (std::numeric_limits<unsigned>::max)();
+        if (joinable() || fn == nullptr || stack_bytes < kMinStackBytes ||
+            stack_bytes > kMaxStackBytes) return false;
+        auto* closure = new (std::nothrow) CheckedClosure{fn, user};
+        if (closure == nullptr) return false;
+        if (spawn_checked(stack_bytes, closure)) return true;
+        delete closure;
+        return false;
+    }
+
+    /// A failed join retains ownership so the owner can retry. In particular,
+    /// a Windows wait success followed by CloseHandle failure stays joinable.
+    bool try_join() noexcept {
+        if (!joinable()) return false;
+#if defined(_WIN32)
+        const DWORD thread_id = GetThreadId(handle_);
+        if (thread_id == 0 || thread_id == GetCurrentThreadId()) return false;
+        if (WaitForSingleObject(handle_, INFINITE) != WAIT_OBJECT_0) return false;
+        if (CloseHandle(handle_) == 0) return false;
+        handle_ = nullptr;
+#else
+        if (pthread_equal(pthread_self(), handle_) != 0) return false;
+        if (pthread_join(handle_, nullptr) != 0) return false;
+#endif
+        has_handle_ = false;
+        return true;
+    }
+
     void join() noexcept {
         assert(joinable());
 #if defined(_WIN32)
@@ -163,9 +201,20 @@ public:
     }
 
 private:
+    struct CheckedClosure {
+        void (*fn)(void*) noexcept;
+        void* user;
+    };
+    bool spawn_checked(std::size_t stack_bytes, CheckedClosure* closure) noexcept;
     void spawn(std::size_t stack_bytes, std::function<void()>* closure);
 
 #if defined(_WIN32)
+    static unsigned __stdcall checked_trampoline(void* arg) noexcept {
+        const auto closure = *static_cast<CheckedClosure*>(arg);
+        delete static_cast<CheckedClosure*>(arg);
+        closure.fn(closure.user);
+        return 0;
+    }
     static unsigned __stdcall trampoline(void* arg) {
         auto* closure = static_cast<std::function<void()>*>(arg);
         (*closure)();
@@ -174,6 +223,12 @@ private:
     }
     HANDLE handle_ = nullptr;
 #else
+    static void* checked_trampoline(void* arg) noexcept {
+        const auto closure = *static_cast<CheckedClosure*>(arg);
+        delete static_cast<CheckedClosure*>(arg);
+        closure.fn(closure.user);
+        return nullptr;
+    }
     static void* trampoline(void* arg) {
         auto* closure = static_cast<std::function<void()>*>(arg);
         (*closure)();
@@ -184,6 +239,32 @@ private:
 #endif
     bool has_handle_ = false;
 };
+
+inline bool StackedThread::spawn_checked(std::size_t stack_bytes,
+                                          CheckedClosure* closure) noexcept {
+    assert(!has_handle_);
+    assert(closure != nullptr);
+#if defined(_WIN32)
+    const uintptr_t handle = _beginthreadex(nullptr,
+        static_cast<unsigned>(stack_bytes), &checked_trampoline, closure, 0, nullptr);
+    if (handle == 0) return false;
+    handle_ = reinterpret_cast<HANDLE>(handle);
+#else
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    const int stack_rc = pthread_attr_setstacksize(&attr, stack_bytes);
+    const int create_rc = stack_rc == 0
+        ? pthread_create(&handle_, &attr, &checked_trampoline, closure) : stack_rc;
+    const int destroy_rc = pthread_attr_destroy(&attr);
+    // A successfully initialized, unmodified attr is valid for destruction.
+    // A created thread remains owned even if this invariant is violated.
+    assert(destroy_rc == 0);
+    (void)destroy_rc;
+    if (create_rc != 0) return false;
+#endif
+    has_handle_ = true;
+    return true;
+}
 
 inline void StackedThread::spawn(std::size_t stack_bytes,
                                   std::function<void()>* closure) {

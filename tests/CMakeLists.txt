@@ -1,4 +1,11 @@
 add_executable(test_bolt_alignment test_bolt_alignment.cpp)
+
+# Checked native thread startup/join, without the callable constructor path.
+add_executable(test_stacked_thread_checked test_stacked_thread_checked.cpp)
+target_link_libraries(test_stacked_thread_checked PRIVATE bolt::core GTest::gtest_main)
+bolt_apply_hardening(test_stacked_thread_checked)
+add_test(NAME test_stacked_thread_checked COMMAND test_stacked_thread_checked)
+set_tests_properties(test_stacked_thread_checked PROPERTIES TIMEOUT 20)
 foreach(_mapped IN ITEMS ring ring_batch write)
     if(NOT _mapped STREQUAL "write" AND NOT TARGET bolt::io_file)
         continue()

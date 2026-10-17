@@ -132,6 +132,7 @@ bolt/
 │   ├── bolt_types.h                   Type enum, StringView, Schema, Arrow C Data ABI
 │   ├── bolt_decimal_scale.h           Lightweight shared AVG scale min(s+4,38) (G2CHK-736)
 │   ├── bolt_arena.h                   Per-thread bump allocator
+│   ├── api/core/stacked_thread.h      Explicit-stack native thread; checked noexcept callback start/join (G2FEAT-248)
 │   ├── bolt_channel.h                 Lock-free SPSC/MPSC ring buffers
 │   ├── bolt_column.h                  Adaptive column + BoltBatch + BitmapIndex
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
