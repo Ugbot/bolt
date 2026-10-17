@@ -409,6 +409,16 @@ bool pq_locate_footer(const uint8_t* buf, uint64_t len,
 bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         PqMeta* out) noexcept;
 
+// Additive exact FLAT schema admission. Legacy tolerant parsing above remains
+// unchanged. Caller supplies fixed columns/chunks; no allocations or retries.
+// Rejects nested/repeated schemas, unknown interpretation, truncated/embedded-
+// NUL/duplicate names and malformed/missing logical members (including explicit
+// UTC adjustment for TIME/TIMESTAMP). Entire compact metadata must be well formed.
+// Does not validate/decode data pages. Output/supplied arrays may change on refusal.
+enum class PqMetaParseStatus : uint8_t { Ok, Invalid, Capacity, Unsupported };
+PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* meta, uint32_t meta_len,
+    PqMeta* out, uint32_t max_row_groups) noexcept;
+
 }  // namespace parquet
 }  // namespace ingest
 }  // namespace bolt

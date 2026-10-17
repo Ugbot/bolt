@@ -1438,6 +1438,7 @@ add_test(NAME test_bolt_csv_parallel COMMAND test_bolt_csv_parallel)
 # W-PQ — Parquet footer metadata reader (hand-rolled thrift compact subset)
 # vs pyarrow goldens + corrupt-input fuzzing (truncations, byte flips).
 add_executable(test_bolt_parquet_meta test_bolt_parquet_meta.cpp)
+target_sources(test_bolt_parquet_meta PRIVATE test_bolt_parquet_meta_strict.cpp)
 target_link_libraries(test_bolt_parquet_meta
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 target_compile_definitions(test_bolt_parquet_meta PRIVATE

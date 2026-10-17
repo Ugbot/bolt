@@ -9,10 +9,39 @@ namespace parquet {
 
 namespace {
 constexpr uint32_t kTcMaxDepth = 16;   // corrupt nesting cap
+bool strict_field(TcCursor*, int16_t*, uint8_t*, bool*) noexcept;
+bool strict_varint(TcCursor* c,uint64_t* value) noexcept {
+    assert(c && value);assert(c->p<=c->end);
+    const uint8_t* begin=c->p;
+    if(!tc_varint(c,value))return false;
+    // The tenth ULEB128 byte contains only bit 63. The tolerant primitive
+    // historically discards its other payload bits; exact admission must not.
+    return c->p-begin<10 || (c->p-begin==10 && begin[9]<=1);
+}
+bool strict_zigzag(TcCursor* c,int64_t* value) noexcept {
+    assert(c && value);assert(c->p<=c->end);
+    uint64_t raw=0;if(!strict_varint(c,&raw))return false;
+    *value=static_cast<int64_t>((raw>>1)^(~(raw&1)+1));return true;
+}
+bool strict_binary(TcCursor* c,const uint8_t** bytes,uint32_t* length) noexcept {
+    assert(c && bytes && length);assert(c->p<=c->end);
+    uint64_t size=0;if(!strict_varint(c,&size) || size>INT32_MAX ||
+        size>static_cast<uint64_t>(c->end-c->p))return false;
+    *bytes=c->p;*length=static_cast<uint32_t>(size);c->p+=size;return true;
+}
+bool strict_list(TcCursor* c,uint8_t* type,uint32_t* count) noexcept {
+    assert(c && type && count);assert(c->p<=c->end);
+    uint8_t header=0;if(!tc_u8(c,&header))return false;
+    *type=header&15u;if(*type==kTcStop || *type>kTcStruct)return false;
+    uint64_t size=header>>4;
+    if(size==15 && !strict_varint(c,&size))return false;
+    if(size>INT32_MAX)return false;
+    *count=static_cast<uint32_t>(size);return true;
+}
 }
 
 // Structurally skip one compact-protocol value. Bounded depth.
-bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
+static bool tc_skip_impl(TcCursor* c, uint8_t type, uint32_t depth, bool strict) noexcept {
     assert(c != nullptr);
     if (depth >= kTcMaxDepth) return false;
     switch (type) {
@@ -21,7 +50,12 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
         case kTcByte: { uint8_t b; return tc_u8(c, &b); }
         case kTcI16:
         case kTcI32:
-        case kTcI64: { int64_t v; return tc_zigzag(c, &v); }
+        case kTcI64: {
+            int64_t v;
+            if(!strict)return tc_zigzag(c,&v);
+            if(!strict_zigzag(c,&v))return false;
+            return type==kTcI64 || (type==kTcI32?v>=INT32_MIN && v<=INT32_MAX:v>=INT16_MIN && v<=INT16_MAX);
+        }
         case kTcDouble: {
             if (c->end - c->p < 8) return false;
             c->p += 8;
@@ -29,14 +63,20 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
         }
         case kTcBinary: {
             const uint8_t* p; uint32_t n;
-            return tc_binary(c, &p, &n);
+            return strict?strict_binary(c,&p,&n):tc_binary(c,&p,&n);
         }
         case kTcList:
         case kTcSet: {
             uint8_t et; uint32_t n;
-            if (!tc_list(c, &et, &n)) return false;
+            if (!(strict?strict_list(c,&et,&n):tc_list(c,&et,&n))) return false;
+            if (strict && n > static_cast<uint64_t>(c->end-c->p)) return false;
             for (uint32_t i = 0; i < n; ++i) {
-                if (!tc_skip(c, et, depth + 1)) return false;
+                if (strict && (et==kTcTrue || et==kTcFalse)) {
+                    uint8_t value=0;
+                    if (!tc_u8(c,&value) || (value!=kTcTrue && value!=kTcFalse)) return false;
+                    continue;
+                }
+                if (!tc_skip_impl(c, et, depth + 1, strict)) return false;
             }
             return true;
         }
@@ -50,13 +90,19 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
             // (Compact map header = varint size, then 1 byte kv-types.)
             c->p -= 1;
             uint64_t sz = 0;
-            if (!tc_varint(c, &sz) || sz > 0xFFFFFF) return false;
+            if (!(strict?strict_varint(c,&sz):tc_varint(c,&sz)) || sz > 0xFFFFFF) return false;
             if (!tc_u8(c, &kv)) return false;
             n = static_cast<uint32_t>(sz);
             const uint8_t kt = kv >> 4, vt = kv & 0x0Fu;
+            if (strict && n > static_cast<uint64_t>(c->end-c->p)/2u) return false;
             for (uint32_t i = 0; i < n; ++i) {
-                if (!tc_skip(c, kt, depth + 1)) return false;
-                if (!tc_skip(c, vt, depth + 1)) return false;
+                const uint8_t items[2]={kt,vt};
+                for (const uint8_t item : items) {
+                    if (strict && (item==kTcTrue || item==kTcFalse)) {
+                        uint8_t value=0;
+                        if (!tc_u8(c,&value) || (value!=kTcTrue && value!=kTcFalse)) return false;
+                    } else if (!tc_skip_impl(c,item,depth+1,strict)) return false;
+                }
             }
             return true;
         }
@@ -64,14 +110,28 @@ bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
             int16_t fid = 0;
             uint8_t ft;
             // Bounded: each tc_field consumes >=1 byte from a finite slice.
-            while (tc_field(c, &fid, &ft)) {
-                if (!tc_skip(c, ft, depth + 1)) return false;
+            for (;;) {
+                if (strict) {
+                    bool done=false;
+                    if (!strict_field(c,&fid,&ft,&done)) return false;
+                    if (done) return true;
+                    if (!tc_skip_impl(c,ft,depth+1,true)) return false;
+                    continue;
+                }
+                const uint8_t* before = c->p;
+                if (!tc_field(c, &fid, &ft))
+                    return !strict || (before < c->end && *before == kTcStop);
+                if (strict && fid <= 0) return false;
+                if (!tc_skip_impl(c, ft, depth + 1, strict)) return false;
             }
-            return true;   // tc_field returned false at STOP (or slice end)
         }
         default:
             return false;
     }
+}
+
+bool tc_skip(TcCursor* c, uint8_t type, uint32_t depth) noexcept {
+    return tc_skip_impl(c, type, depth, false);
 }
 
 namespace {
@@ -979,6 +1039,301 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
         if (out->row_groups[g].chunk_count != out->n_columns) return false;
     }
     return true;
+}
+
+namespace {
+using StrictStatus = PqMetaParseStatus;
+// This preflight shares the compact primitives and SchemaElem decoder with the
+// tolerant reader. Raw presence/error information cannot be recovered from a
+// PqColumn (notably required groups and absent UTC booleans). No data page work.
+struct StrictSchema {
+    StrictStatus status = StrictStatus::Invalid;
+    uint32_t columns = 0, max_columns = 0, max_groups = 0;
+    PqColumn* fields = nullptr;
+};
+bool strict_refuse(StrictSchema& s, StrictStatus status) noexcept {
+    s.status = status; return false;
+}
+// Distinguish an actual STOP from the tolerant helper's end/error return.
+bool strict_field(TcCursor* c, int16_t* id, uint8_t* type, bool* done) noexcept {
+    assert(c && id && type && done); assert(c->p <= c->end);
+    *done = false;
+    if (c->p == c->end) return false;
+    if (*c->p == kTcStop) { ++c->p; *done = true; return true; }
+    uint8_t header=0;if(!tc_u8(c,&header))return false;
+    *type=header & 15u;int64_t next=0;
+    if(header>>4)next=int64_t(*id)+(header>>4);
+    else {
+        const uint8_t* start=c->p;
+        if(!strict_zigzag(c,&next) || c->p-start>3)return false;
+    }
+    if(next<=0 || next>INT16_MAX || *type==kTcStop || *type>kTcStruct)return false;
+    *id=static_cast<int16_t>(next);return true;
+}
+bool strict_i32(TcCursor* c, int32_t* out) noexcept {
+    assert(c && out); assert(c->p <= c->end);
+    const uint8_t* start=c->p; int64_t value=0;
+    if (!strict_zigzag(c,&value) || c->p-start>5 || value<INT32_MIN || value>INT32_MAX) return false;
+    *out=static_cast<int32_t>(value); return true;
+}
+bool strict_empty(TcCursor* c) noexcept {
+    assert(c); assert(c->p <= c->end);
+    if (c->p==c->end || *c->p!=kTcStop) return false;
+    ++c->p; return true;
+}
+bool strict_i64(TcCursor* c,int64_t* out) noexcept {
+    assert(c && out);assert(c->p<=c->end);
+    return strict_zigzag(c,out);
+}
+bool strict_time_unit(TcCursor* c) noexcept {
+    assert(c); assert(c->p <= c->end);
+    int16_t id=0;uint8_t type=0;bool done=false;
+    if (!strict_field(c,&id,&type,&done) || done || id<1 || id>3 || type!=kTcStruct ||
+        !strict_empty(c)) return false;
+    return strict_field(c,&id,&type,&done) && done;
+}
+bool strict_logical_members(TcCursor* c, int16_t member) noexcept {
+    assert(c); assert(member>0);
+    if (member==1 || member==6) return strict_empty(c); // STRING / DATE
+    uint8_t seen=0;int16_t id=0;uint8_t type=0;bool done=false;
+    for (;;) {
+        if (!strict_field(c,&id,&type,&done)) return false;
+        if (done) return seen==3;
+        if (id<1 || id>2 || (seen & (1u<<(id-1)))) return false;
+        seen=static_cast<uint8_t>(seen | (1u<<(id-1)));
+        if (member==5) { // DECIMAL: scale and precision
+            int32_t ignored=0;if(type!=kTcI32 || !strict_i32(c,&ignored))return false;
+        } else if (member==7 || member==8) { // TIME / TIMESTAMP
+            if (id==1) {if(type!=kTcTrue && type!=kTcFalse)return false;}
+            else if(type!=kTcStruct || !strict_time_unit(c))return false;
+        } else { // INTEGER: bitWidth and isSigned
+            if(id==1){uint8_t bits=0;if(type!=kTcByte || !tc_u8(c,&bits) ||
+                (bits!=8 && bits!=16 && bits!=32 && bits!=64))return false;}
+            else if(type!=kTcTrue && type!=kTcFalse)return false;
+        }
+    }
+}
+bool strict_logical(TcCursor* c, StrictSchema& s, int16_t* member) noexcept {
+    assert(c && member); assert(c->p <= c->end);
+    int16_t id=0;uint8_t type=0;bool done=false;
+    if(!strict_field(c,&id,&type,&done) || done || type!=kTcStruct)return false;
+    if(id!=1 && id!=5 && id!=6 && id!=7 && id!=8 && id!=10)
+        return strict_refuse(s,StrictStatus::Unsupported);
+    *member=id;
+    if(!strict_logical_members(c,id))return false;
+    return strict_field(c,&id,&type,&done) && done; // a union has exactly one member
+}
+bool strict_annotation_pair(const SchemaElem& e,int16_t logical) noexcept {
+    const auto& c=e.col;const auto old=c.converted;
+    if(old<0 || !logical)return true;
+    if(logical==1)return old==0;
+    if(logical==5)return old==kCtDecimal;
+    if(logical==6)return old==kCtDate;
+    if(logical==7)return c.ts_utc && old==(c.time_unit==1?kCtTimeMillis:c.time_unit==2?kCtTimeMicros:-1);
+    if(logical==8)return c.ts_utc && old==(c.time_unit==1?kCtTsMillis:c.time_unit==2?kCtTsMicros:-1);
+    assert(logical==10);assert(c.int_bits>0);
+    const int32_t index=c.int_bits==8?0:c.int_bits==16?1:c.int_bits==32?2:3;
+    return old==(c.int_signed?kCtInt8:kCtUint8)+index;
+}
+bool strict_type(const PqColumn& c,StrictSchema& s) noexcept {
+    const auto logical=static_cast<PqLogical>(c.logical);
+    if(logical==PqLogical::Int)return
+        (c.int_bits==8 || c.int_bits==16 || c.int_bits==32 || c.int_bits==64) &&
+        c.physical==(c.int_bits==64?PqType::Int64:PqType::Int32);
+    if(logical==PqLogical::String || (logical==PqLogical::None && c.converted==0))return c.physical==PqType::ByteArray;
+    if(logical==PqLogical::Date)return c.physical==PqType::Int32;
+    if(logical==PqLogical::Timestamp)return c.physical==PqType::Int64 && c.time_unit>=1 && c.time_unit<=3;
+    if(logical==PqLogical::Time)return c.time_unit>=1 && c.time_unit<=3 &&
+        c.physical==(c.time_unit==1?PqType::Int32:PqType::Int64);
+    if(logical==PqLogical::Decimal) {
+        int32_t precision=0;
+        if(c.physical==PqType::Int32)precision=9;
+        else if(c.physical==PqType::Int64)precision=18;
+        else if(c.physical==PqType::FixedLenByteArray) {
+            if(c.type_length==4)precision=9;else if(c.type_length==8)precision=18;
+            else if(c.type_length==16)precision=38;else if(c.type_length==32)precision=76;
+            else return strict_refuse(s,StrictStatus::Unsupported);
+        } else return false;
+        return c.precision>0 && c.precision<=precision && c.scale>=0 && c.scale<=c.precision;
+    }
+    if(logical!=PqLogical::None)return strict_refuse(s,StrictStatus::Unsupported);
+    if(c.physical==PqType::Int96)return strict_refuse(s,StrictStatus::Unsupported);
+    return c.physical!=PqType::FixedLenByteArray || c.type_length>0;
+}
+bool strict_element(TcCursor* c,StrictSchema& s,SchemaElem* element,bool root) noexcept {
+    assert(c && element);assert(c->p <= c->end);
+    TcCursor decoded=*c;uint16_t seen=0;int16_t id=0,logical=0;uint8_t type=0;bool done=false;
+    int32_t legacy_scale=0,legacy_precision=0;
+    PqColumn logical_column{};
+    for (;;) {
+        if(!strict_field(c,&id,&type,&done))return false;
+        if(done)break;
+        if(id>10 || (seen & (1u<<(id-1))))return false;
+        seen=static_cast<uint16_t>(seen | (1u<<(id-1)));
+        if(id==4) {
+            const uint8_t* name=nullptr;uint32_t size=0;
+            if(type!=kTcBinary || !strict_binary(c,&name,&size) || !size || std::memchr(name,0,size))return false;
+            if(size>=kPqMaxNameBytes)return strict_refuse(s,StrictStatus::Unsupported);
+        } else if(id==10) {
+            TcCursor logical_cursor=*c;
+            if(type!=kTcStruct || !strict_logical(c,s,&logical))return false;
+            parse_logical_type(&logical_cursor,&logical_column);
+        } else {
+            int32_t value=0;if(type!=kTcI32 || !strict_i32(c,&value))return false;
+            if((id==1 && (value<0 || value>7)) || (id==2 && value<=0) ||
+                (id==3 && (value<0 || value>2)) || (id==5 && value<0) ||
+                (id==6 && value<0))return false;
+            if(id==7)legacy_scale=value;
+            if(id==8)legacy_precision=value;
+        }
+    }
+    if(!(seen & (1u<<3)) || !parse_schema_element(&decoded,element) || decoded.p!=c->p)return false;
+    if(root)return !element->has_type && seen==((1u<<3)|(1u<<4)) && element->num_children>0;
+    if(element->num_children || element->repeated)return strict_refuse(s,StrictStatus::Unsupported);
+    if(!element->has_type || !(seen & (1u<<2)))return false;
+    const auto old=element->col.converted;
+    if(old>=0 && old!=0 && old!=kCtDecimal && old!=kCtDate && (old<kCtTimeMillis || old>kCtInt64))
+        return strict_refuse(s,StrictStatus::Unsupported);
+    // Converted TIME/TIMESTAMP alone loses the required explicit UTC member.
+    if(!logical && old>=kCtTimeMillis && old<=kCtTsMicros)return strict_refuse(s,StrictStatus::Unsupported);
+    if(!logical && old==kCtDecimal && (seen & ((1u<<6)|(1u<<7)))!=((1u<<6)|(1u<<7)))return false;
+    if((seen & ((1u<<6)|(1u<<7))) && element->col.logical!=static_cast<int32_t>(PqLogical::Decimal))return false;
+    if(logical==5 && (((seen & (1u<<6)) && legacy_scale!=logical_column.scale) ||
+        ((seen & (1u<<7)) && legacy_precision!=logical_column.precision)))return false;
+    if((seen & (1u<<1)) && element->col.physical!=PqType::FixedLenByteArray)return false;
+    if(element->col.physical==PqType::FixedLenByteArray && !(seen & (1u<<1)))return false;
+    return strict_annotation_pair(*element,logical) && strict_type(element->col,s);
+}
+bool strict_schema_list(TcCursor* c,StrictSchema& s) noexcept {
+    assert(c);assert(s.max_columns>0);
+    uint8_t type=0;uint32_t count=0;
+    if(!strict_list(c,&type,&count) || type!=kTcStruct || count<2)return false;
+    if(count-1>s.max_columns)return strict_refuse(s,StrictStatus::Capacity);
+    SchemaElem root{};if(!strict_element(c,s,&root,true))return false;
+    if(static_cast<uint32_t>(root.num_children)!=count-1)return strict_refuse(s,StrictStatus::Unsupported);
+    for(uint32_t i=1;i<count;++i) {
+        SchemaElem column{};if(!strict_element(c,s,&column,false))return false;
+        s.fields[i-1]=column.col;
+    }
+    s.columns=count-1;return true;
+}
+bool strict_chunk_path(TcCursor* c,const PqColumn& column) noexcept {
+    assert(c);assert(column.name[0]);
+    uint8_t type=0;uint32_t count=0;const uint8_t* name=nullptr;uint32_t size=0;
+    return strict_list(c,&type,&count) && type==kTcBinary && count==1 &&
+        strict_binary(c,&name,&size) && size==std::strlen(column.name) &&
+        std::memcmp(name,column.name,size)==0;
+}
+bool strict_column_meta(TcCursor* c,StrictSchema& s,uint32_t column) noexcept {
+    assert(c);assert(column<s.columns);
+    uint32_t seen=0;int16_t id=0;uint8_t type=0;bool done=false;
+    for(;;) {
+        if(!strict_field(c,&id,&type,&done))return false;
+        if(done)return (seen & 0x17fu)==0x17fu;
+        if(id<=16){if(seen & (1u<<(id-1)))return false;seen |= (1u<<(id-1));}
+        if(id==1 || id==4) {
+            int32_t value=0;if(type!=kTcI32 || !strict_i32(c,&value))return false;
+            if(id==1 && value!=static_cast<int32_t>(s.fields[column].physical))return false;
+            if(id==4 && (value<0 || value>7))return strict_refuse(s,StrictStatus::Unsupported);
+        } else if(id==2) {
+            uint8_t element=0;uint32_t count=0;
+            if(type!=kTcList || !strict_list(c,&element,&count) || element!=kTcI32 || !count)return false;
+            for(uint32_t i=0;i<count;++i){int32_t encoding=0;if(!strict_i32(c,&encoding) || encoding<0)return false;}
+        } else if(id==3) {if(type!=kTcList || !strict_chunk_path(c,s.fields[column]))return false;}
+        else if((id>=5 && id<=7) || id==9 || id==11) {
+            int64_t value=0;if(type!=kTcI64 || !strict_i64(c,&value) || value<0 || ((id==9 || id==11) && value<4))return false;
+        } else if(!tc_skip_impl(c,type,0,true))return false;
+    }
+}
+bool strict_column_chunk(TcCursor* c,StrictSchema& s,uint32_t column) noexcept {
+    assert(c);assert(column<s.columns);
+    uint8_t seen=0;int16_t id=0;uint8_t type=0;bool done=false;
+    for(;;) {
+        if(!strict_field(c,&id,&type,&done))return false;
+        if(done)return (seen & 6u)==6u;
+        if(id<=3){if(seen & (1u<<(id-1)))return false;seen=static_cast<uint8_t>(seen | (1u<<(id-1)));}
+        if(id==1) {
+            const uint8_t* path=nullptr;uint32_t size=0;
+            if(type!=kTcBinary || !strict_binary(c,&path,&size))return false;
+            if(size)return strict_refuse(s,StrictStatus::Unsupported); // external data file
+        } else if(id==2) {int64_t offset=0;if(type!=kTcI64 || !strict_i64(c,&offset) || offset<0)return false;}
+        else if(id==3){if(type!=kTcStruct || !strict_column_meta(c,s,column))return false;}
+        else if(!tc_skip_impl(c,type,0,true))return false;
+    }
+}
+bool strict_row_group(TcCursor* c,StrictSchema& s) noexcept {
+    assert(c);assert(s.columns>0);
+    uint8_t seen=0;int16_t id=0;uint8_t type=0;bool done=false;
+    for(;;) {
+        if(!strict_field(c,&id,&type,&done))return false;
+        if(done)return (seen & 7u)==7u;
+        if(id<=3){if(seen & (1u<<(id-1)))return false;seen=static_cast<uint8_t>(seen | (1u<<(id-1)));}
+        if(id==1) {
+            uint8_t element=0;uint32_t count=0;
+            if(type!=kTcList || !strict_list(c,&element,&count) || element!=kTcStruct || count!=s.columns)return false;
+            for(uint32_t i=0;i<count;++i)if(!strict_column_chunk(c,s,i))return false;
+        } else if(id==2 || id==3) {
+            int64_t value=0;if(type!=kTcI64 || !strict_i64(c,&value) || value<0)return false;
+        } else if(!tc_skip_impl(c,type,0,true))return false;
+    }
+}
+bool strict_preflight(const uint8_t* bytes,uint32_t size,StrictSchema& s) noexcept {
+    assert(bytes);assert(size>0);
+    TcCursor c{bytes,bytes+size};int16_t id=0;uint8_t type=0,seen=0;bool done=false;
+    TcCursor groups{};uint32_t group_count=0;
+    for (;;) {
+        if(!strict_field(&c,&id,&type,&done))return false;
+        if(done) {
+            if(seen!=15 || c.p!=c.end)return false;
+            for(uint32_t i=0;i<group_count;++i)if(!strict_row_group(&groups,s))return false;
+            return true;
+        }
+        if(id<=4) {
+            if(seen & (1u<<(id-1)))return false;
+            seen=static_cast<uint8_t>(seen | (1u<<(id-1)));
+        }
+        if(id==1){int32_t version=0;if(type!=kTcI32 || !strict_i32(&c,&version))return false;
+            if(version!=1 && version!=2)return strict_refuse(s,StrictStatus::Unsupported);}
+        else if(id==2){if(type!=kTcList || !strict_schema_list(&c,s))return false;}
+        else if(id==3){int64_t rows=0;if(type!=kTcI64 || !strict_i64(&c,&rows) || rows<0)return false;}
+        else if(id==4) {
+            uint8_t element=0;uint32_t count=0;
+            if(type!=kTcList || !strict_list(&c,&element,&count) || element!=kTcStruct)return false;
+            if(count>s.max_groups)return strict_refuse(s,StrictStatus::Capacity);
+            groups=c;group_count=count;
+            for(uint32_t i=0;i<count;++i)if(!tc_skip_impl(&c,kTcStruct,0,true))return false;
+        } else if(!tc_skip_impl(&c,type,0,true))return false;
+    }
+}
+} // namespace
+
+PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* bytes,uint32_t size,
+        PqMeta* out,uint32_t max_row_groups) noexcept {
+    if(!bytes || !size || !out || !out->columns || !out->columns_cap ||
+        out->columns_cap>kMaxColumns || !out->chunks || !out->chunks_cap ||
+        !max_row_groups || max_row_groups>kPqMaxRowGroups)return StrictStatus::Invalid;
+    assert(out->columns_cap<=kMaxColumns);assert(max_row_groups<=kPqMaxRowGroups);
+    StrictSchema strict{StrictStatus::Invalid,0,out->columns_cap,max_row_groups,out->columns};
+    if(!strict_preflight(bytes,size,strict))return strict.status;
+    if(!pq_parse_file_meta(bytes,size,out))return
+        out->need_columns>out->columns_cap || out->need_chunks>out->chunks_cap?StrictStatus::Capacity:StrictStatus::Invalid;
+    if(out->num_rows<0 || out->n_columns!=strict.columns)return StrictStatus::Invalid;
+    uint64_t rows=0;
+    for(uint32_t g=0;g<out->n_row_groups;++g) {
+        const auto& group=out->row_groups[g];
+        if(group.num_rows<0 || group.total_byte_size<0 ||
+            rows>UINT64_MAX-static_cast<uint64_t>(group.num_rows))return StrictStatus::Invalid;
+        rows+=static_cast<uint64_t>(group.num_rows);
+        for(uint32_t i=0;i<group.chunk_count;++i) {
+            const auto& chunk=out->chunks[group.chunk_off+i];
+            if(chunk.num_values!=group.num_rows || chunk.total_compressed_size<0 ||
+                chunk.total_uncompressed_size<0)return StrictStatus::Invalid;
+        }
+    }
+    if(rows!=static_cast<uint64_t>(out->num_rows))return StrictStatus::Invalid;
+    for(uint32_t i=0;i<out->n_columns;++i)for(uint32_t j=0;j<i;++j)
+        if(std::strcmp(out->columns[i].name,out->columns[j].name)==0)return StrictStatus::Unsupported;
+    return StrictStatus::Ok;
 }
 
 }  // namespace parquet
