@@ -214,11 +214,10 @@ AlignedWriterConfig aligned_writer_config_default() noexcept {
     return c;
 }
 
-AlignedWriteStatus aligned_writer_open(const char* path, const AlignedWriterConfig& cfg,
-                                       AlignedWriter* w) noexcept {
-    assert(path != nullptr && w != nullptr);
-    std::memset(w, 0, sizeof(*w));
-    w->handle = kClosedHandle;
+namespace {
+AlignedWriteStatus prepare_staging(const AlignedWriterConfig& cfg, AlignedWriter* w) noexcept {
+    assert(w != nullptr);
+    assert(w->staging == nullptr);
     if (!units_valid(cfg)) return AlignedWriteStatus::kBadUnits;
     const uint32_t stripe = 1u << cfg.stripe_log2;
     const uint32_t io = 1u << cfg.io_log2;
@@ -229,17 +228,70 @@ AlignedWriteStatus aligned_writer_open(const char* path, const AlignedWriterConf
     const size_t mem_align = io < 4096u ? 4096u : io;
     w->staging = alloc_aligned(cfg.staging_bytes, mem_align);
     if (w->staging == nullptr) return AlignedWriteStatus::kNoMemory;
+    w->staging_cap = cfg.staging_bytes;
+    w->unit[0] = 1u << cfg.buf_log2;
+    w->unit[1] = 1u << cfg.chunk_log2;
+    w->unit[2] = stripe;
+    w->io_unit = io;
+    return AlignedWriteStatus::kOk;
+}
+} // namespace
+
+AlignedWriteStatus aligned_writer_open(const char* path, const AlignedWriterConfig& cfg,
+                                       AlignedWriter* w) noexcept {
+    assert(path != nullptr && w != nullptr);
+    std::memset(w, 0, sizeof(*w));
+    w->handle = kClosedHandle;
+    const auto prepared = prepare_staging(cfg, w);
+    if (prepared != AlignedWriteStatus::kOk) return prepared;
     w->handle = open_file(path, cfg.direct_io != 0, &w->direct);
     if (w->handle == kClosedHandle) {
         free_aligned(w->staging);
         w->staging = nullptr;
         return AlignedWriteStatus::kOpenFailed;
     }
-    w->staging_cap = cfg.staging_bytes;
-    w->unit[0] = 1u << cfg.buf_log2;
-    w->unit[1] = 1u << cfg.chunk_log2;
-    w->unit[2] = stripe;
-    w->io_unit = io;
+    assert(w->staging_cap % w->unit[2] == 0);
+    return AlignedWriteStatus::kOk;
+}
+
+namespace {
+bool empty_regular_file(intptr_t h) noexcept {
+#if defined(_WIN32)
+    BY_HANDLE_FILE_INFORMATION info{};
+    LARGE_INTEGER size{};
+    return GetFileType(reinterpret_cast<HANDLE>(h)) == FILE_TYPE_DISK &&
+        GetFileInformationByHandle(reinterpret_cast<HANDLE>(h), &info) &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+        GetFileSizeEx(reinterpret_cast<HANDLE>(h), &size) && size.QuadPart == 0;
+#else
+    if (h < 0 || static_cast<uint64_t>(h) > INT32_MAX) return false;
+    struct stat st{};
+    return ::fstat(static_cast<int>(h), &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 0;
+#endif
+}
+} // namespace
+
+AlignedWriteStatus aligned_writer_adopt(NativeFile* n, const AlignedWriterConfig& cfg,
+                                        bool actual_direct, AlignedWriter* w) noexcept {
+    if (n == nullptr || w == nullptr) return AlignedWriteStatus::kOpenFailed;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(n);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(w);
+    if (a <= b ? b - a < sizeof(*n) : a - b < sizeof(*w))
+        return AlignedWriteStatus::kOpenFailed;
+    if (w->staging != nullptr || (w->handle != -1 &&
+        (w->handle != 0 || w->io_unit != 0 || w->staging_cap != 0)))
+        return AlignedWriteStatus::kOpenFailed;
+    const AlignedWriterConfig c = cfg;
+    *w = AlignedWriter{};
+    w->handle = -1;
+    if (n->handle == -1 || !empty_regular_file(n->handle))
+        return AlignedWriteStatus::kOpenFailed;
+    const auto prepared = prepare_staging(c, w);
+    if (prepared != AlignedWriteStatus::kOk) return prepared;
+    w->direct = actual_direct ? 1 : 0;
+    w->handle = n->handle;
+    n->handle = -1;
+    assert(w->handle != -1);
     assert(w->staging_cap % w->unit[2] == 0);
     return AlignedWriteStatus::kOk;
 }

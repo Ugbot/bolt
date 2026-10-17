@@ -21,7 +21,14 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -549,5 +556,179 @@ TEST(FileIoBench, ColdAlignedPreadSequential) {
     if (own) std::remove(path.c_str());
     if (env_u64("BOLT_PERF_GATE", 0) == 1) EXPECT_GE(one, 5.1);
 }
+
+
+NativeFile native_read_open(const char* path) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+        FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    return NativeFile{reinterpret_cast<intptr_t>(h)};
+#else
+    return NativeFile{::open(path, O_RDONLY | O_CLOEXEC)};
+#endif
+}
+
+TEST(FileIo, NativeReadAndMapTransferOnlyOnSuccess) {
+    const auto path = tmp_path("native_adopt");
+    const auto bytes = random_bytes(8192, 77);
+    write_file(path, bytes);
+    NativeFile n = native_read_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    const intptr_t identity = n.handle;
+    MappedFile map{};
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 0, 4096, &map), FileIoStatus::kTooLarge);
+    EXPECT_EQ(n.handle, identity);
+    EXPECT_EQ(map.handle, -1);
+    EXPECT_EQ(mapped_file_adopt_bounded(nullptr, 0, 8192, &map), FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 0, 8192, nullptr), FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_adopt_bounded(reinterpret_cast<NativeFile*>(&map), 0, 8192, &map),
+              FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 8193, 8193, &map), FileIoStatus::kBadArg);
+    EXPECT_EQ(n.handle, identity);
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 9, 8, &map), FileIoStatus::kBadArg);
+    ReadFile read{};
+    ASSERT_EQ(file_adopt_read(&n, false, &read), FileIoStatus::kOk);
+    EXPECT_EQ(read.handle, identity);
+    EXPECT_EQ(n.handle, -1);
+    EXPECT_EQ(read.direct, 0);
+    NativeFile other = native_read_open(path.c_str());
+    const intptr_t other_identity = other.handle;
+    EXPECT_EQ(file_adopt_read(&other, false, &read), FileIoStatus::kBadArg);
+    EXPECT_EQ(other.handle, other_identity);
+    EXPECT_EQ(read.handle, identity);
+    EXPECT_EQ(file_adopt_read(nullptr, false, &read), FileIoStatus::kBadArg);
+    EXPECT_EQ(file_adopt_read(&other, false, nullptr), FileIoStatus::kBadArg);
+    EXPECT_EQ(file_adopt_read(reinterpret_cast<NativeFile*>(&read), false, &read),
+              FileIoStatus::kBadArg);
+    ASSERT_EQ(mapped_file_adopt_bounded(&other, bytes.size(), bytes.size(), &map),
+              FileIoStatus::kOk);
+    EXPECT_EQ(map.handle, other_identity);
+    EXPECT_EQ(other.handle, -1);
+    mapped_file_release_handle(&map);
+    EXPECT_EQ(map.handle, -1);
+    EXPECT_EQ(std::memcmp(map.base, bytes.data(), bytes.size()), 0);
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 0, 8192, &map), FileIoStatus::kBadArg);
+    mapped_file_close(&map);
+    mapped_file_close(&map);
+    file_close(&read);
+    EXPECT_TRUE(native_file_close(&n));
+    EXPECT_FALSE(native_file_close(nullptr));
+    std::remove(path.c_str());
+}
+
+TEST(FileIo, NativeEmptyAndNonregularOwnership) {
+    const auto path = tmp_path("native_empty");
+    write_file(path, {});
+    NativeFile n = native_read_open(path.c_str());
+    MappedFile m{};
+    ASSERT_EQ(mapped_file_adopt_bounded(&n, 0, 0, &m), FileIoStatus::kOk);
+    EXPECT_EQ(m.base, nullptr);
+    EXPECT_EQ(n.handle, -1);
+    NativeFile other = native_read_open(path.c_str());
+    EXPECT_EQ(mapped_file_adopt_bounded(&other, 0, 0, &m), FileIoStatus::kBadArg);
+    mapped_file_close(&m);
+    EXPECT_TRUE(native_file_close(&other));
+#if !defined(_WIN32)
+    NativeFile dir{::open("/tmp", O_RDONLY | O_DIRECTORY)};
+    ASSERT_NE(dir.handle, -1);
+    ReadFile r{};
+    EXPECT_EQ(file_adopt_read(&dir, false, &r), FileIoStatus::kBadArg);
+    EXPECT_EQ(mapped_file_adopt_bounded(&dir, 0, 8192, &m), FileIoStatus::kBadArg);
+    EXPECT_TRUE(native_file_close(&dir));
+    int pipefd[2];
+    ASSERT_EQ(::pipe(pipefd), 0);
+    NativeFile pipe_read{pipefd[0]};
+    EXPECT_EQ(file_adopt_read(&pipe_read, false, &r), FileIoStatus::kBadArg);
+    EXPECT_TRUE(native_file_close(&pipe_read));
+    EXPECT_EQ(::close(pipefd[1]), 0);
+#endif
+    std::remove(path.c_str());
+}
+
+#if !defined(_WIN32)
+TEST(FileIo, NativeMapFailurePreservesWriteOnlyHandle) {
+    const auto path = tmp_path("native_map_os_failure");
+    write_file(path, {1, 2, 3, 4});
+    NativeFile n{::open(path.c_str(), O_WRONLY | O_CLOEXEC)};
+    ASSERT_NE(n.handle, -1);
+    const intptr_t identity = n.handle;
+    MappedFile m{};
+    EXPECT_EQ(mapped_file_adopt_bounded(&n, 4, 4, &m), FileIoStatus::kIoError);
+    EXPECT_EQ(n.handle, identity);
+    EXPECT_EQ(m.handle, -1);
+    EXPECT_EQ(m.base, nullptr);
+    EXPECT_EQ(m.size, 0u);
+    struct stat st{};
+    EXPECT_EQ(::fstat(static_cast<int>(n.handle), &st), 0);
+    EXPECT_EQ(st.st_size, 4);
+    EXPECT_TRUE(native_file_close(&n));
+    EXPECT_EQ(n.handle, -1);
+    mapped_file_close(&m);
+    std::remove(path.c_str());
+}
+
+TEST(FileIo, NativeCloseOsFailureStillConsumesToken) {
+    const auto path = tmp_path("native_close_os_failure");
+    write_file(path, {1});
+    NativeFile n = native_read_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    // No opens occur between the external close and native close: the fd cannot
+    // be reused by this test before the expected EBADF result.
+    const int external_close = ::close(static_cast<int>(n.handle));
+    const bool first_close = native_file_close(&n);
+    const bool second_close = native_file_close(&n);
+    EXPECT_EQ(external_close, 0);
+    EXPECT_FALSE(first_close);
+    EXPECT_EQ(n.handle, -1);
+    EXPECT_TRUE(second_close);
+    std::remove(path.c_str());
+}
+
+TEST(FileIo, NativeHandleZeroAndReplacementKeepOpenedIdentity) {
+    const auto path = tmp_path("native_identity");
+    const auto moved = path + ".held";
+    write_file(path, {11, 22, 33});
+    NativeFile n = native_read_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    ASSERT_EQ(std::rename(path.c_str(), moved.c_str()), 0);
+    write_file(path, {44});
+    ReadFile r{};
+    ASSERT_EQ(file_adopt_read(&n, false, &r), FileIoStatus::kOk);
+    uint8_t data[3]{};
+    uint64_t got = 0;
+    EXPECT_EQ(file_pread(r, 0, data, sizeof(data), &got), FileIoStatus::kOk);
+    EXPECT_EQ(got, 3u);
+    EXPECT_EQ(data[0], 11);
+    file_close(&r);
+    write_file(path, {});
+    // Restore stdin before assertions, including when adoption fails.
+    const int saved = ::dup(0);
+    n = native_read_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    if (n.handle == 0) {
+        const int source = ::fcntl(0, F_DUPFD, 3);
+        ASSERT_GE(source, 0);
+        n.handle = source;
+    }
+    const int replaced = ::dup2(static_cast<int>(n.handle), 0);
+    EXPECT_TRUE(native_file_close(&n));
+    if (replaced == 0) {
+        NativeFile zero{0};
+        MappedFile m{};
+        const auto status = mapped_file_adopt_bounded(&zero, 0, 0, &m);
+        NativeFile another = native_read_open(path.c_str());
+        const auto live_status = mapped_file_adopt_bounded(&another, 0, 0, &m);
+        (void)native_file_close(&another);
+        if (status == FileIoStatus::kOk) mapped_file_close(&m);
+        else (void)native_file_close(&zero);
+        if (saved >= 0) { EXPECT_EQ(::dup2(saved, 0), 0); EXPECT_EQ(::close(saved), 0); }
+        EXPECT_EQ(status, FileIoStatus::kOk);
+        EXPECT_EQ(live_status, FileIoStatus::kBadArg);
+    } else if (saved >= 0) { EXPECT_EQ(::close(saved), 0); }
+    EXPECT_EQ(replaced, 0);
+    std::remove(path.c_str());
+    std::remove(moved.c_str());
+}
+#endif
 
 }  // namespace

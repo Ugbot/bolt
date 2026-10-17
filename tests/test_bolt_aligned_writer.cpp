@@ -18,7 +18,13 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -328,6 +334,88 @@ TEST(AlignedWriterPerf, DirectAndBufferedWriteThroughput) {
     std::printf("[aligned_writer] write %zu MiB + fsync, median of 5: direct(granted=%d) "
                 "%.2f GB/s, buffered %.2f GB/s\n", total >> 20, gd, median(d), median(b));
     EXPECT_EQ(gb, 0);
+}
+
+
+bolt::io::NativeFile native_write_open(const char* path) {
+#if defined(_WIN32)
+    return bolt::io::NativeFile{reinterpret_cast<intptr_t>(CreateFileA(path,
+        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr))};
+#else
+    return bolt::io::NativeFile{::open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
+#endif
+}
+
+TEST(AlignedWriter, NativeAdoptionFailurePreservesAndFinishTransfers) {
+    using namespace bolt::io;
+    const auto path = tmp_path("native_adoption");
+    NativeFile n = native_write_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    const intptr_t identity = n.handle;
+    AlignedWriter w{};
+    auto cfg = aligned_writer_config_default();
+    auto bad = cfg;
+    bad.staging_bytes = 1;
+    EXPECT_EQ(aligned_writer_adopt(&n, bad, false, &w), AlignedWriteStatus::kBadStaging);
+    EXPECT_EQ(n.handle, identity);
+    EXPECT_EQ(w.handle, -1);
+    bad = cfg;
+    bad.io_log2 = 0;
+    EXPECT_EQ(aligned_writer_adopt(&n, bad, false, &w), AlignedWriteStatus::kBadUnits);
+    EXPECT_EQ(aligned_writer_adopt(nullptr, cfg, false, &w), AlignedWriteStatus::kOpenFailed);
+    EXPECT_EQ(aligned_writer_adopt(&n, cfg, false, nullptr), AlignedWriteStatus::kOpenFailed);
+    ASSERT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOk);
+    EXPECT_EQ(w.handle, identity);
+    EXPECT_EQ(w.direct, 0);
+    EXPECT_EQ(n.handle, -1);
+    EXPECT_EQ(aligned_writer_adopt(reinterpret_cast<NativeFile*>(&w), cfg, false, &w),
+              AlignedWriteStatus::kOpenFailed);
+    EXPECT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOpenFailed);
+    const uint8_t data[] = {9, 8, 7};
+    ASSERT_EQ(aligned_writer_append(&w, data, sizeof(data)), AlignedWriteStatus::kOk);
+    uint64_t size = 0;
+    EXPECT_EQ(aligned_writer_finish(&w, true, &size), AlignedWriteStatus::kOk);
+    EXPECT_EQ(size, sizeof(data));
+    EXPECT_EQ(read_file(path), std::vector<uint8_t>({9, 8, 7}));
+    aligned_writer_abort(&w);
+    EXPECT_TRUE(native_file_close(&n));
+    std::remove(path.c_str());
+}
+
+TEST(AlignedWriter, NativeNonemptyRefusesWithoutTruncationAndAbortCloses) {
+    using namespace bolt::io;
+    const auto path = tmp_path("native_nonempty");
+    NativeFile n = native_write_open(path.c_str());
+    ASSERT_NE(n.handle, -1);
+    const uint8_t data[] = {5, 4, 3, 2};
+#if defined(_WIN32)
+    DWORD written = 0;
+    ASSERT_TRUE(WriteFile(reinterpret_cast<HANDLE>(n.handle), data, sizeof(data), &written, nullptr));
+    ASSERT_EQ(written, sizeof(data));
+#else
+    ASSERT_EQ(::write(static_cast<int>(n.handle), data, sizeof(data)), sizeof(data));
+#endif
+    const intptr_t identity = n.handle;
+    AlignedWriter w{};
+    const auto cfg = aligned_writer_config_default();
+    EXPECT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOpenFailed);
+    EXPECT_EQ(n.handle, identity);
+    EXPECT_TRUE(native_file_close(&n));
+    EXPECT_EQ(read_file(path), std::vector<uint8_t>({5, 4, 3, 2}));
+    n = native_write_open(path.c_str());
+    ASSERT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOk);
+    ASSERT_EQ(aligned_writer_append(&w, data, sizeof(data)), AlignedWriteStatus::kOk);
+    aligned_writer_abort(&w);
+    aligned_writer_abort(&w);
+    EXPECT_TRUE(read_file(path).empty());
+#if !defined(_WIN32)
+    NativeFile dir{::open("/tmp", O_RDONLY | O_DIRECTORY)};
+    ASSERT_NE(dir.handle, -1);
+    EXPECT_EQ(aligned_writer_adopt(&dir, cfg, false, &w), AlignedWriteStatus::kOpenFailed);
+    EXPECT_TRUE(native_file_close(&dir));
+#endif
+    std::remove(path.c_str());
 }
 
 }  // namespace

@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "bolt/io/bolt_native_file.h"
 
 #include "bolt/io/bolt_io_limits.h"
 
@@ -65,6 +66,10 @@ struct ReadFile {
 };
 
 FileIoStatus file_open_read(const char* path, bool want_direct, ReadFile* f) noexcept;
+// Transfers the same regular-file handle on success only; failure preserves the
+// token. Output must be zero-initialized or closed; live output is unchanged.
+// actual_direct reports caller-established mode; no reopen or flag change.
+FileIoStatus file_adopt_read(NativeFile*, bool actual_direct, ReadFile*) noexcept;
 /// Idempotent.
 void file_close(ReadFile* f) noexcept;
 
@@ -117,6 +122,11 @@ FileIoStatus mapped_file_open(const char* path, MappedFile* m) noexcept;
 /// or handles. Caller prevents truncation while mapped; growth is not remapped.
 FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_file_bytes,
                                     uint64_t max_file_bytes, MappedFile* m) noexcept;
+// Inclusive bounds checked on the same regular-file handle before mapping.
+// Success alone consumes input, including empty files. Failure preserves input
+// and leaves empty output closed; live output and overlapping objects refuse.
+FileIoStatus mapped_file_adopt_bounded(NativeFile*, uint64_t min_file_bytes,
+    uint64_t max_file_bytes, MappedFile*) noexcept;
 /// Idempotent.
 void mapped_file_close(MappedFile* m) noexcept;
 /// Close the file (and Windows mapping) handle; the view stays valid until

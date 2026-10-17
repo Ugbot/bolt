@@ -221,6 +221,106 @@ FileIoStatus file_evict_cache(const char* path) noexcept {
 
 #endif
 
+namespace {
+bool overlaps_native(const NativeFile* n, const void* out, size_t bytes) noexcept {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(n);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(out);
+    return a <= b ? b - a < sizeof(*n) : a - b < bytes;
+}
+bool regular_size(intptr_t h, uint64_t* size) noexcept {
+#if defined(_WIN32)
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileType(reinterpret_cast<HANDLE>(h)) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(reinterpret_cast<HANDLE>(h), &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return false;
+#else
+    if (h < 0 || static_cast<uint64_t>(h) > INT32_MAX) return false;
+    struct stat st{};
+    if (::fstat(static_cast<int>(h), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+        return false;
+#endif
+    return file_size_of(h, size);
+}
+FileIoStatus map_extent(intptr_t handle, MappedFile* m) noexcept {
+    assert(m != nullptr);
+    assert(m->base == nullptr);
+    if (m->size == 0) return FileIoStatus::kOk;
+#if defined(_WIN32)
+    HANDLE mh = CreateFileMappingA(reinterpret_cast<HANDLE>(handle), nullptr,
+        PAGE_READONLY, static_cast<DWORD>(m->size >> 32), static_cast<DWORD>(m->size), nullptr);
+    if (mh == nullptr) return FileIoStatus::kIoError;
+    m->base = static_cast<const uint8_t*>(MapViewOfFile(mh, FILE_MAP_READ,
+        0, 0, static_cast<SIZE_T>(m->size)));
+    if (m->base == nullptr) {
+        close_handle(reinterpret_cast<intptr_t>(mh));
+        return FileIoStatus::kIoError;
+    }
+    m->mapping = reinterpret_cast<intptr_t>(mh);
+#else
+    void* base = ::mmap(nullptr, static_cast<size_t>(m->size), PROT_READ, MAP_SHARED,
+                        static_cast<int>(handle), 0);
+    if (base == MAP_FAILED) return FileIoStatus::kIoError;
+    m->base = static_cast<const uint8_t*>(base);
+#endif
+    return FileIoStatus::kOk;
+}
+} // namespace
+
+bool native_file_close(NativeFile* n) noexcept {
+    if (n == nullptr) return false;
+    const intptr_t h = n->handle;
+    n->handle = kClosedHandle;
+    if (h == kClosedHandle) return true;
+#if defined(_WIN32)
+    return CloseHandle(reinterpret_cast<HANDLE>(h)) != 0;
+#else
+    if (h < 0 || static_cast<uint64_t>(h) > INT32_MAX) return false;
+    return ::close(static_cast<int>(h)) == 0;
+#endif
+}
+
+FileIoStatus file_adopt_read(NativeFile* n, bool actual_direct, ReadFile* f) noexcept {
+    if (n == nullptr || f == nullptr || overlaps_native(n, f, sizeof(*f)))
+        return FileIoStatus::kBadArg;
+    if (f->handle != -1 && (f->handle != 0 || f->io_unit != 0 || f->size != 0))
+        return FileIoStatus::kBadArg;
+    *f = ReadFile{-1, 0, wire::kFrameIoAlign, 0, {0, 0, 0}};
+    uint64_t size = 0;
+    if (n->handle == -1 || !regular_size(n->handle, &size)) return FileIoStatus::kBadArg;
+    f->size = size;
+    f->direct = actual_direct ? 1 : 0;
+    f->handle = n->handle;
+    n->handle = -1;
+    assert(f->handle != -1);
+    assert(pow2(f->io_unit));
+    return FileIoStatus::kOk;
+}
+
+FileIoStatus mapped_file_adopt_bounded(NativeFile* n, uint64_t min_bytes,
+                                      uint64_t max_bytes, MappedFile* m) noexcept {
+    if (n == nullptr || m == nullptr || overlaps_native(n, m, sizeof(*m)))
+        return FileIoStatus::kBadArg;
+    if (m->base != nullptr || (m->handle != -1 &&
+        (m->handle != 0 || m->page != 0 || m->size != 0)) ||
+        (m->mapping != -1 && m->mapping != 0)) return FileIoStatus::kBadArg;
+    *m = MappedFile{nullptr, 0, -1, -1, io_page_size(), 0};
+    if (n->handle == -1 || min_bytes > max_bytes || max_bytes > kFileReadMaxBytes ||
+        max_bytes > SIZE_MAX) return FileIoStatus::kBadArg;
+    uint64_t size = 0;
+    if (!regular_size(n->handle, &size)) return FileIoStatus::kBadArg;
+    if (size > max_bytes) return FileIoStatus::kTooLarge;
+    if (size < min_bytes) return FileIoStatus::kBadArg;
+    MappedFile candidate{nullptr, size, -1, -1, m->page, 0};
+    const auto status = map_extent(n->handle, &candidate);
+    if (status != FileIoStatus::kOk) return status;
+    candidate.handle = n->handle;
+    *m = candidate;
+    n->handle = -1;
+    assert(m->handle != -1);
+    assert(m->size >= min_bytes && m->size <= max_bytes);
+    return FileIoStatus::kOk;
+}
+
 // --- positional reads -------------------------------------------------------
 
 FileIoStatus file_open_read(const char* path, bool want_direct, ReadFile* f) noexcept {
@@ -328,18 +428,9 @@ FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_bytes, uint
     assert(m != nullptr);
     const auto status = prepare_mapping(path, min_bytes, max_bytes, m);
     if (status != FileIoStatus::kOk) return status;
-    if (m->size == 0) return FileIoStatus::kOk;
-    // Fix the extent even if the writer grows the file after the size check.
-    HANDLE mh = CreateFileMappingA(reinterpret_cast<HANDLE>(m->handle), nullptr, PAGE_READONLY,
-                                   static_cast<DWORD>(m->size >> 32),
-                                   static_cast<DWORD>(m->size), nullptr);
-    if (mh == nullptr) { mapped_file_close(m); return FileIoStatus::kIoError; }
-    m->mapping = reinterpret_cast<intptr_t>(mh);
-    m->base = static_cast<const uint8_t*>(MapViewOfFile(
-        mh, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(m->size)));
-    if (m->base == nullptr) { mapped_file_close(m); return FileIoStatus::kIoError; }
-    assert(m->base != nullptr);
-    return FileIoStatus::kOk;
+    const auto mapped = map_extent(m->handle, m);
+    if (mapped != FileIoStatus::kOk) mapped_file_close(m);
+    return mapped;
 }
 
 void mapped_file_release_handle(MappedFile* m) noexcept {
@@ -391,13 +482,9 @@ FileIoStatus mapped_file_open_bounded(const char* path, uint64_t min_bytes, uint
     assert(m != nullptr);
     const auto status = prepare_mapping(path, min_bytes, max_bytes, m);
     if (status != FileIoStatus::kOk) return status;
-    if (m->size == 0) return FileIoStatus::kOk;
-    void* p = ::mmap(nullptr, static_cast<size_t>(m->size), PROT_READ, MAP_SHARED,
-                     static_cast<int>(m->handle), 0);
-    if (p == MAP_FAILED) { mapped_file_close(m); return FileIoStatus::kIoError; }
-    m->base = static_cast<const uint8_t*>(p);
-    assert((reinterpret_cast<uintptr_t>(m->base) & (m->page - 1)) == 0);
-    return FileIoStatus::kOk;
+    const auto mapped = map_extent(m->handle, m);
+    if (mapped != FileIoStatus::kOk) mapped_file_close(m);
+    return mapped;
 }
 
 void mapped_file_release_handle(MappedFile* m) noexcept {

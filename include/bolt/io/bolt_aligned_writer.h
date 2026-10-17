@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "bolt/io/bolt_native_file.h"
 
 #include "bolt/io/bolt_crc32c.h"
 #include "bolt/io/bolt_io_limits.h"
@@ -74,6 +75,13 @@ inline uint64_t aligned_writer_pos(const AlignedWriter& w) noexcept {
 
 AlignedWriteStatus aligned_writer_open(const char* path, const AlignedWriterConfig& cfg,
                                        AlignedWriter* w) noexcept;
+
+// Adopts an empty regular file without truncation; success alone consumes input.
+// Output must be zero-initialized or closed. Live/overlapping output refuses.
+// actual_direct is caller-established mode, independent of cfg.direct_io;
+// no reopen or flag change occurs during adoption. Existing write fallback applies.
+AlignedWriteStatus aligned_writer_adopt(NativeFile*, const AlignedWriterConfig&,
+    bool actual_direct, AlignedWriter*) noexcept;
 
 /// Append raw bytes at the current position (no alignment).
 AlignedWriteStatus aligned_writer_append(AlignedWriter* w, const void* data,
