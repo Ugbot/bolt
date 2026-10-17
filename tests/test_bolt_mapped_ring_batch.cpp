@@ -22,9 +22,9 @@ struct Owner {
             std::to_string(serial.fetch_add(1)))).string();
     }
     ~Owner() { if(ring) EXPECT_EQ(mapped_ring_close(&ring),S::kOk); }
-    void open() {
+    void open(std::uint64_t units=4) {
         const auto unit=std::max(io_page_size(),io_map_granularity());
-        RingOptions options{4ull*unit,io_page_size(),1,true,true,false,nullptr,nullptr,nullptr};
+        RingOptions options{units*unit,io_page_size(),1,true,true,false,nullptr,nullptr,nullptr};
         ASSERT_EQ(mapped_ring_open(name.c_str(),options,&ring),S::kOk);
     }
 };
@@ -144,5 +144,63 @@ TEST(MappedRingBatch, FullRetainsCallerBatchAndFailedEncodeCancelsReservation) {
     ASSERT_EQ(mapped_ring_write_batch(owner.ring,&input.batch,meta()),S::kOk);
     arena.reset();ASSERT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,17),S::kOk);
     EXPECT_EQ(lease.sequence,std::uint64_t{accepted}+1);EXPECT_EQ(mapped_ring_release(owner.ring,lease),S::kOk);
+}
+TEST(MappedRingBatch, SizedHintsAndValidatorRefusalCancelWithoutPublishing) {
+    Owner owner;owner.open();Input input;
+    const auto bytes=wire::frame_size(&input.batch,false);
+    unsigned calls=0;
+    const auto accept=[&]() noexcept { ++calls;return true; };
+    const auto refuse=[&]() noexcept { ++calls;return false; };
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),0,accept),S::kBadArg);
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),UINT64_MAX,accept),S::kBadArg);
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),io_page_size()+1,accept),S::kBadArg);
+    EXPECT_EQ(calls,0u);
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,refuse),S::kUnsupported);
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes-1,accept),S::kUnsupported);
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes+64,accept),S::kUnsupported);
+    EXPECT_EQ(mapped_ring_snapshot(owner.ring).next_sequence,1u);
+    EXPECT_EQ(mapped_ring_snapshot(owner.ring).committed_position,0u);
+    ASSERT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,accept),S::kOk);
+    Arena arena;BoltBatch batch{};RingView lease{};
+    EXPECT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,18),S::kCorrupt);
+    ASSERT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,17),S::kOk);
+    EXPECT_EQ(lease.sequence,1u);EXPECT_TRUE(batch.col(1).is_null(1));
+    EXPECT_EQ(std::memcmp(batch.col(1).data,input.bytes,sizeof(input.bytes)),0);
+    EXPECT_EQ(mapped_ring_release(owner.ring,lease),S::kOk);
+}
+TEST(MappedRingBatch, SizedFullRetriesSkipValidatorAndChangedLayoutRefuses) {
+    Owner owner;owner.open(8);Input input;
+    const auto bytes=wire::frame_size(&input.batch,false);
+    unsigned calls=0;
+    const auto validate=[&]() noexcept { ++calls;return input.columns[0].type==BoltType::UInt64; };
+    std::uint32_t accepted=0;
+    for(;accepted<16384;++accepted) {
+        const auto status=mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,validate);
+        if(status==S::kFull)break;
+        ASSERT_EQ(status,S::kOk);
+    }
+    ASSERT_GT(accepted,0u);ASSERT_LT(accepted,16384u);EXPECT_EQ(calls,accepted);
+    const auto before=mapped_ring_snapshot(owner.ring);
+    Arena arena;BoltBatch batch{};RingView lease{};
+    ASSERT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,17),S::kOk);
+    EXPECT_EQ(mapped_ring_set_limit(owner.ring,before.capacity_bytes-io_page_size()),S::kFull);
+    input.columns[0].type=BoltType::Int64;
+    for(unsigned retry=0;retry<3;++retry)
+        EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,validate),S::kFull);
+    EXPECT_EQ(calls,accepted);
+    EXPECT_EQ(mapped_ring_snapshot(owner.ring).committed_position,before.committed_position);
+    ASSERT_EQ(mapped_ring_release(owner.ring,lease),S::kOk);
+    for(std::uint32_t i=1;i<accepted;++i) {
+        arena.reset();ASSERT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,17),S::kOk);
+        ASSERT_EQ(mapped_ring_release(owner.ring,lease),S::kOk);
+    }
+    EXPECT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,validate),S::kUnsupported);
+    EXPECT_EQ(mapped_ring_snapshot(owner.ring).next_sequence,std::uint64_t{accepted}+1);
+    input.columns[0].type=BoltType::UInt64;
+    ASSERT_EQ(mapped_ring_set_limit(owner.ring,before.capacity_bytes-io_page_size()),S::kOk);
+    ASSERT_EQ(mapped_ring_write_batch_sized(owner.ring,&input.batch,meta(),bytes,validate),S::kOk);
+    arena.reset();ASSERT_EQ(mapped_ring_peek_batch(owner.ring,0,&arena,&batch,&lease,nullptr,17),S::kOk);
+    EXPECT_EQ(lease.sequence,std::uint64_t{accepted}+1);
+    EXPECT_EQ(mapped_ring_release(owner.ring,lease),S::kOk);
 }
 } // namespace

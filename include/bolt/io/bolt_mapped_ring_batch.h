@@ -48,6 +48,40 @@ inline RingStatus mapped_ring_write_batch(MappedRing* ring, const BoltBatch* bat
     return mapped_ring_commit(ring, reservation);
 }
 
+// Lossless retry seam: bytes is an advisory cached frame size, never evidence
+// that the current native layout is valid. Reserve first so kFull performs no
+// validation or frame sizing. On admission validate() must return bool and must
+// not throw, reenter the ring, or mutate the batch/ring. It is invoked inline,
+// never retained. The caller exclusively owns the producer role through return.
+// Batch and all transitive buffers must remain immutable and disjoint from the
+// ring mapping throughout each call. Revalidate any changes between retries in
+// validate(); frame_write still performs its checked native encoding and CRC.
+// Refusal cancels without publication or sequence advance. No overwrite mode:
+// a successful overwrite reservation could evict events before cancellation.
+template<class Validator>
+inline RingStatus mapped_ring_write_batch_sized(MappedRing* ring, const BoltBatch* batch,
+        const wire::FrameMeta& meta, std::uint64_t bytes, Validator&& validate) noexcept {
+    if (!ring || !batch || !bytes || bytes > SIZE_MAX ||
+        batch->num_cols > wire::kWireMaxCols || batch->num_rows < 0 ||
+        batch->num_rows > UINT32_MAX) return RingStatus::kBadArg;
+    assert(batch != nullptr);
+    assert(bytes <= SIZE_MAX);
+    RingReservation reservation{};
+    const auto status = mapped_ring_reserve(ring, bytes, &reservation);
+    if (status != RingStatus::kOk) return status;
+    wire::FrameStatus encoded{};
+    std::size_t written = 0;
+    const bool valid = validate();
+    if (valid) written = wire::frame_write(batch, meta, wire::FrameZones::kNone,
+        nullptr, nullptr, reservation.data, static_cast<std::size_t>(reservation.bytes), &encoded);
+    if (!valid || encoded != wire::FrameStatus::kOk || written != reservation.bytes) {
+        const auto cancelled = mapped_ring_cancel(ring, reservation);
+        return cancelled == RingStatus::kOk ? RingStatus::kUnsupported : cancelled;
+    }
+    assert(written == bytes);
+    return mapped_ring_commit(ring, reservation);
+}
+
 // kOk returns a borrowed batch and a live explicit lease: release consumes the
 // event; unpin permits retry. Both payload and descriptor arena must outlive
 // every batch borrower. Both batch generations equal the ring event sequence,
