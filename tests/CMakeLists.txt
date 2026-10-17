@@ -2625,3 +2625,8 @@ add_executable(test_bolt_thread_affinity test_bolt_thread_affinity.cpp)
 target_link_libraries(test_bolt_thread_affinity PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_thread_affinity)
 add_test(NAME test_bolt_thread_affinity COMMAND test_bolt_thread_affinity)
+
+add_executable(test_bolt_thread_qos test_bolt_thread_qos.cpp)
+target_link_libraries(test_bolt_thread_qos PRIVATE bolt::thread GTest::gtest_main)
+bolt_apply_hardening(test_bolt_thread_qos)
+add_test(NAME test_bolt_thread_qos COMMAND test_bolt_thread_qos)

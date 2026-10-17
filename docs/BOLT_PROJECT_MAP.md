@@ -1,5 +1,10 @@
 # Bolt Project Map
 
+`thread/bolt_thread_qos.h` / `bolt::thread` provide cold current-thread policy
+configuration with explicit native readback. Inherit makes no OS request;
+unsupported/failure is explicit. Configuration is not effective scheduling or
+latency proof. [Contract](THREAD_QOS.md).
+
 `io/bolt_mapped_ring.h` adds a fixed, physically preallocated page-aware event
 ring in `bolt::io_file`: whole-event publication, explicit reader leases,
 lossless backpressure, optional gap-reporting overwrite, live logical caps and

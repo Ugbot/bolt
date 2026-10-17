@@ -141,6 +141,17 @@ target_link_libraries(bolt_arrow INTERFACE bolt::interop)
 # Umbrella — pulls core + every sibling. Most consumers link this.
 add_library(bolt INTERFACE)
 add_library(bolt::bolt ALIAS bolt)
+
+# Cold per-thread policy configuration; public headers carry no platform SDKs.
+add_library(bolt_thread STATIC src/thread/bolt_thread_qos.cpp)
+add_library(bolt::thread ALIAS bolt_thread)
+set_target_properties(bolt_thread PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(bolt_thread PUBLIC bolt::core)
+target_include_directories(bolt_thread PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_thread)
+target_link_libraries(bolt INTERFACE bolt::thread)
 target_link_libraries(bolt INTERFACE
     bolt::core bolt::kernels bolt::join bolt::wire bolt::arrow
 )
@@ -1207,7 +1218,7 @@ install(DIRECTORY include/bolt
 # satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
-    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt
     bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)
