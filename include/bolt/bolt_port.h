@@ -43,6 +43,7 @@
     #include <unistd.h>
 #elif defined(__APPLE__)
     #include <mach/mach_init.h>
+    #include <mach/mach_port.h>
     #include <mach/thread_act.h>
     #include <mach/thread_policy.h>
     #include <unistd.h>          // getpid
@@ -333,12 +334,29 @@ BOLT_FORCE_INLINE uint32_t bolt_get_hardware_concurrency() noexcept {
     return n == 0u ? 1u : static_cast<uint32_t>(n);
 }
 
+inline constexpr uint32_t kBoltThreadAffinityCpuCapacity = 4096u;
+
+// Encoding only: no online-CPU, availability or permission check. CPU IDs may
+// be sparse, so hardware_concurrency() is not an admissible upper bound.
+BOLT_FORCE_INLINE bool bolt_thread_affinity_cpu_representable(uint32_t logical_cpu) noexcept {
+#if defined(_WIN32) || defined(__APPLE__)
+    return logical_cpu < kBoltThreadAffinityCpuCapacity;
+#elif defined(__linux__)
+    return logical_cpu < kBoltThreadAffinityCpuCapacity &&
+        logical_cpu < static_cast<uint32_t>(CPU_SETSIZE);
+#else
+    (void)logical_cpu;
+    return false;
+#endif
+}
+
 // Pin the calling thread to `logical_cpu`. Returns true on success.
 // On macOS this is only a scheduler hint. On Windows this routes to
 // `SetThreadAffinityMask` (group 0) or `SetThreadGroupAffinity` (group > 0)
 // based on `logical_cpu >> 6`, covering the full 4096-CPU space.
 BOLT_FORCE_INLINE bool bolt_pin_current_thread(uint32_t logical_cpu) noexcept {
-    assert(logical_cpu < 4096u && "suspiciously large logical CPU index");
+    if (!bolt_thread_affinity_cpu_representable(logical_cpu)) return false;
+    assert(logical_cpu < kBoltThreadAffinityCpuCapacity && "suspiciously large logical CPU index");
 #if defined(_WIN32)
     HANDLE         h            = GetCurrentThread();
     const uint32_t group_idx    = logical_cpu >> 6;
@@ -361,9 +379,6 @@ BOLT_FORCE_INLINE bool bolt_pin_current_thread(uint32_t logical_cpu) noexcept {
     return ok != 0;
 #elif defined(__linux__)
     assert(logical_cpu < static_cast<uint32_t>(CPU_SETSIZE) && "cpu index exceeds CPU_SETSIZE");
-    if (logical_cpu >= static_cast<uint32_t>(CPU_SETSIZE)) {
-        return false;
-    }
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(static_cast<int>(logical_cpu), &set);
@@ -373,12 +388,16 @@ BOLT_FORCE_INLINE bool bolt_pin_current_thread(uint32_t logical_cpu) noexcept {
     // Darwin: hint only. Threads sharing a tag are scheduled on the same L2.
     thread_affinity_policy_data_t policy;
     policy.affinity_tag = static_cast<integer_t>(logical_cpu + 1u);
+    const mach_port_t thread = mach_thread_self();
+    if (!MACH_PORT_VALID(thread)) return false;
     const kern_return_t kr = thread_policy_set(
-        mach_thread_self(),
+        thread,
         THREAD_AFFINITY_POLICY,
         reinterpret_cast<thread_policy_t>(&policy),
         THREAD_AFFINITY_POLICY_COUNT);
-    return kr == KERN_SUCCESS;
+    // mach_thread_self() acquires a send right, including when policy fails.
+    const kern_return_t released = mach_port_deallocate(mach_task_self(), thread);
+    return kr == KERN_SUCCESS && released == KERN_SUCCESS;
 #else
     (void)logical_cpu;
     return false;
