@@ -142,6 +142,17 @@ target_link_libraries(bolt_arrow INTERFACE bolt::interop)
 add_library(bolt INTERFACE)
 add_library(bolt::bolt ALIAS bolt)
 
+# Small always-built OS entropy primitive, independent of TLS/bolt::crypto.
+add_library(bolt_entropy STATIC src/crypto/random.cpp)
+add_library(bolt::entropy ALIAS bolt_entropy)
+set_target_properties(bolt_entropy PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(bolt_entropy PUBLIC bolt::core)
+if(WIN32)
+    target_link_libraries(bolt_entropy PRIVATE bcrypt)
+endif()
+bolt_apply_hardening(bolt_entropy)
+target_link_libraries(bolt INTERFACE bolt::entropy)
+
 # Cold per-thread policy configuration; public headers carry no platform SDKs.
 add_library(bolt_thread STATIC src/thread/bolt_thread_qos.cpp)
 add_library(bolt::thread ALIAS bolt_thread)
@@ -1219,7 +1230,7 @@ install(DIRECTORY include/bolt
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
     bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt
-    bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
+    bolt_entropy bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)
 ## BLLM-99: bolt_rocm is an IMPORTED target (built via a direct clang++

@@ -1,5 +1,21 @@
 add_executable(test_bolt_alignment test_bolt_alignment.cpp)
 
+add_executable(test_entropy test_entropy.cpp)
+target_link_libraries(test_entropy PRIVATE bolt::entropy GTest::gtest_main)
+bolt_apply_hardening(test_entropy)
+add_test(NAME test_entropy COMMAND test_entropy)
+
+# Compile a private renamed OS backend to exercise partial-output failure.
+if(UNIX)
+    add_executable(test_entropy_failure
+        test_entropy_failure.cpp ../src/crypto/random.cpp)
+    target_compile_definitions(test_entropy_failure PRIVATE
+        getentropy=bolt_entropy_test_backend)
+    target_link_libraries(test_entropy_failure PRIVATE bolt::core GTest::gtest_main)
+    bolt_apply_hardening(test_entropy_failure)
+    add_test(NAME test_entropy_failure COMMAND test_entropy_failure)
+endif()
+
 # Checked native thread startup/join, without the callable constructor path.
 add_executable(test_stacked_thread_checked test_stacked_thread_checked.cpp)
 target_link_libraries(test_stacked_thread_checked PRIVATE bolt::core GTest::gtest_main)
