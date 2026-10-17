@@ -76,9 +76,10 @@ build — there is no separate Bolt compile step.
 | `bolt_types.h` | Type enum, StringView, Schema, Arrow C Data ABI structs |
 | `bolt_arena.h` | Bump allocator (~2.6 ns/alloc), ArenaGuard, `tl_arena` thread-local |
 | `bolt_arena_ring.h` | Ring-of-arenas for multi-generation scratch allocation |
-| `bolt_channel.h` | Lock-free SPSC/MPSC ring buffers, cache-line padded |
+| `bolt_channel.h` | Lock-free SPSC/MPSC ring buffers, cache-line padded; SPSC consumer peek borrows a published slot until pop (capacity ≥2) |
 | `bolt_column.h` | BoltColumn (Flat/Constant/Dict/Seq/View), ColumnStats, BoltBatch COW, BitmapIndex |
 | `bolt_branchless.h` | Filter/aggregate/hash/gather kernels, micro-adaptive dispatch, predicated partition |
+| `kernels/bolt_fixed_gather.h` | Allocation-free fixed-scalar Flat/View/Constant normalization into bounded caller buffers; checked selection and actual validity, refusal preserves outputs |
 | `bolt_scheduler.h` | TaskRing, TaskPool, WorkerConfig, PhaseBarrier |
 | `bolt_swissmap.h` / `bolt_hash.h` | SwissTable, swiss_mix, FNV-1a, wyhash |
 | `bolt_ebr.h` | Epoch-Based Reclamation (lock-free snapshot lifetime) |

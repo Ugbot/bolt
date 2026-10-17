@@ -25,6 +25,7 @@ inline void cpu_pause() noexcept { BOLT_PAUSE(); }
 /// Use for linear pipeline stages (one operator → next operator).
 template <typename T, size_t Capacity = 4096>
 class SPSCChannel {
+    static_assert(Capacity >= 2, "SPSC slot sequence protocol requires at least two slots");
     static_assert((Capacity & (Capacity - 1)) == 0, "Must be power of 2");
     static constexpr size_t kMask = Capacity - 1;
 
@@ -43,6 +44,20 @@ public:
         slots_[pos & kMask].seq.store(pos + 1, std::memory_order_release);
         wpos_.store(pos + 1, std::memory_order_relaxed);
         return true;
+    }
+
+    /// Consumer role only: borrow the front item without copying, moving or
+    /// advancing. Null when empty. Repeated peeks preserve the same item;
+    /// the pointer remains valid until this consumer's next successful pop.
+    /// Producer cannot reuse the slot until pop. Not an observer-thread API.
+    const T* try_peek() const noexcept {
+        static_assert(Capacity > 0, "A channel needs a slot");
+        const size_t pos = rpos_.load(std::memory_order_relaxed);
+        assert((pos & kMask) < Capacity);
+        const Slot& slot = slots_[pos & kMask];
+        if (slot.seq.load(std::memory_order_acquire) != pos + 1) return nullptr;
+        assert((reinterpret_cast<std::uintptr_t>(&slot.data) % alignof(T)) == 0);
+        return &slot.data;
     }
 
     /// Pop. Returns false if empty. Writes result into *out.

@@ -2439,6 +2439,13 @@ target_link_libraries(test_bolt_channel_observer
 bolt_apply_hardening(test_bolt_channel_observer)
 add_test(NAME test_bolt_channel_observer COMMAND test_bolt_channel_observer)
 
+add_executable(test_bolt_channel_peek test_bolt_channel_peek.cpp)
+target_link_libraries(test_bolt_channel_peek PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_channel_peek)
+add_test(NAME test_bolt_channel_peek COMMAND test_bolt_channel_peek)
+set_tests_properties(test_bolt_channel_peek PROPERTIES TIMEOUT 30)
+
+
 # G2CHK-330 (limits L2): ArenaVec/ArenaRingBuffer growth policy, Budget
 # accounting under contention, ResourceExhausted, BOLT_BOUND_CHECK and the
 # Limits registry (parse / clamp / source).
@@ -2600,3 +2607,8 @@ add_executable(test_fast_wire test_fast_wire.cpp)
 target_link_libraries(test_fast_wire PRIVATE bolt::core GTest::gtest_main)
 bolt_apply_hardening(test_fast_wire)
 add_test(NAME test_fast_wire COMMAND test_fast_wire)
+
+add_executable(test_bolt_fixed_gather test_bolt_fixed_gather.cpp)
+target_link_libraries(test_bolt_fixed_gather PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_fixed_gather)
+add_test(NAME test_bolt_fixed_gather COMMAND test_bolt_fixed_gather)
