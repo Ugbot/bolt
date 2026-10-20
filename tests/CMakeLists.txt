@@ -2618,6 +2618,12 @@ add_executable(test_bolt_replica_proof_frame test_bolt_replica_proof_frame.cpp)
 target_link_libraries(test_bolt_replica_proof_frame PRIVATE bolt::crypto GTest::gtest_main)
 bolt_apply_hardening(test_bolt_replica_proof_frame)
 add_test(NAME test_bolt_replica_proof_frame COMMAND test_bolt_replica_proof_frame)
+
+# Explicit data-view/membership envelope; syntax/integrity does not authorize apply.
+add_executable(test_bolt_replica_data_frame test_bolt_replica_data_frame.cpp)
+target_link_libraries(test_bolt_replica_data_frame PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_replica_data_frame)
+add_test(NAME test_bolt_replica_data_frame COMMAND test_bolt_replica_data_frame)
 add_executable(test_bolt_mold_udp64 test_bolt_mold_udp64.cpp)
 target_link_libraries(test_bolt_mold_udp64 PRIVATE bolt::core GTest::gtest_main)
 bolt_apply_hardening(test_bolt_mold_udp64)
