@@ -415,6 +415,13 @@ void IODispatcher::resume_on_worker(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+size_t IODispatcher::current_io_thread_index() const noexcept {
+    const size_t index = t_current_owner == this ? t_current_index : SIZE_MAX;
+    assert(t_current_owner != this || t_current_io != nullptr);
+    assert(index == SIZE_MAX || index < config_.num_io_threads);
+    return index;
+}
+
 core::async_io* IODispatcher::current_io() noexcept {
     // On our own IO thread: the engine that thread polls (ops register where they
     // complete — no cross-thread handoff). Otherwise engine 0 (e.g. an op from a

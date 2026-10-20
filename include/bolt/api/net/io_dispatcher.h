@@ -333,6 +333,12 @@ public:
     /// Configured I/O thread count (valid before start(), unlike num_io_threads()).
     size_t io_thread_count() const noexcept { return config_.num_io_threads; }
 
+    /// Index of this dispatcher's reactor executing the current thread. Returns
+    /// SIZE_MAX off this dispatcher (including before start/after stop); never
+    /// guesses engine 0. Capture on the connection's reactor before offloading
+    /// and pass it to post_to_io_thread to preserve per-core socket ownership.
+    size_t current_io_thread_index() const noexcept;
+
     /// True when each IO thread owns its own engine (per-core backends: epoll/
     /// kqueue/io_uring). False for a shared-completion backend (IOCP: one engine,
     /// all threads poll it). Drives whether the listener does per-thread accept.

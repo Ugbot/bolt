@@ -183,6 +183,11 @@ public:
     /// Submit and block until space available
     void submit_wait(std::coroutine_handle<> handle);
 
+    /// One-shot callback admission. False on a stopped pool, full queue or a
+    /// stop transition; never waits for a worker dequeue or another submitter.
+    /// Accepted callbacks run exactly once, including stop's final queue drain.
+    bool try_submit_blocking(std::function<void()> work) noexcept;
+
     /// Submit blocking work (file I/O, DNS lookup, etc.)
     /// Returns a future that will hold the result
     template <typename F>
@@ -230,6 +235,9 @@ private:
     alignas(kCacheLineSize) std::atomic<uint64_t> tasks_executed_{0};
     alignas(kCacheLineSize) std::atomic<uint64_t> tasks_submitted_{0};
     alignas(kCacheLineSize) std::atomic<uint64_t> blocking_tasks_executed_{0};
+    // Seq-cst entry/exit pairs with running_'s stop exchange: a late submitter
+    // must see stopped; an accepted publisher is included in stop's wait.
+    alignas(kCacheLineSize) std::atomic<uint32_t> blocking_admissions_{0};
 };
 
 // =============================================================================
@@ -283,6 +291,9 @@ inline void WorkerThreadPool::stop() {
         return;  // Not running
     }
 
+    // Prevent a successful nonblocking admission after workers' final drain.
+    while (blocking_admissions_.load(std::memory_order_seq_cst) != 0)
+        std::this_thread::yield();
     shutdown_requested_.store(true, std::memory_order_release);
 
     // Blocking workers will detect shutdown via polling (no CV needed in lock-free design)
@@ -301,6 +312,19 @@ inline void WorkerThreadPool::stop() {
         }
     }
     blocking_workers_.clear();
+}
+
+inline bool WorkerThreadPool::try_submit_blocking(std::function<void()> work) noexcept {
+    if (!work || config_.blocking_workers == 0) return false;
+    const uint32_t before = blocking_admissions_.fetch_add(1, std::memory_order_seq_cst);
+    assert(before < UINT32_MAX - 1);
+    (void)before;
+    const bool allowed = running_.load(std::memory_order_seq_cst) &&
+                         !shutdown_requested_.load(std::memory_order_acquire);
+    const bool accepted = allowed && blocking_task_queue_.try_push(std::move(work));
+    assert(!accepted || allowed);
+    blocking_admissions_.fetch_sub(1, std::memory_order_seq_cst);
+    return accepted;
 }
 
 inline bool WorkerThreadPool::submit(std::coroutine_handle<> handle) noexcept {
