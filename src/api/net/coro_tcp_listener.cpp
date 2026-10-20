@@ -165,14 +165,15 @@ int CoroTcpListener::start_background() {
         io_dispatcher = shared_io_dispatcher_;
     }
 
-    // Decide the accept topology. Per-thread-engine backends (epoll/kqueue/
-    // io_uring) get ONE SO_REUSEPORT listen socket + ONE accept loop PER IO
-    // thread, each started ON its thread so its async_accept registers on that
-    // thread's own engine (kernel load-balances connections across the sockets →
-    // accepts distribute, connections pin to the accepting thread). The shared
-    // backend (IOCP) keeps a single socket + a single worker-pool accept loop.
+    // Linux per-core engines use one SO_REUSEPORT listener per reactor. macOS
+    // the observed wildcard topology does not fan out these binds: accept once on
+    // reactor 0 and transfer each fresh fd before its first I/O. IOCP is shared.
     const bool per_thread = io_dispatcher->per_thread_engines();
+#ifdef __APPLE__
+    const size_t accept_loops = 1;
+#else
     const size_t accept_loops = per_thread ? io_dispatcher->io_thread_count() : 1;
+#endif
 
     auto unwind = [&]() {
         for (int fd : listen_fds_) {
@@ -254,6 +255,8 @@ void CoroTcpListener::stop() {
 // =============================================================================
 
 core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
+    assert(listen_fd >= 0);
+    assert(dispatcher() != nullptr);
     LOG_INFO("CORO_TCP", "Accept loop started on fd %d", listen_fd);
 
     IODispatcher* io_disp = dispatcher();
@@ -272,10 +275,10 @@ core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
         }
 
         connections_accepted_.fetch_add(1, std::memory_order_relaxed);
-        connections_total_.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t sequence = connections_total_.fetch_add(1, std::memory_order_relaxed);
 
         // Spawn connection handler
-        spawn_connection(client_fd);
+        spawn_connection(client_fd, sequence);
     }
 
     LOG_INFO("CORO_TCP", "Accept loop stopped");
@@ -296,14 +299,25 @@ static core::detached_task connection_handler_coro(
     int fd,
     std::atomic<uint64_t>& active_counter
 ) {
-    // Parameters are stored in the coroutine frame, safe across suspensions
-    co_await handler(io, fd);
+    // A queued start remains active but has no registered client I/O yet. The
+    // dispatcher's final inbox drain must close it instead of starting fresh I/O
+    // after stop. This does not cancel a child handler that has already started.
+    if (io.is_running()) co_await handler(io, fd);
+    else sys::close_socket(fd);
     active_counter.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void CoroTcpListener::spawn_connection(int client_fd) {
-    // Set non-blocking
-    sys::set_nonblocking(client_fd);
+void CoroTcpListener::spawn_connection(int client_fd, uint64_t sequence) {
+    assert(client_fd >= 0);
+    assert(dispatcher() != nullptr);
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        sys::set_nonblocking(client_fd) != 0) {
+        sys::close_socket(client_fd);
+        return;
+    }
+#ifndef __APPLE__
+    (void)sequence;
+#endif
 
     // Track active connections
     connections_active_.fetch_add(1, std::memory_order_relaxed);
@@ -321,6 +335,21 @@ void CoroTcpListener::spawn_connection(int client_fd) {
     auto handle = conn_task.release();
 
     if (io_disp->per_thread_engines()) {
+#ifdef __APPLE__
+        const size_t reactors = io_disp->io_thread_count();
+        assert(reactors > 0);
+        const size_t target = static_cast<size_t>(sequence % reactors);
+        if (target != io_disp->current_io_thread_index()) {
+            // No client-fd operation has registered yet. Success transfers both
+            // frame and fd ownership; never touch the frame after publication.
+            if (!io_disp->try_post_to_io_thread(target, handle)) {
+                handle.destroy();
+                sys::close_socket(client_fd);
+                connections_active_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+#endif
         // We are running ON the accepting IO thread. Resume inline so the
         // connection's reads/writes register on THIS thread's engine — the
         // connection is PINNED here for its lifetime (no worker handoff, best

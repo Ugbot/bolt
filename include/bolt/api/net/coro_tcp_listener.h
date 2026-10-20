@@ -81,7 +81,10 @@ public:
     int start_background();
 
     /// Stop the listener
-    /// Thread-safe. Can be called from any thread.
+    /// Stops accepting; active handlers (including queued starts) are not drained.
+    /// Retain this listener and handler captures until the dispatcher has joined
+    /// and its handlers have completed. When owning dispatcher/workers, call
+    /// outside those threads because stop joins them.
     void stop();
 
     /// Check if listener is running
@@ -123,8 +126,8 @@ private:
     // Create and configure the listen socket
     int create_listen_socket();
 
-    // Spawn connection handler on worker pool
-    void spawn_connection(int client_fd);
+    // Transfer an accepted fd before its first I/O, or refuse and close it.
+    void spawn_connection(int client_fd, uint64_t sequence);
 
     CoroTcpListenerConfig config_;
     CoroConnectionHandler handler_;
@@ -138,9 +141,10 @@ private:
     bool owns_resources_ = true;  // Track if we own the resources
 
     // Listen sockets. Per-thread-engine backends (epoll/etc): ONE SO_REUSEPORT
-    // socket per IO thread, each accepted on by that thread's own accept loop
-    // (the kernel load-balances connections across them). Shared backend (IOCP):
-    // a single socket with one accept loop. Closed in stop().
+    // socket per IO thread on Linux. macOS uses one acceptor and bounded
+    // round-robin handoff before client I/O: SO_REUSEPORT does not distribute
+    // these wildcard listeners. Shared backend (IOCP): one accept loop/socket.
+    // Closed in stop(); queued handlers count as active connections.
     std::vector<int> listen_fds_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};

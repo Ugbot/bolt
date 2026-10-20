@@ -13,6 +13,7 @@
 #include <mutex>
 #include <iostream>
 #include <thread>
+#include <utility>
 
 namespace bolt::api {
 namespace net {
@@ -20,8 +21,8 @@ namespace net {
 // Per-IO-thread inbox: a bounded MPSC ring of coroutine handles to resume on the
 // owning IO thread. Producers (any thread) post via post_to_io_thread; the single
 // consumer is the IO thread, which drains at the top of each loop iteration.
-// Capacity is small — posts are rare (starting per-thread accept loops), not a
-// per-request path.
+// Capacity bounds startup posts and accepted-connection handoffs. Refusal sheds
+// new connections instead of waiting on another reactor's progress.
 struct IoInbox {
     static constexpr size_t kCapacity = 256;
     bolt::MPSCChannel<std::coroutine_handle<>, kCapacity> queue;
@@ -267,6 +268,9 @@ void IODispatcher::start() {
         return;  // Already running
     }
 
+    // Preserve a legacy pre-start publisher that overlaps first start. Owner
+    // serializes start/stop/restart; clearing flags must never erase its count.
+    post_state_.fetch_and(kPostCountMask, std::memory_order_acq_rel);
     shutdown_requested_.store(false, std::memory_order_relaxed);
 
     // Create worker pool if needed
@@ -315,6 +319,11 @@ void IODispatcher::stop() {
         return;  // Not running
     }
 
+    // Close before final drain. Publishers admitted before this RMW retain a
+    // count through both queue publication and engine wake; later entries refuse.
+    post_state_.fetch_or(kPostsClosed, std::memory_order_acq_rel);
+    while ((post_state_.load(std::memory_order_acquire) & kPostCountMask) != 0)
+        std::this_thread::yield();
     shutdown_requested_.store(true, std::memory_order_release);
 
     // Stop the async I/O engine(s) (this will wake any blocked poll())
@@ -433,31 +442,51 @@ core::async_io* IODispatcher::current_io() noexcept {
     return ios_[0].get();
 }
 
-bool IODispatcher::post_to_io_thread(size_t io_thread_index,
-                                     std::coroutine_handle<> h) noexcept {
-    if (io_thread_index >= inboxes_.size() || !h) {
-        return false;
+bool IODispatcher::try_post_impl(size_t index, std::coroutine_handle<> h,
+                                  bool allow_before_start) noexcept {
+    assert(index < inboxes_.size());
+    assert(h != nullptr);
+    const uint64_t before = post_state_.fetch_add(1, std::memory_order_acq_rel);
+    assert((before & kPostCountMask) < kPostCountMask);
+    const bool initial = (before & kPostsBeforeStart) != 0;
+    const bool allowed = (before & kPostsClosed) == 0 &&
+        (initial ? allow_before_start : running_.load(std::memory_order_acquire));
+    std::coroutine_handle<> item = h;
+    const bool accepted = allowed && inboxes_[index]->queue.try_push_nowait(std::move(item));
+    if (accepted || (allowed && !initial)) {
+        const size_t engine = index < ios_.size() ? index : 0;
+        assert(engine < ios_.size());
+        ios_[engine]->wake();  // retain admission through final engine access
     }
-    const size_t engine_idx = (io_thread_index < ios_.size()) ? io_thread_index : 0;
-    assert(engine_idx < ios_.size() && "post_to_io_thread: engine index OOB");
-    IoInbox* inbox = inboxes_[io_thread_index].get();
-    assert(inbox != nullptr && "post_to_io_thread: null inbox");
-    const bool on_target =
-        t_current_owner == this && t_current_index == io_thread_index;
-    // Bounded by the target draining (it pops up to kCapacity per loop turn) or
-    // by shutdown; each full turn wakes the target so it drains promptly.
+    post_state_.fetch_sub(1, std::memory_order_release);
+    return accepted;
+}
+
+bool IODispatcher::try_post_to_io_thread(size_t index,
+                                        std::coroutine_handle<> h) noexcept {
+    if (index >= inboxes_.size() || !h) return false;
+    assert(index < config_.num_io_threads);
+    assert(inboxes_[index] != nullptr);
+    if (try_post_impl(index, h, false)) return true;
+    inbox_posts_rejected_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool IODispatcher::post_to_io_thread(size_t index,
+                                     std::coroutine_handle<> h) noexcept {
+    if (index >= inboxes_.size() || !h) return false;
+    assert(index < config_.num_io_threads);
+    assert(inboxes_[index] != nullptr);
+    const bool on_target = t_current_owner == this && t_current_index == index;
+    // Legacy capacity waiting stays outside admission so stop never waits for a
+    // publisher blocked on the reactor whose final drain it is about to run.
     for (;;) {
-        std::coroutine_handle<> item = h;
-        if (inbox->queue.try_push_nowait(std::move(item))) {
-            ios_[engine_idx]->wake();
-            return true;
-        }
+        if (try_post_impl(index, h, true)) return true;
         if (on_target || !running_.load(std::memory_order_acquire) ||
             shutdown_requested_.load(std::memory_order_acquire)) {
             inbox_posts_rejected_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        ios_[engine_idx]->wake();
         std::this_thread::yield();
     }
 }

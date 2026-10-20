@@ -351,6 +351,8 @@ public:
     /// (call from any thread). Only meaningful for per_thread_engines(); the
     /// shared backend keeps a single accept loop.
     ///
+    /// Legacy pre-start posts are retained until start(); callers must start the
+    /// dispatcher before releasing their posted frames. After stop, posts fail.
     /// A full inbox (IoInbox::kCapacity) never drops `h` silently: a foreign
     /// thread waits for the target thread to drain; false (and the post is
     /// counted in inbox_posts_rejected()) on a bad index, when the target IO
@@ -358,7 +360,16 @@ public:
     /// or when the dispatcher is not running. On false the caller still owns `h`.
     bool post_to_io_thread(size_t io_thread_index, std::coroutine_handle<> h) noexcept;
 
-    /// Posts refused by post_to_io_thread because the target inbox was full.
+    /// Bounded admission without waiting for inbox capacity or reactor progress.
+    /// False on bad index/null handle, before start, during/after stop, or on
+    /// capacity/contention refusal. False retains caller ownership of h; true
+    /// transfers it to the target reactor, which may resume it before return.
+    /// Stop closes admission and drains accepted publications before joining.
+    /// Callers retain the dispatcher through every post call; start/stop/restart
+    /// must be serialized by the owner. No allocation occurs in this method.
+    bool try_post_to_io_thread(size_t io_thread_index, std::coroutine_handle<> h) noexcept;
+
+    /// Valid posts refused for inbox capacity or dispatcher lifecycle state.
     uint64_t inbox_posts_rejected() const noexcept {
         return inbox_posts_rejected_.load(std::memory_order_relaxed);
     }
@@ -389,6 +400,8 @@ private:
     friend class SendToAwaitable;
 
     void io_thread_loop(size_t thread_id);
+    bool try_post_impl(size_t io_thread_index, std::coroutine_handle<> h,
+                       bool allow_before_start) noexcept;
 
     // Submit coroutine to worker pool for resumption
     void resume_on_worker(std::coroutine_handle<> handle) noexcept;
@@ -425,6 +438,13 @@ private:
     std::vector<core::StackedThread> io_threads_;
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};
+
+    // One startup-sized admission gate: close flags plus in-flight publisher
+    // count. Stop waits publishers before reactors perform their final drain.
+    static constexpr uint64_t kPostsClosed = uint64_t{1} << 63;
+    static constexpr uint64_t kPostsBeforeStart = uint64_t{1} << 62;
+    static constexpr uint64_t kPostCountMask = kPostsBeforeStart - 1;
+    alignas(core::kCacheLineSize) std::atomic<uint64_t> post_state_{kPostsBeforeStart};
 
     // Stats
     alignas(core::kCacheLineSize) std::atomic<uint64_t> reads_started_{0};
