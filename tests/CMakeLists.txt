@@ -2181,6 +2181,13 @@ bolt_apply_hardening(test_bolt_iceberg_ranged_scan)
 add_test(NAME test_bolt_iceberg_ranged_scan COMMAND test_bolt_iceberg_ranged_scan)
 set_tests_properties(test_bolt_iceberg_ranged_scan PROPERTIES TIMEOUT 120)
 
+add_executable(test_bolt_iceberg_metadata_io test_bolt_iceberg_metadata_io.cpp)
+target_link_libraries(test_bolt_iceberg_metadata_io
+    PRIVATE bolt::lakehouse bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_metadata_io)
+add_test(NAME test_bolt_iceberg_metadata_io COMMAND test_bolt_iceberg_metadata_io)
+set_tests_properties(test_bolt_iceberg_metadata_io PROPERTIES TIMEOUT 60)
+
 # G2ICE-234 — manifest-list partition-summary pruning + the Avro union
 # logical-type branch, over a pyiceberg-written day-partitioned table.
 add_executable(test_bolt_iceberg_manifest_pruning test_bolt_iceberg_manifest_pruning.cpp)

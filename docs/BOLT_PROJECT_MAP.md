@@ -1,5 +1,11 @@
 # Bolt Project Map
 
+`lakehouse/iceberg/metadata_io.h` loads one caller-selected immutable metadata
+object through strong conditional ranges, distinct finite retained/scratch
+arenas, exact table identity and complete SHA-256. It performs no discovery or
+repinning; a declared raw JSON identity subset refuses escaped aliases.
+[Contract and qualification](research/iceberg-metadata-exact.md).
+
 `thread/bolt_thread_qos.h` / `bolt::thread` provide cold current-thread policy
 configuration with explicit native readback. Inherit makes no OS request;
 unsupported/failure is explicit. Configuration is not effective scheduling or

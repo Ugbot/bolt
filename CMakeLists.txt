@@ -1009,6 +1009,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/catalog_gravitino.cpp
     src/lakehouse/iceberg_transform.cpp
     src/lakehouse/iceberg_metadata.cpp
+    src/lakehouse/iceberg_metadata_io.cpp
     src/lakehouse/iceberg_snapshot.cpp
     src/lakehouse/iceberg_manifest.cpp
     src/lakehouse/iceberg_manifest_avro.cpp
