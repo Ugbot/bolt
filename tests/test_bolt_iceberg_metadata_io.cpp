@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 
 namespace {
@@ -290,3 +291,34 @@ TEST_F(IcebergMetadataIO, LargerThanSixteenMiBMetadataUsesOnlyPinnedOneMiBRanges
     ASSERT_EQ(out.n_schemas, 1u); EXPECT_EQ(out.schemas[0].fields[0].id, 7);
 }
 } // namespace
+
+TEST_F(IcebergMetadataIO, CurrentSnapshotPresenceSeparatesSignedMinusOneFromAbsence) {
+    const auto original=origin.bytes;
+    for(const auto value:std::array<const char*,3>{"-1","0","-2"}) {
+        origin.bytes=original;
+        auto at=origin.bytes.find("\"current-snapshot-id\":19"); ASSERT_NE(at,std::string::npos);
+        origin.bytes.replace(at+22,2,value);
+        at=origin.bytes.find("\"snapshot-id\":19"); ASSERT_NE(at,std::string::npos);
+        origin.bytes.replace(at+14,2,value);
+        id.version.size=origin.bytes.size(); origin.next=0; metadata.reset();
+        ASSERT_EQ(load(),Status::Ok); EXPECT_TRUE(out.current_snapshot_present);
+        EXPECT_EQ(out.current_snapshot_id,std::strtoll(value,nullptr,10));
+    }
+    for(const bool omit:std::array<bool,2>{false,true}) {
+        origin.bytes=original; auto at=origin.bytes.find("\"current-snapshot-id\":19"); ASSERT_NE(at,std::string::npos);
+        if(omit) origin.bytes.erase(at,25); else origin.bytes.replace(at+22,2,"null");
+        id.version.size=origin.bytes.size(); origin.next=0; metadata.reset();
+        ASSERT_EQ(load(),Status::Ok); EXPECT_FALSE(out.current_snapshot_present); EXPECT_EQ(out.current_snapshot_id,-1);
+    }
+}
+
+TEST_F(IcebergMetadataIO, MalformedCurrentSnapshotCannotBecomeAbsent) {
+    const auto original=origin.bytes;
+    for(const auto value:std::array<const char*,7>{"true","\"19\"","[]","{}","19.5","9223372036854775808","-9223372036854775809"}) {
+        origin.bytes=original;
+        const auto at=origin.bytes.find("\"current-snapshot-id\":19"); ASSERT_NE(at,std::string::npos);
+        origin.bytes.replace(at+22,2,value); id.version.size=origin.bytes.size();
+        origin.next=0; metadata.reset();
+        EXPECT_EQ(load(),Status::DecodeFailed); unchanged();
+    }
+}

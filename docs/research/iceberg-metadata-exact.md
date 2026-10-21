@@ -39,3 +39,27 @@ identity and full digest. Its physical table also passed all-value PyIceberg
 and DuckDB checks before owned-fixture cleanup. These are macOS component
 checks. Catalog authority, durable bindings, live synthetic remote/local
 stitching, Windows/Linux and performance acceptance are separate work.
+
+## Parsed current-snapshot presence
+
+`Metadata::current_snapshot_present` preserves whether the original JSON has a
+numeric `current-snapshot-id`; numeric signed `-1`, zero and other negative IDs
+are present. Missing and JSON null are absent. The copied Metadata returned by
+`metadata_load_exact` retains this distinction. Consumers selecting exact
+snapshots must compare signed IDs by equality, require membership for every
+present current ID and selected ID, and use presence rather than the legacy
+`current_snapshot_id == -1` sentinel to establish absence.
+
+Writer serialization and the ordinary parser's legacy membership behavior stay
+compatible: old owned empty metadata emits numeric `-1`. That old sentinel is
+still readable by the ordinary parser; an exact binding consumer can refuse it
+when no matching snapshot exists and require null/omitted for explicit absence.
+The provenance flag describes parsed input and does not change writer mutation
+or serialization semantics.
+
+The [Iceberg snapshot ID specification](https://iceberg.apache.org/spec/#assignment-of-snapshot-ids-and-current-snapshot-id)
+notes the Java V1/V2 `-1` convention for no current snapshot. Gestalt2's durable
+remote binding component deliberately refuses numeric `-1` with no matching
+listed snapshot; it admits explicit null/omitted absence or explicit numeric
+`-1` with matching listed snapshot. This strict component policy does not
+change Bolt's legacy writer/parser compatibility.

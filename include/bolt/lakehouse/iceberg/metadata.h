@@ -96,6 +96,12 @@ struct Metadata {
     uint32_t         n_metadata_log;
     uint32_t         _pad5;
     MetadataLogEntry metadata_log[kIcebergMaxMetadataLog];
+    // Parsing provenance: true only for a numeric current-snapshot-id in the
+    // original JSON, including signed -1. Omitted/null are false. The legacy
+    // current_snapshot_id=-1 value alone cannot establish absence. Writers
+    // retain their existing ID-based serialization; this flag describes parsed
+    // input, not a mutation API for writer-owned Metadata.
+    bool current_snapshot_present;
 };
 
 }  // namespace iceberg

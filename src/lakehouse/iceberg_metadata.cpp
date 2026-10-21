@@ -9,6 +9,7 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 
 #include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 
@@ -86,6 +87,23 @@ bool read_int64(bj::Iterator* it, int64_t* out) noexcept {
         *out = static_cast<int64_t>(d); bj::iter_advance(it); return true;
     }
     skip_value(it); return false;
+}
+
+bool read_current_snapshot(const bj::StructuralIndex* idx,bj::Iterator* it,Metadata* out) noexcept {
+    assert(idx && it && out); assert(it->cursor>=0 && it->cursor<idx->token_count);
+    if(bj::iter_peek(it)==bj::TokenType::Null) {
+        out->current_snapshot_id=-1; out->current_snapshot_present=false;
+        return bj::iter_advance(it);
+    }
+    if(bj::iter_peek(it)!=bj::TokenType::Int64) return false;
+    const auto& token=idx->tokens[it->cursor];
+    if(token.start<0 || token.length<=0 || token.length>idx->src_len || token.start>idx->src_len-token.length) return false;
+    const auto* begin=reinterpret_cast<const char*>(idx->src+token.start);
+    const auto* end=begin+token.length; int64_t value=0;
+    const auto decoded=std::from_chars(begin,end,value);
+    if(decoded.ec!=std::errc{} || decoded.ptr!=end) return false;
+    out->current_snapshot_id=value; out->current_snapshot_present=true;
+    return bj::iter_advance(it);
 }
 
 bool read_str(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -462,7 +480,7 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
     if (!bj::iter_init(&idx, &it)) return false;
     if (bj::iter_peek(&it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(&it);
-    bool saw_snapshot_log = false;
+    bool saw_snapshot_log = false, saw_current_snapshot = false;
     uint32_t g = 0;
     while (bj::iter_peek(&it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it.cursor;
@@ -479,11 +497,8 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
         } else if (tok_eq(&idx, key, "last-sequence-number")) {
             read_int64(&it, &out->last_sequence_number);
         } else if (tok_eq(&idx, key, "current-snapshot-id")) {
-            if (bj::iter_peek(&it) == bj::TokenType::Null) {
-                bj::iter_advance(&it); out->current_snapshot_id = -1;
-            } else {
-                read_int64(&it, &out->current_snapshot_id);
-            }
+            if(saw_current_snapshot || !read_current_snapshot(&idx,&it,out)) return false;
+            saw_current_snapshot=true;
         } else if (tok_eq(&idx, key, "current-schema-id")) {
             int64_t v = 0; read_int64(&it, &v);
             out->current_schema_id = static_cast<int32_t>(v);
@@ -574,7 +589,10 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
                 return false;
         }
     }
-    // A current snapshot the list does not carry would scan as an empty table.
+    // Preserve legacy writer compatibility: owned empty metadata historically
+    // emits numeric -1. Exact-selection consumers must use the parsed presence
+    // flag and require membership for every present signed ID, including -1.
+    // A nonnegative current snapshot absent from the list cannot be scanned.
     if (out->current_snapshot_id >= 0 &&
         snapshot_by_id(out, out->current_snapshot_id) == nullptr)
         return false;
