@@ -27,6 +27,8 @@ enum : int {
     kOsIoError         = 4,
     kOsBufferSmall     = 5,
     kOsExists          = 6,   // put_if_absent: the key already exists
+    kOsCancelled       = 7,   // cooperative cancellation before commit
+    kOsWriteUncertain  = 8,   // write may have committed; do not blindly retry
 };
 
 static constexpr uint32_t kOsMaxKey     = 2048u;
@@ -54,7 +56,9 @@ struct ObjectStoreVT {
     int (*get_object)(void* impl, const char* key, Arena* arena,
                       const uint8_t** out_data, uint64_t* out_len) noexcept;
 
-    // PUT object `key` with body data[0..len). Returns kOs* code.
+    // PUT object `key` with body data[0..len). Returns kOs* code. S3 uses
+    // bounded multipart above 16 MiB; kOsWriteUncertain requires caller
+    // reconciliation. Explicit streaming/progress: object_store/s3_upload.h.
     int (*put_object)(void* impl, const char* key,
                       const uint8_t* data, uint64_t len) noexcept;
 

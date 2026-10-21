@@ -96,15 +96,11 @@ inline bool split_endpoint(const char* ep, Buf* origin, Buf* path) noexcept {
     return origin->ok && path->ok;
 }
 
-// Host exactly as bolt::net sends it in the Host header (port stripped).
+// Authority exactly as bolt::net sends it in Host, including nondefault port.
 inline bool url_host(const char* url, char* host, uint32_t cap) noexcept {
     assert(url != nullptr && host != nullptr);
     assert(cap > 0);
-    bool https = false;
-    uint16_t port = 0;
-    char path[net::kHttpMaxUrl];
-    return net::http_url_parse(url, &https, host, cap, &port, path,
-                               sizeof(path));
+    return net::http_url_authority(url, host, cap);
 }
 
 inline void utc_now(std::tm* out) noexcept {

@@ -61,6 +61,7 @@ void make_s3_bucket(const std::string& ep) {
     ASSERT_TRUE(bolt::net::http_url_parse(url.c_str(), &https, host,
                                           sizeof(host), &port, path,
                                           sizeof(path)));
+    ASSERT_TRUE(bolt::net::http_url_authority(url.c_str(), host, sizeof(host)));
     char hash[65];
     bolt::crypto::sha256_empty_hex(hash);
     const std::time_t t = std::time(nullptr);

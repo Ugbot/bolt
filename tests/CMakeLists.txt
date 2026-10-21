@@ -2525,6 +2525,16 @@ if(NOT WIN32)
     bolt_apply_hardening(test_bolt_object_store_range)
     add_test(NAME test_bolt_object_store_range COMMAND test_bolt_object_store_range)
 endif()
+# G2ICE-249: bounded native S3 multipart, signing and uncertain completion.
+add_executable(test_bolt_object_store_s3_upload test_bolt_object_store_s3_upload.cpp)
+target_link_libraries(test_bolt_object_store_s3_upload
+    PRIVATE bolt::lakehouse GTest::gtest_main)
+if(WIN32)
+    target_link_libraries(test_bolt_object_store_s3_upload PRIVATE ws2_32)
+endif()
+bolt_apply_hardening(test_bolt_object_store_s3_upload)
+add_test(NAME test_bolt_object_store_s3_upload COMMAND test_bolt_object_store_s3_upload)
+set_tests_properties(test_bolt_object_store_s3_upload PROPERTIES TIMEOUT 120)
 # Scale proof vs pyiceberg/DuckDB; skipped unless BOLT_L5_SCALE_DIR names the
 # output of scripts/l5_iceberg_scale.py.
 add_executable(test_bolt_lakehouse_scale test_bolt_lakehouse_scale.cpp)

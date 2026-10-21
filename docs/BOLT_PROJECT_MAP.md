@@ -61,6 +61,10 @@ selected rows. [Scope and evidence](research/integer-literal-filters.md).
 decoding with explicit consumption, backpressure, frame integrity and EOF.
 [Contract and scoped native evidence](research/zstd-streaming.md).
 
+`lakehouse/object_store/s3_upload.h` provides bounded synchronous S3 multipart
+and streamed PUT for known-size objects; reconciliation and caller-memory
+budgets are explicit. [Usage, limits and evidence](research/s3-multipart-upload.md).
+
 `wire/dbn.h` adds borrowed bounded DBN1/2/3 metadata/record framing;
 `wire/fast.h` adds the exact stop-bit/presence-map/dictionary FAST1.1 subset.
 Typed Databento extraction and T7 venue templates remain in Chukonu.
