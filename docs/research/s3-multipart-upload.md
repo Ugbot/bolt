@@ -90,11 +90,17 @@ The native multipart suite covers request signing and framing, geometry,
 conditional completion, cancellation, malformed/truncated responses, abort
 outcomes, uncertainty and concurrent-call isolation.
 
-The actual native SST MinIO fixture has separately round-tripped a 34,508,928
-byte MBLT SST with 32,768 rows and 256-wide vectors, verifying the downloaded
-data bits and SHA-256 prefix `a8228982`. The strengthened service-reported
-multipart part-count oracle is still pending; this is not final
-external-service qualification. G2ICE-249 remains
-open until that evidence is recorded. Windows/Linux, broader S3-compatible
-services, TieringManager activation, automatic crash recovery, and throughput or
-tail-latency qualification are outside these results.
+The final explicitly enabled native SST MinIO v5 fixture passed in 0.403 seconds.
+It round-tripped a 34,508,928-byte MBLT SST with 32,768 rows and 256-wide
+vectors; the signed `HEAD ?partNumber=1` independently reported five parts and
+an 8,388,608-byte first part with HTTP 206. Every downloaded value matched,
+including the complete SHA-256
+`a8228982c5d861265e2ccb30f449c38b1f1f63ff034711a090bfe9eceb3506b4`.
+The fixture source SHA-256 was
+`c20b07560c3a539ad305fa8500c934d0926982df9446868ddbc8841665b08321`.
+
+G2ICE-249 remains open because the live tracker criteria have not been
+verified and reconciled. These results do not establish Windows/Linux support,
+broader S3-compatible services, TieringManager endpoint/session wiring or
+activation (G2ICE-253), automatic crash recovery, or throughput and tail-latency
+qualification.
