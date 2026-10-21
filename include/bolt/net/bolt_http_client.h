@@ -11,13 +11,13 @@ namespace bolt {
 namespace net {
 
 static constexpr uint32_t kHttpMaxUrl     = 2048u;
-static constexpr uint32_t kHttpMaxHeader  = 512u;
+static constexpr uint32_t kHttpMaxHeader  = 2048u;
 static constexpr uint32_t kHttpMaxHeaders = 32u;
 static constexpr uint32_t kHttpMaxBody    = 16u * 1024u * 1024u;
 
 struct HttpHeader {
     char name[128];
-    char value[512];
+    char value[kHttpMaxHeader];
 };
 
 struct HttpRequest {
@@ -28,6 +28,7 @@ struct HttpRequest {
     const uint8_t* body;
     uint32_t       body_len;
     uint16_t       timeout_ms;                    // 0 → default
+    uint32_t       max_response_body;             // 0 → kHttpMaxBody; otherwise <= it
 };
 
 struct HttpResponse {
@@ -45,8 +46,21 @@ bool http_url_parse(const char* url, bool* out_https,
                     uint16_t* out_port,
                     char* out_path, uint32_t path_cap) noexcept;
 
+// Host authority used on the wire and by request signers. Preserves nondefault
+// ports and IPv6 brackets. The transport currently resolves IPv4 endpoints.
+bool http_url_authority(const char* url, char* out, uint32_t cap) noexcept;
+
 // Send `req` and read full response. body buffer arena-owned. 0 on success,
-// negative on error.
+// negative on error; a failed response never publishes a partial body. No retry.
+// timeout_ms is a total connect/send/receive deadline after synchronous DNS;
+// accepted values are 1..60000 ms, or zero for 10000 ms. Response framing and
+// declared/decoded body budgets are validated, without truncating fields.
+// Response heads use kHttpResponseHeadCap (8192 bytes); wire staging is bounded
+// by the body budget plus 64 KiB of framing overhead. Unsupported transfer
+// codings fail explicitly. Requests must be zero-initialized before filling.
+// Host/Connection are transport-owned; request Transfer-Encoding is unsupported.
+// An explicit Content-Length must equal body_len; it is emitted exactly once.
+// HttpHeader/HttpRequest layouts changed: consumers must rebuild together.
 int http_send(bolt::Arena* arena, const HttpRequest* req,
               HttpResponse* out) noexcept;
 
