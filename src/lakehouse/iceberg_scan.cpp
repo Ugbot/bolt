@@ -214,23 +214,31 @@ bool is_avro_ocf(const uint8_t* b, uint64_t n) noexcept {
            b[0] == 'O' && b[1] == 'b' && b[2] == 'j' && b[3] == 1u;
 }
 
-bool read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
-                       int64_t* out) noexcept {
+int read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
+                      int64_t* out) noexcept {
     assert(os != nullptr && table_rel != nullptr && out != nullptr);
+    assert(scratch != nullptr);
     char key[kCatMaxPath];
     if (!path_join(table_rel, "metadata/version-hint.text",
-                   key, sizeof(key))) return false;
+                   key, sizeof(key))) return kOsBadArg;
     const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (os_get(os, key, scratch, &body, &blen) != kOsOk) return false;
+    const int rc = os_get(os, key, scratch, &body, &blen);
+    if (rc != kOsOk) return rc;
+    if (blen == 0 || blen > 32u) return kOsBadArg;
     int64_t v = 0; bool any = false;
     for (uint64_t i = 0; i < blen; ++i) {
         const char c = static_cast<char>(body[i]);
-        if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
+        if (c >= '0' && c <= '9') {
+            const int64_t digit = c - '0';
+            if (v > (INT64_MAX - digit) / 10) return kOsBadArg;
+            v = v * 10 + digit;
+            any = true;
+        }
         else if (any) break;
     }
-    if (!any) return false;
+    if (!any) return kOsBadArg;
     *out = v;
-    return true;
+    return kOsOk;
 }
 
 // Version number encoded in a metadata file NAME, across both layouts a real
@@ -265,25 +273,33 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
                           Arena* scratch, char* out_key,
                           uint32_t cap) noexcept {
     assert(os != nullptr && table_rel != nullptr && out_key != nullptr);
+    assert(scratch != nullptr && cap > 0u);
+    int64_t best = -1;
+    char best_key[kCatMaxPath]{};
     int64_t hint = 0;
-    if (read_version_hint(os, table_rel, scratch, &hint)) {
+    const int hr = read_version_hint(os, table_rel, scratch, &hint);
+    if (hr != kOsOk && hr != kOsNotFound && hr != kOsBadArg) return false;
+    if (hr == kOsOk) {
         char rel[64];
         const int n = std::snprintf(rel, sizeof(rel),
                                      "metadata/v%lld.metadata.json",
                                      static_cast<long long>(hint));
-        if (n <= 0) return false;
-        if (!path_join(table_rel, rel, out_key, cap)) return false;
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(rel)) return false;
+        if (!path_join(table_rel, rel, best_key, sizeof(best_key))) return false;
         const uint8_t* body = nullptr; uint64_t blen = 0;
-        if (os_get(os, out_key, scratch, &body, &blen) == kOsOk) return true;
+        const int rc = os_get(os, best_key, scratch, &body, &blen);
+        if (rc == kOsOk) best = hint;
+        else if (rc != kOsNotFound) return false;
     }
+    // The hint is advisory: its write can fail or lose a race AFTER metadata
+    // commits. Rank the complete listing, including retained version gaps and
+    // catalog-managed names. A failed listing is not an unchanged table.
     char prefix[kCatMaxPath];
     if (!path_join(table_rel, "metadata/", prefix, sizeof(prefix))) return false;
     ObjectEntry* listing = nullptr;
     uint32_t nl = 0;
     if (os_list_all(os, prefix, scratch, 256u, &listing, &nl) != kOsOk)
         return false;
-    int64_t best = -1;
-    char best_key[kCatMaxPath]; best_key[0] = '\0';
     for (uint32_t i = 0; i < nl; ++i) {
         const char* k = listing[i].key;
         const char* slash = std::strrchr(k, '/');
@@ -291,14 +307,16 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
         int64_t v = 0;
         if (!metadata_version_of(tail, &v)) continue;
         if (v > best) {
+            const size_t len = std::strlen(k);
+            if (len >= sizeof(best_key)) return false;
             best = v;
-            std::strncpy(best_key, k, cap - 1u);
-            best_key[cap - 1u] = '\0';
+            std::memcpy(best_key, k, len + 1u);
         }
     }
     if (best < 0) return false;
-    std::strncpy(out_key, best_key, cap - 1u);
-    out_key[cap - 1u] = '\0';
+    const size_t len = std::strlen(best_key);
+    if (len >= cap) return false;
+    std::memcpy(out_key, best_key, len + 1u);
     return true;
 }
 

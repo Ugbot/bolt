@@ -118,6 +118,7 @@ uint32_t delete_expired_files(TableHandle* th, const Snapshot* gone,
 bool table_expire_snapshots_ex(TableHandle* th, const ExpireOptions* o,
                                ExpireResult* r) noexcept {
     assert(th != nullptr && o != nullptr);
+    if (!write_ready(th)) return false;
     ExpireResult res{};
     Metadata& m = th->meta;
     const uint32_t n = m.n_snapshots;
@@ -191,6 +192,7 @@ bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
 bool table_set_retention(TableHandle* th, int64_t max_snapshot_age_ms,
                          int32_t min_snapshots_to_keep) noexcept {
     assert(th != nullptr);
+    if (!write_ready(th)) return false;
     if (max_snapshot_age_ms < 0 || min_snapshots_to_keep < 0) return false;
     const int64_t pa = th->meta.retention_max_age_ms;
     const int32_t pk = th->meta.retention_min_snapshots;

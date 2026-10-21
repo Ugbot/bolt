@@ -6,7 +6,7 @@
 //
 // Tiger Style: PODs, ≥2 asserts/fn, no exceptions, no smart pointers, all
 // allocations through the caller-owned Arena, atomic commits via
-// ObjectStore put_if_absent emulation (head_object then put).
+// ObjectStore put_if_absent (never a head-then-put emulation).
 
 #pragma once
 
@@ -73,6 +73,27 @@ inline void optimize_options_init(OptimizeOptions* o) noexcept {
 struct TableHandle;
 struct AppendHandle;
 
+enum class CommitObjectKind : uint8_t { kNone = 0, kManifest, kManifestList, kMetadata };
+
+// Evidence of an uncertain conditional write, copied out of the table arena.
+// Keys are store-relative; object_location and table_uuid bind the candidate
+// to its table. Reconcile with the EXACT bytes (SHA-256 + length), table UUID,
+// version and snapshot identity, not HEAD/size alone. A manifest/list candidate
+// means metadata publication was not attempted. A metadata candidate MAY be
+// visible. Absence at one read is not permission to retry a still-in-flight PUT.
+struct CommitCandidate {
+    CommitObjectKind kind;
+    uint8_t _pad[7];
+    uint64_t length;
+    int64_t base_metadata_version;
+    int64_t candidate_metadata_version;
+    int64_t snapshot_id;
+    char object_key[kIcebergMaxPath];
+    char object_location[kIcebergMaxLocation];
+    char table_uuid[kIcebergMaxUuid];
+    char sha256[65];
+};
+
 // Create a new Iceberg table rooted at `path` (filesystem root). Writes
 // metadata/v1.metadata.json + metadata/version-hint.text. Returns false on
 // any IO error or capacity overflow.
@@ -80,6 +101,14 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
                   const char* path, const Schema* schema,
                   const PartitionSpec* spec, const SortOrder* sort,
                   const WriteOptions* opts) noexcept;
+
+// Same create contract; *out is null on failure. On uncertain initial v1
+// publication, out_uncertain receives the candidate despite there being no
+// usable handle. Otherwise it is zeroed. No automatic retry/reconciliation.
+bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
+                     const char* path, const Schema* schema,
+                     const PartitionSpec* spec, const SortOrder* sort,
+                     const WriteOptions* opts, CommitCandidate* out_uncertain) noexcept;
 
 // Open an existing Iceberg table (reads latest metadata.json).
 bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
@@ -92,8 +121,13 @@ void table_close(TableHandle* h) noexcept;
 // a file name this commit needed). Nothing of this commit is visible; the
 // handle is stale and must be reopened (table_open) before retrying.
 // kFailed: any other failure (IO, capacity, refused operation).
-enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2 };
+// kUncertain: a conditional write may have succeeded. Candidate objects are
+// retained. This handle refuses further mutations; reconcile externally, then
+// reopen. Neither a read nor another mutation clears the uncertainty.
+enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2, kUncertain = 3 };
 CommitError table_last_commit_error(const TableHandle* th) noexcept;
+// False (and zeroes *out) unless this handle has an uncertain candidate.
+bool table_uncertain_commit(const TableHandle* th, CommitCandidate* out) noexcept;
 
 // Append path: open → write N batches → commit. Each commit emits one new
 // data Parquet file + a manifest + a manifest list + a new metadata.json.

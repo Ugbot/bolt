@@ -7,14 +7,50 @@
 // is created with the store's atomic put_if_absent, so of two writers building
 // on version N-1 exactly one publishes v<N> and the other sees kConflict.
 
+// Uncertainty is sticky until external reconciliation and a fresh handle.
+bool write_ready(TableHandle* th) noexcept {
+    assert(th != nullptr);
+    assert(th->os != nullptr);
+    if (!th->write_uncertain) return true;
+    th->last_error = CommitError::kUncertain;
+    return false;
+}
+
 // Create `key` iff absent. kOsExists is a conflict: someone else holds the
 // name (another writer's table version, or a colliding object name).
 bool commit_object(TableHandle* th, const char* key, const uint8_t* data,
-                   uint64_t len) noexcept {
+                   uint64_t len, CommitObjectKind kind, int64_t snapshot_id) noexcept {
     assert(th != nullptr && th->os != nullptr && key != nullptr);
     assert(data != nullptr || len == 0);
+    if (!write_ready(th)) return false;
+    // Complete identity must fit BEFORE sending a conditional write. Never
+    // expose a truncated receipt for a possibly accepted candidate.
+    CommitCandidate& c = th->candidate;
+    c = CommitCandidate{};
+    const size_t key_len = std::strlen(key);
+    const size_t uuid_len = std::strlen(th->meta.table_uuid);
+    if (key_len >= sizeof(c.object_key) || uuid_len >= sizeof(c.table_uuid) ||
+        !abs_location(th->root, key, c.object_location, sizeof(c.object_location))) {
+        th->last_error = CommitError::kFailed;
+        return false;
+    }
+    std::memcpy(c.object_key, key, key_len + 1u);
+    std::memcpy(c.table_uuid, th->meta.table_uuid, uuid_len + 1u);
+    c.kind = kind;
+    c.length = len;
+    c.base_metadata_version = th->meta_version;
+    c.candidate_metadata_version = th->meta_version + 1;
+    c.snapshot_id = snapshot_id;
     const int rc = os_put_if_absent(th->os, key, data, len);
     if (rc == kOsOk) return true;
+    if (rc == kOsWriteUncertain) {
+        // The caller still owns these exact bytes. Hash only the uncertain
+        // path; successful local commits need no additional full-body pass.
+        crypto::sha256_hex(data, len, c.sha256);
+        th->write_uncertain = true;
+        th->last_error = CommitError::kUncertain;
+        return false;
+    }
     th->last_error = (rc == kOsExists) ? CommitError::kConflict
                                        : CommitError::kFailed;
     return false;
@@ -74,6 +110,7 @@ bool write_version_hint(ObjectStore* os, int64_t v) noexcept {
 bool persist_metadata(TableHandle* th) noexcept {
     assert(th != nullptr && th->arena != nullptr && th->os != nullptr);
     assert(th->meta_version >= 0);
+    if (!write_ready(th)) return false;
     const int64_t next = th->meta_version + 1;
     // The version this commit supersedes goes on the metadata-log, stamped
     // with that version's own last-updated-ms. Staged, not pushed, so a lost
@@ -104,7 +141,8 @@ bool persist_metadata(TableHandle* th) noexcept {
     char rel[64];
     version_key(next, rel);
     // The CAS: v<next> is created only if no other writer created it first.
-    if (!commit_object(th, rel, body, blen)) {
+    if (!commit_object(th, rel, body, blen, CommitObjectKind::kMetadata,
+                       th->meta.current_snapshot_id)) {
         th->meta.last_updated_ms = prev_updated_ms;
         return false;
     }
@@ -120,6 +158,7 @@ bool persist_metadata(TableHandle* th) noexcept {
 // version this handle was opened on? The atomic check is still persist's.
 bool handle_is_current(TableHandle* th) noexcept {
     assert(th != nullptr && th->os != nullptr);
+    if (!write_ready(th)) return false;
     if (!version_exists(th->os, th->meta_version + 1)) return true;
     th->last_error = CommitError::kConflict;
     return false;

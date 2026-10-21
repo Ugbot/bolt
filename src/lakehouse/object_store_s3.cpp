@@ -247,7 +247,8 @@ int s3_put(void* impl, const char* key, const uint8_t* data,
 }
 
 // S3 conditional writes: PutObject with If-None-Match: * fails 412 when the
-// key exists. 409 (a concurrent conditional write in flight) is transient.
+// key exists. 409 (a concurrent conditional write in flight), server errors
+// and lost acknowledgements are uncertain; this layer never retries them.
 int s3_put_if_absent(void* impl, const char* key, const uint8_t* data,
                      uint64_t len) noexcept {
     assert(impl != nullptr && key != nullptr);
@@ -258,8 +259,12 @@ int s3_put_if_absent(void* impl, const char* key, const uint8_t* data,
     net::HttpResponse resp;
     const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "PUT", key, "",
                            data, len, true, &scratch, &resp);
-    if (rc != kOsOk) return rc;
+    // Admission/signing errors precede I/O. Once the HTTP exchange is
+    // attempted, a lost response cannot prove that the conditional PUT lost.
+    if (rc != kOsOk) return rc == kOsIoError ? kOsWriteUncertain : rc;
     if (resp.status == 412) return kOsExists;
+    // A concurrent conditional request or server error may race publication.
+    if (resp.status == 409 || resp.status >= 500) return kOsWriteUncertain;
     return resp.status / 100 == 2 ? kOsOk : kOsIoError;
 }
 

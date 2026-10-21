@@ -2159,6 +2159,13 @@ target_link_libraries(test_bolt_lakehouse_iceberg_write
 bolt_apply_hardening(test_bolt_lakehouse_iceberg_write)
 add_test(NAME test_bolt_lakehouse_iceberg_write COMMAND test_bolt_lakehouse_iceberg_write)
 
+add_executable(test_bolt_iceberg_uncertain_commit test_bolt_iceberg_uncertain_commit.cpp)
+target_link_libraries(test_bolt_iceberg_uncertain_commit
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_uncertain_commit)
+add_test(NAME test_bolt_iceberg_uncertain_commit COMMAND test_bolt_iceberg_uncertain_commit)
+set_tests_properties(test_bolt_iceberg_uncertain_commit PROPERTIES TIMEOUT 30)
+
 # G2ICE-84 — write a table for pyiceberg to read. This executable only WRITES
 # the fixture (and checks what it honestly can in-process); the value-level
 # verdict is scripts/iceberg_pyiceberg_interop.py, because bolt's own reader

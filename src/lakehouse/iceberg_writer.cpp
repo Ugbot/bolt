@@ -42,6 +42,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
+#include "bolt/crypto/sigv4.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
@@ -87,7 +88,9 @@ struct TableHandle {
     char           view_sql[kIcebergMaxSql];
     int64_t        view_version_id;
     CommitError    last_error;
-    uint8_t        _pad[2];
+    bool           write_uncertain;
+    uint8_t        _pad;
+    CommitCandidate candidate;
 };
 
 struct AppendHandle {
@@ -789,12 +792,14 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
 // table_create / table_open / table_close
 // ---------------------------------------------------------------------------
 
-bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
-                  const char* path, const Schema* schema,
-                  const PartitionSpec* spec, const SortOrder* sort,
-                  const WriteOptions* opts) noexcept {
+bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
+                     const char* path, const Schema* schema,
+                     const PartitionSpec* spec, const SortOrder* sort,
+                     const WriteOptions* opts, CommitCandidate* out_uncertain) noexcept {
     assert(out != nullptr && arena != nullptr && os != nullptr);
     assert(path != nullptr && schema != nullptr);
+    *out = nullptr;
+    if (out_uncertain != nullptr) *out_uncertain = CommitCandidate{};
     if (std::strlen(path) + 1u > kMaxPathLen) return false;
     TableHandle* h = arena->allocate_array<TableHandle>(1);
     if (h == nullptr) return false;
@@ -828,9 +833,21 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     if (opts != nullptr) {
         (void)opts;  // values applied at append-time
     }
-    if (!persist_metadata(h)) return false;
+    if (!persist_metadata(h)) {
+        if (h->write_uncertain && out_uncertain != nullptr) *out_uncertain = h->candidate;
+        return false;
+    }
     *out = h;
     return true;
+}
+
+bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
+                  const char* path, const Schema* schema,
+                  const PartitionSpec* spec, const SortOrder* sort,
+                  const WriteOptions* opts) noexcept {
+    assert(out != nullptr && arena != nullptr);
+    assert(os != nullptr && path != nullptr);
+    return table_create_ex(out, arena, os, path, schema, spec, sort, opts, nullptr);
 }
 
 bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
@@ -879,6 +896,13 @@ CommitError table_last_commit_error(const TableHandle* th) noexcept {
     return th->last_error;
 }
 
+bool table_uncertain_commit(const TableHandle* th, CommitCandidate* out) noexcept {
+    assert(th != nullptr);
+    assert(out != nullptr);
+    *out = th->write_uncertain ? th->candidate : CommitCandidate{};
+    return th->write_uncertain;
+}
+
 const Metadata* table_metadata(const TableHandle* th) noexcept {
     assert(th != nullptr);
     return &th->meta;
@@ -890,6 +914,7 @@ const Metadata* table_metadata(const TableHandle* th) noexcept {
 
 bool append_open(AppendHandle** out, TableHandle* th) noexcept {
     assert(out != nullptr && th != nullptr);
+    if (!write_ready(th)) return false;
     AppendHandle* a = th->arena->allocate_array<AppendHandle>(1);
     if (a == nullptr) return false;
     std::memset(a, 0, sizeof(*a));
@@ -900,6 +925,7 @@ bool append_open(AppendHandle** out, TableHandle* th) noexcept {
 
 bool append_write(AppendHandle* ah, const BoltBatch* batch) noexcept {
     assert(ah != nullptr && batch != nullptr);
+    if (!write_ready(ah->th)) return false;
     if (ah->n_pending >= kMaxPendingBatch) return false;
     ah->pending[ah->n_pending++] = batch;
     return true;
@@ -1072,6 +1098,7 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
                      char* rel_out, uint32_t rel_cap,
                      int64_t* out_size, int64_t* out_rows) noexcept {
     assert(th != nullptr && batches != nullptr);
+    if (!write_ready(th)) return false;
     if (n_batches == 0) return false;
     // data/<snap-id>-<unique>.parquet. The suffix used to be `snap_id & 0xFFFF`
     // — no entropy of its own, so a snapshot-id collision was also a data-file
@@ -1197,7 +1224,8 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     char mrel[128];
     std::snprintf(mrel, sizeof(mrel), "metadata/manifest-%lld.avro",
                   static_cast<long long>(snap_id));
-    if (!commit_object(th, mrel, manifest_body, manifest_len)) return false;
+    if (!commit_object(th, mrel, manifest_body, manifest_len,
+                       CommitObjectKind::kManifest, snap_id)) return false;
 
     // A snapshot's manifest list names EVERY manifest live at that snapshot,
     // not just the one the commit added. This wrote a one-entry list, so each
@@ -1321,8 +1349,8 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     // cannot leave a half-written snapshot in the metadata.
     char mlabs[kIcebergMaxManifestPath];
     if (!abs_location(th->root, mlrel, mlabs, sizeof(mlabs))) return false;
-    if (!commit_object(th, mlrel, mlb, mll)) {
-        (void)os_delete(th->os, mrel);
+    if (!commit_object(th, mlrel, mlb, mll, CommitObjectKind::kManifestList, snap_id)) {
+        if (!th->write_uncertain) (void)os_delete(th->os, mrel);
         return false;
     }
 
@@ -1354,14 +1382,16 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
     } else {
         th->last_error = CommitError::kFailed;
     }
-    // Not committed (typically a conflict): withdraw the snapshot from this
-    // handle and remove the objects only this commit referenced.
+    // Restore the handle's base view. An uncertain publication may already
+    // reference these objects: retain them and require reconciliation/reopen.
     th->meta.n_snapshot_log = n_log_saved;
     th->meta.n_snapshots = n_snap_saved;
     --th->meta.last_sequence_number;
     th->meta.current_snapshot_id = parent;
-    (void)os_delete(th->os, mlrel);
-    (void)os_delete(th->os, mrel);
+    if (!th->write_uncertain) {
+        (void)os_delete(th->os, mlrel);
+        (void)os_delete(th->os, mrel);
+    }
     return false;
 }
 
@@ -1370,6 +1400,7 @@ bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
 bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
                       int64_t* out_rows) noexcept {
     assert(ah != nullptr && ah->th != nullptr);
+    if (!write_ready(ah->th)) return false;
     ah->th->last_error = CommitError::kNone;
     if (ah->n_pending == 0) return true;
     // Don't write a data file for a commit that has already lost.
@@ -1400,8 +1431,8 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
         compute_file_stats(ah->pending, ah->n_pending, cur, &df.stats);
     }
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
-        // Never referenced by a committed snapshot: remove it.
-        (void)os_delete(ah->th->os, rel);
+        // Only a definitive refusal proves this file was not published.
+        if (!ah->th->write_uncertain) (void)os_delete(ah->th->os, rel);
         if (ah->th->last_error == CommitError::kNone)
             ah->th->last_error = CommitError::kFailed;
         return false;
@@ -1475,6 +1506,7 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     assert(th != nullptr);
     assert(dels != nullptr || n == 0);
     if (th == nullptr || th->arena == nullptr || th->os == nullptr) return false;
+    if (!write_ready(th)) return false;
     if (dels == nullptr || n == 0) return false;
 
     const int64_t snap_id = mint_snapshot_id(th);
@@ -1609,6 +1641,7 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
 // Nothing in `th` changes until commit_schema_evolution.
 bool begin_schema_evolution(TableHandle* th, Schema* next) noexcept {
     assert(th != nullptr && next != nullptr);
+    if (!write_ready(th)) return false;
     Metadata& m = th->meta;
     if (m.n_schemas == 0) return false;
     const Schema* cur = metadata_current_schema(&m);
@@ -1703,6 +1736,7 @@ bool table_rename_column(TableHandle* th, const char* from,
 bool table_update_partition_spec(TableHandle* th,
                                   const PartitionSpec* spec) noexcept {
     assert(th != nullptr && spec != nullptr);
+    if (!write_ready(th)) return false;
     if (th->meta.n_specs >= kIcebergMaxSpecs) return false;
     th->meta.specs[th->meta.n_specs] = *spec;
     th->meta.current_spec_id = spec->spec_id;
@@ -1712,6 +1746,7 @@ bool table_update_partition_spec(TableHandle* th,
 
 bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
     assert(th != nullptr && sort != nullptr);
+    if (!write_ready(th)) return false;
     if (th->meta.n_sort_orders >= kIcebergMaxSortOrders) return false;
     th->meta.sort_orders[th->meta.n_sort_orders] = *sort;
     th->meta.default_sort_order_id = sort->order_id;
@@ -1777,6 +1812,7 @@ bool table_remove_orphans(TableHandle* th, uint64_t /*older_than_ms*/,
                           bool dry_run, char (*out)[512], uint32_t cap,
                           uint32_t* n) noexcept {
     assert(th != nullptr && n != nullptr);
+    if (!dry_run && !write_ready(th)) return false;
     *n = 0;
     if (!dry_run) return true;
     // List the table data/ prefix, report all paths.
@@ -1802,6 +1838,7 @@ bool table_remove_orphans(TableHandle* th, uint64_t /*older_than_ms*/,
 bool table_create_branch(TableHandle* th, const char* name,
                          int64_t base_snapshot_id) noexcept {
     assert(th != nullptr && name != nullptr);
+    if (!write_ready(th)) return false;
     if (th->n_refs >= kIcebergMaxRefs) return false;
     NamedRef& r = th->refs[th->n_refs];
     std::memset(&r, 0, sizeof(r));
@@ -1815,6 +1852,7 @@ bool table_create_branch(TableHandle* th, const char* name,
 bool table_create_tag(TableHandle* th, const char* name,
                        int64_t snapshot_id) noexcept {
     assert(th != nullptr && name != nullptr);
+    if (!write_ready(th)) return false;
     if (th->n_refs >= kIcebergMaxRefs) return false;
     NamedRef& r = th->refs[th->n_refs];
     std::memset(&r, 0, sizeof(r));
@@ -1827,6 +1865,7 @@ bool table_create_tag(TableHandle* th, const char* name,
 
 bool table_drop_ref(TableHandle* th, const char* name) noexcept {
     assert(th != nullptr && name != nullptr);
+    if (!write_ready(th)) return false;
     uint32_t out = 0;
     bool dropped = false;
     for (uint32_t i = 0; i < th->n_refs; ++i) {
@@ -1865,6 +1904,7 @@ bool view_create(TableHandle** out, Arena* arena, ObjectStore* os,
 bool view_replace(TableHandle* th, const char* sql_dialect,
                   const char* sql) noexcept {
     assert(th != nullptr && sql_dialect != nullptr && sql != nullptr);
+    if (!write_ready(th)) return false;
     if (!th->is_view) return false;
     if (std::strlen(sql_dialect) + 1u > kIcebergMaxSqlDialect) return false;
     if (std::strlen(sql)         + 1u > kIcebergMaxSql)        return false;

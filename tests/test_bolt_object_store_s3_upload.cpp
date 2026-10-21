@@ -70,7 +70,8 @@ std::string request_header(const std::string& request, const char* name) {
 enum class UploadMode { Success, PartError, AbortError, MissingEtag, OversizeEtag,
     Error200, Truncated, Dropped, Conditional412, Conflict409, MalformedInit,
     WrongKey, MalformedComplete, ChunkedComplete, NumericId, InitOversize,
-    InitDuplicate, InitBadEntity, InitBadDeclaration };
+    InitDuplicate, InitBadEntity, InitBadDeclaration, SmallPutDropped, SmallPutTruncated,
+    SmallPutServerError };
 
 struct UploadStats { unsigned parts = 0; uint64_t bytes = 0; };
 
@@ -81,6 +82,8 @@ public:
     uint32_t part_bytes = kS3DefaultPartBytes;
     unsigned creates = 0, completes = 0, aborts = 0, puts = 0;
     unsigned conditional_completes = 0;
+    unsigned conditional_puts = 0;
+    std::string accepted_put_body;
     std::array<UploadStats, 8> uploads{};
     bool valid = true;
     uint16_t port = 0;
@@ -265,7 +268,18 @@ private:
             if (mode == UploadMode::InitBadDeclaration) result.replace(6, 7, "invalid");
             return respond(fd, 200, result);
         }
-        if (method == "PUT" && target == kUploadPath) { ++puts; return respond(fd, 200, ""); }
+        if (method == "PUT" && target == kUploadPath) {
+            ++puts;
+            if (request_header(head, "If-None-Match") == "*") ++conditional_puts;
+            if (mode == UploadMode::Conditional412) return respond(fd, 412, "");
+            if (mode == UploadMode::Conflict409) return respond(fd, 409, "");
+            if (mode == UploadMode::SmallPutServerError) return respond(fd, 503, "");
+            accepted_put_body = body;
+            if (mode == UploadMode::SmallPutDropped) return true;
+            if (mode == UploadMode::SmallPutTruncated)
+                return socket_send(fd, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nx");
+            return respond(fd, 200, "");
+        }
         if (upload == 0) return false;
         const std::string query = part == 0 ? "?uploadId=" : "?partNumber=" + std::to_string(part) + "&uploadId=";
         if (target != std::string(kUploadPath) + query + id(upload, true)) return false;
@@ -575,6 +589,48 @@ TEST(S3MultipartUpload, ExistingSmallAndEmptyPutsRetainSingleRequestShape) {
     EXPECT_TRUE(server.valid);
     EXPECT_EQ(server.puts, 2u);
     EXPECT_EQ(server.creates, 0u);
+}
+
+TEST(S3MultipartUpload, AcceptedSmallConditionalPutWithLostReplyIsUncertainWithoutRetry) {
+    for (UploadMode mode : {UploadMode::SmallPutDropped, UploadMode::SmallPutTruncated}) {
+        SCOPED_TRACE(static_cast<unsigned>(mode));
+        UploadServer server;
+        server.mode = mode;
+        ASSERT_TRUE(server.start());
+        S3ObjectStore config;
+        ObjectStore store;
+        ASSERT_TRUE(server.store(&config, &store));
+        constexpr char metadata[] = "{\"format-version\":2,\"current-snapshot-id\":17}";
+        EXPECT_EQ(os_put_if_absent(&store, kUploadKey,
+            reinterpret_cast<const uint8_t*>(metadata), sizeof(metadata) - 1u), kOsWriteUncertain);
+        server.stop();
+        EXPECT_TRUE(server.valid);
+        EXPECT_EQ(server.accepted_put_body, metadata);
+        EXPECT_EQ(server.puts, 1u);
+        EXPECT_EQ(server.conditional_puts, 1u);
+        EXPECT_EQ(server.creates, 0u);
+        EXPECT_EQ(server.aborts, 0u);
+    }
+}
+
+TEST(S3MultipartUpload, SmallConditionalPutDistinguishesDefinitive412FromAmbiguous409And503) {
+    for (UploadMode mode : {UploadMode::Conditional412, UploadMode::Conflict409,
+                             UploadMode::SmallPutServerError}) {
+        SCOPED_TRACE(static_cast<unsigned>(mode));
+        UploadServer server;
+        server.mode = mode;
+        ASSERT_TRUE(server.start());
+        S3ObjectStore config;
+        ObjectStore store;
+        ASSERT_TRUE(server.store(&config, &store));
+        const int expected = mode == UploadMode::Conditional412 ? kOsExists : kOsWriteUncertain;
+        EXPECT_EQ(os_put_if_absent(&store, kUploadKey, nullptr, 0), expected);
+        server.stop();
+        EXPECT_TRUE(server.valid);
+        EXPECT_EQ(server.puts, 1u);
+        EXPECT_EQ(server.conditional_puts, 1u);
+        EXPECT_EQ(server.creates, 0u);
+    }
 }
 
 TEST(S3MultipartUpload, ExplicitCleanupUsesTheRetainedOpaqueIdWithoutRetry) {

@@ -78,6 +78,9 @@ struct ObjectStoreVT {
     // by a PUT is not one, because two writers can both see "absent". A store
     // that cannot provide the guarantee leaves this null (os_put_if_absent
     // then reports kOsNotImplemented) — it must never be emulated.
+    // A lost/ambiguous acknowledgement is kOsWriteUncertain, not proof of
+    // failure: preserve any objects this candidate might reference and
+    // reconcile exact candidate content/identity before another attempt.
     int (*put_if_absent)(void* impl, const char* key,
                          const uint8_t* data, uint64_t len) noexcept;
 
