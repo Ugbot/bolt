@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -45,7 +46,8 @@ void shutdown_socket(TestSocket socket) {
 }
 bool send_bytes(TestSocket socket, const std::string& bytes) {
     size_t off = 0;
-    for (uint32_t part = 0; off < bytes.size() && part < 64; ++part) {
+    constexpr uint32_t kSendParts = kOsVersionedRangeMaxBytes / 65536u + 2u;
+    for (uint32_t part = 0; off < bytes.size() && part < kSendParts; ++part) {
 #ifdef MSG_NOSIGNAL
         constexpr int flags = MSG_NOSIGNAL;
 #else
@@ -68,7 +70,7 @@ std::string header(const std::string& request, const char* name) {
 }
 enum class Reply { Valid, MissingEtag, DuplicateEtag, WeakEtag, ChangedEtag, OversizeEtag,
     MissingRange, DuplicateRange, WrongRange, OverflowRange, WrongTotal, IgnoredRange,
-    Precondition, NotFound, Truncated, ShortBody, MissingLength, DuplicateLength, OverflowLength };
+    Precondition, PreconditionBody, NotFound, Truncated, ShortBody, MissingLength, DuplicateLength, OverflowLength };
 
 class VersionServer {
 public:
@@ -76,6 +78,7 @@ public:
     Reply reply = Reply::Valid;
     uint16_t port = 0;
     uint32_t requests = 0;
+    uint32_t extent = kExtent, offset = kOffset, length = kLength;
     std::string token = std::string(640, 't');
     ~VersionServer() { stop(); }
     bool start() {
@@ -127,7 +130,8 @@ private:
         char authority[64]{};
         std::snprintf(authority, sizeof(authority), "127.0.0.1:%u", port);
         if (header(request, "Host") != authority || header(request, "X-Amz-Security-Token") != token) return false;
-        if (!head && (header(request, "Range") != "bytes=17-47" || header(request, "If-Match") != kTag)) return false;
+        const std::string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1u);
+        if (!head && (header(request, "Range") != range || header(request, "If-Match") != kTag)) return false;
         const std::string date = header(request, "X-Amz-Date");
         char empty[65]{}; bolt::crypto::sha256_empty_hex(empty);
         bolt::crypto::SigV4Request sign{};
@@ -142,6 +146,7 @@ private:
     }
     std::string response() {
         if (reply == Reply::Precondition) return "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n";
+        if (reply == Reply::PreconditionBody) return "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 500\r\n\r\n" + std::string(500, 'e');
         if (reply == Reply::NotFound) return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         std::string out = head || reply == Reply::IgnoredRange ? "HTTP/1.1 200 OK\r\n" : "HTTP/1.1 206 Partial Content\r\n";
         if (reply != Reply::MissingEtag) {
@@ -153,11 +158,12 @@ private:
         if (!head && reply != Reply::MissingRange && reply != Reply::IgnoredRange) {
             const std::string range = reply == Reply::WrongRange ? "bytes 18-48/257" :
                 reply == Reply::OverflowRange ? "bytes 17-18446744073709551616/257" :
-                reply == Reply::WrongTotal ? "bytes 17-47/258" : "bytes 17-47/257";
+                reply == Reply::WrongTotal ? "bytes 17-47/258" : "bytes " + std::to_string(offset) + "-" +
+                    std::to_string(offset + length - 1u) + "/" + std::to_string(extent);
             out += "Content-Range: " + range + "\r\n";
             if (reply == Reply::DuplicateRange) out += "Content-Range: " + range + "\r\n";
         }
-        uint32_t size = head || reply == Reply::IgnoredRange ? kExtent : kLength;
+        uint32_t size = head || reply == Reply::IgnoredRange ? extent : length;
         if (reply == Reply::ShortBody) --size;
         if (reply != Reply::MissingLength) out += "Content-Length: " +
             (reply == Reply::OverflowLength ? std::string("18446744073709551616") : std::to_string(size)) + "\r\n";
@@ -165,7 +171,7 @@ private:
         out += "Connection: close\r\n\r\n";
         if (!head) {
             if (reply == Reply::Truncated) --size;
-            for (uint32_t i = 0; i < size; ++i) out += static_cast<char>(value((reply == Reply::IgnoredRange ? 0 : kOffset) + i));
+            for (uint32_t i = 0; i < size; ++i) out += static_cast<char>(value((reply == Reply::IgnoredRange ? 0 : offset) + i));
         }
         return out;
     }
@@ -174,10 +180,12 @@ private:
         if (client == kInvalidSocket) return;
 #ifdef _WIN32
         const DWORD timeout = 3000;
-        valid = ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+        valid = ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0 &&
+            ::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
 #else
         const timeval timeout{3, 0};
-        valid = ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0;
+        valid = ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+            ::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
 #endif
         std::string request;
         for (uint32_t attempt = 0; valid && attempt < 16384 && request.size() < 16384; ++attempt) {
@@ -251,10 +259,30 @@ TEST(S3VersionedRange, MalformedIgnoredShortAndTruncatedResponsesNeverPublishByt
     }
 }
 TEST(S3VersionedRange, PreconditionAndChangedEtagAreExplicitWithoutRetry) {
-    for (const Reply reply : {Reply::Precondition, Reply::ChangedEtag, Reply::NotFound}) {
+    for (const Reply reply : {Reply::Precondition, Reply::PreconditionBody, Reply::ChangedEtag, Reply::NotFound}) {
         std::array<uint8_t, kLength> bytes{}; uint32_t got = 999;
         EXPECT_EQ(range_request(reply, &bytes, &got), reply == Reply::NotFound ? kOsNotFound : kOsPreconditionFailed);
         EXPECT_EQ(got, 0u);
+    }
+}
+TEST(S3VersionedRange, RawTransportPreservesOneFourAndEightMiBRequests) {
+    for (const uint32_t length : {1u << 20, 4u << 20, 8u << 20}) {
+        SCOPED_TRACE(length);
+        VersionServer server; server.length = length; server.extent = kOffset + length;
+        ASSERT_TRUE(server.start());
+        S3ObjectStore s3{}; ObjectStore store{}; ASSERT_TRUE(server.store(&s3, &store));
+        bolt::Arena scratch{{length, length, 64, false}}; scratch.set_growth_enabled(false);
+        ObjectVersion expected{}; expected.size = server.extent; std::strcpy(expected.etag, kTag);
+        std::vector<uint8_t> output(length, 0xa5); uint32_t got = 0;
+        const int rc = os_get_range_if_match(&store, "key name.bin", &expected, kOffset, length,
+                                            &scratch, output.data(), &got);
+        server.stop();
+        ASSERT_EQ(rc, kOsOk); ASSERT_EQ(got, length);
+        EXPECT_TRUE(server.valid); EXPECT_EQ(server.requests, 1u);
+        EXPECT_EQ(scratch.total_reserved(), length); EXPECT_FALSE(scratch.growth_enabled());
+        uint32_t matched = 0;
+        while (matched < length && output[matched] == value(kOffset + matched)) ++matched;
+        ASSERT_EQ(matched, length) << "first differing byte " << matched;
     }
 }
 TEST(S3VersionedRange, AdmissionRejectsInvalidPinnedDescriptorAndRangeWithoutConnecting) {
@@ -267,7 +295,7 @@ TEST(S3VersionedRange, AdmissionRejectsInvalidPinnedDescriptorAndRangeWithoutCon
     EXPECT_EQ(got, 0u);
     std::strcpy(version.etag, kTag);
     EXPECT_EQ(os_get_range_if_match(&store, "key", &version, UINT64_MAX, 1, &scratch, &byte, &got), kOsBadArg);
-    EXPECT_EQ(os_get_range_if_match(&store, "key", &version, 0, kObjectRangePageBytes + 1u, &scratch, &byte, &got), kOsBadArg);
+    EXPECT_EQ(os_get_range_if_match(&store, "key", &version, 0, kOsVersionedRangeMaxBytes + 1u, &scratch, &byte, &got), kOsBadArg);
 }
 }  // namespace
 

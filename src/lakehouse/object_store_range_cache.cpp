@@ -210,7 +210,7 @@ int read_impl(ObjectRangeCache* c, const char* key, const ObjectVersion* expecte
     confined(c);
     assert(out != nullptr && (dst != nullptr || length == 0));
     detail::ObjectSpan inputs[2]{{}, {expected, expected == nullptr ? 0u : sizeof(*expected)}};
-    const uint64_t limit = conditional ? kOsVersionedRangeMaxBytes : kObjectRangeMaxReadBytes;
+    const uint64_t limit = conditional ? kObjectRangePageBytes : kObjectRangeMaxReadBytes;
     const detail::ObjectSpan outputs[]{{dst, length > limit ? 0u : static_cast<size_t>(length)}, {out, sizeof(*out)}};
     if (length > SIZE_MAX || !detail::object_key_span(key, kOsMaxKey, &inputs[0]) ||
         !admit(c, inputs, 2, outputs, 2)) return kOsBadArg;
@@ -219,7 +219,7 @@ int read_impl(ObjectRangeCache* c, const char* key, const ObjectVersion* expecte
     ObjectVersion stable_expected{};
     if (expected != nullptr) stable_expected = *expected;
     *out = 0;
-    if (conditional && (expected == nullptr || length > kOsVersionedRangeMaxBytes)) return kOsBadArg;
+    if (conditional && (expected == nullptr || length > kObjectRangePageBytes)) return kOsBadArg;
     uint64_t got = 0;
     const int rc = read_admitted(c, stable_key, expected == nullptr ? nullptr : &stable_expected,
                                  offset, length, dst, &got, legacy_eof);

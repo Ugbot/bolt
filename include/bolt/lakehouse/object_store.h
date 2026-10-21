@@ -98,7 +98,7 @@ struct ObjectStoreVT {
     // Caller supplies exclusive resettable body workspace; result owns no spans.
     int (*head_versioned)(void* impl, const char* key, Arena* scratch,
                           ObjectVersion* out) noexcept = nullptr;
-    // Exact206/If-Match range, <=1 MiB and wholly within expected extent.
+    // Exact206/If-Match range, <=8 MiB and wholly within expected extent.
     // Success copies exactly length; admitted failure publishes zero length.
     // Invalid aliases return BadArg without changing output. Key/descriptor/output
     // must be disjoint from scratch backing and mutable output spans.

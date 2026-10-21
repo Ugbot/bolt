@@ -21,6 +21,8 @@ struct ObjectRangeCacheStats {
 // freezes it. Only this module resets it; input/output spans must not alias it.
 // origin and its immutable implementation/config must outlive this instance.
 // All calls, including adapter VT operations, occur on the init thread.
+// The adapter's conditional range operation admits <=1 MiB per call, even
+// when the raw origin transport supports larger ranges. Logical reads use pages.
 // No retries. Maintained HTTP retains its separately bounded wire allocation.
 int object_range_cache_init(ObjectRangeCache** out, ObjectStore* origin,
                             Arena* backing, Arena* io, uint32_t pages,

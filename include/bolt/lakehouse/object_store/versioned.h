@@ -6,7 +6,7 @@
 
 namespace bolt::lakehouse {
 inline constexpr uint32_t kOsStrongEtagCap = 256u;
-inline constexpr uint32_t kOsVersionedRangeMaxBytes = 1u << 20;
+inline constexpr uint32_t kOsVersionedRangeMaxBytes = 8u << 20;
 struct ObjectVersion {
     uint64_t size;
     char etag[kOsStrongEtagCap]; // exact strong quoted validator, including quotes

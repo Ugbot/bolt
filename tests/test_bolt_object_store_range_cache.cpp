@@ -372,9 +372,11 @@ TEST_F(ObjectRangeCacheTest, OverflowingAddressesRefuseWithoutDereferenceOrOutpu
     EXPECT_EQ(got, 81u); EXPECT_EQ(origin.heads, 0u); EXPECT_EQ(stats().reads, 0u);
 }
 TEST_F(ObjectRangeCacheTest, ConditionalAdapterRetainsOneMiBAndDescriptorAdmission) {
+    EXPECT_EQ(kOsVersionedRangeMaxBytes, 8u * kPage);
     uint8_t byte = 0; uint32_t got = 81;
+    std::vector<uint8_t> oversized(kPage + 1u);
     ObjectVersion expected{}; expected.size = origin.bytes[0].size(); std::strcpy(expected.etag, "\"opaque-2\"");
-    EXPECT_EQ(os_get_range_if_match(&adapter, "a", &expected, 0, kPage + 1u, &io, &byte, &got), kOsBadArg);
+    EXPECT_EQ(os_get_range_if_match(&adapter, "a", &expected, 0, kPage + 1u, &io, oversized.data(), &got), kOsBadArg);
     EXPECT_EQ(got, 0u); EXPECT_EQ(origin.heads, 0u);
     EXPECT_EQ(adapter.vt->get_range_if_match(adapter.impl, "a", nullptr, 0, 1, &io, &byte, &got), kOsBadArg);
     EXPECT_EQ(got, 0u); EXPECT_EQ(origin.ranges, 0u);

@@ -161,6 +161,8 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
     return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
 }
 
+constexpr uint32_t kVersionedControlBytes = 64u << 10;
+
 bool header_name_equal(const char* a, const char* b) noexcept {
     assert(a != nullptr && b != nullptr);
     for (uint32_t i = 0; i < 64; ++i) {
@@ -237,7 +239,7 @@ int s3_head_versioned(void* impl, const char* key, Arena* scratch, ObjectVersion
     *out = {};
     net::HttpResponse response{};
     const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "HEAD", key, "", nullptr, 0,
-                          false, scratch, &response, nullptr, 0, kOsVersionedRangeMaxBytes);
+                          false, scratch, &response, nullptr, 0, kVersionedControlBytes);
     if (rc != kOsOk) return rc;
     if (response.status == 404) return kOsNotFound;
     if (response.status != 200 || !response_version(response, out)) return kOsIoError;
@@ -263,8 +265,9 @@ int s3_get_range_if_match(void* impl, const char* key, const ObjectVersion* expe
         static_cast<unsigned long long>(offset), static_cast<unsigned long long>(offset + length - 1u));
     if (n <= 0 || static_cast<size_t>(n) >= sizeof(range)) return kOsBadArg;
     net::HttpResponse response{};
+    const uint32_t response_budget = length > kVersionedControlBytes ? length : kVersionedControlBytes;
     const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "GET", key, "", nullptr, 0,
-        false, scratch, &response, range, 0, kOsVersionedRangeMaxBytes, expected->etag);
+        false, scratch, &response, range, 0, response_budget, expected->etag);
     if (rc != kOsOk) return rc;
     if (response.status == 412) return kOsPreconditionFailed;
     if (response.status == 404) return kOsNotFound;
