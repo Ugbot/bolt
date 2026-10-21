@@ -224,6 +224,7 @@ struct PqColumn {
     int32_t  converted;               // ConvertedType, -1 = none
     int32_t  scale;                   // DECIMAL scale (converted/logical)
     int32_t  precision;               // DECIMAL precision
+    int32_t  field_id;                // SchemaElement field 9; signed, 0 if absent
     // Logical-type refinement (G2FEAT-46). `logical` is a PqLogical value;
     // the rest qualify it: `time_unit` for Timestamp/Time (0 none / 1 millis
     // / 2 micros / 3 nanos), `int_bits`/`int_signed` for the Int logical
@@ -234,6 +235,7 @@ struct PqColumn {
     uint8_t  int_bits;                // Int logical bit width (0 = n/a)
     uint8_t  int_signed;              // Int logical signedness (1 = signed)
     uint8_t  ts_utc;                  // Timestamp/Time isAdjustedToUTC
+    uint8_t  has_field_id;            // presence is distinct from signed ID 0
     // Dremel levels for this LEAF, computed by walking the schema tree.
     // A flat OPTIONAL column is max_def 1 / max_rep 0; a field inside an
     // optional struct is max_def 2 / max_rep 0. max_rep > 0 means the leaf is

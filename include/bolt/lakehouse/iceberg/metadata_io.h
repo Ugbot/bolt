@@ -60,4 +60,18 @@ MetadataLoadStatus metadata_load_exact(ObjectStore* store,
     const MetadataObjectIdentity* identity, const MetadataLoadLimits* limits,
     Arena* metadata_arena, Arena* io_arena, Metadata* out,
     MetadataLoadResult* result) noexcept;
+
+// Validate an exact locally retained copy through the SAME URI, original JSON
+// identity, parser and complete digest contract. No store access or discovery.
+// The caller establishes that these bytes belong to the supplied version (for
+// example, a durable binding with a full SHA); this function does not verify an
+// ETag against an origin. It copies the bytes into the exclusively owned frozen
+// metadata arena. Extent must equal identity.version.size and fit max_bytes.
+// Inputs, arena object/backing and both writable outputs must be disjoint;
+// inputs may alias each other. Failure leaves both outputs unchanged, while
+// admitted scratch allocations may remain consumed. Parser allocation refusal
+// can still be DecodeFailed, as for metadata_load_exact.
+MetadataLoadStatus metadata_validate_exact(const MetadataObjectIdentity* identity,
+    const MetadataLoadLimits* limits, const uint8_t* bytes, uint64_t length,
+    Arena* metadata_arena, Metadata* out, MetadataLoadResult* result) noexcept;
 } // namespace bolt::lakehouse::iceberg

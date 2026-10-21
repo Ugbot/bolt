@@ -125,6 +125,48 @@ TEST(IcebergMetadata, ParseV2) {
     EXPECT_EQ(s.snapshot_id, 100);
 }
 
+TEST(IcebergSnapshot, ExactSelectionPreservesAllSignedIds) {
+    Snapshot snapshots[4]{};
+    const int64_t ids[]{INT64_MIN, -1, 0, INT64_MAX};
+    for (uint32_t i = 0; i < 4; ++i) snapshots[i].snapshot_id = ids[i];
+    Metadata metadata{};
+    metadata.snapshots = snapshots;
+    metadata.n_snapshots = metadata.cap_snapshots = 4;
+    metadata.current_snapshot_id = INT64_MAX;
+    metadata.current_snapshot_present = true;
+    Snapshot selected{};
+    for (const auto id : ids) {
+        ASSERT_TRUE(snapshot_resolve_selected(&metadata, id, -1,
+                                              SnapshotSelection::Exact, &selected));
+        EXPECT_EQ(selected.snapshot_id, id);
+    }
+    ASSERT_TRUE(snapshot_resolve_selected(&metadata, -1, -1,
+                                          SnapshotSelection::Legacy, &selected));
+    EXPECT_EQ(selected.snapshot_id, INT64_MAX);
+}
+
+TEST(IcebergSnapshot, InvalidSelectionPreservesOutput) {
+    Snapshot snapshot{};
+    snapshot.snapshot_id = -1;
+    Metadata metadata{};
+    metadata.snapshots = &snapshot;
+    metadata.n_snapshots = metadata.cap_snapshots = 1;
+    Snapshot selected{};
+    selected.snapshot_id = 987;
+    EXPECT_FALSE(snapshot_resolve_selected(&metadata, -2, -1,
+                                           SnapshotSelection::Exact, &selected));
+    EXPECT_FALSE(snapshot_resolve_selected(&metadata, -1, 0,
+                                           SnapshotSelection::Exact, &selected));
+    EXPECT_FALSE(snapshot_resolve_selected(&metadata, 0, -1,
+                                           SnapshotSelection::Empty, &selected));
+    EXPECT_FALSE(snapshot_resolve_selected(&metadata, -1, -1,
+                                           static_cast<SnapshotSelection>(255), &selected));
+    EXPECT_EQ(selected.snapshot_id, 987);
+    ReadOptions options{};
+    read_options_init(&options);
+    EXPECT_EQ(options.snapshot_selection, SnapshotSelection::Legacy);
+}
+
 TEST(IcebergManifest, ParseListAndManifestJson) {
     bolt::Arena arena;
     const char* mlist = R"([
@@ -173,6 +215,31 @@ TEST(IcebergManifest, ParseListAndManifestJson) {
     EXPECT_TRUE(files[0].partition[0].is_int);
     EXPECT_EQ(files[0].partition[0].i64, 3);
     EXPECT_GE(files[0].stats.n_cols, 1u);
+}
+
+TEST(IcebergManifest, JsonFileContentMatchesSpecAndOwnedEnum) {
+    for (const int content : {0,1,2,3,-1}) {
+        bolt::Arena arena;
+        const std::string json="[{\"status\":1,\"snapshot_id\":1,\"data_file\":{\"content\":"+
+            std::to_string(content)+",\"file_path\":\"data.parquet\",\"record_count\":1}}]";
+        DataFileRef file{}; uint32_t count=0;
+        const bool ok=manifest_parse_json(reinterpret_cast<const uint8_t*>(json.data()),
+            static_cast<uint32_t>(json.size()),&arena,0,&file,1,&count);
+        if (content<0 || content>2) { EXPECT_FALSE(ok); continue; }
+        ASSERT_TRUE(ok); ASSERT_EQ(count,1u);
+        EXPECT_EQ(file.content,static_cast<FileContent>(content));
+    }
+}
+
+TEST(IcebergManifest, JsonFileContentNeverTruncatesOrUsesLastDuplicate) {
+    for (const char* value : {"0.5","null","\"1\"","9223372036854775808","1,\"content\":0"}) {
+        bolt::Arena arena;
+        const std::string json=std::string("[{\"status\":1,\"data_file\":{\"content\":")+value+
+            ",\"file_path\":\"data.parquet\"}}]";
+        DataFileRef file{}; uint32_t count=0;
+        EXPECT_FALSE(manifest_parse_json(reinterpret_cast<const uint8_t*>(json.data()),
+            static_cast<uint32_t>(json.size()),&arena,0,&file,1,&count));
+    }
 }
 
 TEST(IcebergScan, EmptyTableNoSnapshot) {

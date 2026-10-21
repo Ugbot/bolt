@@ -157,7 +157,8 @@ Status projection_extents(const ParquetByteSource& source, const ParquetSourceWo
 }
 }  // namespace
 
-ParquetSourceStatus parquet_read_meta_source(const ParquetByteSource* source,
+template<bool FlatStrict>
+static ParquetSourceStatus read_meta_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* w, Arena* arena, PqMeta* out) noexcept {
     assert(source != nullptr && w != nullptr);
     assert(arena != nullptr && out != nullptr);
@@ -184,9 +185,24 @@ ParquetSourceStatus parquet_read_meta_source(const ParquetByteSource* source,
     *staged = PqMeta{};
     status = parquet_read_meta_slice(w->bytes, length, arena, staged);
     if (status != Status::Ok) return status;
+    if constexpr (FlatStrict) {
+        const auto parsed=pq_parse_file_meta_strict(w->bytes,length,staged,kPqMaxRowGroups);
+        if (parsed==PqMetaParseStatus::Capacity) return Status::Capacity;
+        if (parsed!=PqMetaParseStatus::Ok) return Status::DecodeFailed;
+    }
     if (!metadata_extents(*staged, footer)) return Status::DecodeFailed;
     *out = *staged;
     return Status::Ok;
+}
+
+ParquetSourceStatus parquet_read_meta_source(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace, Arena* metadata, PqMeta* out) noexcept {
+    return read_meta_source<false>(source,workspace,metadata,out);
+}
+
+ParquetSourceStatus parquet_read_meta_source_flat_strict(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace, Arena* metadata, PqMeta* out) noexcept {
+    return read_meta_source<true>(source,workspace,metadata,out);
 }
 
 ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* source,

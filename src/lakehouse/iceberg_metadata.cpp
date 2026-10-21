@@ -89,12 +89,8 @@ bool read_int64(bj::Iterator* it, int64_t* out) noexcept {
     skip_value(it); return false;
 }
 
-bool read_current_snapshot(const bj::StructuralIndex* idx,bj::Iterator* it,Metadata* out) noexcept {
+bool read_exact_integer(const bj::StructuralIndex* idx,bj::Iterator* it,int64_t* out) noexcept {
     assert(idx && it && out); assert(it->cursor>=0 && it->cursor<idx->token_count);
-    if(bj::iter_peek(it)==bj::TokenType::Null) {
-        out->current_snapshot_id=-1; out->current_snapshot_present=false;
-        return bj::iter_advance(it);
-    }
     if(bj::iter_peek(it)!=bj::TokenType::Int64) return false;
     const auto& token=idx->tokens[it->cursor];
     if(token.start<0 || token.length<=0 || token.length>idx->src_len || token.start>idx->src_len-token.length) return false;
@@ -102,8 +98,19 @@ bool read_current_snapshot(const bj::StructuralIndex* idx,bj::Iterator* it,Metad
     const auto* end=begin+token.length; int64_t value=0;
     const auto decoded=std::from_chars(begin,end,value);
     if(decoded.ec!=std::errc{} || decoded.ptr!=end) return false;
-    out->current_snapshot_id=value; out->current_snapshot_present=true;
+    *out=value;
     return bj::iter_advance(it);
+}
+
+bool read_current_snapshot(const bj::StructuralIndex* idx,bj::Iterator* it,Metadata* out) noexcept {
+    assert(idx && it && out); assert(it->cursor>=0 && it->cursor<idx->token_count);
+    if(bj::iter_peek(it)==bj::TokenType::Null) {
+        out->current_snapshot_id=-1; out->current_snapshot_present=false;
+        return bj::iter_advance(it);
+    }
+    if (!read_exact_integer(idx,it,&out->current_snapshot_id)) return false;
+    out->current_snapshot_present=true;
+    return true;
 }
 
 bool read_str(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -118,21 +125,44 @@ bool read_str(const bj::StructuralIndex* idx, bj::Iterator* it,
     return true;
 }
 
+void parse_snapshot_summary(const bj::StructuralIndex* idx, bj::Iterator* it,
+    Snapshot* out) noexcept {
+    assert(idx!=nullptr && it!=nullptr); assert(out!=nullptr);
+    if (bj::iter_peek(it)!=bj::TokenType::BeginObject) { skip_value(it); return; }
+    bj::iter_advance(it);
+    uint32_t guard=0;
+    while (bj::iter_peek(it)==bj::TokenType::Key && guard++<kIterGuard) {
+        const int32_t key=it->cursor;
+        bj::iter_advance(it);
+        if (!tok_eq(idx,key,"operation")) { skip_value(it); continue; }
+        char op[32]; read_str(idx,it,op,sizeof(op));
+        if (std::strcmp(op,"append")==0) out->op=SnapshotOp::kAppend;
+        else if (std::strcmp(op,"replace")==0) out->op=SnapshotOp::kReplace;
+        else if (std::strcmp(op,"overwrite")==0) out->op=SnapshotOp::kOverwrite;
+        else if (std::strcmp(op,"delete")==0) out->op=SnapshotOp::kDelete;
+    }
+    if (bj::iter_peek(it)==bj::TokenType::EndObject) bj::iter_advance(it);
+}
+
 bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
                     Snapshot* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
+    assert(it->idx==idx);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
     out->parent_snapshot_id = -1;
     out->sequence_number = 0;
     out->op = SnapshotOp::kUnknown;
     out->schema_id = 0;   // spec default when a snapshot omits it
+    out->schema_id_present = 0;
+    bool id_present=false;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(idx, key, "snapshot-id")) {
-            read_int64(it, &out->snapshot_id);
+            if (id_present || !read_exact_integer(idx,it,&out->snapshot_id)) return false;
+            id_present=true;
         } else if (tok_eq(idx, key, "parent-snapshot-id")) {
             if (bj::iter_peek(it) == bj::TokenType::Null) {
                 bj::iter_advance(it); out->parent_snapshot_id = -1;
@@ -147,8 +177,11 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
             // Read back so an open->modify->persist cycle preserves the schema
             // each historical snapshot was committed under, instead of
             // rewriting them all as the current one (G2ICE-50).
-            int64_t v = 0; read_int64(it, &v);
+            int64_t v = 0;
+            if (out->schema_id_present || !read_exact_integer(idx,it,&v) || v<0 || v>INT32_MAX)
+                return false;
             out->schema_id = static_cast<int32_t>(v);
+            out->schema_id_present = 1;
         } else if (tok_eq(idx, key, "manifest-list")) {
             if (bj::iter_peek(it) == bj::TokenType::String &&
                 idx->tokens[it->cursor].length >=
@@ -156,53 +189,31 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
                 return false;   // a cut path names a different object
             read_str(idx, it, out->manifest_list, kIcebergMaxManifestPath);
         } else if (tok_eq(idx, key, "summary")) {
-            if (bj::iter_peek(it) == bj::TokenType::BeginObject) {
-                bj::iter_advance(it);
-                uint32_t g2 = 0;
-                while (bj::iter_peek(it) == bj::TokenType::Key &&
-                       g2++ < kIterGuard) {
-                    const int32_t sk = it->cursor;
-                    bj::iter_advance(it);
-                    if (tok_eq(idx, sk, "operation")) {
-                        char op[32];
-                        read_str(idx, it, op, sizeof(op));
-                        if (std::strcmp(op, "append") == 0)
-                            out->op = SnapshotOp::kAppend;
-                        else if (std::strcmp(op, "replace") == 0)
-                            out->op = SnapshotOp::kReplace;
-                        else if (std::strcmp(op, "overwrite") == 0)
-                            out->op = SnapshotOp::kOverwrite;
-                        else if (std::strcmp(op, "delete") == 0)
-                            out->op = SnapshotOp::kDelete;
-                    } else {
-                        skip_value(it);
-                    }
-                }
-                if (bj::iter_peek(it) == bj::TokenType::EndObject)
-                    bj::iter_advance(it);
-            } else {
-                skip_value(it);
-            }
+            parse_snapshot_summary(idx,it,out);
         } else {
             skip_value(it);
         }
     }
     if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    return true;
+    return id_present;
 }
 
 bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
                  SchemaField* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
+    assert(it->idx==idx);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
     std::memset(out, 0, sizeof(*out));
+    bool id_present=false;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(idx, key, "id")) {
-            int64_t v = 0; read_int64(it, &v); out->id = static_cast<int32_t>(v);
+            int64_t v = 0;
+            if (id_present || !read_exact_integer(idx,it,&v) || v<=0 || v>INT32_MAX) return false;
+            out->id = static_cast<int32_t>(v); id_present=true;
         } else if (tok_eq(idx, key, "name")) {
             // A cut name can collide with a sibling: refuse the schema.
             if (bj::iter_peek(it) == bj::TokenType::String &&
@@ -229,7 +240,7 @@ bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
         }
     }
     if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    return true;
+    return id_present;
 }
 
 bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -239,13 +250,16 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
     std::memset(out, 0, sizeof(*out));
+    bool id_present=false;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(idx, key, "schema-id")) {
-            int64_t v = 0; read_int64(it, &v);
+            int64_t v = 0;
+            if (id_present || !read_exact_integer(idx,it,&v) || v<0 || v>INT32_MAX) return false;
             out->schema_id = static_cast<int32_t>(v);
+            id_present=true;
         } else if (tok_eq(idx, key, "fields")) {
             if (bj::iter_peek(it) != bj::TokenType::BeginArray) {
                 skip_value(it); continue;
@@ -500,7 +514,9 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
             if(saw_current_snapshot || !read_current_snapshot(&idx,&it,out)) return false;
             saw_current_snapshot=true;
         } else if (tok_eq(&idx, key, "current-schema-id")) {
-            int64_t v = 0; read_int64(&it, &v);
+            int64_t v = 0;
+            if (out->current_schema_id>=0 || !read_exact_integer(&idx,&it,&v) || v<0 || v>INT32_MAX)
+                return false;
             out->current_schema_id = static_cast<int32_t>(v);
         } else if (tok_eq(&idx, key, "default-spec-id")) {
             int64_t v = 0; read_int64(&it, &v);

@@ -39,6 +39,13 @@ struct ParquetSourceWorkspace {
 ParquetSourceStatus parquet_read_meta_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* workspace, Arena* metadata_arena, PqMeta* out) noexcept;
 
+// Same pinned transport, staging, capacity and output contract. Additionally
+// requires the maintained exact flat footer/schema decoder before publication;
+// nested/repeated shapes and ambiguous logical metadata are refused. No extra
+// origin requests; validation consumes the already fetched exact footer bytes.
+ParquetSourceStatus parquet_read_meta_source_flat_strict(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace, Arena* metadata_arena, PqMeta* out) noexcept;
+
 // Flat-column projection (caller-deduplicated indices), with the same supported types/encodings as the
 // contiguous row-group decoder. Fetches each selected compressed chunk once,
 // in bounded requests; metadata and output live outside the reused workspace.

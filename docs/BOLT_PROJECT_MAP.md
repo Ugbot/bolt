@@ -1,5 +1,16 @@
 # Bolt Project Map
 
+`lakehouse/iceberg/pinned_read.h` opens exact retained metadata over a bounded
+caller-admitted `object_store/pinned.h` directory. Manifest/list/data/delete
+reads use only copied strong versions; `object_store/s3_uri.h` maps original
+absolute URIs once against the store namespace. Signed snapshot selection is
+separate from legacy latest sentinels. Flat data and position deletes bind by
+retained Parquet field IDs; `parquet_read_meta_source_flat_strict` validates the
+exact fetched footer without extra transport calls. Full graph admission and
+durable publication remain caller responsibilities. Unsupported types/options
+are enumerated in the pinned-read public header; this is not a complete mounted
+Iceberg service or read/write cache.
+
 `lakehouse/iceberg/metadata_io.h` loads one caller-selected immutable metadata
 object through strong conditional ranges, distinct finite retained/scratch
 arenas, exact table identity and complete SHA-256. It performs no discovery or

@@ -5,6 +5,7 @@
 #include "bolt/lakehouse/iceberg/manifest.h"
 
 #include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -279,6 +280,21 @@ void read_eq_ids(const bj::StructuralIndex* /*idx*/, bj::Iterator* it,
     }
 }
 
+bool read_file_content(const bj::StructuralIndex* idx, bj::Iterator* it,
+    FileContent* out) noexcept {
+    assert(idx!=nullptr && it!=nullptr && out!=nullptr); assert(it->idx==idx);
+    if (bj::iter_peek(it)!=bj::TokenType::Int64) return false;
+    const auto& token=idx->tokens[it->cursor];
+    if (token.start<0 || token.length<=0 || token.length>idx->src_len ||
+        token.start>idx->src_len-token.length) return false;
+    const auto* first=reinterpret_cast<const char*>(idx->src+token.start);
+    int64_t value=0;
+    const auto decoded=std::from_chars(first,first+token.length,value);
+    if (decoded.ec!=std::errc{} || decoded.ptr!=first+token.length || value<0 || value>2) return false;
+    *out=static_cast<FileContent>(value);
+    return bj::iter_advance(it);
+}
+
 bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
                      DataFileRef* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
@@ -286,18 +302,14 @@ bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
         skip_value(it); return true;
     }
     bj::iter_advance(it);
+    bool content_seen=false;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(idx, key, "content")) {
-            int64_t v = 0; read_int64(it, &v);
-            switch (v) {
-                case 0: out->content = FileContent::kData; break;
-                case 1: out->content = FileContent::kEqualityDeletes; break;
-                case 2: out->content = FileContent::kPositionDeletes; break;
-                default: out->content = FileContent::kData; break;
-            }
+            if (content_seen || !read_file_content(idx,it,&out->content)) return false;
+            content_seen=true;
         } else if (tok_eq(idx, key, "file_path") ||
                    tok_eq(idx, key, "file-path")) {
             // A cut path names a different (or no) file.

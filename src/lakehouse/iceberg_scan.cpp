@@ -39,6 +39,8 @@
 // Tiger Style: bounded, noexcept, fixed-size scratch.
 
 #include "bolt/lakehouse/iceberg/scan.h"
+#include "bolt/lakehouse/iceberg/pinned_read.h"
+#include "bolt/lakehouse/object_store/s3_uri.h"
 
 #include <cassert>
 #include <cstdio>
@@ -331,7 +333,14 @@ struct TableHandle {
     ObjectStore           os;
     Metadata              meta;
     bool                  meta_loaded;
-    uint8_t               _pad[7];
+    bool                  strict_pinned;
+    SnapshotSelection     selection;
+    int64_t               selected_snapshot;
+    uint32_t              parquet_metadata_bytes;
+    uint32_t              manifest_bytes;
+    uint32_t              request_bytes;
+    Arena*                retained_arena;
+    PinnedObjectStore*    pinned_source;
 };
 
 // One live data file that passed pruning. The path lives in the manifest
@@ -395,10 +404,13 @@ struct ScanHandle {
     bool failed;
     bool owns_transport;
     uint16_t source_indices[kMaxColumns];
+    const Schema* selected_schema;
+    uint32_t output_columns;
 };
 
 namespace {
 
+#include "iceberg_pinned_read.inc"
 #include "iceberg_scan_source.inc"
 
 bool load_latest_metadata(TableHandle* h) noexcept {
@@ -514,6 +526,12 @@ bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
     return true;
 }
 
+bool iceberg_table_open_pinned(TableHandle** out, Arena* owner, Arena* metadata,
+    PinnedObjectStore* source, const PinnedTableRead* read,
+    const uint8_t* bytes, uint64_t length) noexcept {
+    return open_pinned_table(out,owner,metadata,source,read,bytes,length);
+}
+
 void iceberg_table_close(TableHandle* /*h*/) noexcept {}
 
 const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept {
@@ -561,6 +579,7 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
         *out_err = true;
         return false;
     }
+    if (!bind_data_columns(s,meta)) { s->failed=true; *out_err=true; return false; }
     s->cur_meta = meta;
     s->cur_body = body;
     s->cur_body_len = blen;
@@ -613,10 +632,7 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
             return false;
         }
         int32_t path_ci = -1, pos_ci = -1;
-        for (uint32_t c = 0; c < meta->n_columns; ++c) {
-            if (std::strcmp(meta->columns[c].name, "file_path") == 0) path_ci = static_cast<int32_t>(c);
-            else if (std::strcmp(meta->columns[c].name, "pos") == 0) pos_ci = static_cast<int32_t>(c);
-        }
+        if (!delete_column_indices(s,meta,&path_ci,&pos_ci)) return false;
         // A delete file without both well-known columns is not a delete
         // file bolt understands -- decline rather than skip it silently.
         if (path_ci < 0 || pos_ci < 0) return false;
@@ -643,10 +659,18 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
             const uint8_t* pdata = nullptr; int32_t plen = 0;
             path_col.utf8_at(r, &pdata, &plen);
             if (plen <= 0 || static_cast<uint32_t>(plen) >= kIcebergMaxPath) return false;
+            if (s->table->strict_pinned && std::memchr(pdata,0,static_cast<size_t>(plen))!=nullptr)
+                return false;
             PositionDeleteEntry& e = s->pos_dels.entries[s->pos_dels.n];
             std::memcpy(e.file_path, pdata, static_cast<size_t>(plen));
             e.file_path[plen] = '\0';
             e.pos = pos_vals[r];
+            if (s->table->strict_pinned) {
+                char key[kOsMaxKey];
+                if (path_col.is_null(r) || pos_col.is_null(r) || e.pos<0 ||
+                    s3_uri_object_key(s->table->fs_root,e.file_path,key,sizeof(key))!=S3UriStatus::Ok)
+                    return false;
+            }
             ++s->pos_dels.n;
         }
     }
@@ -872,8 +896,7 @@ bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
     const uint8_t* body = nullptr; uint64_t blen = 0;
     // A manifest the list names but the store cannot produce is missing data,
     // not an empty manifest — fail rather than under-report.
-    if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
-                  mle.manifest_path, s->man_arena, &body, &blen))
+    if (!table_read_ref(h, mle.manifest_path, s->man_arena, &body, &blen))
         return false;
     s->stats.metadata_bytes_read += blen;
     if (deletes_pass) ++s->stats.delete_manifests_read;
@@ -881,7 +904,7 @@ bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
     VisitCtx v{};
     v.s = s;
     v.spec = metadata_spec(&h->meta, mle.partition_spec_id);
-    v.sch = metadata_current_schema(&h->meta);
+    v.sch = h->strict_pinned ? s->selected_schema : metadata_current_schema(&h->meta);
     v.mc = mle.content;
     v.deletes_pass = deletes_pass;
     uint32_t n = 0;
@@ -931,7 +954,7 @@ bool load_next_manifest(ScanHandle* s, bool* out_err) noexcept {
     // O(manifests touched) rather than O(table files).
     const TableHandle* h = s->table;
     if (!manifest_may_match(&mle, metadata_spec(&h->meta, mle.partition_spec_id),
-                            metadata_current_schema(&h->meta),
+                            h->strict_pinned ? s->selected_schema : metadata_current_schema(&h->meta),
                             s->opts.predicates, s->opts.n_predicates)) {
         ++s->stats.manifests_pruned;
         return true;
@@ -953,18 +976,21 @@ bool prepare_scan(ScanHandle* s) noexcept {
     assert(s != nullptr && s->table != nullptr);
     assert(s->budget != nullptr);
     TableHandle* h = s->table;
-    if (!snapshot_resolve(&h->meta, s->opts.snapshot_id, s->opts.timestamp_ms,
-                          &s->snap)) {
+    if (s->opts.snapshot_selection == SnapshotSelection::Empty)
+        return s->opts.snapshot_id == 0 && s->opts.timestamp_ms < 0 && !h->meta.current_snapshot_present;
+    if (!snapshot_resolve_selected(&h->meta, s->opts.snapshot_id, s->opts.timestamp_ms,
+                                  s->opts.snapshot_selection, &s->snap)) {
         // Only a table with no snapshot at all is legitimately empty.
-        if (s->opts.snapshot_id >= 0 || s->opts.timestamp_ms >= 0 ||
+        if (s->opts.snapshot_selection != SnapshotSelection::Legacy ||
+            s->opts.snapshot_id >= 0 || s->opts.timestamp_ms >= 0 ||
             h->meta.current_snapshot_id >= 0)
             return false;
         return true;
     }
+    if (h->strict_pinned && !select_pinned_schema(s)) return false;
     {
         const uint8_t* body = nullptr; uint64_t blen = 0;
-        if (!read_ref(&h->os, h->meta.location, h->fs_root, h->table_rel,
-                      s->snap.manifest_list, h->arena, &body, &blen)) {
+        if (!table_read_ref(h, s->snap.manifest_list, h->arena, &body, &blen)) {
             return false;
         }
         if (!parse_manifest_list_any(h->arena, body, blen, &s->mlist,
@@ -1014,8 +1040,8 @@ bool iceberg_scan_open_with_io(ScanHandle** out, TableHandle* h,
     std::memset(s, 0, sizeof(*s));
     s->table = h;
     s->scratch = h->arena;
-    s->meta_arena = new_arena(h->arena);
-    s->man_arena = new_arena(h->arena);
+    s->meta_arena = h->strict_pinned ? scan_fixed_arena(h->arena,h->parquet_metadata_bytes) : new_arena(h->arena);
+    s->man_arena = h->strict_pinned ? scan_fixed_arena(h->arena,h->manifest_bytes) : new_arena(h->arena);
     if (!setup_scan_source(s, io)) { iceberg_scan_close(s); return false; }
     void* bp = h->arena->allocate(sizeof(Budget), alignof(Budget));
     EqualityDeleteI64* ed_buf = h->arena->allocate_array<EqualityDeleteI64>(1u);
@@ -1024,6 +1050,7 @@ bool iceberg_scan_open_with_io(ScanHandle** out, TableHandle* h,
         { iceberg_scan_close(s); return false; }
     s->budget = new (bp) Budget(kLakeMetadataKnob, lake_metadata_budget_bytes());
     if (opts != nullptr) s->opts = *opts; else read_options_init(&s->opts);
+    if (h->strict_pinned && !pinned_scan_options(s,opts)) { iceberg_scan_close(s); return false; }
     s->pos_dels.entries = nullptr;
     s->pos_dels.n = 0;
     s->pos_dels.cap = 0;
@@ -1049,7 +1076,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         if (!s->cur_file_open) {
             bool err = false;
             if (!open_next_file(s, &err)) {
-                if (err) return false;              // unreadable live data file
+                if (err) { s->failed=true; return false; } // unreadable live data file
                 *out_eof = true;
                 return true;
             }
@@ -1062,7 +1089,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             continue;
         }
         // G2FEAT-47: right-size columns[2] to this file's width before deref.
-        if (!BoltBatch::alloc_columns(out, s->scratch, s->cur_meta->n_columns))
+        if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns))
             return false;
         BoltColumn* cols = out->columns[out->read_epoch];
         int64_t rows = 0;
@@ -1070,7 +1097,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // missing rows (an unsupported codec — zstd — or encoding lands here).
         // Fail; do not step over it.
         if (!read_parquet_group(s, &s->pinned, s->cur_body, s->cur_body_len,
-                               s->cur_meta, s->cur_row_group, cols, &rows)) {
+                               s->cur_meta, s->cur_row_group, cols, &rows, s->output_columns)) {
             s->failed = true;
             return false;
         }
@@ -1083,17 +1110,18 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         const FileTask& live_file = s->tasks[s->cur_file_idx];
         if (!apply_position_deletes_to_group(&s->pos_dels, live_file.path,
                                              s->cur_file_row_base, cols,
-                                             s->cur_meta->n_columns, &rows,
+                                             s->output_columns, &rows,
                                              s->scratch)) {
             return false;
         }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         out->num_rows = rows;
-        out->num_cols = s->cur_meta->n_columns;
-        for (uint32_t c = 0; c < s->cur_meta->n_columns; ++c) {
-            const char* phys = s->cur_meta->columns[c].name;
-            if (s->cur_meta->columns[c].name_truncated != 0u) return false;
-            if (!out->schema.add_field(phys, cols[c].type, true)) return false;
+        out->num_cols = s->output_columns;
+        for (uint32_t c = 0; c < s->output_columns; ++c) {
+            const char* name = s->table->strict_pinned ? s->selected_schema->fields[c].name :
+                s->cur_meta->columns[c].name;
+            if (!s->table->strict_pinned && s->cur_meta->columns[c].name_truncated != 0u) return false;
+            if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
@@ -1125,7 +1153,7 @@ bool iceberg_scan_next_file(ScanHandle* s, const char** out_path,
     while (s->cur_file_idx >= s->n_tasks) {
         if (s->next_manifest >= s->n_mlist) { *out_eof = true; return true; }
         bool err = false;
-        if (!load_next_manifest(s, &err) && err) return false;
+        if (!load_next_manifest(s, &err) && err) { s->failed=true; return false; }
     }
     *out_path = s->tasks[s->cur_file_idx++].path;
     return true;

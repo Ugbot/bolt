@@ -8,6 +8,7 @@
 
 namespace bolt {
 namespace lakehouse {
+enum class SnapshotSelection : uint8_t;
 namespace iceberg {
 
 static constexpr uint32_t kIcebergMaxManifestPath = 1024u;
@@ -26,7 +27,8 @@ struct Snapshot {
     int64_t     timestamp_ms;
     int64_t     sequence_number;
     SnapshotOp  op;
-    uint8_t     _pad0[3];
+    uint8_t     schema_id_present; // parsed optional field; zero preserves legacy layout
+    uint8_t     _pad0[2];
     // G2ICE-50 — the schema the snapshot was COMMITTED under. pyiceberg's own
     // golden metadata carries it on every snapshot and bolt emitted none, so a
     // time-travel read of a pre-evolution snapshot had nothing to bind its
@@ -45,6 +47,10 @@ const Snapshot* snapshot_by_id(const Metadata* m, int64_t snapshot_id) noexcept;
 const Snapshot* snapshot_at_timestamp(const Metadata* m, int64_t ts_ms) noexcept;
 bool snapshot_resolve(const Metadata* m, int64_t explicit_id, int64_t ts_ms,
                       Snapshot* out) noexcept;
+// Exact selection has no timestamp/latest fallback. Unknown/empty selectors
+// return false and preserve out; scan admission handles explicit empty state.
+bool snapshot_resolve_selected(const Metadata* m, int64_t id, int64_t ts_ms,
+    SnapshotSelection selection, Snapshot* out) noexcept;
 
 }  // namespace iceberg
 }  // namespace lakehouse

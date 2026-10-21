@@ -426,6 +426,34 @@ TEST_F(ParquetSource, MalformedFooterAndZeroRequestNeverPublishMetadata) {
     EXPECT_EQ(memory.calls, calls);
 }
 
+TEST_F(ParquetSource, FlatStrictUsesTheSameBoundedFooterRequests) {
+    ASSERT_TRUE(integer_file(2,32,&file));
+    bind(); ASSERT_NE(meta,nullptr);
+    ASSERT_EQ(parquet_read_meta_source_flat_strict(&source,&workspace,&metadata,meta),Status::Ok);
+    EXPECT_EQ(meta->num_rows,64); EXPECT_EQ(meta->n_columns,1u); EXPECT_EQ(meta->n_row_groups,2u);
+    EXPECT_STREQ(meta->columns[0].name,"id");
+    const auto calls=memory.calls, bytes=memory.bytes;
+    memory.calls=0; memory.bytes=0;
+    ASSERT_EQ(parquet_read_meta_source(&source,&workspace,&metadata,meta),Status::Ok);
+    EXPECT_EQ(memory.calls,calls); EXPECT_EQ(memory.bytes,bytes);
+    EXPECT_LE(memory.largest_request,workspace.request_bytes);
+}
+
+TEST_F(ParquetSource, FlatStrictPreservesOutputsOnTransportAndArgumentRefusal) {
+    ASSERT_TRUE(integer_file(1,16,&file));
+    bind(); ASSERT_NE(meta,nullptr);
+    meta->num_rows=-77;
+    for (const auto failure : {Status::IoError,Status::Changed,Status::Capacity}) {
+        memory.fail_call=memory.calls+3; memory.failure=failure;
+        EXPECT_EQ(parquet_read_meta_source_flat_strict(&source,&workspace,&metadata,meta),failure);
+        EXPECT_EQ(meta->num_rows,-77);
+    }
+    const auto calls=memory.calls;
+    workspace.request_bytes=0;
+    EXPECT_EQ(parquet_read_meta_source_flat_strict(&source,&workspace,&metadata,meta),Status::BadArg);
+    EXPECT_EQ(memory.calls,calls); EXPECT_EQ(meta->num_rows,-77);
+}
+
 TEST_F(ParquetSource, FrozenOutputCapacityAndAliasedWorkspaceRefuseBeforeIo) {
     open_small();
     ASSERT_NE(meta, nullptr);

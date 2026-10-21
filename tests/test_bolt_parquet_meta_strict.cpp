@@ -82,6 +82,62 @@ struct Output {
 };
 S parse(const Bytes& b,Output& out){return pq::pq_parse_file_meta_strict(b.bytes.data(),
     static_cast<std::uint32_t>(b.bytes.size()),out.meta,4);}
+bool parse_legacy(const Bytes& b,Output& out){return pq::pq_parse_file_meta(b.bytes.data(),
+    static_cast<std::uint32_t>(b.bytes.size()),out.meta);}
+Bytes field_id_metadata(const Bytes& encoded_id,bool nested=false) {
+    Bytes b;b.number(1,1);b.field(2,pq::kTcList);b.list(nested?3:2);
+    b.name("schema");b.number(5,1);b.stop();
+    if(nested){b.number(3,0);b.name("group");b.number(5,1);b.number(9,23);b.stop();}
+    b.number(1,2);b.number(3,0);b.name("MiXeD");
+    b.bytes.insert(b.bytes.end(),encoded_id.bytes.begin(),encoded_id.bytes.end());b.stop();
+    b.number(3,0,pq::kTcI64);b.field(4,pq::kTcList);b.list(0);b.stop();return b;
+}
+
+TEST(ParquetMetaStrict, SignedFieldIdsAndAbsenceSurviveBothParsers) {
+    for(const std::int64_t id:{std::int64_t{INT32_MIN},std::int64_t{-1},std::int64_t{0},
+                              std::int64_t{17},std::int64_t{INT32_MAX}}) {
+        Bytes encoded;encoded.number(9,id);const auto bytes=field_id_metadata(encoded);
+        Output exact;ASSERT_EQ(parse(bytes,exact),S::Ok);ASSERT_EQ(exact.meta->n_columns,1u);
+        EXPECT_EQ(exact.columns[0].has_field_id,1);EXPECT_EQ(exact.columns[0].field_id,id);
+        Output legacy;ASSERT_TRUE(parse_legacy(bytes,legacy));ASSERT_EQ(legacy.meta->n_columns,1u);
+        EXPECT_EQ(legacy.columns[0].has_field_id,1);EXPECT_EQ(legacy.columns[0].field_id,id);
+    }
+    const auto absent=field_id_metadata(Bytes{});Output exact,legacy;
+    ASSERT_EQ(parse(absent,exact),S::Ok);ASSERT_TRUE(parse_legacy(absent,legacy));
+    EXPECT_EQ(exact.columns[0].has_field_id,0);EXPECT_EQ(exact.columns[0].field_id,0);
+    EXPECT_EQ(legacy.columns[0].has_field_id,0);EXPECT_EQ(legacy.columns[0].field_id,0);
+}
+TEST(ParquetMetaStrict, LegacyNestedLeafKeepsItsOwnFieldId) {
+    for(const bool present:{false,true}) {
+        Bytes encoded;if(present)encoded.number(9,-1);
+        const auto bytes=field_id_metadata(encoded,true);Output legacy;
+        ASSERT_TRUE(parse_legacy(bytes,legacy));ASSERT_EQ(legacy.meta->n_columns,1u);
+        EXPECT_STREQ(legacy.columns[0].name,"group.MiXeD");
+        EXPECT_EQ(legacy.columns[0].has_field_id,present?1:0);
+        EXPECT_EQ(legacy.columns[0].field_id,present?-1:0);
+        Output exact;EXPECT_EQ(parse(bytes,exact),S::Unsupported);
+    }
+}
+TEST(ParquetMetaStrict, MalformedFieldIdsNeverTruncateOrUseLastValue) {
+    std::vector<Bytes> malformed;
+    for(const std::int64_t id:{std::int64_t{INT32_MIN}-1,std::int64_t{INT32_MAX}+1}) {
+        Bytes encoded;encoded.number(9,id);malformed.push_back(encoded);
+    }
+    Bytes wrapped;wrapped.field(9,pq::kTcI32);wrapped.overflow(0);malformed.push_back(wrapped);
+    Bytes overlong;overlong.field(9,pq::kTcI32);
+    for(unsigned i=0;i<5;++i)overlong.bytes.push_back(0x80);
+    overlong.bytes.push_back(0);malformed.push_back(overlong);
+    Bytes duplicate;duplicate.number(9,17);duplicate.number(9,18);malformed.push_back(duplicate);
+    for(const auto type:{pq::kTcI16,pq::kTcI64,pq::kTcBinary,pq::kTcTrue}) {
+        Bytes encoded;encoded.field(9,type);
+        if(type!=pq::kTcTrue)encoded.zig(0);
+        malformed.push_back(encoded);
+    }
+    for(const auto& encoded:malformed) {
+        const auto bytes=field_id_metadata(encoded);Output exact,legacy;
+        EXPECT_EQ(parse(bytes,exact),S::Invalid);EXPECT_FALSE(parse_legacy(bytes,legacy));
+    }
+}
 
 TEST(ParquetMetaStrict, ExactFlatNamesAndLogicalMembers) {
     for(const auto shape:{Shape::Plain,Shape::Dot,Shape::Timestamp,Shape::LocalTime,Shape::LegacyUnsigned,Shape::Decimal}) {

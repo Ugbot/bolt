@@ -2186,6 +2186,22 @@ target_link_libraries(test_bolt_iceberg_metadata_io
     PRIVATE bolt::lakehouse bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_iceberg_metadata_io)
 add_test(NAME test_bolt_iceberg_metadata_io COMMAND test_bolt_iceberg_metadata_io)
+
+add_executable(test_bolt_object_store_s3_uri test_bolt_object_store_s3_uri.cpp)
+target_link_libraries(test_bolt_object_store_s3_uri PRIVATE bolt_lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_object_store_s3_uri)
+add_test(NAME test_bolt_object_store_s3_uri COMMAND test_bolt_object_store_s3_uri)
+
+add_executable(test_bolt_object_store_pinned test_bolt_object_store_pinned.cpp)
+target_link_libraries(test_bolt_object_store_pinned PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_object_store_pinned)
+add_test(NAME test_bolt_object_store_pinned COMMAND test_bolt_object_store_pinned)
+set_tests_properties(test_bolt_object_store_pinned PROPERTIES TIMEOUT 120)
+add_executable(test_bolt_iceberg_pinned_read test_bolt_iceberg_pinned_read.cpp)
+target_link_libraries(test_bolt_iceberg_pinned_read PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_pinned_read)
+add_test(NAME test_bolt_iceberg_pinned_read COMMAND test_bolt_iceberg_pinned_read)
+set_tests_properties(test_bolt_iceberg_pinned_read PROPERTIES TIMEOUT 120)
 set_tests_properties(test_bolt_iceberg_metadata_io PROPERTIES TIMEOUT 60)
 
 # G2ICE-234 — manifest-list partition-summary pruning + the Avro union

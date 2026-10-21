@@ -2,6 +2,7 @@
 
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
+#include "bolt/lakehouse/format.h"
 
 #include <cassert>
 #include <cstdint>
@@ -57,6 +58,17 @@ bool snapshot_resolve(const Metadata* m, int64_t explicit_id, int64_t ts_ms,
     if (p == nullptr) return false;
     *out = *p;
     return true;
+}
+
+bool snapshot_resolve_selected(const Metadata* m, int64_t id, int64_t ts_ms,
+    SnapshotSelection selection, Snapshot* out) noexcept {
+    assert(m != nullptr && out != nullptr); assert(m->n_snapshots <= m->cap_snapshots);
+    if (selection == SnapshotSelection::Legacy) return snapshot_resolve(m, id, ts_ms, out);
+    if (selection != SnapshotSelection::Exact || ts_ms >= 0) return false;
+    const auto* selected = snapshot_by_id(m, id);
+    if (selected == nullptr) return false;
+    *out = *selected;
+    assert(out->snapshot_id == id); return true;
 }
 
 }  // namespace iceberg

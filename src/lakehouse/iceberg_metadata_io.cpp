@@ -1,7 +1,7 @@
 #include "bolt/lakehouse/iceberg/metadata_io.h"
 #include "bolt/crypto/sha256.h"
 #include "bolt/parse/bolt_json.h"
-#include "object_store_http.h"
+#include "bolt/lakehouse/object_store/s3_uri.h"
 
 #include <cassert>
 #include <cstring>
@@ -21,61 +21,10 @@ bool length_of(const char* text, uint32_t capacity, uint32_t* length) noexcept {
     return true;
 }
 
-bool path_components(const char* text, uint32_t length) noexcept {
-    assert(text != nullptr);
-    assert(length < kOsMaxKey);
-    if (length == 0) return false;
-    uint32_t start = 0;
-    for (uint32_t i = 0; i <= length; ++i) {
-        const auto c = static_cast<unsigned char>(text[i]);
-        if ((c < 32 || c == 127 || c == '\\') && i != length) return false;
-        if (i != length && c != '/') continue;
-        const uint32_t n = i - start;
-        if (n == 0 || (n == 1 && text[start] == '.') ||
-            (n == 2 && text[start] == '.' && text[start + 1] == '.')) return false;
-        start = i + 1u;
-    }
-    return true;
-}
-
-int upper_hex(unsigned char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-// Recognize the maintained encoder's canonical spelling; never normalize it.
-Status canonical_s3(const char* uri, uint32_t length) noexcept {
-    assert(uri != nullptr);
-    assert(length < kIcebergMaxLocation);
-    if (std::strncmp(uri, "s3://", 5) != 0) return Status::Unsupported;
-    uint32_t end = 5;
-    while (end < length && uri[end] != '/') ++end;
-    const uint32_t bucket = end - 5u;
-    if (bucket < 3 || bucket > 63 || uri[5] == '-' || uri[5] == '.' ||
-        uri[end - 1u] == '-' || uri[end - 1u] == '.') return Status::BadArg;
-    for (uint32_t i = 5; i < end; ++i) {
-        const char c = uri[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.'))
-            return Status::BadArg;
-    }
-    if (end == length) return Status::Ok; // Bucket-only store root is canonical.
-    const char* path = uri + end + 1u;
-    const uint32_t n = length - end - 1u;
-    if (!path_components(path, n)) return Status::BadArg;
-    for (uint32_t i = 0; i < n; ++i) {
-        const auto c = static_cast<unsigned char>(path[i]);
-        if (oshttp::unreserved(c) || c == '/') continue;
-        if (c != '%' || n - i < 3) return Status::BadArg;
-        const int hi = upper_hex(static_cast<unsigned char>(path[i + 1u]));
-        const int lo = upper_hex(static_cast<unsigned char>(path[i + 2u]));
-        if (hi < 0 || lo < 0) return Status::BadArg;
-        const auto decoded = static_cast<unsigned char>(hi * 16 + lo);
-        if (decoded < 32 || decoded == 127 || decoded == '\\' || decoded == '/' ||
-            oshttp::unreserved(decoded)) return Status::BadArg;
-        i += 2u;
-    }
-    return Status::Ok;
+Status uri_status(S3UriStatus status) noexcept {
+    assert(sizeof(S3UriStatus) == 1); assert(sizeof(Status) == 1);
+    if (status == S3UriStatus::Ok) return Status::Ok;
+    return status == S3UriStatus::Unsupported ? Status::Unsupported : Status::BadArg;
 }
 
 Status identity_valid(const MetadataObjectIdentity& id) noexcept {
@@ -86,24 +35,20 @@ Status identity_valid(const MetadataObjectIdentity& id) noexcept {
         !length_of(id.table_location, sizeof(id.table_location), &table) ||
         !length_of(id.metadata_uri, sizeof(id.metadata_uri), &uri) ||
         !length_of(id.object_key, sizeof(id.object_key), &key) ||
-        !length_of(id.table_uuid, sizeof(id.table_uuid), &uuid) || uuid == 0 ||
-        !path_components(id.object_key, key)) return Status::BadArg;
+        !length_of(id.table_uuid, sizeof(id.table_uuid), &uuid) || uuid == 0) return Status::BadArg;
     for (uint32_t i = 0; i < uuid; ++i)
         if (static_cast<unsigned char>(id.table_uuid[i]) < 32 || id.table_uuid[i] == 127)
             return Status::BadArg;
     const Span uris[]{{id.store_location, root}, {id.table_location, table}, {id.metadata_uri, uri}};
     for (const Span item : uris) {
-        const Status status = canonical_s3(static_cast<const char*>(item.data),
-                                           static_cast<uint32_t>(item.size));
+        const Status status = uri_status(s3_uri_validate(static_cast<const char*>(item.data)));
         if (status != Status::Ok) return status;
     }
     char mapped[kIcebergMaxLocation]{};
-    oshttp::Buf out{}; oshttp::buf_init(&out, mapped, sizeof(mapped));
-    oshttp::buf_str(&out, id.store_location);
-    oshttp::buf_str(&out, "/");
-    oshttp::buf_pct(&out, id.object_key, true);
-    if (!out.ok) return Status::BadArg;
-    return out.n == uri && std::memcmp(mapped, id.metadata_uri, uri) == 0
+    const Status mapped_status = uri_status(s3_uri_for_object_key(id.store_location,
+        id.object_key, mapped, sizeof(mapped)));
+    if (mapped_status != Status::Ok) return mapped_status;
+    return std::strlen(mapped) == uri && std::memcmp(mapped, id.metadata_uri, uri) == 0
         ? Status::Ok : Status::IdentityMismatch;
 }
 
@@ -230,6 +175,29 @@ Status original_identity(const uint8_t* bytes, uint32_t length,
         return check.mismatch ? Status::IdentityMismatch : Status::DecodeFailed;
     return Status::Ok;
 }
+Status decode_exact(const MetadataObjectIdentity& pinned, const uint8_t* bytes,
+    uint32_t length, Arena* metadata, Metadata* staged, Metadata* out,
+    MetadataLoadResult* result) noexcept {
+    assert(bytes != nullptr && metadata != nullptr); assert(staged != nullptr && out != nullptr && result != nullptr);
+    auto status = original_identity(bytes, length, pinned);
+    if (status != Status::Ok) return status;
+    if (!metadata_parse(bytes, length, metadata, staged) ||
+        (staged->format_version != 1 && staged->format_version != 2)) return Status::DecodeFailed;
+    if (std::strcmp(staged->location, pinned.table_location) != 0 ||
+        std::strcmp(staged->table_uuid, pinned.table_uuid) != 0) return Status::IdentityMismatch;
+    MetadataLoadResult copied{}; copied.object = pinned;
+    crypto::Sha256State hash{}; uint8_t digest[32]{};
+    if (!crypto::sha256_stream_init(&hash) || !crypto::sha256_stream_update(&hash, bytes, length) ||
+        !crypto::sha256_stream_final(&hash, digest)) return Status::DecodeFailed;
+    constexpr char hex[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < 32; ++i) {
+        copied.sha256[2u * i] = hex[digest[i] >> 4]; copied.sha256[2u * i + 1u] = hex[digest[i] & 15];
+    }
+    *out = *staged; *result = copied;
+    assert(out->arena == metadata && result->sha256[64] == 0);
+    return Status::Ok;
+}
+
 } // namespace
 
 MetadataLoadStatus metadata_load_exact(ObjectStore* store,
@@ -257,22 +225,32 @@ MetadataLoadStatus metadata_load_exact(ObjectStore* store,
     status = read_exact(store, pinned, limits->request_bytes, io, bytes);
     if (status != Status::Ok) return status;
     const auto length = static_cast<uint32_t>(pinned.version.size);
-    status = original_identity(bytes, length, pinned);
-    if (status != Status::Ok) return status;
-    if (!metadata_parse(bytes, length, metadata, staged) ||
-        (staged->format_version != 1 && staged->format_version != 2)) return Status::DecodeFailed;
-    if (std::strcmp(staged->location, pinned.table_location) != 0 ||
-        std::strcmp(staged->table_uuid, pinned.table_uuid) != 0) return Status::IdentityMismatch;
-    MetadataLoadResult copied{}; copied.object = pinned;
-    crypto::Sha256State hash{}; uint8_t digest[32]{};
-    if (!crypto::sha256_stream_init(&hash) || !crypto::sha256_stream_update(&hash, bytes, length) ||
-        !crypto::sha256_stream_final(&hash, digest)) return Status::DecodeFailed;
-    constexpr char hex[] = "0123456789abcdef";
-    for (uint32_t i = 0; i < 32; ++i) {
-        copied.sha256[2u * i] = hex[digest[i] >> 4]; copied.sha256[2u * i + 1u] = hex[digest[i] & 15];
-    }
-    *out = *staged; *result = copied;
-    assert(out->arena == metadata && result->sha256[64] == 0);
-    return Status::Ok;
+    return decode_exact(pinned, bytes, length, metadata, staged, out, result);
+}
+
+MetadataLoadStatus metadata_validate_exact(const MetadataObjectIdentity* id,
+    const MetadataLoadLimits* limits, const uint8_t* bytes, uint64_t length,
+    Arena* metadata, Metadata* out, MetadataLoadResult* result) noexcept {
+    assert(id != nullptr && limits != nullptr && bytes != nullptr);
+    assert(metadata != nullptr && out != nullptr && result != nullptr);
+    if (id == nullptr || limits == nullptr || bytes == nullptr || metadata == nullptr ||
+        out == nullptr || result == nullptr || length > SIZE_MAX) return Status::BadArg;
+    const Span inputs[]{{id, sizeof(*id)}, {limits, sizeof(*limits)}, {bytes, static_cast<size_t>(length)}};
+    const Span outputs[]{{out, sizeof(*out)}, {result, sizeof(*result)}};
+    const Span arena_object{metadata, sizeof(*metadata)};
+    if (!detail::object_io_admit(inputs, 3, outputs, 2, nullptr, &arena_object, 1) ||
+        !detail::object_io_admit(inputs, 3, outputs, 2, metadata, nullptr, 0) ||
+        metadata->growth_enabled()) return Status::BadArg;
+    if (!os_object_version_valid(&id->version) || !length || !limits->max_bytes ||
+        limits->max_bytes >= (1u << 30) || !limits->request_bytes ||
+        limits->request_bytes > kMetadataLoadMaxRequestBytes) return Status::BadArg;
+    if (length != id->version.size) return Status::IdentityMismatch;
+    auto status = identity_valid(*id); if (status != Status::Ok) return status;
+    if (length > limits->max_bytes || length >= (1u << 30)) return Status::Capacity;
+    auto* retained = metadata->allocate_array<uint8_t>(static_cast<size_t>(length));
+    auto* staged = metadata->allocate_array<Metadata>(1);
+    if (retained == nullptr || staged == nullptr) return Status::Capacity;
+    std::memcpy(retained, bytes, static_cast<size_t>(length));
+    return decode_exact(*id, retained, static_cast<uint32_t>(length), metadata, staged, out, result);
 }
 } // namespace bolt::lakehouse::iceberg

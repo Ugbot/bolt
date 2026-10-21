@@ -322,3 +322,58 @@ TEST_F(IcebergMetadataIO, MalformedCurrentSnapshotCannotBecomeAbsent) {
         EXPECT_EQ(load(),Status::DecodeFailed); unchanged();
     }
 }
+
+TEST_F(IcebergMetadataIO, RetainedExactBytesUseSameIdentitySchemaAndDigestWithoutTransport) {
+    origin.failure = bl::kOsIoError;
+    ASSERT_EQ(ice::metadata_validate_exact(&id, &limits,
+        reinterpret_cast<const uint8_t*>(origin.bytes.data()), origin.bytes.size(),
+        &metadata, &out, &result), Status::Ok);
+    EXPECT_EQ(origin.calls, 0u); no_discovery();
+    EXPECT_EQ(out.current_schema_id, 9); ASSERT_EQ(out.n_schemas, 1u);
+    EXPECT_EQ(out.schemas[0].fields[0].id, 7); EXPECT_TRUE(out.current_snapshot_present);
+    EXPECT_EQ(std::memcmp(&result.object, &id, sizeof(id)), 0);
+    char expected[65]{};
+    bolt::crypto::sha256_hex(reinterpret_cast<const uint8_t*>(origin.bytes.data()), origin.bytes.size(), expected);
+    EXPECT_STREQ(result.sha256, expected);
+    origin.bytes.assign(origin.bytes.size(), 'x');
+    EXPECT_STREQ(out.schemas[0].fields[0].name, "value"); EXPECT_STREQ(out.table_uuid, kUuid);
+}
+
+TEST_F(IcebergMetadataIO, RetainedExtentIdentityAndCapacityFailurePublishNothing) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(origin.bytes.data());
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits, bytes, origin.bytes.size() - 1,
+        &metadata, &out, &result), Status::IdentityMismatch); unchanged();
+    limits.max_bytes = origin.bytes.size() - 1;
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits, bytes, origin.bytes.size(),
+        &metadata, &out, &result), Status::Capacity); unchanged();
+    limits.max_bytes = 1u << 20; id.table_uuid[0] = 'X';
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits, bytes, origin.bytes.size(),
+        &metadata, &out, &result), Status::IdentityMismatch); unchanged();
+    EXPECT_EQ(origin.calls, 0u); no_discovery();
+}
+
+TEST_F(IcebergMetadataIO, RetainedMalformedIdentityNeverPassesTheSharedValidator) {
+    const auto at = origin.bytes.find("\"table-uuid\""); ASSERT_NE(at, std::string::npos);
+    origin.bytes.replace(at, 12, "\"table-\\u0075uid\"");
+    id.version.size = origin.bytes.size();
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits,
+        reinterpret_cast<const uint8_t*>(origin.bytes.data()), origin.bytes.size(),
+        &metadata, &out, &result), Status::DecodeFailed);
+    unchanged(); EXPECT_EQ(origin.calls, 0u); no_discovery();
+}
+
+TEST_F(IcebergMetadataIO, RetainedAliasesRefuseBeforeArenaOrOutputMutation) {
+    auto* input = static_cast<uint8_t*>(metadata.allocate(origin.bytes.size(), 1)); ASSERT_NE(input, nullptr);
+    std::memcpy(input, origin.bytes.data(), origin.bytes.size());
+    const auto used = metadata.total_allocated();
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits, input, origin.bytes.size(),
+        &metadata, &out, &result), Status::BadArg);
+    EXPECT_EQ(metadata.total_allocated(), used); unchanged();
+    EXPECT_EQ(std::memcmp(input, origin.bytes.data(), origin.bytes.size()), 0);
+    auto* alias = static_cast<ice::Metadata*>(metadata.allocate(sizeof(ice::Metadata), alignof(ice::Metadata)));
+    ASSERT_NE(alias, nullptr); alias->format_version = -77;
+    EXPECT_EQ(ice::metadata_validate_exact(&id, &limits,
+        reinterpret_cast<const uint8_t*>(origin.bytes.data()), origin.bytes.size(),
+        &metadata, alias, &result), Status::BadArg);
+    EXPECT_EQ(alias->format_version, -77); EXPECT_EQ(origin.calls, 0u); no_discovery();
+}

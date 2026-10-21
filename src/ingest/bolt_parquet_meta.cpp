@@ -10,6 +10,7 @@ namespace parquet {
 namespace {
 constexpr uint32_t kTcMaxDepth = 16;   // corrupt nesting cap
 bool strict_field(TcCursor*, int16_t*, uint8_t*, bool*) noexcept;
+bool strict_i32(TcCursor*, int32_t*) noexcept;
 bool strict_varint(TcCursor* c,uint64_t* value) noexcept {
     assert(c && value);assert(c->p<=c->end);
     const uint8_t* begin=c->p;
@@ -323,12 +324,11 @@ void derive_logical_from_converted(PqColumn* col) noexcept {
 
 bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
     assert(c != nullptr && out != nullptr);
+    assert(c->p <= c->end);
     std::memset(out, 0, sizeof(*out));
     out->col.converted = -1;
     out->col.logical = static_cast<int32_t>(PqLogical::None);
     out->col.int_signed = 1;
-    out->num_children = 0;
-    out->repeated = false;
     int16_t fid = 0;
     uint8_t ft;
     while (tc_field(c, &fid, &ft)) {
@@ -370,6 +370,11 @@ bool parse_schema_element(TcCursor* c, SchemaElem* out) noexcept {
             case 8:    // 8 = precision
                 if (!tc_zigzag(c, &v)) return false;
                 out->col.precision = static_cast<int32_t>(v);
+                break;
+            case 9:    // optional signed ID; retain zero and negative values
+                if (ft != kTcI32 || out->col.has_field_id ||
+                    !strict_i32(c, &out->col.field_id)) return false;
+                out->col.has_field_id = 1;
                 break;
             case 10:   // logicalType union (preferred over ConvertedType)
                 if (ft != kTcStruct) { if (!tc_skip(c, ft, 0)) return false; break; }

@@ -1,0 +1,253 @@
+// Private helpers, included after the table/scan definitions.
+bool pinned_open_admit(TableHandle** out, Arena* owner, Arena* metadata,
+    PinnedObjectStore* source, const PinnedTableRead* read,
+    const uint8_t* bytes, uint64_t length) noexcept {
+    assert(sizeof(size_t) <= sizeof(uint64_t)); assert(kOsPinnedMaxEntries <= 65536);
+    using detail::ObjectSpan;
+    if (out == nullptr || owner == nullptr || metadata == nullptr || source == nullptr ||
+        read == nullptr || bytes == nullptr || length == 0 || length > SIZE_MAX ||
+        source->count > kOsPinnedMaxEntries || source->io == nullptr || owner == metadata)
+        return false;
+    const ObjectSpan retained[]{{source,sizeof(*source)},
+        {source->entries,static_cast<size_t>(source->count)*sizeof(PinnedObject)},
+        {source->origin.vt,sizeof(ObjectStoreVT)}, {source->origin.impl,1},
+        {source->io,sizeof(Arena)}, {read,sizeof(*read)},
+        {bytes,static_cast<size_t>(length)}, {out,sizeof(*out)}};
+    const ObjectSpan arenas[]{{owner,sizeof(Arena)},{metadata,sizeof(Arena)}};
+    // Complete raw object-span admission precedes inspecting proposed arenas.
+    for (const auto span : retained) if (!detail::object_span_valid(span)) return false;
+    if (!detail::object_span_valid(arenas[0]) || !detail::object_span_valid(arenas[1]) ||
+        detail::object_spans_overlap(arenas[0],arenas[1])) return false;
+    for (const auto arena : arenas) {
+        for (const auto span : retained)
+            if (detail::object_spans_overlap(arena,span)) return false;
+        if (source->io->overlaps_backing(arena.data,arena.size)) return false;
+    }
+    for (uint32_t i=0; i+1<sizeof(retained)/sizeof(retained[0]); ++i)
+        if (detail::object_spans_overlap(retained[i],retained[7])) return false;
+    if (source->io->overlaps_backing(out,sizeof(*out)) ||
+        source->io->overlaps_backing(read,sizeof(*read)) ||
+        source->io->overlaps_backing(bytes,static_cast<size_t>(length))) return false;
+    if (owner->growth_enabled() || metadata->growth_enabled() || owner->concurrent() || metadata->concurrent())
+        return false;
+    Arena* workspaces[]{owner,metadata};
+    for (Arena* arena : workspaces) {
+        for (const auto span : retained)
+            if (arena->overlaps_backing(span.data,span.size)) return false;
+        if (arena->overlaps_backing(arena == owner ? metadata : owner,sizeof(Arena))) return false;
+    }
+    return true;
+}
+
+bool pinned_read_valid(PinnedObjectStore* source, const PinnedTableRead& read,
+    ObjectStore* view) noexcept {
+    assert(source != nullptr && view != nullptr); assert(sizeof(read.sha256)==65);
+    if (pinned_object_store_view(source,view) != kOsOk ||
+        read.parquet_metadata_bytes == 0 || read.parquet_metadata_bytes > (1u<<30) ||
+        read.manifest_bytes == 0 || read.manifest_bytes > (1u<<30) ||
+        (read.selection != SnapshotSelection::Exact && read.selection != SnapshotSelection::Empty) ||
+        (read.selection == SnapshotSelection::Empty && read.snapshot_id != 0) ||
+        read.sha256[64] != 0) return false;
+    for (uint32_t i=0; i<64; ++i)
+        if (!((read.sha256[i]>='0' && read.sha256[i]<='9') ||
+              (read.sha256[i]>='a' && read.sha256[i]<='f'))) return false;
+    detail::ObjectSpan root{};
+    if (!detail::object_key_span(read.object.store_location,sizeof(read.object.store_location),&root) ||
+        std::strcmp(source->namespace_uri,read.object.store_location) != 0) return false;
+    char key[kOsMaxKey];
+    if (s3_uri_object_key(read.object.store_location,read.object.table_location,key,sizeof(key)) !=
+        S3UriStatus::Ok) return false;
+    // Directory HEAD is a local copied pin, never origin discovery.
+    ObjectVersion pin{};
+    return os_head_versioned(view,read.object.object_key,source->io,&pin)==kOsOk &&
+        pin.size==read.object.version.size &&
+        std::strcmp(pin.etag,read.object.version.etag)==0;
+}
+
+bool open_pinned_table(TableHandle** out, Arena* owner, Arena* metadata,
+    PinnedObjectStore* source, const PinnedTableRead* read,
+    const uint8_t* bytes, uint64_t length) noexcept {
+    assert(sizeof(TableHandle)>0); assert(sizeof(MetadataLoadResult)>0);
+    if (!pinned_open_admit(out,owner,metadata,source,read,bytes,length)) return false;
+    ObjectStore view{};
+    // Validate exact metadata identity before comparing any untrusted strings.
+    Metadata parsed{}; MetadataLoadResult validated{};
+    if (metadata_validate_exact(&read->object,&read->metadata_limits,bytes,length,
+            metadata,&parsed,&validated)!=MetadataLoadStatus::Ok ||
+        std::memcmp(validated.sha256,read->sha256,sizeof(read->sha256))!=0 ||
+        !pinned_read_valid(source,*read,&view)) return false;
+    Snapshot selected{};
+    if (read->selection==SnapshotSelection::Empty ? parsed.current_snapshot_present :
+        !snapshot_resolve_selected(&parsed,read->snapshot_id,-1,read->selection,&selected)) return false;
+    if (read->selection==SnapshotSelection::Exact) {
+        uint32_t matches=0;
+        for (uint32_t i=0; i<parsed.n_snapshots; ++i)
+            if (parsed.snapshots[i].snapshot_id==read->snapshot_id) ++matches;
+        if (matches!=1) return false;
+    }
+    auto* h=owner->allocate_array<TableHandle>(1);
+    if (h==nullptr) return false;
+    std::memset(h,0,sizeof(*h));
+    h->arena=owner; h->os=view; h->meta=parsed; h->meta_loaded=true;
+    h->strict_pinned=true; h->selection=read->selection; h->selected_snapshot=read->snapshot_id;
+    h->parquet_metadata_bytes=read->parquet_metadata_bytes; h->manifest_bytes=read->manifest_bytes;
+    h->retained_arena=metadata; h->pinned_source=source;
+    h->request_bytes=source->limits.request_bytes;
+    std::memcpy(h->fs_root,read->object.store_location,sizeof(read->object.store_location));
+    *out=h;
+    assert(h->meta_loaded && h->strict_pinned); return true;
+}
+
+bool table_read_ref(TableHandle* h, const char* path, Arena* scratch,
+    const uint8_t** body, uint64_t* length) noexcept {
+    assert(h!=nullptr && path!=nullptr); assert(scratch!=nullptr);
+    if (!h->strict_pinned)
+        return read_ref(&h->os,h->meta.location,h->fs_root,h->table_rel,path,scratch,body,length);
+    char key[kOsMaxKey];
+    return s3_uri_object_key(h->fs_root,path,key,sizeof(key))==S3UriStatus::Ok &&
+        os_get(&h->os,key,scratch,body,length)==kOsOk;
+}
+
+bool pinned_scan_options(ScanHandle* s, const ReadOptions* supplied) noexcept {
+    assert(s!=nullptr && s->table!=nullptr); assert(s->table->strict_pinned);
+    const auto* h=s->table;
+    if (supplied==nullptr) {
+        s->opts.snapshot_selection=h->selection; s->opts.snapshot_id=h->selected_snapshot;
+    }
+    // These options are not yet implemented by this scanner: refuse rather
+    // than silently returning an unprojected/unfiltered alternative result.
+    return s->opts.snapshot_selection==h->selection && s->opts.snapshot_id==h->selected_snapshot &&
+        s->opts.timestamp_ms<0 && s->opts.n_projection==0 && !s->opts.include_partition_columns &&
+        !s->opts.include_deletes && s->opts.n_predicates==0;
+}
+
+bool pinned_scan_io_admit(TableHandle* h, const detail::ObjectSpan* inputs, uint32_t count,
+    detail::ObjectSpan output, Arena* scratch) noexcept {
+    assert(h!=nullptr && h->pinned_source!=nullptr); assert(count<=3);
+    using detail::ObjectSpan;
+    const auto* source=h->pinned_source;
+    const ObjectSpan protected_spans[]{{h,sizeof(*h)}, {source,sizeof(*source)},
+        {source->entries,static_cast<size_t>(source->count)*sizeof(PinnedObject)},
+        {source->origin.vt,sizeof(ObjectStoreVT)}, {h->os.vt,sizeof(ObjectStoreVT)},
+        {source->io,sizeof(Arena)}, {h->arena,sizeof(Arena)}, {h->retained_arena,sizeof(Arena)}};
+    if (!detail::object_span_valid(output)) return false;
+    for (uint32_t i=0; i<count; ++i) {
+        if (!detail::object_span_valid(inputs[i])) return false;
+        for (const auto span : protected_spans)
+            if (detail::object_spans_overlap(inputs[i],span)) return false;
+        if (h->arena->overlaps_backing(inputs[i].data,inputs[i].size) ||
+            h->retained_arena->overlaps_backing(inputs[i].data,inputs[i].size) ||
+            source->io->overlaps_backing(inputs[i].data,inputs[i].size)) return false;
+    }
+    for (const auto span : protected_spans)
+        if (detail::object_spans_overlap(output,span) ||
+            (scratch!=nullptr && detail::object_spans_overlap({scratch,sizeof(Arena)},span))) return false;
+    if (h->arena->overlaps_backing(output.data,output.size) ||
+        h->retained_arena->overlaps_backing(output.data,output.size) ||
+        source->io->overlaps_backing(output.data,output.size)) return false;
+    if (scratch==nullptr) return true;
+    const ObjectSpan object{scratch,sizeof(Arena)};
+    if (!detail::object_span_valid(object) || h->arena->overlaps_backing(object.data,object.size) ||
+        h->retained_arena->overlaps_backing(object.data,object.size) ||
+        source->io->overlaps_backing(object.data,object.size)) return false;
+    for (uint32_t i=0; i<count; ++i)
+        if (!detail::object_span_valid(inputs[i]) || detail::object_spans_overlap(object,inputs[i])) return false;
+    if (detail::object_spans_overlap(object,output)) return false;
+    for (const auto span : protected_spans)
+        if (scratch->overlaps_backing(span.data,span.size)) return false;
+    return true;
+}
+
+bool select_pinned_schema(ScanHandle* s) noexcept {
+    assert(s!=nullptr && s->table!=nullptr); assert(s->table->strict_pinned);
+    const auto& meta=s->table->meta;
+    const Schema* selected=nullptr;
+    const int32_t selected_id=s->snap.schema_id_present ? s->snap.schema_id : meta.current_schema_id;
+    for (uint32_t i=0; i<meta.n_schemas; ++i) {
+        if (meta.schemas[i].schema_id!=selected_id) continue;
+        if (selected!=nullptr) return false;
+        selected=&meta.schemas[i];
+    }
+    if (selected==nullptr || selected->n_fields==0 || selected->n_fields>kMaxColumns) return false;
+    for (uint32_t i=0; i<selected->n_fields; ++i) {
+        const auto& field=selected->fields[i];
+        if (field.id<=0 || field.name[0]==0 || std::strchr(field.name,'\\')!=nullptr ||
+            std::strcmp(field.type,"struct")==0) return false;
+        for (uint32_t j=0; j<i; ++j)
+            if (field.id==selected->fields[j].id || std::strcmp(field.name,selected->fields[j].name)==0)
+                return false;
+    }
+    s->selected_schema=selected; return true;
+}
+
+bool pinned_type_matches(const SchemaField& field, const pq::PqColumn& column) noexcept {
+    assert(field.id>0); assert(column.has_field_id);
+    const auto logical=static_cast<pq::PqLogical>(column.logical);
+    const bool plain=logical==pq::PqLogical::None && column.converted<0;
+    const bool integer=plain || (logical==pq::PqLogical::Int && column.int_signed &&
+        column.int_bits==(column.physical==pq::PqType::Int64 ? 64 : 32));
+    const char* type=field.type;
+    if (std::strcmp(type,"long")==0) return integer && column.physical==pq::PqType::Int64;
+    if (std::strcmp(type,"int")==0) return integer && column.physical==pq::PqType::Int32;
+    if (std::strcmp(type,"float")==0) return plain && column.physical==pq::PqType::Float;
+    if (std::strcmp(type,"double")==0) return plain && column.physical==pq::PqType::Double;
+    if (std::strcmp(type,"boolean")==0) return plain && column.physical==pq::PqType::Boolean;
+    if (std::strcmp(type,"string")==0) return (logical==pq::PqLogical::String ||
+        (logical==pq::PqLogical::None && column.converted==0)) && column.physical==pq::PqType::ByteArray;
+    if (std::strcmp(type,"binary")==0) return plain && column.physical==pq::PqType::ByteArray;
+    if (std::strcmp(type,"date")==0) return logical==pq::PqLogical::Date && column.physical==pq::PqType::Int32;
+    if (std::strcmp(type,"time")==0) return logical==pq::PqLogical::Time && column.time_unit==2 &&
+        column.physical==pq::PqType::Int64;
+    if (std::strcmp(type,"timestamp")==0 || std::strcmp(type,"timestamptz")==0)
+        return logical==pq::PqLogical::Timestamp && column.time_unit==2 &&
+            column.ts_utc==(std::strcmp(type,"timestamptz")==0) && column.physical==pq::PqType::Int64;
+    return false; // nested/decimal/fixed/UUID materialization must not be guessed
+}
+
+bool bind_data_columns(ScanHandle* s, const pq::PqMeta* meta) noexcept {
+    assert(s!=nullptr && meta!=nullptr); assert(s->table!=nullptr);
+    s->output_columns=meta->n_columns;
+    if (!s->table->strict_pinned) return true;
+    const auto* schema=s->selected_schema;
+    if (schema==nullptr || meta->n_columns>kMaxColumns) return false;
+    for (uint32_t i=0; i<meta->n_columns; ++i) {
+        const auto& column=meta->columns[i];
+        if (!column.has_field_id || column.field_id<=0 || column.max_rep!=0 || column.max_def>1)
+            return false;
+        for (uint32_t j=0; j<i; ++j)
+            if (column.field_id==meta->columns[j].field_id) return false;
+    }
+    for (uint32_t i=0; i<schema->n_fields; ++i) {
+        uint32_t physical=meta->n_columns;
+        for (uint32_t j=0; j<meta->n_columns; ++j)
+            if (schema->fields[i].id==meta->columns[j].field_id) physical=j;
+        if (physical==meta->n_columns) return false;
+        if (!pinned_type_matches(schema->fields[i],meta->columns[physical])) return false;
+        s->source_indices[i]=static_cast<uint16_t>(physical);
+    }
+    s->output_columns=schema->n_fields;
+    assert(s->output_columns<=kMaxColumns); return true;
+}
+
+bool delete_column_indices(const ScanHandle* s, const pq::PqMeta* meta,
+    int32_t* path, int32_t* pos) noexcept {
+    assert(s!=nullptr && meta!=nullptr); assert(path!=nullptr && pos!=nullptr);
+    *path=-1; *pos=-1;
+    for (uint32_t c=0; c<meta->n_columns; ++c) {
+        const auto& column=meta->columns[c];
+        const bool is_path=s->table->strict_pinned ? column.has_field_id && column.field_id==2147483546 :
+            std::strcmp(column.name,"file_path")==0;
+        const bool is_pos=s->table->strict_pinned ? column.has_field_id && column.field_id==2147483545 :
+            std::strcmp(column.name,"pos")==0;
+        if (is_path) { if (*path>=0) return false; *path=static_cast<int32_t>(c); }
+        if (is_pos) { if (*pos>=0) return false; *pos=static_cast<int32_t>(c); }
+    }
+    if (*path<0 || *pos<0) return false;
+    if (!s->table->strict_pinned) return true;
+    SchemaField field{}; field.id=1;
+    std::strcpy(field.type,"string");
+    if (!pinned_type_matches(field,meta->columns[*path])) return false;
+    std::strcpy(field.type,"long");
+    return pinned_type_matches(field,meta->columns[*pos]) && meta->columns[*path].max_rep==0 &&
+        meta->columns[*pos].max_rep==0 && meta->columns[*path].max_def<=1 && meta->columns[*pos].max_def<=1;
+}

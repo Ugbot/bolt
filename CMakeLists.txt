@@ -993,6 +993,8 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/object_store_s3.cpp
     src/lakehouse/object_store_range_cache.cpp
     src/lakehouse/object_store_prefix.cpp
+    src/lakehouse/object_store_s3_uri.cpp
+    src/lakehouse/object_store_pinned.cpp
     src/lakehouse/object_store_azure.cpp
     src/lakehouse/object_store_gcs.cpp
     src/lakehouse/object_store_compat.cpp

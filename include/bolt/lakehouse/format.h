@@ -79,6 +79,11 @@ struct Predicate {
     PredicateValue value;
 };
 
+// Legacy keeps existing ID>=0 / -1-latest behavior. Exact selects the signed
+// int64 literally, including -1. Empty selects explicit absence (ID zero and
+// timestamp -1), never latest. Iceberg pinned readers require Exact or Empty.
+enum class SnapshotSelection : uint8_t { Legacy = 0, Exact = 1, Empty = 2 };
+
 struct ReadOptions {
     int64_t   snapshot_id;
     int64_t   timestamp_ms;
@@ -88,7 +93,8 @@ struct ReadOptions {
     uint32_t  n_projection;
     bool      include_deletes;
     bool      include_partition_columns;
-    uint8_t   _pad[6];
+    SnapshotSelection snapshot_selection;
+    uint8_t   _pad[5];
 };
 
 inline void read_options_init(ReadOptions* o) noexcept {

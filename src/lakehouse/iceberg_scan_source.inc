@@ -15,6 +15,17 @@ bool scan_open_admit(ScanHandle** out, TableHandle* table, const ReadOptions* op
         {table->os.vt,table->os.vt == nullptr ? 0u : sizeof(ObjectStoreVT)},
         {table->os.impl,table->os.impl == nullptr ? 0u : 1u}};
     Arena* scratch = io == nullptr ? nullptr : io->transport_scratch;
+    if (table->strict_pinned && !pinned_scan_io_admit(table,inputs,3,outputs[0],scratch)) return false;
+    // Reject ALL proposed Arena object aliases before inspecting its backing.
+    if (scratch!=nullptr) {
+        const ObjectSpan object{scratch,sizeof(Arena)};
+        if (!detail::object_span_valid(object)) return false;
+        for (const auto span : protected_spans)
+            if (detail::object_spans_overlap(object,span)) return false;
+        for (const auto span : inputs)
+            if (detail::object_spans_overlap(object,span)) return false;
+        if (detail::object_spans_overlap(object,outputs[0])) return false;
+    }
     for (const auto span : protected_spans) {
         if (!detail::object_span_valid(span)) return false;
         if (scratch != nullptr && (detail::object_spans_overlap(span,{scratch,sizeof(Arena)}) ||
@@ -27,6 +38,9 @@ bool scan_outputs_admit(ScanHandle* s, const detail::ObjectSpan* outputs,
     uint32_t count) noexcept {
     assert(s != nullptr && outputs != nullptr);
     assert(count > 0 && count <= 2);
+    if (s->table->strict_pinned)
+        for (uint32_t i=0; i<count; ++i)
+            if (!pinned_scan_io_admit(s->table,nullptr,0,outputs[i],nullptr)) return false;
     const detail::ObjectSpan inputs[]{{s->meta_arena,s->meta_arena == nullptr ? 0u : sizeof(Arena)},
         {s->man_arena,s->man_arena == nullptr ? 0u : sizeof(Arena)}};
     const detail::ObjectSpan protected_spans[]{{s,sizeof(*s)}, {s->table,sizeof(*s->table)},
@@ -100,6 +114,7 @@ bool setup_scan_source(ScanHandle* s, const IcebergScanIO* supplied) noexcept {
     for (uint32_t i = 0; i < kMaxColumns; ++i) s->source_indices[i] = static_cast<uint16_t>(i);
     if (supplied != nullptr) {
         const IcebergScanIO io = *supplied;
+        if (s->table->strict_pinned && io.request_bytes>s->table->request_bytes) return false;
         if (!borrowed_scan_io_valid(s, io)) return false;
         io.transport_scratch->set_growth_enabled(false);
         io.transport_scratch->reset();
@@ -117,6 +132,7 @@ bool setup_scan_source(ScanHandle* s, const IcebergScanIO* supplied) noexcept {
     auto* bytes = static_cast<uint8_t*>(s->source_arena->allocate(kIcebergScanWorkspaceBytes, 1));
     if (bytes == nullptr) return false;
     s->source_workspace = {bytes, kIcebergScanWorkspaceBytes, pq::kParquetSourceMaxReadBytes};
+    if (s->table->strict_pinned) s->source_workspace.request_bytes=s->table->request_bytes;
     return true;
 }
 
@@ -126,6 +142,8 @@ bool scan_source_key(ScanHandle* s, const char* path, char* out) noexcept {
     assert(s != nullptr && path != nullptr);
     assert(out != nullptr);
     const auto* table = s->table;
+    if (table->strict_pinned)
+        return s3_uri_object_key(table->fs_root,path,out,kCatMaxPath)==S3UriStatus::Ok;
     if (key_from_location(table->meta.location, table->table_rel, path, out, kCatMaxPath))
         return true;
     if (std::strstr(path, "://") != nullptr || path[0] == '/' || path[0] == '\\') return false;
@@ -157,19 +175,24 @@ bool open_parquet(ScanHandle* s, const char* path, Arena* metadata,
     const int rc = os_head_versioned(file->store, file->key, file->io, &file->version);
     if (rc != kOsOk || !os_object_version_valid(&file->version) || file->version.size < 12) return false;
     file->source = {file->version.size, file, pinned_parquet_read};
+    if (s->table->strict_pinned)
+        return pq::parquet_read_meta_source_flat_strict(&file->source,&s->source_workspace,
+            metadata,meta)==pq::ParquetSourceStatus::Ok;
     return pq::parquet_read_meta_source(&file->source, &s->source_workspace,
                                         metadata, meta) == pq::ParquetSourceStatus::Ok;
 }
 
 bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
     uint64_t length, const pq::PqMeta* meta, uint32_t row_group,
-    BoltColumn* columns, int64_t* rows) noexcept {
+    BoltColumn* columns, int64_t* rows, uint32_t selected=0) noexcept {
     assert(s != nullptr && meta != nullptr && columns != nullptr);
     assert(rows != nullptr);
     if (!s->ranged) return pq::parquet_read_row_group(body, length, meta, row_group,
                                                     s->scratch, columns, rows);
     if (meta->n_columns == 0 || meta->n_columns > kMaxColumns) return false;
+    const uint32_t count = selected==0 ? meta->n_columns : selected;
+    if (count>kMaxColumns) return false;
     return pq::parquet_read_row_group_cols_source(&file->source, &s->source_workspace,
-        meta, row_group, s->source_indices, meta->n_columns, s->scratch,
+        meta, row_group, s->source_indices, count, s->scratch,
         columns, rows) == pq::ParquetSourceStatus::Ok;
 }
