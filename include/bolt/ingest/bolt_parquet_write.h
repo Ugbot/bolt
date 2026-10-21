@@ -491,6 +491,13 @@ struct ParquetWriter;
 ParquetWriter* parquet_write_open(const char* path,
                                   const ParquetWriteOpts* opts) noexcept;
 
+// Same file writer with an explicit serialized-file bound, including prologue,
+// pages, indexes and footer. Cap is 4..min(INT64_MAX,SIZE_MAX); it does not
+// bound encoder scratch/RSS. Every sink write refuses BEFORE exceeding cap.
+// A refused writer is sticky-failed; close releases/removes its partial file.
+ParquetWriter* parquet_write_open_bounded(const char* path,
+    const ParquetWriteOpts* opts, uint64_t max_file_bytes) noexcept;
+
 // Append one row group built from `batch`. `batch->num_cols` must match
 // the writer's column count and each column's type / nullability must
 // match the schema declared at open. Returns false on any mismatch or

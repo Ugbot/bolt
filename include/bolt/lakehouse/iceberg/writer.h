@@ -1,6 +1,6 @@
 // bolt/lakehouse/iceberg/writer.h — W5 Iceberg write public surface.
 //
-// Path-based open (caller passes a filesystem root); per-table opaque
+// Location-based open (filesystem path or URI); per-table opaque
 // TableHandle. Append/overwrite/delete/rewrite/expire/refs/views — the full
 // W5 surface. Bounded caps: 256 manifests/snapshot, 64 snapshots, 16 refs.
 //
@@ -73,14 +73,16 @@ inline void optimize_options_init(OptimizeOptions* o) noexcept {
 struct TableHandle;
 struct AppendHandle;
 
-enum class CommitObjectKind : uint8_t { kNone = 0, kManifest, kManifestList, kMetadata };
+enum class CommitObjectKind : uint8_t { kNone = 0, kManifest, kManifestList, kMetadata, kDataFile };
 
 // Evidence of an uncertain conditional write, copied out of the table arena.
 // Keys are store-relative; object_location and table_uuid bind the candidate
 // to its table. Reconcile with the EXACT bytes (SHA-256 + length), table UUID,
 // version and snapshot identity, not HEAD/size alone. A manifest/list candidate
 // means metadata publication was not attempted. A metadata candidate MAY be
-// visible. Absence at one read is not permission to retry a still-in-flight PUT.
+// visible. A data-file candidate means no manifest/metadata was attempted;
+// its retained local source is available through iceberg/write_io.h.
+// Absence at one read is not permission to retry a still-in-flight PUT.
 struct CommitCandidate {
     CommitObjectKind kind;
     uint8_t _pad[7];
@@ -94,7 +96,9 @@ struct CommitCandidate {
     char sha256[65];
 };
 
-// Create a new Iceberg table rooted at `path` (filesystem root). Writes
+// Create a new Iceberg table at canonical location `path`. Metadata uses os;
+// data defaults to local files, or opt into iceberg/write_io.h before mutation.
+// Writes
 // metadata/v1.metadata.json + metadata/version-hint.text. Returns false on
 // any IO error or capacity overflow.
 bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,

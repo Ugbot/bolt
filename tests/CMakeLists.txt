@@ -1942,6 +1942,27 @@ target_link_libraries(test_bolt_sigv4
 bolt_apply_hardening(test_bolt_sigv4)
 add_test(NAME test_bolt_sigv4 COMMAND test_bolt_sigv4)
 
+add_executable(test_bolt_sha256_stream test_bolt_sha256_stream.cpp)
+target_link_libraries(test_bolt_sha256_stream
+    PRIVATE bolt::crypto GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_sha256_stream)
+add_test(NAME test_bolt_sha256_stream COMMAND test_bolt_sha256_stream)
+set_tests_properties(test_bolt_sha256_stream PROPERTIES TIMEOUT 30)
+
+add_executable(test_bolt_parquet_write_bounded test_bolt_parquet_write_bounded.cpp)
+target_link_libraries(test_bolt_parquet_write_bounded
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_write_bounded)
+add_test(NAME test_bolt_parquet_write_bounded COMMAND test_bolt_parquet_write_bounded)
+set_tests_properties(test_bolt_parquet_write_bounded PROPERTIES TIMEOUT 30)
+
+add_executable(test_bolt_iceberg_write_io test_bolt_iceberg_write_io.cpp)
+target_link_libraries(test_bolt_iceberg_write_io
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_write_io)
+add_test(NAME test_bolt_iceberg_write_io COMMAND test_bolt_iceberg_write_io)
+set_tests_properties(test_bolt_iceberg_write_io PROPERTIES TIMEOUT 90)
+
 add_executable(test_bolt_sha1 test_bolt_sha1.cpp)
 target_link_libraries(test_bolt_sha1
     PRIVATE bolt::crypto GTest::gtest GTest::gtest_main)
@@ -2150,6 +2171,15 @@ target_compile_definitions(test_bolt_iceberg_real_scan PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_iceberg_real_scan)
 add_test(NAME test_bolt_iceberg_real_scan COMMAND test_bolt_iceberg_real_scan)
+
+add_executable(test_bolt_iceberg_ranged_scan test_bolt_iceberg_ranged_scan.cpp)
+target_link_libraries(test_bolt_iceberg_ranged_scan
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_iceberg_ranged_scan PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_iceberg_ranged_scan)
+add_test(NAME test_bolt_iceberg_ranged_scan COMMAND test_bolt_iceberg_ranged_scan)
+set_tests_properties(test_bolt_iceberg_ranged_scan PROPERTIES TIMEOUT 120)
 
 # G2ICE-234 — manifest-list partition-summary pruning + the Avro union
 # logical-type branch, over a pyiceberg-written day-partitioned table.

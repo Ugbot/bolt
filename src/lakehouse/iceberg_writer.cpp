@@ -26,6 +26,7 @@
 // 64 snapshots, 16 refs. No exceptions, no smart pointers, ≥2 asserts/fn.
 
 #include "bolt/lakehouse/iceberg/writer.h"
+#include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
 
 #include <atomic>
@@ -43,6 +44,8 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
 #include "bolt/crypto/sigv4.h"
+#include "bolt/crypto/sha256.h"
+#include "bolt/io/bolt_file_io.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
@@ -75,6 +78,13 @@ struct NamedRef {
     uint8_t _pad[7];
 };
 
+struct FileWriteState {
+    FileWriteIO config;
+    StagedDataFile receipt;
+    uint8_t* hash_workspace;
+    bool has_receipt;
+};
+
 struct TableHandle {
     Arena*         arena;
     ObjectStore*   os;
@@ -91,6 +101,8 @@ struct TableHandle {
     bool           write_uncertain;
     uint8_t        _pad;
     CommitCandidate candidate;
+    FileWriteState* file_io;
+    bool file_io_configurable;
 };
 
 struct AppendHandle {
@@ -348,6 +360,8 @@ bool make_pq_opts(const Schema* sch, const WriteOptions* w,
         else if (std::strcmp(t, "timestamp") == 0) bt = BoltType::Timestamp;
         cols[i].type     = bt;
         cols[i].nullable = !sch->fields[i].required;
+        cols[i].has_field_id = true;
+        cols[i].field_id = sch->fields[i].id;
     }
     po->row_group_target_bytes = w ? static_cast<uint32_t>(
         w->target_row_group_rows ? w->target_row_group_rows * 64u : 1u << 20)
@@ -428,24 +442,10 @@ namespace {
 // INSIDE a string, so it has to be escaped twice; doing that by hand is how
 // a stray quote in a column name corrupts the metadata).
 //
-// WHY A NAME MAPPING AND NOT FIELD IDS. Iceberg binds a data file's columns
-// to schema fields by FIELD ID, read from the parquet `field_id` on each
-// SchemaElement. bolt's parquet writer emits none — `ParquetWriteColumn` has
-// no field_id member — so pyiceberg refuses the scan outright:
-//
-//     ValueError: Parquet file does not have field-ids and the Iceberg table
-//     does not have 'schema.name-mapping.default' defined
-//
-// The spec defines exactly one remedy for field-id-less data files and this
-// is it: a table property carrying a name→id mapping the reader applies while
-// projecting. It is what every engine uses for tables imported from plain
-// parquet, and it needs no change to the parquet writer.
-//
-// Stamping real field ids into the parquet is the better long-term answer —
-// ids travel with the file, so it stays bindable when read outside its table,
-// and a rename cannot break it — and it is the recorded follow-up. It is not
-// done here because it means adding a member to `ParquetWriteColumn` and a
-// SchemaElement field to the parquet writer, which is another lane's file.
+// New Iceberg data files carry their source schema IDs in physical Parquet
+// SchemaElement field 9 via make_pq_opts. Keep this mapping for older files
+// written without IDs. It is compatibility metadata, not the binding used
+// for new files: physical IDs survive renames and dropped/re-added names.
 //
 // DERIVED from the schema on every emit rather than stored on Metadata, for
 // the same reason `last-column-id` is: a mapping that can drift from the
@@ -656,8 +656,7 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
     }
     if (!buf_put(&b, "],")) return false;
 
-    // properties — carries `schema.name-mapping.default` so a reader can bind
-    // bolt's field-id-less parquet to this schema (G2ICE-84).
+    // Retain name mapping for legacy field-id-less files (G2ICE-84).
     if (!buf_put(&b, "\"properties\":{")) return false;
     {
         const Schema* cur = metadata_current_schema(m);
@@ -747,6 +746,7 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
 // ---------------------------------------------------------------------------
 
 namespace {
+#include "iceberg_write_io.inc"
 #include "iceberg_commit.inc"
 }  // namespace
 
@@ -837,6 +837,7 @@ bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
         if (h->write_uncertain && out_uncertain != nullptr) *out_uncertain = h->candidate;
         return false;
     }
+    h->file_io_configurable = true;
     *out = h;
     return true;
 }
@@ -885,28 +886,14 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
+    h->file_io_configurable = true;
     *out = h;
     return true;
 }
 
 void table_close(TableHandle* /*h*/) noexcept {}
 
-CommitError table_last_commit_error(const TableHandle* th) noexcept {
-    assert(th != nullptr);
-    return th->last_error;
-}
-
-bool table_uncertain_commit(const TableHandle* th, CommitCandidate* out) noexcept {
-    assert(th != nullptr);
-    assert(out != nullptr);
-    *out = th->write_uncertain ? th->candidate : CommitCandidate{};
-    return th->write_uncertain;
-}
-
-const Metadata* table_metadata(const TableHandle* th) noexcept {
-    assert(th != nullptr);
-    return &th->meta;
-}
+#include "iceberg_write_io_api.inc"
 
 // ---------------------------------------------------------------------------
 // Append path.
@@ -1099,7 +1086,14 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
                      int64_t* out_size, int64_t* out_rows) noexcept {
     assert(th != nullptr && batches != nullptr);
     if (!write_ready(th)) return false;
-    if (n_batches == 0) return false;
+    th->last_error = CommitError::kFailed;
+    if (n_batches == 0 || n_batches > kMaxPendingBatch) return false;
+    int64_t total_rows = 0;
+    for (uint32_t i = 0; i < n_batches; ++i) {
+        if (batches[i] == nullptr || batches[i]->num_rows < 0 ||
+            batches[i]->num_rows > INT64_MAX - total_rows) return false;
+        total_rows += batches[i]->num_rows;
+    }
     // data/<snap-id>-<unique>.parquet. The suffix used to be `snap_id & 0xFFFF`
     // — no entropy of its own, so a snapshot-id collision was also a data-file
     // collision (G2ICE-163). It is independent of the snapshot id now.
@@ -1108,18 +1102,8 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
                                 static_cast<long long>(snap_id),
                                 static_cast<unsigned long long>(unique_u64()));
     if (n <= 0 || static_cast<uint32_t>(n) >= rel_cap) return false;
-    char full[kMaxPathLen];
-    if (!path_join(th->root, rel_out, full, sizeof(full))) return false;
-    // Ensure parent directory exists (ParquetWriter uses fopen, doesn't mkdir).
-    {
-        std::error_code ec;
-        std::filesystem::path p(full);
-        if (p.has_parent_path()) {
-            std::filesystem::create_directories(p.parent_path(), ec);
-        }
-    }
-
-    // Use ParquetWriter directly (filesystem-only). Data is always written
+    // The default writer is local; optional FileWriteIO stages and publishes.
+    // Data is always written
     // under the CURRENT schema (G2ICE-89) -- `schemas[0]` is only "current"
     // before the table's first evolution; hardcoding it here made an append
     // committed after `table_add_column` serialize against the table's
@@ -1129,22 +1113,16 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
     if (!make_pq_opts(write_sch, nullptr, &po, &wide)) return false;
-    auto* w = ingest::parquet::parquet_write_open(full, &po);
-    if (w == nullptr) return false;
-    int64_t total_rows = 0;
+    auto* w = data_file_begin(th, rel_out, snap_id, &po);
+    if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     for (uint32_t i = 0; i < n_batches; ++i) {
         if (!ingest::parquet::parquet_write_row_group(w, batches[i])) {
-            (void)ingest::parquet::parquet_write_close(w);
+            data_file_abandon(th, w);
+            th->last_error = CommitError::kFailed;
             return false;
         }
-        total_rows += batches[i]->num_rows;
     }
-    if (!ingest::parquet::parquet_write_close(w)) return false;
-
-    // size: head_object
-    ObjectMeta m{};
-    (void)os_head(th->os, rel_out, &m);
-    *out_size = static_cast<int64_t>(m.size);
+    if (!data_file_finish(th, rel_out, w, out_size)) return false;
     *out_rows = total_rows;
     return true;
 }
@@ -1410,7 +1388,7 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
     int64_t size = 0, rows = 0;
     if (!write_data_file(ah->th, ah->pending, ah->n_pending, snap_id,
                          rel, sizeof(rel), &size, &rows)) {
-        ah->th->last_error = CommitError::kFailed;
+        if (ah->th->last_error == CommitError::kNone) ah->th->last_error = CommitError::kFailed;
         return false;
     }
     DataFileRef df{};
@@ -1419,8 +1397,10 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
     df.partition_spec_id = ah->th->meta.current_spec_id;
     df.snapshot_id       = snap_id;
     // Absolute (G2ICE-84) — `rel` remains the ObjectStore key.
-    if (!abs_location(ah->th->root, rel, df.file_path,
-                      sizeof(df.file_path))) return false;
+    if (!abs_location(ah->th->root, rel, df.file_path, sizeof(df.file_path))) {
+        data_file_complete(ah->th, rel, false);
+        return false;
+    }
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
     // G2ICE-135 — real per-column null_count + numeric bounds from the exact
@@ -1432,11 +1412,12 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
     }
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
         // Only a definitive refusal proves this file was not published.
-        if (!ah->th->write_uncertain) (void)os_delete(ah->th->os, rel);
+        data_file_complete(ah->th, rel, false);
         if (ah->th->last_error == CommitError::kNone)
             ah->th->last_error = CommitError::kFailed;
         return false;
     }
+    data_file_complete(ah->th, rel, true);
     ah->n_pending = 0;
     if (out_path != nullptr && out_path_cap != 0) {
         std::strncpy(out_path, df.file_path, out_path_cap - 1u);
@@ -1507,19 +1488,27 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     assert(dels != nullptr || n == 0);
     if (th == nullptr || th->arena == nullptr || th->os == nullptr) return false;
     if (!write_ready(th)) return false;
-    if (dels == nullptr || n == 0) return false;
+    th->last_error = CommitError::kFailed;
+    if (dels == nullptr || n == 0 || n > kIcebergMaxManifestEntries || !handle_is_current(th)) return false;
 
     const int64_t snap_id = mint_snapshot_id(th);
 
     // Build the two delete columns. The file_path column is Utf8; bolt's
     // StringView carries an inline prefix plus a spill buffer, so the paths
     // are copied into arena storage that outlives this frame.
+    uint32_t path_lengths[kIcebergMaxManifestEntries]{};
+    uint64_t spill_bytes = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        size_t length = 0;
+        if (!stage_text(dels[i].file_path, kIcebergMaxPath, &length) || length == 0 || dels[i].pos < 0 ||
+            length > UINT32_MAX - 1u - spill_bytes) return false;
+        path_lengths[i] = static_cast<uint32_t>(length);
+        spill_bytes += length;
+    }
     Arena* a = th->arena;
     auto* pos = a->allocate_array<int64_t>(n);
     auto* svs = a->allocate_array<StringView>(n);
     if (pos == nullptr || svs == nullptr) return false;
-    uint64_t spill_bytes = 0;
-    for (uint32_t i = 0; i < n; ++i) spill_bytes += std::strlen(dels[i].file_path);
     auto* spill = a->allocate_array<uint8_t>(spill_bytes + 1u);
     if (spill == nullptr) return false;
     uint32_t off = 0;
@@ -1529,8 +1518,7 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
         // file a reader will silently ignore.
         if (dels[i].file_path[0] == '\0' || dels[i].pos < 0) return false;
         pos[i] = dels[i].pos;
-        const uint32_t len =
-            static_cast<uint32_t>(std::strlen(dels[i].file_path));
+        const uint32_t len = path_lengths[i];
         std::memcpy(spill + off, dels[i].file_path, len);
         svs[i] = StringView::from_cstr(dels[i].file_path);
         if (len > 12u) {                       // spilled: anchor the reference
@@ -1563,26 +1551,14 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
                                  static_cast<long long>(snap_id),
                                  static_cast<unsigned long long>(unique_u64()));
     if (rn <= 0 || static_cast<uint32_t>(rn) >= sizeof(rel)) return false;
-    char full[kMaxPathLen];
-    if (!path_join(th->root, rel, full, sizeof(full))) return false;
-    {
-        std::error_code ec;
-        std::filesystem::path p(full);
-        if (p.has_parent_path()) {
-            std::filesystem::create_directories(p.parent_path(), ec);
-        }
-    }
     Schema dsch{};
     if (!position_delete_schema(a, &dsch)) return false;
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
     if (!make_pq_opts(&dsch, nullptr, &po, &wide)) return false;
     // G2ICE-117 — stamp the spec-RESERVED field ids into the physical
-    // parquet footer, not only into `dsch` (which only ever reached the
-    // Iceberg-level manifest/metadata, never the file bolt's own writer
-    // produced). `make_pq_opts` does not do this generically (see its own
-    // comment) — narrowly fixed here rather than there so the already-proven
-    // regular data-file write path is untouched. Column order is fixed by
+    // parquet footer. make_pq_opts now stamps all Iceberg source IDs; retain
+    // the explicit reserved-ID assignments here. Column order is fixed by
     // `position_delete_schema()` immediately above: [0]=file_path,
     // [1]=pos.
     assert(po.n_columns == 2u && "position_delete_schema shape changed");
@@ -1590,16 +1566,15 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     po.columns[0].field_id     = dsch.fields[0].id;   // 2147483546 file_path
     po.columns[1].has_field_id = true;
     po.columns[1].field_id     = dsch.fields[1].id;   // 2147483545 pos
-    auto* w = ingest::parquet::parquet_write_open(full, &po);
-    if (w == nullptr) return false;
+    auto* w = data_file_begin(th, rel, snap_id, &po);
+    if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     if (!ingest::parquet::parquet_write_row_group(w, &b)) {
-        (void)ingest::parquet::parquet_write_close(w);
+        data_file_abandon(th, w);
+        th->last_error = CommitError::kFailed;
         return false;
     }
-    if (!ingest::parquet::parquet_write_close(w)) return false;
-
-    ObjectMeta om{};
-    (void)os_head(th->os, rel, &om);
+    int64_t size = 0;
+    if (!data_file_finish(th, rel, w, &size)) return false;
 
     DataFileRef df{};
     df.status            = ManifestStatus::kAdded;
@@ -1607,11 +1582,14 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     df.partition_spec_id = th->meta.current_spec_id;
     df.snapshot_id       = snap_id;
     if (!abs_location(th->root, rel, df.file_path, sizeof(df.file_path))) {
+        data_file_complete(th, rel, false);
         return false;
     }
     df.stats.record_count       = static_cast<int64_t>(n);
-    df.stats.file_size_in_bytes = static_cast<int64_t>(om.size);
-    return publish_snapshot(th, &df, 1, SnapshotOp::kDelete, snap_id);
+    df.stats.file_size_in_bytes = size;
+    const bool committed = publish_snapshot(th, &df, 1, SnapshotOp::kDelete, snap_id);
+    data_file_complete(th, rel, committed);
+    return committed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,6 +1739,9 @@ bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
 bool table_overwrite(TableHandle* th, const Predicate* /*pred*/,
                      const BoltBatch* batch) noexcept {
     assert(th != nullptr && batch != nullptr);
+    if (!write_ready(th)) return false;
+    th->last_error = CommitError::kNone;
+    if (!handle_is_current(th)) return false;
     // Treat as a single-batch append tagged kOverwrite.
     const int64_t snap_id = mint_snapshot_id(th);
     char rel[128];
@@ -1773,15 +1754,19 @@ bool table_overwrite(TableHandle* th, const Predicate* /*pred*/,
     df.content           = FileContent::kData;
     df.partition_spec_id = th->meta.current_spec_id;
     df.snapshot_id       = snap_id;
-    if (!abs_location(th->root, rel, df.file_path,
-                      sizeof(df.file_path))) return false;
+    if (!abs_location(th->root, rel, df.file_path, sizeof(df.file_path))) {
+        data_file_complete(th, rel, false);
+        return false;
+    }
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
     // G2ICE-135 — same real per-column stats append_commit_ex computes.
     if (const Schema* cur = metadata_current_schema(&th->meta)) {
         compute_file_stats(arr, 1u, cur, &df.stats);
     }
-    return publish_snapshot(th, &df, 1, SnapshotOp::kOverwrite, snap_id);
+    const bool committed = publish_snapshot(th, &df, 1, SnapshotOp::kOverwrite, snap_id);
+    data_file_complete(th, rel, committed);
+    return committed;
 }
 
 bool table_delete(TableHandle* th, const Predicate* /*pred*/) noexcept {

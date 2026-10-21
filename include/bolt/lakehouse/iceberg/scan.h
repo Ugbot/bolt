@@ -59,6 +59,31 @@ const Metadata* iceberg_table_metadata(const TableHandle* h) noexcept;
 bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
                        const ReadOptions* opts) noexcept;
 
+// Version-capable stores use pinned ranged Parquet reads automatically. The
+// convenience open above owns an 8 MiB footer/compressed-chunk workspace and
+// 1 MiB transport scratch, allocated once at scan startup. A larger file is
+// allowed; a footer or individual compressed chunk exceeding workspace fails.
+// Stores without either optional version operation retain the local contiguous
+// reader. A partially implemented version interface is refused.
+inline constexpr uint32_t kIcebergScanWorkspaceBytes = 8u << 20;
+struct IcebergScanIO {
+    uint8_t* workspace = nullptr;
+    uint64_t workspace_bytes = 0;
+    Arena* transport_scratch = nullptr;
+    uint32_t request_bytes = 1u << 20;
+};
+// Explicit borrowed workspace for version-capable stores. Caller exclusively
+// owns these disjoint buffers until close; scratch is frozen against growth at
+// startup and reset per transport call. Startup probes its bounded reservation.
+// Workspace and transport scratch must not overlap the table/output arena or
+// each other. Configuration is copied. No fallback, retry or repin on failure.
+// The handle output must be disjoint from table/config/workspace/transport
+// storage; invalid output aliases are refused unchanged before startup writes.
+// The borrowed origin implementation/config remains immutable and outside the
+// reused buffers. Its extent is opaque; only its first byte can be checked.
+bool iceberg_scan_open_with_io(ScanHandle** out, TableHandle* h,
+    const ReadOptions* opts, const IcebergScanIO* io) noexcept;
+
 // What planning cost so far (G2ICE-234). Planning must scale with the
 // manifests a predicate touches, not with the table's file count; these
 // counters are how a caller checks that.

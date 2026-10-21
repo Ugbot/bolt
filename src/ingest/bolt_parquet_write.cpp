@@ -419,6 +419,8 @@ struct ParquetWriter {
     // opts used (inline or wide_columns). opts.columns is not read after open.
     std::vector<ParquetWriteColumn> cols;
     std::int64_t      file_pos;        // bytes written
+    std::uint64_t     sink_bytes = 0;
+    std::uint64_t     sink_limit = INT64_MAX;
     bool              failed;
     // Footer accumulators.
     std::vector<ChunkRec>    chunks;
@@ -455,6 +457,9 @@ namespace {
 bool sink_write(ParquetWriter* w, const void* p, std::size_t n) noexcept {
     assert(w != nullptr);
     assert(p != nullptr || n == 0u);
+    assert(w->sink_bytes <= w->sink_limit);
+    if (w->failed) return false;
+    if (n > w->sink_limit - w->sink_bytes) { w->failed = true; return false; }
     if (n == 0u) return true;
     if (w->to_mem) {
         const std::uint8_t* b = static_cast<const std::uint8_t*>(p);
@@ -464,10 +469,13 @@ bool sink_write(ParquetWriter* w, const void* p, std::size_t n) noexcept {
         // compressed page are accumulated in std::vector here too -- so the
         // memory sink adds no new failure mode, it just holds the bytes longer.
         w->mem.insert(w->mem.end(), b, b + n);
+        w->sink_bytes += n;
         return true;
     }
     w->fout.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
-    return w->fout.good();
+    if (!w->fout.good()) { w->failed = true; return false; }
+    w->sink_bytes += n;
+    return true;
 }
 
 bool sink_ok(const ParquetWriter* w) noexcept {
@@ -2769,6 +2777,18 @@ ParquetWriter* parquet_write_open(const char* path,
     return w;
 }
 
+ParquetWriter* parquet_write_open_bounded(const char* path, const ParquetWriteOpts* opts,
+                                         uint64_t max_file_bytes) noexcept {
+    assert(path != nullptr && opts != nullptr);
+    if (max_file_bytes < 4u || max_file_bytes > INT64_MAX || max_file_bytes > SIZE_MAX) return nullptr;
+    auto* writer = parquet_write_open(path, opts);
+    if (writer != nullptr) {
+        assert(writer->sink_bytes == 4u);
+        writer->sink_limit = max_file_bytes;
+    }
+    return writer;
+}
+
 ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
                                       std::uint64_t reserve_bytes) noexcept {
     assert(opts != nullptr);
@@ -3369,6 +3389,7 @@ bool finish_footer(ParquetWriter* w) noexcept {
     if (!write_page_index(w)) return false;
     std::vector<std::uint8_t> footer;
     write_file_metadata(&footer, w);
+    if (footer.size() > UINT32_MAX) return false;
     const std::uint32_t flen = static_cast<std::uint32_t>(footer.size());
     if (!sink_write(w, footer.data(), footer.size())) return false;
     const std::uint8_t lb[4] = {
@@ -3390,7 +3411,9 @@ bool parquet_write_close(ParquetWriter* w) noexcept {
     if (w == nullptr) return false;
     bool ok = !w->failed && sink_ok(w);
     if (ok) ok = finish_footer(w);
+    if (ok) { w->fout.flush(); ok = w->fout.good(); }
     w->fout.close();
+    ok = ok && !w->fout.fail();
     // A file WITHOUT a footer is not a parquet file, and leaving one on disk
     // is worse than leaving nothing: it has the right name and the right
     // extension, an Iceberg/Delta manifest can end up pointing at it, and the

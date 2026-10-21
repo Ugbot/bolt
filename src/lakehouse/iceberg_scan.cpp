@@ -30,14 +30,11 @@
 //      directory, then falls back to the older strip-root / join-table-rel
 //      attempts so existing callers are unaffected.
 //
-// Still declined, loudly and never silently:
-//   - Position/equality delete files are skipped, so a table carrying them
-//     would over-report rows — `iceberg_scan_open` therefore FAILS on one
-//     rather than returning a wrong answer. TODO(W5-delete-load).
-//   - A live data file that cannot be fetched or decoded fails the scan. It
-//     used to be skipped, which silently returned short.
-//   - Parquet codecs outside Snappy/uncompressed (notably zstd, pyiceberg's
-//     default) fail at decode via the rule above — never a short read.
+// Positional deletes are loaded and applied across absolute file positions.
+// Equality deletes remain refused. A live file or unsupported decode fails
+// the scan, never a silent short result. Version-capable stores use bounded
+// pinned Parquet sources without key fallback/retry; legacy stores retain the
+// contiguous decoder. Codec support comes from the maintained Parquet reader.
 //
 // Tiger Style: bounded, noexcept, fixed-size scratch.
 
@@ -52,6 +49,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/ingest/bolt_parquet_source.h"
 #include "bolt/lakehouse/iceberg/delete_file.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
@@ -342,6 +340,14 @@ struct FileTask {
     const char* path;
 };
 
+struct PinnedParquet {
+    ObjectStore* store;
+    Arena* io;
+    ObjectVersion version;
+    char key[kCatMaxPath];
+    pq::ParquetByteSource source;
+};
+
 // Manifests are evaluated one at a time as the scan reaches them (delete
 // manifests all at open, since a delete applies to every data file). Only the
 // current manifest's surviving files are held, in `man_arena`; metadata
@@ -381,9 +387,19 @@ struct ScanHandle {
     PositionDeleteSet    pos_dels;
     EqualityDeleteSetI64 eq_dels;
     IcebergScanStats     stats;
+    PinnedParquet        pinned;
+    pq::ParquetSourceWorkspace source_workspace;
+    Arena* source_arena;
+    Arena* transport_arena;
+    bool ranged;
+    bool failed;
+    bool owns_transport;
+    uint16_t source_indices[kMaxColumns];
 };
 
 namespace {
+
+#include "iceberg_scan_source.inc"
 
 bool load_latest_metadata(TableHandle* h) noexcept {
     assert(h != nullptr && h->arena != nullptr);
@@ -534,19 +550,14 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
         return false;
     }
     const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (!read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
-                  s->table->table_rel, f.path, s->scratch,
-                  &body, &blen)) {
-        *out_err = true;
-        return false;
-    }
     assert(s->meta_arena != nullptr);
     s->cur_meta = nullptr;
     s->meta_arena->reset();
     pq::PqMeta* meta = s->meta_arena->allocate_array<pq::PqMeta>(1);
     if (meta == nullptr) { *out_err = true; return false; }
     std::memset(meta, 0, sizeof(*meta));
-    if (!pq::parquet_read_meta(body, blen, s->meta_arena, meta)) {
+    if (!open_parquet(s, f.path, s->meta_arena, meta, &s->pinned, &body, &blen)) {
+        s->failed = true;
         *out_err = true;
         return false;
     }
@@ -586,23 +597,19 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
     assert(df.content == FileContent::kPositionDeletes);
 
     const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (!read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
-                  s->table->table_rel, df.file_path, s->scratch,
-                  &body, &blen)) {
-        return false;
-    }
-    pq::PqMeta* meta = s->scratch->allocate_array<pq::PqMeta>(1);
+    s->meta_arena->reset();
+    pq::PqMeta* meta = s->meta_arena->allocate_array<pq::PqMeta>(1);
     if (meta == nullptr) return false;
     std::memset(meta, 0, sizeof(*meta));
-    if (!pq::parquet_read_meta(body, blen, s->scratch, meta)) return false;
+    PinnedParquet pinned{};
+    if (!open_parquet(s, df.file_path, s->meta_arena, meta, &pinned, &body, &blen)) return false;
 
     BoltColumn* cols = s->scratch->allocate_array<BoltColumn>(meta->n_columns);
     if (cols == nullptr) return false;
     for (uint32_t rg = 0; rg < meta->n_row_groups && rg < kLakeMaxRowGroups; ++rg) {
         std::memset(cols, 0, sizeof(BoltColumn) * meta->n_columns);
         int64_t rows = 0;
-        if (!pq::parquet_read_row_group(body, blen, meta, rg, s->scratch,
-                                        cols, &rows)) {
+        if (!read_parquet_group(s, &pinned, body, blen, meta, rg, cols, &rows)) {
             return false;
         }
         int32_t path_ci = -1, pos_ci = -1;
@@ -942,38 +949,16 @@ Arena* new_arena(Arena* in) noexcept {
     return p == nullptr ? nullptr : new (p) Arena();
 }
 
-}  // namespace
-
-bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
-                       const ReadOptions* opts) noexcept {
-    assert(out != nullptr && h != nullptr);
-    *out = nullptr;
-    if (!h->meta_loaded) return false;
-    ScanHandle* s = h->arena->allocate_array<ScanHandle>(1);
-    if (s == nullptr) return false;
-    std::memset(s, 0, sizeof(*s));
-    s->table = h;
-    s->scratch = h->arena;
-    s->meta_arena = new_arena(h->arena);
-    s->man_arena = new_arena(h->arena);
-    void* bp = h->arena->allocate(sizeof(Budget), alignof(Budget));
-    EqualityDeleteI64* ed_buf = h->arena->allocate_array<EqualityDeleteI64>(1u);
-    if (s->meta_arena == nullptr || s->man_arena == nullptr || bp == nullptr ||
-        ed_buf == nullptr)
-        return false;
-    s->budget = new (bp) Budget(kLakeMetadataKnob, lake_metadata_budget_bytes());
-    if (opts != nullptr) s->opts = *opts; else read_options_init(&s->opts);
-    s->pos_dels.entries = nullptr;
-    s->pos_dels.n = 0;
-    s->pos_dels.cap = 0;
-    equality_delete_set_init(&s->eq_dels, ed_buf, 1u);
+bool prepare_scan(ScanHandle* s) noexcept {
+    assert(s != nullptr && s->table != nullptr);
+    assert(s->budget != nullptr);
+    TableHandle* h = s->table;
     if (!snapshot_resolve(&h->meta, s->opts.snapshot_id, s->opts.timestamp_ms,
                           &s->snap)) {
         // Only a table with no snapshot at all is legitimately empty.
         if (s->opts.snapshot_id >= 0 || s->opts.timestamp_ms >= 0 ||
             h->meta.current_snapshot_id >= 0)
             return false;
-        *out = s;
         return true;
     }
     {
@@ -1007,6 +992,43 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
     s->next_manifest = 0;
     s->cur_file_idx = 0;
     s->cur_file_open = false;
+    return true;
+}
+
+}  // namespace
+
+bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
+                       const ReadOptions* opts) noexcept {
+    return iceberg_scan_open_with_io(out, h, opts, nullptr);
+}
+
+bool iceberg_scan_open_with_io(ScanHandle** out, TableHandle* h,
+    const ReadOptions* opts, const IcebergScanIO* io) noexcept {
+    assert(out != nullptr && h != nullptr);
+    assert(h->arena != nullptr);
+    if (!scan_open_admit(out,h,opts,io)) return false;
+    *out = nullptr;
+    if (!h->meta_loaded) return false;
+    ScanHandle* s = h->arena->allocate_array<ScanHandle>(1);
+    if (s == nullptr) return false;
+    std::memset(s, 0, sizeof(*s));
+    s->table = h;
+    s->scratch = h->arena;
+    s->meta_arena = new_arena(h->arena);
+    s->man_arena = new_arena(h->arena);
+    if (!setup_scan_source(s, io)) { iceberg_scan_close(s); return false; }
+    void* bp = h->arena->allocate(sizeof(Budget), alignof(Budget));
+    EqualityDeleteI64* ed_buf = h->arena->allocate_array<EqualityDeleteI64>(1u);
+    if (s->meta_arena == nullptr || s->man_arena == nullptr || bp == nullptr ||
+        ed_buf == nullptr)
+        { iceberg_scan_close(s); return false; }
+    s->budget = new (bp) Budget(kLakeMetadataKnob, lake_metadata_budget_bytes());
+    if (opts != nullptr) s->opts = *opts; else read_options_init(&s->opts);
+    s->pos_dels.entries = nullptr;
+    s->pos_dels.n = 0;
+    s->pos_dels.cap = 0;
+    equality_delete_set_init(&s->eq_dels, ed_buf, 1u);
+    if (!prepare_scan(s)) { iceberg_scan_close(s); return false; }
     *out = s;
     return true;
 }
@@ -1014,9 +1036,13 @@ bool iceberg_scan_open(ScanHandle** out, TableHandle* h,
 bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
                              bool* out_eof) noexcept {
     assert(s != nullptr && out != nullptr && out_eof != nullptr);
+    assert(s->scratch != nullptr);
+    const detail::ObjectSpan outputs[]{{out,sizeof(*out)}, {out_eof,sizeof(*out_eof)}};
+    if (!scan_outputs_admit(s,outputs,2)) return false;
     *out_eof = false;
     BoltBatch::init_empty(out);
     out->arena = s->scratch;
+    if (s->failed) return false;
     // Bounded: every iteration returns, decodes a row group, or retires a file.
     constexpr uint64_t kGuardMax = UINT64_C(1) << 48;
     for (uint64_t guard = 0; guard <= kGuardMax; ++guard) {
@@ -1043,9 +1069,9 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // A row group the footer declares but the decoder cannot produce is
         // missing rows (an unsupported codec — zstd — or encoding lands here).
         // Fail; do not step over it.
-        if (!pq::parquet_read_row_group(s->cur_body, s->cur_body_len,
-                                         s->cur_meta, s->cur_row_group,
-                                         s->scratch, cols, &rows)) {
+        if (!read_parquet_group(s, &s->pinned, s->cur_body, s->cur_body_len,
+                               s->cur_meta, s->cur_row_group, cols, &rows)) {
+            s->failed = true;
             return false;
         }
         ++s->cur_row_group;
@@ -1090,8 +1116,11 @@ bool iceberg_scan_next_file(ScanHandle* s, const char** out_path,
                             bool* out_eof) noexcept {
     assert(s != nullptr && out_path != nullptr && out_eof != nullptr);
     assert(!s->cur_file_open);
+    const detail::ObjectSpan outputs[]{{out_path,sizeof(*out_path)}, {out_eof,sizeof(*out_eof)}};
+    if (!scan_outputs_admit(s,outputs,2)) return false;
     *out_path = nullptr;
     *out_eof = false;
+    if (s->failed) return false;
     // Bounded: each round consumes one manifest.
     while (s->cur_file_idx >= s->n_tasks) {
         if (s->next_manifest >= s->n_mlist) { *out_eof = true; return true; }
@@ -1103,14 +1132,25 @@ bool iceberg_scan_next_file(ScanHandle* s, const char** out_path,
 }
 
 void iceberg_scan_close(ScanHandle* s) noexcept {
-    if (s == nullptr || s->meta_arena == nullptr) return;
+    if (s == nullptr) return;
     s->cur_meta = nullptr;
-    s->meta_arena->~Arena();
-    s->meta_arena = nullptr;
+    if (s->meta_arena != nullptr) {
+        s->meta_arena->~Arena();
+        s->meta_arena = nullptr;
+    }
     if (s->man_arena != nullptr) {
         s->man_arena->~Arena();
         s->man_arena = nullptr;
     }
+    if (s->source_arena != nullptr) {
+        s->source_arena->~Arena();
+        s->source_arena = nullptr;
+    }
+    if (s->owns_transport && s->transport_arena != nullptr) {
+        s->transport_arena->~Arena();
+    }
+    s->transport_arena = nullptr;
+    s->failed = true;
 }
 
 }  // namespace iceberg

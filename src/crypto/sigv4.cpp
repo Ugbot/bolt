@@ -2,6 +2,7 @@
 // Zero external dependency (no OpenSSL): bolt stays a leaf library.
 
 #include "bolt/crypto/sigv4.h"
+#include "bolt/crypto/sha256.h"
 
 #include <cassert>
 #include <cstring>
@@ -13,12 +14,7 @@ namespace {
 
 // ---- SHA-256 (FIPS 180-4) -------------------------------------------------
 
-struct Sha256Ctx {
-    uint32_t h[8];
-    uint64_t bitlen;
-    uint8_t  buf[64];
-    uint32_t buflen;
-};
+using Sha256Ctx = Sha256State;
 
 inline uint32_t rotr(uint32_t x, uint32_t n) noexcept {
     return (x >> n) | (x << (32u - n));
@@ -83,8 +79,8 @@ void sha256_update(Sha256Ctx* c, const uint8_t* data, uint64_t len) noexcept {
     uint64_t i = 0;
     while (i < len) {                              // bounded by len
         const uint32_t space = 64u - c->buflen;
-        uint32_t take = static_cast<uint32_t>(len - i);
-        if (take > space) take = space;
+        const uint64_t remaining = len - i;
+        const uint32_t take = remaining < space ? static_cast<uint32_t>(remaining) : space;
         std::memcpy(c->buf + c->buflen, data + i, take);
         c->buflen += take;
         i += take;
@@ -143,6 +139,49 @@ bool app(char* dst, uint32_t cap, uint32_t* pos, const char* s) noexcept {
 }
 
 }  // namespace
+
+namespace {
+bool stream_span_valid(const void* data, uint64_t bytes) noexcept {
+    return bytes == 0 || (data != nullptr && bytes <= UINTPTR_MAX - reinterpret_cast<uintptr_t>(data));
+}
+bool stream_disjoint(const Sha256State* state, const void* data, uint64_t bytes) noexcept {
+    if (!stream_span_valid(state, sizeof(*state)) || !stream_span_valid(data, bytes)) return false;
+    if (bytes == 0) return true;
+    const auto a = reinterpret_cast<uintptr_t>(state), b = reinterpret_cast<uintptr_t>(data);
+    return a >= b + bytes || b >= a + sizeof(*state);
+}
+bool stream_active(const Sha256State* state) noexcept {
+    return state != nullptr && state->phase == 1 && state->buflen < 64 &&
+        state->bitlen % 8u == 0 && state->buflen == (state->bitlen / 8u) % 64u;
+}
+}  // namespace
+
+bool sha256_stream_init(Sha256State* state) noexcept {
+    if (!stream_span_valid(state, sizeof(*state))) return false;
+    *state = {};
+    sha256_init(state);
+    state->phase = 1;
+    assert(stream_active(state));
+    assert(state->bitlen == 0);
+    return true;
+}
+bool sha256_stream_update(Sha256State* state, const uint8_t* data, uint64_t length) noexcept {
+    if (!stream_span_valid(state, sizeof(*state)) || !stream_active(state) ||
+        !stream_disjoint(state, data, length) || length > (UINT64_MAX - state->bitlen) / 8u) return false;
+    assert(state->phase == 1);
+    sha256_update(state, data, length);
+    assert(stream_active(state));
+    return true;
+}
+bool sha256_stream_final(Sha256State* state, uint8_t digest[32]) noexcept {
+    if (!stream_span_valid(state, sizeof(*state)) || !stream_active(state) ||
+        !stream_disjoint(state, digest, 32)) return false;
+    assert(state->phase == 1);
+    sha256_final(state, digest);
+    state->phase = 2;
+    assert(state->buflen == 0);
+    return true;
+}
 
 void sha256(const uint8_t* data, uint64_t len, uint8_t out[32]) noexcept {
     assert(data != nullptr || len == 0);

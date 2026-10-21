@@ -11,6 +11,7 @@
 bool write_ready(TableHandle* th) noexcept {
     assert(th != nullptr);
     assert(th->os != nullptr);
+    th->file_io_configurable = false;
     if (!th->write_uncertain) return true;
     th->last_error = CommitError::kUncertain;
     return false;
