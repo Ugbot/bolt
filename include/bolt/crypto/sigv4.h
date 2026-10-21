@@ -9,11 +9,11 @@
 //
 // The canonical request we build is the common case used by S3 / Glue / STS:
 //   METHOD \n CANONICAL_URI \n CANONICAL_QUERY \n
-//   host:HOST \n x-amz-content-sha256:HASH \n x-amz-date:DATE \n
+//   host:HOST \n [if-match:ETAG \n] x-amz-content-sha256:HASH \n x-amz-date:DATE \n
 //   [x-amz-security-token:TOKEN \n] [EXTRA_NAME:EXTRA_VALUE \n] \n
 //   SIGNED_HEADERS \n PAYLOAD_SHA256
 // with SIGNED_HEADERS =
-//   "host;x-amz-content-sha256;x-amz-date[;x-amz-security-token][;EXTRA_NAME]".
+//   "host[;if-match];x-amz-content-sha256;x-amz-date[;x-amz-security-token][;EXTRA_NAME]".
 //
 // Tiger Style: PODs, caller-owned output buffers, ≥2 asserts/fn, no heap,
 // no exceptions.
@@ -37,6 +37,7 @@ static constexpr uint32_t kSigV4MaxSecret  = 256u;
 static constexpr uint32_t kSigV4MaxToken   = 2048u;
 // Authorization header value upper bound (signed headers + sig hex + creds).
 static constexpr uint32_t kSigV4MaxAuth    = 1024u;
+static constexpr uint32_t kSigV4MaxIfMatch = 256u;
 
 // One request to sign. All char* are NUL-terminated C strings the caller owns.
 // `payload_sha256` is the lowercase-hex SHA-256 of the body (64 hex chars +
@@ -58,6 +59,9 @@ struct SigV4Request {
     // One extra signed header, "name:value" with a lowercase name that sorts
     // after x-amz-security-token (e.g. GCS "x-goog-if-generation-match:0").
     const char* extra_header = nullptr;
+    // One strong quoted ETag, no whitespace normalization or wildcard/list.
+    // Dedicated lexical position: host; if-match; x-amz-*; optional extra.
+    const char* if_match = nullptr;
 };
 
 // The signed outputs, written into caller buffers. `auth_header` is the full

@@ -197,6 +197,18 @@ void sha256_empty_hex(char out_hex[65]) noexcept {
 
 namespace {
 
+bool if_match_valid(const char* value) noexcept {
+    if (value == nullptr) return true;
+    uint32_t n = 0;
+    while (n < kSigV4MaxIfMatch && value[n] != 0) ++n;
+    if (n < 2 || n == kSigV4MaxIfMatch || value[0] != '"' || value[n - 1] != '"') return false;
+    for (uint32_t i = 1; i + 1 < n; ++i) {
+        const auto c = static_cast<unsigned char>(value[i]);
+        if (c < 0x21 || c == '"' || c == 127) return false;
+    }
+    return true;
+}
+
 // Build the canonical request into `buf`; returns its length or 0 on overflow.
 // Also fills `signed_headers` (caller buffer >= 160 bytes).
 uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
@@ -204,8 +216,9 @@ uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
     assert(r != nullptr);
     assert(buf != nullptr);
     uint32_t shp = 0;
-    if (!app(signed_headers, sh_cap, &shp,
-             "host;x-amz-content-sha256;x-amz-date")) return 0;
+    if (!if_match_valid(r->if_match) || !app(signed_headers, sh_cap, &shp, "host") ||
+        (r->if_match != nullptr && !app(signed_headers, sh_cap, &shp, ";if-match")) ||
+        !app(signed_headers, sh_cap, &shp, ";x-amz-content-sha256;x-amz-date")) return 0;
     if (r->session_token != nullptr) {
         if (!app(signed_headers, sh_cap, &shp, ";x-amz-security-token"))
             return 0;
@@ -234,8 +247,11 @@ uint32_t build_canonical(const SigV4Request* r, char* buf, uint32_t cap,
     bool ok = app(buf, cap, &p, r->method) && app(buf, cap, &p, "\n") &&
               app(buf, cap, &p, r->path) && app(buf, cap, &p, "\n") &&
               app(buf, cap, &p, r->query_string) && app(buf, cap, &p, "\n") &&
-              app(buf, cap, &p, "host:") && app(buf, cap, &p, r->host) &&
-              app(buf, cap, &p, "\nx-amz-content-sha256:") &&
+              app(buf, cap, &p, "host:") && app(buf, cap, &p, r->host) && app(buf, cap, &p, "\n");
+    if (r->if_match != nullptr) {
+        ok = ok && app(buf, cap, &p, "if-match:") && app(buf, cap, &p, r->if_match) && app(buf, cap, &p, "\n");
+    }
+    ok = ok && app(buf, cap, &p, "x-amz-content-sha256:") &&
               app(buf, cap, &p, r->payload_sha256) &&
               app(buf, cap, &p, "\nx-amz-date:") &&
               app(buf, cap, &p, r->amz_date) && app(buf, cap, &p, "\n");
@@ -279,7 +295,7 @@ bool sigv4_sign(const SigV4Request* req, SigV4Result* out) noexcept {
 
     // 1) canonical request → its SHA-256 hex.
     char canon[kSigV4MaxPath + kSigV4MaxQuery + kSigV4MaxHost +
-               kSigV4MaxToken + 512u];
+               kSigV4MaxToken + kSigV4MaxIfMatch + 512u];
     char signed_headers[160];
     const uint32_t clen = build_canonical(req, canon, sizeof(canon),
                                           signed_headers, sizeof(signed_headers));

@@ -1821,14 +1821,16 @@ bool assemble_v2_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
 // One column chunk: walk its pages, decode rows [row0, row0+rows).
 bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
                   ColCtx* cx, int64_t row0, int64_t rows,
-                  Arena* arena) noexcept {
+                  Arena* arena, uint64_t buffer_base = 0) noexcept {
     assert(buf != nullptr && ch != nullptr);
     assert(cx != nullptr && arena != nullptr);
     if (rows == 0) return true;
     const int64_t start = (ch->dictionary_page_offset > 0)
         ? ch->dictionary_page_offset : ch->data_page_offset;
     if (start <= 0 || ch->total_compressed_size <= 0) return false;
-    const uint64_t s = static_cast<uint64_t>(start);
+    const uint64_t absolute_start = static_cast<uint64_t>(start);
+    if (absolute_start < buffer_base) return false;
+    const uint64_t s = absolute_start - buffer_base;
     const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
     if (s > len || region > len - s) return false;
     const uint64_t end = s + region;
@@ -2813,6 +2815,14 @@ bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
     uint64_t off = 0;
     uint32_t mlen = 0;
     if (!pq_locate_footer(buf, len, &off, &mlen)) return false;
+    return parquet_read_meta_slice(buf + off, mlen, arena, out) == ParquetSourceStatus::Ok;
+}
+
+ParquetSourceStatus parquet_read_meta_slice(const uint8_t* metadata, uint32_t length,
+                                           Arena* arena, PqMeta* out) noexcept {
+    assert(arena != nullptr);
+    assert(out != nullptr);
+    if (metadata == nullptr || length == 0) return ParquetSourceStatus::BadArg;
     // Modest first guess; a file that needs more reports its exact width
     // (need_columns) or chunk count (need_chunks) and is re-parsed once per
     // array at that size. A corrupt footer re-fails identically.
@@ -2823,17 +2833,42 @@ bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
         out->columns_cap = (out->columns != nullptr) ? col_cap : 0;
         out->chunks = arena->allocate_array<PqChunk>(chunk_cap);
         out->chunks_cap = (out->chunks != nullptr) ? chunk_cap : 0;
-        if (out->columns == nullptr || out->chunks == nullptr) return false;
-        if (pq_parse_file_meta(buf + off, mlen, out)) return true;
+        if (out->columns == nullptr || out->chunks == nullptr) return ParquetSourceStatus::Capacity;
+        if (pq_parse_file_meta(metadata, length, out)) return ParquetSourceStatus::Ok;
         if (out->need_columns > col_cap) {
             col_cap = out->need_columns;
         } else if (out->need_chunks > chunk_cap) {
             chunk_cap = out->need_chunks;
         } else {
-            return false;                                  // not a capacity miss
+            return ParquetSourceStatus::DecodeFailed;       // not a capacity miss
         }
     }
-    return false;
+    return ParquetSourceStatus::Capacity;
+}
+
+bool parquet_read_col_region(const uint8_t* buf, uint64_t length, uint64_t base,
+    const PqMeta* meta, uint32_t row_group, uint16_t column, Arena* arena,
+    BoltColumn* out, int64_t* out_rows) noexcept {
+    assert(meta != nullptr && out != nullptr);
+    assert(arena != nullptr && out_rows != nullptr);
+    if (buf == nullptr || meta->n_row_groups > kPqMaxRowGroups ||
+        meta->n_columns > kMaxColumns || row_group >= meta->n_row_groups ||
+        column >= meta->n_columns || meta->columns == nullptr || meta->chunks == nullptr ||
+        meta->n_columns > meta->columns_cap || meta->n_chunks > meta->chunks_cap) return false;
+    const PqRowGroup& rg = meta->row_groups[row_group];
+    if (rg.num_rows < 0 || rg.chunk_off > meta->n_chunks ||
+        column >= meta->n_chunks - rg.chunk_off) return false;
+    const PqChunk* chunk = &meta->chunks[rg.chunk_off + column];
+    if (chunk->num_values != rg.num_rows) return false;
+    BoltColumn staged{};
+    ColCtx context;
+    if (!init_col_ctx(meta, column, row_group, row_group + 1u, rg.num_rows,
+                      arena, &staged, &context)) return false;
+    if (!decode_chunk(buf, length, chunk, &context, 0, rg.num_rows, arena, base)) return false;
+    (void)attach_dict_hint(&context, &staged, arena);
+    *out = staged;
+    *out_rows = rg.num_rows;
+    return true;
 }
 
 bool parquet_read_row_group(const uint8_t* buf, uint64_t len,

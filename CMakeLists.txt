@@ -713,6 +713,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_parquet_pageindex.cpp
         src/ingest/bolt_parquet_bloom.cpp
         src/ingest/bolt_parquet_read.cpp
+        src/ingest/bolt_parquet_source.cpp
         src/ingest/bolt_parquet_write.cpp
         src/ingest/bolt_arrow_ipc.cpp
         src/ingest/bolt_arrow_ipc_reader.cpp
@@ -990,6 +991,8 @@ if(BOLT_BUILD_LAKEHOUSE)
 add_library(bolt_lakehouse STATIC
     src/lakehouse/object_store_filesystem.cpp
     src/lakehouse/object_store_s3.cpp
+    src/lakehouse/object_store_range_cache.cpp
+    src/lakehouse/object_store_prefix.cpp
     src/lakehouse/object_store_azure.cpp
     src/lakehouse/object_store_gcs.cpp
     src/lakehouse/object_store_compat.cpp

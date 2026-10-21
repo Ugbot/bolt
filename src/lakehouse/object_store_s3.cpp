@@ -19,6 +19,7 @@ namespace lakehouse {
 namespace {
 
 using oshttp::Buf;
+static_assert(kOsStrongEtagCap == crypto::kSigV4MaxIfMatch);
 
 // url/host/path/query for one request against `key` ("" = bucket root).
 struct S3Target {
@@ -84,7 +85,8 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
             const char* query, const uint8_t* body, uint64_t len,
             bool if_none_match, Arena* arena,
             net::HttpResponse* resp, const char* range = nullptr,
-            uint16_t timeout_ms = 0, uint32_t response_limit = 0) noexcept {
+            uint16_t timeout_ms = 0, uint32_t response_limit = 0,
+            const char* if_match = nullptr) noexcept {
     assert(s3 != nullptr && method != nullptr && key != nullptr);
     assert(arena != nullptr && resp != nullptr);
     if (len > net::kHttpMaxBody) return kOsBadArg;
@@ -124,6 +126,7 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
                                                     : nullptr;
     const bool goog_cas = if_none_match &&
                           s3->create_only == kS3CreateOnlyGoogGeneration;
+    sr.if_match = if_match;
     if (goog_cas) sr.extra_header = "x-goog-if-generation-match:0";
     char auth[crypto::kSigV4MaxAuth];
     char amz_out[24];
@@ -153,8 +156,133 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
     if (len != 0 && std::strcmp(method, "POST") == 0)
         ok = ok && net::http_request_add_header(&req, "Content-Type", "application/xml");
     if (range != nullptr) ok = ok && net::http_request_add_header(&req, "Range", range);
+    if (if_match != nullptr) ok = ok && net::http_request_add_header(&req, "If-Match", if_match);
     if (!ok) return kOsBadArg;
     return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
+}
+
+bool header_name_equal(const char* a, const char* b) noexcept {
+    assert(a != nullptr && b != nullptr);
+    for (uint32_t i = 0; i < 64; ++i) {
+        const unsigned char x = static_cast<unsigned char>(a[i]);
+        const unsigned char y = static_cast<unsigned char>(b[i]);
+        const auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+        if (lower(x) != lower(y)) return false;
+        if (x == 0) return true;
+    }
+    assert(a != nullptr);
+    return false;
+}
+bool single_header(const net::HttpResponse& r, const char* name, const char** out) noexcept {
+    assert(name != nullptr && out != nullptr);
+    assert(r.header_count <= net::kHttpMaxHeaders);
+    *out = nullptr;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < r.header_count; ++i) {
+        if (!header_name_equal(r.headers[i].name, name)) continue;
+        ++count;
+        *out = r.headers[i].value;
+    }
+    return count == 1;
+}
+bool decimal_u64(std::string_view value, uint64_t* out) noexcept {
+    assert(out != nullptr);
+    *out = 0;
+    if (value.empty() || value.size() > 20) return false;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') return false;
+        const auto digit = static_cast<uint64_t>(ch - '0');
+        if (*out > (UINT64_MAX - digit) / 10u) return false;
+        *out = *out * 10u + digit;
+    }
+    assert(value.size() <= 20);
+    return true;
+}
+bool response_version(const net::HttpResponse& response, ObjectVersion* out) noexcept {
+    assert(out != nullptr);
+    assert(response.header_count <= net::kHttpMaxHeaders);
+    const char* length = nullptr;
+    const char* etag = nullptr;
+    ObjectVersion version{};
+    if (!single_header(response, "Content-Length", &length) ||
+        !decimal_u64(length, &version.size) || !single_header(response, "ETag", &etag)) return false;
+    const size_t n = std::strlen(etag);
+    if (n >= sizeof(version.etag)) return false;
+    std::memcpy(version.etag, etag, n + 1u);
+    if (!os_object_version_valid(&version)) return false;
+    *out = version;
+    return true;
+}
+bool exact_content_range(const char* text, uint64_t off, uint32_t length, uint64_t size) noexcept {
+    assert(text != nullptr);
+    assert(length > 0 && off <= size && length <= size - off);
+    std::string_view value(text);
+    if (!value.starts_with("bytes ")) return false;
+    value.remove_prefix(6);
+    const size_t dash = value.find('-'), slash = value.find('/');
+    if (dash == std::string_view::npos || slash == std::string_view::npos || slash <= dash) return false;
+    uint64_t begin = 0, end = 0, total = 0;
+    return decimal_u64(value.substr(0, dash), &begin) &&
+        decimal_u64(value.substr(dash + 1u, slash - dash - 1u), &end) &&
+        decimal_u64(value.substr(slash + 1u), &total) &&
+        begin == off && end == off + length - 1u && total == size;
+}
+int s3_head_versioned(void* impl, const char* key, Arena* scratch, ObjectVersion* out) noexcept {
+    assert(impl != nullptr && key != nullptr);
+    assert(scratch != nullptr && out != nullptr);
+    detail::ObjectSpan key_span{};
+    const detail::ObjectSpan output{out, sizeof(*out)}, state{impl, sizeof(S3ObjectStore)};
+    if (!detail::object_key_span(key, kOsMaxKey, &key_span) ||
+        !detail::object_io_admit(&key_span, 1, &output, 1, scratch, &state, 1)) return kOsBadArg;
+    *out = {};
+    net::HttpResponse response{};
+    const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "HEAD", key, "", nullptr, 0,
+                          false, scratch, &response, nullptr, 0, kOsVersionedRangeMaxBytes);
+    if (rc != kOsOk) return rc;
+    if (response.status == 404) return kOsNotFound;
+    if (response.status != 200 || !response_version(response, out)) return kOsIoError;
+    return kOsOk;
+}
+int s3_get_range_if_match(void* impl, const char* key, const ObjectVersion* expected,
+                          uint64_t offset, uint32_t length, Arena* scratch,
+                          uint8_t* dst, uint32_t* out_length) noexcept {
+    assert(impl != nullptr && key != nullptr && expected != nullptr);
+    assert(scratch != nullptr && out_length != nullptr && (dst != nullptr || length == 0));
+    detail::ObjectSpan inputs[2]{{}, {expected, sizeof(*expected)}};
+    const detail::ObjectSpan outputs[]{{dst, length > kOsVersionedRangeMaxBytes ? 0u : length},
+        {out_length, sizeof(*out_length)}};
+    const detail::ObjectSpan state{impl, sizeof(S3ObjectStore)};
+    if (!detail::object_key_span(key, kOsMaxKey, &inputs[0]) ||
+        !detail::object_io_admit(inputs, 2, outputs, 2, scratch, &state, 1)) return kOsBadArg;
+    *out_length = 0;
+    if (!os_object_version_valid(expected) || length > kOsVersionedRangeMaxBytes ||
+        offset > expected->size || length > expected->size - offset) return kOsBadArg;
+    if (length == 0) return kOsOk;
+    char range[64]{};
+    const int n = std::snprintf(range, sizeof(range), "bytes=%llu-%llu",
+        static_cast<unsigned long long>(offset), static_cast<unsigned long long>(offset + length - 1u));
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(range)) return kOsBadArg;
+    net::HttpResponse response{};
+    const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "GET", key, "", nullptr, 0,
+        false, scratch, &response, range, 0, kOsVersionedRangeMaxBytes, expected->etag);
+    if (rc != kOsOk) return rc;
+    if (response.status == 412) return kOsPreconditionFailed;
+    if (response.status == 404) return kOsNotFound;
+    const char* etag = nullptr;
+    const char* content_range = nullptr;
+    if (response.status != 206 || !single_header(response, "ETag", &etag) ||
+        !single_header(response, "Content-Range", &content_range)) return kOsIoError;
+    ObjectVersion actual{};
+    const size_t tag_size = std::strlen(etag);
+    if (tag_size >= sizeof(actual.etag)) return kOsIoError;
+    std::memcpy(actual.etag, etag, tag_size + 1u);
+    if (!os_object_version_valid(&actual)) return kOsIoError;
+    if (std::strcmp(actual.etag, expected->etag) != 0) return kOsPreconditionFailed;
+    if (!exact_content_range(content_range, offset, length, expected->size) ||
+        response.body_len != length || response.body == nullptr) return kOsIoError;
+    std::memcpy(dst, response.body, length);
+    *out_length = length;
+    return kOsOk;
 }
 
 struct ContiguousSource { const uint8_t* data; };
@@ -361,7 +489,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head, s3_put_if_absent,
-    s3_get_range,
+    s3_get_range, s3_head_versioned, s3_get_range_if_match,
 };
 
 constexpr uint32_t kUploadResponseBytes = 64u * 1024u;

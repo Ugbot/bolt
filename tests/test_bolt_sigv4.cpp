@@ -162,3 +162,52 @@ TEST(BoltSigV4, RejectsNullFields) {
 }
 
 }  // namespace
+
+namespace {
+std::string independent_if_match_authorization() {
+    using namespace bolt::crypto;
+    char empty[65]{}, canonical_hash[65]{};
+    sha256_empty_hex(empty);
+    const std::string headers = "host;if-match;x-amz-content-sha256;x-amz-date;x-amz-security-token;x-goog-if-generation-match";
+    const std::string canonical = std::string("GET\n/object\n\nhost:example.com\nif-match:\"opaque-test\"\nx-amz-content-sha256:") +
+        empty + "\nx-amz-date:20261021T120000Z\nx-amz-security-token:session-token\nx-goog-if-generation-match:0\n\n" + headers + "\n" + empty;
+    sha256_hex(reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size(), canonical_hash);
+    const std::string scope = "20261021/us-east-1/s3/aws4_request";
+    const std::string to_sign = std::string("AWS4-HMAC-SHA256\n20261021T120000Z\n") + scope + "\n" + canonical_hash;
+    uint8_t date_key[32]{}, region_key[32]{}, service_key[32]{}, signing_key[32]{}, signature[32]{};
+    const auto* secret = reinterpret_cast<const uint8_t*>("AWS4secret");
+    hmac_sha256(secret, 10, reinterpret_cast<const uint8_t*>("20261021"), 8, date_key);
+    hmac_sha256(date_key, 32, reinterpret_cast<const uint8_t*>("us-east-1"), 9, region_key);
+    hmac_sha256(region_key, 32, reinterpret_cast<const uint8_t*>("s3"), 2, service_key);
+    hmac_sha256(service_key, 32, reinterpret_cast<const uint8_t*>("aws4_request"), 12, signing_key);
+    hmac_sha256(signing_key, 32, reinterpret_cast<const uint8_t*>(to_sign.data()), to_sign.size(), signature);
+    constexpr char hex[] = "0123456789abcdef";
+    char signature_hex[65]{};
+    for (uint32_t i = 0; i < 32; ++i) {
+        signature_hex[i * 2u] = hex[signature[i] >> 4u];
+        signature_hex[i * 2u + 1u] = hex[signature[i] & 15u];
+    }
+    return "AWS4-HMAC-SHA256 Credential=access/" + scope + ", SignedHeaders=" + headers + ", Signature=" + signature_hex;
+}
+
+TEST(BoltSigV4, IfMatchHasIndependentLexicalCanonicalOrderWithSessionAndExtra) {
+    char empty[65]{};
+    bolt::crypto::sha256_empty_hex(empty);
+    bolt::crypto::SigV4Request request{};
+    request.method = "GET"; request.host = "example.com"; request.path = "/object";
+    request.query_string = ""; request.service = "s3"; request.region = "us-east-1";
+    request.amz_date = "20261021T120000Z"; request.payload_sha256 = empty;
+    request.access_key = "access"; request.secret_key = "secret";
+    request.session_token = "session-token"; request.extra_header = "x-goog-if-generation-match:0";
+    request.if_match = "\"opaque-test\"";
+    char auth[bolt::crypto::kSigV4MaxAuth]{}, date[24]{};
+    bolt::crypto::SigV4Result out{auth, sizeof(auth), date, sizeof(date)};
+    ASSERT_TRUE(bolt::crypto::sigv4_sign(&request, &out));
+    EXPECT_EQ(std::string(auth), independent_if_match_authorization());
+    EXPECT_STREQ(date, request.amz_date);
+    for (const char* invalid : {"W/\"weak\"", "*", "\"one\",\"two\"", "\"space value\"", "\"tag\r\nInjected:yes\""}) {
+        request.if_match = invalid;
+        EXPECT_FALSE(bolt::crypto::sigv4_sign(&request, &out)) << invalid;
+    }
+}
+}  // namespace

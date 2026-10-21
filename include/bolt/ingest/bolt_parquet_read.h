@@ -55,6 +55,8 @@
 
 #pragma once
 
+#include "bolt/ingest/bolt_parquet_source.h"
+
 #include <cstdint>
 
 #include "bolt/bolt_types.h"
@@ -139,6 +141,18 @@ bool parquet_column_int_range(const PqMeta* meta, uint32_t col_idx,
 // the file (a first guess, re-parsed at the file's exact counts).
 bool parquet_read_meta(const uint8_t* buf, uint64_t len, Arena* arena,
                        PqMeta* out) noexcept;
+
+// Shared owned-footer parser for contiguous and exact-source readers. Copies
+// metadata strings/statistics; out may change on refusal, unlike source open.
+ParquetSourceStatus parquet_read_meta_slice(const uint8_t* metadata, uint32_t length,
+                                           Arena* arena, PqMeta* out) noexcept;
+
+// Decode one flat column from a contiguous compressed chunk region. base is
+// the region's absolute FILE offset; no pointer before buf is ever formed.
+// Output descriptor/row count publish only on success. Used by source reads.
+bool parquet_read_col_region(const uint8_t* buf, uint64_t length, uint64_t base,
+    const PqMeta* meta, uint32_t row_group, uint16_t column, Arena* arena,
+    BoltColumn* out, int64_t* out_rows) noexcept;
 
 // Decode ONE row group into caller-preallocated column descriptors
 // (out_cols[meta->n_columns]; the structs are descriptors only — all

@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/lakehouse/object_store/versioned.h"
 
 namespace bolt {
 namespace lakehouse {
@@ -28,6 +29,7 @@ enum : int {
     kOsBufferSmall     = 5,
     kOsExists          = 6,   // put_if_absent: the key already exists
     kOsCancelled       = 7,   // cooperative cancellation before commit
+    kOsPreconditionFailed = 9, // pinned object version changed; never implicitly repin
     kOsWriteUncertain  = 8,   // write may have committed; do not blindly retry
 };
 
@@ -91,6 +93,18 @@ struct ObjectStoreVT {
     // without ranged reads (os_get_range reports kOsNotImplemented).
     int (*get_range)(void* impl, const char* key, uint64_t offset,
                      uint64_t len, uint8_t* dst, uint64_t* out_len) noexcept;
+
+    // Optional strong versioned transport. No emulation via old HEAD/range.
+    // Caller supplies exclusive resettable body workspace; result owns no spans.
+    int (*head_versioned)(void* impl, const char* key, Arena* scratch,
+                          ObjectVersion* out) noexcept = nullptr;
+    // Exact206/If-Match range, <=1 MiB and wholly within expected extent.
+    // Success copies exactly length; admitted failure publishes zero length.
+    // Invalid aliases return BadArg without changing output. Key/descriptor/output
+    // must be disjoint from scratch backing and mutable output spans.
+    int (*get_range_if_match)(void* impl, const char* key, const ObjectVersion* expected,
+                              uint64_t offset, uint32_t length, Arena* scratch,
+                              uint8_t* dst, uint32_t* out_length) noexcept = nullptr;
 };
 
 struct ObjectStore {
@@ -159,13 +173,46 @@ inline int os_put_if_absent(ObjectStore* s, const char* key, const uint8_t* d,
     return s->vt->put_if_absent(s->impl, key, d, n);
 }
 
+// Invalid writable aliases are rejected without output writes. Present providers
+// initialize admitted outputs, including on errors; wrappers do not prewrite them.
 inline int os_get_range(ObjectStore* s, const char* key, uint64_t offset,
                         uint64_t len, uint8_t* dst, uint64_t* out_len) noexcept {
     assert(s != nullptr && s->vt != nullptr);
     assert(key != nullptr && out_len != nullptr && (dst != nullptr || len == 0));
-    *out_len = 0;
-    if (s->vt->get_range == nullptr) return kOsNotImplemented;
+    detail::ObjectSpan key_span{};
+    const detail::ObjectSpan outputs[]{{dst, static_cast<size_t>(len)}, {out_len, sizeof(*out_len)}};
+    const detail::ObjectSpan protected_spans[]{{s, sizeof(*s)}, {s->vt, sizeof(*s->vt)}};
+    if (len > SIZE_MAX || !detail::object_key_span(key, kOsMaxKey, &key_span) ||
+        !detail::object_io_admit(&key_span, 1, outputs, 2, nullptr, protected_spans, 2)) return kOsBadArg;
+    if (s->vt->get_range == nullptr) { *out_len = 0; return kOsNotImplemented; }
     return s->vt->get_range(s->impl, key, offset, len, dst, out_len);
+}
+
+inline int os_head_versioned(ObjectStore* s, const char* key, Arena* scratch,
+                              ObjectVersion* out) noexcept {
+    assert(s != nullptr && s->vt != nullptr && key != nullptr);
+    assert(scratch != nullptr && out != nullptr);
+    detail::ObjectSpan key_span{};
+    const detail::ObjectSpan output{out, sizeof(*out)};
+    const detail::ObjectSpan protected_spans[]{{s, sizeof(*s)}, {s->vt, sizeof(*s->vt)}};
+    if (!detail::object_key_span(key, kOsMaxKey, &key_span) ||
+        !detail::object_io_admit(&key_span, 1, &output, 1, scratch, protected_spans, 2)) return kOsBadArg;
+    if (s->vt->head_versioned == nullptr) { *out = {}; return kOsNotImplemented; }
+    return s->vt->head_versioned(s->impl, key, scratch, out);
+}
+inline int os_get_range_if_match(ObjectStore* s, const char* key, const ObjectVersion* expected,
+                                  uint64_t offset, uint32_t length, Arena* scratch,
+                                  uint8_t* dst, uint32_t* out_length) noexcept {
+    assert(s != nullptr && s->vt != nullptr && key != nullptr);
+    assert(scratch != nullptr && out_length != nullptr && (dst != nullptr || length == 0));
+    detail::ObjectSpan inputs[2]{{}, {expected, sizeof(*expected)}};
+    const detail::ObjectSpan outputs[]{{dst, length > kOsVersionedRangeMaxBytes ? 0u : length},
+        {out_length, sizeof(*out_length)}};
+    const detail::ObjectSpan protected_spans[]{{s, sizeof(*s)}, {s->vt, sizeof(*s->vt)}};
+    if (!detail::object_key_span(key, kOsMaxKey, &inputs[0]) ||
+        !detail::object_io_admit(inputs, 2, outputs, 2, scratch, protected_spans, 2)) return kOsBadArg;
+    if (s->vt->get_range_if_match == nullptr) { *out_length = 0; return kOsNotImplemented; }
+    return s->vt->get_range_if_match(s->impl, key, expected, offset, length, scratch, dst, out_length);
 }
 
 // ---------------------------------------------------------------------------
