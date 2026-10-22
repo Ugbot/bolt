@@ -64,7 +64,7 @@ template <typename T> inline T le(const std::uint8_t* p) noexcept {
     return value;
 }
 inline bool equal(const Instance& a, const Instance& b) noexcept {
-    return std::memcmp(a.bytes, b.bytes, 16) == 0;
+    return std::memcmp(a.bytes, b.bytes, 16) == 0; // sv-memcmp-ok: fixed inline instance bytes, no StringView offsets.
 }
 inline bool zero(const std::uint8_t* p, std::uint32_t size) noexcept {
     assert(p != nullptr);
