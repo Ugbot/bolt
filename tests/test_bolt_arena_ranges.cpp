@@ -35,6 +35,22 @@ TEST(BoltArenaRanges, RetainsUnusedResetAndOversizeBackingWithoutAllocation) {
     EXPECT_TRUE(arena.overlaps_backing(first,16)); EXPECT_TRUE(arena.overlaps_backing(second,8192));
     EXPECT_TRUE(arena.overlaps_backing(oversize,32768)); EXPECT_EQ(arena.total_allocated(),0u);
 }
+TEST(BoltArenaRanges, PairwiseBackingIncludesResetAndOversizeBlocks) {
+    bolt::Arena first({4096,8192}), second({4096,8192});
+    ASSERT_NE(first.allocate(32768),nullptr);
+    const auto reserved=first.total_reserved();
+    const auto used=first.total_allocated();
+    EXPECT_TRUE(first.overlaps_backing(first));
+    EXPECT_FALSE(first.overlaps_backing(second));
+    EXPECT_FALSE(second.overlaps_backing(first));
+    EXPECT_EQ(first.total_reserved(),reserved);
+    EXPECT_EQ(first.total_allocated(),used);
+    first.reset(); first.set_growth_enabled(false); second.set_growth_enabled(false);
+    EXPECT_TRUE(first.overlaps_backing(first));
+    EXPECT_FALSE(first.overlaps_backing(second));
+    EXPECT_EQ(first.total_reserved(),reserved);
+    EXPECT_EQ(first.total_allocated(),0u);
+}
 TEST(BoltArenaRanges, ExtremeAddressAndLengthUseDifferencesWithoutWrapping) {
     bolt::Arena arena({4096,4096});
     auto* p = arena.allocate_array<std::uint8_t>(1); ASSERT_NE(p,nullptr);

@@ -1,0 +1,26 @@
+{
+  "producer": "PyIceberg",
+  "pyiceberg": "0.11.0",
+  "pyarrow": "21.0.0",
+  "root": "s3://graph-bucket/root%20space",
+  "table": "s3://graph-bucket/root%20space/tables/orders",
+  "snapshot_id": 19,
+  "manifest_count": 1,
+  "data_files": 1,
+  "data_file_bytes": 2048,
+  "data_row_bodies": "not generated or read by graph admission",
+  "files": {
+    "golden_iceberg_s3_graph_metadata.json": {
+      "bytes": 839,
+      "sha256": "8afd19b714f999044db1632cdb97dd8cf465e5ea6a05359e536b2708b408efae"
+    },
+    "golden_iceberg_s3_graph_manifest.avro": {
+      "bytes": 4155,
+      "sha256": "6635edf0695ffa303e539a1d5569cb8fd9c8463bb73fe5422be6f2b06f824fec"
+    },
+    "golden_iceberg_s3_graph_manifest_list.avro": {
+      "bytes": 1717,
+      "sha256": "f2df826322e93752c4f3985de4ceadd6ea7168247897b28724d3432b3dd047a4"
+    }
+  }
+}

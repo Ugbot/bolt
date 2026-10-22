@@ -135,6 +135,19 @@ public:
         return false;
     }
 
+    /// Pairwise backing admission for two valid, quiescent Arena objects.
+    /// Includes every retained block, even unused/reset/oversized backing.
+    /// This does not validate raw bytes as an Arena; callers admit object spans
+    /// before invoking methods. No allocation, reset or pointer dereference.
+    bool overlaps_backing(const Arena& other) const noexcept {
+        assert(num_blocks_ <= kArenaMaxBlocks);
+        assert(other.num_blocks_ <= kArenaMaxBlocks);
+        for (uint32_t i = 0; i < other.num_blocks_; ++i) {
+            if (overlaps_backing(other.blocks_[i], other.block_sizes_[i])) return true;
+        }
+        return false;
+    }
+
     /// True only when the entire nonempty range fits one retained block.
     /// Same quiescence requirement as overlaps_backing(); no pointer dereference.
     bool contains_backing(const void* address, size_t size) const noexcept {

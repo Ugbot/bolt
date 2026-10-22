@@ -1113,11 +1113,16 @@ bool avro_read_ex(const uint8_t* src, uint64_t src_len, Arena* arena,
             if (!on_row(ctx, vals, hdr.n_fields, row_index)) return false;
             ++row_index;
         }
+        // The OCF count and byte extent describe the SAME complete block.
+        // Accepting an undecoded suffix can silently hide manifest entries.
+        if (boff != body_len) return false;
         // Sync marker after the block.
         if (off + kAvroSyncLen > src_len) return false;
         if (std::memcmp(src + off, hdr.sync, kAvroSyncLen) != 0) return false;
         off += kAvroSyncLen;
     }
+    // Exhausting the bounded loop is not proof that the container ended.
+    if (off != src_len) return false;
     if (out_rows != nullptr) *out_rows = row_index;
     return true;
 }

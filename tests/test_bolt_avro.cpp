@@ -107,6 +107,52 @@ void put_str(std::vector<uint8_t>& v, const char* s) {
     put_long(v, static_cast<int64_t>(n));
     v.insert(v.end(), s, s + n);
 }
+std::vector<uint8_t> exact_ocf_header() {
+    std::vector<uint8_t> result{'O','b','j',1};
+    put_long(result,1); put_str(result,"avro.schema");
+    put_str(result,R"({"type":"record","name":"Exact","fields":[{"name":"value","type":"long"}]})");
+    put_long(result,0); result.insert(result.end(),kAvroSyncLen,0xa7); return result;
+}
+void exact_ocf_block(std::vector<uint8_t>& result,int64_t count,const std::vector<uint8_t>& body) {
+    put_long(result,count); put_long(result,static_cast<int64_t>(body.size()));
+    result.insert(result.end(),body.begin(),body.end()); result.insert(result.end(),kAvroSyncLen,0xa7);
+}
+bool exact_ocf_row(void* ctx,const AvroValue* values,uint32_t count,int64_t) noexcept {
+    auto* rows=static_cast<std::vector<int64_t>*>(ctx);
+    if(count!=1 || values[0].type!=AvroType::kLong) return false;
+    rows->push_back(values[0].num.i64); return true;
+}
+TEST(BoltAvroExactBlocks, HiddenRowsAndZeroCountNonemptyBlockRefuse) {
+    std::vector<uint8_t> body; put_long(body,11); put_long(body,22);
+    for(const int64_t count:{int64_t{0},int64_t{1},int64_t{3}}) {
+        auto bytes=exact_ocf_header(); exact_ocf_block(bytes,count,body);
+        bolt::Arena arena; std::vector<int64_t> rows; int64_t delivered=777;
+        EXPECT_FALSE(avro_read(bytes.data(),bytes.size(),&arena,&rows,exact_ocf_row,&delivered))<<count;
+        EXPECT_EQ(delivered,777); // Streaming callbacks may have delivered a prefix.
+    }
+}
+TEST(BoltAvroExactBlocks, CompleteMultipleBlocksAndNoDataHeaderRemainValid) {
+    auto bytes=exact_ocf_header(); std::vector<uint8_t> body; put_long(body,11); put_long(body,22);
+    exact_ocf_block(bytes,2,body); body.clear(); put_long(body,-33); exact_ocf_block(bytes,1,body);
+    bolt::Arena arena; std::vector<int64_t> rows; int64_t delivered=777;
+    ASSERT_TRUE(avro_read(bytes.data(),bytes.size(),&arena,&rows,exact_ocf_row,&delivered));
+    EXPECT_EQ(delivered,3); EXPECT_EQ(rows,(std::vector<int64_t>{11,22,-33}));
+    bytes=exact_ocf_header(); rows.clear(); arena.reset();
+    ASSERT_TRUE(avro_read(bytes.data(),bytes.size(),&arena,&rows,exact_ocf_row,&delivered));
+    EXPECT_EQ(delivered,0); EXPECT_TRUE(rows.empty());
+}
+TEST(BoltAvroExactBlocks, ActualBlockCountCapCannotPublishTruncatedPrefix) {
+    auto bytes=exact_ocf_header(); std::vector<uint8_t> block;
+    exact_ocf_block(block,0,{}); constexpr uint32_t cap=1u<<24;
+    const auto header=bytes.size(); bytes.resize(header+std::size_t(cap)*block.size());
+    for(uint32_t i=0;i<cap;++i) std::memcpy(bytes.data()+header+std::size_t(i)*block.size(),block.data(),block.size());
+    bolt::Arena arena; std::vector<int64_t> rows; int64_t delivered=777;
+    ASSERT_TRUE(avro_read(bytes.data(),bytes.size(),&arena,&rows,exact_ocf_row,&delivered));
+    EXPECT_EQ(delivered,0); EXPECT_TRUE(rows.empty());
+    exact_ocf_block(bytes,0,{}); arena.reset(); delivered=777;
+    EXPECT_FALSE(avro_read(bytes.data(),bytes.size(),&arena,&rows,exact_ocf_row,&delivered));
+    EXPECT_EQ(delivered,777); EXPECT_TRUE(rows.empty());
+}
 
 TEST(BoltAvroDatum, ParseSchemaAndDecodePrimitives) {
     const char* json =

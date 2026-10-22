@@ -125,8 +125,9 @@ TEST(BoltLakehouseObjectStore, FilesystemPutGetListDelete) {
 }
 
 // Live-endpoint behaviour is in test_bolt_lakehouse_cloud_put_if_absent; an
-// unreachable endpoint must surface as an I/O error, never a silent success.
-TEST(BoltLakehouseObjectStore, S3UnreachableEndpointIsIoError) {
+// Reads report transport failure. Conditional writes conservatively preserve
+// an unknown outcome, because the transport cannot prove a write was absent.
+TEST(BoltLakehouseObjectStore, S3UnreachableEndpointPreservesWriteUncertainty) {
     S3ObjectStore s3;
     ObjectStore os;
     ASSERT_TRUE(s3_object_store_init(&s3, "my-bucket", "us-east-1",
@@ -137,7 +138,7 @@ TEST(BoltLakehouseObjectStore, S3UnreachableEndpointIsIoError) {
     EXPECT_EQ(os_head(&os, "k", &meta), kOsIoError);
     EXPECT_EQ(os_delete(&os, "k"), kOsIoError);
     const uint8_t b = 'x';
-    EXPECT_EQ(os_put_if_absent(&os, "k", &b, 1), kOsIoError);
+    EXPECT_EQ(os_put_if_absent(&os, "k", &b, 1), kOsWriteUncertain);
 }
 
 }  // namespace

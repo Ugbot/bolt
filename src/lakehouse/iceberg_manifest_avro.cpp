@@ -64,8 +64,9 @@ int32_t find_prefixed(const ing::AvroHeader* h, const char* prefix,
 }
 
 int64_t i64_or(const ing::AvroValue* v, int64_t dflt) noexcept {
-    assert(v != nullptr);
-    return v->is_null ? dflt : v->num.i64;
+    assert(sizeof(dflt) == 8);
+    assert(sizeof(v->num.i64) == sizeof(dflt));
+    return v == nullptr || v->is_null ? dflt : v->num.i64;
 }
 
 bool fits(uint32_t cap, const ing::AvroValue* v) noexcept {

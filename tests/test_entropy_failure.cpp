@@ -1,5 +1,15 @@
 #include "bolt/crypto/random.h"
 
+// Use the same native declaration as random.cpp. The target renames
+// getentropy in this header as well as at the production call site.
+#if defined(__APPLE__)
+#include <sys/random.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#else
+#error "the renamed getentropy test requires macOS or Linux"
+#endif
+
 #include <gtest/gtest.h>
 #include <array>
 #include <cstddef>
@@ -8,11 +18,12 @@
 
 namespace {
 uint32_t backend_calls = 0;
+constexpr bool kBackendNoexcept = noexcept(::getentropy(nullptr, size_t{0}));
 }
 
 // random.cpp is compiled into this test with getentropy renamed here.
 // Deliberately dirty only part of the buffer before reporting OS failure.
-extern "C" int bolt_entropy_test_backend(void* output, size_t size) noexcept {
+extern "C" int bolt_entropy_test_backend(void* output, size_t size) noexcept(kBackendNoexcept) {
     ++backend_calls;
     std::memset(output, 0xEF, (size + 1) / 2);
     return -1;

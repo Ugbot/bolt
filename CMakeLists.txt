@@ -1014,6 +1014,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_metadata_io.cpp
     src/lakehouse/iceberg_snapshot.cpp
     src/lakehouse/iceberg_manifest.cpp
+    src/lakehouse/iceberg_object_graph.cpp
     src/lakehouse/iceberg_manifest_avro.cpp
     src/lakehouse/iceberg_partition.cpp
     src/lakehouse/iceberg_statistics.cpp
@@ -1125,6 +1126,10 @@ target_link_libraries(test_bolt_sbe PRIVATE bolt::core)
 bolt_apply_hardening(test_bolt_sbe)
 
 if(BOLT_BUILD_TESTS)
+    # Every registered CTest executable must exist after the default test build.
+    set_target_properties(test_bolt_sbe_codegen test_bolt_exact_depth
+        test_bolt_exact_ioc test_bolt_book test_bolt_byte_reader test_bolt_sbe
+        PROPERTIES EXCLUDE_FROM_ALL FALSE)
     add_test(NAME test_bolt_sbe_codegen COMMAND test_bolt_sbe_codegen)
     add_test(NAME test_bolt_exact_depth COMMAND test_bolt_exact_depth)
     add_test(NAME test_bolt_exact_ioc COMMAND test_bolt_exact_ioc)
