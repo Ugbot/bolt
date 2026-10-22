@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cassert>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -115,21 +116,28 @@ struct SelfSigned {
 };
 
 bool make_self_signed(SelfSigned* out) noexcept {
-    out->key = EVP_EC_gen("P-256");
-    if (out->key == nullptr) return false;
-    out->cert = X509_new();
-    if (out->cert == nullptr) return false;
-    X509_set_version(out->cert, 2);
-    ASN1_INTEGER_set(X509_get_serialNumber(out->cert), 1);
-    X509_gmtime_adj(X509_getm_notBefore(out->cert), 0);
-    X509_gmtime_adj(X509_getm_notAfter(out->cert), 3600);
-    X509_set_pubkey(out->cert, out->key);
-    X509_NAME* name = X509_get_subject_name(out->cert);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("localhost"),
-                               -1, -1, 0);
-    X509_set_issuer_name(out->cert, name);
-    return X509_sign(out->cert, out->key, EVP_sha256()) > 0;
+    assert(out != nullptr);
+    if (out == nullptr) return false;
+    assert(out->key == nullptr && out->cert == nullptr);
+    *out = {};
+    EVP_PKEY* key = EVP_EC_gen("P-256");
+    X509* cert = key != nullptr ? X509_new() : nullptr;
+    X509_NAME* name = cert != nullptr ? X509_NAME_new() : nullptr;
+    ASN1_INTEGER* serial = cert != nullptr ? X509_get_serialNumber(cert) : nullptr;
+    ASN1_TIME* before = cert != nullptr ? X509_getm_notBefore(cert) : nullptr;
+    ASN1_TIME* after = cert != nullptr ? X509_getm_notAfter(cert) : nullptr;
+    const bool complete = name != nullptr && serial != nullptr && before != nullptr && after != nullptr &&
+        X509_set_version(cert, 2) == 1 && ASN1_INTEGER_set(serial, 1) == 1 &&
+        X509_gmtime_adj(before, 0) != nullptr && X509_gmtime_adj(after, 3600) != nullptr &&
+        X509_set_pubkey(cert, key) == 1 &&
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) == 1 &&
+        X509_set_subject_name(cert, name) == 1 && X509_set_issuer_name(cert, name) == 1 &&
+        X509_sign(cert, key, EVP_sha256()) > 0;
+    X509_NAME_free(name); // both setters copy; the fixture owns this name
+    if (!complete) { X509_free(cert); EVP_PKEY_free(key); return false; }
+    out->key = key; out->cert = cert;
+    return true;
 }
 
 // Accept one connection, finish the TLS handshake, then reset it.

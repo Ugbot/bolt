@@ -341,7 +341,7 @@ inline int32_t bytes_find_simd(
                 0);
             while (m != 0u) {
                 const uint32_t j =
-                    static_cast<uint32_t>(__builtin_ctzll(m)) >> 2;
+                    static_cast<uint32_t>(bolt_ctz64(m)) >> 2;
                 if (mid == 0u ||
                     bytes_eq_mid(hay + i + j + 1u, ndl + 1, mid)) {
                     return static_cast<int32_t>(i + j);
@@ -358,7 +358,7 @@ inline int32_t bytes_find_simd(
                         reinterpret_cast<const __m128i*>(tail + i)), vl));
             uint32_t m = static_cast<uint32_t>(_mm_movemask_epi8(eq));
             while (m != 0u) {
-                const uint32_t j = static_cast<uint32_t>(__builtin_ctz(m));
+                const uint32_t j = static_cast<uint32_t>(bolt_ctz32(m));
                 if (mid == 0u ||
                     bytes_eq_mid(hay + i + j + 1u, ndl + 1, mid)) {
                     return static_cast<int32_t>(i + j);
