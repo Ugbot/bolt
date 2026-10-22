@@ -3,14 +3,13 @@
 // namespace), table, incarnation/schema, cuts and sender before admission.
 // Digests/End/ACK do not establish history retention or a query read lease.
 #pragma once
+#include "bolt/net/replica_limits.h"
 #include "bolt/net/replica_proof_frame_detail.h"
 #include "bolt/net/wal_frame.h"
 namespace bolt::net {
 inline constexpr std::uint32_t kReplicaProofMagic = 0x32505247u;
 inline constexpr std::uint16_t kReplicaProofVersion = 2;
 inline constexpr std::uint32_t kReplicaProofHeaderBytes = 252;
-inline constexpr std::uint32_t kReplicaProofMaxPayload = 4u * 1024u * 1024u - 512u;
-inline constexpr std::uint64_t kReplicaProofMaxEntries = 65536;
 static_assert(kReplicaProofHeaderBytes + kReplicaProofMaxPayload + kFrameHeaderBytes <= kWalMaxFrameBytes,
               "proof envelope and outer WAL wrapper must fit fragmentation cap");
 // Outer WAL wrapper uses this non-catalog tid and a disjoint kind. Only a

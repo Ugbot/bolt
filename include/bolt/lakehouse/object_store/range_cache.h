@@ -1,10 +1,10 @@
 // Thread-confined, validator-bound object ranges; explicit startup ownership.
 #pragma once
+#include "bolt/lakehouse/object_store/object_store_limits.h"
 #include "bolt/lakehouse/object_store.h"
 
 namespace bolt::lakehouse {
 inline constexpr uint32_t kObjectRangePageBytes = 1u << 20;
-inline constexpr uint32_t kObjectRangeMaxPages = 64;
 inline constexpr uint64_t kObjectRangeMaxReadBytes = uint64_t{kObjectRangePageBytes} * kObjectRangeMaxPages;
 struct ObjectRangeCache;
 struct ObjectRangeCacheStats {

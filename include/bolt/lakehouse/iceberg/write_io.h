@@ -1,9 +1,9 @@
 // Optional staged data transport. Metadata still uses the table ObjectStore.
 #pragma once
+#include "bolt/lakehouse/iceberg/iceberg_io_limits.h"
 #include "bolt/lakehouse/iceberg/writer.h"
 
 namespace bolt::lakehouse::iceberg {
-inline constexpr uint32_t kIcebergStagedPathCap = 4096;
 struct StagedDataFile {
     CommitCandidate candidate{};
     char local_path[kIcebergStagedPathCap]{};

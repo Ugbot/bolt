@@ -1,13 +1,12 @@
 // Cold, bounded immutable Arrow snapshot and allocation-free C ABI leases.
 // No engine, Python, or libarrow dependency. CPU flat struct batches only.
 #pragma once
+#include "bolt/interop/arrow_owner_limits.h"
 #include <cstdint>
 #include "bolt/interop/arrow_c.h"
 namespace bolt { class Arena; }
 namespace bolt::arrow {
 struct ArrowOwner;
-inline constexpr std::uint32_t kOwnerMaxFields = 4096;
-inline constexpr std::uint32_t kOwnerMaxLeases = 64;
 struct OwnerLimits {
     std::uint64_t bytes = 128 * 1024 * 1024;
     std::uint32_t fields = 32;

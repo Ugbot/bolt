@@ -1,14 +1,13 @@
 // A finite, caller-admitted directory of immutable object versions.
 #pragma once
+#include "bolt/lakehouse/object_store/object_store_limits.h"
 
 #include <thread>
 #include "bolt/lakehouse/object_store.h"
 
 namespace bolt::lakehouse {
 
-inline constexpr uint32_t kOsPinnedMaxEntries = 65536u;
 inline constexpr uint64_t kOsPinnedMaxGetBytes = uint64_t{1} << 30;
-inline constexpr uint32_t kOsPinnedMaxRequestBytes = 1u << 20;
 
 struct PinnedObject {
     char key[kOsMaxKey];

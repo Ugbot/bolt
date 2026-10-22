@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/bolt_port_limits.h"
 #include "bolt/bolt_config.h"
 // bolt_port.h — portability macros.
 // Compiles cleanly on MSVC, clang, clang-cl, gcc. No POSIX in the core.
@@ -334,7 +335,6 @@ BOLT_FORCE_INLINE uint32_t bolt_get_hardware_concurrency() noexcept {
     return n == 0u ? 1u : static_cast<uint32_t>(n);
 }
 
-inline constexpr uint32_t kBoltThreadAffinityCpuCapacity = 4096u;
 
 // Encoding only: no online-CPU, availability or permission check. CPU IDs may
 // be sparse, so hardware_concurrency() is not an admissible upper bound.

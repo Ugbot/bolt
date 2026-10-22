@@ -1,10 +1,10 @@
 #pragma once
+#include "bolt/wire/mold_udp64_limits.h"
 #include "sbe.h"
 
 namespace bolt::wire::mold_udp64 {
 inline constexpr std::uint32_t kHeaderBytes = 20;
 inline constexpr std::uint32_t kSessionBytes = 10;
-inline constexpr std::uint32_t kUdpPayloadMax = 65507;
 enum class Status : std::uint8_t { Ok, End, Invalid, Truncated, Capacity, Overflow };
 enum class Kind : std::uint8_t { Data, Heartbeat, EndSession };
 struct Limits { std::uint32_t datagram_bytes = 0, messages = 0; };

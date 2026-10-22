@@ -53,11 +53,9 @@ namespace net {
 
 namespace {
 
+#include "bolt_http_client_limits.h"
+
 constexpr uint32_t kDefaultTimeoutMs = 10000;
-constexpr uint32_t kMaxTimeoutMs = 60000;
-constexpr uint32_t kMaxWireOverhead = 64u * 1024u;
-constexpr uint32_t kInitialReadCapacity = 8192;
-constexpr uint32_t kMaxSocketRetries = 64;
 
 int64_t now_ms() noexcept {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -564,7 +562,7 @@ bool send_request_head(HttpConn* c, const HttpRequest* req,
                        const char* path, const char* authority) noexcept {
     assert(c != nullptr && req != nullptr);
     assert(path != nullptr && authority != nullptr);
-    constexpr uint32_t kRequestHeadCap = 16u * 1024u;
+    constexpr uint32_t kRequestHeadCap = http_client_limits::kRequestHeadCap;
     char head[kRequestHeadCap];
     int size = std::snprintf(head, sizeof(head),
         "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n",

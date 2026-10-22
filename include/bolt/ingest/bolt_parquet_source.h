@@ -1,12 +1,12 @@
 // Parquet over an exact, version-pinned byte source. No transport dependency.
 #pragma once
+#include "bolt/ingest/bolt_parquet_source_limits.h"
 #include <cstdint>
 #include "bolt/ingest/bolt_parquet_meta.h"
 
 namespace bolt { class Arena; struct BoltColumn; }
 namespace bolt::ingest::parquet {
 
-inline constexpr uint32_t kParquetSourceMaxReadBytes = 1024u * 1024u;
 enum class ParquetSourceStatus : uint8_t {
     Ok, BadArg, IoError, Changed, Capacity, DecodeFailed
 };

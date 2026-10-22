@@ -1,6 +1,7 @@
 // Bounded, synchronous S3 multipart upload. Caller owns source storage, arena
 // and result. Uses ordinary SigV4 requests, never implicit retries.
 #pragma once
+#include "bolt/lakehouse/object_store/object_store_limits.h"
 
 #include "bolt/lakehouse/object_store.h"
 
@@ -8,10 +9,6 @@ namespace bolt::lakehouse {
 
 inline constexpr uint32_t kS3MinPartBytes = 5u * 1024u * 1024u;
 inline constexpr uint32_t kS3DefaultPartBytes = 8u * 1024u * 1024u;
-inline constexpr uint32_t kS3MaxPartBytes = 16u * 1024u * 1024u;
-inline constexpr uint32_t kS3MaxUploadParts = 10000u;
-inline constexpr uint32_t kS3UploadIdCap = 1024u;
-inline constexpr uint32_t kS3PartEtagCap = 128u;
 
 enum class S3UploadPhase : uint8_t { Admission, Create, Source, Part, Complete, Done };
 

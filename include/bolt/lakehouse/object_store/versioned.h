@@ -1,12 +1,11 @@
 // Strong copied object identity and bounded admission for borrowed versioned I/O.
 #pragma once
+#include "bolt/lakehouse/object_store/object_store_limits.h"
 #include <cstddef>
 #include <cstdint>
 #include "bolt/bolt_arena.h"
 
 namespace bolt::lakehouse {
-inline constexpr uint32_t kOsStrongEtagCap = 256u;
-inline constexpr uint32_t kOsVersionedRangeMaxBytes = 8u << 20;
 struct ObjectVersion {
     uint64_t size;
     char etag[kOsStrongEtagCap]; // exact strong quoted validator, including quotes

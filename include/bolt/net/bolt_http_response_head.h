@@ -1,12 +1,11 @@
 #pragma once
+#include "bolt/net/bolt_http_limits.h"
 // Caller-buffer HTTP/1 response head parser. Does not read a socket or allocate.
 // Slices borrow input bytes. Transport/body-framing policy belongs to the caller.
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 namespace bolt::net {
-inline constexpr std::uint32_t kHttpResponseHeadCap = 8192;
-inline constexpr std::uint32_t kHttpResponseHeaderCap = 32;
 enum class HttpHeadParse : std::uint8_t { kIncomplete, kInvalid, kComplete };
 struct HttpHeadSlice { const char* bytes; std::uint32_t size; };
 struct HttpResponseHeaderView { HttpHeadSlice name, value; };

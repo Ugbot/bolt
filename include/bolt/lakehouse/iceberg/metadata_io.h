@@ -1,11 +1,11 @@
 // Exact immutable metadata-object load; no catalog/path discovery or mutation.
 #pragma once
+#include "bolt/lakehouse/iceberg/iceberg_io_limits.h"
 
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/object_store.h"
 
 namespace bolt::lakehouse::iceberg {
-inline constexpr uint32_t kMetadataLoadMaxRequestBytes = 1u << 20;
 
 struct MetadataObjectIdentity {
     // Canonical root of the SUPPLIED ObjectStore's relative key namespace.

@@ -3,6 +3,7 @@
 // Legacy WAL frames and proof/control codecs remain unchanged. Strict peers
 // must explicitly opt in; legacy apply must never receive this outer kind.
 #pragma once
+#include "bolt/net/replica_limits.h"
 #include "bolt/net/wal_frame.h"
 #include "bolt/wire/byte_reader.h"
 #include <cstddef>
@@ -15,7 +16,6 @@ inline constexpr std::uint16_t kReplicaDataVersion = 1;
 inline constexpr std::uint32_t kReplicaDataHeaderBytes = 32;
 inline constexpr std::uint32_t kReplicaDataHasLane = 1u;
 inline constexpr std::uint32_t kReplicaDataHasIncarnation = 2u;
-inline constexpr std::uint8_t kReplicaDataMaxPrimaries = 8;
 inline constexpr std::uint32_t kReplicaDataMaxPayload =
     kWalMaxFrameBytes - kFrameHeaderBytes - kReplicaDataHeaderBytes;
 static_assert(kFrameHeaderBytes + kReplicaDataHeaderBytes < kWalMaxFrameBytes);

@@ -19,6 +19,7 @@
 // no exceptions.
 
 #pragma once
+#include "bolt/crypto/crypto_limits.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +38,6 @@ static constexpr uint32_t kSigV4MaxSecret  = 256u;
 static constexpr uint32_t kSigV4MaxToken   = 2048u;
 // Authorization header value upper bound (signed headers + sig hex + creds).
 static constexpr uint32_t kSigV4MaxAuth    = 1024u;
-static constexpr uint32_t kSigV4MaxIfMatch = 256u;
 
 // One request to sign. All char* are NUL-terminated C strings the caller owns.
 // `payload_sha256` is the lowercase-hex SHA-256 of the body (64 hex chars +
