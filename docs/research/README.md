@@ -10,6 +10,8 @@ or plan prose. New topic → new file + add an entry below.
 
 ## Index
 
+- [accept-retirement.md](accept-retirement.md) — checked listener retirement, original/cancel completion ownership and shared dispatcher lifetime; implementation qualification pending.
+
 - [idot-isa-isolation.md](idot-isa-isolation.md) — baseline dispatch compilation, configured consumer ISA, isolated performance tripwire and platform qualification limits.
 
 - [seqlock-atomic-payload.md](seqlock-atomic-payload.md) — inline atomic snapshot cells, sequence coherence proof, bounded refusal and separate mapping lifetime/qualification gates.

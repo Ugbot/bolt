@@ -78,19 +78,33 @@ public:
 
     /// Start in background (non-blocking)
     /// Returns immediately, listener runs in background threads
+    /// A later submission failure sets accept_error() and clears is_running();
+    /// retirement/stop still owns the failed startup's records and fds.
     int start_background();
 
-    /// Stop the listener
+    /// Cold blocking stop; externally serialize start/retirement/stop calls.
+    /// Repeats bounded retirement units while the owner makes progress, then
+    /// joins owned resources. There is no universal wall-clock deadline.
     /// Stops accepting; active handlers (including queued starts) are not drained.
     /// Retain this listener and handler captures until the dispatcher has joined
     /// and its handlers have completed. When owning dispatcher/workers, call
     /// outside those threads because stop joins them.
     void stop();
 
+    /// Serialized cold lifecycle operation. No join, polling or blocking lock.
+    /// Complete retires only accepts/callbacks/cancel tokens/listening fds.
+    /// Every other result retains this owner/storage; keep engine progress alive.
+    /// Complete permits rebinding the port, but stop() must finish the lifecycle
+    /// before restarting this object or destroying shared handler captures.
+    core::AcceptRetirementStatus try_retire_accepts(core::AcceptRetirementDeadline deadline) noexcept;
+
     /// Check if listener is running
     bool is_running() const noexcept {
         return running_.load(std::memory_order_relaxed);
     }
+    /// Native startup/submission refusal, zero while healthy. Asynchronous
+    /// refusal stops admission; retained records still require stop/retirement.
+    int accept_error() const noexcept { return accept_error_.load(std::memory_order_acquire); }
 
     /// Get the IODispatcher (works for both owned and shared)
     IODispatcher* dispatcher() noexcept {
@@ -118,10 +132,11 @@ public:
     Stats get_stats() const noexcept;
 
 private:
+    friend struct AcceptRetirementTestAccess;
     // Accept loop coroutine — detached_task self-destroys on completion, so
     // the frame is reclaimed when the loop exits (listener stop or fatal accept
     // error) — no leaked frame for the lifetime of the process.
-    core::detached_task accept_loop(int listen_fd);
+    core::detached_task accept_loop(core::AcceptRetirement* record);
 
     // Create and configure the listen socket
     int create_listen_socket();
@@ -146,8 +161,12 @@ private:
     // these wildcard listeners. Shared backend (IOCP): one accept loop/socket.
     // Closed in stop(); queued handlers count as active connections.
     std::vector<int> listen_fds_;
+    std::unique_ptr<core::AcceptRetirement[]> accept_records_;
+    size_t accept_record_count_ = 0u;
+    bool accepts_retired_ = false;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
+    std::atomic<int> accept_error_{0};
 
     // Stats
     alignas(core::kCacheLineSize) std::atomic<uint64_t> connections_accepted_{0};

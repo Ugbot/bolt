@@ -40,6 +40,7 @@ struct pending_op {
     int fd;
     io_callback callback;
     void* user_data;
+    AcceptRetirement* retirement{nullptr};
     
     // For read/write
     void* buffer{nullptr};
@@ -62,6 +63,7 @@ struct pending_op {
         fd = -1;
         callback = nullptr;
         user_data = nullptr;
+        retirement = nullptr;
         buffer = nullptr;
         size = 0;
         addrlen = 0;
@@ -100,7 +102,7 @@ struct kqueue_io::impl {
     // independently, so each fd has a read slot and a write slot; close_async
     // claims them to complete in-flight ops.
     static constexpr std::uint32_t kOpPoolSize = 8192;
-    static constexpr int           kMaxFds     = 1 << 16;
+    static constexpr int           kMaxFds     = AcceptRetirement::kReadinessFdLimit;
     std::vector<pending_op>                 op_pool{std::vector<pending_op>(kOpPoolSize)};
     std::vector<std::atomic<std::uint32_t>> free_next{std::vector<std::atomic<std::uint32_t>>(kOpPoolSize)};
     std::atomic<std::uint64_t>              free_head{0};  // (tag<<32)|(index+1); 0=empty
@@ -134,13 +136,18 @@ struct kqueue_io::impl {
 
     void free_index(std::uint32_t idx) noexcept {
         assert(idx < kOpPoolSize);
+        auto* retirement = op_pool[idx].retirement;
+        op_pool[idx].retirement = nullptr;
         op_pool[idx].callback = nullptr;  // release captured state now
         std::uint64_t head = free_head.load(std::memory_order_acquire);
         for (;;) {
             free_next[idx].store(static_cast<std::uint32_t>(head), std::memory_order_relaxed);
             const std::uint64_t nxt = (((head >> 32) + 1) << 32) | (idx + 1);
             if (free_head.compare_exchange_weak(head, nxt, std::memory_order_acq_rel,
-                                                std::memory_order_acquire)) return;
+                                                std::memory_order_acquire)) {
+                if (retirement) retirement->operations.fetch_sub(1u, std::memory_order_release);
+                return;
+            }
         }
     }
 
@@ -250,16 +257,20 @@ kqueue_io::~kqueue_io() {
 int kqueue_io::accept_async(
     int listen_fd,
     io_callback callback,
-    void* user_data
+    void* user_data, AcceptRetirement* retirement
 ) noexcept {
+    if (retirement && retirement->requested.load(std::memory_order_acquire)) { errno = ECANCELED; return -1; }
+    if (retirement && impl_->slot_for(listen_fd, EVFILT_READ) == nullptr) { errno = EOVERFLOW; return -1; }
     impl_->set_nonblocking(listen_fd);
     
     pending_op* op = impl_->alloc_op();
-    if (op == nullptr) return -1;
+    if (op == nullptr) { errno = ENOBUFS; return -1; }
     op->operation = io_op::accept;
     op->fd = listen_fd;
     op->callback = std::move(callback);
     op->user_data = user_data;
+    op->retirement = retirement;
+    if (retirement) retirement->operations.fetch_add(1u, std::memory_order_acq_rel);
 
     impl_->stat_accepts.fetch_add(1, std::memory_order_relaxed);
     return impl_->register_op(op, EVFILT_READ);
@@ -403,6 +414,7 @@ int kqueue_io::close_async(int fd) noexcept {
 }
 
 int kqueue_io::poll(uint32_t timeout_us) noexcept {
+    progress_accept_retirements();
     if (impl_->kq_fd < 0) return -1;
     
     impl_->stat_polls.fetch_add(1, std::memory_order_relaxed);
@@ -507,6 +519,30 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     }
     
     return n;
+}
+
+AcceptRetirementStatus kqueue_io::advance_accept_retirement(AcceptRetirement& record) noexcept {
+    if (auto* slot = impl_->slot_for(record.fd, EVFILT_READ)) {
+        const auto index = slot->load(std::memory_order_acquire);
+        if (index != 0u) {
+            auto& op = impl_->op_pool[index - 1u];
+            if (op.operation != io_op::accept || op.retirement != &record) {
+                record.error.store(EINVAL, std::memory_order_release); return AcceptRetirementStatus::Error;
+            }
+            struct kevent removal;
+            EV_SET(&removal, record.fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+            if (kevent(impl_->kq_fd, &removal, 1, nullptr, 0, nullptr) != 0) {
+                record.error.store(errno, std::memory_order_release); return AcceptRetirementStatus::Error;
+            }
+            impl_->cancel_slot(record.fd, EVFILT_READ);
+        }
+    }
+    if (record.operations.load(std::memory_order_acquire) != 0u ||
+        !record.loop_exited.load(std::memory_order_acquire)) return AcceptRetirementStatus::Pending;
+    if (::close(record.fd) != 0) {
+        record.error.store(errno, std::memory_order_release); return AcceptRetirementStatus::Error;
+    }
+    return AcceptRetirementStatus::Complete;
 }
 
 void kqueue_io::run() noexcept {

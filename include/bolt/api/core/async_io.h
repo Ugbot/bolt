@@ -15,6 +15,8 @@
 #include <functional>
 #include <memory>
 #include <atomic>
+#include <array>
+#include "bolt/api/core/accept_retirement.h"
 
 // Platform-specific includes
 #ifdef _WIN32
@@ -120,13 +122,41 @@ public:
      * @param listen_fd Listening socket FD
      * @param callback Callback when connection accepted
      * @param user_data User data passed to callback
+     * @param retirement Optional startup-owned listener record. Tracked
+     *        readiness registration and poll use one serialized reactor owner;
+     *        out-of-table descriptors refuse before registration (EOVERFLOW).
      * @return 0 on success, error code otherwise
      */
     virtual int accept_async(
         int listen_fd,
         io_callback callback,
-        void* user_data = nullptr
+        void* user_data = nullptr,
+        AcceptRetirement* retirement = nullptr
     ) noexcept = 0;
+
+    // Bounded admission/observation only; never polls, locks or joins here.
+    // Polling owner retains record/storage through every non-Complete result.
+    AcceptRetirementStatus try_retire_accepts(AcceptRetirement& record,
+        AcceptRetirementDeadline deadline) noexcept {
+        if (record.complete.load(std::memory_order_acquire)) return AcceptRetirementStatus::Complete;
+        record.requested.store(true, std::memory_order_release);
+        if (record.error.load(std::memory_order_acquire) != 0) return AcceptRetirementStatus::Error;
+        if (record.admitted.load(std::memory_order_acquire)) return AcceptRetirementStatus::Pending;
+        for (auto& slot : accept_retirements_) {
+            if (std::chrono::steady_clock::now() >= deadline) return AcceptRetirementStatus::Pending;
+            AcceptRetirement* empty = nullptr;
+            // Serialized lifecycle caller sets admission before publishing; the
+            // poll owner can complete immediately after this release CAS.
+            record.admitted.store(true, std::memory_order_relaxed);
+            accept_retirement_count_.fetch_add(1u, std::memory_order_acq_rel);
+            if (slot.compare_exchange_strong(empty, &record, std::memory_order_release, std::memory_order_relaxed)) {
+                wake(); return AcceptRetirementStatus::Pending;
+            }
+            accept_retirement_count_.fetch_sub(1u, std::memory_order_release);
+            record.admitted.store(false, std::memory_order_relaxed);
+        }
+        return AcceptRetirementStatus::Unavailable;
+    }
     
     /**
      * Submit async read operation
@@ -315,6 +345,27 @@ public:
     virtual stats get_stats() const noexcept = 0;
 
 protected:
+    virtual AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept = 0;
+    void progress_accept_retirements() noexcept {
+        if (accept_retirement_count_.load(std::memory_order_acquire) == 0u) return;
+        if (accept_retirement_owner_.test_and_set(std::memory_order_acquire)) return;
+        for (auto& slot : accept_retirements_) {
+            auto* record = slot.load(std::memory_order_acquire);
+            if (record == nullptr || record->error.load(std::memory_order_acquire) != 0) continue;
+            if (advance_accept_retirement(*record) != AcceptRetirementStatus::Complete) continue;
+            slot.store(nullptr, std::memory_order_release);
+            accept_retirement_count_.fetch_sub(1u, std::memory_order_release);
+            record->complete.store(true, std::memory_order_release); // last record access
+        }
+        accept_retirement_owner_.clear(std::memory_order_release);
+    }
+
+private:
+    std::array<std::atomic<AcceptRetirement*>, AcceptRetirement::kCapacity> accept_retirements_{};
+    std::atomic_flag accept_retirement_owner_ = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> accept_retirement_count_{0u};
+
+protected:
     async_io() = default;
 };
 
@@ -337,7 +388,10 @@ public:
     io_backend backend() const noexcept override { return io_backend::kqueue; }
     const char* backend_name() const noexcept override { return "kqueue"; }
 
-    int accept_async(int listen_fd, io_callback callback, void* user_data) noexcept override;
+    int accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement = nullptr) noexcept override;
+protected:
+    AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
+public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
@@ -375,7 +429,10 @@ public:
     io_backend backend() const noexcept override { return io_backend::epoll; }
     const char* backend_name() const noexcept override { return "epoll"; }
 
-    int accept_async(int listen_fd, io_callback callback, void* user_data) noexcept override;
+    int accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement = nullptr) noexcept override;
+protected:
+    AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
+public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
@@ -412,7 +469,10 @@ public:
     io_backend backend() const noexcept override { return io_backend::io_uring; }
     const char* backend_name() const noexcept override { return "io_uring"; }
 
-    int accept_async(int listen_fd, io_callback callback, void* user_data) noexcept override;
+    int accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement = nullptr) noexcept override;
+protected:
+    AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
+public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
@@ -438,6 +498,12 @@ public:
     bool usable() const noexcept;
 
 private:
+    friend struct AcceptRetirementTestAccess;
+    // Owner-thread admission controls for deterministic syscall-failure tests.
+    // They cannot create CQEs or release a kernel-owned slot.
+    void test_limit_next_enter(unsigned limit) noexcept;
+    void test_interrupt_next_enter() noexcept;
+    unsigned test_pending_submissions() noexcept;
     struct impl;
     std::unique_ptr<impl> impl_;
 };
@@ -457,7 +523,10 @@ public:
     io_backend backend() const noexcept override { return io_backend::iocp; }
     const char* backend_name() const noexcept override { return "IOCP"; }
 
-    int accept_async(int listen_fd, io_callback callback, void* user_data) noexcept override;
+    int accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement = nullptr) noexcept override;
+protected:
+    AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
+public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;

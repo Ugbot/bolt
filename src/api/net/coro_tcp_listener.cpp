@@ -108,11 +108,14 @@ int CoroTcpListener::start() {
 }
 
 int CoroTcpListener::start_background() {
+    if (accept_record_count_ != 0u) { errno = EBUSY; return -1; }
+    accepts_retired_ = false;
     if (running_.exchange(true)) {
         return -1;  // Already running
     }
 
     stop_requested_.store(false, std::memory_order_relaxed);
+    accept_error_.store(0, std::memory_order_release);
 
     LOG_INFO("CORO_TCP", "Starting on %s:%d (shared_resources: %s)",
              config_.host.c_str(), config_.port,
@@ -123,6 +126,7 @@ int CoroTcpListener::start_background() {
         LOG_ERROR("CORO_TCP", "Port %d is already in use (%s); refusing to share it "
                   "with another listener", config_.port, strerror(saved));
         running_.store(false);
+        accept_error_.store(saved, std::memory_order_release);
         errno = saved;
         return -1;
     }
@@ -158,6 +162,7 @@ int CoroTcpListener::start_background() {
         if (!shared_io_dispatcher_ || !shared_worker_pool_) {
             LOG_ERROR("CORO_TCP", "Shared resources not provided");
             running_.store(false);
+            accept_error_.store(EINVAL, std::memory_order_release); errno = EINVAL;
             return -1;
         }
 
@@ -174,28 +179,38 @@ int CoroTcpListener::start_background() {
 #else
     const size_t accept_loops = per_thread ? io_dispatcher->io_thread_count() : 1;
 #endif
+    if (accept_loops > core::AcceptRetirement::kCapacity) {
+        accept_error_.store(EINVAL, std::memory_order_release); stop(); errno = EINVAL; return -1;
+    }
+    accept_records_ = std::make_unique<core::AcceptRetirement[]>(accept_loops);
+    accept_record_count_ = accept_loops;
+    for (size_t i = 0u; i < accept_loops; ++i)
+        accept_records_[i].loop_exited.store(true, std::memory_order_relaxed);
 
     auto unwind = [&]() {
-        for (int fd : listen_fds_) {
-            if (fd >= 0) sys::close_socket(fd);
-        }
-        listen_fds_.clear();
-        if (owns_resources_) {
-            io_dispatcher_->stop();
-            worker_pool_->stop();
-        }
-        running_.store(false);
+        stop(); // published accept ownership uses the same retirement path
     };
 
     listen_fds_.reserve(accept_loops);
     for (size_t i = 0; i < accept_loops; ++i) {
         int fd = create_listen_socket();
         if (fd < 0) {
+            const int saved = errno;
             LOG_ERROR("CORO_TCP", "Failed to create listen socket %zu", i);
             unwind();
+            accept_error_.store(saved, std::memory_order_release);
+            errno = saved;
             return -1;
         }
         listen_fds_.push_back(fd);
+        accept_records_[i].fd = fd;
+        accept_records_[i].reactor = static_cast<uint32_t>(i);
+        const int admission_error = io_dispatcher->accept_admission_error(accept_records_[i]);
+        if (admission_error != 0) {
+            accept_records_[i].admission_error.store(admission_error, std::memory_order_release);
+            accept_error_.store(admission_error, std::memory_order_release);
+            unwind(); errno = admission_error; return -1;
+        }
     }
     LOG_INFO("CORO_TCP", "Listening on %zu socket(s) (per-thread accept: %s)",
              listen_fds_.size(), per_thread ? "yes" : "no");
@@ -203,15 +218,20 @@ int CoroTcpListener::start_background() {
     // Start the accept loop(s). Each is a coroutine; release its handle (the
     // worker pool / IO thread owns it thereafter) and start it.
     for (size_t i = 0; i < accept_loops; ++i) {
-        auto accept_task = accept_loop(listen_fds_[i]);
+        auto& record = accept_records_[i];
+        record.loop_exited.store(false, std::memory_order_release); // before queue publication
+        auto accept_task = accept_loop(&record);
         auto handle = accept_task.release();
         const bool ok = per_thread
-            ? io_dispatcher->post_to_io_thread(i, handle)   // run ON IO thread i
+            ? io_dispatcher->try_post_to_io_thread(i, handle)   // bounded startup admission
             : worker_pool->submit(handle);                  // shared: any worker
         if (!ok) {
             LOG_ERROR("CORO_TCP", "Failed to start accept loop %zu", i);
             if (handle) handle.destroy();
+            record.loop_exited.store(true, std::memory_order_release);
             unwind();
+            accept_error_.store(ENOBUFS, std::memory_order_release);
+            errno = ENOBUFS;
             return -1;
         }
     }
@@ -220,19 +240,11 @@ int CoroTcpListener::start_background() {
 }
 
 void CoroTcpListener::stop() {
-    if (!running_.exchange(false)) {
-        return;  // Not running
-    }
-
-    stop_requested_.store(true, std::memory_order_release);
-
-    // Close listen socket(s) to break the accept loop(s).
-    for (int fd : listen_fds_) {
-        if (fd >= 0) {
-            sys::close_socket(fd);
-        }
-    }
-    listen_fds_.clear();
+    if (!running_.load(std::memory_order_acquire) && accept_record_count_ == 0u) return;
+    // Legacy cold owner-progress wrapper; no universal wall-clock bound. Must
+    // run outside owned reactors/workers and before shared progress is stopped.
+    while (try_retire_accepts(std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) !=
+           core::AcceptRetirementStatus::Complete) std::this_thread::yield();
 
     // Only stop resources if we own them
     if (owns_resources_) {
@@ -248,13 +260,34 @@ void CoroTcpListener::stop() {
     }
 
     LOG_INFO("CORO_TCP", "Stopped");
+    listen_fds_.clear(); accept_records_.reset(); accept_record_count_ = 0u; accepts_retired_ = false;
+}
+
+core::AcceptRetirementStatus CoroTcpListener::try_retire_accepts(core::AcceptRetirementDeadline deadline) noexcept {
+    if (accepts_retired_) return core::AcceptRetirementStatus::Complete;
+    stop_requested_.store(true, std::memory_order_release);
+    running_.store(false, std::memory_order_release);
+    auto* io = dispatcher();
+    bool pending = false;
+    for (size_t i = 0u; i < accept_record_count_; ++i) {
+        if (accept_records_[i].fd < 0) continue; // never published startup slot
+        if (std::chrono::steady_clock::now() >= deadline) return core::AcceptRetirementStatus::Pending;
+        if (io == nullptr) return core::AcceptRetirementStatus::Error;
+        const auto result = io->try_retire_accepts(i, accept_records_[i], deadline);
+        if (result == core::AcceptRetirementStatus::Error || result == core::AcceptRetirementStatus::Unavailable) return result;
+        pending |= result != core::AcceptRetirementStatus::Complete;
+    }
+    if (pending) return core::AcceptRetirementStatus::Pending;
+    accepts_retired_ = true; // storage reclamation belongs to legacy stop/start, not this bounded call
+    return core::AcceptRetirementStatus::Complete;
 }
 
 // =============================================================================
 // Accept Loop Coroutine
 // =============================================================================
 
-core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
+core::detached_task CoroTcpListener::accept_loop(core::AcceptRetirement* record) {
+    const int listen_fd = record->fd;
     assert(listen_fd >= 0);
     assert(dispatcher() != nullptr);
     LOG_INFO("CORO_TCP", "Accept loop started on fd %d", listen_fd);
@@ -263,11 +296,19 @@ core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
 
     while (!stop_requested_.load(std::memory_order_acquire)) {
         // Async accept - yields until connection ready
-        int client_fd = co_await io_disp->async_accept(listen_fd);
+        int client_fd = co_await io_disp->async_accept(listen_fd, record);
 
         if (client_fd < 0) {
             if (stop_requested_.load(std::memory_order_relaxed)) {
                 break;  // Clean shutdown
+            }
+            if (const int error = record->admission_error.load(std::memory_order_acquire); error != 0) {
+                int empty = 0;
+                accept_error_.compare_exchange_strong(empty, error, std::memory_order_acq_rel);
+                stop_requested_.store(true, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                LOG_ERROR("CORO_TCP", "Accept submission refused on fd %d: %s", listen_fd, strerror(error));
+                break; // no registered operation; retain fd for checked retirement
             }
             // Accept error - continue trying
             LOG_ERROR("CORO_TCP", "Accept error: %s", strerror(errno));
@@ -282,6 +323,7 @@ core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
     }
 
     LOG_INFO("CORO_TCP", "Accept loop stopped");
+    record->loop_exited.store(true, std::memory_order_release); // final listener/record access
 }
 
 // =============================================================================

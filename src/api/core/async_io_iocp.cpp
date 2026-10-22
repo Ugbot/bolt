@@ -35,6 +35,7 @@ struct iocp_op {
     SOCKET sock;
     io_callback callback;
     void* user_data;
+    AcceptRetirement* retirement{nullptr};
     
     // For read/write
     WSABUF wsabuf;
@@ -68,6 +69,7 @@ struct iocp_op {
         operation = io_op::read;
         sock = INVALID_SOCKET;
         user_data = nullptr;
+        retirement = nullptr;
         wsabuf.buf = nullptr;
         wsabuf.len = 0;
         buffer = nullptr;
@@ -242,15 +244,19 @@ struct iocp_io::impl {
 
     void free_op(iocp_op* op) {
         if (op == nullptr) return;
+        auto* retirement = op->retirement;
+        op->retirement = nullptr;
         op->callback = nullptr;  // release any captured state promptly
         {
             std::lock_guard<std::mutex> lock(pool_mutex);
             if (pool_free.size() < kPoolCap) {
                 pool_free.push_back(op);
+                if (retirement) retirement->operations.fetch_sub(1u, std::memory_order_release);
                 return;
             }
         }
         delete op;
+        if (retirement) retirement->operations.fetch_sub(1u, std::memory_order_release);
     }
 };
 
@@ -265,8 +271,9 @@ iocp_io::~iocp_io() {
 int iocp_io::accept_async(
     int listen_fd,
     io_callback callback,
-    void* user_data
+    void* user_data, AcceptRetirement* retirement
 ) noexcept {
+    if (retirement && retirement->requested.load(std::memory_order_acquire)) return -1;
     SOCKET listen_socket = (SOCKET)listen_fd;
     
     // Associate with IOCP
@@ -281,6 +288,8 @@ int iocp_io::accept_async(
     op->sock = listen_socket;
     op->callback = std::move(callback);
     op->user_data = user_data;
+    op->retirement = retirement;
+    if (retirement) retirement->operations.fetch_add(1u, std::memory_order_acq_rel);
 
     // Create accept socket
     op->accept_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -554,6 +563,7 @@ int iocp_io::close_async(int fd) noexcept {
 }
 
 int iocp_io::poll(uint32_t timeout_us) noexcept {
+    progress_accept_retirements();
     if (impl_->iocp_handle == INVALID_HANDLE_VALUE) return -1;
     
     impl_->stat_polls.fetch_add(1, std::memory_order_relaxed);
@@ -608,6 +618,9 @@ int iocp_io::poll(uint32_t timeout_us) noexcept {
     if (!result) {
         // Operation failed
         event.result = -1;
+        if (op->operation == io_op::accept && op->accept_socket != INVALID_SOCKET) {
+            closesocket(op->accept_socket); op->accept_socket = INVALID_SOCKET;
+        }
     } else {
         switch (op->operation) {
             case io_op::accept:
@@ -654,6 +667,33 @@ int iocp_io::poll(uint32_t timeout_us) noexcept {
     impl_->free_op(op);
 
     return 1;
+}
+
+AcceptRetirementStatus iocp_io::advance_accept_retirement(AcceptRetirement& record) noexcept {
+    if (record.operations.load(std::memory_order_acquire) != 0u) {
+        const auto handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(static_cast<SOCKET>(record.fd)));
+        if (!CancelIoEx(handle, nullptr)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_FOUND) {
+                record.error.store(static_cast<int>(error), std::memory_order_release);
+                return AcceptRetirementStatus::Error;
+            }
+        }
+        return AcceptRetirementStatus::Pending;
+    }
+    if (!record.loop_exited.load(std::memory_order_acquire)) return AcceptRetirementStatus::Pending;
+    std::unique_lock<std::mutex> lock(impl_->assoc_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return AcceptRetirementStatus::Pending;
+    int error = 0;
+    const bool closed = impl_->associated.close_and_forget(static_cast<uint64_t>(record.fd), [&]() noexcept {
+        if (closesocket(static_cast<SOCKET>(record.fd)) == 0) return true;
+        error = WSAGetLastError(); return false;
+    });
+    if (!closed) {
+        record.error.store(error != 0 ? error : WSAEINVAL, std::memory_order_release);
+        return AcceptRetirementStatus::Error;
+    }
+    return AcceptRetirementStatus::Complete;
 }
 
 void iocp_io::run() noexcept {

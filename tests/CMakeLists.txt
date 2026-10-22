@@ -2451,6 +2451,18 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     add_test(NAME test_bolt_coro_listener_port_clash COMMAND test_bolt_coro_listener_port_clash)
 endif()
 
+# Listener accept retirement keeps kernel/callback ownership until completion.
+# The lifecycle controls run on every reactor backend, including IOCP.
+if(TARGET bolt_reactor)
+    add_executable(test_bolt_accept_retirement test_bolt_accept_retirement.cpp)
+    target_link_libraries(test_bolt_accept_retirement
+        PRIVATE bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_accept_retirement)
+    add_test(NAME test_bolt_accept_retirement COMMAND test_bolt_accept_retirement)
+    set_tests_properties(test_bolt_accept_retirement PROPERTIES
+        RUN_SERIAL TRUE TIMEOUT 180)
+endif()
+
 # timer_queue — backend-agnostic reactor timer facility (STATION-82). Was not
 # wired into the test build at all (found while doing the G2CHK-85 Part 4
 # broader sweep); the file is self-contained (plain assert-based main(), no

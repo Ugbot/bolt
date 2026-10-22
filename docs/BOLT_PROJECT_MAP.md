@@ -1,5 +1,11 @@
 # Bolt Project Map
 
+Listener accept retirement is under implementation in `api/core/accept_retirement.h`
+and the reactor backends. The checked listener API retains ownership on every
+non-complete result; legacy stop remains a blocking owner-progress operation.
+The new cross-platform lifecycle target is registered, but qualification and
+main integration are pending. [Contract](research/accept-retirement.md).
+
 IDOT's compiled scalar/dispatch sources use baseline compiler options; core ISA
 requirements remain on the consumer interface. Shared layout/feature definitions
 still reach every compiled tier. The existing IDOT CTest benchmark runs serially;

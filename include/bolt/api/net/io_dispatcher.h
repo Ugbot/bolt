@@ -133,8 +133,8 @@ private:
 /// Awaitable for async accept operations
 class AcceptAwaitable {
 public:
-    AcceptAwaitable(IODispatcher* dispatcher, int listen_fd) noexcept
-        : dispatcher_(dispatcher), listen_fd_(listen_fd) {}
+    AcceptAwaitable(IODispatcher* dispatcher, int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept
+        : dispatcher_(dispatcher), listen_fd_(listen_fd), retirement_(retirement) {}
 
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> handle) noexcept;
@@ -144,6 +144,7 @@ private:
     friend class IODispatcher;
     IODispatcher* dispatcher_;
     int listen_fd_;
+    core::AcceptRetirement* retirement_;
     int result_fd_ = -1;
 };
 
@@ -182,7 +183,8 @@ struct IODispatcherConfig {
     // worker-pool handoff (Drogon/Seastar thread-per-core model; collapses tail
     // latency + removes MPMC/scheduling overhead). The worker pool is then reserved
     // for explicitly-offloaded blocking work. Set false to restore the old behavior
-    // (every completion submitted to the worker pool) — only needed if handlers do
+    // (client completions submitted to the worker pool; tracked listener accept
+    // control stays on its recorded reactor) — only needed if handlers do
     // BLOCKING work inline (they should co_await or offload instead).
     bool inline_resume = true;
 
@@ -259,9 +261,12 @@ public:
     /// Async accept - returns awaitable
     /// @param listen_fd Listening socket file descriptor
     /// @return Awaitable that yields accepted fd, or -1 on error
-    AcceptAwaitable async_accept(int listen_fd) noexcept {
-        return AcceptAwaitable(this, listen_fd);
+    AcceptAwaitable async_accept(int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept {
+        return AcceptAwaitable(this, listen_fd, retirement);
     }
+
+    core::AcceptRetirementStatus try_retire_accepts(size_t reactor, core::AcceptRetirement& record,
+        core::AcceptRetirementDeadline deadline) noexcept;
 
     /// Async connect - returns awaitable
     /// @param fd Socket file descriptor
@@ -398,6 +403,7 @@ private:
     friend class ConnectAwaitable;
     friend class RecvFromAwaitable;
     friend class SendToAwaitable;
+    friend class CoroTcpListener;
 
     void io_thread_loop(size_t thread_id);
     bool try_post_impl(size_t io_thread_index, std::coroutine_handle<> h,
@@ -414,6 +420,9 @@ private:
     // engine 0. For a shared-engine backend (IOCP) there is one engine and this
     // always returns it.
     core::async_io* current_io() noexcept;
+    // Tracked accepts retain their startup engine across worker resumptions.
+    core::async_io* accept_io(core::AcceptRetirement* retirement) noexcept;
+    int accept_admission_error(const core::AcceptRetirement& retirement) const noexcept;
 
     IODispatcherConfig config_;
     // One async_io engine per IO thread for thread-per-core backends (epoll/

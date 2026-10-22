@@ -17,8 +17,8 @@
 //
 // Op→SQE: ACCEPT, RECV (read_async), SEND (write_async), CONNECT, RECVMSG
 // (recvfrom_async), SENDMSG (sendto_async), POLL_ADD on the wake-eventfd.
-// close_async stays SYNCHRONOUS (cancel+close) — mirrors epoll, preserving
-// the UdpTransport::stop drain semantic the engine API contract relies on.
+// Tracked listener accepts use explicit cancellation/completion retirement.
+// Generic close_async remains plain close, without a kernel-request drain.
 
 #include "bolt/api/core/async_io.h"
 
@@ -75,6 +75,7 @@ inline int io_uring_enter(int fd, unsigned to_submit, unsigned min_complete,
 // Wake-fd sentinel: a CQE with user_data == 0 means the eventfd POLL_ADD fired.
 // User ops carry user_data = op_pool_index + 1 (never zero).
 constexpr std::uint64_t kWakeUserData = 0;
+constexpr std::uint64_t kAcceptCancelTag = std::uint64_t{1} << 63;
 
 }  // namespace
 
@@ -83,11 +84,14 @@ constexpr std::uint64_t kWakeUserData = 0;
 // and SENDMSG need a stable msghdr+iovec+sockaddr (the kernel reads them async,
 // not at submit time — the epoll "valid only during call" guarantee is void).
 // =============================================================================
-struct uring_pending_op {
+struct uring_pending_op : detail::AcceptCompletionWitness {
     io_op operation{io_op::read};
     int fd{-1};
     io_callback callback;
     void* user_data{nullptr};
+    AcceptRetirement* retirement{nullptr};
+    bool live{false};
+    uint64_t submission_ticket{0u};
 
     // For read/write/recv/send
     const void* cbuf{nullptr};
@@ -112,6 +116,9 @@ struct uring_pending_op {
         fd = -1;
         callback = nullptr;
         user_data = nullptr;
+        retirement = nullptr;
+        live = original_seen = callback_done = cancel_inflight = false; cancel_retry = true;
+        submission_ticket = 0u;
         cbuf = nullptr;
         buf = nullptr;
         len = 0;
@@ -157,6 +164,8 @@ struct io_uring_io::impl {
 
     unsigned sq_entries{0};
     unsigned cq_entries{0};
+    detail::SubmissionProgress submissions;
+    uint64_t published_total{0u}; // exhaustion refuses new SQ admission, never wraps
 
     // Wake mechanism: eventfd watched by a POLL_ADD SQE (re-armed each fire).
     int wake_fd{-1};
@@ -164,17 +173,14 @@ struct io_uring_io::impl {
     async_io::wake_callback wake_cb;
     std::atomic<bool> wake_pending{false};
 
-    // Pending SQEs not yet submitted (lazy-submit at the next poll → batching).
-    unsigned pending_submits{0};
-
     // Submit-side mutex. Three reasons it has to exist:
     //  1. io_uring's SQ ring is SINGLE-PRODUCER by design (one writer to
     //     `*sq_tail`). Multiple threads calling submit_op concurrently must
     //     serialize the SQE write + tail bump.
     //  2. The op-pool free-list is a plain stack (no atomic Treiber stack here;
     //     keeping it simple). alloc_op + free_op need serialization.
-    //  3. The pending_submits counter (queued SQEs not yet io_uring_enter'd)
-    //     is read by the IO thread in do_poll and written by submitters.
+    //  3. Published SQ tail versus kernel-consumed head is inspected by poll
+    //     and advanced by submitters. Partial enters retain the remaining SQEs.
     // Server-side post-slice-B: connections are pinned, ALL submits happen on
     // the same IO thread → mutex is uncontended (a few cycles per acquire,
     // dwarfed by the syscall avoided when batching). Client-side / pre-pinning
@@ -197,6 +203,9 @@ struct io_uring_io::impl {
     // Lifecycle flags.
     std::atomic<bool> running{false};
     std::atomic<bool> stop_requested{false};
+    std::atomic<int> terminal_error{0};
+    unsigned enter_limit_once{0u}; // private owner-thread test controls; 0 = normal syscall
+    bool interrupt_enter_once{false};
 
     // Statistics.
     std::atomic<std::uint64_t> stat_accepts{0};
@@ -329,12 +338,18 @@ struct io_uring_io::impl {
         const std::uint32_t idx = free_stack[--free_top];
         op_pool[idx].reset();
         op_pool[idx].pool_index = idx;
+        op_pool[idx].live = true;
         return &op_pool[idx];
     }
     void free_op(std::uint32_t idx) noexcept {
         assert(idx < kOpPoolSize && "free_op: bad index");
         assert(free_top < kOpPoolSize && "free_op: stack overflow (double free?)");
+        auto& op = op_pool[idx];
+        assert(op.live && !op.cancel_inflight);
+        auto* retirement = op.retirement;
+        op.retirement = nullptr; op.callback = nullptr; op.live = false;
         free_stack[free_top++] = idx;
+        if (retirement) retirement->operations.fetch_sub(1u, std::memory_order_release);
     }
     std::atomic<std::uint32_t>* slot_for(int fd) noexcept {
         if (fd < 0 || fd >= kMaxFds) return nullptr;
@@ -349,7 +364,11 @@ struct io_uring_io::impl {
     // would only fire under sustained pressure faster than poll() drains).
     struct io_uring_sqe* next_sqe() noexcept {
         const unsigned tail = *sq_tail;
-        const unsigned head = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
+        const unsigned head = observe_head_locked();
+        if (terminal_error.load(std::memory_order_acquire) != 0) return nullptr;
+        if (published_total == UINT64_MAX) {
+            terminal_error.store(EOVERFLOW, std::memory_order_release); return nullptr;
+        }
         if (tail - head >= sq_entries) return nullptr;
         const unsigned index = tail & *sq_ring_mask;
         struct io_uring_sqe* s = &sqes[index];
@@ -360,7 +379,12 @@ struct io_uring_io::impl {
     void publish_sqe() noexcept {
         // Release-store the bumped tail so the kernel sees our SQE.
         __atomic_store_n(sq_tail, *sq_tail + 1, __ATOMIC_RELEASE);
-        ++pending_submits;
+        ++published_total;
+    }
+    unsigned observe_head_locked() noexcept {
+        const unsigned head = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
+        if (!submissions.observe(head, sq_entries)) terminal_error.store(EOVERFLOW, std::memory_order_release);
+        return head;
     }
 
     // Arm a single-shot POLL_ADD on wake_fd; user_data = kWakeUserData (0).
@@ -385,17 +409,20 @@ struct io_uring_io::impl {
     // — e.g. HTTP client's first async_connect from the calling thread before
     // the connection pins itself to an IO thread — must serialize here).
     // -----------------------------------------------------------------------
-    int submit_accept(int listen_fd, io_callback cb, void* udata) noexcept {
+    int submit_accept(int listen_fd, io_callback cb, void* udata, AcceptRetirement* retirement) noexcept {
         std::lock_guard<std::mutex> lk(submit_mu);
+        if (retirement && retirement->requested.load(std::memory_order_acquire)) { errno = ECANCELED; return -1; }
         uring_pending_op* op = alloc_op();
-        if (op == nullptr) return -1;
+        if (op == nullptr) { errno = ENOBUFS; return -1; }
         op->operation = io_op::accept;
         op->fd = listen_fd;
         op->callback = std::move(cb);
         op->user_data = udata;
+        op->retirement = retirement;
+        if (retirement) retirement->operations.fetch_add(1u, std::memory_order_acq_rel);
         op->addrlen = sizeof(op->addr);
         struct io_uring_sqe* s = next_sqe();
-        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        if (s == nullptr) { free_op(op->pool_index); errno = EAGAIN; return -1; }
         s->opcode = IORING_OP_ACCEPT;
         s->fd = listen_fd;
         s->addr = reinterpret_cast<__u64>(&op->addr);
@@ -403,6 +430,7 @@ struct io_uring_io::impl {
         s->accept_flags = SOCK_CLOEXEC;
         s->user_data = op->pool_index + 1;
         publish_sqe();
+        op->submission_ticket = published_total;
         stat_accepts.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
@@ -546,19 +574,9 @@ struct io_uring_io::impl {
         return 0;
     }
 
-    // close_async: just ::close(fd) — DO NOT touch the op pool or fire
-    // callbacks from this thread. io_uring's op pool + free-list are
-    // single-owner (the IO thread that runs poll); close_async is the lone
-    // cross-thread entry (UdpTransport::stop / connection teardown can call
-    // from anywhere). Closing the fd causes the kernel to complete any
-    // pending op on it with a negative cqe->res (-ECANCELED / -EBADF);
-    // those completions land in the IO thread's next poll() and fire their
-    // callbacks there (correct thread, normal free_op). The UdpTransport
-    // drain on in_flight_ observes those decrements normally — just with
-    // a poll-cycle of latency vs the epoll backend's synchronous fire.
-    //
-    // Earlier version (cancel+fire+free here, mirroring epoll) corrupted
-    // the single-owner free-list under cross-thread close.
+    // Generic close remains plain close and DOES NOT cancel kernel-owned
+    // requests or prove callback drain. Its read/write/UDP lifecycle limitation
+    // is outside this narrow tracked ACCEPT retirement operation.
     int close_async_impl(int fd) noexcept {
         if (fd < 0) return -1;
         ::close(fd);
@@ -586,8 +604,7 @@ struct io_uring_io::impl {
             // write path with cross-thread submitters.
             std::lock_guard<std::mutex> lk(submit_mu);
             if (!wake_armed) arm_wake_poll_locked();
-            to_submit = pending_submits;
-            pending_submits = 0;
+            to_submit = detail::pending_submissions(*sq_tail, observe_head_locked());
         }
 
         unsigned min_complete = 0;
@@ -614,9 +631,16 @@ struct io_uring_io::impl {
         }
 
         if (to_submit > 0 || (flags & IORING_ENTER_GETEVENTS)) {
-            int r = io_uring_enter(ring_fd, to_submit, min_complete, flags, arg_ptr, arg_sz);
+            const unsigned admitted = enter_limit_once != 0u && enter_limit_once < to_submit ? enter_limit_once : to_submit;
+            enter_limit_once = 0u;
+            int r = -1;
+            if (interrupt_enter_once) { interrupt_enter_once = false; errno = EINTR; }
+            else r = io_uring_enter(ring_fd, admitted, min_complete, flags, arg_ptr, arg_sz);
             if (r < 0 && errno != EINTR && errno != ETIME) {
                 stat_errors.fetch_add(1, std::memory_order_relaxed);
+                if (errno == EBADF || errno == EINVAL || errno == EFAULT) {
+                    terminal_error.store(errno, std::memory_order_release);
+                }
                 // Don't abort — fall through to reap whatever's already in CQ.
             }
         }
@@ -651,12 +675,28 @@ struct io_uring_io::impl {
                 continue;
             }
 
+            if ((ud & kAcceptCancelTag) != 0u) {
+                const auto token = ud & ~kAcceptCancelTag;
+                if (token == 0u || token > kOpPoolSize) { stat_errors.fetch_add(1u); continue; }
+                auto& op = op_pool[static_cast<size_t>(token - 1u)];
+                assert(op.live && op.cancel_inflight && op.retirement);
+                const int cancel_error = op.cancel_completed(static_cast<int>(res));
+                if (cancel_error != 0)
+                    op.retirement->error.store(cancel_error, std::memory_order_release);
+                if (op.recyclable()) {
+                    std::lock_guard<std::mutex> lk(submit_mu); free_op(static_cast<uint32_t>(token - 1u));
+                }
+                continue;
+            }
+
             const std::uint32_t idx_p1 = static_cast<std::uint32_t>(ud);
             if (idx_p1 == 0 || idx_p1 - 1 >= kOpPoolSize) {
                 stat_errors.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             uring_pending_op& op = op_pool[idx_p1 - 1];
+            assert(op.live && !op.original_seen);
+            op.original_seen = true;
             // cqe->user_data is authoritative — no fd_slot match needed.
             // io_uring allows multiple ops in flight on the same fd (HTTP
             // client overlaps write/read on a keep-alive socket); the
@@ -686,7 +726,8 @@ struct io_uring_io::impl {
             if (op.callback) op.callback(ev);
             {
                 std::lock_guard<std::mutex> lk(submit_mu);
-                free_op(idx_p1 - 1);
+                op.callback_done = true;
+                if (op.recyclable()) free_op(idx_p1 - 1);
             }
             stat_events.fetch_add(1, std::memory_order_relaxed);
         }
@@ -703,8 +744,8 @@ io_uring_io::io_uring_io(const async_io_config& config)
 
 io_uring_io::~io_uring_io() = default;
 
-int io_uring_io::accept_async(int listen_fd, io_callback callback, void* user_data) noexcept {
-    return impl_->submit_accept(listen_fd, std::move(callback), user_data);
+int io_uring_io::accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement) noexcept {
+    return impl_->submit_accept(listen_fd, std::move(callback), user_data, retirement);
 }
 int io_uring_io::read_async(int fd, void* buffer, std::size_t size,
                             io_callback callback, void* user_data) noexcept {
@@ -732,14 +773,48 @@ int io_uring_io::close_async(int fd) noexcept {
     return impl_->close_async_impl(fd);
 }
 int io_uring_io::poll(std::uint32_t timeout_us) noexcept {
-    return impl_->do_poll(timeout_us);
+    const int events = impl_->do_poll(timeout_us);
+    progress_accept_retirements();
+    return events;
 }
 void io_uring_io::run() noexcept {
     impl_->running.store(true, std::memory_order_release);
     while (!impl_->stop_requested.load(std::memory_order_acquire)) {
-        impl_->do_poll(impl_->config.poll_timeout_us ? impl_->config.poll_timeout_us : 1000);
+        poll(impl_->config.poll_timeout_us ? impl_->config.poll_timeout_us : 1000);
     }
     impl_->running.store(false, std::memory_order_release);
+}
+
+AcceptRetirementStatus io_uring_io::advance_accept_retirement(AcceptRetirement& record) noexcept {
+    if (const int error = impl_->terminal_error.load(std::memory_order_acquire); error != 0) {
+        record.error.store(error, std::memory_order_release); return AcceptRetirementStatus::Error;
+    }
+    std::unique_lock<std::mutex> lock(impl_->submit_mu, std::try_to_lock);
+    if (!lock.owns_lock()) return AcceptRetirementStatus::Pending;
+    impl_->observe_head_locked();
+    if (const int error = impl_->terminal_error.load(std::memory_order_acquire); error != 0) {
+        record.error.store(error, std::memory_order_release); return AcceptRetirementStatus::Error;
+    }
+    for (auto& op : impl_->op_pool) {
+        if (!op.live || op.retirement != &record) continue;
+        assert(op.operation == io_op::accept && op.fd == record.fd);
+        if (op.original_seen || op.cancel_inflight || !op.cancel_retry) continue;
+        // Original SQE must be kernel-consumed before a meaningful cancel.
+        if (!detail::original_consumed(impl_->submissions.consumed, op.submission_ticket)) continue;
+        auto* sqe = impl_->next_sqe();
+        if (sqe == nullptr) return AcceptRetirementStatus::Pending; // intent retained, no user slot needed
+        sqe->opcode = IORING_OP_ASYNC_CANCEL;
+        sqe->addr = op.pool_index + 1u;
+        sqe->user_data = kAcceptCancelTag | (op.pool_index + 1u);
+        op.cancel_inflight = true;
+        impl_->publish_sqe();
+    }
+    if (record.operations.load(std::memory_order_acquire) != 0u ||
+        !record.loop_exited.load(std::memory_order_acquire)) return AcceptRetirementStatus::Pending;
+    if (::close(record.fd) != 0) {
+        record.error.store(errno, std::memory_order_release); return AcceptRetirementStatus::Error;
+    }
+    return AcceptRetirementStatus::Complete;
 }
 void io_uring_io::stop() noexcept {
     impl_->stop_requested.store(true, std::memory_order_release);
@@ -786,6 +861,23 @@ async_io::stats io_uring_io::get_stats() const noexcept {
 // in the factory while the static type is io_uring_io.
 bool io_uring_io::usable() const noexcept {
     return impl_ != nullptr && impl_->setup_ok;
+}
+
+void io_uring_io::test_limit_next_enter(unsigned limit) noexcept {
+    assert(limit > 0u);
+    assert(impl_->owner_tid.load() == std::thread::id{} || impl_->owner_tid.load() == std::this_thread::get_id());
+    impl_->enter_limit_once = limit;
+}
+void io_uring_io::test_interrupt_next_enter() noexcept {
+    assert(impl_ != nullptr);
+    assert(impl_->owner_tid.load() == std::thread::id{} || impl_->owner_tid.load() == std::this_thread::get_id());
+    impl_->interrupt_enter_once = true;
+}
+unsigned io_uring_io::test_pending_submissions() noexcept {
+    assert(impl_->setup_ok);
+    assert(impl_->owner_tid.load() == std::this_thread::get_id());
+    std::lock_guard<std::mutex> lock(impl_->submit_mu);
+    return detail::pending_submissions(*impl_->sq_tail, impl_->observe_head_locked());
 }
 
 }  // namespace core

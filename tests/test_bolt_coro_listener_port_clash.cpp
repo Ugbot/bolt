@@ -13,6 +13,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -148,16 +150,72 @@ bolt::api::core::coro_task<void> report_owner(IODispatcher& io, int fd) {
     co_return;
 }
 
-int connect_owner_client(uint16_t port) {
+using ClientClock = std::chrono::steady_clock;
+using ClientDeadline = ClientClock::time_point;
+// Test-fixture syscall seam: defaults are real OS calls. Scripted controls only
+// introduce EINTR; readiness/peer state and byte transfer still require the OS.
+struct ClientCalls {
+    int (*poll_ready)(pollfd*, nfds_t, int) = ::poll;
+    int (*connect_socket)(int, const sockaddr*, socklen_t) = ::connect;
+    ssize_t (*send_one)(int, const void*, size_t, int) = ::send;
+    ssize_t (*recv_one)(int, void*, size_t, int) = ::recv;
+};
+bool client_ready(int fd, short events, ClientDeadline deadline, const ClientCalls& calls = {}) {
+    for (unsigned attempt = 0u; attempt < 1024u && ClientClock::now() < deadline; ++attempt) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - ClientClock::now()).count();
+        pollfd p{fd, events, 0};
+        const int result = calls.poll_ready(&p, 1u, static_cast<int>(left > 0 ? left : 1));
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) return false;
+        if (result == 0) break;
+        if ((p.revents & POLLNVAL) != 0) { errno = EBADF; return false; }
+        if ((p.revents & (events | POLLHUP | POLLERR)) != 0) return true;
+    }
+    errno = ETIMEDOUT; return false;
+}
+ssize_t client_one(int fd, char* byte, bool write, ClientDeadline deadline, const ClientCalls& calls = {}) {
+#ifdef MSG_NOSIGNAL
+    constexpr int send_flags = MSG_NOSIGNAL;
+#else
+    constexpr int send_flags = 0; // SO_NOSIGPIPE is set on the macOS client
+#endif
+    for (unsigned attempt = 0u; attempt < 1024u && ClientClock::now() < deadline; ++attempt) {
+        const auto n = write ? calls.send_one(fd, byte, 1u, send_flags) : calls.recv_one(fd, byte, 1u, 0);
+        if (n >= 0) return n; // exact1 or real EOF; never manufacture bytes
+        const int error = errno;
+        if (error == EINTR) continue;
+        if (error != EAGAIN && error != EWOULDBLOCK) return -1;
+        if (!client_ready(fd, write ? POLLOUT : POLLIN, deadline, calls)) return -1;
+    }
+    errno = ETIMEDOUT; return -1;
+}
+int client_failure(int fd, int error) { close(fd); errno = error; return -1; }
+bool client_connected(int fd, uint16_t port, ClientDeadline deadline, const ClientCalls& calls) {
+    for (unsigned attempt = 0u; attempt < 1024u && ClientClock::now() < deadline; ++attempt) {
+        if (!client_ready(fd, POLLOUT, deadline, calls)) return false;
+        int error = 0; socklen_t bytes = sizeof(error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &bytes) != 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (error == EINPROGRESS || error == EALREADY) continue;
+        if (error != 0) { errno = error; return false; }
+        sockaddr_in peer{}; bytes = sizeof(peer);
+        if (getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &bytes) == 0) {
+            if (peer.sin_family == AF_INET && peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && peer.sin_port == htons(port)) return true;
+            errno = EPROTO; return false;
+        }
+        if (errno != ENOTCONN && errno != EINTR) return false;
+    }
+    errno = ETIMEDOUT; return false;
+}
+int connect_owner_client(uint16_t port, ClientDeadline deadline, const ClientCalls& calls = {}) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 #ifdef SO_NOSIGPIPE
     const int no_sigpipe = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
-        const int error = errno;
-        close(fd);
-        errno = error;
-        return -1;
+        return client_failure(fd, errno);
     }
 #endif
     timeval timeout{2, 0};
@@ -166,14 +224,91 @@ int connect_owner_client(uint16_t port) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
-        connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        const int error = errno;
-        close(fd);
-        errno = error;
-        return -1;
-    }
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) return client_failure(fd, errno);
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return client_failure(fd, errno);
+    const int result = calls.connect_socket(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)); // exactly once
+    if (result != 0 && errno != EINTR && errno != EINPROGRESS && errno != EALREADY) return client_failure(fd, errno);
+    if (!client_connected(fd, port, deadline, calls)) return client_failure(fd, errno);
     return fd;
+}
+
+unsigned interrupted_polls = 0u, interrupted_reads = 0u, interrupted_writes = 0u, connect_calls = 0u;
+int interrupt_poll_once(pollfd* fds, nfds_t count, int timeout) {
+    if (interrupted_polls++ == 0u) { errno = EINTR; return -1; }
+    return ::poll(fds, count, timeout);
+}
+ssize_t interrupt_read_once(int fd, void* bytes, size_t count, int flags) {
+    if (interrupted_reads++ == 0u) { errno = EINTR; return -1; }
+    return ::recv(fd, bytes, count, flags);
+}
+ssize_t interrupt_write_once(int fd, const void* bytes, size_t count, int flags) {
+    if (interrupted_writes++ == 0u) { errno = EINTR; return -1; }
+    return ::send(fd, bytes, count, flags);
+}
+int interrupt_actual_connect(int fd, const sockaddr* peer, socklen_t bytes) {
+    ++connect_calls;
+    const int result = ::connect(fd, peer, bytes);
+    if (result == 0 || errno == EINPROGRESS) { errno = EINTR; return -1; }
+    return result;
+}
+struct ClientPair {
+    int fd[2]{-1, -1};
+    ClientPair() {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return;
+        for (int value : fd) {
+            const int flags = fcntl(value, F_GETFL, 0);
+            if (flags < 0 || fcntl(value, F_SETFL, flags | O_NONBLOCK) != 0) {
+                close(fd[0]); close(fd[1]); fd[0] = fd[1] = -1; return;
+            }
+        }
+    }
+    ~ClientPair() { for (int value : fd) if (value >= 0) close(value); }
+};
+
+TEST(CoroListenerClient, InterruptedPollAndExactIoStillRequireRealBytesAndRespectDeadline) {
+    ClientPair pair;
+    ASSERT_GE(pair.fd[0], 0);
+    interrupted_polls = interrupted_reads = interrupted_writes = 0u;
+    ClientCalls calls;
+    calls.poll_ready = interrupt_poll_once;
+    calls.recv_one = interrupt_read_once;
+    calls.send_one = interrupt_write_once;
+    const auto deadline = ClientClock::now() + std::chrono::seconds(2);
+    char byte = 'q';
+    ASSERT_EQ(client_one(pair.fd[0], &byte, true, deadline, calls), 1);
+    EXPECT_EQ(interrupted_writes, 2u);
+    ASSERT_TRUE(client_ready(pair.fd[1], POLLIN, deadline, calls));
+    EXPECT_EQ(interrupted_polls, 2u);
+    byte = '?';
+    ASSERT_EQ(client_one(pair.fd[1], &byte, false, deadline, calls), 1);
+    EXPECT_EQ(interrupted_reads, 2u);
+    EXPECT_EQ(byte, 'q');
+    const auto expired = ClientClock::now() + std::chrono::milliseconds(2);
+    EXPECT_EQ(client_one(pair.fd[1], &byte, false, expired), -1);
+    EXPECT_EQ(errno, ETIMEDOUT);
+    EXPECT_EQ(byte, 'q');
+    close(pair.fd[0]); pair.fd[0] = -1;
+    EXPECT_EQ(client_one(pair.fd[1], &byte, false, deadline), 0); // real EOF, never a byte
+    EXPECT_EQ(client_one(-1, &byte, false, deadline), -1);
+    EXPECT_EQ(errno, EBADF);
+}
+
+TEST(CoroListenerClient, InterruptedSingleConnectRequiresActualPeerWithoutReplacementClient) {
+    const uint16_t port = free_port();
+    ASSERT_NE(port, 0);
+    auto config = cfg_for(port); config.num_io_threads = 1u;
+    config.worker_config.num_workers = 1u; config.worker_config.blocking_workers = 0u;
+    CoroTcpListener listener(config, drop_conn);
+    ASSERT_EQ(listener.start_background(), 0);
+    ClientCalls calls; calls.connect_socket = interrupt_actual_connect;
+    connect_calls = 0u;
+    const int fd = connect_owner_client(port, ClientClock::now() + std::chrono::seconds(2), calls);
+    const int error = errno;
+    if (fd >= 0) close(fd);
+    EXPECT_GE(fd, 0) << error << " " << std::strerror(error);
+    EXPECT_EQ(connect_calls, 1u);
+    listener.stop();
 }
 
 void check_natural_owners(std::size_t reactors) {
@@ -190,16 +325,17 @@ void check_natural_owners(std::size_t reactors) {
         backend, reactors, static_cast<unsigned>(port));
     std::array<unsigned, 4> owners{};
     for (unsigned connection = 0; connection < 64; ++connection) {
+        const auto deadline = ClientClock::now() + std::chrono::seconds(2);
         errno = 0;
-        const int fd = connect_owner_client(port);
+        const int fd = connect_owner_client(port, deadline);
         const int connect_error = errno;
         EXPECT_GE(fd, 0) << "backend=" << backend << " reactors=" << reactors << " connection=" << connection
             << " errno=" << connect_error << " " << std::strerror(connect_error);
         if (fd < 0) continue;
         char first = '?', second = '?';
-        const char request = 'x';
-        const bool exact = send(fd, &request, 1, 0) == 1 && recv(fd, &first, 1, 0) == 1 &&
-            send(fd, &request, 1, 0) == 1 && recv(fd, &second, 1, 0) == 1;
+        char request = 'x';
+        const bool exact = client_one(fd, &request, true, deadline) == 1 && client_one(fd, &first, false, deadline) == 1 &&
+            client_one(fd, &request, true, deadline) == 1 && client_one(fd, &second, false, deadline) == 1;
         const int io_error = errno;
         EXPECT_TRUE(exact) << "backend=" << backend << " errno=" << io_error << " " << std::strerror(io_error);
         EXPECT_EQ(first, second) << "same connection changed reactor";
@@ -243,16 +379,17 @@ bolt::api::core::detached_task mark_acceptor_turn(std::atomic<bool>& passed) {
 }
 
 void expect_owner_zero(uint16_t port, const char* backend) {
+    const auto deadline = ClientClock::now() + std::chrono::seconds(2);
     errno = 0;
-    const int fd = connect_owner_client(port);
+    const int fd = connect_owner_client(port, deadline);
     const int connect_error = errno;
     EXPECT_GE(fd, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     if (fd < 0) return;
     for (unsigned i = 0; i < 2; ++i) {
-        const char request = 'x';
+        char request = 'x';
         char owner = '?';
-        EXPECT_EQ(send(fd, &request, 1, 0), 1);
-        EXPECT_EQ(recv(fd, &owner, 1, 0), 1);
+        EXPECT_EQ(client_one(fd, &request, true, deadline), 1);
+        EXPECT_EQ(client_one(fd, &owner, false, deadline), 1);
         EXPECT_EQ(owner, '0');
     }
     close(fd);
@@ -281,12 +418,13 @@ TEST(CoroListenerFanout, FullTargetInboxClosesRefusedFdAndKeepsAcceptorResponsiv
     for (size_t i = 0; i < 256; ++i)
         EXPECT_TRUE(io->try_post_to_io_thread(1, std::noop_coroutine()));
     errno = 0;
-    const int refused = connect_owner_client(port);
+    const auto refused_deadline = ClientClock::now() + std::chrono::seconds(2);
+    const int refused = connect_owner_client(port, refused_deadline);
     const int connect_error = errno;
     EXPECT_GE(refused, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     if (refused >= 0) {
         char byte = 0;
-        const ssize_t n = recv(refused, &byte, 1, 0);
+        const ssize_t n = client_one(refused, &byte, false, refused_deadline);
         const int error = errno;
         EXPECT_TRUE(n == 0 || (n < 0 && error == ECONNRESET))
             << "refused fd must close, not remain queued until target progress";
@@ -325,7 +463,7 @@ TEST(CoroListenerFanout, StopClosesQueuedFdBeforeStartingClientIo) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(gate.entered.load());
     errno = 0;
-    const int fd = connect_owner_client(port);  // sequence 1 queues on held reactor
+    const int fd = connect_owner_client(port, ClientClock::now() + std::chrono::seconds(2)); // sequence1 queues
     const int connect_error = errno;
     EXPECT_GE(fd, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     for (unsigned i = 0; i < 1000 && listener.get_stats().connections_active != 1; ++i)
@@ -340,6 +478,28 @@ TEST(CoroListenerFanout, StopClosesQueuedFdBeforeStartingClientIo) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(passed.load());  // accept callback returned after queue publication
     EXPECT_EQ(io->inbox_posts_rejected(), 0u);
+    // Retire the acceptor while its completion owner is alive. Reactor 1 stays
+    // paused with the queued client; accept retirement does not drain handlers.
+    using Retirement = bolt::api::core::AcceptRetirementStatus;
+    const auto retirement_deadline = ClientClock::now() + std::chrono::seconds(2);
+    Retirement retired = Retirement::Pending;
+    for (unsigned attempt = 0u; attempt < 1000000u && ClientClock::now() < retirement_deadline; ++attempt) {
+        retired = listener.try_retire_accepts(retirement_deadline);
+        if (retired != Retirement::Pending) break;
+        std::this_thread::yield();
+    }
+    if (retired != Retirement::Complete) {
+        // Failed proof cannot strand the paused owner or destroy borrowed
+        // handler state. Keep dispatcher progress alive until the closed peer's
+        // queued/started handler really exits, then perform legacy owner cleanup.
+        if (fd >= 0) close(fd);
+        gate.release.store(true);
+        gate.release.notify_all();
+        while (listener.get_stats().connections_active != 0u) std::this_thread::yield();
+        listener.stop();
+    }
+    ASSERT_EQ(retired, Retirement::Complete); // failure cleanup already released/joined owners
+    EXPECT_EQ(listener.get_stats().connections_active, 1u);
     std::thread stopper([&] { io->stop(); });
     for (unsigned i = 0; i < 1000 && io->is_running(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -350,7 +510,7 @@ TEST(CoroListenerFanout, StopClosesQueuedFdBeforeStartingClientIo) {
     EXPECT_EQ(listener.get_stats().connections_active, 0u);
     if (fd >= 0) {
         char byte = 0;
-        const ssize_t n = recv(fd, &byte, 1, 0);
+        const ssize_t n = client_one(fd, &byte, false, ClientClock::now() + std::chrono::seconds(2));
         const int error = errno;
         EXPECT_TRUE(n == 0 || (n < 0 && error == ECONNRESET));
         close(fd);

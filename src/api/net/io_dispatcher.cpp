@@ -9,6 +9,7 @@
 #include "bolt/bolt_topology.h"    // CpuTopology, bolt_detect_topology
 #include "bolt/bolt_scheduler.h"   // scheduler_assign_cpus
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <mutex>
 #include <iostream>
@@ -163,20 +164,42 @@ void AcceptAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
 
     AcceptAwaitable* self = this;
 
-    int rc = dispatcher_->current_io()->accept_async(
+    auto* engine = dispatcher_->accept_io(retirement_);
+    int rc = engine == nullptr ? -1 : engine->accept_async(
         listen_fd_,
         [self, handle](const core::io_event& event) {
             self->result_fd_ = static_cast<int>(event.result);
             self->dispatcher_->accepts_completed_.fetch_add(1, std::memory_order_relaxed);
-            self->dispatcher_->resume_on_worker(handle);
+            // Tracked listener accepts are reactor control work. Keep their
+            // registration/cancellation serialized even when client I/O opts
+            // into worker resumption (inline_resume=false).
+            if (self->retirement_ && self->dispatcher_->per_thread_engines()) handle.resume();
+            else self->dispatcher_->resume_on_worker(handle);
         },
-        nullptr
+        nullptr, retirement_
     );
 
     if (rc != 0) {
+#ifdef _WIN32
+        const int admission_error = engine == nullptr ? WSAEINVAL : WSAGetLastError();
+#else
+        const int admission_error = engine == nullptr ? EINVAL : errno;
+#endif
         result_fd_ = -1;
-        dispatcher_->resume_on_worker(handle);
+        if (retirement_) retirement_->admission_error.store(admission_error != 0 ? admission_error : EIO, std::memory_order_release);
+        if (retirement_ && dispatcher_->per_thread_engines() && dispatcher_->current_io_thread_index() == retirement_->reactor) handle.resume();
+        else dispatcher_->resume_on_worker(handle);
     }
+}
+
+core::AcceptRetirementStatus IODispatcher::try_retire_accepts(size_t reactor,
+    core::AcceptRetirement& record, core::AcceptRetirementDeadline deadline) noexcept {
+    if (record.complete.load(std::memory_order_acquire)) return core::AcceptRetirementStatus::Complete;
+    if (!is_running() || reactor >= config_.num_io_threads) return core::AcceptRetirementStatus::Unavailable;
+    if (per_thread_engines_ && reactor != record.reactor) return core::AcceptRetirementStatus::Error;
+    const size_t index = per_thread_engines_ ? reactor : 0u;
+    if (index >= ios_.size() || !ios_[index]) return core::AcceptRetirementStatus::Error;
+    return ios_[index]->try_retire_accepts(record, deadline);
 }
 
 void ConnectAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
@@ -442,6 +465,25 @@ core::async_io* IODispatcher::current_io() noexcept {
     return ios_[0].get();
 }
 
+core::async_io* IODispatcher::accept_io(core::AcceptRetirement* retirement) noexcept {
+    if (retirement == nullptr) return current_io();
+    const size_t index = per_thread_engines_ ? retirement->reactor : 0u;
+    if (index >= ios_.size()) return nullptr;
+    if (per_thread_engines_ && current_io_thread_index() != index) return nullptr;
+    assert(retirement->fd >= 0);
+    assert(ios_[index] != nullptr);
+    return ios_[index].get();
+}
+
+int IODispatcher::accept_admission_error(const core::AcceptRetirement& record) const noexcept {
+    const size_t index = per_thread_engines_ ? record.reactor : 0u;
+    if (record.fd < 0 || index >= ios_.size() || !ios_[index]) return EINVAL;
+    const auto backend = ios_[index]->backend();
+    if ((backend == core::io_backend::epoll || backend == core::io_backend::kqueue) &&
+        record.fd >= core::AcceptRetirement::kReadinessFdLimit) return EOVERFLOW;
+    return 0;
+}
+
 bool IODispatcher::try_post_impl(size_t index, std::coroutine_handle<> h,
                                   bool allow_before_start) noexcept {
     assert(index < inboxes_.size());
@@ -493,8 +535,8 @@ bool IODispatcher::post_to_io_thread(size_t index,
 
 void IODispatcher::async_close(int fd) noexcept {
     // Close on the engine the calling thread is pinned to: that is where this
-    // fd's in-flight read/write ops were registered, so the close completes them
-    // (the drain semantics UdpTransport::stop and the connection teardown rely on).
+    // fd's operations were registered. Generic io_uring close does not prove
+    // pending read/write/UDP completion; tracked ACCEPT retirement is separate.
     if (core::async_io* io = current_io()) {
         io->close_async(fd);
     }
