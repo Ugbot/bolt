@@ -196,6 +196,7 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_hardening(bench_compute_idot)
     bolt_apply_bench_tuning(bench_compute_idot)
     add_test(NAME bench_compute_idot COMMAND bench_compute_idot)
+    set_tests_properties(bench_compute_idot PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # -----------------------------------------------------------------------

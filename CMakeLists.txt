@@ -352,7 +352,15 @@ if(BOLT_BUILD_COMPUTE_IDOT)
         src/compute/idot_avx512vnni.cpp
         src/compute/idot_dispatch.cpp)
     add_library(bolt::compute_idot ALIAS bolt_compute_idot)
-    target_link_libraries(bolt_compute_idot PUBLIC bolt::core)
+    # Consumers retain core's configured ISA. These dispatchable translation
+    # units must not inherit it: scalar/dispatch are baseline, and each SIMD
+    # source receives only its explicit ISA below. Preserve shared layout and
+    # feature definitions without importing core's native compiler options.
+    target_link_libraries(bolt_compute_idot
+        PRIVATE Threads::Threads
+        INTERFACE bolt::core)
+    target_compile_definitions(bolt_compute_idot PRIVATE
+        $<TARGET_PROPERTY:bolt_core,INTERFACE_COMPILE_DEFINITIONS>)
     target_include_directories(bolt_compute_idot PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)

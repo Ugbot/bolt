@@ -1,5 +1,10 @@
 # Bolt Project Map
 
+IDOT's compiled scalar/dispatch sources use baseline compiler options; core ISA
+requirements remain on the consumer interface. Shared layout/feature definitions
+still reach every compiled tier. The existing IDOT CTest benchmark runs serially;
+its speedup floor is unchanged. [Contract](research/idot-isa-isolation.md).
+
 `bolt_seqlock.h` stores trivially-copyable snapshots in inline atomic cells;
 `try_read` has a fixed attempt bound and preserves caller lifetime pins.
 The legacy `read()` wrapper still spins until success.

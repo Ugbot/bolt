@@ -10,6 +10,8 @@ or plan prose. New topic → new file + add an entry below.
 
 ## Index
 
+- [idot-isa-isolation.md](idot-isa-isolation.md) — baseline dispatch compilation, configured consumer ISA, isolated performance tripwire and platform qualification limits.
+
 - [seqlock-atomic-payload.md](seqlock-atomic-payload.md) — inline atomic snapshot cells, sequence coherence proof, bounded refusal and separate mapping lifetime/qualification gates.
 - [replica-proof-frame.md](replica-proof-frame.md) — bounded replica coverage envelopes, canonical fields, integrity and the authority/retention boundary.
 - [materialization-transport-primitives.md](materialization-transport-primitives.md) — caller-buffer HTTP response heads, explicit TLS I/O deadlines and scoped loopback evidence/limits.
