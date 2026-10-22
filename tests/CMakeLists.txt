@@ -1,5 +1,11 @@
 add_executable(test_bolt_alignment test_bolt_alignment.cpp)
 
+add_executable(test_seqlock test_seqlock.cpp)
+target_link_libraries(test_seqlock PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_seqlock)
+add_test(NAME test_seqlock COMMAND test_seqlock)
+set_tests_properties(test_seqlock PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+
 add_executable(test_entropy test_entropy.cpp)
 target_link_libraries(test_entropy PRIVATE bolt::entropy GTest::gtest_main)
 bolt_apply_hardening(test_entropy)

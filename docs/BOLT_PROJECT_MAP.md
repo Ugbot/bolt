@@ -1,5 +1,10 @@
 # Bolt Project Map
 
+`bolt_seqlock.h` stores trivially-copyable snapshots in inline atomic cells;
+`try_read` has a fixed attempt bound and preserves caller lifetime pins.
+The legacy `read()` wrapper still spins until success.
+[Representation, ordering proof and qualification limits](research/seqlock-atomic-payload.md).
+
 `lakehouse/iceberg/pinned_read.h` opens exact retained metadata over a bounded
 caller-admitted `object_store/pinned.h` directory. Manifest/list/data/delete
 reads use only copied strong versions; `object_store/s3_uri.h` maps original
