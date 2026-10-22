@@ -11,6 +11,7 @@
 #include <chrono>
 #include <thread>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -50,6 +51,16 @@ CoroTcpListenerConfig cfg_for(uint16_t port) {
     cfg.num_io_threads = 2;
     cfg.num_workers = 2;
     return cfg;
+}
+
+bool actual_backend(CoroTcpListener& listener, const char** name) {
+    *name = nullptr;
+    auto* dispatcher = listener.dispatcher();
+    if (dispatcher == nullptr) return false;
+    auto* engine = dispatcher->io_engine();
+    if (engine == nullptr) return false;
+    *name = engine->backend_name();
+    return *name != nullptr;
 }
 
 }  // namespace
@@ -103,15 +114,24 @@ TEST(CoroListenerPortClash, SecondListenerInProcessIsRefusedAndPortFreesOnStop) 
 
     CoroTcpListener first(cfg_for(port), drop_conn);
     ASSERT_EQ(first.start_background(), 0);
+    const char* backend = nullptr;
+    ASSERT_TRUE(actual_backend(first, &backend));
+    SCOPED_TRACE(::testing::Message() << "stopped listener backend=" << backend);
+    std::fprintf(stderr, "[listener-diag] stop/rebind backend=%s port=%u\n", backend, static_cast<unsigned>(port));
 
     CoroTcpListener second(cfg_for(port), drop_conn);
     errno = 0;
-    EXPECT_EQ(second.start_background(), -1);
-    EXPECT_EQ(errno, EADDRINUSE);
+    const int second_result = second.start_background();
+    const int second_error = errno;
+    EXPECT_EQ(second_result, -1) << "backend=" << backend << " errno=" << second_error << " " << std::strerror(second_error);
+    EXPECT_EQ(second_error, EADDRINUSE) << "backend=" << backend << " " << std::strerror(second_error);
 
     first.stop();
     CoroTcpListener third(cfg_for(port), drop_conn);
-    EXPECT_EQ(third.start_background(), 0);
+    errno = 0;
+    const int third_result = third.start_background();
+    const int third_error = errno;
+    EXPECT_EQ(third_result, 0) << "stopped_backend=" << backend << " errno=" << third_error << " " << std::strerror(third_error);
     third.stop();
 }
 
@@ -134,7 +154,9 @@ int connect_owner_client(uint16_t port) {
 #ifdef SO_NOSIGPIPE
     const int no_sigpipe = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+        const int error = errno;
         close(fd);
+        errno = error;
         return -1;
     }
 #endif
@@ -146,7 +168,9 @@ int connect_owner_client(uint16_t port) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
         connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        const int error = errno;
         close(fd);
+        errno = error;
         return -1;
     }
     return fd;
@@ -159,16 +183,25 @@ void check_natural_owners(std::size_t reactors) {
     config.num_io_threads = reactors;
     CoroTcpListener listener(config, report_owner);
     ASSERT_EQ(listener.start_background(), 0);
+    const char* backend = nullptr;
+    ASSERT_TRUE(actual_backend(listener, &backend));
+    SCOPED_TRACE(::testing::Message() << "backend=" << backend << " reactors=" << reactors);
+    std::fprintf(stderr, "[listener-diag] natural fanout backend=%s reactors=%zu port=%u\n",
+        backend, reactors, static_cast<unsigned>(port));
     std::array<unsigned, 4> owners{};
     for (unsigned connection = 0; connection < 64; ++connection) {
+        errno = 0;
         const int fd = connect_owner_client(port);
-        EXPECT_GE(fd, 0);
+        const int connect_error = errno;
+        EXPECT_GE(fd, 0) << "backend=" << backend << " reactors=" << reactors << " connection=" << connection
+            << " errno=" << connect_error << " " << std::strerror(connect_error);
         if (fd < 0) continue;
         char first = '?', second = '?';
         const char request = 'x';
         const bool exact = send(fd, &request, 1, 0) == 1 && recv(fd, &first, 1, 0) == 1 &&
             send(fd, &request, 1, 0) == 1 && recv(fd, &second, 1, 0) == 1;
-        EXPECT_TRUE(exact);
+        const int io_error = errno;
+        EXPECT_TRUE(exact) << "backend=" << backend << " errno=" << io_error << " " << std::strerror(io_error);
         EXPECT_EQ(first, second) << "same connection changed reactor";
         if (exact && first >= '0' && first < '0' + static_cast<int>(reactors))
             ++owners[static_cast<std::size_t>(first - '0')];
@@ -209,9 +242,11 @@ bolt::api::core::detached_task mark_acceptor_turn(std::atomic<bool>& passed) {
     co_return;
 }
 
-void expect_owner_zero(uint16_t port) {
+void expect_owner_zero(uint16_t port, const char* backend) {
+    errno = 0;
     const int fd = connect_owner_client(port);
-    EXPECT_GE(fd, 0);
+    const int connect_error = errno;
+    EXPECT_GE(fd, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     if (fd < 0) return;
     for (unsigned i = 0; i < 2; ++i) {
         const char request = 'x';
@@ -230,8 +265,11 @@ TEST(CoroListenerFanout, FullTargetInboxClosesRefusedFdAndKeepsAcceptorResponsiv
     ASSERT_NE(port, 0);
     CoroTcpListener listener(cfg_for(port), report_owner);
     ASSERT_EQ(listener.start_background(), 0);
+    const char* backend = nullptr;
+    ASSERT_TRUE(actual_backend(listener, &backend));
+    SCOPED_TRACE(::testing::Message() << "backend=" << backend);
     auto* io = listener.dispatcher();
-    expect_owner_zero(port);  // sequence 0; next fresh fd targets reactor 1
+    expect_owner_zero(port, backend);  // sequence 0; next fresh fd targets reactor 1
     auto hold = hold_fanout_reactor(gate);
     auto handle = hold.release();
     const bool posted = io->post_to_io_thread(1, handle);
@@ -242,8 +280,10 @@ TEST(CoroListenerFanout, FullTargetInboxClosesRefusedFdAndKeepsAcceptorResponsiv
     EXPECT_TRUE(gate.entered.load());
     for (size_t i = 0; i < 256; ++i)
         EXPECT_TRUE(io->try_post_to_io_thread(1, std::noop_coroutine()));
+    errno = 0;
     const int refused = connect_owner_client(port);
-    EXPECT_GE(refused, 0);
+    const int connect_error = errno;
+    EXPECT_GE(refused, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     if (refused >= 0) {
         char byte = 0;
         const ssize_t n = recv(refused, &byte, 1, 0);
@@ -252,7 +292,7 @@ TEST(CoroListenerFanout, FullTargetInboxClosesRefusedFdAndKeepsAcceptorResponsiv
             << "refused fd must close, not remain queued until target progress";
         close(refused);
     }
-    expect_owner_zero(port);  // sequence 2 progresses while target 1 is held
+    expect_owner_zero(port, backend);  // sequence 2 progresses while target 1 is held
     EXPECT_GE(io->inbox_posts_rejected(), 1u);
     gate.release.store(true);  // no fatal assertions bypass release/join
     gate.release.notify_all();
@@ -268,8 +308,11 @@ TEST(CoroListenerFanout, StopClosesQueuedFdBeforeStartingClientIo) {
     ASSERT_NE(port, 0);
     CoroTcpListener listener(cfg_for(port), report_owner);
     ASSERT_EQ(listener.start_background(), 0);
+    const char* backend = nullptr;
+    ASSERT_TRUE(actual_backend(listener, &backend));
+    SCOPED_TRACE(::testing::Message() << "backend=" << backend);
     auto* io = listener.dispatcher();
-    expect_owner_zero(port);
+    expect_owner_zero(port, backend);
     for (unsigned i = 0; i < 1000 && listener.get_stats().connections_active != 0; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_EQ(listener.get_stats().connections_active, 0u);
@@ -281,8 +324,10 @@ TEST(CoroListenerFanout, StopClosesQueuedFdBeforeStartingClientIo) {
     for (unsigned i = 0; i < 1000 && !gate.entered.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(gate.entered.load());
+    errno = 0;
     const int fd = connect_owner_client(port);  // sequence 1 queues on held reactor
-    EXPECT_GE(fd, 0);
+    const int connect_error = errno;
+    EXPECT_GE(fd, 0) << "backend=" << backend << " errno=" << connect_error << " " << std::strerror(connect_error);
     for (unsigned i = 0; i < 1000 && listener.get_stats().connections_active != 1; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_EQ(listener.get_stats().connections_active, 1u);

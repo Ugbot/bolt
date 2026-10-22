@@ -54,6 +54,43 @@ uint32_t below(Rng* r, uint32_t n) noexcept {
 }
 bool chance(Rng* r, uint32_t pct) noexcept { return below(r, 100) < pct; }
 
+// Fixture-local inclusive sampler. The full u64 width cannot be represented
+// by hi-lo+1; retain that boundary by sampling the raw RNG without modulo.
+uint64_t inclusive(Rng* r, uint64_t lo, uint64_t hi) noexcept {
+    assert(r != nullptr);
+    assert(lo <= hi);
+    if (lo == hi) return lo;
+    const uint64_t value = rng_next(r);
+    if (lo == 0u && hi == UINT64_MAX) return value;
+    return lo + value % (hi - lo + 1u);
+}
+void check_inclusive_sampler() {
+    g_phase = "generator.inclusive";
+    Rng actual = rng_seed(0x51a9u), reference = actual;
+    for (uint32_t i = 0u; i < 256u; ++i) {
+        const auto value = rng_next(&reference);
+        CHK(inclusive(&actual, 0u, UINT64_MAX) == value);
+        CHK(actual.s == reference.s);
+        const auto saved = actual.s;
+        CHK(inclusive(&actual, 0u, 0u) == 0u);
+        CHK(inclusive(&actual, UINT64_MAX, UINT64_MAX) == UINT64_MAX);
+        CHK(actual.s == saved);
+    }
+    constexpr uint64_t lower[] = {1u, UINT64_MAX - 7u, UINT64_MAX - 1u};
+    for (const auto lo : lower) {
+        const uint64_t width = UINT64_MAX - lo + 1u;
+        CHK(width != 0u);
+        for (uint32_t i = 0u; i < 256u; ++i) {
+            const auto value = rng_next(&reference);
+            const auto got = inclusive(&actual, lo, UINT64_MAX);
+            CHK(got == lo + value % width);
+            CHK(got >= lo);
+            CHK(UINT64_MAX - got < width);
+            CHK(actual.s == reference.s);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // limits
 // ---------------------------------------------------------------------------
@@ -91,7 +128,7 @@ void gen_value(Rng* r, uint64_t lo, uint64_t hi, char* buf, bool* set) noexcept 
         case 3: put_u64(buf, hi); return;
         case 4: put_u64(buf, hi + 1u); return;          // wraps to 0 at UINT64_MAX
         case 5: put_u64(buf, lo - 1u); return;
-        case 6: put_u64(buf, lo + (hi > lo ? rng_next(r) % (hi - lo + 1u) : 0u)); return;
+        case 6: put_u64(buf, inclusive(r, lo, hi)); return;
         case 7: put_u64(buf, rng_next(r)); return;
         case 8: std::snprintf(buf, kStrCap, "18446744073709551616"); return;  // 2^64
         case 9: {                                        // leading zeros
@@ -160,7 +197,7 @@ void fuzz_limits_synthetic(Rng* r) {
     uint64_t hi = lo + rng_next(r) % 10000u;
     if (chance(r, 10)) { lo = 0; hi = UINT64_MAX; }
     if (chance(r, 10)) { hi = UINT64_MAX; }
-    const uint64_t def = lo + (hi > lo ? rng_next(r) % (hi - lo + 1u) : 0u);
+    const uint64_t def = inclusive(r, lo, hi);
     const bool alias = chance(r, 60);
     const bolt::LimitKind kind = chance(r, 10) ? bolt::LimitKind::kInvariant
                                                : bolt::LimitKind::kFixedAtAlloc;
@@ -427,6 +464,7 @@ int main(int argc, char** argv) {
     const char* saved = std::getenv("BOLT_WORKERS");
     char saved_buf[64] = {0};
     if (saved != nullptr) std::snprintf(saved_buf, sizeof(saved_buf), "%s", saved);
+    check_inclusive_sampler();
     check_topology();
     if (one != 0) {
         run_seed(one);

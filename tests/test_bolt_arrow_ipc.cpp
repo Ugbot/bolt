@@ -21,6 +21,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
 #include "bolt/ingest/bolt_arrow_ipc.h"
 
@@ -36,6 +37,21 @@ namespace {
 // The one deterministic generating rule; the python oracle re-derives
 // the same values independently.
 constexpr std::int64_t kRows = 100;
+
+BoltBatch* allocate_batch(bolt::Arena* arena, std::uint32_t columns) {
+    auto* batch = static_cast<BoltBatch*>(bolt_aligned_alloc(alignof(BoltBatch), sizeof(BoltBatch)));
+    if (batch == nullptr) { ADD_FAILURE() << "aligned BoltBatch allocation failed"; return nullptr; }
+    if (reinterpret_cast<std::uintptr_t>(batch) % alignof(BoltBatch) != 0u) {
+        ADD_FAILURE() << "BoltBatch allocation did not preserve required alignment";
+        bolt_aligned_free(batch); return nullptr;
+    }
+    BoltBatch::init_empty(batch);
+    if (!BoltBatch::alloc_columns(batch, arena, columns)) {
+        ADD_FAILURE() << "BoltBatch fixture column allocation failed";
+        bolt_aligned_free(batch); return nullptr;
+    }
+    return batch;
+}
 
 std::int64_t int_val(std::int64_t i) { return i * 3 - 50; }
 double dbl_val(std::int64_t i) { return static_cast<double>(i) * 0.5 - 10.0; }
@@ -92,11 +108,8 @@ struct Fixture {
                                      pool, &pool_used);
             }
         }
-        batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
-        BoltBatch::init_empty(batch);
-        const bool cols_ok = BoltBatch::alloc_columns(batch, &arena, 3);
-        assert(cols_ok);
-        (void)cols_ok;
+        batch = allocate_batch(&arena, 3u);
+        if (batch == nullptr) return;
         batch->num_rows = kRows;
         batch->num_cols = 3;
         BoltColumn& c0 = batch->columns[batch->read_epoch][0];
@@ -111,7 +124,7 @@ struct Fixture {
         c2.str_overflow_base = pool;
         c2.validity = validity;
     }
-    ~Fixture() { std::free(batch); }
+    ~Fixture() { bolt_aligned_free(batch); }
 };
 
 std::string fixture_path() {
@@ -231,11 +244,8 @@ struct WideFixture {
                 decimals_validity[i >> 3] &= static_cast<std::uint8_t>(~(1u << (i & 7)));
             }
         }
-        batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
-        BoltBatch::init_empty(batch);
-        const bool cols_ok = BoltBatch::alloc_columns(batch, &arena, 7);
-        assert(cols_ok);
-        (void)cols_ok;
+        batch = allocate_batch(&arena, 7u);
+        if (batch == nullptr) return;
         batch->num_rows = kRows;
         batch->num_cols = 7;
         BoltColumn& c0 = batch->columns[batch->read_epoch][0];
@@ -266,7 +276,7 @@ struct WideFixture {
         c6.decimal_scale = kDecimalScale;
         c6.validity = decimals_validity;
     }
-    ~WideFixture() { std::free(batch); }
+    ~WideFixture() { bolt_aligned_free(batch); }
 };
 
 std::string wide_fixture_path() {
@@ -385,11 +395,8 @@ struct NestedFixture {
             }
         }
 
-        batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
-        BoltBatch::init_empty(batch);
-        const bool cols_ok = BoltBatch::alloc_columns(batch, &arena, 3);
-        assert(cols_ok);
-        (void)cols_ok;
+        batch = allocate_batch(&arena, 3u);
+        if (batch == nullptr) return;
         batch->num_rows = kRows;
         batch->num_cols = 3;
 
@@ -418,7 +425,7 @@ struct NestedFixture {
         batch->columns[batch->read_epoch][2] = BoltColumn::make_struct(
             fields, 2, kRows, person_validity, &arena);
     }
-    ~NestedFixture() { std::free(batch); }
+    ~NestedFixture() { bolt_aligned_free(batch); }
 };
 
 std::string nested_fixture_path() {
@@ -502,6 +509,7 @@ TEST(ArrowIpc, SchemaMismatchFailsClosed) {
     const BoltType tys[1] = {BoltType::Float64};
     ASSERT_TRUE(arrow_ipc_open(w, f, tys, nullptr, 1));
     Fixture fx;                       // batch is (Int64, Float64, Utf8)
+    ASSERT_NE(fx.batch, nullptr);
     EXPECT_FALSE(arrow_ipc_write_batch(w, fx.batch));   // col-count drift
     EXPECT_FALSE(arrow_ipc_close(w)); // failure is latched
     std::fclose(f);
@@ -514,6 +522,7 @@ TEST(ArrowIpc, StreamStructureAndEos) {
     std::FILE* f = std::tmpfile();
     ASSERT_NE(f, nullptr);
     Fixture fx;
+    ASSERT_NE(fx.batch, nullptr);
     const BoltType tys[3] = {BoltType::Int64, BoltType::Float64,
                              BoltType::Utf8};
     const char* names[3] = {"ints", "floats", "strs"};
@@ -548,6 +557,7 @@ TEST(ArrowIpc, WritesPyarrowOracleFixture) {
     auto* w = static_cast<ArrowIpcWriter*>(
         std::calloc(1, sizeof(ArrowIpcWriter)));
     Fixture fx;
+    ASSERT_NE(fx.batch, nullptr);
     const BoltType tys[3] = {BoltType::Int64, BoltType::Float64,
                              BoltType::Utf8};
     const char* names[3] = {"ints", "floats", "strs"};
@@ -573,6 +583,7 @@ TEST(ArrowIpc, WritesPyarrowOracleWideTypesFixture) {
     auto* w = static_cast<ArrowIpcWriter*>(
         std::calloc(1, sizeof(ArrowIpcWriter)));
     WideFixture fx;
+    ASSERT_NE(fx.batch, nullptr);
     const BoltType tys[7] = {
         BoltType::Int64,  BoltType::Float64, BoltType::Utf8,
         BoltType::Bool,   BoltType::Date32,  BoltType::Binary,
@@ -715,6 +726,7 @@ TEST(ArrowIpc, WritesPyarrowOracleNestedFixture) {
     auto* w = static_cast<ArrowIpcWriter*>(
         std::calloc(1, sizeof(ArrowIpcWriter)));
     NestedFixture fx;
+    ASSERT_NE(fx.batch, nullptr);
 
     FieldSpec elem{};
     elem.type = BoltType::Utf8;
@@ -771,10 +783,8 @@ TEST(ArrowIpc, WritesPyarrowOracleTimestampFixture) {
         }
     }
     bolt::Arena arena;
-    BoltBatch* batch = static_cast<BoltBatch*>(std::calloc(1, sizeof(BoltBatch)));
+    BoltBatch* batch = allocate_batch(&arena, 2u);
     ASSERT_NE(batch, nullptr);
-    BoltBatch::init_empty(batch);
-    ASSERT_TRUE(BoltBatch::alloc_columns(batch, &arena, 2));
     batch->num_rows = kRows;
     batch->num_cols = 2;
     BoltColumn& c0 = batch->columns[batch->read_epoch][0];
@@ -790,7 +800,7 @@ TEST(ArrowIpc, WritesPyarrowOracleTimestampFixture) {
     ASSERT_TRUE(arrow_ipc_write_batch(w, batch));
     ASSERT_TRUE(arrow_ipc_close(w));
     std::fclose(f);
-    std::free(batch);
+    bolt_aligned_free(batch);
     std::free(w);
     ::testing::Test::RecordProperty("fixture", path);
 }
