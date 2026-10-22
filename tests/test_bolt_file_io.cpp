@@ -85,7 +85,7 @@ TEST(FileIo, PreadMatchesFileBufferedAndDirect) {
     const std::vector<uint8_t> bytes = random_bytes(n, 1);
     write_file(path, bytes);
     for (int direct = 0; direct < 2; ++direct) {
-        ReadFile f{};
+        bolt::io::ReadFile f{};
         ASSERT_EQ(file_open_read(path.c_str(), direct != 0, &f), FileIoStatus::kOk);
         EXPECT_EQ(f.size, n);
         EXPECT_EQ(f.io_unit, bolt::wire::kFrameIoAlign);
@@ -113,7 +113,7 @@ TEST(FileIo, PreadUnalignedBufferedAndShortAtEof) {
     const std::string path = tmp_path("unaligned");
     const std::vector<uint8_t> bytes = random_bytes(100003, 2);
     write_file(path, bytes);
-    ReadFile f{};
+    bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), false, &f), FileIoStatus::kOk);
     std::vector<uint8_t> dst(5000);
     uint64_t got = 0;
@@ -134,7 +134,7 @@ TEST(FileIo, PreadUnalignedBufferedAndShortAtEof) {
 TEST(FileIo, AlignedReadRejectsMisalignment) {
     const std::string path = tmp_path("misalign");
     write_file(path, random_bytes(1u << 18, 3));
-    ReadFile f{};
+    bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), true, &f), FileIoStatus::kOk);
     AlignedBuf buf(1u << 17, f.io_unit);
     uint64_t got = 0;
@@ -421,7 +421,7 @@ TEST(ReadBatch, FuzzMatchesSerialReads) {
         ASSERT_EQ(read_pool_create(w, &pool), FileIoStatus::kOk);
         ASSERT_EQ(read_pool_workers(pool), w);
         for (int direct = 0; direct < 2; ++direct) {
-            ReadFile f{};
+            bolt::io::ReadFile f{};
             ASSERT_EQ(file_open_read(path.c_str(), direct != 0, &f), FileIoStatus::kOk);
             std::mt19937_64 rng(100u + w * 2u + static_cast<unsigned>(direct));
             for (uint64_t it = 0; it < iters; ++it) {
@@ -461,7 +461,7 @@ TEST(ReadBatch, FuzzMatchesSerialReads) {
 TEST(ReadBatch, FailedRequestReportedPerRequest) {
     const std::string path = tmp_path("batchfail");
     write_file(path, random_bytes(1u << 16, 8));
-    ReadFile f{};
+    bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), false, &f), FileIoStatus::kOk);
     ReadPool* pool = nullptr;
     ASSERT_EQ(read_pool_create(2, &pool), FileIoStatus::kOk);
@@ -496,7 +496,7 @@ void write_bench_file(const std::string& path, uint64_t bytes) {
 
 double cold_seq_gbps(const std::string& path, uint64_t bytes, uint32_t threads) {
     EXPECT_EQ(file_evict_cache(path.c_str()), FileIoStatus::kOk);
-    ReadFile f{};
+    bolt::io::ReadFile f{};
     EXPECT_EQ(file_open_read(path.c_str(), true, &f), FileIoStatus::kOk);
     ReadPool* pool = nullptr;
     EXPECT_EQ(read_pool_create(threads - 1, &pool), FileIoStatus::kOk);
@@ -586,7 +586,7 @@ TEST(FileIo, NativeReadAndMapTransferOnlyOnSuccess) {
     EXPECT_EQ(mapped_file_adopt_bounded(&n, 8193, 8193, &map), FileIoStatus::kBadArg);
     EXPECT_EQ(n.handle, identity);
     EXPECT_EQ(mapped_file_adopt_bounded(&n, 9, 8, &map), FileIoStatus::kBadArg);
-    ReadFile read{};
+    bolt::io::ReadFile read{};
     ASSERT_EQ(file_adopt_read(&n, false, &read), FileIoStatus::kOk);
     EXPECT_EQ(read.handle, identity);
     EXPECT_EQ(n.handle, -1);
@@ -631,7 +631,7 @@ TEST(FileIo, NativeEmptyAndNonregularOwnership) {
 #if !defined(_WIN32)
     NativeFile dir{::open("/tmp", O_RDONLY | O_DIRECTORY)};
     ASSERT_NE(dir.handle, -1);
-    ReadFile r{};
+    bolt::io::ReadFile r{};
     EXPECT_EQ(file_adopt_read(&dir, false, &r), FileIoStatus::kBadArg);
     EXPECT_EQ(mapped_file_adopt_bounded(&dir, 0, 8192, &m), FileIoStatus::kBadArg);
     EXPECT_TRUE(native_file_close(&dir));
@@ -692,7 +692,7 @@ TEST(FileIo, NativeHandleZeroAndReplacementKeepOpenedIdentity) {
     ASSERT_NE(n.handle, -1);
     ASSERT_EQ(std::rename(path.c_str(), moved.c_str()), 0);
     write_file(path, {44});
-    ReadFile r{};
+    bolt::io::ReadFile r{};
     ASSERT_EQ(file_adopt_read(&n, false, &r), FileIoStatus::kOk);
     uint8_t data[3]{};
     uint64_t got = 0;

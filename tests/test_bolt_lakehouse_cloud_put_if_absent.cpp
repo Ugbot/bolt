@@ -33,6 +33,18 @@ constexpr const char* kAzKey =
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
     "K1SZFPTOtr/KBHBeksoGMGw==";
 
+bool utc_tm(std::time_t value, std::tm* out) noexcept {
+    if (out == nullptr) return false;
+    *out = {};
+#if defined(_WIN32)
+    const bool ok = ::gmtime_s(out, &value) == 0;
+#else
+    const bool ok = ::gmtime_r(&value, out) != nullptr;
+#endif
+    if (!ok) *out = {};
+    return ok;
+}
+
 std::string unique_prefix() {
     const auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
     return "t" + std::to_string(static_cast<long long>(ns)) + "/";
@@ -65,12 +77,14 @@ void make_s3_bucket(const std::string& ep) {
     char hash[65];
     bolt::crypto::sha256_empty_hex(hash);
     const std::time_t t = std::time(nullptr);
-    std::tm tmv;
-    gmtime_r(&t, &tmv);
+    ASSERT_NE(t, std::time_t{-1});
+    std::tm tmv{};
+    ASSERT_TRUE(utc_tm(t, &tmv));
     char date[20];
-    std::snprintf(date, sizeof(date), "%04d%02d%02dT%02d%02d%02dZ",
+    const int formatted = std::snprintf(date, sizeof(date), "%04d%02d%02dT%02d%02d%02dZ",
                   tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
                   tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    ASSERT_TRUE(formatted > 0 && static_cast<size_t>(formatted) < sizeof(date));
     bolt::crypto::SigV4Request s{"PUT", host, path, "", "s3", "us-east-1",
                                  date, hash, "minioadmin", "minioadmin",
                                  nullptr};
@@ -94,9 +108,10 @@ void make_az_container(const std::string& ep, const azure_blob::AzureBlobStore* 
     const std::string path = "/" + std::string(kAzAccount) + "/" + kBucket;
     char date[64];
     const std::time_t t = std::time(nullptr);
-    std::tm tmv;
-    gmtime_r(&t, &tmv);
-    std::strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tmv);
+    ASSERT_NE(t, std::time_t{-1});
+    std::tm tmv{};
+    ASSERT_TRUE(utc_tm(t, &tmv));
+    ASSERT_GT(std::strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tmv), 0u);
     SignHeaders h;
     std::memset(&h, 0, sizeof(h));
     CanonicalizedHeader xh[2] = {{"x-ms-date", date},
@@ -211,7 +226,7 @@ void exercise(ObjectStore* os) {
 TEST(BoltCloudPutIfAbsent, S3MinIO) {
     const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
     if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
-    make_s3_bucket(ep);
+    ASSERT_NO_FATAL_FAILURE(make_s3_bucket(ep));
     bolt::Arena arena;
     s3_compat::Secret k;
     s3_compat::Secret s;
@@ -219,13 +234,13 @@ TEST(BoltCloudPutIfAbsent, S3MinIO) {
     ASSERT_TRUE(s3_compat::secret_set(&s, "minioadmin"));
     ObjectStore os;
     ASSERT_TRUE(s3_compat::minio_store_new(&os, &arena, ep, kBucket, &k, &s));
-    exercise(&os);
+    ASSERT_NO_FATAL_FAILURE(exercise(&os));
 }
 
 TEST(BoltCloudPutIfAbsent, S3WrongSecretIsRefused) {
     const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
     if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
-    make_s3_bucket(ep);
+    ASSERT_NO_FATAL_FAILURE(make_s3_bucket(ep));
     bolt::Arena arena;
     s3_compat::Secret k;
     s3_compat::Secret s;
@@ -249,14 +264,14 @@ TEST(BoltCloudPutIfAbsent, AzureAzurite) {
     std::strncpy(cfg.endpoint_override, ep, sizeof(cfg.endpoint_override) - 1u);
     ObjectStore os;
     ASSERT_TRUE(azure_blob::azure_blob_store_new(&os, &arena, &cfg));
-    make_az_container(ep, static_cast<const azure_blob::AzureBlobStore*>(os.impl));
-    exercise(&os);
+    ASSERT_NO_FATAL_FAILURE(make_az_container(ep, static_cast<const azure_blob::AzureBlobStore*>(os.impl)));
+    ASSERT_NO_FATAL_FAILURE(exercise(&os));
 }
 
 TEST(BoltCloudPutIfAbsent, GcsFakeServer) {
     const char* ep = std::getenv("BOLT_TEST_GCS_ENDPOINT");
     if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_GCS_ENDPOINT unset";
-    make_gcs_bucket(ep);
+    ASSERT_NO_FATAL_FAILURE(make_gcs_bucket(ep));
     bolt::Arena arena;
     static gcs::Config cfg;
     std::memset(&cfg, 0, sizeof(cfg));
@@ -265,7 +280,7 @@ TEST(BoltCloudPutIfAbsent, GcsFakeServer) {
     std::strncpy(cfg.endpoint_override, ep, sizeof(cfg.endpoint_override) - 1u);
     ObjectStore os;
     ASSERT_TRUE(gcs::gcs_store_new(&os, &arena, &cfg));
-    exercise(&os);
+    ASSERT_NO_FATAL_FAILURE(exercise(&os));
 }
 
 // An HMAC access id without its secret is a config error, never anonymous.
@@ -298,7 +313,7 @@ gcs::Config* gcs_hmac_cfg(const char* ep, const char* secret) {
 TEST(BoltCloudPutIfAbsent, GcsHmacSigningAgainstMinIO) {
     const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
     if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
-    make_s3_bucket(ep);
+    ASSERT_NO_FATAL_FAILURE(make_s3_bucket(ep));
     bolt::Arena arena;
     gcs::Config* cfg = gcs_hmac_cfg(ep, "minioadmin");
     ASSERT_NE(cfg, nullptr);
@@ -325,7 +340,7 @@ TEST(BoltCloudPutIfAbsent, GcsHmacSigningAgainstMinIO) {
 TEST(BoltCloudPutIfAbsent, GcsHmacWrongSecretIsRefused) {
     const char* ep = std::getenv("BOLT_TEST_S3_ENDPOINT");
     if (ep == nullptr || ep[0] == '\0') GTEST_SKIP() << "BOLT_TEST_S3_ENDPOINT unset";
-    make_s3_bucket(ep);
+    ASSERT_NO_FATAL_FAILURE(make_s3_bucket(ep));
     bolt::Arena arena;
     gcs::Config* cfg = gcs_hmac_cfg(ep, "not-the-secret");
     ASSERT_NE(cfg, nullptr);

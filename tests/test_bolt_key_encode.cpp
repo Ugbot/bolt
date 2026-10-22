@@ -5,14 +5,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "bolt/kernels/bolt_key_encode.h"
+#include "bolt/kernels/bolt_decimal.h"
 
 namespace {
 
@@ -75,19 +78,39 @@ TEST(KeyEncode, IntegersOrderAsValues) {
     EXPECT_EQ(enc1<int64_t>(-1, BoltType::Int64).size(), 8u);
 }
 
+int decimal_order(const bolt::kernels::decimal::Decimal128& a,
+                  const bolt::kernels::decimal::Decimal128& b) {
+    if (a.hi != b.hi) return a.hi < b.hi ? -1 : 1;
+    const auto lo_a = static_cast<uint64_t>(a.lo), lo_b = static_cast<uint64_t>(b.lo);
+    return lo_a < lo_b ? -1 : (lo_a > lo_b ? 1 : 0);
+}
 TEST(KeyEncode, Decimal128OrdersAsTwosComplement) {
+    using D = bolt::kernels::decimal::Decimal128;
     std::mt19937_64 rng(11);
-    std::vector<__int128> v = {0, -1, 1};
+    std::vector<D> v = {{0, 0}, {-1, -1}, {1, 0}};
     for (int i = 0; i < 300; ++i) {
-        const __int128 x = (static_cast<__int128>(static_cast<int64_t>(rng())) << 64) |
-                           static_cast<__int128>(rng());
-        v.push_back(x);
+        const auto hi = std::bit_cast<int64_t>(rng()); // same first/high RNG draw
+        const auto lo = std::bit_cast<int64_t>(rng());
+        v.push_back({lo, hi});
     }
     for (size_t i = 0; i < v.size(); ++i)
         for (size_t j = 0; j < v.size(); j += 7) {
-            const int want = v[i] < v[j] ? -1 : (v[i] > v[j] ? 1 : 0);
+            const int want = decimal_order(v[i], v[j]);
             ASSERT_EQ(bytes_cmp(enc1(v[i], BoltType::Decimal128), enc1(v[j], BoltType::Decimal128)), want);
         }
+    const D ordered[] = {{0, INT64_MIN}, {0, -1}, {INT64_MAX, -1}, {-1, -1},
+        {0, 0}, {INT64_MAX, 0}, {INT64_MIN, 0}, {-1, 0}, {-1, INT64_MAX}};
+    for (size_t i = 0u; i < std::size(ordered); ++i) {
+        if (i + 1u < std::size(ordered))
+            EXPECT_LT(bytes_cmp(enc1(ordered[i], BoltType::Decimal128),
+                enc1(ordered[i + 1u], BoltType::Decimal128)), 0);
+        for (size_t j = 0u; j < std::size(ordered); ++j) {
+            const int want = i < j ? -1 : (i > j ? 1 : 0);
+            EXPECT_EQ(decimal_order(ordered[i], ordered[j]), want);
+            EXPECT_EQ(bytes_cmp(enc1(ordered[i], BoltType::Decimal128),
+                enc1(ordered[j], BoltType::Decimal128)), want);
+        }
+    }
 }
 
 TEST(KeyEncode, FloatsTotalOrderZeroAndNan) {

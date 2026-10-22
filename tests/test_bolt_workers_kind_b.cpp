@@ -10,6 +10,7 @@
 
 #include "bolt/bolt_budget.h"
 #include "bolt/bolt_ebr.h"
+#include "bolt/bolt_port.h"
 #include "bolt/bolt_scheduler.h"
 #include "bolt/bolt_topology.h"
 
@@ -80,18 +81,18 @@ TEST(WorkersKindB, ShutdownThenReinit) {
 // BOLT_WORKERS resolves once per process, so each case runs in a fresh child.
 TEST(WorkersKindBDeathTest, InvalidBoltWorkersIsAStartupError) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    ::setenv("BOLT_WORKERS", "5000", 1);
+    ASSERT_TRUE(bolt_setenv("BOLT_WORKERS", "5000"));
     EXPECT_EXIT({
         bolt::Scheduler* s = new bolt::Scheduler();
         const bool ok = s->init(0u);
         std::exit(ok ? 0 : 3);
     }, ::testing::ExitedWithCode(3), "BOLT_WORKERS=5000 is invalid");
-    ::unsetenv("BOLT_WORKERS");
+    EXPECT_TRUE(bolt_unsetenv("BOLT_WORKERS"));
 }
 
 TEST(WorkersKindBDeathTest, BoltWorkersSizesAutoPools) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    ::setenv("BOLT_WORKERS", "5", 1);
+    ASSERT_TRUE(bolt_setenv("BOLT_WORKERS", "5"));
     EXPECT_EXIT({
         bolt::Scheduler* s = new bolt::Scheduler();
         const bool ok = s->init(0u) && s->thread_count() == 5u &&
@@ -99,7 +100,7 @@ TEST(WorkersKindBDeathTest, BoltWorkersSizesAutoPools) {
         s->shutdown();
         std::exit(ok ? 7 : 1);
     }, ::testing::ExitedWithCode(7), "");
-    ::unsetenv("BOLT_WORKERS");
+    EXPECT_TRUE(bolt_unsetenv("BOLT_WORKERS"));
 }
 
 TEST(WorkersKindB, EbrShardsAreSizedAtInit) {

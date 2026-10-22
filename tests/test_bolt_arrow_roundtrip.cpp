@@ -350,7 +350,7 @@ TEST(ArrowRoundTrip, BinaryWithEmbeddedNulBytesAndValidity) {
     Arena src_arena, import_arena;
     // Binary payloads may contain \0 -- use explicit lengths, not strlen.
     const char b0[] = {0x00, 0x01, 0x02};
-    const char b1[] = {};
+    const char b1[1] = {0};
     const char b2[] = {static_cast<char>(0xFF), 0x00, static_cast<char>(0xAB)};
     struct BRow { const char* p; int32_t len; bool valid; };
     const BRow rows[3] = {{b0, 3, true}, {b1, 0, true}, {b2, 3, false}};

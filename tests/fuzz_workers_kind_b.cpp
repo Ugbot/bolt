@@ -18,14 +18,17 @@
 
 #include <atomic>
 #include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <system_error>
 
 #include "bolt/bolt_budget.h"
 #include "bolt/bolt_ebr.h"
 #include "bolt/bolt_limits.h"
+#include "bolt/bolt_port.h"
 #include "bolt/bolt_scheduler.h"
 #include "bolt/bolt_topology.h"
 
@@ -101,16 +104,38 @@ constexpr uint32_t kStrCap = 48;
 
 // Reference parser, written independently of limits_parse_u64.
 bool ref_parse(const char* s, uint64_t* out) noexcept {
-    const size_t n = std::strlen(s);
-    if (n == 0) return false;
-    unsigned __int128 v = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (s[i] < '0' || s[i] > '9') return false;
-        v = v * 10u + static_cast<unsigned>(s[i] - '0');
-        if (v > UINT64_MAX) return false;
-    }
-    *out = static_cast<uint64_t>(v);
+    if (s == nullptr || out == nullptr) return false;
+    size_t n = 0u;
+    for (; n < kStrCap && s[n] != '\0'; ++n) {}
+    // Explicit lexical contract: at most32 decimal digits, including zeros.
+    if (n == 0u || n > 32u) return false;
+    uint64_t value = 0u;
+    const auto parsed = std::from_chars(s, s + n, value, 10);
+    if (parsed.ec != std::errc{} || parsed.ptr != s + n) return false;
+    *out = value;
     return true;
+}
+
+void check_parser_edges() {
+    g_phase = "parser.literal_edges";
+    struct Case { const char* text; bool valid; uint64_t value; };
+    constexpr Case cases[] = {{nullptr, false, 0u}, {"", false, 0u}, {"0", true, 0u},
+        {"18446744073709551615", true, UINT64_MAX}, {"18446744073709551616", false, 0u},
+        {"00000000" "00000000" "00000000" "00000000", true, 0u},
+        {"00000000" "00000000" "00000000" "00000000" "0", false, 0u},
+        {"0005", true, 5u}, {"+1", false, 0u}, {"-1", false, 0u},
+        {" 1", false, 0u}, {"1 ", false, 0u}, {"1x", false, 0u},
+        {"999999999999999999999999999999999999999", false, 0u}};
+    uint64_t empty = 73u;
+    CHK(!bolt::limits_parse_u64("", &empty));
+    CHK(empty == 73u);
+    for (const auto& edge : cases) {
+        uint64_t reference = 73u, production = 73u;
+        CHK(ref_parse(edge.text, &reference) == edge.valid);
+        CHK(bolt::limits_parse_u64(edge.text, &production) == edge.valid);
+        CHK(reference == (edge.valid ? edge.value : 73u));
+        CHK(production == (edge.valid ? edge.value : 73u));
+    }
 }
 
 void put_u64(char* buf, uint64_t v) noexcept {
@@ -156,7 +181,13 @@ void gen_value(Rng* r, uint64_t lo, uint64_t hi, char* buf, bool* set) noexcept 
 }
 
 void set_env(const char* name, bool set, const char* v) noexcept {
-    if (set) ::setenv(name, v, 1); else ::unsetenv(name);
+    // Owned wrappers canonically clear empty on every platform. Resolver
+    // modeling already treats absent/empty alike; parser emptiness is tested
+    // directly above, never inferred from the environment representation.
+    CHK(set ? bolt_setenv(name, v) : bolt_unsetenv(name));
+    const char* actual = std::getenv(name);
+    if (!set || v == nullptr || v[0] == '\0') CHK(actual == nullptr);
+    else CHK(actual != nullptr && std::strcmp(actual, v) == 0);
 }
 
 // Check one row of `t` after limits_resolve against the reference.
@@ -215,8 +246,8 @@ void fuzz_limits_synthetic(Rng* r) {
     set_env(kAlias, as, av);
     const bool ok = bolt::limits_resolve(&t);
     check_row(t, 0, kPrimary, ps, pv, alias ? kAlias : nullptr, as, av, ok);
-    ::unsetenv(kPrimary);
-    ::unsetenv(kAlias);
+    set_env(kPrimary, false, nullptr);
+    set_env(kAlias, false, nullptr);
 }
 
 // The real bolt.workers row, re-resolved into scratch storage so the
@@ -238,7 +269,7 @@ void fuzz_limits_bolt_workers(Rng* r) {
     set_env("BOLT_WORKERS", ps, pv);
     const bool ok = bolt::limits_resolve(&t);
     check_row(t, 0, "BOLT_WORKERS", ps, pv, nullptr, false, "", ok);
-    ::unsetenv("BOLT_WORKERS");
+    set_env("BOLT_WORKERS", false, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -452,19 +483,24 @@ void run_seed(uint64_t seed) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Resolve the process tables before any setenv so they see the real env.
+    // Resolve the process tables before environment mutation.
     (void)bolt::bolt_limits();
-    ::unsetenv(kPrimary);
-    ::unsetenv(kAlias);
+    set_env(kPrimary, false, nullptr);
+    set_env(kAlias, false, nullptr);
     uint64_t count = 200, one = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--count") == 0) count = std::strtoull(argv[i + 1], nullptr, 10);
         else if (std::strcmp(argv[i], "--seed") == 0) one = std::strtoull(argv[i + 1], nullptr, 10);
     }
     const char* saved = std::getenv("BOLT_WORKERS");
+    const bool had_saved = saved != nullptr;
     char saved_buf[64] = {0};
-    if (saved != nullptr) std::snprintf(saved_buf, sizeof(saved_buf), "%s", saved);
+    if (had_saved) {
+        const int n = std::snprintf(saved_buf, sizeof(saved_buf), "%s", saved);
+        CHK(n >= 0 && static_cast<size_t>(n) < sizeof(saved_buf));
+    }
     check_inclusive_sampler();
+    check_parser_edges();
     check_topology();
     if (one != 0) {
         run_seed(one);
@@ -474,7 +510,7 @@ int main(int argc, char** argv) {
     } else {
         for (uint64_t s = 1; s <= count; ++s) run_seed(s);
     }
-    if (saved != nullptr) ::setenv("BOLT_WORKERS", saved_buf, 1);
+    set_env("BOLT_WORKERS", had_saved, had_saved ? saved_buf : nullptr);
     std::printf("fuzz_workers_kind_b: ok (%llu seeds)\n",
                 static_cast<unsigned long long>(one != 0 ? 1 : count));
     return 0;
