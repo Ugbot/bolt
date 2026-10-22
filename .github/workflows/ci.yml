@@ -48,7 +48,8 @@ jobs:
         run: cmake --preset ${{ matrix.preset }} -G Ninja
 
       - name: Build
-        run: cmake --build --preset ${{ matrix.preset }} --parallel 4
+        # Collect independent Ninja errors while preserving a nonzero build exit.
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 4 -- -k 0
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }} --parallel 2 --timeout 600

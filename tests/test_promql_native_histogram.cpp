@@ -595,7 +595,7 @@ TEST(NativeHistogram, ArithmeticDiscriminatingPower) {
 
     // (1) Div-by-zero implemented as Mul(1/0) would keep buckets at +Inf.
     NativeHistogram as_mul = base;
-    bolt::promql::nh_mul(&as_mul, 1.0 / 0.0);
+    bolt::promql::nh_mul(&as_mul, std::numeric_limits<double>::infinity());
     EXPECT_EQ(as_mul.n_pos, 3);
     NativeHistogram real_div = base;
     bolt::promql::nh_div(&real_div, 0.0);
