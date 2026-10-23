@@ -234,12 +234,24 @@ bool bind_current_schema(ScanHandle* s, const pq::PqMeta* meta) noexcept {
         s->map_schema=cur;
         for (uint32_t j=0; j<cur->n_fields; ++j) s->want_type[j]=want_bolt_type(cur->fields[j].type);
     }
+    // Files written without field ids bind through the table's default name mapping (spec), falling back to the current column name only
+    // when the table carries no mapping.
+    if (!file_has_ids && !s->nm_loaded) {
+        s->nm_loaded=true;
+        if (!metadata_name_mapping(&s->table->meta,s->scratch,&s->nm_entries,&s->nm_count)) return false;
+    }
     for (uint32_t j=0; j<cur->n_fields; ++j) {
         int32_t found=-1;
+        const NameMapEntry* nm=nullptr;
+        if (!file_has_ids) for (uint32_t e=0; e<s->nm_count; ++e) if (s->nm_entries[e].field_id==cur->fields[j].id) nm=&s->nm_entries[e];
         for (uint32_t i=0; i<meta->n_columns; ++i) {
             const auto& col=meta->columns[i];
-            const bool hit=file_has_ids ? (col.has_field_id && col.field_id==cur->fields[j].id)
-                                        : std::strcmp(col.name,cur->fields[j].name)==0;
+            bool by_name=false;
+            if (!file_has_ids) {
+                if (nm!=nullptr) { for (uint32_t k=0; k<nm->n_names; ++k) by_name=by_name||std::strcmp(col.name,nm->names[k])==0; }
+                else if (s->nm_count==0) by_name=std::strcmp(col.name,cur->fields[j].name)==0;
+            }
+            const bool hit=file_has_ids ? (col.has_field_id && col.field_id==cur->fields[j].id) : by_name;
             if (!hit) continue;
             if (found>=0) return false;                                  // two file columns claim one field: ambiguous, never guess
             found=static_cast<int32_t>(i);
@@ -293,6 +305,11 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
             continue;
         }
         // Absent from this file: the column was added after the file was written. Reads as null (v3 initial-default is refused at the gate).
+        if (s->map_schema->fields[j].required) {
+            std::fprintf(stderr,"[iceberg_scan] REFUSED: required column '%s' (field id %d) has no data in a data file and no default; the file or the table is corrupt\n",
+                         name,s->map_schema->fields[j].id);
+            return false;
+        }
         const BoltType t=s->want_type[j];
         if (t==BoltType::NA) {
             std::fprintf(stderr,"[iceberg_scan] REFUSED: column '%s' is absent from a data file and its type cannot be null-filled here\n",name);

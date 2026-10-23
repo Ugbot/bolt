@@ -142,6 +142,8 @@ const char* strip_root(const char* root, const char* path) noexcept {
 // Returns a pointer INTO `p`, never null, never past the terminator.
 const char* strip_scheme(const char* p) noexcept {
     assert(p != nullptr);
+    // "file:/tmp/x" (one slash: what Hadoop's Path prints, and a valid URI for the same file as "/tmp/x").
+    if (std::strncmp(p, "file:", 5) == 0 && p[5] == '/' && p[6] != '/') return p + 5;
     const char* sep = std::strstr(p, "://");
     if (sep == nullptr) return p;
     const char* q = sep + 3;
@@ -433,6 +435,9 @@ struct ScanHandle {
     uint32_t      decode_columns;
     const Schema* map_schema;
     int32_t*      colmap;     // per schema field: file column index, or -1 (absent in this file: read as null)
+    NameMapEntry* nm_entries;   // the table's default name mapping, parsed once per scan
+    uint32_t      nm_count;
+    bool          nm_loaded;
     BoltType*     want_type;  // per schema field: the decoded type the Iceberg type implies (Invalid => not checked)
     // Identity of the row group behind the most recent iceberg_scan_next_batch result.
     IcebergScanGroup last_group;

@@ -102,7 +102,24 @@ struct Metadata {
     // retain their existing ID-based serialization; this flag describes parsed
     // input, not a mutation API for writer-owned Metadata.
     bool current_snapshot_present;
+    // Raw (JSON-string-escaped) value of the `schema.name-mapping.default` table property, arena-owned; null when absent. Read it through
+    // metadata_name_mapping(); files written without field ids bind through it (spec: "Column Projection").
+    const char* name_mapping_json;
+    uint32_t    name_mapping_len;
+    uint32_t    _pad_nm;
 };
+
+// One top-level field of a name mapping: the Iceberg field id and the file column names that map to it.
+static constexpr uint32_t kNameMapMaxNames = 8u;
+struct NameMapEntry {
+    int32_t  field_id;
+    uint32_t n_names;
+    char     names[kNameMapMaxNames][kIcebergMaxFieldName];
+};
+
+// Parse the default name mapping into arena-owned entries (top-level fields only: the scan reads flat columns). *n = 0 and true when
+// the table has no mapping. False on a malformed mapping (never guessed around).
+bool metadata_name_mapping(const Metadata* m, Arena* scratch, NameMapEntry** out, uint32_t* n) noexcept;
 
 }  // namespace iceberg
 }  // namespace lakehouse
