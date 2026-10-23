@@ -455,7 +455,7 @@ struct ScanHandle {
     uint32_t             eq_cap;
     uint32_t             n_cur_eq;     // sets that apply to the file being read
     uint32_t             cur_eq[kMaxEqualitySets];
-    struct DvEntry { const char* path; bolt::ingest::RoaringBitmap64 bm; };
+    struct DvEntry { const char* path; int64_t seq; bolt::ingest::RoaringBitmap64 bm; };
     DvEntry*             dvs;          // v3 deletion vectors, one per referenced data file
     uint32_t             n_dvs;
     uint32_t             dvs_cap;
@@ -690,7 +690,7 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
 // content == kPositionDeletes. Returns false on any I/O/decode failure or
 // on overflowing kMaxPosDels -- a delete file bolt cannot fully load must
 // fail the scan, not load a PARTIAL delete set that would then under-delete.
-bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
+bool load_position_delete_file(ScanHandle* s, const DataFileRef& df, int64_t seq) noexcept {
     assert(s != nullptr);
     assert(df.content == FileContent::kPositionDeletes);
 
@@ -744,6 +744,7 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
             std::memcpy(e.file_path, pdata, static_cast<size_t>(plen));
             e.file_path[plen] = '\0';
             e.pos = pos_vals[r];
+            e.seq = seq;
             if (s->table->strict_pinned) {
                 char key[kOsMaxKey];
                 if (path_col.is_null(r) || pos_col.is_null(r) || e.pos<0 ||
@@ -761,7 +762,7 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
 // by referenced_data_file. Anything malformed, duplicated for one data file, or too large fails the scan (never under-deletes).
 // The whole Puffin object is read (the transport has no ranged table read here); DVs are small next to the data they cover.
 constexpr uint64_t kMaxDvObjectBytes = 256ull << 20;
-bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
+bool load_deletion_vector(ScanHandle* s, const DataFileRef& df, int64_t seq) noexcept {
     assert(s != nullptr && df.is_dv);
     if (df.referenced_data_file[0] == '\0' || df.content_offset < 0 || df.content_size <= 0) return false;
     char want_path[kIcebergMaxPath];
@@ -783,19 +784,20 @@ bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
     std::memcpy(path, df.referenced_data_file, plen + 1u);
     normalize_ref_path(path);
     e.path = path;
+    e.seq = seq;
     if (!lake_grow(s->scratch, s->budget, &s->dvs, s->n_dvs, &s->dvs_cap, s->n_dvs + 1u)) return false;
     s->dvs[s->n_dvs++] = e;
     return true;
 }
 
-const bolt::ingest::RoaringBitmap64* dv_for(const ScanHandle* s, const char* file_path) noexcept {
+const bolt::ingest::RoaringBitmap64* dv_for(const ScanHandle* s, const char* file_path, int64_t data_seq) noexcept {
     char norm[kIcebergMaxPath];
     const size_t n = std::strlen(file_path);
     if (n >= sizeof(norm)) return nullptr;
     std::memcpy(norm, file_path, n + 1u);
     normalize_ref_path(norm);
     for (uint32_t i = 0; i < s->n_dvs; ++i)
-        if (std::strcmp(s->dvs[i].path, norm) == 0) return &s->dvs[i].bm;
+        if (std::strcmp(s->dvs[i].path, norm) == 0) return s->dvs[i].seq >= data_seq ? &s->dvs[i].bm : nullptr;   // a DV reaches only data at or below its sequence
     return nullptr;
 }
 
@@ -892,8 +894,21 @@ bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, ui
 // function cannot safely compact -- never a silent under-delete. A group
 // with nothing to delete is untouched regardless of column shape, so a
 // table's odd column types cost nothing unless a real delete lands in it.
+// First entry of the (path,pos) run is found by binary search; any entry of the run whose delete sequence reaches the data file applies.
+bool position_deleted(const PositionDeleteSet* d, const char* path, int64_t pos, int64_t data_seq) noexcept {
+    uint32_t lo = 0, hi = d->n;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2u;
+        const int c = std::strcmp(d->entries[mid].file_path, path);
+        if (c < 0 || (c == 0 && d->entries[mid].pos < pos)) lo = mid + 1u; else hi = mid;
+    }
+    for (uint32_t i = lo; i < d->n && std::strcmp(d->entries[i].file_path, path) == 0 && d->entries[i].pos == pos; ++i)   // bounded by the run
+        if (d->entries[i].seq >= data_seq) return true;
+    return false;
+}
+
 bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
-                                     const bolt::ingest::RoaringBitmap64* dv,
+                                     const bolt::ingest::RoaringBitmap64* dv, int64_t data_seq,
                                      const char* file_path, uint64_t base_row,
                                      BoltColumn* cols, uint32_t n_cols,
                                      int64_t* rows, Arena* scratch) noexcept {
@@ -911,7 +926,7 @@ bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
     uint32_t kept = 0;
     for (int64_t r = 0; r < *rows; ++r) {
         const int64_t file_pos = static_cast<int64_t>(base_row) + r;
-        if (!position_delete_set_contains(pos_dels, file_path, file_pos) &&
+        if (!position_deleted(pos_dels, file_path, file_pos, data_seq) &&
             (dv == nullptr || !bolt::lakehouse::iceberg::iceberg_dv_contains(dv, static_cast<uint64_t>(file_pos)))) {
             sel[kept++] = static_cast<uint32_t>(r);
         }
@@ -1012,7 +1027,8 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
             return true;
         }
         if (use != EntryUse::kPosDelete) return true;
-        if (e->is_dv ? !load_deletion_vector(v->s, *e) : !load_position_delete_file(v->s, *e)) { v->failed = true; return false; }
+        const int64_t dseq = e->has_sequence_number ? e->sequence_number : v->mle_seq;
+        if (e->is_dv ? !load_deletion_vector(v->s, *e, dseq) : !load_position_delete_file(v->s, *e, dseq)) { v->failed = true; return false; }
         return true;
     }
     // A delete file in a data manifest breaks the spec's layout and the delete
@@ -1278,7 +1294,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         ++s->cur_row_group;
         // Positions are counted against the FULL data file (deleted rows included), so the next group's base must
         // advance by the pre-filter row count -- `decoded_rows` was captured before the filter can shrink `rows`.
-        if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, dv_for(s, live_file.path), live_file.path,
+        if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, dv_for(s, live_file.path, live_file.seq), live_file.seq, live_file.path,
                                                           s->cur_file_row_base, dec,
                                                           dec_columns, &rows,
                                                           s->scratch)) {

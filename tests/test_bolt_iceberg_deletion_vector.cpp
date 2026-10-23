@@ -175,7 +175,7 @@ TEST(IcebergDeletionVector, ScanExcludesRowsNamedByADeletionVectorAndRefusesACor
         for (uint32_t i = 0; i < n_mle; ++i)
             l << (i ? "," : "") << "{\"manifest_path\":\"" << mle[i].manifest_path << "\",\"manifest_length\":" << mle[i].manifest_length
               << ",\"partition_spec_id\":" << mle[i].partition_spec_id << ",\"content\":0}";
-        l << ",{\"manifest_path\":\"" << dm << "\",\"manifest_length\":" << m.str().size() << ",\"partition_spec_id\":0,\"content\":1}]";
+        l << ",{\"manifest_path\":\"" << dm << "\",\"manifest_length\":" << m.str().size() << ",\"partition_spec_id\":0,\"content\":1,\"sequence_number\":100}]";
         spit(ln, l.str());
         std::string patched = meta;
         patched.replace(q1 + 1, q2 - q1 - 1, ln);

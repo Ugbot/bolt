@@ -57,6 +57,7 @@ struct DeleteFileRef {
 struct PositionDeleteEntry {
     char     file_path[kIcebergMaxPath];
     int64_t  pos;
+    int64_t  seq;   // the delete file's data sequence number: it reaches only data files with a sequence number <= this (readers; 0 from writers)
 };
 
 struct EqualityDeleteI64 {

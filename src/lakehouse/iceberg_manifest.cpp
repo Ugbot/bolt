@@ -448,6 +448,10 @@ bool manifest_list_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
                 int64_t v = 0; read_int64(&it, &v);
                 slot->content = (v == 1) ? ManifestContent::kDeleteManifest
                                          : ManifestContent::kDataManifest;
+            } else if (tok_eq(&idx, key, "sequence_number") || tok_eq(&idx, key, "sequence-number")) {
+                read_int64(&it, &slot->sequence_number);
+            } else if (tok_eq(&idx, key, "min_sequence_number") || tok_eq(&idx, key, "min-sequence-number")) {
+                read_int64(&it, &slot->min_sequence_number);
             } else if (tok_eq(&idx, key, "added_snapshot_id") ||
                        tok_eq(&idx, key, "added-snapshot-id")) {
                 read_int64(&it, &slot->added_snapshot_id);
