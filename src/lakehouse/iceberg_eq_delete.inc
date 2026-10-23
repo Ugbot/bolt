@@ -1,3 +1,4 @@
+#include "bolt/lakehouse/iceberg/iceberg_limits.h"
 // Equality deletes (spec: "Equality Delete Files") and the sequence-number / partition scoping that governs every delete file.
 // Included by iceberg_scan.cpp inside the iceberg namespace, after ScanHandle and the position-delete code.
 //
@@ -25,7 +26,7 @@ uint64_t partition_hash(const DataFileRef& e) noexcept {
     return h;
 }
 
-constexpr uint32_t kEqKeyMax = 4096;
+constexpr uint32_t kEqKeyMax = limits::kEqKeyMax;
 
 bool put_u32(uint8_t* b, uint32_t cap, uint32_t* n, uint32_t v) noexcept {
     if (*n + 4 > cap) return false;

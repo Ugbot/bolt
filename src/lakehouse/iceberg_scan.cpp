@@ -38,6 +38,7 @@
 //
 // Tiger Style: bounded, noexcept, fixed-size scratch.
 
+#include "bolt/lakehouse/iceberg/iceberg_limits.h"
 #include "bolt/lakehouse/iceberg/scan.h"
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
@@ -379,8 +380,8 @@ struct FileTask {
     uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
 };
 
-constexpr uint32_t kMaxEqualityIds = 16;
-constexpr uint32_t kMaxEqualitySets = 64;
+constexpr uint32_t kMaxEqualityIds = limits::kMaxEqualityIds;
+constexpr uint32_t kMaxEqualitySets = limits::kMaxEqualitySets;
 struct EqSet {
     int64_t   seq;
     int32_t   spec_id;
@@ -761,7 +762,7 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df, int64_t seq
 // v3 deletion vector: read the Puffin blob [content_offset, +content_size) of df.file_path and keep its bitmap for the file named
 // by referenced_data_file. Anything malformed, duplicated for one data file, or too large fails the scan (never under-deletes).
 // The whole Puffin object is read (the transport has no ranged table read here); DVs are small next to the data they cover.
-constexpr uint64_t kMaxDvObjectBytes = 256ull << 20;
+constexpr uint64_t kMaxDvObjectBytes = limits::kMaxDvObjectBytes;
 bool load_deletion_vector(ScanHandle* s, const DataFileRef& df, int64_t seq) noexcept {
     assert(s != nullptr && df.is_dv);
     if (df.referenced_data_file[0] == '\0' || df.content_offset < 0 || df.content_size <= 0) return false;

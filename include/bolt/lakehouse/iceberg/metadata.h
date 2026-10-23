@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+#include "bolt/lakehouse/iceberg/iceberg_limits.h"
 #include "bolt/lakehouse/iceberg/partition.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
 #include "bolt/lakehouse/iceberg/sort_order.h"
@@ -110,7 +111,7 @@ struct Metadata {
 };
 
 // One top-level field of a name mapping: the Iceberg field id and the file column names that map to it.
-static constexpr uint32_t kNameMapMaxNames = 8u;
+static constexpr uint32_t kNameMapMaxNames = limits::kNameMapMaxNames;
 struct NameMapEntry {
     int32_t  field_id;
     uint32_t n_names;
