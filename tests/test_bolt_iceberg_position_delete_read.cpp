@@ -155,12 +155,28 @@ TEST(IcebergPositionDeleteRead, BoltOwnReaderExcludesDeletedRow) {
            "delete -- the read-side loader/apply path regressed";
 
     int64_t seen[32]; uint32_t n_seen = 0;
+    IcebergScanGroup none{};
+    EXPECT_FALSE(iceberg_scan_last_group(sh, &none)) << "no group before the first batch";
+    uint32_t groups_seen = 0;
     for (int guard = 0; guard < 64; ++guard) {
         bolt::BoltBatch batch{};
         bool eof = false;
         ASSERT_TRUE(iceberg_scan_next_batch(sh, &batch, &eof));
         if (eof) break;
         ASSERT_GT(batch.num_rows, 0);
+        // G2ICE-262: the batch's row-group identity, including pre-delete counts.
+        IcebergScanGroup g{};
+        ASSERT_TRUE(iceberg_scan_last_group(sh, &g));
+        ASSERT_NE(g.file_path, nullptr);
+        EXPECT_EQ(g.row_group, 0u) << "each fixture file has one row group";
+        EXPECT_EQ(g.file_row_base, 0u);
+        EXPECT_EQ(g.decoded_rows, static_cast<uint64_t>(kRowsPerCommit));
+        EXPECT_EQ(g.emitted_rows, static_cast<uint64_t>(batch.num_rows));
+        const bool is_deleted_file = std::strstr(g.file_path, commit_file[kDeletedRow / kRowsPerCommit]) != nullptr ||
+                                     std::strstr(commit_file[kDeletedRow / kRowsPerCommit], g.file_path) != nullptr;
+        EXPECT_EQ(g.emitted_rows, is_deleted_file ? static_cast<uint64_t>(kRowsPerCommit - 1)
+                                                  : static_cast<uint64_t>(kRowsPerCommit));
+        ++groups_seen;
         const auto& col = batch.columns[batch.read_epoch][0];
         const auto* vals = static_cast<const int64_t*>(col.data);
         for (int64_t r = 0; r < batch.num_rows; ++r) {
@@ -168,6 +184,7 @@ TEST(IcebergPositionDeleteRead, BoltOwnReaderExcludesDeletedRow) {
             seen[n_seen++] = vals[r];
         }
     }
+    EXPECT_EQ(groups_seen, static_cast<uint32_t>(kCommits));
     iceberg_scan_close(sh);
     iceberg_table_close(rh);
 

@@ -422,6 +422,8 @@ struct ScanHandle {
     uint16_t source_indices[kMaxColumns];
     const Schema* selected_schema;
     uint32_t output_columns;
+    // Identity of the row group behind the most recent iceberg_scan_next_batch result.
+    IcebergScanGroup last_group;
 };
 
 namespace {
@@ -1117,6 +1119,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             s->failed = true;
             return false;
         }
+        const uint32_t group_index = s->cur_row_group;
+        const uint64_t group_base = s->cur_file_row_base;
         ++s->cur_row_group;
         // Positions are counted against the FULL data file (deleted rows
         // included), so the next group's base must advance by the
@@ -1131,6 +1135,11 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
+        s->last_group.file_path = live_file.path;
+        s->last_group.row_group = group_index;
+        s->last_group.file_row_base = group_base;
+        s->last_group.decoded_rows = static_cast<uint64_t>(decoded_rows);
+        s->last_group.emitted_rows = static_cast<uint64_t>(rows);
         out->num_rows = rows;
         out->num_cols = s->output_columns;
         for (uint32_t c = 0; c < s->output_columns; ++c) {
@@ -1146,6 +1155,13 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     // the guard cannot expire. Fail closed if the invariant ever breaks.
     assert(false && "iceberg scan advance did not make progress");
     return false;
+}
+
+bool iceberg_scan_last_group(const ScanHandle* s, IcebergScanGroup* out) noexcept {
+    assert(out != nullptr);
+    if (s == nullptr || out == nullptr || s->last_group.file_path == nullptr) return false;
+    *out = s->last_group;
+    return true;
 }
 
 bool iceberg_scan_stats(const ScanHandle* s, IcebergScanStats* out) noexcept {

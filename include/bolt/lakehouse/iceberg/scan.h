@@ -107,6 +107,23 @@ bool iceberg_scan_next_file(ScanHandle* h, const char** out_path,
 bool iceberg_scan_next_batch(ScanHandle* h, BoltBatch* out,
                              bool* out_eof) noexcept;
 
+// Identity of the row group that produced the batch most recently returned by
+// iceberg_scan_next_batch (G2ICE-262: lets a consumer key a cache of decoded groups).
+//   file_path     the data file's path as planned; valid until the next iceberg_scan_next_batch call
+//   row_group     index inside that file's footer
+//   file_row_base absolute position of the group's first row in the file (positional deletes)
+//   decoded_rows  rows before positional deletes; emitted_rows rows in the batch after them
+// Returns false before any batch was produced or on a null handle.
+struct IcebergScanGroup {
+    const char* file_path;
+    uint32_t    row_group;
+    uint32_t    _pad;
+    uint64_t    file_row_base;
+    uint64_t    decoded_rows;
+    uint64_t    emitted_rows;
+};
+bool iceberg_scan_last_group(const ScanHandle* h, IcebergScanGroup* out) noexcept;
+
 void iceberg_scan_close(ScanHandle* h) noexcept;
 
 }  // namespace iceberg
