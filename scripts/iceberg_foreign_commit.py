@@ -106,6 +106,17 @@ def main() -> int:
             check("DuckDB reads the same rows", ids == [1, 2, 3, 900, 901, 902], str(ids))
         except ImportError:
             print("  (DuckDB not installed: skipped its read)")
+        spark_helper = os.environ.get("BOLT_SPARK_ORACLE")   # path to Gestalt2's scripts/oracles/spark_iceberg.py (optional)
+        if spark_helper:
+            sys.path.insert(0, os.path.dirname(spark_helper))
+            try:
+                import spark_iceberg as so
+                sp = so.session(f"file://{work}/spark_wh")
+                ids = sorted(r[0] for r in sp.read.format("iceberg").load(after_path).select("id").collect())
+                check("Iceberg-Java (Spark) reads the same rows", ids == [1, 2, 3, 900, 901, 902], str(ids))
+                sp.stop()
+            except ImportError:
+                print("  (pyspark not installed: skipped the Spark read)")
 
     t1 = cat.create_table("ns.t1", schema=SCHEMA, properties={"format-version": "1"})
     t1.append(ROWS)
