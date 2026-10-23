@@ -182,7 +182,7 @@ Status decode_exact(const MetadataObjectIdentity& pinned, const uint8_t* bytes,
     auto status = original_identity(bytes, length, pinned);
     if (status != Status::Ok) return status;
     if (!metadata_parse(bytes, length, metadata, staged) ||
-        (staged->format_version != 1 && staged->format_version != 2)) return Status::DecodeFailed;
+        (staged->format_version < 1 || staged->format_version > 3)) return Status::DecodeFailed;  // spec v1-v3 are adopted; v4 is not
     if (std::strcmp(staged->location, pinned.table_location) != 0 ||
         std::strcmp(staged->table_uuid, pinned.table_uuid) != 0) return Status::IdentityMismatch;
     MetadataLoadResult copied{}; copied.object = pinned;
