@@ -896,6 +896,15 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
             sizeof(TableHandle), sizeof(Metadata), offsetof(TableHandle, meta),
             offsetof(TableHandle, last_error), offsetof(TableHandle, write_uncertain),
             static_cast<unsigned long long>(ml), h->meta.n_snapshots);
+        {
+            const uint8_t* hb0 = reinterpret_cast<const uint8_t*>(h);
+            const bool mb_in_h = mb >= hb0 && mb < hb0 + sizeof(TableHandle);
+            const bool mb_end_in_h = mb + ml > hb0 && mb + ml <= hb0 + sizeof(TableHandle);
+            std::fprintf(stderr, "[iceberg-open-diag] mb=%p ml=%llu mb_in_h=%d mb_end_in_h=%d h=%p h_end=%p arena_alloc=%llu arena_reserved=%llu\n",
+                static_cast<const void*>(mb), static_cast<unsigned long long>(ml), mb_in_h ? 1 : 0, mb_end_in_h ? 1 : 0,
+                static_cast<const void*>(hb0), static_cast<const void*>(hb0 + sizeof(TableHandle)),
+                static_cast<unsigned long long>(arena->total_allocated()), static_cast<unsigned long long>(arena->total_reserved()));
+        }
         {   // Where did the bytes land? Everything after meta should still be zero.
             const uint8_t* base = reinterpret_cast<const uint8_t*>(h);
             const size_t tail0 = offsetof(TableHandle, meta) + sizeof(Metadata);
