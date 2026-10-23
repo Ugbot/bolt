@@ -215,3 +215,89 @@ TEST(IcebergDeletionVector, ScanExcludesRowsNamedByADeletionVectorAndRefusesACor
     std::vector<int64_t> bad;
     EXPECT_FALSE(scan_ids(&bad) && bad.size() == 10) << "a CRC-failing DV must not yield the undeleted rows";
 }
+
+// Negative control for column binding: a schema column that no data file carries is NULL when optional and a refusal (never invented
+// values or silent nulls) when required.
+TEST(IcebergSchemaBinding, RequiredColumnWithNoDataRefusesAndOptionalReadsNull) {
+    bolt::Arena arena;
+    const std::filesystem::path base = std::filesystem::temp_directory_path() / "bolt_iceberg_required_col";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    const std::filesystem::path root = base / "default" / "t";
+    std::filesystem::create_directories(root, ec);
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.generic_string().c_str(), &os));
+    static SchemaField fields[1]{};
+    Schema sch{}; sch.fields = fields; sch.cap_fields = 1; sch.n_fields = 1;
+    fields[0].id = 1; fields[0].required = true;
+    std::strncpy(fields[0].name, "id", sizeof(fields[0].name) - 1);
+    std::strncpy(fields[0].type, "long", sizeof(fields[0].type) - 1);
+    PartitionSpec spec{}; SortOrder sort{}; WriteOptions wo; write_options_init(&wo);
+    TableHandle* wh = nullptr;
+    ASSERT_TRUE(table_create(&wh, &arena, &os, root.generic_string().c_str(), &sch, &spec, &sort, &wo));
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, wh));
+    bolt::BoltBatch b{};
+    bolt::BoltBatch::init_empty(&b);
+    b.arena = &arena; b.num_rows = 3; b.num_cols = 1;
+    bolt::BoltBatch::alloc_columns(&b, &arena, 1);
+    b.schema.add_field("id", bolt::BoltType::Int64, false);
+    auto* ids = arena.allocate_array<int64_t>(3);
+    for (int i = 0; i < 3; ++i) ids[i] = 7 + i;
+    b.columns[b.read_epoch][0].type = bolt::BoltType::Int64;
+    b.columns[b.read_epoch][0].length = 3;
+    b.columns[b.read_epoch][0].data = ids;
+    ASSERT_TRUE(append_write(ah, &b));
+    ASSERT_TRUE(append_commit(ah));
+    append_close(ah);
+    table_close(wh);
+
+    std::filesystem::path meta_path;
+    for (auto& e : std::filesystem::recursive_directory_iterator(root)) {
+        const std::string n = e.path().string();
+        if (n.size() > 14 && n.rfind(".metadata.json") == n.size() - 14 && (meta_path.empty() || e.path() > meta_path)) meta_path = e.path();
+    }
+    ASSERT_FALSE(meta_path.empty());
+    const std::string original = slurp(meta_path);
+
+    auto scan = [&](std::vector<int64_t>* second_col_nulls) {
+        FilesystemCatalog cat_fs{}; Catalog cat{};
+        EXPECT_TRUE(filesystem_catalog_init(&cat_fs, base.generic_string().c_str(), &cat));
+        bolt::Arena ra;
+        TableHandle* rh = nullptr;
+        if (!iceberg_table_open(&rh, &ra, &cat, "default", "t")) return 2;
+        ReadOptions ro{}; read_options_init(&ro);
+        ScanHandle* sh = nullptr;
+        if (!iceberg_scan_open(&sh, rh, &ro)) { iceberg_table_close(rh); return 3; }
+        int rc = 0;
+        for (int g = 0; g < 16 && rc == 0; ++g) {
+            bolt::BoltBatch bb{}; bool eof = false;
+            if (!iceberg_scan_next_batch(sh, &bb, &eof)) { rc = 1; break; }
+            if (eof) break;
+            int extra = -1;
+            for (int32_t c = 0; c < bb.num_cols; ++c) if (std::strcmp(bb.schema.fields[c].name, "extra") == 0) extra = c;
+            for (int64_t r = 0; r < bb.num_rows; ++r)
+                second_col_nulls->push_back(extra >= 0 && bb.columns[bb.read_epoch][extra].is_null(r) ? 1 : 0);
+        }
+        iceberg_scan_close(sh); iceberg_table_close(rh);
+        return rc;
+    };
+    auto with_extra = [&](bool required) {
+        std::string patched = original;
+        const size_t at = patched.find("\"fields\":[");
+        EXPECT_NE(at, std::string::npos);
+        patched.insert(at + 10, std::string("{\"id\":3,\"name\":\"extra\",\"required\":") + (required ? "true" : "false") + ",\"type\":\"long\"},");
+        spit(meta_path, patched);
+    };
+
+    with_extra(false);
+    std::vector<int64_t> nulls;
+    EXPECT_EQ(scan(&nulls), 0) << "an optional column added after the file was written reads as null";
+    EXPECT_EQ(nulls.size(), 3u);
+    for (int64_t n : nulls) EXPECT_EQ(n, 1);
+
+    with_extra(true);
+    std::vector<int64_t> none;
+    EXPECT_NE(scan(&none), 0) << "a required column with no data must refuse, not read as null";
+    spit(meta_path, original);
+}
