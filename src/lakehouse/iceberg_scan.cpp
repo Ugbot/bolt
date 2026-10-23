@@ -343,6 +343,22 @@ struct TableHandle {
     PinnedObjectStore*    pinned_source;
 };
 
+// iceberg_scan.cpp and iceberg_writer.cpp each define their OWN
+// bolt::lakehouse::iceberg::TableHandle (the public headers only forward-declare
+// it), which is an ODR violation. Arena::allocate_array<TableHandle> is a
+// type-keyed template, so its instantiation is a shared COMDAT symbol: the MSVC
+// linker kept the other TU's copy and the writer got 113,384 bytes for a
+// 118,696-byte handle (CI 39887412144: the metadata buffer landed inside the
+// handle and corrupted last_error/write_uncertain). Allocate through this
+// internal-linkage helper so each TU uses its own sizeof. TODO(G2ICE-261):
+// give the two handles distinct public types.
+namespace {
+TableHandle* new_table_handle(Arena* a) noexcept {
+    assert(a != nullptr);
+    return static_cast<TableHandle*>(a->allocate(sizeof(TableHandle), alignof(TableHandle)));
+}
+}  // namespace
+
 // One live data file that passed pruning. The path lives in the manifest
 // arena, which is reset when the scan moves to the next manifest.
 struct FileTask {
@@ -433,7 +449,7 @@ bool iceberg_table_open(TableHandle** out, Arena* arena, Catalog* catalog,
                         const char* namespace_, const char* name) noexcept {
     assert(out != nullptr && arena != nullptr);
     assert(catalog != nullptr && namespace_ != nullptr && name != nullptr);
-    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
     h->arena = arena;
@@ -462,7 +478,7 @@ bool iceberg_table_open_store(TableHandle** out, Arena* arena,
         return false;
     const size_t tl = std::strlen(table_rel);
     if (tl == 0u || tl + 1u > kMaxFsRoot) return false;
-    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
     h->arena = arena;
@@ -505,7 +521,7 @@ bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
     assert(store != nullptr && store->vt != nullptr);
     *out = nullptr;
     if (metadata_json == nullptr || metadata_len == 0u) return false;
-    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
     h->arena = arena;

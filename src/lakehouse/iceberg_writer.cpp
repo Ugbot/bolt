@@ -33,9 +33,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
-#include <cstddef>
 #include <cstring>
-#include <string_view>
 #include <chrono>
 #include <filesystem>
 #include <system_error>
@@ -106,6 +104,22 @@ struct TableHandle {
     FileWriteState* file_io;
     bool file_io_configurable;
 };
+
+// iceberg_scan.cpp and iceberg_writer.cpp each define their OWN
+// bolt::lakehouse::iceberg::TableHandle (the public headers only forward-declare
+// it), which is an ODR violation. Arena::allocate_array<TableHandle> is a
+// type-keyed template, so its instantiation is a shared COMDAT symbol: the MSVC
+// linker kept the other TU's copy and the writer got 113,384 bytes for a
+// 118,696-byte handle (CI 39887412144: the metadata buffer landed inside the
+// handle and corrupted last_error/write_uncertain). Allocate through this
+// internal-linkage helper so each TU uses its own sizeof. TODO(G2ICE-261):
+// give the two handles distinct public types.
+namespace {
+TableHandle* new_table_handle(Arena* a) noexcept {
+    assert(a != nullptr);
+    return static_cast<TableHandle*>(a->allocate(sizeof(TableHandle), alignof(TableHandle)));
+}
+}  // namespace
 
 struct AppendHandle {
     TableHandle*   th;
@@ -803,7 +817,7 @@ bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
     *out = nullptr;
     if (out_uncertain != nullptr) *out_uncertain = CommitCandidate{};
     if (std::strlen(path) + 1u > kMaxPathLen) return false;
-    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
     h->arena = arena;
@@ -853,29 +867,16 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     return table_create_ex(out, arena, os, path, schema, spec, sort, opts, nullptr);
 }
 
-namespace {
-// TEMP(G2ICE-261 Windows diag): where does the arena cursor sit relative to h?
-void diag_cursor(const char* where, Arena* arena, const TableHandle* h) noexcept {
-    uint8_t* probe = static_cast<uint8_t*>(arena->allocate(1u, 1u));
-    const long long rel = probe == nullptr ? -1ll :
-        static_cast<long long>(probe - reinterpret_cast<const uint8_t*>(h));
-    if (rel < static_cast<long long>(sizeof(TableHandle)))
-        std::fprintf(stderr, "[iceberg-open-diag] CURSOR INSIDE h at %s: probe-h=%lld sizeof(h)=%zu total_alloc=%llu\n",
-            where, rel, sizeof(TableHandle), static_cast<unsigned long long>(arena->total_allocated()));
-}
-}  // namespace
-
 bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
                 const char* path) noexcept {
     assert(out != nullptr && arena != nullptr && os != nullptr);
     assert(path != nullptr);
-    TableHandle* h = arena->allocate_array<TableHandle>(1);
+    TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
     h->arena = arena;
     h->os    = os;
     std::strncpy(h->root, path, sizeof(h->root) - 1u);
-    diag_cursor("after_memset", arena, h);
 
     // The hint is a starting point only (G2ICE-163): it can lag behind a
     // concurrent writer or be caught mid-rewrite, so fall back to v1 and
@@ -893,73 +894,14 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
         if (!version_exists(os, 1)) return false;
         v = 1;
     }
-    diag_cursor("after_hint", arena, h);
     v = probe_latest(os, v);
-    diag_cursor("after_probe", arena, h);
     h->meta_version = v;
     char rel[64];
     version_key(v, rel);
     const uint8_t* mb = nullptr; uint64_t ml = 0;
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
-    const CommitError before_parse = h->last_error; const bool before_unc = h->write_uncertain;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
-    if (h->write_uncertain || static_cast<unsigned>(h->last_error) > 3u) {   // TEMP(G2ICE-261 Windows diag)
-        std::fprintf(stderr, "[iceberg-open-diag] BAD HANDLE v=%lld before_parse(err=%u unc=%d) after(err=%u unc=%d) sizeof(TableHandle)=%zu sizeof(Metadata)=%zu off(meta)=%zu off(last_error)=%zu off(write_uncertain)=%zu ml=%llu n_snap=%u\n",
-            static_cast<long long>(v), static_cast<unsigned>(before_parse), before_unc ? 1 : 0,
-            static_cast<unsigned>(h->last_error), h->write_uncertain ? 1 : 0,
-            sizeof(TableHandle), sizeof(Metadata), offsetof(TableHandle, meta),
-            offsetof(TableHandle, last_error), offsetof(TableHandle, write_uncertain),
-            static_cast<unsigned long long>(ml), h->meta.n_snapshots);
-        {
-            const uint8_t* hb0 = reinterpret_cast<const uint8_t*>(h);
-            const bool mb_in_h = mb >= hb0 && mb < hb0 + sizeof(TableHandle);
-            const bool mb_end_in_h = mb + ml > hb0 && mb + ml <= hb0 + sizeof(TableHandle);
-            std::fprintf(stderr, "[iceberg-open-diag] mb=%p ml=%llu mb_in_h=%d mb_end_in_h=%d h=%p h_end=%p arena_alloc=%llu arena_reserved=%llu\n",
-                static_cast<const void*>(mb), static_cast<unsigned long long>(ml), mb_in_h ? 1 : 0, mb_end_in_h ? 1 : 0,
-                static_cast<const void*>(hb0), static_cast<const void*>(hb0 + sizeof(TableHandle)),
-                static_cast<unsigned long long>(arena->total_allocated()), static_cast<unsigned long long>(arena->total_reserved()));
-        }
-        {   // Where did the bytes land? Everything after meta should still be zero.
-            const uint8_t* base = reinterpret_cast<const uint8_t*>(h);
-            const size_t tail0 = offsetof(TableHandle, meta) + sizeof(Metadata);
-            size_t nz_first = SIZE_MAX, nz_last = 0, nz_count = 0;
-            for (size_t i = tail0; i < sizeof(TableHandle); ++i)
-                if (base[i] != 0) { if (nz_first == SIZE_MAX) nz_first = i; nz_last = i; ++nz_count; }
-            std::fprintf(stderr, "[iceberg-open-diag] tail nonzero: count=%zu first=%lld last=%zu (tail starts %zu, meta_version=%lld) snapshots=%p schemas=%p snaplog=%p h=%p..%p\n",
-                nz_count, nz_first == SIZE_MAX ? -1ll : static_cast<long long>(nz_first), nz_last, tail0,
-                static_cast<long long>(h->meta_version), static_cast<void*>(h->meta.snapshots),
-                static_cast<void*>(h->meta.schemas), static_cast<void*>(h->meta.snapshot_log),
-                static_cast<const void*>(h), static_cast<const void*>(base + sizeof(TableHandle)));
-            if (nz_first != SIZE_MAX) {
-                char hex[200]; size_t n = 0;
-                for (size_t i = nz_first; i < nz_first + 48 && i < sizeof(TableHandle) && n + 3 < sizeof(hex); ++i)
-                    n += static_cast<size_t>(std::snprintf(hex + n, sizeof(hex) - n, "%02x", base[i]));
-                std::fprintf(stderr, "[iceberg-open-diag] tail bytes from first: %s\n", hex);
-            }
-        }
-        // Re-parse into a private buffer followed by a canary to see whether the
-        // parse itself writes beyond Metadata.
-        constexpr size_t kCanary = 32768u;
-        uint8_t* raw = arena->allocate_array<uint8_t>(sizeof(Metadata) + kCanary);
-        if (raw != nullptr) {
-            std::memset(raw, 0x5A, sizeof(Metadata) + kCanary);
-            Metadata* probe = reinterpret_cast<Metadata*>(raw);
-            const bool ok = metadata_parse(mb, static_cast<uint32_t>(ml), arena, probe);
-            size_t first = SIZE_MAX, last = 0, changed = 0;
-            for (size_t i = 0; i < kCanary; ++i) {
-                if (raw[sizeof(Metadata) + i] != 0x5A) {
-                    if (first == SIZE_MAX) first = i;
-                    last = i; ++changed;
-                }
-            }
-            std::fprintf(stderr, "[iceberg-open-diag] private re-parse ok=%d canary_changed=%zu first=%lld last=%zu probe_addr=%p h_addr=%p\n",
-                ok ? 1 : 0, changed, first == SIZE_MAX ? static_cast<long long>(-1) : static_cast<long long>(first), last,
-                static_cast<void*>(raw), static_cast<void*>(h));
-        }
-        const std::string_view head(reinterpret_cast<const char*>(mb), ml < 2300 ? static_cast<size_t>(ml) : 2300u);
-        std::fprintf(stderr, "[iceberg-open-diag] json=%.*s\n", static_cast<int>(head.size()), head.data());
-    }
     h->file_io_configurable = true;
     *out = h;
     return true;
