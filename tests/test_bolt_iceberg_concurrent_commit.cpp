@@ -275,6 +275,14 @@ Attempt try_commit(const std::string& root, int32_t w, int32_t c,
     diagnostic.phase = "open";
     if (!table_open(&th, &arena, &os, root.c_str())) return fail("open");
     diagnostic.base_version = diagnostic.observed_version;
+    {   // Windows-only round-3 failure: is the handle already uncertain straight after open?
+        CommitCandidate probe{};
+        const bool uncertain_after_open = table_uncertain_commit(th, &probe);
+        if (uncertain_after_open)
+            std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d UNCERTAIN IMMEDIATELY AFTER table_open err=%u arena_allocated=%llu\n",
+                w, c, static_cast<unsigned>(table_last_commit_error(th)),
+                static_cast<unsigned long long>(arena.total_allocated()));
+    }
     diagnostic.phase = "append_open";
     if (!append_open(&ah, th)) return fail("append_open");
     bolt::BoltBatch b{};
