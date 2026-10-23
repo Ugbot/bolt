@@ -853,6 +853,18 @@ bool table_create(TableHandle** out, Arena* arena, ObjectStore* os,
     return table_create_ex(out, arena, os, path, schema, spec, sort, opts, nullptr);
 }
 
+namespace {
+// TEMP(G2ICE-261 Windows diag): where does the arena cursor sit relative to h?
+void diag_cursor(const char* where, Arena* arena, const TableHandle* h) noexcept {
+    uint8_t* probe = static_cast<uint8_t*>(arena->allocate(1u, 1u));
+    const long long rel = probe == nullptr ? -1ll :
+        static_cast<long long>(probe - reinterpret_cast<const uint8_t*>(h));
+    if (rel < static_cast<long long>(sizeof(TableHandle)))
+        std::fprintf(stderr, "[iceberg-open-diag] CURSOR INSIDE h at %s: probe-h=%lld sizeof(h)=%zu total_alloc=%llu\n",
+            where, rel, sizeof(TableHandle), static_cast<unsigned long long>(arena->total_allocated()));
+}
+}  // namespace
+
 bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
                 const char* path) noexcept {
     assert(out != nullptr && arena != nullptr && os != nullptr);
@@ -863,6 +875,7 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     h->arena = arena;
     h->os    = os;
     std::strncpy(h->root, path, sizeof(h->root) - 1u);
+    diag_cursor("after_memset", arena, h);
 
     // The hint is a starting point only (G2ICE-163): it can lag behind a
     // concurrent writer or be caught mid-rewrite, so fall back to v1 and
@@ -880,7 +893,9 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
         if (!version_exists(os, 1)) return false;
         v = 1;
     }
+    diag_cursor("after_hint", arena, h);
     v = probe_latest(os, v);
+    diag_cursor("after_probe", arena, h);
     h->meta_version = v;
     char rel[64];
     version_key(v, rel);
