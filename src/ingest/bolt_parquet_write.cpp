@@ -510,6 +510,7 @@ std::uint32_t list_chain(const ParquetWriteColumn& sch,
 bool type_supported(const ParquetWriteColumn& c) noexcept {
     if(c.integer_bits && !((c.integer_bits==8 || c.integer_bits==16 || c.integer_bits==32) ? c.type==BoltType::Int32 : c.integer_bits==64 && c.type==BoltType::Int64)) return false;
     if(c.timestamp_unit>3 || (c.timestamp_unit && c.type!=BoltType::Timestamp)) return false;
+    if(c.time_micros && c.type!=BoltType::Int64) return false;
     switch (c.type) {
         case BoltType::Bool:
         case BoltType::Int32:
@@ -2218,6 +2219,17 @@ void write_schema_element_col(TcOut* o,
         tc_put_field(o, 14, kFStruct);       // LogicalType.UUID (empty UUIDType)
         tc_put_stop(o);
         tc_put_stop(o);
+    }
+    if (c.time_micros) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, 7, kFStruct);        // LogicalType.TIME
+        tc_put_field(o, 1, kFFalse);         // isAdjustedToUTC
+        tc_put_field(o, 2, kFStruct);        // unit
+        tc_put_field(o, 2, kFStruct);        // MICROS
+        tc_put_stop(o);                      // empty MicroSeconds
+        tc_put_stop(o);                      // end TimeUnit union
+        tc_put_stop(o);                      // end TimeType
+        tc_put_stop(o);                      // end LogicalType union
     }
     if (c.type == BoltType::Timestamp && (c.ts_local || c.timestamp_unit)) {
         tc_put_field(o, 10, kFStruct);

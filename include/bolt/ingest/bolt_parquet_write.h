@@ -279,6 +279,8 @@ struct ParquetWriteColumn {
     bool                  integer_signed;
     // Timestamp unit: 0 legacy microseconds, 1 millis, 2 micros, 3 nanos.
     std::uint8_t          timestamp_unit;
+    // INT64 only: LogicalType TIME(isAdjustedToUTC=false, MICROS) - an Iceberg `time` (micros since midnight).
+    bool                  time_micros;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
