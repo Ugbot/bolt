@@ -195,6 +195,13 @@ struct DataFileRef {
     int32_t        equality_ids[8];
     uint32_t       n_equality_ids;
     uint32_t       _pad3;
+    // v3 deletion vector: a Puffin `deletion-vector-v1` blob located by (file_path, content_offset, content_size) that deletes
+    // rows of exactly `referenced_data_file`. is_dv is set only when the manifest carried a non-null content_offset.
+    int64_t        content_offset;
+    int64_t        content_size;
+    bool           is_dv;
+    uint8_t        _pad4[7];
+    char           referenced_data_file[kIcebergMaxPath];
 };
 // Pinned: the provenance flags came out of the 4 bytes of padding that used to
 // follow `n_partition`, so nothing after them moved and the struct is the same

@@ -6,9 +6,22 @@
 #include <vector>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_deflate.h"
+#include "bolt/lakehouse/catalog.h"
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
+#include "bolt/lakehouse/iceberg/manifest.h"
+#include "bolt/lakehouse/iceberg/metadata.h"
+#include "bolt/lakehouse/iceberg/scan.h"
+#include "bolt/lakehouse/iceberg/writer.h"
+#include "bolt/lakehouse/object_store.h"
 
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+
+using namespace bolt::lakehouse;
 using namespace bolt::lakehouse::iceberg;
 
 TEST(IcebergDeletionVector, RoundTripsPositionsAndRefusesCorruption) {
@@ -64,4 +77,141 @@ TEST(IcebergDeletionVector, DecodesAMultiBucketBitmapFromAnotherWriter) {
     EXPECT_TRUE(iceberg_dv_contains(&dv, (1ull << 32) + 9));
     EXPECT_FALSE(iceberg_dv_contains(&dv, 9));
     EXPECT_FALSE(iceberg_dv_contains(&dv, (1ull << 32) + 5));
+}
+
+namespace {
+
+std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    std::stringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+
+void spit(const std::filesystem::path& p, const std::string& b) {
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(b.data(), static_cast<std::streamsize>(b.size()));
+}
+
+}  // namespace
+
+// A table with a v3 deletion vector (Puffin blob located by offset/size in a delete manifest) reads without the DV's rows, and a
+// blob that fails its CRC fails the scan rather than returning rows it should have deleted.
+TEST(IcebergDeletionVector, ScanExcludesRowsNamedByADeletionVectorAndRefusesACorruptOne) {
+    bolt::Arena arena;
+    const std::filesystem::path base = std::filesystem::temp_directory_path() / "bolt_iceberg_dv_scan";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    const std::filesystem::path root = base / "default" / "t";
+    std::filesystem::create_directories(root, ec);
+
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.generic_string().c_str(), &os));
+    static SchemaField fields[1]{};
+    Schema sch{}; sch.fields = fields; sch.cap_fields = 1; sch.n_fields = 1;
+    fields[0].id = 1; fields[0].required = true;
+    std::strncpy(fields[0].name, "id", sizeof(fields[0].name) - 1);
+    std::strncpy(fields[0].type, "long", sizeof(fields[0].type) - 1);
+    PartitionSpec spec{}; SortOrder sort{}; WriteOptions wo; write_options_init(&wo);
+    TableHandle* wh = nullptr;
+    ASSERT_TRUE(table_create(&wh, &arena, &os, root.generic_string().c_str(), &sch, &spec, &sort, &wo));
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, wh));
+    bolt::BoltBatch b{};
+    bolt::BoltBatch::init_empty(&b);
+    b.arena = &arena; b.num_rows = 10; b.num_cols = 1;
+    bolt::BoltBatch::alloc_columns(&b, &arena, 1);
+    b.schema.add_field("id", bolt::BoltType::Int64, false);
+    auto* ids = arena.allocate_array<int64_t>(10);
+    for (int i = 0; i < 10; ++i) ids[i] = 100 + i;
+    b.columns[b.read_epoch][0].type = bolt::BoltType::Int64;
+    b.columns[b.read_epoch][0].length = 10;
+    b.columns[b.read_epoch][0].data = ids;
+    ASSERT_TRUE(append_write(ah, &b));
+    char data_file[kIcebergMaxPath]; int64_t rows = 0;
+    ASSERT_TRUE(append_commit_ex(ah, data_file, kIcebergMaxPath, &rows));
+    append_close(ah);
+    table_close(wh);
+
+    // Locate the current metadata and manifest list the writer produced.
+    std::filesystem::path meta_path;
+    for (auto& e : std::filesystem::recursive_directory_iterator(root))
+        if (e.path().string().size() > 14 && e.path().string().rfind(".metadata.json") == e.path().string().size() - 14 &&
+            (meta_path.empty() || e.path() > meta_path)) meta_path = e.path();
+    ASSERT_FALSE(meta_path.empty());
+    std::string meta = slurp(meta_path);
+    const size_t ml_key = meta.find("\"manifest-list\"");
+    ASSERT_NE(ml_key, std::string::npos);
+    const size_t q1 = meta.find('"', meta.find(':', ml_key)), q2 = meta.find('"', q1 + 1);
+    const std::string old_list = meta.substr(q1 + 1, q2 - q1 - 1);
+    std::string old_list_path = old_list;
+    if (old_list_path.rfind("file:", 0) == 0) old_list_path = old_list_path.substr(5);
+    if (!std::filesystem::exists(old_list_path)) old_list_path = (root / old_list).generic_string();
+    const std::string list_bytes = slurp(old_list_path);
+    ASSERT_FALSE(list_bytes.empty());
+    ManifestListEntry* mle = nullptr; uint32_t n_mle = 0;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(reinterpret_cast<const uint8_t*>(list_bytes.data()), list_bytes.size(), &arena, 8, &mle, &n_mle));
+    ASSERT_GE(n_mle, 1u);
+
+    // Puffin file: "PFA1" + blob + (unparsed) footer padding; the manifest locates the blob by offset/size.
+    const uint32_t del_pos[] = {2, 5, 9};
+    const uint8_t* blob = nullptr; uint64_t blob_len = 0;
+    ASSERT_TRUE(iceberg_dv_encode(del_pos, 3, &arena, &blob, &blob_len));
+    auto build = [&](bool corrupt) {
+        std::string puffin = "PFA1";
+        std::string bl(reinterpret_cast<const char*>(blob), blob_len);
+        if (corrupt) bl[bl.size() / 2] ^= 0x01;
+        puffin += bl; puffin += "PFA1{}";
+        const std::string pf = (root / "data" / "dv-1.puffin").generic_string();
+        spit(pf, puffin);
+        const std::string dm = (root / "metadata" / "dv-manifest.json").generic_string();
+        std::ostringstream m;
+        m << "[{\"status\":1,\"data_file\":{\"content\":1,\"file_path\":\"" << pf << "\",\"file_format\":\"PUFFIN\","
+          << "\"record_count\":3,\"file_size_in_bytes\":" << puffin.size() << ",\"content_offset\":4,\"content_size_in_bytes\":"
+          << blob_len << ",\"referenced_data_file\":\"" << data_file << "\"}}]";
+        spit(dm, m.str());
+        const std::string ln = (root / "metadata" / "dv-list.json").generic_string();
+        std::ostringstream l;
+        l << "[";
+        for (uint32_t i = 0; i < n_mle; ++i)
+            l << (i ? "," : "") << "{\"manifest_path\":\"" << mle[i].manifest_path << "\",\"manifest_length\":" << mle[i].manifest_length
+              << ",\"partition_spec_id\":" << mle[i].partition_spec_id << ",\"content\":0}";
+        l << ",{\"manifest_path\":\"" << dm << "\",\"manifest_length\":" << m.str().size() << ",\"partition_spec_id\":0,\"content\":1}]";
+        spit(ln, l.str());
+        std::string patched = meta;
+        patched.replace(q1 + 1, q2 - q1 - 1, ln);
+        const size_t fv = patched.find("\"format-version\"");
+        if (fv != std::string::npos) { const size_t c = patched.find(':', fv); patched[patched.find_first_of("0123456789", c)] = '3'; }
+        spit(meta_path, patched);
+    };
+
+    auto scan_ids = [&](std::vector<int64_t>* out) {
+        FilesystemCatalog cat_fs{}; Catalog cat{};
+        EXPECT_TRUE(filesystem_catalog_init(&cat_fs, base.generic_string().c_str(), &cat));
+        bolt::Arena ra;
+        TableHandle* rh = nullptr;
+        if (!iceberg_table_open(&rh, &ra, &cat, "default", "t")) return false;
+        ReadOptions ro{}; read_options_init(&ro);
+        ScanHandle* sh = nullptr;
+        if (!iceberg_scan_open(&sh, rh, &ro)) { iceberg_table_close(rh); return false; }
+        bool ok = true;
+        for (int g = 0; g < 64 && ok; ++g) {
+            bolt::BoltBatch bb{}; bool eof = false;
+            if (!iceberg_scan_next_batch(sh, &bb, &eof)) { ok = false; break; }
+            if (eof) break;
+            const auto* v = static_cast<const int64_t*>(bb.columns[bb.read_epoch][0].data);
+            for (int64_t r = 0; r < bb.num_rows; ++r) out->push_back(v[r]);
+        }
+        iceberg_scan_close(sh); iceberg_table_close(rh);
+        return ok;
+    };
+
+    build(false);
+    std::vector<int64_t> got;
+    ASSERT_TRUE(scan_ids(&got)) << "a table with a valid deletion vector must scan";
+    std::vector<int64_t> want = {100, 101, 103, 104, 106, 107, 108};
+    EXPECT_EQ(got, want) << "rows at positions 2, 5 and 9 must be absent, every other row present";
+
+    build(true);
+    std::vector<int64_t> bad;
+    EXPECT_FALSE(scan_ids(&bad) && bad.size() == 10) << "a CRC-failing DV must not yield the undeleted rows";
 }

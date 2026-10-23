@@ -210,6 +210,7 @@ struct DfCtx {
     bool         have_pending;
 
     int32_t f_status, f_snap, f_content, f_path, f_records, f_size;
+    int32_t f_dv_offset, f_dv_size, f_dv_ref;
     // Partition struct leaves, in declared order.
     int32_t part_idx[kMaxPartCols];
     uint32_t n_part;
@@ -307,6 +308,15 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
     if (const ing::AvroValue* v = at(s->f_path)) {
         if (!fits(kIcebergMaxPath, v)) return false;
         copy_str(e->file_path, kIcebergMaxPath, v);
+    }
+    if (const ing::AvroValue* off = at(s->f_dv_offset); off != nullptr && !off->is_null) {
+        e->content_offset = i64_or(off, 0);
+        e->content_size   = i64_or(at(s->f_dv_size), 0);
+        e->is_dv          = true;
+    }
+    if (const ing::AvroValue* v = at(s->f_dv_ref); v != nullptr && !v->is_null) {
+        if (!fits(kIcebergMaxPath, v)) return false;
+        copy_str(e->referenced_data_file, kIcebergMaxPath, v);
     }
     e->stats.record_count       = i64_or(at(s->f_records), 0);
     e->stats.file_size_in_bytes = i64_or(at(s->f_size), 0);
@@ -461,6 +471,9 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->f_path    = find_field(h, "data_file.file_path");
     s->f_records = find_field(h, "data_file.record_count");
     s->f_size    = find_field(h, "data_file.file_size_in_bytes");
+    s->f_dv_offset = find_field(h, "data_file.content_offset");
+    s->f_dv_size   = find_field(h, "data_file.content_size_in_bytes");
+    s->f_dv_ref    = find_field(h, "data_file.referenced_data_file");
     if (s->f_path < 0) return false;                // not a manifest
 
     // Partition struct leaves flatten to "data_file.partition.<col>".

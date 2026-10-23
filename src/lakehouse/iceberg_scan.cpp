@@ -39,6 +39,7 @@
 // Tiger Style: bounded, noexcept, fixed-size scratch.
 
 #include "bolt/lakehouse/iceberg/scan.h"
+#include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
 #include "bolt/lakehouse/object_store/s3_uri.h"
 
@@ -410,6 +411,10 @@ struct ScanHandle {
     // table's file count is not bounded by the table arena's block table.
     Arena*        meta_arena;
     PositionDeleteSet    pos_dels;
+    struct DvEntry { const char* path; bolt::ingest::RoaringBitmap64 bm; };
+    DvEntry*             dvs;          // v3 deletion vectors, one per referenced data file
+    uint32_t             n_dvs;
+    uint32_t             dvs_cap;
     EqualityDeleteSetI64 eq_dels;
     IcebergScanStats     stats;
     PinnedParquet        pinned;
@@ -696,6 +701,39 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
     return true;
 }
 
+// v3 deletion vector: read the Puffin blob [content_offset, +content_size) of df.file_path and keep its bitmap for the file named
+// by referenced_data_file. Anything malformed, duplicated for one data file, or too large fails the scan (never under-deletes).
+// The whole Puffin object is read (the transport has no ranged table read here); DVs are small next to the data they cover.
+constexpr uint64_t kMaxDvObjectBytes = 256ull << 20;
+bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
+    assert(s != nullptr && df.is_dv);
+    if (df.referenced_data_file[0] == '\0' || df.content_offset < 0 || df.content_size <= 0) return false;
+    for (uint32_t i = 0; i < s->n_dvs; ++i)
+        if (std::strcmp(s->dvs[i].path, df.referenced_data_file) == 0) return false;   // at most one DV per data file
+    const uint8_t* body = nullptr; uint64_t blen = 0;
+    s->meta_arena->reset();
+    if (!table_read_ref(s->table, df.file_path, s->meta_arena, &body, &blen) || blen > kMaxDvObjectBytes) return false;
+    const uint64_t off = static_cast<uint64_t>(df.content_offset), size = static_cast<uint64_t>(df.content_size);
+    if (off > blen || size > blen - off) return false;
+    if (!s->budget->try_reserve(size * 2u)) return false;
+    ScanHandle::DvEntry e{};
+    if (!bolt::lakehouse::iceberg::iceberg_dv_decode(body + off, size, s->scratch, &e.bm)) return false;
+    const size_t plen = std::strlen(df.referenced_data_file);
+    char* path = s->scratch->allocate_array<char>(plen + 1u);
+    if (path == nullptr) return false;
+    std::memcpy(path, df.referenced_data_file, plen + 1u);
+    e.path = path;
+    if (!lake_grow(s->scratch, s->budget, &s->dvs, s->n_dvs, &s->dvs_cap, s->n_dvs + 1u)) return false;
+    s->dvs[s->n_dvs++] = e;
+    return true;
+}
+
+const bolt::ingest::RoaringBitmap64* dv_for(const ScanHandle* s, const char* file_path) noexcept {
+    for (uint32_t i = 0; i < s->n_dvs; ++i)
+        if (std::strcmp(s->dvs[i].path, file_path) == 0) return &s->dvs[i].bm;
+    return nullptr;
+}
+
 // Order by (file_path, pos) -- position_delete_set_contains' binary-search
 // branch (n > 32) requires it. Entries are 1 KiB, so sort indices (shell sort:
 // no recursion, no allocation beyond two arrays) and permute once.
@@ -746,19 +784,21 @@ bool sort_position_deletes(PositionDeleteSet* s, Arena* a, Budget* b) noexcept {
 // with nothing to delete is untouched regardless of column shape, so a
 // table's odd column types cost nothing unless a real delete lands in it.
 bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
+                                     const bolt::ingest::RoaringBitmap64* dv,
                                      const char* file_path, uint64_t base_row,
                                      BoltColumn* cols, uint32_t n_cols,
                                      int64_t* rows, Arena* scratch) noexcept {
     assert(pos_dels != nullptr && file_path != nullptr);
     assert(cols != nullptr && rows != nullptr && scratch != nullptr);
-    if (pos_dels->n == 0 || *rows == 0) return true;  // nothing declared, or nothing to check
+    if ((pos_dels->n == 0 && dv == nullptr) || *rows == 0) return true;  // nothing declared, or nothing to check
 
     auto* sel = scratch->allocate_array<uint32_t>(static_cast<uint64_t>(*rows));
     if (sel == nullptr) return false;
     uint32_t kept = 0;
     for (int64_t r = 0; r < *rows; ++r) {
         const int64_t file_pos = static_cast<int64_t>(base_row) + r;
-        if (!position_delete_set_contains(pos_dels, file_path, file_pos)) {
+        if (!position_delete_set_contains(pos_dels, file_path, file_pos) &&
+            (dv == nullptr || !bolt::lakehouse::iceberg::iceberg_dv_contains(dv, static_cast<uint64_t>(file_pos)))) {
             sel[kept++] = static_cast<uint32_t>(r);
         }
     }
@@ -885,7 +925,7 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
     if (use == EntryUse::kSkip) return true;
     if (v->deletes_pass) {
         if (use != EntryUse::kPosDelete) return true;
-        if (!load_position_delete_file(v->s, *e)) { v->failed = true; return false; }
+        if (e->is_dv ? !load_deletion_vector(v->s, *e) : !load_position_delete_file(v->s, *e)) { v->failed = true; return false; }
         return true;
     }
     // A delete file in a data manifest breaks the spec's layout and the delete
@@ -1141,7 +1181,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         ++s->cur_row_group;
         // Positions are counted against the FULL data file (deleted rows included), so the next group's base must
         // advance by the pre-filter row count -- `decoded_rows` was captured before the filter can shrink `rows`.
-        if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, live_file.path,
+        if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, dv_for(s, live_file.path), live_file.path,
                                                           s->cur_file_row_base, cols,
                                                           s->output_columns, &rows,
                                                           s->scratch)) {

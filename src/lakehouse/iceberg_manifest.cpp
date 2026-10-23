@@ -339,6 +339,19 @@ bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
         } else if (tok_eq(idx, key, "null_value_counts") ||
                    tok_eq(idx, key, "null-value-counts")) {
             read_stat_array(idx, it, &out->stats, 2);
+        } else if (tok_eq(idx, key, "content_offset") ||
+                   tok_eq(idx, key, "content-offset")) {
+            if (bj::iter_peek(it) == bj::TokenType::Int64) { read_int64(it, &out->content_offset); out->is_dv = true; }
+            else skip_value(it);
+        } else if (tok_eq(idx, key, "content_size_in_bytes") ||
+                   tok_eq(idx, key, "content-size-in-bytes")) {
+            read_int64(it, &out->content_size);
+        } else if (tok_eq(idx, key, "referenced_data_file") ||
+                   tok_eq(idx, key, "referenced-data-file")) {
+            if (bj::iter_peek(it) == bj::TokenType::String &&
+                idx->tokens[it->cursor].length >= static_cast<int32_t>(kIcebergMaxPath))
+                return false;
+            read_str(idx, it, out->referenced_data_file, kIcebergMaxPath);
         } else if (tok_eq(idx, key, "equality_ids") ||
                    tok_eq(idx, key, "equality-ids")) {
             read_eq_ids(idx, it, out);
