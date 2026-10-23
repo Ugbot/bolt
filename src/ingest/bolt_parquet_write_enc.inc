@@ -483,6 +483,7 @@ std::size_t plain_elem_width(BoltType t) noexcept {
         case BoltType::Int64:
         case BoltType::Timestamp:
         case BoltType::Float64:    return 8u;
+        case BoltType::UUID:
         case BoltType::Decimal128: return 16u;
         default:                   return 0u;
     }

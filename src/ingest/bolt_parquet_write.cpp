@@ -521,6 +521,8 @@ bool type_supported(const ParquetWriteColumn& c) noexcept {
         case BoltType::Date32:
         case BoltType::Timestamp:
             return true;
+        case BoltType::UUID:       // FIXED_LEN_BYTE_ARRAY(16) annotated UUID; the 16 bytes are written as given
+            return true;
         case BoltType::Decimal128:
             // Tolerate p=0 (no statistics use scale) but require scale < 38.
             return c.scale <= 38u && c.precision <= 38u;
@@ -566,6 +568,8 @@ bool type_supported_flat(const ParquetWriteColumn& c) noexcept {
         case BoltType::Date32:
         case BoltType::Timestamp:
             return true;
+        case BoltType::UUID:
+            return true;
         case BoltType::Decimal128:
             return c.scale <= 38u && c.precision <= 38u;
         default:
@@ -584,6 +588,7 @@ std::int32_t bolt_to_pq_physical(BoltType t) noexcept {
         case BoltType::Float64:    return kPtDouble;
         case BoltType::Utf8:
         case BoltType::Binary:     return kPtByteArray;
+        case BoltType::UUID:
         case BoltType::Decimal128: return kPtFlba;
         default:                   return kPtInt32;   // unreachable
     }
@@ -1185,6 +1190,7 @@ bool dict_eligible(BoltType t) noexcept {
         case BoltType::Timestamp:
         case BoltType::Float64:
         case BoltType::Decimal128:
+        case BoltType::UUID:
         case BoltType::Utf8:
         case BoltType::Binary:
             return true;
@@ -1273,6 +1279,15 @@ bool encode_plain_range(const BoltColumn& col, const ParquetWriteColumn& sch,
                 std::uint8_t be[16];
                 decimal_to_be(p + r * 16, be);
                 dst->insert(dst->end(), be, be + 16);
+            }
+            return true;
+        }
+        case BoltType::UUID: {                // canonical (big-endian) bytes, as the lane holds them
+            const auto* p = static_cast<const std::uint8_t*>(col.data);
+            if (p == nullptr && r0 != r1) return false;
+            for (std::int64_t r = r0; r < r1; ++r) {
+                if (nullable && def_bits[r] == 0u) continue;
+                dst->insert(dst->end(), p + r * 16, p + r * 16 + 16);
             }
             return true;
         }
@@ -1559,6 +1574,7 @@ bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
     idx->reserve(static_cast<std::size_t>(n_rows));
     const std::size_t elem = plain_elem_width(sch.type);
     const bool is_dec = (sch.type == BoltType::Decimal128);
+    const bool is_uuid = (sch.type == BoltType::UUID);
     for (std::int64_t r = 0; r < n_rows; ++r) {
         if (nullable && def_bits[r] == 0u) continue;
         std::uint32_t id;
@@ -1566,6 +1582,8 @@ bool dict_build_chunk(const BoltColumn& col, const ParquetWriteColumn& sch,
             const RowVal v = row_val_bytes(col, r);
             if (v.n == 0xFFFFFFFFu) return false;   // spilled with no base
             id = dict_intern(d, v.p, v.n);
+        } else if (is_uuid) {
+            id = dict_intern(d, static_cast<const std::uint8_t*>(col.data) + r * 16, 16u);
         } else if (is_dec) {
             std::uint8_t be[16];
             decimal_to_be(static_cast<const std::uint8_t*>(col.data) + r * 16,
@@ -2143,7 +2161,7 @@ void write_schema_element_col(TcOut* o,
                               const ParquetWriteColumn& c) noexcept {
     tc_put_field(o, 1, kFI32);
     tc_put_zigzag(o, bolt_to_pq_physical(c.type));
-    if (c.type == BoltType::Decimal128) {
+    if (c.type == BoltType::Decimal128 || c.type == BoltType::UUID) {
         tc_put_field(o, 2, kFI32);
         tc_put_zigzag(o, 16);                // FLBA length
     }
@@ -2194,6 +2212,12 @@ void write_schema_element_col(TcOut* o,
         tc_put_field(o, (lg == BoltLogical::Enum) ? 4 : 11, kFStruct);
         tc_put_stop(o);                      // empty EnumType / NullType
         tc_put_stop(o);                      // end LogicalType union
+    }
+    if (c.type == BoltType::UUID) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, 14, kFStruct);       // LogicalType.UUID (empty UUIDType)
+        tc_put_stop(o);
+        tc_put_stop(o);
     }
     if (c.type == BoltType::Timestamp && (c.ts_local || c.timestamp_unit)) {
         tc_put_field(o, 10, kFStruct);
@@ -2900,6 +2924,7 @@ std::size_t slice_stride(BoltType t) noexcept {
         case BoltType::Float64:    return 8u;
         case BoltType::Utf8:
         case BoltType::Binary:     return sizeof(StringView);
+        case BoltType::UUID:
         case BoltType::Decimal128: return 16u;
         default:                   return 0u;
     }
