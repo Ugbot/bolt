@@ -210,7 +210,7 @@ struct DfCtx {
     bool         have_pending;
 
     int32_t f_status, f_snap, f_content, f_path, f_records, f_size;
-    int32_t f_dv_offset, f_dv_size, f_dv_ref;
+    int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq;
     // Partition struct leaves, in declared order.
     int32_t part_idx[kMaxPartCols];
     uint32_t n_part;
@@ -308,6 +308,10 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
     if (const ing::AvroValue* v = at(s->f_path)) {
         if (!fits(kIcebergMaxPath, v)) return false;
         copy_str(e->file_path, kIcebergMaxPath, v);
+    }
+    if (const ing::AvroValue* sq = at(s->f_entry_seq); sq != nullptr && !sq->is_null) {
+        e->sequence_number = i64_or(sq, 0);
+        e->has_sequence_number = true;
     }
     if (const ing::AvroValue* off = at(s->f_dv_offset); off != nullptr && !off->is_null) {
         e->content_offset = i64_or(off, 0);
@@ -471,6 +475,7 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->f_path    = find_field(h, "data_file.file_path");
     s->f_records = find_field(h, "data_file.record_count");
     s->f_size    = find_field(h, "data_file.file_size_in_bytes");
+    s->f_entry_seq = find_field(h, "sequence_number");
     s->f_dv_offset = find_field(h, "data_file.content_offset");
     s->f_dv_size   = find_field(h, "data_file.content_size_in_bytes");
     s->f_dv_ref    = find_field(h, "data_file.referenced_data_file");

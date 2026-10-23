@@ -154,6 +154,14 @@ const char* strip_scheme(const char* p) noexcept {
     return q;
 }
 
+// Canonical form for comparing two references to the same object: no scheme (s3a:// == s3:// == s3n://, file:/x == /x), '/' separators.
+void normalize_ref_path(char* p) noexcept {
+    assert(p != nullptr);
+    const char* q = strip_scheme(p);
+    if (q != p) std::memmove(p, q, std::strlen(q) + 1u);
+    for (char* c = p; *c != '\0'; ++c) if (*c == '\\') *c = '/';
+}
+
 // Path-equality-insensitive to separator flavour, so a '\'-joined root still
 // matches a '/'-written URI.
 bool path_prefix_len(const char* path, const char* prefix,
@@ -366,7 +374,36 @@ TableHandle* new_table_handle(Arena* a) noexcept {
 // arena, which is reset when the scan moves to the next manifest.
 struct FileTask {
     const char* path;
+    int64_t     seq;        // data sequence number: the entry's own, else its manifest's (v1 tables: 0)
+    int32_t     spec_id;
+    uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
 };
+
+constexpr uint32_t kMaxEqualityIds = 16;
+constexpr uint32_t kMaxEqualitySets = 64;
+struct EqSet {
+    int64_t   seq;
+    int32_t   spec_id;
+    uint64_t  part_hash;
+    bool      global;               // delete written under an unpartitioned spec
+    uint8_t   _pad[3];
+    uint32_t  n_ids;
+    int32_t   ids[kMaxEqualityIds];
+    int32_t   schema_idx[kMaxEqualityIds];   // emitted-column index of each equality field
+    uint32_t  n_rows;
+    uint32_t  cap_rows;
+    uint32_t  n_slots;              // open-addressing table over rows, power of two (0 until built)
+    uint32_t* slots;                // row index + 1, 0 = empty
+    uint64_t* hashes;
+    uint32_t* key_off;
+    uint32_t* key_len;
+    uint8_t*  key_bytes;            // concatenated keys
+    uint64_t  key_used;
+    uint64_t  key_cap;
+};
+
+// Declared here, defined in iceberg_eq_delete.inc (open_next_file runs before that include).
+namespace { void select_equality_sets(ScanHandle* s, const FileTask& f) noexcept; }
 
 struct PinnedParquet {
     ObjectStore* store;
@@ -413,6 +450,11 @@ struct ScanHandle {
     // table's file count is not bounded by the table arena's block table.
     Arena*        meta_arena;
     PositionDeleteSet    pos_dels;
+    EqSet*               eq_sets;      // loaded equality-delete files (G2ICE-282)
+    uint32_t             n_eq_sets;
+    uint32_t             eq_cap;
+    uint32_t             n_cur_eq;     // sets that apply to the file being read
+    uint32_t             cur_eq[kMaxEqualitySets];
     struct DvEntry { const char* path; bolt::ingest::RoaringBitmap64 bm; };
     DvEntry*             dvs;          // v3 deletion vectors, one per referenced data file
     uint32_t             n_dvs;
@@ -616,6 +658,7 @@ bool open_next_file(ScanHandle* s, bool* out_err) noexcept {
         return false;
     }
     if (!bind_data_columns(s,meta)) { s->failed=true; *out_err=true; return false; }
+    select_equality_sets(s, f);
     s->cur_meta = meta;
     s->cur_body = body;
     s->cur_body_len = blen;
@@ -707,6 +750,7 @@ bool load_position_delete_file(ScanHandle* s, const DataFileRef& df) noexcept {
                     s3_uri_object_key(s->table->fs_root,e.file_path,key,sizeof(key))!=S3UriStatus::Ok)
                     return false;
             }
+            normalize_ref_path(e.file_path);                // s3a:// vs s3://, file:/x vs /x: the same object (after the pinned URI check above)
             ++s->pos_dels.n;
         }
     }
@@ -720,8 +764,11 @@ constexpr uint64_t kMaxDvObjectBytes = 256ull << 20;
 bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
     assert(s != nullptr && df.is_dv);
     if (df.referenced_data_file[0] == '\0' || df.content_offset < 0 || df.content_size <= 0) return false;
+    char want_path[kIcebergMaxPath];
+    std::memcpy(want_path, df.referenced_data_file, std::strlen(df.referenced_data_file) + 1u);
+    normalize_ref_path(want_path);
     for (uint32_t i = 0; i < s->n_dvs; ++i)
-        if (std::strcmp(s->dvs[i].path, df.referenced_data_file) == 0) return false;   // at most one DV per data file
+        if (std::strcmp(s->dvs[i].path, want_path) == 0) return false;   // at most one DV per data file
     const uint8_t* body = nullptr; uint64_t blen = 0;
     s->meta_arena->reset();
     if (!table_read_ref(s->table, df.file_path, s->meta_arena, &body, &blen) || blen > kMaxDvObjectBytes) return false;
@@ -734,6 +781,7 @@ bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
     char* path = s->scratch->allocate_array<char>(plen + 1u);
     if (path == nullptr) return false;
     std::memcpy(path, df.referenced_data_file, plen + 1u);
+    normalize_ref_path(path);
     e.path = path;
     if (!lake_grow(s->scratch, s->budget, &s->dvs, s->n_dvs, &s->dvs_cap, s->n_dvs + 1u)) return false;
     s->dvs[s->n_dvs++] = e;
@@ -741,8 +789,13 @@ bool load_deletion_vector(ScanHandle* s, const DataFileRef& df) noexcept {
 }
 
 const bolt::ingest::RoaringBitmap64* dv_for(const ScanHandle* s, const char* file_path) noexcept {
+    char norm[kIcebergMaxPath];
+    const size_t n = std::strlen(file_path);
+    if (n >= sizeof(norm)) return nullptr;
+    std::memcpy(norm, file_path, n + 1u);
+    normalize_ref_path(norm);
     for (uint32_t i = 0; i < s->n_dvs; ++i)
-        if (std::strcmp(s->dvs[i].path, file_path) == 0) return &s->dvs[i].bm;
+        if (std::strcmp(s->dvs[i].path, norm) == 0) return &s->dvs[i].bm;
     return nullptr;
 }
 
@@ -782,48 +835,17 @@ bool sort_position_deletes(PositionDeleteSet* s, Arena* a, Budget* b) noexcept {
     return true;
 }
 
-// Filter deleted rows out of one just-decoded row group, in place. `cols`
-// holds `*rows` rows for `n_cols` columns, all ColumnFormat::Flat (what
-// parquet_read_row_group always produces -- true for Utf8 too, which
-// decodes as a 16-byte StringView "Flat" array referencing an unmoving
-// spill buffer, per bolt/bolt_column.h's utf8_at banner). `base_row` is
-// this row group's first row's position within the data FILE (Iceberg
-// positions are file-relative, not row-group-relative).
-//
-// Returns false only when filtering was actually NEEDED (>=1 row in this
-// group matched a delete) and at least one column's format/width this
-// function cannot safely compact -- never a silent under-delete. A group
-// with nothing to delete is untouched regardless of column shape, so a
-// table's odd column types cost nothing unless a real delete lands in it.
-bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
-                                     const bolt::ingest::RoaringBitmap64* dv,
-                                     const char* file_path, uint64_t base_row,
-                                     BoltColumn* cols, uint32_t n_cols,
-                                     int64_t* rows, Arena* scratch) noexcept {
-    assert(pos_dels != nullptr && file_path != nullptr);
-    assert(cols != nullptr && rows != nullptr && scratch != nullptr);
-    if ((pos_dels->n == 0 && dv == nullptr) || *rows == 0) return true;  // nothing declared, or nothing to check
-
-    auto* sel = scratch->allocate_array<uint32_t>(static_cast<uint64_t>(*rows));
-    if (sel == nullptr) return false;
-    uint32_t kept = 0;
-    for (int64_t r = 0; r < *rows; ++r) {
-        const int64_t file_pos = static_cast<int64_t>(base_row) + r;
-        if (!position_delete_set_contains(pos_dels, file_path, file_pos) &&
-            (dv == nullptr || !bolt::lakehouse::iceberg::iceberg_dv_contains(dv, static_cast<uint64_t>(file_pos)))) {
-            sel[kept++] = static_cast<uint32_t>(r);
-        }
-    }
-    if (kept == static_cast<uint32_t>(*rows)) return true;  // nothing in THIS group matched
-
+// Keep only rows `sel[0..kept)` of every column, in place. Fails (never under-deletes) on a column shape it cannot compact.
+bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, uint32_t kept, int64_t* rows,
+                      Arena* scratch, const char* what) noexcept {
+    assert(cols != nullptr && sel != nullptr && rows != nullptr && scratch != nullptr);
     for (uint32_t c = 0; c < n_cols; ++c) {
         BoltColumn& col = cols[c];
         if (col.format != ColumnFormat::Flat || col.type_size_bytes == 0) {
             std::fprintf(stderr,
-                "[iceberg_scan] REFUSED: a positional delete matched a row in "
-                "'%s', but column %u (format=%d, width=%u) cannot be safely "
+                "[iceberg_scan] REFUSED: %s matched a row, but column %u (format=%d, width=%u) cannot be safely "
                 "compacted -- refusing rather than risk under-deleting.\n",
-                file_path, c, static_cast<int>(col.format),
+                what, c, static_cast<int>(col.format),
                 static_cast<unsigned>(col.type_size_bytes));
             return false;
         }
@@ -856,6 +878,53 @@ bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
     return true;
 }
 
+
+// Filter deleted rows out of one just-decoded row group, in place. `cols`
+// holds `*rows` rows for `n_cols` columns, all ColumnFormat::Flat (what
+// parquet_read_row_group always produces -- true for Utf8 too, which
+// decodes as a 16-byte StringView "Flat" array referencing an unmoving
+// spill buffer, per bolt/bolt_column.h's utf8_at banner). `base_row` is
+// this row group's first row's position within the data FILE (Iceberg
+// positions are file-relative, not row-group-relative).
+//
+// Returns false only when filtering was actually NEEDED (>=1 row in this
+// group matched a delete) and at least one column's format/width this
+// function cannot safely compact -- never a silent under-delete. A group
+// with nothing to delete is untouched regardless of column shape, so a
+// table's odd column types cost nothing unless a real delete lands in it.
+bool apply_position_deletes_to_group(const PositionDeleteSet* pos_dels,
+                                     const bolt::ingest::RoaringBitmap64* dv,
+                                     const char* file_path, uint64_t base_row,
+                                     BoltColumn* cols, uint32_t n_cols,
+                                     int64_t* rows, Arena* scratch) noexcept {
+    assert(pos_dels != nullptr && file_path != nullptr);
+    assert(cols != nullptr && rows != nullptr && scratch != nullptr);
+    if ((pos_dels->n == 0 && dv == nullptr) || *rows == 0) return true;  // nothing declared, or nothing to check
+
+    char norm_path[kIcebergMaxPath];
+    if (std::strlen(file_path) >= sizeof(norm_path)) return false;
+    std::memcpy(norm_path, file_path, std::strlen(file_path) + 1u);
+    normalize_ref_path(norm_path);
+    file_path = norm_path;
+    auto* sel = scratch->allocate_array<uint32_t>(static_cast<uint64_t>(*rows));
+    if (sel == nullptr) return false;
+    uint32_t kept = 0;
+    for (int64_t r = 0; r < *rows; ++r) {
+        const int64_t file_pos = static_cast<int64_t>(base_row) + r;
+        if (!position_delete_set_contains(pos_dels, file_path, file_pos) &&
+            (dv == nullptr || !bolt::lakehouse::iceberg::iceberg_dv_contains(dv, static_cast<uint64_t>(file_pos)))) {
+            sel[kept++] = static_cast<uint32_t>(r);
+        }
+    }
+    if (kept == static_cast<uint32_t>(*rows)) return true;  // nothing in THIS group matched
+
+    return compact_selected(cols, n_cols, sel, kept, rows, scratch, file_path);
+}
+
+}  // namespace
+
+namespace {
+#include "iceberg_eq_delete.inc"
 }  // namespace
 
 namespace {
@@ -888,12 +957,11 @@ bool parse_manifest_list_any(Arena* a, const uint8_t* body, uint64_t blen,
 }
 
 // What an entry means to the scan, one rule for the data and delete passes.
-enum class EntryUse : uint8_t { kSkip, kData, kPosDelete, kRefuse };
+enum class EntryUse : uint8_t { kSkip, kData, kPosDelete, kEqDelete, kRefuse };
 
 EntryUse classify(const DataFileRef& e, ManifestContent mc) noexcept {
     if (e.status == ManifestStatus::kDeleted) return EntryUse::kSkip;
-    // Equality deletes have no loader: skipping one over-reports rows.
-    if (e.content == FileContent::kEqualityDeletes) return EntryUse::kRefuse;
+    if (e.content == FileContent::kEqualityDeletes) return EntryUse::kEqDelete;
     if (mc == ManifestContent::kDeleteManifest ||
         e.content == FileContent::kPositionDeletes)
         return EntryUse::kPosDelete;
@@ -908,9 +976,10 @@ struct VisitCtx {
     bool                 deletes_pass;
     bool                 failed;
     uint8_t              _pad[5];
+    int64_t              mle_seq;   // the manifest's sequence number, inherited by entries that carry none
 };
 
-bool push_task(ScanHandle* s, const char* path) noexcept {
+bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash) noexcept {
     assert(s != nullptr && path != nullptr);
     const size_t len = std::strlen(path);
     const uint64_t before = s->tasks_cap;
@@ -924,7 +993,8 @@ bool push_task(ScanHandle* s, const char* path) noexcept {
     char* p = s->man_arena->allocate_array<char>(len + 1u);
     if (p == nullptr) return false;
     std::memcpy(p, path, len + 1u);
-    s->tasks[s->n_tasks++].path = p;
+    FileTask& t = s->tasks[s->n_tasks++];
+    t.path = p; t.seq = seq; t.spec_id = spec_id; t.part_hash = part_hash;
     ++s->stats.files_planned;
     return true;
 }
@@ -936,12 +1006,18 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
     if (use == EntryUse::kRefuse) { v->failed = true; return false; }
     if (use == EntryUse::kSkip) return true;
     if (v->deletes_pass) {
+        if (use == EntryUse::kEqDelete) {
+            const int64_t seq = e->has_sequence_number ? e->sequence_number : v->mle_seq;
+            if (!load_equality_delete_file(v->s, *e, seq, v->spec)) { v->failed = true; return false; }
+            return true;
+        }
         if (use != EntryUse::kPosDelete) return true;
         if (e->is_dv ? !load_deletion_vector(v->s, *e) : !load_position_delete_file(v->s, *e)) { v->failed = true; return false; }
         return true;
     }
     // A delete file in a data manifest breaks the spec's layout and the delete
     // pass skipped it: refuse rather than under-delete.
+    if (use == EntryUse::kEqDelete) { v->failed = true; return false; }       // a delete file in a data manifest: spec violation
     if (use == EntryUse::kPosDelete) {
         if (v->mc == ManifestContent::kDeleteManifest) return true;
         v->failed = true;
@@ -954,7 +1030,7 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
         return true;
     if (!stats_pass(e, v->sch, s->opts.predicates, s->opts.n_predicates))
         return true;
-    if (!push_task(v->s, e->file_path)) { v->failed = true; return false; }
+    if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e))) { v->failed = true; return false; }
     return true;
 }
 
@@ -977,6 +1053,7 @@ bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
     v.spec = metadata_spec(&h->meta, mle.partition_spec_id);
     v.sch = h->strict_pinned ? s->selected_schema : metadata_current_schema(&h->meta);
     v.mc = mle.content;
+    v.mle_seq = mle.sequence_number;
     v.deletes_pass = deletes_pass;
     uint32_t n = 0;
     if (is_avro_ocf(body, blen)) {
@@ -1208,6 +1285,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         }
         if (!supplied && s->use_map && !conform_group(s, dec, cols, rows)) { s->failed = true; return false; }
+        if (!supplied && !apply_equality_deletes(s, cols, s->output_columns, &rows)) { s->failed = true; return false; }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         s->last_group.file_path = live_file.path;
         s->last_group.row_group = group_index;

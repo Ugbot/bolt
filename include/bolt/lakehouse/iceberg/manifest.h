@@ -202,6 +202,10 @@ struct DataFileRef {
     bool           is_dv;
     uint8_t        _pad4[7];
     char           referenced_data_file[kIcebergMaxPath];
+    // The entry's own data sequence number (v2+): explicit on EXISTING entries, null (inherited from the manifest list) on ADDED ones.
+    int64_t        sequence_number;
+    bool           has_sequence_number;
+    uint8_t        _pad5[7];
 };
 // Pinned: the provenance flags came out of the 4 bytes of padding that used to
 // follow `n_partition`, so nothing after them moved and the struct is the same

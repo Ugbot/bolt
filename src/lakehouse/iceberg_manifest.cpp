@@ -384,6 +384,9 @@ bool parse_manifest_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
                 case 2: out->status = ManifestStatus::kDeleted; break;
                 default: out->status = ManifestStatus::kUnknown; break;
             }
+        } else if (tok_eq(idx, key, "sequence_number") || tok_eq(idx, key, "sequence-number")) {
+            if (bj::iter_peek(it) == bj::TokenType::Int64) { read_int64(it, &out->sequence_number); out->has_sequence_number = true; }
+            else skip_value(it);
         } else if (tok_eq(idx, key, "snapshot_id") ||
                    tok_eq(idx, key, "snapshot-id")) {
             read_int64(it, &out->snapshot_id);
