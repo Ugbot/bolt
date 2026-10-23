@@ -103,6 +103,11 @@ struct TableHandle {
     CommitCandidate candidate;
     FileWriteState* file_io;
     bool file_io_configurable;
+    const uint8_t* prior_meta;      // G2ICE-279: the metadata document this handle last read or wrote (arena-owned)
+    uint64_t       prior_meta_len;
+    uint32_t       dirty_meta;      // what the pending commit changes beyond its snapshot (kDirty*)
+    uint32_t       n_dropped_refs;
+    char           dropped_refs[16][64];
 };
 
 // iceberg_scan.cpp and iceberg_writer.cpp each define their OWN
@@ -294,10 +299,14 @@ bool abs_location(const char* root, const char* rel, char* out,
 // shapes must resolve or a table stops being readable across the change.
 const char* store_key_for(const char* root, const char* loc) noexcept {
     assert(root != nullptr && loc != nullptr);
+    // A location another writer recorded may carry the file scheme (pyiceberg: file:///abs/path); the store root is a path.
+    const char* path = loc;
+    if (std::strncmp(path, "file://", 7) == 0) path += 7;
+    else if (std::strncmp(path, "file:/", 6) == 0) path += 5;
     const size_t rl = std::strlen(root);
-    if (rl > 0u && std::strncmp(loc, root, rl) == 0 &&
-        (loc[rl] == '/' || loc[rl] == '\\')) {
-        return loc + rl + 1u;
+    if (rl > 0u && std::strncmp(path, root, rl) == 0 &&
+        (path[rl] == '/' || path[rl] == '\\')) {
+        return path + rl + 1u;
     }
     return loc;
 }
@@ -727,8 +736,14 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
 
     // refs
     if (!buf_put(&b, "\"refs\":{")) return false;
+    // main always names the current snapshot (spec: main must match current-snapshot-id).
+    bool main_listed = false;
+    for (uint32_t i = 0; i < nr; ++i) if (std::strcmp(refs[i].name, "main") == 0) main_listed = true;   // bounded
+    const bool emit_main = !main_listed && !is_view && m->current_snapshot_id > 0;
+    if (emit_main && !buf_fmt(&b, "\"main\":{\"snapshot-id\":%lld,\"type\":\"branch\"}",
+                              static_cast<long long>(m->current_snapshot_id))) return false;
     for (uint32_t i = 0; i < nr; ++i) {
-        if (i > 0 && !buf_put(&b, ",")) return false;
+        if ((i > 0 || emit_main) && !buf_put(&b, ",")) return false;
         if (!buf_put(&b, "\"")) return false;
         if (!buf_put_jstr(&b, refs[i].name)) return false;
         if (!buf_fmt(&b, "\":{\"snapshot-id\":%lld,\"type\":\"%s\"}",
@@ -763,6 +778,7 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
 
 namespace {
 #include "iceberg_write_io.inc"
+#include "iceberg_metadata_merge.inc"
 #include "iceberg_commit.inc"
 }  // namespace
 
@@ -902,6 +918,8 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
+    h->prior_meta = mb;
+    h->prior_meta_len = ml;
     h->file_io_configurable = true;
     *out = h;
     return true;
@@ -1662,6 +1680,7 @@ bool commit_schema_evolution(TableHandle* th, const Schema* next) noexcept {
     if (slot == nullptr) return false;
     *slot = *next;
     th->meta.current_schema_id = next->schema_id;
+    th->dirty_meta |= kDirtySchema;
     if (persist_metadata(th)) return true;
     th->meta.n_schemas--;
     th->meta.current_schema_id = prev_id;
@@ -1735,6 +1754,7 @@ bool table_update_partition_spec(TableHandle* th,
     th->meta.specs[th->meta.n_specs] = *spec;
     th->meta.current_spec_id = spec->spec_id;
     th->meta.n_specs++;
+    th->dirty_meta |= kDirtySpec;
     return persist_metadata(th);
 }
 
@@ -1745,6 +1765,7 @@ bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
     th->meta.sort_orders[th->meta.n_sort_orders] = *sort;
     th->meta.default_sort_order_id = sort->order_id;
     th->meta.n_sort_orders++;
+    th->dirty_meta |= kDirtySort;
     return persist_metadata(th);
 }
 
@@ -1823,6 +1844,7 @@ bool table_create_branch(TableHandle* th, const char* name,
     r.snapshot_id = base_snapshot_id;
     r.kind = 0;
     th->n_refs++;
+    th->dirty_meta |= kDirtyRefs;
     return persist_metadata(th);
 }
 
@@ -1837,6 +1859,7 @@ bool table_create_tag(TableHandle* th, const char* name,
     r.snapshot_id = snapshot_id;
     r.kind = 1;
     th->n_refs++;
+    th->dirty_meta |= kDirtyRefs;
     return persist_metadata(th);
 }
 
@@ -1850,8 +1873,11 @@ bool table_drop_ref(TableHandle* th, const char* name) noexcept {
         if (out != i) th->refs[out] = th->refs[i];
         ++out;
     }
-    if (!dropped) return false;
+    if (!dropped && th->prior_meta == nullptr) return false;
     th->n_refs = out;
+    if (th->n_dropped_refs >= 16u) return false;
+    std::strncpy(th->dropped_refs[th->n_dropped_refs++], name, 63u);   // a foreign ref (one this handle never loaded) is dropped from the document
+    th->dirty_meta |= kDirtyRefs;
     return persist_metadata(th);
 }
 

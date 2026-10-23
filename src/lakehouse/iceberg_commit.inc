@@ -12,6 +12,13 @@ bool write_ready(TableHandle* th) noexcept {
     assert(th != nullptr);
     assert(th->os != nullptr);
     th->file_io_configurable = false;
+    // G2ICE-279: only the v2 writer exists. An opened v1 or v3 table is refused by name, never rewritten as v2.
+    if (th->prior_meta != nullptr && th->meta.format_version != 2) {
+        th->last_error = CommitError::kUnimplemented;
+        std::fprintf(stderr, "[iceberg_writer] format-version %d tables are not written yet (G2ICE-276); nothing was written\n",
+                     th->meta.format_version);
+        return false;
+    }
     if (!th->write_uncertain) return true;
     th->last_error = CommitError::kUncertain;
     return false;
@@ -139,6 +146,19 @@ bool persist_metadata(TableHandle* th) noexcept {
         th->last_error = CommitError::kFailed;
         return false;
     }
+    if (th->prior_meta != nullptr && !th->is_view) {         // G2ICE-279: keep every member the commit does not own
+        const uint8_t* merged = nullptr; uint64_t mlen = 0;
+        if (!metadata_merge(th->prior_meta, th->prior_meta_len, body, blen, th->dirty_meta, th->dropped_refs, th->n_dropped_refs,
+                            th->arena, &merged, &mlen)) {
+            std::fprintf(stderr, "[iceberg_writer] the table's metadata document could not be merged (malformed or over %u members); nothing was written\n",
+                         kMergeMaxMembers);
+            th->meta.last_updated_ms = prev_updated_ms;
+            th->last_error = CommitError::kFailed;
+            return false;
+        }
+        body = merged;
+        blen = mlen;
+    }
     char rel[64];
     version_key(next, rel);
     // The CAS: v<next> is created only if no other writer created it first.
@@ -148,6 +168,9 @@ bool persist_metadata(TableHandle* th) noexcept {
         return false;
     }
     if (has_prev) metadata_metadata_log_push(&th->meta, &prev);
+    if (th->prior_meta != nullptr) { th->prior_meta = body; th->prior_meta_len = blen; }
+    th->dirty_meta = 0u;
+    th->n_dropped_refs = 0u;
     th->meta_version = next;
     th->last_error = CommitError::kNone;
     // Committed. A failed hint write does not un-commit it (readers probe).

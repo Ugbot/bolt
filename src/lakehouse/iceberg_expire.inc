@@ -198,6 +198,7 @@ bool table_set_retention(TableHandle* th, int64_t max_snapshot_age_ms,
     const int32_t pk = th->meta.retention_min_snapshots;
     th->meta.retention_max_age_ms = max_snapshot_age_ms;
     th->meta.retention_min_snapshots = min_snapshots_to_keep;
+    th->dirty_meta |= kDirtyProps;
     if (persist_metadata(th)) { apply_retention_policy(th); return true; }
     th->meta.retention_max_age_ms = pa;
     th->meta.retention_min_snapshots = pk;

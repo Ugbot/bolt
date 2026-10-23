@@ -2800,3 +2800,14 @@ add_executable(test_bolt_thread_qos test_bolt_thread_qos.cpp)
 target_link_libraries(test_bolt_thread_qos PRIVATE bolt::thread GTest::gtest_main)
 bolt_apply_hardening(test_bolt_thread_qos)
 add_test(NAME test_bolt_thread_qos COMMAND test_bolt_thread_qos)
+
+# G2ICE-279 — a commit to a pyiceberg-made table keeps its refs, sort orders, properties and statistics; a v1 table
+# is refused. The C++ half skips unless the oracle script drives it.
+add_executable(test_bolt_iceberg_foreign_commit test_bolt_iceberg_foreign_commit.cpp)
+target_link_libraries(test_bolt_iceberg_foreign_commit
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_foreign_commit)
+add_test(NAME test_bolt_iceberg_foreign_commit_oracle
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_foreign_commit.py
+                 $<TARGET_FILE:test_bolt_iceberg_foreign_commit> ${CMAKE_CURRENT_BINARY_DIR}/foreign_commit_fixture)
+set_tests_properties(test_bolt_iceberg_foreign_commit_oracle PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 120)
