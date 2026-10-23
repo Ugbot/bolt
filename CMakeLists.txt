@@ -1028,6 +1028,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_statistics.cpp
     src/lakehouse/iceberg_parquet_stats.cpp
     src/lakehouse/iceberg_delete_file.cpp
+    src/lakehouse/iceberg_deletion_vector.cpp
     src/lakehouse/iceberg_scan.cpp
     src/lakehouse/iceberg_writer.cpp
     src/lakehouse/iceberg_metadata_writer.cpp

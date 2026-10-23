@@ -98,6 +98,11 @@ struct RoaringBitmap {
 bool roaring_deserialize(const uint8_t* src, uint64_t src_len,
                          Arena* arena, RoaringBitmap* out) noexcept;
 
+// Same, reporting how many bytes of `src` the bitmap occupied (needed to walk
+// consecutive bitmaps, e.g. the buckets of a 64-bit treemap).
+bool roaring_deserialize_n(const uint8_t* src, uint64_t src_len, Arena* arena,
+                           RoaringBitmap* out, uint64_t* out_consumed) noexcept;
+
 // Membership test: is the 32-bit value present?
 bool roaring_contains(const RoaringBitmap* bm, uint32_t value) noexcept;
 

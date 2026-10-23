@@ -125,8 +125,8 @@ bool decode_payload(Cursor* c, Arena* arena, RoaringContainer* ct) noexcept {
 
 }  // namespace
 
-bool roaring_deserialize(const uint8_t* src, uint64_t src_len,
-                         Arena* arena, RoaringBitmap* out) noexcept {
+bool roaring_deserialize_n(const uint8_t* src, uint64_t src_len, Arena* arena,
+                           RoaringBitmap* out, uint64_t* out_consumed) noexcept {
     assert(arena != nullptr);
     assert(out != nullptr);
     if (src == nullptr || out == nullptr || arena == nullptr) return false;
@@ -207,7 +207,13 @@ bool roaring_deserialize(const uint8_t* src, uint64_t src_len,
     out->n_containers = n;
     out->_pad = 0;
     out->cardinality = total;
+    if (out_consumed != nullptr) *out_consumed = c.off;
     return true;
+}
+
+bool roaring_deserialize(const uint8_t* src, uint64_t src_len,
+                         Arena* arena, RoaringBitmap* out) noexcept {
+    return roaring_deserialize_n(src, src_len, arena, out, nullptr);
 }
 
 bool roaring_contains(const RoaringBitmap* bm, uint32_t value) noexcept {
@@ -311,22 +317,13 @@ bool roaring_deserialize_r64(const uint8_t* src, uint64_t src_len,
         if (!rd_u32(&c, &high32)) return false;
         buckets[i].high32 = high32;
         buckets[i]._pad = 0;
-        // Sub-map consumes the remainder starting at the cursor; the 32-bit
-        // reader re-bounds against the whole tail and reports its own length.
-        if (!roaring_deserialize(c.p + c.off, c.len - c.off, arena,
-                                 &buckets[i].map)) {
+        uint64_t used = 0;
+        if (!roaring_deserialize_n(c.p + c.off, c.len - c.off, arena,
+                                   &buckets[i].map, &used)) {
             return false;
         }
         total += buckets[i].map.cardinality;
-        // Advance the cursor: re-serialise length is implicit, so we recompute
-        // the consumed bytes by re-walking the header + payloads is costly;
-        // instead the r64 portable layout stores each sub-map back-to-back and
-        // the 32-bit reader leaves nothing trailing it must skip — but it does
-        // not report bytes consumed. We therefore require a length-prefix-free
-        // single-bucket form OR re-parse. Keep it strict: only n_buckets<=1 is
-        // supported without a per-bucket length; multi-bucket needs the prefix.
-        if (n_buckets > 1u) return false;
-        c.off = c.len;
+        c.off += used;
     }
 
     out->buckets = buckets;
