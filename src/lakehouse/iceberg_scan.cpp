@@ -424,6 +424,7 @@ struct ScanHandle {
     uint32_t output_columns;
     // Identity of the row group behind the most recent iceberg_scan_next_batch result.
     IcebergScanGroup last_group;
+    IcebergGroupProvider provider;  // optional cache-hit supplier (G2ICE-262)
 };
 
 namespace {
@@ -1111,27 +1112,39 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         BoltColumn* cols = out->columns[out->read_epoch];
         int64_t rows = 0;
-        // A row group the footer declares but the decoder cannot produce is
-        // missing rows (an unsupported codec — zstd — or encoding lands here).
-        // Fail; do not step over it.
-        if (!read_parquet_group(s, &s->pinned, s->cur_body, s->cur_body_len,
-                               s->cur_meta, s->cur_row_group, cols, &rows, s->output_columns)) {
-            s->failed = true;
-            return false;
-        }
         const uint32_t group_index = s->cur_row_group;
+        const FileTask& live_file = s->tasks[s->cur_file_idx];
+        // G2ICE-262: a caller may supply the group already decoded and already past positional deletes.
+        int64_t decoded_rows = 0;
+        bool supplied = false;
+        if (s->provider.provide != nullptr) {
+            int64_t emitted = 0;
+            supplied = s->provider.provide(s->provider.ctx, live_file.path, group_index, s->scratch, cols,
+                                           s->output_columns, &decoded_rows, &emitted);
+            if (supplied) {
+                if (emitted < 0 || decoded_rows < emitted) { s->failed = true; return false; }
+                rows = emitted;
+            }
+        }
+        if (!supplied) {
+            // A row group the footer declares but the decoder cannot produce is
+            // missing rows (an unsupported codec -- zstd -- or encoding lands here).
+            // Fail; do not step over it.
+            if (!read_parquet_group(s, &s->pinned, s->cur_body, s->cur_body_len,
+                                    s->cur_meta, s->cur_row_group, cols, &rows, s->output_columns)) {
+                s->failed = true;
+                return false;
+            }
+            decoded_rows = rows;
+        }
         const uint64_t group_base = s->cur_file_row_base;
         ++s->cur_row_group;
-        // Positions are counted against the FULL data file (deleted rows
-        // included), so the next group's base must advance by the
-        // pre-filter row count -- capture it before the filter can shrink
-        // `rows`.
-        const int64_t decoded_rows = rows;
-        const FileTask& live_file = s->tasks[s->cur_file_idx];
-        if (!apply_position_deletes_to_group(&s->pos_dels, live_file.path,
-                                             s->cur_file_row_base, cols,
-                                             s->output_columns, &rows,
-                                             s->scratch)) {
+        // Positions are counted against the FULL data file (deleted rows included), so the next group's base must
+        // advance by the pre-filter row count -- `decoded_rows` was captured before the filter can shrink `rows`.
+        if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, live_file.path,
+                                                          s->cur_file_row_base, cols,
+                                                          s->output_columns, &rows,
+                                                          s->scratch)) {
             return false;
         }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
@@ -1155,6 +1168,13 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     // the guard cannot expire. Fail closed if the invariant ever breaks.
     assert(false && "iceberg scan advance did not make progress");
     return false;
+}
+
+void iceberg_scan_set_group_provider(ScanHandle* s, const IcebergGroupProvider* provider) noexcept {
+    assert(s != nullptr);
+    if (s == nullptr) return;
+    if (provider == nullptr) { s->provider = IcebergGroupProvider{}; return; }
+    s->provider = *provider;
 }
 
 bool iceberg_scan_last_group(const ScanHandle* s, IcebergScanGroup* out) noexcept {

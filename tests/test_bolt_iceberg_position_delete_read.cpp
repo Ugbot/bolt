@@ -42,6 +42,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -252,4 +253,121 @@ TEST(IcebergPositionDeleteRead, NoDeletesUnaffected) {
     iceberg_scan_close(sh);
     iceberg_table_close(rh);
     EXPECT_EQ(n_seen, static_cast<uint32_t>(kRowsPerCommit));
+}
+
+// G2ICE-262: a supplied (cache-hit) row group replaces decoding and is NOT re-filtered by deletes, yet the scan's
+// file-position accounting still advances by the pre-delete row count. Cached groups are captured post-delete.
+namespace {
+struct Captured {
+    std::string path;
+    uint32_t row_group;
+    int64_t decoded, emitted;
+    std::vector<int64_t> ids;
+};
+struct Serve {
+    const std::vector<Captured>* groups;
+    bool only_deleted_file;       // serve only groups whose emitted != decoded
+    uint32_t served = 0, declined = 0;
+};
+bool provide(void* ctx, const char* path, uint32_t rg, bolt::Arena* arena, bolt::BoltColumn* cols, uint32_t ncols,
+             int64_t* decoded, int64_t* emitted) noexcept {
+    auto* sv = static_cast<Serve*>(ctx);
+    for (const auto& g : *sv->groups) {
+        if (g.row_group != rg || g.path != path) continue;
+        if (sv->only_deleted_file && g.emitted == g.decoded) { ++sv->declined; return false; }
+        if (ncols != 1) return false;
+        auto* d = arena->allocate_array<int64_t>(static_cast<uint32_t>(g.ids.size()));
+        for (size_t i = 0; i < g.ids.size(); ++i) d[i] = g.ids[i];
+        cols[0].type = bolt::BoltType::Int64;
+        cols[0].length = static_cast<int64_t>(g.ids.size());
+        cols[0].data = d;
+        *decoded = g.decoded;
+        *emitted = g.emitted;
+        ++sv->served;
+        return true;
+    }
+    ++sv->declined;
+    return false;
+}
+}  // namespace
+
+TEST(IcebergPositionDeleteRead, SuppliedGroupsReplaceDecodingAndKeepPositionAccounting) {
+    bolt::Arena arena;
+    const std::string root = fixture_root();
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    ASSERT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    Schema sch = make_schema();
+    PartitionSpec spec{}; SortOrder sort{};
+    WriteOptions wo; write_options_init(&wo);
+    TableHandle* wh = nullptr;
+    ASSERT_TRUE(table_create(&wh, &arena, &os, root.c_str(), &sch, &spec, &sort, &wo));
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, wh));
+    char commit_file[kCommits][kIcebergMaxPath];
+    for (int32_t c = 0; c < kCommits; ++c) {
+        bolt::BoltBatch b{};
+        make_batch(&arena, &b, c * kRowsPerCommit, kRowsPerCommit);
+        ASSERT_TRUE(append_write(ah, &b));
+        int64_t rows = 0;
+        ASSERT_TRUE(append_commit_ex(ah, commit_file[c], kIcebergMaxPath, &rows));
+    }
+    append_close(ah);
+    PositionDeleteEntry pd{};
+    std::strncpy(pd.file_path, commit_file[kDeletedRow / kRowsPerCommit], sizeof(pd.file_path) - 1u);
+    pd.pos = kDeletedRow % kRowsPerCommit;
+    ASSERT_TRUE(table_delete_positions(wh, &pd, 1));
+    table_close(wh);
+
+    const std::string ns_root = std::filesystem::path(root).parent_path().parent_path().generic_string();
+    bolt::lakehouse::FilesystemCatalog cat_fs{};
+    bolt::lakehouse::Catalog cat{};
+    ASSERT_TRUE(bolt::lakehouse::filesystem_catalog_init(&cat_fs, ns_root.c_str(), &cat));
+
+    auto scan = [&](const IcebergGroupProvider* prov, std::vector<Captured>* capture, std::vector<int64_t>* ids) {
+        bolt::Arena ra;
+        TableHandle* rh = nullptr;
+        ASSERT_TRUE(iceberg_table_open(&rh, &ra, &cat, "default", "t"));
+        ReadOptions ro{}; read_options_init(&ro);
+        ScanHandle* sh = nullptr;
+        ASSERT_TRUE(iceberg_scan_open(&sh, rh, &ro));
+        if (prov != nullptr) iceberg_scan_set_group_provider(sh, prov);
+        for (int guard = 0; guard < 64; ++guard) {
+            bolt::BoltBatch batch{};
+            bool eof = false;
+            ASSERT_TRUE(iceberg_scan_next_batch(sh, &batch, &eof));
+            if (eof) break;
+            IcebergScanGroup g{};
+            ASSERT_TRUE(iceberg_scan_last_group(sh, &g));
+            const auto* v = static_cast<const int64_t*>(batch.columns[batch.read_epoch][0].data);
+            Captured c{g.file_path, g.row_group, static_cast<int64_t>(g.decoded_rows), static_cast<int64_t>(g.emitted_rows), {}};
+            for (int64_t r = 0; r < batch.num_rows; ++r) { c.ids.push_back(v[r]); ids->push_back(v[r]); }
+            if (capture != nullptr) capture->push_back(std::move(c));
+        }
+        iceberg_scan_close(sh);
+        iceberg_table_close(rh);
+    };
+
+    std::vector<Captured> groups;
+    std::vector<int64_t> plain;
+    scan(nullptr, &groups, &plain);
+    ASSERT_EQ(groups.size(), 2u);
+    ASSERT_EQ(plain.size(), static_cast<size_t>(kCommits * kRowsPerCommit - 1));
+
+    {   // every group supplied: identical rows, nothing decoded, no delete re-applied
+        Serve sv{&groups, false};
+        const IcebergGroupProvider prov{&provide, &sv};
+        std::vector<int64_t> ids;
+        scan(&prov, nullptr, &ids);
+        EXPECT_EQ(sv.served, 2u);
+        EXPECT_EQ(ids, plain);
+    }
+    {   // only the group that had a delete supplied; the other decodes: still identical
+        Serve sv{&groups, true};
+        const IcebergGroupProvider prov{&provide, &sv};
+        std::vector<int64_t> ids;
+        scan(&prov, nullptr, &ids);
+        EXPECT_EQ(sv.served, 1u);
+        EXPECT_EQ(sv.declined, 1u);
+        EXPECT_EQ(ids, plain);
+    }
 }

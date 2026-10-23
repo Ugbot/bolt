@@ -17,6 +17,7 @@ namespace bolt {
 
 class Arena;
 struct BoltBatch;
+struct BoltColumn;
 
 namespace lakehouse {
 namespace iceberg {
@@ -123,6 +124,21 @@ struct IcebergScanGroup {
     uint64_t    emitted_rows;
 };
 bool iceberg_scan_last_group(const ScanHandle* h, IcebergScanGroup* out) noexcept;
+
+// G2ICE-262 — let a caller SUPPLY a decoded row group instead of decoding it (a read-through cache hit).
+// `provide` is called once per row group, before decoding, with the group's identity. Returning true means it filled
+// cols[0..ncols) (flat columns whose buffers it allocated from `arena`, the scan's scratch arena) with the group's
+// rows AS THE SCAN WOULD EMIT THEM: already after positional deletes. It must also set
+//   *decoded_rows  rows of the group BEFORE deletes (the scan advances its file row base by this), and
+//   *emitted_rows  rows in cols (== the column length).
+// The scan then neither decodes the group nor re-applies deletes to it. Returning false decodes normally.
+// Only valid for a scan that emits every file column (no source column selection). Copied; nullptr clears.
+struct IcebergGroupProvider {
+    bool (*provide)(void* ctx, const char* file_path, uint32_t row_group, Arena* arena, BoltColumn* cols,
+                    uint32_t ncols, int64_t* decoded_rows, int64_t* emitted_rows) noexcept;
+    void* ctx;
+};
+void iceberg_scan_set_group_provider(ScanHandle* h, const IcebergGroupProvider* provider) noexcept;
 
 void iceberg_scan_close(ScanHandle* h) noexcept;
 
