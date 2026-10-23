@@ -2287,6 +2287,11 @@ bolt_apply_hardening(test_bolt_iceberg_position_delete_read)
 add_test(NAME test_bolt_iceberg_position_delete_read
          COMMAND test_bolt_iceberg_position_delete_read)
 
+# Oracle tool (not a test): scan a filesystem-catalog Iceberg table with bolt's reader; see scripts/oracles/verify_v3_external.py.
+add_executable(bolt_iceberg_scan_dump bolt_iceberg_scan_dump.cpp)
+target_link_libraries(bolt_iceberg_scan_dump PRIVATE bolt::lakehouse bolt::ingest bolt::parse)
+bolt_apply_hardening(bolt_iceberg_scan_dump)
+
 add_executable(test_bolt_iceberg_deletion_vector test_bolt_iceberg_deletion_vector.cpp)
 target_link_libraries(test_bolt_iceberg_deletion_vector
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
