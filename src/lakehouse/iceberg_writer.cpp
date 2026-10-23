@@ -896,6 +896,24 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
             sizeof(TableHandle), sizeof(Metadata), offsetof(TableHandle, meta),
             offsetof(TableHandle, last_error), offsetof(TableHandle, write_uncertain),
             static_cast<unsigned long long>(ml), h->meta.n_snapshots);
+        {   // Where did the bytes land? Everything after meta should still be zero.
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(h);
+            const size_t tail0 = offsetof(TableHandle, meta) + sizeof(Metadata);
+            size_t nz_first = SIZE_MAX, nz_last = 0, nz_count = 0;
+            for (size_t i = tail0; i < sizeof(TableHandle); ++i)
+                if (base[i] != 0) { if (nz_first == SIZE_MAX) nz_first = i; nz_last = i; ++nz_count; }
+            std::fprintf(stderr, "[iceberg-open-diag] tail nonzero: count=%zu first=%lld last=%zu (tail starts %zu, meta_version=%lld) snapshots=%p schemas=%p snaplog=%p h=%p..%p\n",
+                nz_count, nz_first == SIZE_MAX ? -1ll : static_cast<long long>(nz_first), nz_last, tail0,
+                static_cast<long long>(h->meta_version), static_cast<void*>(h->meta.snapshots),
+                static_cast<void*>(h->meta.schemas), static_cast<void*>(h->meta.snapshot_log),
+                static_cast<const void*>(h), static_cast<const void*>(base + sizeof(TableHandle)));
+            if (nz_first != SIZE_MAX) {
+                char hex[200]; size_t n = 0;
+                for (size_t i = nz_first; i < nz_first + 48 && i < sizeof(TableHandle) && n + 3 < sizeof(hex); ++i)
+                    n += static_cast<size_t>(std::snprintf(hex + n, sizeof(hex) - n, "%02x", base[i]));
+                std::fprintf(stderr, "[iceberg-open-diag] tail bytes from first: %s\n", hex);
+            }
+        }
         // Re-parse into a private buffer followed by a canary to see whether the
         // parse itself writes beyond Metadata.
         constexpr size_t kCanary = 32768u;
