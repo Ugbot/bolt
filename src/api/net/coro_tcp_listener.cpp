@@ -422,14 +422,24 @@ int CoroTcpListener::create_listen_socket() {
         return -1;
     }
 
-    // SO_REUSEADDR
     int opt = 1;
+#ifdef _WIN32
+    // Windows SO_REUSEADDR lets another socket bind a port this listener still
+    // holds; claim it exclusively instead (must precede bind).
+    if (setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char*>(&opt), sizeof(opt)) < 0) {
+        LOG_ERROR("CORO_TCP", "Failed to set SO_EXCLUSIVEADDRUSE: %d", WSAGetLastError());
+        sys::close_socket(fd);
+        return -1;
+    }
+#else
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
                    reinterpret_cast<const char*>(&opt), sizeof(opt)) < 0) {
         LOG_ERROR("CORO_TCP", "Failed to set SO_REUSEADDR: %s", strerror(errno));
         sys::close_socket(fd);
         return -1;
     }
+#endif
 
     // SO_REUSEPORT (Linux/BSD only; not available on Windows)
 #ifdef SO_REUSEPORT

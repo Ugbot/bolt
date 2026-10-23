@@ -161,6 +161,13 @@ struct DiagnosticStore {
             static_cast<long long>(meta ? meta->current_snapshot_id : -1),
             static_cast<long long>(current ? current->parent_snapshot_id : -1),
             meta ? meta->n_snapshots : 0u, current ? current->manifest_list : "");
+        CommitCandidate uncertain{};
+        if (table && table_uncertain_commit(table, &uncertain))
+            std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d uncertain candidate key=%.255s kind=%d base_version=%lld candidate_version=%lld length=%llu\n",
+                writer, commit, uncertain.object_key, static_cast<int>(uncertain.kind),
+                static_cast<long long>(uncertain.base_metadata_version),
+                static_cast<long long>(uncertain.candidate_metadata_version),
+                static_cast<unsigned long long>(uncertain.length));
         if (have_io) event(first_io);
         const unsigned count = calls < kTrace ? calls : kTrace;
         for (unsigned i = 0u; i < count; ++i) event(events[(calls - count + i) % kTrace]);
