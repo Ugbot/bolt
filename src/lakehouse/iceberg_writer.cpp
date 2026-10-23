@@ -33,6 +33,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <chrono>
 #include <filesystem>
@@ -884,8 +885,17 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     version_key(v, rel);
     const uint8_t* mb = nullptr; uint64_t ml = 0;
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
+    const CommitError before_parse = h->last_error; const bool before_unc = h->write_uncertain;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
+    if (h->write_uncertain || static_cast<unsigned>(h->last_error) > 3u) {   // TEMP(G2ICE-261 Windows diag)
+        std::fprintf(stderr, "[iceberg-open-diag] BAD HANDLE v=%lld before_parse(err=%u unc=%d) after(err=%u unc=%d) sizeof(TableHandle)=%zu sizeof(Metadata)=%zu off(meta)=%zu off(last_error)=%zu off(write_uncertain)=%zu ml=%llu n_snap=%u\n",
+            static_cast<long long>(v), static_cast<unsigned>(before_parse), before_unc ? 1 : 0,
+            static_cast<unsigned>(h->last_error), h->write_uncertain ? 1 : 0,
+            sizeof(TableHandle), sizeof(Metadata), offsetof(TableHandle, meta),
+            offsetof(TableHandle, last_error), offsetof(TableHandle, write_uncertain),
+            static_cast<unsigned long long>(ml), h->meta.n_snapshots);
+    }
     h->file_io_configurable = true;
     *out = h;
     return true;
