@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstring>
+#include <string_view>
 #include <chrono>
 #include <filesystem>
 #include <system_error>
@@ -895,6 +896,27 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
             sizeof(TableHandle), sizeof(Metadata), offsetof(TableHandle, meta),
             offsetof(TableHandle, last_error), offsetof(TableHandle, write_uncertain),
             static_cast<unsigned long long>(ml), h->meta.n_snapshots);
+        // Re-parse into a private buffer followed by a canary to see whether the
+        // parse itself writes beyond Metadata.
+        constexpr size_t kCanary = 32768u;
+        uint8_t* raw = arena->allocate_array<uint8_t>(sizeof(Metadata) + kCanary);
+        if (raw != nullptr) {
+            std::memset(raw, 0x5A, sizeof(Metadata) + kCanary);
+            Metadata* probe = reinterpret_cast<Metadata*>(raw);
+            const bool ok = metadata_parse(mb, static_cast<uint32_t>(ml), arena, probe);
+            size_t first = SIZE_MAX, last = 0, changed = 0;
+            for (size_t i = 0; i < kCanary; ++i) {
+                if (raw[sizeof(Metadata) + i] != 0x5A) {
+                    if (first == SIZE_MAX) first = i;
+                    last = i; ++changed;
+                }
+            }
+            std::fprintf(stderr, "[iceberg-open-diag] private re-parse ok=%d canary_changed=%zu first=%lld last=%zu probe_addr=%p h_addr=%p\n",
+                ok ? 1 : 0, changed, first == SIZE_MAX ? static_cast<long long>(-1) : static_cast<long long>(first), last,
+                static_cast<void*>(raw), static_cast<void*>(h));
+        }
+        const std::string_view head(reinterpret_cast<const char*>(mb), ml < 2300 ? static_cast<size_t>(ml) : 2300u);
+        std::fprintf(stderr, "[iceberg-open-diag] json=%.*s\n", static_cast<int>(head.size()), head.data());
     }
     h->file_io_configurable = true;
     *out = h;
