@@ -577,6 +577,8 @@ TEST(FileIoBench, ColdAlignedPreadSequential) {
     if (own) ASSERT_TRUE(temp.valid()) << temp.error().message();
     const std::string path = own ? temp.path() : std::string(given);
     if (own) ASSERT_TRUE(write_bench_file(path, bytes));
+    if (file_evict_cache(path.c_str()) == FileIoStatus::kUnsupported)
+        GTEST_SKIP() << "no page-cache eviction on this platform: a cold read cannot be measured";
     double one = 0, many = 0;
     ASSERT_TRUE(cold_seq_gbps(path, bytes, 1, &one));
     ASSERT_TRUE(cold_seq_gbps(path, bytes, wide, &many));

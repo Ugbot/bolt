@@ -2491,6 +2491,9 @@ add_test(NAME test_bolt_iceberg_concurrent_commit
 set_tests_properties(test_bolt_iceberg_concurrent_commit PROPERTIES
     FIXTURES_SETUP iceberg_concurrent_fixture
     ENVIRONMENT BOLT_ICEBERG_CONCURRENT_DIR=${CMAKE_CURRENT_BINARY_DIR}/ice_concurrent_fixture)
+# The multi-process case that writes the fixture is POSIX-only (fork), so on
+# Windows there is nothing for the oracle to read.
+if(NOT WIN32)
 add_test(NAME test_bolt_iceberg_concurrent_commit_oracle
          COMMAND ${BOLT_ORACLE_PYTHON}
                  ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_concurrent_commit_oracle.py
@@ -2498,6 +2501,7 @@ add_test(NAME test_bolt_iceberg_concurrent_commit_oracle
 set_tests_properties(test_bolt_iceberg_concurrent_commit_oracle PROPERTIES
     SKIP_RETURN_CODE 2
     FIXTURES_REQUIRED iceberg_concurrent_fixture)
+endif()
 
 # G2ICE-166: scheduler workers keep a real stack under a static-TLS block
 # larger than RLIMIT_STACK (the chukonu-linked marbledb maint-worker SIGSEGV).

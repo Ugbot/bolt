@@ -83,7 +83,13 @@ bool truncate_sync_close(AlignedWriter* w, uint64_t size, bool sync) noexcept {
     HANDLE h = reinterpret_cast<HANDLE>(w->handle);
     LARGE_INTEGER li;
     li.QuadPart = static_cast<LONGLONG>(size);
-    bool ok = SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && SetEndOfFile(h);
+    // A no-buffering handle refuses SetEndOfFile at an unaligned file pointer
+    // (the padded tail is written unit-aligned, then cut back to `size`), so set
+    // the end of file directly; the pointer-based call stays as the fallback.
+    FILE_END_OF_FILE_INFO eof{};
+    eof.EndOfFile = li;
+    bool ok = SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof(eof)) ||
+              (SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && SetEndOfFile(h));
     if (ok && sync) ok = FlushFileBuffers(h) != 0;
     ok = (CloseHandle(h) != 0) && ok;
     w->handle = kClosedHandle;

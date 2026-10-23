@@ -370,6 +370,10 @@ FileIoStatus file_pread(const ReadFile& f, uint64_t off, void* dst, uint64_t len
             return FileIoStatus::kIoError;
         }
         done += static_cast<uint64_t>(n);
+        // The size is known from open: stop at it rather than issue one more
+        // read at an unaligned offset just to see EOF (a direct, no-buffering
+        // read refuses that on Windows).
+        if (off + done >= f.size) break;
     }
     assert(done <= len);
     if (done < len && off + done < f.size) return FileIoStatus::kIoError;
