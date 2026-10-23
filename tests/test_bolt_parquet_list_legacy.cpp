@@ -91,7 +91,10 @@ void check_list(const char* fixture, const char* path,
     ASSERT_FALSE(buf.empty()) << "fixture missing -- run "
                                  "scripts/make_legacy_list_fixtures.py";
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     ASSERT_EQ(meta.n_row_groups, 1u);
     const int ci = find_col(&meta, path);
@@ -162,7 +165,10 @@ TEST(BoltParquetListLegacy, BareRepeatedFieldIsAList) {
     const auto buf = slurp(data_path("legacy2_bare.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int ni = find_col(&meta, "nums");
     ASSERT_GE(ni, 0);
@@ -206,7 +212,10 @@ TEST(BoltParquetListLegacy, TwoLevelAnnotatedList) {
     const auto buf = slurp(data_path("legacy2_annotated.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int li = find_col(&meta, "l.element");
     ASSERT_GE(li, 0);

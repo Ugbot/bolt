@@ -90,7 +90,10 @@ TEST(BoltParquetList, SchemaWalkDerivesListLevels) {
     const auto buf = slurp(data_path("golden_list.parquet").c_str());
     ASSERT_FALSE(buf.empty()) << "fixture missing";
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
 
     const int li = find_col(&meta, "li.list.element");
@@ -126,7 +129,10 @@ void check_int_list(const char* fixture) {
     const auto buf = slurp(data_path(fixture).c_str());
     ASSERT_FALSE(buf.empty()) << fixture;
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int li = find_col(&meta, "li.list.element");
     ASSERT_GE(li, 0);
@@ -201,7 +207,10 @@ TEST(BoltParquetList, StringListsWithNullElements) {
         const auto buf = slurp(data_path(fixture).c_str());
         ASSERT_FALSE(buf.empty()) << fixture;
         bolt::Arena a;
-        PqMeta meta{};
+        auto* meta_storage = a.allocate_array<PqMeta>(1);
+        ASSERT_NE(meta_storage, nullptr);
+        PqMeta& meta = *meta_storage;
+        std::memset(&meta, 0, sizeof(meta));
         ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
         const int ls = find_col(&meta, "ls.list.element");
         ASSERT_GE(ls, 0);
@@ -263,7 +272,10 @@ TEST(BoltParquetList, MapLeavesReadAsLists) {
     const auto buf = slurp(data_path("golden_list.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int mk = find_col(&meta, "mp.key_value.key");
     const int mv = find_col(&meta, "mp.key_value.value");
@@ -321,7 +333,10 @@ TEST(BoltParquetList, FlatColumnsInTheSameFileStillRead) {
     const auto buf = slurp(data_path("golden_list.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int fl = find_col(&meta, "flat");
     ASSERT_GE(fl, 0);
@@ -347,7 +362,10 @@ TEST(BoltParquetList, WrongPathsAreRefusedNotGuessed) {
     const auto buf = slurp(data_path("golden_list.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int li = find_col(&meta, "li.list.element");
     const int fl = find_col(&meta, "flat");
@@ -383,7 +401,10 @@ TEST(BoltParquetList, DiscriminatingPower) {
     const auto buf = slurp(data_path("golden_list.parquet").c_str());
     ASSERT_FALSE(buf.empty());
     bolt::Arena a;
-    PqMeta meta{};
+    auto* meta_storage = a.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &a, &meta));
     const int li = find_col(&meta, "li.list.element");
     ASSERT_GE(li, 0);
@@ -530,7 +551,10 @@ TEST(BoltParquetList, WriteListRoundTripsAndEmitsInteropFixtures) {
         // The schema must be the 3-level LIST shape, which is what makes the
         // derived Dremel levels match what every other reader computes.
         bolt::Arena ma;
-        PqMeta meta{};
+        auto* meta_storage = ma.allocate_array<PqMeta>(1);
+        ASSERT_NE(meta_storage, nullptr);
+        PqMeta& meta = *meta_storage;
+        std::memset(&meta, 0, sizeof(meta));
         ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
         ASSERT_EQ(meta.n_columns, 1u);
         EXPECT_STREQ(meta.columns[0].name, "li.list.element");
@@ -595,7 +619,10 @@ TEST(BoltParquetList, ReadFileReturnsListColumns) {
         // Ground truth from the per-column API, which is independently
         // verified against pyarrow by scripts/parquet_list_interop.py.
         bolt::Arena ma;
-        PqMeta meta{};
+        auto* meta_storage = ma.allocate_array<PqMeta>(1);
+        ASSERT_NE(meta_storage, nullptr);
+        PqMeta& meta = *meta_storage;
+        std::memset(&meta, 0, sizeof(meta));
         ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
         int lc = -1;
         for (std::uint32_t c = 0; c < meta.n_columns; ++c) {
@@ -681,7 +708,10 @@ TEST(BoltParquetList, ReadFileAssemblesListsAcrossRowGroups) {
     ASSERT_FALSE(buf.empty());
 
     bolt::Arena ma;
-    PqMeta meta{};
+    auto* meta_storage = ma.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
     ASSERT_GT(meta.n_row_groups, 1u) << "the multi-row-group path never ran";
 
@@ -729,7 +759,10 @@ TEST(BoltParquetList, ReadFileAssemblesNestedRepetition) {
     const auto buf = slurp(data_path("golden_list_nested.parquet").c_str());
     if (buf.empty()) GTEST_SKIP() << "no nested fixture";
     bolt::Arena ma;
-    PqMeta meta{};
+    auto* meta_storage = ma.allocate_array<PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(parquet_read_meta(buf.data(), buf.size(), &ma, &meta));
     const int ci = find_col(&meta, "c.list.element.list.element");
     ASSERT_GE(ci, 0);
@@ -818,7 +851,10 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
         SCOPED_TRACE(fixture);
 
         bolt::Arena ma;
-        PqMeta meta{};
+        auto* meta_storage = ma.allocate_array<PqMeta>(1);
+        ASSERT_NE(meta_storage, nullptr);
+        PqMeta& meta = *meta_storage;
+        std::memset(&meta, 0, sizeof(meta));
         if (!parquet_read_meta(buf.data(), buf.size(), &ma, &meta)) continue;
         // Fuzz every repeated column the file has; a map has two leaves and
         // they assemble independently.
@@ -827,6 +863,7 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
             ++repeated_cols;
 
             bolt::Arena a;
+            bolt::Arena la; // bounded malformed-metadata scratch, reused each attempt
             bolt::BoltColumn col{};
             std::int64_t rows = 0;
 
@@ -834,8 +871,11 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
             //    meets a page that promises more levels than it carries.
             for (std::size_t cut = 1; cut <= buf.size(); cut += 613) {
                 a.reset();
-                bolt::Arena la;
-                PqMeta lm{};
+                la.reset();
+                auto* lm_storage = la.allocate_array<PqMeta>(1);
+                ASSERT_NE(lm_storage, nullptr);
+                PqMeta& lm = *lm_storage;
+                std::memset(&lm, 0, sizeof(lm));
                 const std::size_t n = buf.size() - cut;
                 if (!parquet_read_meta(buf.data(), n, &la, &lm)) continue;
                 if (c >= lm.n_columns) continue;
@@ -856,8 +896,11 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
                  i = (i < 4096) ? i + 1 : i + 29) {
                 mut[i] ^= 0xFF;
                 a.reset();
-                bolt::Arena la;
-                PqMeta lm{};
+                la.reset();
+                auto* lm_storage = la.allocate_array<PqMeta>(1);
+                ASSERT_NE(lm_storage, nullptr);
+                PqMeta& lm = *lm_storage;
+                std::memset(&lm, 0, sizeof(lm));
                 if (parquet_read_meta(mut.data(), mut.size(), &la, &lm) &&
                     c < lm.n_columns) {
                     ++attempts;
@@ -874,8 +917,11 @@ TEST(BoltParquetList, CorruptLevelsNeverCrash) {
             for (std::size_t z = 4; z + 48 < page_end; z += 401) {
                 std::memset(mut.data() + z, 0xFF, 48);
                 a.reset();
-                bolt::Arena la;
-                PqMeta lm{};
+                la.reset();
+                auto* lm_storage = la.allocate_array<PqMeta>(1);
+                ASSERT_NE(lm_storage, nullptr);
+                PqMeta& lm = *lm_storage;
+                std::memset(&lm, 0, sizeof(lm));
                 if (parquet_read_meta(mut.data(), mut.size(), &la, &lm) &&
                     c < lm.n_columns) {
                     ++attempts;

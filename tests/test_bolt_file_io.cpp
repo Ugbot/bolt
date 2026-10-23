@@ -9,6 +9,7 @@
 
 #include "bolt/io/bolt_aligned_writer.h"
 #include "bolt/io/bolt_file_io.h"
+#include "test_temp_owner.h"
 
 #include <gtest/gtest.h>
 
@@ -41,18 +42,6 @@ uint64_t env_u64(const char* name, uint64_t dflt) {
     return (v != nullptr && *v != '\0') ? std::strtoull(v, nullptr, 10) : dflt;
 }
 
-std::string tmp_path(const char* tag) {
-    const char* d = std::getenv("TMPDIR");
-    std::string p = (d != nullptr && *d != '\0') ? d : "/tmp";
-    if (p.back() != '/') p += '/';
-#if defined(_WIN32)
-    p += std::string("bolt_fio_") + tag;
-#else
-    p += std::string("bolt_fio_") + tag + "_" + std::to_string(::getpid());
-#endif
-    return p;
-}
-
 std::vector<uint8_t> random_bytes(size_t n, uint64_t seed) {
     std::vector<uint8_t> v(n);
     std::mt19937_64 rng(seed);
@@ -64,11 +53,12 @@ std::vector<uint8_t> random_bytes(size_t n, uint64_t seed) {
     return v;
 }
 
-void write_file(const std::string& path, const std::vector<uint8_t>& bytes) {
+bool write_file(const std::string& path, const std::vector<uint8_t>& bytes) {
     FILE* f = std::fopen(path.c_str(), "wb");
-    ASSERT_NE(f, nullptr);
-    ASSERT_EQ(std::fwrite(bytes.data(), 1, bytes.size(), f), bytes.size());
-    std::fclose(f);
+    if (f == nullptr) return false;
+    const auto written = std::fwrite(bytes.data(), 1, bytes.size(), f);
+    const auto closed = std::fclose(f);
+    return written == bytes.size() && closed == 0;
 }
 
 struct AlignedBuf {
@@ -80,10 +70,12 @@ struct AlignedBuf {
 // --- positional reads ---------------------------------------------------------
 
 TEST(FileIo, PreadMatchesFileBufferedAndDirect) {
-    const std::string path = tmp_path("pread");
+    bolt::test::TempOwner temp("pread");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const size_t n = (3u << 20) + 12345;
     const std::vector<uint8_t> bytes = random_bytes(n, 1);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     for (int direct = 0; direct < 2; ++direct) {
         bolt::io::ReadFile f{};
         ASSERT_EQ(file_open_read(path.c_str(), direct != 0, &f), FileIoStatus::kOk);
@@ -109,10 +101,22 @@ TEST(FileIo, PreadMatchesFileBufferedAndDirect) {
     std::remove(path.c_str());
 }
 
+TEST(FileIo, MissingDirectoryWriteRefusesBeforeAnyReadSetup) {
+    bolt::test::TempOwner temp("fio-missing");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const auto missing = (temp.directory() / "missing" / "data").string();
+    EXPECT_FALSE(write_file(missing, {1, 2, 3}));
+    std::error_code error;
+    EXPECT_FALSE(std::filesystem::exists(missing, error));
+    EXPECT_FALSE(error);
+}
+
 TEST(FileIo, PreadUnalignedBufferedAndShortAtEof) {
-    const std::string path = tmp_path("unaligned");
+    bolt::test::TempOwner temp("unaligned");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const std::vector<uint8_t> bytes = random_bytes(100003, 2);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), false, &f), FileIoStatus::kOk);
     std::vector<uint8_t> dst(5000);
@@ -132,8 +136,10 @@ TEST(FileIo, PreadUnalignedBufferedAndShortAtEof) {
 }
 
 TEST(FileIo, AlignedReadRejectsMisalignment) {
-    const std::string path = tmp_path("misalign");
-    write_file(path, random_bytes(1u << 18, 3));
+    bolt::test::TempOwner temp("misalign");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    ASSERT_TRUE(write_file(path, random_bytes(1u << 18, 3)));
     bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), true, &f), FileIoStatus::kOk);
     AlignedBuf buf(1u << 17, f.io_unit);
@@ -151,10 +157,12 @@ TEST(FileIo, AlignedReadRejectsMisalignment) {
 // --- mmap --------------------------------------------------------------------------
 
 TEST(FileIo, MappedViewsArePageAligned) {
-    const std::string path = tmp_path("mmap");
+    bolt::test::TempOwner temp("mmap");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const size_t n = (1u << 20) + 999;
     const std::vector<uint8_t> bytes = random_bytes(n, 4);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     MappedFile m{};
     ASSERT_EQ(mapped_file_open(path.c_str(), &m), FileIoStatus::kOk);
     ASSERT_EQ(m.size, n);
@@ -184,9 +192,11 @@ TEST(FileIo, MappedViewsArePageAligned) {
 }
 
 TEST(FileIo, BoundedMappingChecksExactExtentAndClosesOnRefusal) {
-    const std::string path = tmp_path("mmap_bounded");
+    bolt::test::TempOwner temp("mmap_bounded");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const auto bytes = random_bytes(8192, 41);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     MappedFile m{};
     ASSERT_EQ(mapped_file_open_bounded(path.c_str(), bytes.size(), bytes.size(), &m),
               FileIoStatus::kOk);
@@ -204,7 +214,7 @@ TEST(FileIo, BoundedMappingChecksExactExtentAndClosesOnRefusal) {
               FileIoStatus::kBadArg);
     EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, 0, &m), FileIoStatus::kTooLarge);
     EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.handle, -1);
-    write_file(path, {});
+    ASSERT_TRUE(write_file(path, {}));
     EXPECT_EQ(mapped_file_open_bounded(path.c_str(), 0, 0, &m), FileIoStatus::kOk);
     EXPECT_EQ(m.base, nullptr); EXPECT_EQ(m.size, 0u);
     mapped_file_close(&m);
@@ -212,9 +222,11 @@ TEST(FileIo, BoundedMappingChecksExactExtentAndClosesOnRefusal) {
 }
 
 TEST(FileIo, BoundedMappingKeepsAdmittedExtentWhenFileGrows) {
-    const std::string path = tmp_path("mmap_bounded_growth");
+    bolt::test::TempOwner temp("mmap_bounded_growth");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const auto bytes = random_bytes(8192, 42);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     MappedFile m{};
     ASSERT_EQ(mapped_file_open_bounded(path.c_str(), bytes.size(), bytes.size(), &m),
               FileIoStatus::kOk);
@@ -234,10 +246,12 @@ TEST(FileIo, BoundedMappingKeepsAdmittedExtentWhenFileGrows) {
 // A mapping outlives its released handle: the view still reads the file
 // and closing it twice is safe.
 TEST(FileIo, MappingSurvivesReleasedHandle) {
-    const std::string path = tmp_path("release");
+    bolt::test::TempOwner temp("release");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const size_t n = 3u << 20;
     const std::vector<uint8_t> bytes = random_bytes(n, 11);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     MappedFile m{};
     ASSERT_EQ(mapped_file_open(path.c_str(), &m), FileIoStatus::kOk);
     ASSERT_NE(m.handle, -1);
@@ -254,9 +268,11 @@ TEST(FileIo, MappingSurvivesReleasedHandle) {
 
 #if !defined(_WIN32)
 TEST(FileIo, EvictDropsResidency) {
-    const std::string path = tmp_path("evict");
+    bolt::test::TempOwner temp("evict");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const size_t n = 8u << 20;
-    write_file(path, random_bytes(n, 5));
+    ASSERT_TRUE(write_file(path, random_bytes(n, 5)));
     MappedFile m{};
     ASSERT_EQ(mapped_file_open(path.c_str(), &m), FileIoStatus::kOk);
     uint64_t sum = 0;
@@ -410,10 +426,12 @@ TEST(RangeCoalesce, PropertyRandom) {
 // --- batched reads -----------------------------------------------------------------
 
 TEST(ReadBatch, FuzzMatchesSerialReads) {
-    const std::string path = tmp_path("batch");
+    bolt::test::TempOwner temp("batch");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const size_t n = (6u << 20) + 4321;
     const std::vector<uint8_t> bytes = random_bytes(n, 6);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     const uint64_t iters = env_u64("BOLT_FIO_FUZZ_ITERS", 400) / 8 + 1;
     const uint32_t workers[4] = {0, 1, 4, 11};
     for (uint32_t w : workers) {
@@ -459,8 +477,10 @@ TEST(ReadBatch, FuzzMatchesSerialReads) {
 }
 
 TEST(ReadBatch, FailedRequestReportedPerRequest) {
-    const std::string path = tmp_path("batchfail");
-    write_file(path, random_bytes(1u << 16, 8));
+    bolt::test::TempOwner temp("batchfail");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    ASSERT_TRUE(write_file(path, random_bytes(1u << 16, 8)));
     bolt::io::ReadFile f{};
     ASSERT_EQ(file_open_read(path.c_str(), false, &f), FileIoStatus::kOk);
     ReadPool* pool = nullptr;
@@ -484,26 +504,48 @@ TEST(ReadBatch, FailedRequestReportedPerRequest) {
 // --- cold throughput (reported; gated with BOLT_PERF_GATE=1) ---------------------
 
 // Write with the direct writer, then evict, so the reads below are cold.
-void write_bench_file(const std::string& path, uint64_t bytes) {
+bool write_bench_file(const std::string& path, uint64_t bytes) {
     AlignedWriterConfig cfg = aligned_writer_config_default();
     AlignedWriter w{};
-    ASSERT_EQ(aligned_writer_open(path.c_str(), cfg, &w), AlignedWriteStatus::kOk);
+    const auto opened = aligned_writer_open(path.c_str(), cfg, &w);
+    if (opened != AlignedWriteStatus::kOk) return false;
     const std::vector<uint8_t> chunk = random_bytes(1u << 20, 11);
-    for (uint64_t done = 0; done < bytes; done += chunk.size())
-        ASSERT_EQ(aligned_writer_append(&w, chunk.data(), chunk.size()), AlignedWriteStatus::kOk);
-    ASSERT_EQ(aligned_writer_finish(&w, true, nullptr), AlignedWriteStatus::kOk);
+    for (uint64_t done = 0; done < bytes; done += chunk.size()) {
+        const auto status = aligned_writer_append(&w, chunk.data(), chunk.size());
+        EXPECT_EQ(status, AlignedWriteStatus::kOk);
+        if (status != AlignedWriteStatus::kOk) { aligned_writer_abort(&w); return false; }
+    }
+    const auto finished = aligned_writer_finish(&w, true, nullptr);
+    EXPECT_EQ(finished, AlignedWriteStatus::kOk);
+    if (finished != AlignedWriteStatus::kOk) aligned_writer_abort(&w);
+    return finished == AlignedWriteStatus::kOk;
 }
 
-double cold_seq_gbps(const std::string& path, uint64_t bytes, uint32_t threads) {
-    EXPECT_EQ(file_evict_cache(path.c_str()), FileIoStatus::kOk);
+bool cold_seq_gbps(const std::string& path, uint64_t bytes, uint32_t threads, double* gbps) {
+    *gbps = 0;
+    if (threads == 0u || threads > kReadPoolMaxWorkers + 1u) return false;
+    const auto evicted = file_evict_cache(path.c_str());
+    EXPECT_EQ(evicted, FileIoStatus::kOk);
+    if (evicted != FileIoStatus::kOk) return false;
     bolt::io::ReadFile f{};
-    EXPECT_EQ(file_open_read(path.c_str(), true, &f), FileIoStatus::kOk);
+    const auto opened = file_open_read(path.c_str(), true, &f);
+    EXPECT_EQ(opened, FileIoStatus::kOk);
+    if (opened != FileIoStatus::kOk) return false;
     ReadPool* pool = nullptr;
-    EXPECT_EQ(read_pool_create(threads - 1, &pool), FileIoStatus::kOk);
+    const auto pooled = read_pool_create(threads - 1, &pool);
+    EXPECT_EQ(pooled, FileIoStatus::kOk);
+    if (pooled != FileIoStatus::kOk) { file_close(&f); return false; }
     const uint64_t req = 1u << 20;
     const uint32_t per_batch = threads * 4;
     std::vector<AlignedBuf*> bufs;
-    for (uint32_t i = 0; i < per_batch; ++i) bufs.push_back(new AlignedBuf(req, f.io_unit));
+    auto cleanup = [&] {
+        for (AlignedBuf* buffer : bufs) delete buffer;
+        read_pool_destroy(pool); file_close(&f);
+    };
+    for (uint32_t i = 0; i < per_batch; ++i) {
+        bufs.push_back(new AlignedBuf(req, f.io_unit));
+        if (bufs.back()->p == nullptr) { cleanup(); return false; }
+    }
     std::vector<ReadReq> reqs(per_batch);
     uint64_t total = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -514,15 +556,16 @@ double cold_seq_gbps(const std::string& path, uint64_t bytes, uint32_t threads) 
             reqs[k].off = off + k * req; reqs[k].len = req; reqs[k].dst = bufs[k]->p;
             reqs[k].aligned = 1;
         }
-        EXPECT_EQ(file_read_batch(pool, f, reqs.data(), k), FileIoStatus::kOk);
+        const auto read = file_read_batch(pool, f, reqs.data(), k);
+        EXPECT_EQ(read, FileIoStatus::kOk);
+        if (read != FileIoStatus::kOk) { cleanup(); return false; }
         for (uint32_t i = 0; i < k; ++i) total += reqs[i].got;
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     EXPECT_EQ(total, bytes);
-    for (AlignedBuf* b : bufs) delete b;
-    read_pool_destroy(pool);
-    file_close(&f);
-    return static_cast<double>(total) / s / 1e9;
+    cleanup();
+    *gbps = static_cast<double>(total) / s / 1e9;
+    return total == bytes;
 }
 
 TEST(FileIoBench, ColdAlignedPreadSequential) {
@@ -530,11 +573,13 @@ TEST(FileIoBench, ColdAlignedPreadSequential) {
     const uint32_t wide = static_cast<uint32_t>(env_u64("BOLT_FIO_THREADS", 12));
     const char* given = std::getenv("BOLT_FIO_BENCH_FILE");
     const bool own = given == nullptr || *given == '\0';
-    const std::string path = own ? tmp_path("bench") : std::string(given);
-    if (own) write_bench_file(path, bytes);
-    if (HasFatalFailure()) return;
-    const double one = cold_seq_gbps(path, bytes, 1);
-    const double many = cold_seq_gbps(path, bytes, wide);
+    bolt::test::TempOwner temp("fio_bench", own);
+    if (own) ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string path = own ? temp.path() : std::string(given);
+    if (own) ASSERT_TRUE(write_bench_file(path, bytes));
+    double one = 0, many = 0;
+    ASSERT_TRUE(cold_seq_gbps(path, bytes, 1, &one));
+    ASSERT_TRUE(cold_seq_gbps(path, bytes, wide, &many));
     std::printf("[fio] cold 1 MiB aligned direct pread, %llu MiB: 1 thread %.2f GB/s, "
                 "%u threads %.2f GB/s\n",
                 static_cast<unsigned long long>(bytes >> 20), one, wide, many);
@@ -569,9 +614,11 @@ NativeFile native_read_open(const char* path) {
 }
 
 TEST(FileIo, NativeReadAndMapTransferOnlyOnSuccess) {
-    const auto path = tmp_path("native_adopt");
+    bolt::test::TempOwner temp("native_adopt");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const auto bytes = random_bytes(8192, 77);
-    write_file(path, bytes);
+    ASSERT_TRUE(write_file(path, bytes));
     NativeFile n = native_read_open(path.c_str());
     ASSERT_NE(n.handle, -1);
     const intptr_t identity = n.handle;
@@ -617,8 +664,10 @@ TEST(FileIo, NativeReadAndMapTransferOnlyOnSuccess) {
 }
 
 TEST(FileIo, NativeEmptyAndNonregularOwnership) {
-    const auto path = tmp_path("native_empty");
-    write_file(path, {});
+    bolt::test::TempOwner temp("native_empty");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    ASSERT_TRUE(write_file(path, {}));
     NativeFile n = native_read_open(path.c_str());
     MappedFile m{};
     ASSERT_EQ(mapped_file_adopt_bounded(&n, 0, 0, &m), FileIoStatus::kOk);
@@ -647,8 +696,10 @@ TEST(FileIo, NativeEmptyAndNonregularOwnership) {
 
 #if !defined(_WIN32)
 TEST(FileIo, NativeMapFailurePreservesWriteOnlyHandle) {
-    const auto path = tmp_path("native_map_os_failure");
-    write_file(path, {1, 2, 3, 4});
+    bolt::test::TempOwner temp("native_map_os_failure");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    ASSERT_TRUE(write_file(path, {1, 2, 3, 4}));
     NativeFile n{::open(path.c_str(), O_WRONLY | O_CLOEXEC)};
     ASSERT_NE(n.handle, -1);
     const intptr_t identity = n.handle;
@@ -668,8 +719,10 @@ TEST(FileIo, NativeMapFailurePreservesWriteOnlyHandle) {
 }
 
 TEST(FileIo, NativeCloseOsFailureStillConsumesToken) {
-    const auto path = tmp_path("native_close_os_failure");
-    write_file(path, {1});
+    bolt::test::TempOwner temp("native_close_os_failure");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    ASSERT_TRUE(write_file(path, {1}));
     NativeFile n = native_read_open(path.c_str());
     ASSERT_NE(n.handle, -1);
     // No opens occur between the external close and native close: the fd cannot
@@ -685,13 +738,15 @@ TEST(FileIo, NativeCloseOsFailureStillConsumesToken) {
 }
 
 TEST(FileIo, NativeHandleZeroAndReplacementKeepOpenedIdentity) {
-    const auto path = tmp_path("native_identity");
+    bolt::test::TempOwner temp("native_identity");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     const auto moved = path + ".held";
-    write_file(path, {11, 22, 33});
+    ASSERT_TRUE(write_file(path, {11, 22, 33}));
     NativeFile n = native_read_open(path.c_str());
     ASSERT_NE(n.handle, -1);
     ASSERT_EQ(std::rename(path.c_str(), moved.c_str()), 0);
-    write_file(path, {44});
+    ASSERT_TRUE(write_file(path, {44}));
     bolt::io::ReadFile r{};
     ASSERT_EQ(file_adopt_read(&n, false, &r), FileIoStatus::kOk);
     uint8_t data[3]{};
@@ -700,7 +755,7 @@ TEST(FileIo, NativeHandleZeroAndReplacementKeepOpenedIdentity) {
     EXPECT_EQ(got, 3u);
     EXPECT_EQ(data[0], 11);
     file_close(&r);
-    write_file(path, {});
+    ASSERT_TRUE(write_file(path, {}));
     // Restore stdin before assertions, including when adoption fails.
     const int saved = ::dup(0);
     n = native_read_open(path.c_str());

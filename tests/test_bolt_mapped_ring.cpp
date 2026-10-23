@@ -5,12 +5,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 using namespace bolt::io;
@@ -85,7 +92,11 @@ TEST(MappedRing, FullRefusalIsLosslessAndBothReadersFenceReuse) {
 }
 TEST(MappedRing, WrapPaddingAndGenerationsPreserveCopiedPayloads) {
     Owner o;o.open();std::vector<std::uint8_t> data(io_page_size()+19);
-    for(std::uint64_t sequence=1;sequence<=200;++sequence) {
+    // Every payload is nonempty: packed 64-byte header + at least one byte
+    // rounds to two cache lines. Derive enough real records for every geometry.
+    constexpr std::uint64_t min_record_bytes=128u;
+    const auto count=std::max<std::uint64_t>(200u,o.options().capacity_bytes/min_record_bytes+1u);
+    for(std::uint64_t sequence=1;sequence<=count;++sequence) {
         const auto size=sequence%3==0?data.size():static_cast<std::size_t>(sequence%173+1);
         for(std::size_t i=0;i<size;++i)data[i]=static_cast<std::uint8_t>(sequence+i*29);
         put(o.ring,data.data(),size);consume(o.ring,0,data.data(),size,sequence);
@@ -219,24 +230,48 @@ TEST(MappedRing, ConcurrentProducerConsumerPublishesWholePayloads) {
     consumer.join();EXPECT_FALSE(failed.load());
     EXPECT_EQ(next,count+1);
 }
-void corrupt_file_bytes(const std::string& name,long offset,const void* bytes,std::size_t size) {
-    auto* file=std::fopen(name.c_str(),"r+b");ASSERT_NE(file,nullptr);
-    const auto sought=std::fseek(file,offset,SEEK_SET);
-    EXPECT_EQ(sought,0);
-    if(sought==0)EXPECT_EQ(std::fwrite(bytes,1,size,file),size);
-    EXPECT_EQ(std::fclose(file),0);
+bool corrupt_file_bytes(const std::string& name,long offset,const void* bytes,std::size_t size) {
+#if defined(_WIN32)
+    if(size>MAXDWORD) {ADD_FAILURE()<<"corruption write exceeds native byte-count bound";return false;}
+    const auto path=std::filesystem::path(name);
+    HANDLE file=CreateFileW(path.c_str(),GENERIC_READ|GENERIC_WRITE,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) {const DWORD error=GetLastError();ADD_FAILURE()<<"corruption open Win32="<<error;return false;}
+    LARGE_INTEGER position{};position.QuadPart=offset;
+    const BOOL sought=SetFilePointerEx(file,position,nullptr,FILE_BEGIN);
+    const DWORD seek_error=sought?ERROR_SUCCESS:GetLastError();
+    DWORD count=0;
+    const BOOL wrote=sought ? WriteFile(file,bytes,static_cast<DWORD>(size),&count,nullptr):FALSE;
+    const DWORD write_error=wrote?ERROR_SUCCESS:(sought?GetLastError():seek_error);
+    const BOOL closed=CloseHandle(file);
+    const DWORD close_error=closed?ERROR_SUCCESS:GetLastError();
+    EXPECT_TRUE(sought)<<"corruption seek Win32="<<seek_error;
+    EXPECT_TRUE(wrote)<<"corruption write Win32="<<write_error;
+    EXPECT_EQ(count,size);EXPECT_TRUE(closed)<<"corruption close Win32="<<close_error;
+    return sought && wrote && count==size && closed;
+#else
+    auto* file=std::fopen(name.c_str(),"r+b");
+    if(file==nullptr) {const int error=errno;ADD_FAILURE()<<"corruption open errno="<<error;return false;}
+    const auto sought=std::fseek(file,offset,SEEK_SET);const int seek_error=errno;
+    const auto count=sought==0?std::fwrite(bytes,1,size,file):0u;const int write_error=errno;
+    const auto closed=std::fclose(file);const int close_error=errno;
+    EXPECT_EQ(sought,0)<<"corruption seek errno="<<seek_error;
+    EXPECT_EQ(count,size)<<"corruption write errno="<<write_error;
+    EXPECT_EQ(closed,0)<<"corruption close errno="<<close_error;
+    return sought==0 && count==size && closed==0;
+#endif
 }
 TEST(MappedRing, PayloadCorruptionRefusesWithoutLeakingPin) {
     Owner o;o.open();const std::uint64_t value=0x0123456789abcdefULL;put(o.ring,&value,8);
     // The public packed-record geometry is a 64-byte header followed by bytes.
-    const std::uint8_t changed=0x5a;corrupt_file_bytes(o.name,64,&changed,1);
+    const std::uint8_t changed=0x5a;ASSERT_TRUE(corrupt_file_bytes(o.name,64,&changed,1));
     RingView view{};EXPECT_EQ(mapped_ring_peek(o.ring,0,&view),S::kCorrupt);
     EXPECT_EQ(mapped_ring_close(&o.ring),S::kOk);EXPECT_EQ(o.ring,nullptr);
 }
 TEST(MappedRing, HeaderCorruptionRefusesWithoutLeakingPin) {
     Owner o;o.open();const std::uint64_t value=73;put(o.ring,&value,8);
     const std::uint8_t destroyed_header[64]{};
-    corrupt_file_bytes(o.name,0,destroyed_header,sizeof(destroyed_header));
+    ASSERT_TRUE(corrupt_file_bytes(o.name,0,destroyed_header,sizeof(destroyed_header)));
     RingView view{};EXPECT_EQ(mapped_ring_peek(o.ring,0,&view),S::kCorrupt);
     EXPECT_EQ(mapped_ring_close(&o.ring),S::kOk);EXPECT_EQ(o.ring,nullptr);
 }

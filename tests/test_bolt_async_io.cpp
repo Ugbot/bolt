@@ -29,6 +29,11 @@ void* operator new(std::size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+    return std::malloc(n == 0 ? 1 : n);
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 namespace {
 
@@ -62,6 +67,18 @@ struct Pair {
 bool poll_until(core::async_io& io, const int& done, int want) {
     for (int i = 0; i < 2000 && done < want; ++i) io.poll(1000);
     return done >= want;
+}
+
+TEST(AsyncIo, NothrowNewUsesCountedMallocAndMatchingDeleteFamily) {
+    const auto before = g_alloc_count.load(std::memory_order_relaxed);
+    void* first = ::operator new(17u, std::nothrow);
+    const auto allocated = g_alloc_count.load(std::memory_order_relaxed);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(allocated, before + 1u);
+    ::operator delete(first); // GTest's observed nothrow-new/ordinary-delete path
+    void* second = ::operator new(0u, std::nothrow);
+    ASSERT_NE(second, nullptr);
+    ::operator delete(second, std::nothrow);
 }
 
 TEST(AsyncIo, CloseCompletesPendingReadWithError) {

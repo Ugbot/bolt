@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cerrno>
+#include "bolt/lakehouse/iceberg/snapshot.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +45,129 @@ namespace {
 using namespace bolt::lakehouse;
 using namespace bolt::lakehouse::iceberg;
 
+// Observational filesystem trait wrapper: returns/capabilities are unchanged.
+// Native error is sampled immediately at trait return, not inside backend cleanup.
+struct DiagnosticStore {
+    struct Event {
+        const char* operation = "";
+        const char* phase = "init";
+        char key[kOsMaxKey]{};
+        int status = 0, posix_error = 0;
+        unsigned long native_error = 0;
+    };
+    static constexpr unsigned kTrace = 12u;
+    ObjectStore delegate{};
+    ObjectStore exposed{};
+    ObjectStoreVT vt{};
+    Event events[kTrace]{};
+    Event first_io{};
+    bool have_io = false;
+    bool log_deletes = false;
+    unsigned calls = 0u;
+    int writer = -1, commit = -1, attempt = 0;
+    int64_t observed_version = -1, base_version = -1;
+    const char* phase = "init";
+    static void before() noexcept {
+        errno = 0;
+#if defined(_WIN32)
+        SetLastError(ERROR_SUCCESS);
+#endif
+    }
+    int after(const char* operation, const char* key, int result) noexcept {
+        const int saved_errno = errno;
+#if defined(_WIN32)
+        const unsigned long saved_native = GetLastError();
+#else
+        const unsigned long saved_native = 0;
+#endif
+        auto& event = events[calls++ % kTrace];
+        event.operation = operation; event.phase = phase; event.status = result;
+        event.posix_error = saved_errno; event.native_error = saved_native;
+        std::strncpy(event.key, key, sizeof(event.key) - 1u); event.key[sizeof(event.key) - 1u] = 0;
+        if (result != kOsOk && result != kOsNotFound && result != kOsExists && !have_io) {
+            first_io = event; have_io = true;
+        }
+        if (result == kOsOk && (std::strcmp(operation, "get") == 0 || std::strcmp(operation, "put_if_absent") == 0) &&
+            std::strncmp(key, "metadata/v", 10u) == 0) {
+            char* end = nullptr;
+            const auto version = std::strtoll(key + 10u, &end, 10);
+            if (end != key + 10u && std::strcmp(end, ".metadata.json") == 0) observed_version = version;
+        }
+        if (log_deletes && std::strcmp(operation, "delete") == 0) this->event(event);
+        errno = saved_errno;
+#if defined(_WIN32)
+        SetLastError(saved_native);
+#endif
+        return result;
+    }
+    static DiagnosticStore& self(void* p) { return *static_cast<DiagnosticStore*>(p); }
+    static int get(void* p, const char* key, bolt::Arena* arena, const uint8_t** data, uint64_t* size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_object(s.delegate.impl, key, arena, data, size);
+        return s.after("get", key, rc);
+    }
+    static int put(void* p, const char* key, const uint8_t* data, uint64_t size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->put_object(s.delegate.impl, key, data, size);
+        return s.after("put", key, rc);
+    }
+    static int list(void* p, const char* key, ObjectEntry* out, uint32_t cap, uint32_t* count) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->list_prefix(s.delegate.impl, key, out, cap, count);
+        return s.after("list", key, rc);
+    }
+    static int remove(void* p, const char* key) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->delete_object(s.delegate.impl, key);
+        return s.after("delete", key, rc);
+    }
+    static int head(void* p, const char* key, ObjectMeta* out) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->head_object(s.delegate.impl, key, out);
+        return s.after("head", key, rc);
+    }
+    static int conditional(void* p, const char* key, const uint8_t* data, uint64_t size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->put_if_absent(s.delegate.impl, key, data, size);
+        return s.after("put_if_absent", key, rc);
+    }
+    static int range(void* p, const char* key, uint64_t offset, uint64_t size, uint8_t* out, uint64_t* got) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_range(s.delegate.impl, key, offset, size, out, got);
+        return s.after("get_range", key, rc);
+    }
+    static int versioned(void* p, const char* key, bolt::Arena* scratch, ObjectVersion* out) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->head_versioned(s.delegate.impl, key, scratch, out);
+        return s.after("head_versioned", key, rc);
+    }
+    static int matched(void* p, const char* key, const ObjectVersion* version, uint64_t offset,
+        uint32_t size, bolt::Arena* scratch, uint8_t* out, uint32_t* got) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_range_if_match(s.delegate.impl, key, version, offset, size, scratch, out, got);
+        return s.after("get_range_if_match", key, rc);
+    }
+    void bind(ObjectStore* store) {
+        delegate = *store; vt = *delegate.vt;
+        vt.get_object = get; vt.put_object = put; vt.list_prefix = list;
+        vt.delete_object = remove; vt.head_object = head;
+        if (delegate.vt->put_if_absent) vt.put_if_absent = conditional;
+        if (delegate.vt->get_range) vt.get_range = range;
+        if (delegate.vt->head_versioned) vt.head_versioned = versioned;
+        if (delegate.vt->get_range_if_match) vt.get_range_if_match = matched;
+        exposed = ObjectStore{&vt, this}; *store = exposed;
+    }
+    void event(const Event& e) const {
+        std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d attempt=%d phase=%s op=%s key=%.2047s status=%d post_return_errno=%d post_return_native=%lu\n",
+            writer, commit, attempt, e.phase, e.operation, e.key, e.status, e.posix_error, e.native_error);
+    }
+    void dump(TableHandle* table) const {
+        const Metadata* meta = table ? table_metadata(table) : nullptr;
+        const Snapshot* current = meta ? snapshot_by_id(meta, meta->current_snapshot_id) : nullptr;
+        std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d attempt=%d phase=%s CommitError=%u observed_metadata_version=%lld opened_base_version=%lld snapshot=%lld parent_snapshot=%lld retained=%u parent_manifest_list=%.2047s\n",
+            writer, commit, attempt, phase, static_cast<unsigned>(table ? table_last_commit_error(table) : CommitError::kFailed),
+            static_cast<long long>(observed_version), static_cast<long long>(base_version),
+            static_cast<long long>(meta ? meta->current_snapshot_id : -1),
+            static_cast<long long>(current ? current->parent_snapshot_id : -1),
+            meta ? meta->n_snapshots : 0u, current ? current->manifest_list : "");
+        if (have_io) event(first_io);
+        const unsigned count = calls < kTrace ? calls : kTrace;
+        for (unsigned i = 0u; i < count; ++i) event(events[(calls - count + i) % kTrace]);
+    }
+};
+
+
 constexpr int32_t kRowsPerCommit = 4;
 
 int64_t row_id(int32_t w, int32_t c, int32_t r) {
@@ -55,18 +180,21 @@ std::string table_root(const std::string& base) {
 }
 
 std::string fresh_base(const char* tag) {
+    std::error_code ec;
     std::filesystem::path p;
     const char* env = std::getenv("BOLT_ICEBERG_CONCURRENT_DIR");
     if (env != nullptr && env[0] != '\0' && std::strcmp(tag, "procs") == 0) {
         p = std::filesystem::path(env);
     } else {
-        p = std::filesystem::temp_directory_path() /
-            ("bolt_iceberg_concurrent_" + std::string(tag) + "_" +
-             std::to_string(static_cast<long long>(bolt_getpid())));
+        p = std::filesystem::temp_directory_path(ec);
+        if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=temp_directory status=%d\n", ec.value()); return {}; }
+        p /= "bolt_iceberg_concurrent_" + std::string(tag) + "_" +
+             std::to_string(static_cast<long long>(bolt_getpid()));
     }
-    std::error_code ec;
     std::filesystem::remove_all(p, ec);
+    if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=remove_fixture status=%d\n", ec.value()); return {}; }
     std::filesystem::create_directories(p / "default" / "t", ec);
+    if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=create_fixture status=%d\n", ec.value()); return {}; }
     return p.generic_string();
 }
 
@@ -83,19 +211,21 @@ Schema make_schema() {
     return s;
 }
 
-void make_batch(bolt::Arena* a, bolt::BoltBatch* out, int32_t w, int32_t c) {
+bool make_batch(bolt::Arena* a, bolt::BoltBatch* out, int32_t w, int32_t c) {
     bolt::BoltBatch::init_empty(out);
     out->arena    = a;
     out->num_rows = kRowsPerCommit;
     out->num_cols = 1;
-    bolt::BoltBatch::alloc_columns(out, a, 1);
+    if (!bolt::BoltBatch::alloc_columns(out, a, 1)) return false;
     out->schema.add_field("id", bolt::BoltType::Int64, false);
     auto* cols  = out->columns[out->read_epoch];
     auto* idata = a->allocate_array<int64_t>(kRowsPerCommit);
+    if (!idata) return false;
     for (int32_t r = 0; r < kRowsPerCommit; ++r) idata[r] = row_id(w, c, r);
     cols[0].type = bolt::BoltType::Int64;
     cols[0].length = kRowsPerCommit;
     cols[0].data = idata;
+    return true;
 }
 
 bool create_table(const std::string& root) {
@@ -119,28 +249,42 @@ enum class Attempt { kCommitted, kConflict, kError };
 // `ready` (optional) is a barrier spun on between staging and committing so
 // several writers can be lined up on the same base version.
 Attempt try_commit(const std::string& root, int32_t w, int32_t c,
-                   std::atomic<int32_t>* ready, int32_t n_ready_target) {
+                   std::atomic<int32_t>* ready, int32_t n_ready_target, int32_t attempt = 0) {
     bolt::Arena arena;
     FilesystemObjectStore fs{}; ObjectStore os{};
-    if (!filesystem_object_store_init(&fs, root.c_str(), &os))
+    DiagnosticStore diagnostic;
+    diagnostic.writer = w; diagnostic.commit = c; diagnostic.attempt = attempt;
+    TableHandle* th = nullptr; AppendHandle* ah = nullptr;
+    auto fail = [&](const char* phase) {
+        diagnostic.phase = phase; diagnostic.dump(th);
+        if (ah) append_close(ah);
+        if (th) table_close(th);
         return Attempt::kError;
-    TableHandle* th = nullptr;
-    if (!table_open(&th, &arena, &os, root.c_str())) return Attempt::kError;
-    AppendHandle* ah = nullptr;
-    if (!append_open(&ah, th)) return Attempt::kError;
+    };
+    if (!filesystem_object_store_init(&fs, root.c_str(), &os)) {
+        diagnostic.after("store_init", "", kOsIoError); return fail("store_init");
+    }
+    diagnostic.bind(&os);
+    diagnostic.phase = "open";
+    if (!table_open(&th, &arena, &os, root.c_str())) return fail("open");
+    diagnostic.base_version = diagnostic.observed_version;
+    diagnostic.phase = "append_open";
+    if (!append_open(&ah, th)) return fail("append_open");
     bolt::BoltBatch b{};
-    make_batch(&arena, &b, w, c);
-    if (!append_write(ah, &b)) return Attempt::kError;
+    if (!make_batch(&arena, &b, w, c)) return fail("batch_alloc");
+    diagnostic.phase = "write";
+    if (!append_write(ah, &b)) return fail("write");
     if (ready != nullptr) {
         ready->fetch_add(1, std::memory_order_acq_rel);
-        for (uint32_t spin = 0; spin < (1u << 30); ++spin) {   // bounded
+        for (uint32_t spin = 0; spin < (1u << 30); ++spin) {
             if (ready->load(std::memory_order_acquire) >= n_ready_target) break;
         }
     }
+    diagnostic.phase = "commit";
     const bool ok = append_commit(ah);
-    append_close(ah);
     const CommitError err = table_last_commit_error(th);
-    table_close(th);
+    if (!ok && err != CommitError::kConflict) diagnostic.dump(th);
+    append_close(ah); table_close(th);
     if (ok) {
         EXPECT_EQ(err, CommitError::kNone);
         return Attempt::kCommitted;
@@ -195,6 +339,7 @@ std::vector<int64_t> expected_ids(const std::vector<std::pair<int32_t, int32_t>>
 TEST(IcebergConcurrentCommit, StaleHandleIsRefusedAndWinnerSurvives) {
     for (int32_t round = 0; round < 60; ++round) {
         const std::string base = fresh_base("stale");
+        ASSERT_FALSE(base.empty());
         const std::string root = table_root(base);
         ASSERT_TRUE(create_table(root));
 
@@ -209,8 +354,8 @@ TEST(IcebergConcurrentCommit, StaleHandleIsRefusedAndWinnerSurvives) {
         ASSERT_TRUE(append_open(&aa, a));
         ASSERT_TRUE(append_open(&ab, b));
         bolt::BoltBatch ba{}, bb{};
-        make_batch(&arena_a, &ba, 1, round);
-        make_batch(&arena_b, &bb, 2, round);
+        ASSERT_TRUE(make_batch(&arena_a, &ba, 1, round));
+        ASSERT_TRUE(make_batch(&arena_b, &bb, 2, round));
         ASSERT_TRUE(append_write(aa, &ba));
         ASSERT_TRUE(append_write(ab, &bb));
 
@@ -236,6 +381,7 @@ TEST(IcebergConcurrentCommit, StaleHandleIsRefusedAndWinnerSurvives) {
 // table must hold exactly the winners' rows.
 TEST(IcebergConcurrentCommit, RacingThreadsAtMostOneWinnerPerVersion) {
     const std::string base = fresh_base("race");
+    ASSERT_FALSE(base.empty());
     const std::string root = table_root(base);
     ASSERT_TRUE(create_table(root));
     constexpr int32_t kThreads = 6;
@@ -282,7 +428,7 @@ int32_t writer_loop(const std::string& root, int32_t w) {
     for (int32_t c = 0; c < kCommitsPerWriter; ++c) {
         bool done = false;
         for (int32_t attempt = 0; attempt < 2000 && !done; ++attempt) {  // bounded
-            const Attempt a = try_commit(root, w, c, nullptr, 0);
+            const Attempt a = try_commit(root, w, c, nullptr, 0, attempt);
             if (a == Attempt::kCommitted) done = true;
             else if (a == Attempt::kError) return 1;
         }
@@ -301,6 +447,7 @@ std::vector<std::pair<int32_t, int32_t>> all_commits() {
 
 TEST(IcebergConcurrentCommit, RetryingThreadsLoseNothing) {
     const std::string base = fresh_base("threads");
+    ASSERT_FALSE(base.empty());
     const std::string root = table_root(base);
     ASSERT_TRUE(create_table(root));
     int32_t rc[kWriters] = {};
@@ -323,6 +470,7 @@ TEST(IcebergConcurrentCommit, RetryingThreadsLoseNothing) {
 // Leaves the table at BOLT_ICEBERG_CONCURRENT_DIR for the external oracle.
 TEST(IcebergConcurrentCommit, RetryingProcessesLoseNothing) {
     const std::string base = fresh_base("procs");
+    ASSERT_FALSE(base.empty());
     const std::string root = table_root(base);
     ASSERT_TRUE(create_table(root));
     pid_t pids[kWriters];

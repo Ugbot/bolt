@@ -6,6 +6,7 @@
 
 #include "bolt/io/bolt_aligned_writer.h"
 #include "bolt/io/bolt_crc32c.h"
+#include "test_temp_owner.h"
 
 #include <gtest/gtest.h>
 
@@ -36,30 +37,18 @@ using bolt::io::AlignedWriter;
 using bolt::io::AlignedWriterConfig;
 using bolt::io::AlignUnit;
 
-std::string tmp_path(const char* tag) {
-    const char* d = std::getenv("TMPDIR");
-    std::string p = (d != nullptr && *d != '\0') ? d : "/tmp";
-    if (p.back() != '/') p += '/';
-#if defined(_WIN32)
-    p += std::string("bolt_aw_") + tag;
-#else
-    p += std::string("bolt_aw_") + tag + "_" + std::to_string(::getpid());
-#endif
-    return p;
-}
-
-std::vector<uint8_t> read_file(const std::string& path) {
-    std::vector<uint8_t> out;
+bool read_file(const std::string& path, std::vector<uint8_t>* out) {
+    out->clear();
     FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) return out;
-    std::fseek(f, 0, SEEK_END);
-    const long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    out.resize(static_cast<size_t>(n));
-    const size_t got = n > 0 ? std::fread(out.data(), 1, out.size(), f) : 0;
-    std::fclose(f);
-    out.resize(got);
-    return out;
+    if (f == nullptr) return false;
+    const int end = std::fseek(f, 0, SEEK_END);
+    const long n = end == 0 ? std::ftell(f) : -1;
+    const int begin = n >= 0 ? std::fseek(f, 0, SEEK_SET) : -1;
+    if (n < 0 || begin != 0) { std::fclose(f); return false; }
+    out->resize(static_cast<size_t>(n));
+    const size_t got = n > 0 ? std::fread(out->data(), 1, out->size(), f) : 0;
+    const int closed = std::fclose(f);
+    return got == out->size() && closed == 0;
 }
 
 void fill_random(std::vector<uint8_t>& v, std::mt19937_64& rng) {
@@ -135,44 +124,54 @@ struct Written {
 };
 
 // Write a random sequence of pages, raw appends and pads; return the pages.
-std::vector<Written> write_random_file(const std::string& path, const AlignedWriterConfig& cfg,
-                                       uint64_t* size, uint8_t* direct, uint64_t seed) {
+bool write_random_file(const std::string& path, const AlignedWriterConfig& cfg,
+                       uint64_t* size, uint8_t* direct, uint64_t seed,
+                       std::vector<Written>* pages) {
+    *size = 0; *direct = 0; pages->clear();
     std::mt19937_64 rng(seed);
-    AlignedWriter w;
-    EXPECT_EQ(bolt::io::aligned_writer_open(path.c_str(), cfg, &w), AlignedWriteStatus::kOk);
+    AlignedWriter w{};
+    const auto opened = bolt::io::aligned_writer_open(path.c_str(), cfg, &w);
+    if (opened != AlignedWriteStatus::kOk) return false;
     *direct = w.direct;
-    std::vector<Written> pages;
     std::vector<uint8_t> buf(200000);
     for (int i = 0; i < 300; ++i) {
         const uint32_t kind = static_cast<uint32_t>(rng() % 8);
         const size_t len = static_cast<size_t>(rng() % (kind == 0 ? 150000 : 9000));
         buf.resize(len);
         fill_random(buf, rng);
-        if (kind == 7) {  // raw bytes between pages: the next pad must zero
-            EXPECT_EQ(bolt::io::aligned_writer_append(&w, buf.data(), len % 100),
-                      AlignedWriteStatus::kOk);
+        if (kind == 7) {
+            const auto status = bolt::io::aligned_writer_append(&w, buf.data(), len % 100);
+            EXPECT_EQ(status, AlignedWriteStatus::kOk);
+            if (status != AlignedWriteStatus::kOk) { bolt::io::aligned_writer_abort(&w); return false; }
             continue;
         }
         const AlignUnit u = static_cast<AlignUnit>(rng() % 3);
         Written wr{};
         wr.unit = w.unit[static_cast<uint32_t>(u)];
-        EXPECT_EQ(bolt::io::aligned_writer_page(&w, buf.data(), len, u, 0, &wr.page),
-                  AlignedWriteStatus::kOk);
-        pages.push_back(wr);
+        const auto status = bolt::io::aligned_writer_page(&w, buf.data(), len, u, 0, &wr.page);
+        EXPECT_EQ(status, AlignedWriteStatus::kOk);
+        if (status != AlignedWriteStatus::kOk) { bolt::io::aligned_writer_abort(&w); return false; }
+        pages->push_back(wr);
     }
-    EXPECT_EQ(bolt::io::aligned_writer_finish(&w, true, size), AlignedWriteStatus::kOk);
-    return pages;
+    const auto finished = bolt::io::aligned_writer_finish(&w, true, size);
+    EXPECT_EQ(finished, AlignedWriteStatus::kOk);
+    if (finished != AlignedWriteStatus::kOk) bolt::io::aligned_writer_abort(&w);
+    return finished == AlignedWriteStatus::kOk;
 }
 
 void check_file(bool direct_wanted) {
-    const std::string path = tmp_path(direct_wanted ? "layout_direct" : "layout_buffered");
+    bolt::test::TempOwner temp(direct_wanted ? "layout_direct" : "layout_buffered");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     uint64_t size = 0;
     uint8_t direct = 0;
     const AlignedWriterConfig cfg = small_cfg(direct_wanted);
-    const std::vector<Written> pages = write_random_file(path, cfg, &size, &direct, 42);
+    std::vector<Written> pages;
+    ASSERT_TRUE(write_random_file(path, cfg, &size, &direct, 42, &pages));
     std::printf("[aligned_writer] direct requested=%d granted=%d\n", direct_wanted, direct);
     if (!direct_wanted) EXPECT_EQ(direct, 0);
-    const std::vector<uint8_t> file = read_file(path);
+    std::vector<uint8_t> file;
+    ASSERT_TRUE(read_file(path, &file));
     ASSERT_EQ(file.size(), size);
     std::mt19937_64 rng(42);  // replay the payloads
     std::vector<uint8_t> buf(200000);
@@ -183,7 +182,7 @@ void check_file(bool direct_wanted) {
         buf.resize(len);
         fill_random(buf, rng);
         if (kind == 7) continue;
-        rng();  // unit draw
+        (void)rng();  // preserve the unit draw while replaying payloads
         const Written& wr = pages[pi++];
         const AlignedPage& p = wr.page;
         ASSERT_EQ(p.off % wr.unit, 0u);
@@ -198,22 +197,41 @@ void check_file(bool direct_wanted) {
     std::remove(path.c_str());
 }
 
-TEST(AlignedWriter, OffsetsOnUnitsPaddingZeroBuffered) { check_file(false); }
-TEST(AlignedWriter, OffsetsOnUnitsPaddingZeroDirect) { check_file(true); }
+TEST(AlignedWriter, MissingDirectoryGenerationRefusesWithoutPublishingPages) {
+    bolt::test::TempOwner temp("aw-missing");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    uint64_t size = 77u; uint8_t direct = 1u;
+    std::vector<Written> pages;
+    const auto missing = (temp.directory() / "missing" / "data").string();
+    EXPECT_FALSE(write_random_file(missing, small_cfg(true), &size, &direct, 99u, &pages));
+    EXPECT_TRUE(pages.empty()); EXPECT_EQ(size, 0u); EXPECT_EQ(direct, 0u);
+}
+
+TEST(AlignedWriter, OffsetsOnUnitsPaddingZeroBuffered) {
+    ASSERT_NO_FATAL_FAILURE(check_file(false));
+}
+TEST(AlignedWriter, OffsetsOnUnitsPaddingZeroDirect) {
+    ASSERT_NO_FATAL_FAILURE(check_file(true));
+}
 
 TEST(AlignedWriter, RandomByteFlipsAllDetectedByPageCrc) {
-    const std::string path = tmp_path("flips");
+    bolt::test::TempOwner temp("flips");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     uint64_t size = 0;
     uint8_t direct = 0;
-    const std::vector<Written> pages =
-        write_random_file(path, small_cfg(true), &size, &direct, 99);
-    std::vector<uint8_t> file = read_file(path);
+    std::vector<Written> pages;
+    ASSERT_TRUE(write_random_file(path, small_cfg(true), &size, &direct, 99, &pages));
+    std::vector<uint8_t> file;
+    ASSERT_TRUE(read_file(path, &file));
     ASSERT_EQ(file.size(), size);
     std::mt19937_64 rng(1234);
+    std::vector<size_t> nonempty;
+    for (size_t i = 0; i < pages.size(); ++i) if (pages[i].page.padded_len != 0u) nonempty.push_back(i);
+    ASSERT_FALSE(nonempty.empty());
     uint32_t detected = 0, flips = 0;
     for (; flips < 10000; ++flips) {
-        const AlignedPage& p = pages[rng() % pages.size()].page;
-        if (p.padded_len == 0) { --flips; continue; }
+        const AlignedPage& p = pages[nonempty[rng() % nonempty.size()]].page;
         const uint64_t at = p.off + rng() % p.padded_len;  // payload or padding
         const uint8_t x = static_cast<uint8_t>(1 + rng() % 255);
         file[at] ^= x;
@@ -221,13 +239,16 @@ TEST(AlignedWriter, RandomByteFlipsAllDetectedByPageCrc) {
         file[at] ^= x;
     }
     std::printf("[aligned_writer] byte flips detected %u / %u\n", detected, flips);
+    EXPECT_EQ(flips, 10000u);
     EXPECT_EQ(detected, flips);
     std::remove(path.c_str());
 }
 
 TEST(AlignedWriter, RefusesBadUnitsAndStaging) {
-    const std::string path = tmp_path("bad");
-    AlignedWriter w;
+    bolt::test::TempOwner temp("bad");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    AlignedWriter w{};
     AlignedWriterConfig c = bolt::io::aligned_writer_config_default();
     c.buf_log2 = 5;  // 32 B < 64 B
     EXPECT_EQ(bolt::io::aligned_writer_open(path.c_str(), c, &w), AlignedWriteStatus::kBadUnits);
@@ -244,21 +265,26 @@ TEST(AlignedWriter, RefusesBadUnitsAndStaging) {
 }
 
 TEST(AlignedWriter, EmptyFileAndTailShorterThanIoUnit) {
-    const std::string path = tmp_path("tail");
-    AlignedWriter w;
+    bolt::test::TempOwner temp("tail");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
+    AlignedWriter w{};
     ASSERT_EQ(bolt::io::aligned_writer_open(path.c_str(), small_cfg(true), &w),
               AlignedWriteStatus::kOk);
     uint64_t size = 1;
     ASSERT_EQ(bolt::io::aligned_writer_finish(&w, false, &size), AlignedWriteStatus::kOk);
     EXPECT_EQ(size, 0u);
-    EXPECT_EQ(read_file(path).size(), 0u);
+    std::vector<uint8_t> empty;
+    ASSERT_TRUE(read_file(path, &empty));
+    EXPECT_EQ(empty.size(), 0u);
     ASSERT_EQ(bolt::io::aligned_writer_open(path.c_str(), small_cfg(true), &w),
               AlignedWriteStatus::kOk);
     const char msg[] = "abc";
     ASSERT_EQ(bolt::io::aligned_writer_append(&w, msg, 3), AlignedWriteStatus::kOk);
     ASSERT_EQ(bolt::io::aligned_writer_finish(&w, false, &size), AlignedWriteStatus::kOk);
     EXPECT_EQ(size, 3u);
-    const std::vector<uint8_t> f = read_file(path);
+    std::vector<uint8_t> f;
+    ASSERT_TRUE(read_file(path, &f));
     ASSERT_EQ(f.size(), 3u);
     EXPECT_EQ(std::memcmp(f.data(), msg, 3), 0);
     EXPECT_EQ(bolt::io::aligned_writer_append(&w, msg, 3), AlignedWriteStatus::kClosed);
@@ -300,26 +326,34 @@ TEST(AlignedWriterPerf, PageCrcThroughputOneThread) {
     if (gate != nullptr && std::strcmp(gate, "1") == 0) EXPECT_GE(g64, 11.5);
 }
 
-double write_gbps(bool direct, size_t total, uint8_t* granted) {
-    const std::string path = tmp_path(direct ? "bench_direct" : "bench_buffered");
+bool write_gbps(bool direct, size_t total, uint8_t* granted, double* gbps) {
+    *granted = 0; *gbps = 0;
+    bolt::test::TempOwner temp(direct ? "bench_direct" : "bench_buffered");
+    if (!temp.valid()) return false;
+    const std::string& path = temp.path();
     std::vector<uint8_t> page(65536);
     std::mt19937_64 rng(5);
     fill_random(page, rng);
     AlignedWriterConfig c = bolt::io::aligned_writer_config_default();
     c.direct_io = direct ? 1 : 0;
-    AlignedWriter w;
+    AlignedWriter w{};
     const auto t0 = std::chrono::steady_clock::now();
-    EXPECT_EQ(bolt::io::aligned_writer_open(path.c_str(), c, &w), AlignedWriteStatus::kOk);
+    const auto opened = bolt::io::aligned_writer_open(path.c_str(), c, &w);
+    EXPECT_EQ(opened, AlignedWriteStatus::kOk);
+    if (opened != AlignedWriteStatus::kOk) return false;
     *granted = w.direct;
-    AlignedPage p;
-    for (size_t done = 0; done < total; done += page.size())
-        EXPECT_EQ(bolt::io::aligned_writer_page(&w, page.data(), page.size(), AlignUnit::kStripe,
-                                                0, &p),
-                  AlignedWriteStatus::kOk);
-    EXPECT_EQ(bolt::io::aligned_writer_finish(&w, true, nullptr), AlignedWriteStatus::kOk);
-    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::remove(path.c_str());
-    return static_cast<double>(total) / s / 1e9;
+    AlignedPage page_out{};
+    for (size_t done = 0; done < total; done += page.size()) {
+        const auto status = bolt::io::aligned_writer_page(&w, page.data(), page.size(), AlignUnit::kStripe, 0, &page_out);
+        EXPECT_EQ(status, AlignedWriteStatus::kOk);
+        if (status != AlignedWriteStatus::kOk) { bolt::io::aligned_writer_abort(&w); return false; }
+    }
+    const auto finished = bolt::io::aligned_writer_finish(&w, true, nullptr);
+    EXPECT_EQ(finished, AlignedWriteStatus::kOk);
+    if (finished != AlignedWriteStatus::kOk) { bolt::io::aligned_writer_abort(&w); return false; }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    *gbps = static_cast<double>(total) / seconds / 1e9;
+    return true;
 }
 
 TEST(AlignedWriterPerf, DirectAndBufferedWriteThroughput) {
@@ -328,8 +362,11 @@ TEST(AlignedWriterPerf, DirectAndBufferedWriteThroughput) {
     std::vector<double> d, b;
     uint8_t gd = 0, gb = 0;
     for (int r = 0; r < 5; ++r) {
-        d.push_back(write_gbps(true, total, &gd));
-        b.push_back(write_gbps(false, total, &gb));
+        double direct_gbps = 0, buffered_gbps = 0;
+        ASSERT_TRUE(write_gbps(true, total, &gd, &direct_gbps));
+        ASSERT_TRUE(write_gbps(false, total, &gb, &buffered_gbps));
+        d.push_back(direct_gbps);
+        b.push_back(buffered_gbps);
     }
     std::printf("[aligned_writer] write %zu MiB + fsync, median of 5: direct(granted=%d) "
                 "%.2f GB/s, buffered %.2f GB/s\n", total >> 20, gd, median(d), median(b));
@@ -349,7 +386,9 @@ bolt::io::NativeFile native_write_open(const char* path) {
 
 TEST(AlignedWriter, NativeAdoptionFailurePreservesAndFinishTransfers) {
     using namespace bolt::io;
-    const auto path = tmp_path("native_adoption");
+    bolt::test::TempOwner temp("native_adoption");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     NativeFile n = native_write_open(path.c_str());
     ASSERT_NE(n.handle, -1);
     const intptr_t identity = n.handle;
@@ -377,7 +416,9 @@ TEST(AlignedWriter, NativeAdoptionFailurePreservesAndFinishTransfers) {
     uint64_t size = 0;
     EXPECT_EQ(aligned_writer_finish(&w, true, &size), AlignedWriteStatus::kOk);
     EXPECT_EQ(size, sizeof(data));
-    EXPECT_EQ(read_file(path), std::vector<uint8_t>({9, 8, 7}));
+    std::vector<uint8_t> actual;
+    ASSERT_TRUE(read_file(path, &actual));
+    EXPECT_EQ(actual, std::vector<uint8_t>({9, 8, 7}));
     aligned_writer_abort(&w);
     EXPECT_TRUE(native_file_close(&n));
     std::remove(path.c_str());
@@ -385,7 +426,9 @@ TEST(AlignedWriter, NativeAdoptionFailurePreservesAndFinishTransfers) {
 
 TEST(AlignedWriter, NativeNonemptyRefusesWithoutTruncationAndAbortCloses) {
     using namespace bolt::io;
-    const auto path = tmp_path("native_nonempty");
+    bolt::test::TempOwner temp("native_nonempty");
+    ASSERT_TRUE(temp.valid()) << temp.error().message();
+    const std::string& path = temp.path();
     NativeFile n = native_write_open(path.c_str());
     ASSERT_NE(n.handle, -1);
     const uint8_t data[] = {5, 4, 3, 2};
@@ -402,13 +445,16 @@ TEST(AlignedWriter, NativeNonemptyRefusesWithoutTruncationAndAbortCloses) {
     EXPECT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOpenFailed);
     EXPECT_EQ(n.handle, identity);
     EXPECT_TRUE(native_file_close(&n));
-    EXPECT_EQ(read_file(path), std::vector<uint8_t>({5, 4, 3, 2}));
+    std::vector<uint8_t> actual;
+    ASSERT_TRUE(read_file(path, &actual));
+    EXPECT_EQ(actual, std::vector<uint8_t>({5, 4, 3, 2}));
     n = native_write_open(path.c_str());
     ASSERT_EQ(aligned_writer_adopt(&n, cfg, false, &w), AlignedWriteStatus::kOk);
     ASSERT_EQ(aligned_writer_append(&w, data, sizeof(data)), AlignedWriteStatus::kOk);
     aligned_writer_abort(&w);
     aligned_writer_abort(&w);
-    EXPECT_TRUE(read_file(path).empty());
+    ASSERT_TRUE(read_file(path, &actual));
+    EXPECT_TRUE(actual.empty());
 #if !defined(_WIN32)
     NativeFile dir{::open("/tmp", O_RDONLY | O_DIRECTORY)};
     ASSERT_NE(dir.handle, -1);

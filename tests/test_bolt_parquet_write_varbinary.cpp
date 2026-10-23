@@ -211,7 +211,10 @@ void read_back_strings(const char* path, std::vector<std::string>* out,
     const std::vector<uint8_t> buf = slurp(path);
     ASSERT_FALSE(buf.empty());
     Arena arena;
-    bp::PqMeta meta{};
+    auto* meta_storage = arena.allocate_array<bp::PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    bp::PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     ASSERT_TRUE(bp::parquet_read_meta(buf.data(), buf.size(), &arena, &meta));
     ASSERT_EQ(meta.n_columns, 3u);
     for (uint32_t rg = 0; rg < meta.n_row_groups; ++rg) {
@@ -267,7 +270,7 @@ TEST(ParquetWriteVarBinary, VarBinaryUtf8WritesCompleteFile) {
 
     std::vector<std::string> vals;
     std::vector<bool> nulls;
-    read_back_strings(path, &vals, &nulls);
+    ASSERT_NO_FATAL_FAILURE(read_back_strings(path, &vals, &nulls));
     expect_matches_model(vals, nulls);
 }
 
@@ -287,7 +290,7 @@ TEST(ParquetWriteVarBinary, FlatUtf8StillWritesCompleteFile) {
 
     std::vector<std::string> vals;
     std::vector<bool> nulls;
-    read_back_strings(path, &vals, &nulls);
+    ASSERT_NO_FATAL_FAILURE(read_back_strings(path, &vals, &nulls));
     expect_matches_model(vals, nulls);
 }
 
@@ -336,14 +339,17 @@ TEST(ParquetWriteVarBinary, VarBinarySurvivesRowGroupSplitting) {
     ASSERT_TRUE(bp::parquet_write_close(w));
 
     Arena meta_arena;
-    bp::PqMeta meta{};
+    auto* meta_storage = meta_arena.allocate_array<bp::PqMeta>(1);
+    ASSERT_NE(meta_storage, nullptr);
+    bp::PqMeta& meta = *meta_storage;
+    std::memset(&meta, 0, sizeof(meta));
     const std::vector<uint8_t> raw = slurp(path);
     ASSERT_TRUE(bp::parquet_read_meta(raw.data(), raw.size(), &meta_arena, &meta));
     EXPECT_GT(meta.n_row_groups, 1u);
 
     std::vector<std::string> vals;
     std::vector<bool> nulls;
-    read_back_strings(path, &vals, &nulls);
+    ASSERT_NO_FATAL_FAILURE(read_back_strings(path, &vals, &nulls));
     expect_matches_model(vals, nulls);
 }
 

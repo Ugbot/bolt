@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/api/core/accept_retirement_limits.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -10,8 +11,8 @@ using AcceptRetirementDeadline = std::chrono::steady_clock::time_point;
 // Startup-owned, immovable record. Its listener and engine outlive every
 // non-Complete result. Lifecycle calls are externally serialized.
 struct AcceptRetirement {
-    static constexpr uint32_t kCapacity = 4096u;
-    static constexpr int kReadinessFdLimit = 1 << 16;
+    static constexpr uint32_t kCapacity = limits::kAcceptRetirementCapacity;
+    static constexpr int kReadinessFdLimit = limits::kAcceptReadinessFdLimit;
     int fd = -1;
     uint32_t reactor = 0u; // immutable actual registration/progress owner
     std::atomic<bool> requested{false};

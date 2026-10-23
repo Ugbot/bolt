@@ -26,6 +26,7 @@
 // bloom slices) and synthetic-buffer unit tests for the helpers.
 
 #include "pq_test_columns.h"
+#include "bolt/bolt_arena.h"
 #include "bolt/ingest/bolt_parquet_bloom.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_pageindex.h"
@@ -63,26 +64,29 @@ std::string data_path(const char* name) {
 struct ParsedFile {
     std::vector<uint8_t> buf;
     std::vector<PqChunk> chunks;
-    PqMeta meta{};
+    bolt::Arena arena;
+    PqMeta* meta = nullptr;
 };
 
 void parse_file(const char* name, ParsedFile* pf) {
     pf->buf = slurp(data_path(name).c_str());
     ASSERT_FALSE(pf->buf.empty()) << name;
     pf->chunks.resize(64 * 64);
-    std::memset(&pf->meta, 0, sizeof(pf->meta));
-    pf->meta.chunks = pf->chunks.data();
-    pf->meta.chunks_cap = static_cast<uint32_t>(pf->chunks.size());
-    pf->meta.columns = pq_test_columns();
-    pf->meta.columns_cap = kPqTestColumns;
+    pf->meta = pf->arena.allocate_array<PqMeta>(1);
+    ASSERT_NE(pf->meta, nullptr);
+    std::memset(pf->meta, 0, sizeof(*pf->meta));
+    pf->meta->chunks = pf->chunks.data();
+    pf->meta->chunks_cap = static_cast<uint32_t>(pf->chunks.size());
+    pf->meta->columns = pq_test_columns();
+    pf->meta->columns_cap = kPqTestColumns;
     uint64_t off = 0;
     uint32_t len = 0;
     ASSERT_TRUE(pq_locate_footer(pf->buf.data(), pf->buf.size(), &off, &len));
-    ASSERT_TRUE(pq_parse_file_meta(pf->buf.data() + off, len, &pf->meta));
+    ASSERT_TRUE(pq_parse_file_meta(pf->buf.data() + off, len, pf->meta));
 }
 
 const PqChunk& chunk_at(const ParsedFile& pf, uint32_t rg, uint32_t col) {
-    return pf.meta.chunks[pf.meta.row_groups[rg].chunk_off + col];
+    return pf.meta->chunks[pf.meta->row_groups[rg].chunk_off + col];
 }
 
 // Parse both index halves of one chunk into caller storage.
@@ -121,12 +125,12 @@ int64_t page_stat_i64(const PqPageStat& ps, bool want_min) {
 
 TEST(BoltParquetPageIndex, FooterCapturesIndexOffsets) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
-    EXPECT_EQ(pf.meta.num_rows, 2000);
-    ASSERT_EQ(pf.meta.n_columns, 5u);
-    ASSERT_EQ(pf.meta.n_row_groups, 2u);
-    for (uint32_t g = 0; g < pf.meta.n_row_groups; ++g) {
-        for (uint32_t c = 0; c < pf.meta.n_columns; ++c) {
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
+    EXPECT_EQ(pf.meta->num_rows, 2000);
+    ASSERT_EQ(pf.meta->n_columns, 5u);
+    ASSERT_EQ(pf.meta->n_row_groups, 2u);
+    for (uint32_t g = 0; g < pf.meta->n_row_groups; ++g) {
+        for (uint32_t c = 0; c < pf.meta->n_columns; ++c) {
             const PqChunk& ch = chunk_at(pf, g, c);
             EXPECT_GT(ch.column_index_offset, 0) << g << "," << c;
             EXPECT_GT(ch.column_index_length, 0) << g << "," << c;
@@ -137,11 +141,11 @@ TEST(BoltParquetPageIndex, FooterCapturesIndexOffsets) {
     }
     // Older fixture (no page index): all location fields stay absent.
     ParsedFile old;
-    parse_file("golden_flat.parquet", &old);
-    for (uint32_t i = 0; i < old.meta.n_chunks; ++i) {
-        EXPECT_EQ(old.meta.chunks[i].column_index_offset, 0);
-        EXPECT_EQ(old.meta.chunks[i].offset_index_offset, 0);
-        EXPECT_EQ(old.meta.chunks[i].bloom_filter_offset, 0);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_flat.parquet", &old));
+    for (uint32_t i = 0; i < old.meta->n_chunks; ++i) {
+        EXPECT_EQ(old.meta->chunks[i].column_index_offset, 0);
+        EXPECT_EQ(old.meta->chunks[i].offset_index_offset, 0);
+        EXPECT_EQ(old.meta->chunks[i].bloom_filter_offset, 0);
     }
 }
 
@@ -151,11 +155,11 @@ TEST(BoltParquetPageIndex, FooterCapturesIndexOffsets) {
 
 TEST(BoltParquetPageIndex, IdColumnPagesMatchRowIndexGroundTruth) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     for (uint32_t g = 0; g < 2u; ++g) {
         ChunkIndex ix;
-        read_chunk_index(pf, g, 0, &ix);   // col 0 = id (== global row idx)
-        const int64_t rg_rows = pf.meta.row_groups[g].num_rows;
+        ASSERT_NO_FATAL_FAILURE(read_chunk_index(pf, g, 0, &ix));   // col 0 = id (== global row idx)
+        const int64_t rg_rows = pf.meta->row_groups[g].num_rows;
         const int64_t base = static_cast<int64_t>(g) * 1000;
         EXPECT_EQ(ix.ci.boundary_order, 1) << "id pages sorted ascending";
         EXPECT_EQ(ix.oi.pages[0].first_row_index, 0);
@@ -175,7 +179,7 @@ TEST(BoltParquetPageIndex, IdColumnPagesMatchRowIndexGroundTruth) {
         // Chunk-level stats == envelope of the page stats.
         const PqChunk& ch = chunk_at(pf, g, 0);
         int64_t clo = 0, chi = 0;
-        const PqColumn& col = pf.meta.columns[0];
+        const PqColumn& col = pf.meta->columns[0];
         ASSERT_TRUE(pq_stat_range_i64(col, ch, &clo, &chi));
         EXPECT_EQ(clo, page_stat_i64(ix.ci.pages[0], true));
         EXPECT_EQ(chi, page_stat_i64(ix.ci.pages[ix.ci.n_pages - 1], false));
@@ -184,14 +188,14 @@ TEST(BoltParquetPageIndex, IdColumnPagesMatchRowIndexGroundTruth) {
 
 TEST(BoltParquetPageIndex, NullCountsOnMixedPages) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     // col 3 = opt: rows with (row/100)%5 == 2 are null. pyarrow merges each
     // null span into a MIXED 200-row page (an all-null batch adds ~0
     // estimated bytes, so the size-based page split doesn't fire) — the
     // per-page null_counts must still sum to the exact ground truth.
     for (uint32_t g = 0; g < 2u; ++g) {
         ChunkIndex ix;
-        read_chunk_index(pf, g, 3, &ix);
+        ASSERT_NO_FATAL_FAILURE(read_chunk_index(pf, g, 3, &ix));
         ASSERT_EQ(ix.ci.has_null_counts, 1u);
         int64_t total_nulls = 0;
         for (uint32_t p = 0; p < ix.ci.n_pages; ++p) {
@@ -208,7 +212,7 @@ TEST(BoltParquetPageIndex, NullCountsOnMixedPages) {
 
 TEST(BoltParquetPageIndex, AllNullColumnYieldsNullPages) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     // col 4 = allnull: 100% null -> EVERY page of the chunk is a null page
     // with empty bounds, and null_counts equal the page row counts.
     for (uint32_t g = 0; g < 2u; ++g) {
@@ -227,7 +231,7 @@ TEST(BoltParquetPageIndex, AllNullColumnYieldsNullPages) {
                                          &oi));
         ASSERT_EQ(ci.n_pages, oi.n_pages);
         ASSERT_GE(ci.n_pages, 1u);
-        const int64_t rg_rows = pf.meta.row_groups[g].num_rows;
+        const int64_t rg_rows = pf.meta->row_groups[g].num_rows;
         int64_t total_nulls = 0;
         for (uint32_t p = 0; p < ci.n_pages; ++p) {
             const PqPageStat& ps = ci.pages[p];
@@ -243,7 +247,7 @@ TEST(BoltParquetPageIndex, AllNullColumnYieldsNullPages) {
                 total_nulls += ps.null_count;
             }
             // A null page must never claim to exclude anything.
-            EXPECT_FALSE(pq_page_excludes_range_i64(pf.meta.columns[4], ps,
+            EXPECT_FALSE(pq_page_excludes_range_i64(pf.meta->columns[4], ps,
                                                     INT64_MIN,
                                                     INT64_MAX - 1));
             EXPECT_FALSE(pq_page_utf8_excludes_eq(ps, nullptr, 0));
@@ -252,16 +256,16 @@ TEST(BoltParquetPageIndex, AllNullColumnYieldsNullPages) {
         // Range pruning over an all-null chunk keeps every page (the
         // conservative contract — nulls are the caller's gate).
         PqPageSet s{};
-        pq_prune_pages_i64(pf.meta.columns[4], ci, 0, 100, &s);
+        pq_prune_pages_i64(pf.meta->columns[4], ci, 0, 100, &s);
         EXPECT_EQ(s.n_survivors, ci.n_pages);
     }
 }
 
 TEST(BoltParquetPageIndex, Utf8PageBoundsSortedAndUsable) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     ChunkIndex ix;
-    read_chunk_index(pf, 0, 2, &ix);       // col 2 = name = "k%06d" (sorted)
+    ASSERT_NO_FATAL_FAILURE(read_chunk_index(pf, 0, 2, &ix));       // col 2 = name = "k%06d" (sorted)
     EXPECT_EQ(ix.ci.boundary_order, 1);
     for (uint32_t p = 0; p < ix.ci.n_pages; ++p) {
         const PqPageStat& ps = ix.ci.pages[p];
@@ -286,12 +290,12 @@ TEST(BoltParquetPageIndex, Utf8PageBoundsSortedAndUsable) {
 // queries genuinely drop pages.
 TEST(BoltParquetPageIndex, RangePruneNeverDropsMatchingRows) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
-    const PqColumn& col = pf.meta.columns[0];
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
+    const PqColumn& col = pf.meta->columns[0];
     for (uint32_t g = 0; g < 2u; ++g) {
         ChunkIndex ix;
-        read_chunk_index(pf, g, 0, &ix);
-        const int64_t rg_rows = pf.meta.row_groups[g].num_rows;
+        ASSERT_NO_FATAL_FAILURE(read_chunk_index(pf, g, 0, &ix));
+        const int64_t rg_rows = pf.meta->row_groups[g].num_rows;
         const int64_t base = static_cast<int64_t>(g) * 1000;
         for (int64_t q_lo = base - 150; q_lo <= base + 1050; q_lo += 97) {
             const int64_t q_hi = q_lo + 130;
@@ -341,10 +345,10 @@ TEST(BoltParquetPageIndex, RangePruneNeverDropsMatchingRows) {
 
 TEST(BoltParquetPageIndex, Utf8EqPruneFindsTheOnePage) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     ChunkIndex ix;
-    read_chunk_index(pf, 0, 2, &ix);       // name, rowgroup 0
-    const int64_t rg_rows = pf.meta.row_groups[0].num_rows;
+    ASSERT_NO_FATAL_FAILURE(read_chunk_index(pf, 0, 2, &ix));       // name, rowgroup 0
+    const int64_t rg_rows = pf.meta->row_groups[0].num_rows;
     // "k000550" is row 550 — it must land in a surviving range.
     const char* q = "k000550";
     PqPageSet s{};
@@ -409,7 +413,7 @@ TEST(BoltParquetPageIndex, PageStatHelpersConservative) {
 
 TEST(BoltParquetPageIndex, CorruptIndexSlicesNeverCrash) {
     ParsedFile pf;
-    parse_file("golden_pageindex.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_pageindex.parquet", &pf));
     const PqChunk& ch = chunk_at(pf, 0, 0);
     std::vector<PqPageStat> stats(kPqMaxPagesPerChunk);
     std::vector<PqPageLocation> locs(kPqMaxPagesPerChunk);
@@ -502,9 +506,9 @@ TEST(BoltParquetBloom, Xxh64KnownVectors) {
 // No false negatives ever; false positives rare (fpp 0.01 requested).
 void check_bloom_file(const char* name, bool has_val_col) {
     ParsedFile pf;
-    parse_file(name, &pf);
-    ASSERT_EQ(pf.meta.n_row_groups, 1u);
-    const uint32_t n_cols = pf.meta.n_columns;
+    ASSERT_NO_FATAL_FAILURE(parse_file(name, &pf));
+    ASSERT_EQ(pf.meta->n_row_groups, 1u);
+    const uint32_t n_cols = pf.meta->n_columns;
     ASSERT_GE(n_cols, 2u);
 
     // Column 0: id = 10000 + 3*i.
@@ -579,12 +583,12 @@ TEST(BoltParquetBloom, DuckdbBloomMembership) {
 
 TEST(BoltParquetBloom, AbsentBloomIsAbsent) {
     ParsedFile pf;
-    parse_file("golden_flat.parquet", &pf);
-    for (uint32_t i = 0; i < pf.meta.n_chunks; ++i) {
-        EXPECT_EQ(pf.meta.chunks[i].bloom_filter_offset, 0);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_flat.parquet", &pf));
+    for (uint32_t i = 0; i < pf.meta->n_chunks; ++i) {
+        EXPECT_EQ(pf.meta->chunks[i].bloom_filter_offset, 0);
         PqBloomFilter bf{};
         EXPECT_FALSE(pq_read_bloom(pf.buf.data(), pf.buf.size(),
-                                   pf.meta.chunks[i], &bf));
+                                   pf.meta->chunks[i], &bf));
     }
 }
 
@@ -648,7 +652,7 @@ TEST(BoltParquetBloom, SyntheticHeaderAcceptAndReject) {
 
 TEST(BoltParquetBloom, CorruptBloomSlicesNeverCrash) {
     ParsedFile pf;
-    parse_file("golden_bloom.parquet", &pf);
+    ASSERT_NO_FATAL_FAILURE(parse_file("golden_bloom.parquet", &pf));
     const PqChunk& ch = chunk_at(pf, 0, 0);
     ASSERT_GT(ch.bloom_filter_offset, 0);
     ASSERT_GT(ch.bloom_filter_length, 0);

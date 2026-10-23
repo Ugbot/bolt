@@ -209,9 +209,7 @@ include/bolt/parse/bolt_json.h::kJsonMaxPathBytes
 include/bolt/parse/bolt_json.h::kJsonMaxPaths
 include/bolt/stream/bolt_stream.h::kStreamMaxInFlight
 include/bolt/stream/bolt_stream.h::kStreamMaxStages
-src/api/core/async_io_epoll.cpp::kMaxFds
 src/api/core/async_io_iocp.cpp::kPoolCap
-src/api/core/async_io_kqueue.cpp::kMaxFds
 src/api/core/async_io_uring.cpp::kMaxFds
 src/api/net/fd_registry.h::kMaxSegs
 src/api/net/io_dispatcher.cpp::kCapacity

@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,13 +37,139 @@ namespace {
 using namespace bolt::lakehouse;
 using namespace bolt::lakehouse::iceberg;
 
+// Observational filesystem trait wrapper: returns/capabilities are unchanged.
+// Native error is sampled immediately at trait return, not inside backend cleanup.
+struct DiagnosticStore {
+    struct Event {
+        const char* operation = "";
+        const char* phase = "init";
+        char key[kOsMaxKey]{};
+        int status = 0, posix_error = 0;
+        unsigned long native_error = 0;
+    };
+    static constexpr unsigned kTrace = 12u;
+    ObjectStore delegate{};
+    ObjectStore exposed{};
+    ObjectStoreVT vt{};
+    Event events[kTrace]{};
+    Event first_io{};
+    bool have_io = false;
+    bool log_deletes = false;
+    unsigned calls = 0u;
+    int writer = -1, commit = -1, attempt = 0;
+    int64_t observed_version = -1, base_version = -1;
+    const char* phase = "init";
+    static void before() noexcept {
+        errno = 0;
+#if defined(_WIN32)
+        SetLastError(ERROR_SUCCESS);
+#endif
+    }
+    int after(const char* operation, const char* key, int result) noexcept {
+        const int saved_errno = errno;
+#if defined(_WIN32)
+        const unsigned long saved_native = GetLastError();
+#else
+        const unsigned long saved_native = 0;
+#endif
+        auto& event = events[calls++ % kTrace];
+        event.operation = operation; event.phase = phase; event.status = result;
+        event.posix_error = saved_errno; event.native_error = saved_native;
+        std::strncpy(event.key, key, sizeof(event.key) - 1u); event.key[sizeof(event.key) - 1u] = 0;
+        if (result != kOsOk && result != kOsNotFound && result != kOsExists && !have_io) {
+            first_io = event; have_io = true;
+        }
+        if (result == kOsOk && (std::strcmp(operation, "get") == 0 || std::strcmp(operation, "put_if_absent") == 0) &&
+            std::strncmp(key, "metadata/v", 10u) == 0) {
+            char* end = nullptr;
+            const auto version = std::strtoll(key + 10u, &end, 10);
+            if (end != key + 10u && std::strcmp(end, ".metadata.json") == 0) observed_version = version;
+        }
+        if (log_deletes && std::strcmp(operation, "delete") == 0) this->event(event);
+        errno = saved_errno;
+#if defined(_WIN32)
+        SetLastError(saved_native);
+#endif
+        return result;
+    }
+    static DiagnosticStore& self(void* p) { return *static_cast<DiagnosticStore*>(p); }
+    static int get(void* p, const char* key, bolt::Arena* arena, const uint8_t** data, uint64_t* size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_object(s.delegate.impl, key, arena, data, size);
+        return s.after("get", key, rc);
+    }
+    static int put(void* p, const char* key, const uint8_t* data, uint64_t size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->put_object(s.delegate.impl, key, data, size);
+        return s.after("put", key, rc);
+    }
+    static int list(void* p, const char* key, ObjectEntry* out, uint32_t cap, uint32_t* count) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->list_prefix(s.delegate.impl, key, out, cap, count);
+        return s.after("list", key, rc);
+    }
+    static int remove(void* p, const char* key) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->delete_object(s.delegate.impl, key);
+        return s.after("delete", key, rc);
+    }
+    static int head(void* p, const char* key, ObjectMeta* out) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->head_object(s.delegate.impl, key, out);
+        return s.after("head", key, rc);
+    }
+    static int conditional(void* p, const char* key, const uint8_t* data, uint64_t size) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->put_if_absent(s.delegate.impl, key, data, size);
+        return s.after("put_if_absent", key, rc);
+    }
+    static int range(void* p, const char* key, uint64_t offset, uint64_t size, uint8_t* out, uint64_t* got) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_range(s.delegate.impl, key, offset, size, out, got);
+        return s.after("get_range", key, rc);
+    }
+    static int versioned(void* p, const char* key, bolt::Arena* scratch, ObjectVersion* out) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->head_versioned(s.delegate.impl, key, scratch, out);
+        return s.after("head_versioned", key, rc);
+    }
+    static int matched(void* p, const char* key, const ObjectVersion* version, uint64_t offset,
+        uint32_t size, bolt::Arena* scratch, uint8_t* out, uint32_t* got) noexcept {
+        auto& s = self(p); before(); const int rc = s.delegate.vt->get_range_if_match(s.delegate.impl, key, version, offset, size, scratch, out, got);
+        return s.after("get_range_if_match", key, rc);
+    }
+    void bind(ObjectStore* store) {
+        delegate = *store; vt = *delegate.vt;
+        vt.get_object = get; vt.put_object = put; vt.list_prefix = list;
+        vt.delete_object = remove; vt.head_object = head;
+        if (delegate.vt->put_if_absent) vt.put_if_absent = conditional;
+        if (delegate.vt->get_range) vt.get_range = range;
+        if (delegate.vt->head_versioned) vt.head_versioned = versioned;
+        if (delegate.vt->get_range_if_match) vt.get_range_if_match = matched;
+        exposed = ObjectStore{&vt, this}; *store = exposed;
+    }
+    void event(const Event& e) const {
+        std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d attempt=%d phase=%s op=%s key=%.2047s status=%d post_return_errno=%d post_return_native=%lu\n",
+            writer, commit, attempt, e.phase, e.operation, e.key, e.status, e.posix_error, e.native_error);
+    }
+    void dump(TableHandle* table) const {
+        const Metadata* meta = table ? table_metadata(table) : nullptr;
+        const Snapshot* current = meta ? snapshot_by_id(meta, meta->current_snapshot_id) : nullptr;
+        std::fprintf(stderr, "[iceberg-diag] writer=%d c/round=%d attempt=%d phase=%s CommitError=%u observed_metadata_version=%lld opened_base_version=%lld snapshot=%lld parent_snapshot=%lld retained=%u parent_manifest_list=%.2047s\n",
+            writer, commit, attempt, phase, static_cast<unsigned>(table ? table_last_commit_error(table) : CommitError::kFailed),
+            static_cast<long long>(observed_version), static_cast<long long>(base_version),
+            static_cast<long long>(meta ? meta->current_snapshot_id : -1),
+            static_cast<long long>(current ? current->parent_snapshot_id : -1),
+            meta ? meta->n_snapshots : 0u, current ? current->manifest_list : "");
+        if (have_io) event(first_io);
+        const unsigned count = calls < kTrace ? calls : kTrace;
+        for (unsigned i = 0u; i < count; ++i) event(events[(calls - count + i) % kTrace]);
+    }
+};
+
+
 std::string fresh_dir(const char* tag) {
-    auto p = std::filesystem::temp_directory_path() /
-             ("bolt_l5_" + std::string(tag) + "_" +
-              std::to_string(static_cast<long long>(bolt_getpid())));
     std::error_code ec;
+    auto p = std::filesystem::temp_directory_path(ec);
+    if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=temp_directory status=%d\n", ec.value()); return {}; }
+    p /= "bolt_l5_" + std::string(tag) + "_" +
+         std::to_string(static_cast<long long>(bolt_getpid()));
     std::filesystem::remove_all(p, ec);
+    if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=remove_fixture status=%d\n", ec.value()); return {}; }
     std::filesystem::create_directories(p / "default" / "t", ec);
+    if (ec) { std::fprintf(stderr, "[iceberg-diag] phase=create_fixture status=%d\n", ec.value()); return {}; }
     return p.generic_string();
 }
 
@@ -59,34 +186,44 @@ Schema one_col_schema() {
     return s;
 }
 
-void make_batch(bolt::Arena* a, bolt::BoltBatch* out, int64_t first, int32_t n) {
+bool make_batch(bolt::Arena* a, bolt::BoltBatch* out, int64_t first, int32_t n) {
     bolt::BoltBatch::init_empty(out);
     out->arena = a;
     out->num_rows = n;
     out->num_cols = 1;
-    bolt::BoltBatch::alloc_columns(out, a, 1);
+    if (!bolt::BoltBatch::alloc_columns(out, a, 1)) return false;
     out->schema.add_field("id", bolt::BoltType::Int64, false);
     auto* cols = out->columns[out->read_epoch];
     auto* d = a->allocate_array<int64_t>(static_cast<uint32_t>(n));
+    if (!d) return false;
     for (int32_t k = 0; k < n; ++k) d[k] = first + k;
     cols[0].type = bolt::BoltType::Int64;
     cols[0].length = n;
     cols[0].data = d;
+    return true;
 }
 
 struct Table {
     bolt::Arena arena;
     FilesystemObjectStore fs{};
     ObjectStore os{};
+    DiagnosticStore diagnostic;
+    const char* tag = "";
+    bool reopened = false;
     std::string ns_root;
     std::string root;
     TableHandle* th = nullptr;
 };
 
 void create_table(Table* t, const char* tag) {
+    t->tag = tag;
     t->ns_root = fresh_dir(tag);
+    ASSERT_FALSE(t->ns_root.empty());
     t->root = t->ns_root + "/default/t";
     ASSERT_TRUE(filesystem_object_store_init(&t->fs, t->root.c_str(), &t->os));
+    t->diagnostic.bind(&t->os);
+    t->diagnostic.log_deletes = std::strcmp(tag, "retain") == 0;
+    t->diagnostic.phase = "create";
     Schema sch = one_col_schema();
     PartitionSpec spec{};
     SortOrder sort{};
@@ -94,14 +231,45 @@ void create_table(Table* t, const char* tag) {
     write_options_init(&wo);
     ASSERT_TRUE(table_create(&t->th, &t->arena, &t->os, t->root.c_str(), &sch,
                              &spec, &sort, &wo));
+    t->diagnostic.base_version = t->diagnostic.observed_version;
+}
+
+void parent_context(Table* t) {
+    const Metadata* metadata = table_metadata(t->th);
+    const Snapshot* parent = snapshot_by_id(metadata, metadata->current_snapshot_id);
+    t->diagnostic.dump(t->th);
+    if (!parent || parent->manifest_list[0] == 0) return;
+    std::string key(parent->manifest_list);
+    const std::string prefix = t->root + "/";
+    if (key.compare(0u, prefix.size(), prefix) == 0) key.erase(0u, prefix.size());
+    ObjectMeta object{};
+    const int status = os_head(&t->os, key.c_str(), &object);
+    std::fprintf(stderr, "[iceberg-diag] c=%d phase=%s parent_probe_key=%.2047s status=%d exists=%d bytes=%llu\n",
+        t->diagnostic.commit, t->diagnostic.phase, key.c_str(), status, object.exists ? 1 : 0,
+        static_cast<unsigned long long>(object.size));
 }
 
 bool append(Table* t, int64_t first, int32_t n) {
+    auto& diagnostic = t->diagnostic;
+    diagnostic.commit = static_cast<int>(first / 10);
+    diagnostic.phase = t->reopened ? "after_reopen.before_append" : "before_reopen.before_append";
+    if (std::strcmp(t->tag, "retain") == 0) parent_context(t);
     AppendHandle* ah = nullptr;
-    if (!append_open(&ah, t->th)) return false;
+    auto fail = [&] {
+        diagnostic.dump(t->th);
+        if (ah) append_close(ah);
+        return false;
+    };
+    diagnostic.phase = t->reopened ? "after_reopen.append_open" : "append_open";
+    if (!append_open(&ah, t->th)) return fail();
     bolt::BoltBatch b{};
-    make_batch(&t->arena, &b, first, n);
-    const bool ok = append_write(ah, &b) && append_commit(ah);
+    diagnostic.phase = "batch_alloc";
+    if (!make_batch(&t->arena, &b, first, n)) return fail();
+    diagnostic.phase = t->reopened ? "after_reopen.write" : "write";
+    if (!append_write(ah, &b)) return fail();
+    diagnostic.phase = t->reopened ? "after_reopen.commit" : "commit";
+    const bool ok = append_commit(ah);
+    if (!ok) diagnostic.dump(t->th);
     append_close(ah);
     return ok;
 }
@@ -178,7 +346,10 @@ TEST(LakeGrowth, RetentionPolicyExpiresHistoryNotData) {
     ASSERT_NE(t.th, nullptr);
     for (int32_t c = 0; c < 30; ++c) ASSERT_TRUE(append(&t, c * 10, 2));
     const int64_t first_id = table_metadata(t.th)->snapshots[0].snapshot_id;
-    ASSERT_TRUE(table_set_retention(t.th, 0, 5));
+    t.diagnostic.phase = "set_retention";
+    const bool retained = table_set_retention(t.th, 0, 5);
+    if (!retained) t.diagnostic.dump(t.th);
+    ASSERT_TRUE(retained);
     const Metadata* m = table_metadata(t.th);
     EXPECT_EQ(m->n_snapshots, 5u);
     EXPECT_EQ(m->n_snapshot_log, 5u);
@@ -193,7 +364,12 @@ TEST(LakeGrowth, RetentionPolicyExpiresHistoryNotData) {
     table_close(t.th);
     bolt::Arena a2;
     TableHandle* th2 = nullptr;
-    ASSERT_TRUE(table_open(&th2, &a2, &t.os, t.root.c_str()));
+    t.diagnostic.phase = "reopen";
+    const bool reopened = table_open(&th2, &a2, &t.os, t.root.c_str());
+    if (!reopened) t.diagnostic.dump(th2);
+    ASSERT_TRUE(reopened);
+    t.diagnostic.base_version = t.diagnostic.observed_version;
+    t.reopened = true;
     EXPECT_EQ(table_metadata(th2)->retention_min_snapshots, 5);
     t.th = th2;
     for (int32_t c = 30; c < 40; ++c) ASSERT_TRUE(append(&t, c * 10, 2));
@@ -366,6 +542,7 @@ bool first_batch_fails(ObjectStore* os, const std::string& mj) {
 
 TEST(LakeGrowth, MetadataBudgetExhaustionIsResourceExhausted) {
     const std::string dir = fresh_dir("budget");
+    ASSERT_FALSE(dir.empty());
     FilesystemObjectStore fs{};
     ObjectStore os{};
     ASSERT_TRUE(filesystem_object_store_init(&fs, dir.c_str(), &os));
@@ -417,6 +594,7 @@ std::string add_line(uint32_t f) {
 // path search per action).
 TEST(LakeGrowth, DeltaSnapshotHoldsEveryLiveFile) {
     const std::string dir = fresh_dir("delta");
+    ASSERT_FALSE(dir.empty());
     FilesystemObjectStore fs{};
     ObjectStore os{};
     ASSERT_TRUE(filesystem_object_store_init(&fs, dir.c_str(), &os));
@@ -457,6 +635,7 @@ TEST(LakeGrowth, DeltaSnapshotHoldsEveryLiveFile) {
 // implemented) is refused rather than replayed without that commit's actions.
 TEST(LakeGrowth, DeltaLogWithAGapIsRefused) {
     const std::string dir = fresh_dir("delta_gap");
+    ASSERT_FALSE(dir.empty());
     FilesystemObjectStore fs{};
     ObjectStore os{};
     ASSERT_TRUE(filesystem_object_store_init(&fs, dir.c_str(), &os));
