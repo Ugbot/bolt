@@ -128,7 +128,8 @@ void table_close(TableHandle* h) noexcept;
 // kUncertain: a conditional write may have succeeded. Candidate objects are
 // retained. This handle refuses further mutations; reconcile externally, then
 // reopen. Neither a read nor another mutation clears the uncertainty.
-enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2, kUncertain = 3 };
+// kUnimplemented: the operation is a known spec operation this writer has not built yet (G2ICE-280); nothing was written.
+enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2, kUncertain = 3, kUnimplemented = 4 };
 CommitError table_last_commit_error(const TableHandle* th) noexcept;
 // False (and zeroes *out) unless this handle has an uncertain candidate.
 bool table_uncertain_commit(const TableHandle* th, CommitCandidate* out) noexcept;

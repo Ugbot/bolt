@@ -255,11 +255,15 @@ TEST(IcebergWrite, OverwriteAndDeleteAndCompact) {
     ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, nullptr,
                               nullptr, &wo));
     bolt::BoltBatch b0{}; make_batch(&arena, &b0, 0, 3);
-    EXPECT_TRUE(table_overwrite(th, nullptr, &b0));
+    // These spec operations are not built yet (G2ICE-280): each must refuse and write nothing, never publish a snapshot labelled
+    // overwrite/delete/replace that changed no data.
+    EXPECT_FALSE(table_overwrite(th, nullptr, &b0));
+    EXPECT_EQ(table_last_commit_error(th), CommitError::kUnimplemented);
     Predicate pred{};
-    EXPECT_TRUE(table_delete(th, &pred));
-    EXPECT_TRUE(table_compact(th, 64u * 1024u * 1024u));
-    EXPECT_GE(table_metadata(th)->n_snapshots, 3u);
+    EXPECT_FALSE(table_delete(th, &pred));
+    EXPECT_FALSE(table_rewrite(th, nullptr));
+    EXPECT_FALSE(table_compact(th, 64u * 1024u * 1024u));
+    EXPECT_EQ(table_metadata(th)->n_snapshots, 0u);
 }
 
 TEST(IcebergWrite, RemoveOrphansDryRun) {

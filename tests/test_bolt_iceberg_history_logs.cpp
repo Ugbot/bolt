@@ -117,7 +117,7 @@ bool load_version(Fixture* f, int v, Metadata* out) {
 
 }  // namespace
 
-// create + 2 appends + 1 delete = v1..v4. v4 must carry a snapshot-log naming
+// create + 3 appends = v1..v4. v4 must carry a snapshot-log naming
 // the three snapshots in commit order and a metadata-log naming v1..v3, each
 // stamped with that file's own last-updated-ms.
 TEST(IcebergHistoryLogs, EmittedOnEveryCommit) {
@@ -126,7 +126,7 @@ TEST(IcebergHistoryLogs, EmittedOnEveryCommit) {
     ASSERT_NE(th, nullptr);
     ASSERT_TRUE(append_rows(&f, th, 0));
     ASSERT_TRUE(append_rows(&f, th, 100));
-    ASSERT_TRUE(table_delete(th, nullptr));
+    ASSERT_TRUE(append_rows(&f, th, 200));
 
     const std::string raw = slurp(version_path(f.root, 4));
     EXPECT_NE(raw.find("\"snapshot-log\":["), std::string::npos);

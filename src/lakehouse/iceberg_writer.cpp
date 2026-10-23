@@ -1752,59 +1752,35 @@ bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
 // Overwrite / delete / rewrite / compact — minimal correct snapshot bumps.
 // ---------------------------------------------------------------------------
 
-bool table_overwrite(TableHandle* th, const Predicate* /*pred*/,
-                     const BoltBatch* batch) noexcept {
+// Overwrite / delete / rewrite / compact are spec operations (snapshot operations overwrite, delete, replace) that this writer has not
+// built yet. They used to publish a snapshot LABELLED overwrite/delete/replace that removed nothing, which an Iceberg reader would trust:
+// table_overwrite appended while old rows stayed, table_delete deleted nothing. They now refuse loudly and write nothing until the real
+// implementations land (G2ICE-280: file-level deletes from manifest stats, row-level deletes via position/equality/DV, rewrite_data_files).
+static bool unimplemented_operation(TableHandle* th, const char* what) noexcept {
+    assert(th != nullptr && what != nullptr);
+    th->last_error = CommitError::kUnimplemented;
+    std::fprintf(stderr, "[iceberg_writer] %s is not implemented yet (G2ICE-280); nothing was written\n", what);
+    return false;
+}
+
+bool table_overwrite(TableHandle* th, const Predicate* /*pred*/, const BoltBatch* batch) noexcept {
     assert(th != nullptr && batch != nullptr);
-    if (!write_ready(th)) return false;
-    th->last_error = CommitError::kNone;
-    if (!handle_is_current(th)) return false;
-    // Treat as a single-batch append tagged kOverwrite.
-    const int64_t snap_id = mint_snapshot_id(th);
-    char rel[128];
-    int64_t size = 0, rows = 0;
-    const BoltBatch* arr[1] = { batch };
-    if (!write_data_file(th, arr, 1, snap_id, rel, sizeof(rel), &size, &rows))
-        return false;
-    DataFileRef df{};
-    df.status            = ManifestStatus::kAdded;
-    df.content           = FileContent::kData;
-    df.partition_spec_id = th->meta.current_spec_id;
-    df.snapshot_id       = snap_id;
-    if (!abs_location(th->root, rel, df.file_path, sizeof(df.file_path))) {
-        data_file_complete(th, rel, false);
-        return false;
-    }
-    df.stats.record_count       = rows;
-    df.stats.file_size_in_bytes = size;
-    // G2ICE-135 — same real per-column stats append_commit_ex computes.
-    if (const Schema* cur = metadata_current_schema(&th->meta)) {
-        compute_file_stats(arr, 1u, cur, &df.stats);
-    }
-    const bool committed = publish_snapshot(th, &df, 1, SnapshotOp::kOverwrite, snap_id);
-    data_file_complete(th, rel, committed);
-    return committed;
+    return unimplemented_operation(th, "table_overwrite");
 }
 
 bool table_delete(TableHandle* th, const Predicate* /*pred*/) noexcept {
     assert(th != nullptr);
-    // Empty manifest snapshot tagged kDelete (predicate semantics deferred).
-    DataFileRef df{};
-    df.status = ManifestStatus::kDeleted;
-    return publish_snapshot(th, &df, 0, SnapshotOp::kDelete, /*mint*/0);
+    return unimplemented_operation(th, "table_delete");
 }
 
 bool table_rewrite(TableHandle* th, const OptimizeOptions* /*opts*/) noexcept {
     assert(th != nullptr);
-    // Stub: emit a kReplace snapshot referring to no new files. A real
-    // compactor would rewrite small files; here the snapshot bump is the
-    // observable effect.
-    DataFileRef df{};
-    return publish_snapshot(th, &df, 0, SnapshotOp::kReplace, /*mint*/0);
+    return unimplemented_operation(th, "table_rewrite");
 }
 
 bool table_compact(TableHandle* th, int64_t /*target_file_size_bytes*/) noexcept {
     assert(th != nullptr);
-    return table_rewrite(th, nullptr);
+    return unimplemented_operation(th, "table_compact");
 }
 
 #include "iceberg_expire.inc"

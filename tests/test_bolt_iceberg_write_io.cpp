@@ -295,9 +295,9 @@ TEST_F(IcebergWriteIO, CleanupFailureRetainsSourceButDoesNotRelabelAcknowledgedC
     StagedDataFile same{}; ASSERT_TRUE(table_staged_data_file(table, &same)); EXPECT_STREQ(same.operation_id, file.operation_id);
     EXPECT_FALSE(table_uncertain_data_file(table, &same));
 }
-TEST_F(IcebergWriteIO, OverwriteAndPositionDeleteBothUseStagedPublisher) {
+TEST_F(IcebergWriteIO, AppendAndPositionDeleteBothUseStagedPublisher) {
     auto options = config(); ASSERT_TRUE(table_set_file_write_io(table, &options));
-    ASSERT_TRUE(table_overwrite(table, nullptr, &batch)); ASSERT_EQ(publisher.calls, 1u);
+    ASSERT_TRUE(append()); ASSERT_EQ(publisher.calls, 1u);
     StagedDataFile first{}; ASSERT_TRUE(table_staged_data_file(table, &first));
     check_data_field_id(first.candidate.object_key, 7);
     PositionDeleteEntry entry{}; std::strcpy(entry.file_path, first.candidate.object_location); entry.pos = 1;
