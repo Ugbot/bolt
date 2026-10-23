@@ -204,10 +204,115 @@ bool pinned_type_matches(const SchemaField& field, const pq::PqColumn& column) n
     return false; // nested/decimal/fixed/UUID materialization must not be guessed
 }
 
+// The decoded type an Iceberg primitive type implies; Invalid for types this check does not model (decimal, binary, nested, ...).
+BoltType want_bolt_type(const char* t) noexcept {
+    assert(t!=nullptr);
+    if (std::strcmp(t,"long")==0) return BoltType::Int64;
+    if (std::strcmp(t,"int")==0) return BoltType::Int32;
+    if (std::strcmp(t,"double")==0) return BoltType::Float64;
+    if (std::strcmp(t,"float")==0) return BoltType::Float32;
+    if (std::strcmp(t,"boolean")==0) return BoltType::Bool;
+    if (std::strcmp(t,"string")==0) return BoltType::Utf8;
+    if (std::strcmp(t,"date")==0) return BoltType::Date32;
+    return BoltType::NA;
+}
+
+// Map this file's columns onto the table's current schema by field id (files without any field ids fall back to the column name, the
+// spec's default name mapping). A schema column the file lacks reads as null (evolved schemas); a file column the schema lacks is dropped.
+bool bind_current_schema(ScanHandle* s, const pq::PqMeta* meta) noexcept {
+    assert(s!=nullptr && meta!=nullptr);
+    const Schema* cur=metadata_current_schema(&s->table->meta);
+    s->use_map=false;
+    if (cur==nullptr || cur->n_fields==0) return true;                  // no schema to conform to: the file's own layout
+    if (cur->n_fields>kMaxColumns || meta->n_columns>kMaxColumns) return false;
+    bool file_has_ids=false;
+    for (uint32_t i=0; i<meta->n_columns; ++i) file_has_ids=file_has_ids||meta->columns[i].has_field_id;
+    if (s->colmap==nullptr || s->map_schema!=cur) {
+        s->colmap=s->scratch->allocate_array<int32_t>(cur->n_fields);
+        s->want_type=s->scratch->allocate_array<BoltType>(cur->n_fields);
+        if (s->colmap==nullptr || s->want_type==nullptr) return false;
+        s->map_schema=cur;
+        for (uint32_t j=0; j<cur->n_fields; ++j) s->want_type[j]=want_bolt_type(cur->fields[j].type);
+    }
+    for (uint32_t j=0; j<cur->n_fields; ++j) {
+        int32_t found=-1;
+        for (uint32_t i=0; i<meta->n_columns; ++i) {
+            const auto& col=meta->columns[i];
+            const bool hit=file_has_ids ? (col.has_field_id && col.field_id==cur->fields[j].id)
+                                        : std::strcmp(col.name,cur->fields[j].name)==0;
+            if (!hit) continue;
+            if (found>=0) return false;                                  // two file columns claim one field: ambiguous, never guess
+            found=static_cast<int32_t>(i);
+        }
+        s->colmap[j]=found;
+    }
+    s->use_map=true;
+    s->decode_columns=meta->n_columns;
+    s->output_columns=cur->n_fields;
+    return true;
+}
+
+// Widen a decoded column to the type the table schema now declares (spec promotions: int->long, float->double).
+bool promote_column(const BoltColumn& src, BoltType want, int64_t rows, Arena* a, BoltColumn* out, const char* what) noexcept {
+    assert(a!=nullptr && out!=nullptr);
+    // Representation-equivalent decodes are not a mismatch: a parquet boolean decodes as a one-byte integer, a date as int32/date32, a
+    // string as utf8 or binary.
+    // (bolt's parquet decoder returns a boolean as an integer column; the spec allows no evolution to or from boolean)
+    const auto byte_like=[](BoltType t){ return t==BoltType::Bool || t==BoltType::Int8 || t==BoltType::UInt8 || t==BoltType::Int64; };
+    const auto date_like=[](BoltType t){ return t==BoltType::Date32 || t==BoltType::Int32; };
+    const bool same_repr=(want==BoltType::Bool && byte_like(src.type)) || (date_like(want) && date_like(src.type) && want==BoltType::Date32) ||
+        (want==BoltType::Utf8 && src.type==BoltType::Binary);
+    if (want==BoltType::NA || src.type==want || same_repr) { *out=src; return true; }
+    if (src.format==ColumnFormat::Flat && src.type==BoltType::Int32 && want==BoltType::Int64) {
+        auto* d=a->allocate_array<int64_t>(static_cast<size_t>(rows)+1u);
+        if (d==nullptr) return false;
+        const int32_t* in=static_cast<const int32_t*>(src.data);
+        for (int64_t r=0; r<rows; ++r) d[r]=in[r];
+        *out=src; out->data=d; out->type=BoltType::Int64; out->type_size_bytes=sizeof(int64_t); return true;
+    }
+    if (src.format==ColumnFormat::Flat && src.type==BoltType::Float32 && want==BoltType::Float64) {
+        auto* d=a->allocate_array<double>(static_cast<size_t>(rows)+1u);
+        if (d==nullptr) return false;
+        const float* in=static_cast<const float*>(src.data);
+        for (int64_t r=0; r<rows; ++r) d[r]=static_cast<double>(in[r]);
+        *out=src; out->data=d; out->type=BoltType::Float64; out->type_size_bytes=sizeof(double); return true;
+    }
+    std::fprintf(stderr,"[iceberg_scan] REFUSED: column '%s' is decoded as type %d but the table schema declares type %d, and that is not a spec promotion\n",
+                 what,static_cast<int>(src.type),static_cast<int>(want));
+    return false;
+}
+
+// Build the emitted columns (current-schema order) from the decoded file columns.
+bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_t rows) noexcept {
+    assert(s!=nullptr && s->use_map && s->map_schema!=nullptr);
+    assert(dec!=nullptr && out!=nullptr);
+    for (uint32_t j=0; j<s->map_schema->n_fields; ++j) {
+        const char* name=s->map_schema->fields[j].name;
+        if (s->colmap[j]>=0) {
+            if (!promote_column(dec[s->colmap[j]],s->want_type[j],rows,s->scratch,&out[j],name)) return false;
+            continue;
+        }
+        // Absent from this file: the column was added after the file was written. Reads as null (v3 initial-default is refused at the gate).
+        const BoltType t=s->want_type[j];
+        if (t==BoltType::NA) {
+            std::fprintf(stderr,"[iceberg_scan] REFUSED: column '%s' is absent from a data file and its type cannot be null-filled here\n",name);
+            return false;
+        }
+        const size_t width=bolt::type_size(t);
+        void* d=s->scratch->allocate_zeroed(width*(static_cast<size_t>(rows)+1u));
+        auto* v=static_cast<uint8_t*>(s->scratch->allocate_zeroed((static_cast<size_t>(rows)+7u)/8u+1u));
+        if (d==nullptr || v==nullptr) return false;
+        out[j]=BoltColumn::make_flat(d,v,rows,t);
+        out[j].stats.all_valid=(rows==0);
+        out[j].stats.null_count=rows;
+    }
+    return true;
+}
+
 bool bind_data_columns(ScanHandle* s, const pq::PqMeta* meta) noexcept {
     assert(s!=nullptr && meta!=nullptr); assert(s->table!=nullptr);
     s->output_columns=meta->n_columns;
-    if (!s->table->strict_pinned) return true;
+    if (!s->table->strict_pinned) return bind_current_schema(s,meta);
     const auto* schema=s->selected_schema;
     if (schema==nullptr || meta->n_columns>kMaxColumns) return false;
     for (uint32_t i=0; i<meta->n_columns; ++i) {

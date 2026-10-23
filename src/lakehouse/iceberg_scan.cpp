@@ -427,6 +427,13 @@ struct ScanHandle {
     uint16_t source_indices[kMaxColumns];
     const Schema* selected_schema;
     uint32_t output_columns;
+    // Non-pinned scans conform each file's columns to the table's CURRENT schema by Iceberg field id (spec: columns are identified by id,
+    // never by name or position). use_map => decode_columns file columns are read, then mapped into output_columns schema columns.
+    bool          use_map;
+    uint32_t      decode_columns;
+    const Schema* map_schema;
+    int32_t*      colmap;     // per schema field: file column index, or -1 (absent in this file: read as null)
+    BoltType*     want_type;  // per schema field: the decoded type the Iceberg type implies (Invalid => not checked)
     // Identity of the row group behind the most recent iceberg_scan_next_batch result.
     IcebergScanGroup last_group;
     IcebergGroupProvider provider;  // optional cache-hit supplier (G2ICE-262)
@@ -1151,6 +1158,14 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns))
             return false;
         BoltColumn* cols = out->columns[out->read_epoch];
+        // With a schema map the file's own columns are decoded into `dec`, then conformed into `cols` (the table's current schema).
+        BoltColumn* dec = cols;
+        if (s->use_map) {
+            dec = s->scratch->allocate_array<BoltColumn>(s->decode_columns);
+            if (dec == nullptr) return false;
+            std::memset(dec, 0, sizeof(BoltColumn) * s->decode_columns);
+        }
+        const uint32_t dec_columns = s->use_map ? s->decode_columns : s->output_columns;
         int64_t rows = 0;
         const uint32_t group_index = s->cur_row_group;
         const FileTask& live_file = s->tasks[s->cur_file_idx];
@@ -1171,7 +1186,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             // missing rows (an unsupported codec -- zstd -- or encoding lands here).
             // Fail; do not step over it.
             if (!read_parquet_group(s, &s->pinned, s->cur_body, s->cur_body_len,
-                                    s->cur_meta, s->cur_row_group, cols, &rows, s->output_columns)) {
+                                    s->cur_meta, s->cur_row_group, dec, &rows, dec_columns)) {
                 s->failed = true;
                 return false;
             }
@@ -1182,11 +1197,12 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // Positions are counted against the FULL data file (deleted rows included), so the next group's base must
         // advance by the pre-filter row count -- `decoded_rows` was captured before the filter can shrink `rows`.
         if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, dv_for(s, live_file.path), live_file.path,
-                                                          s->cur_file_row_base, cols,
-                                                          s->output_columns, &rows,
+                                                          s->cur_file_row_base, dec,
+                                                          dec_columns, &rows,
                                                           s->scratch)) {
             return false;
         }
+        if (!supplied && s->use_map && !conform_group(s, dec, cols, rows)) { s->failed = true; return false; }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         s->last_group.file_path = live_file.path;
         s->last_group.row_group = group_index;
@@ -1197,8 +1213,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         out->num_cols = s->output_columns;
         for (uint32_t c = 0; c < s->output_columns; ++c) {
             const char* name = s->table->strict_pinned ? s->selected_schema->fields[c].name :
-                s->cur_meta->columns[c].name;
-            if (!s->table->strict_pinned && s->cur_meta->columns[c].name_truncated != 0u) return false;
+                s->use_map ? s->map_schema->fields[c].name : s->cur_meta->columns[c].name;
+            if (!s->table->strict_pinned && !s->use_map && s->cur_meta->columns[c].name_truncated != 0u) return false;
             if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
