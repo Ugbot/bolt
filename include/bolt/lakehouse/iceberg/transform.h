@@ -89,6 +89,10 @@ int64_t micros_from_nanos(int64_t ns) noexcept;
 
 // Truncate W on int, with Java's 32-bit wrap; on a decimal's unscaled value.
 int32_t truncate_i32(int32_t value, int32_t W) noexcept;
+// As truncate_i32 / truncate_i64, false when v - (v mod W) is below the type's minimum (the spec's value is not
+// representable; Java would wrap it to a large positive value, which breaks the transform's monotonicity).
+bool truncate_i32_checked(int32_t value, int32_t W, int32_t* out) noexcept;
+bool truncate_i64_checked(int64_t value, int32_t W, int64_t* out) noexcept;
 void truncate_decimal(int64_t hi, uint64_t lo, int32_t W,
                       int64_t* out_hi, uint64_t* out_lo) noexcept;
 // Byte length of the first L code points of UTF-8 `s` (spec note 3); a

@@ -204,8 +204,14 @@ bool apply_truncate(const IcebergTypeInfo& src, const SrcVal& v, int32_t W, Part
     assert(out != nullptr);
     if (W <= 0) return false;
     switch (src.type) {
-        case IcebergType::kInt:  out->is_int = true; out->i64 = truncate_i32(static_cast<int32_t>(v.i64), W); return true;
-        case IcebergType::kLong: out->is_int = true; out->i64 = truncate_i64(v.i64, W); return true;
+        case IcebergType::kInt: {
+            int32_t t = 0;
+            if (!truncate_i32_checked(static_cast<int32_t>(v.i64), W, &t)) return false;   // not representable
+            out->is_int = true; out->i64 = t; return true;
+        }
+        case IcebergType::kLong:
+            out->is_int = true;
+            return truncate_i64_checked(v.i64, W, &out->i64);
         case IcebergType::kDecimal: {
             int64_t hi = 0; uint64_t lo = 0;
             truncate_decimal(v.dec_hi, v.dec_lo, W, &hi, &lo);

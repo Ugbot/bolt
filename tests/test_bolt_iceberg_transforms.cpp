@@ -77,6 +77,12 @@ TEST(IcebergTruncate, SpecExamples) {
     EXPECT_EQ(truncate_i64(1, 10), 0);
     EXPECT_EQ(truncate_i64(-1, 10), -10);
     EXPECT_EQ(truncate_i64(INT64_C(-10), 10), -10);
+    int32_t t32 = 0; int64_t t64 = 0;
+    EXPECT_FALSE(truncate_i32_checked(INT32_MIN, 10, &t32));   // INT32_MIN - 2 is not an int
+    EXPECT_TRUE(truncate_i32_checked(INT32_MIN + 8, 10, &t32)); EXPECT_EQ(t32, INT32_MIN + 8);
+    EXPECT_TRUE(truncate_i32_checked(-1, 10, &t32)); EXPECT_EQ(t32, -10);
+    EXPECT_FALSE(truncate_i64_checked(INT64_MIN, 10, &t64));
+    EXPECT_TRUE(truncate_i64_checked(INT64_MAX, 10, &t64)); EXPECT_EQ(t64, INT64_MAX - 7);
     int64_t hi = 0; uint64_t lo = 0;
     truncate_decimal(0, 1065u, 50, &hi, &lo);                 // 10.65 -> 10.50 (W = 50 at scale 2)
     EXPECT_EQ(hi, 0); EXPECT_EQ(lo, 1050u);

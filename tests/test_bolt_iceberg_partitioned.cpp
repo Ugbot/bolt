@@ -618,3 +618,215 @@ TEST(IcebergPartitioned, SpecEvolutionKeepsEachFileOnItsSpec) {
     EXPECT_EQ(table_metadata(t.th)->n_specs, 2u);
     EXPECT_EQ(table_metadata(t.th)->current_spec_id, 0);
 }
+
+namespace {
+
+const char* kColName[] = {"", "id", "k", "s", "d", "ts", "i"};
+
+// The planned data files of the current snapshot under `preds`, and the scan's planning counters.
+std::set<std::string> planned(const std::string& root, const Predicate* preds, uint32_t n, IcebergScanStats* st) {
+    std::set<std::string> out;
+    bolt::Arena a;
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    EXPECT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    const std::string meta = read_file(latest_metadata_path(root));
+    TableHandle* rh = nullptr;
+    EXPECT_TRUE(iceberg_table_open_on_store(&rh, &a, &os, "", reinterpret_cast<const uint8_t*>(meta.data()),
+                                            static_cast<uint32_t>(meta.size())));
+    ReadOptions ro; read_options_init(&ro);
+    for (uint32_t i = 0; i < n; ++i) ro.predicates[i] = preds[i];
+    ro.n_predicates = n;
+    ScanHandle* sh = nullptr;
+    EXPECT_TRUE(iceberg_scan_open(&sh, rh, &ro));
+    for (int guard = 0; sh != nullptr && guard < 100000; ++guard) {
+        const char* path = nullptr; bool eof = false;
+        EXPECT_TRUE(iceberg_scan_next_file(sh, &path, &eof));
+        if (eof) break;
+        out.insert(path);
+    }
+    if (st != nullptr && sh != nullptr) EXPECT_TRUE(iceberg_scan_stats(sh, st));
+    if (sh != nullptr) iceberg_scan_close(sh);
+    return out;
+}
+
+bool is_null_in(const Row& r, int col) {
+    switch (col) {
+        case 1: return false;
+        case 2: return r.k == kNull;
+        case 3: return r.s == kNullS;
+        case 4: return r.d == kNull;
+        case 5: return r.ts == kNull;
+        default: return r.i == kNull;
+    }
+}
+
+int64_t int_of(const Row& r, int col) { return col == 1 ? r.id : col == 2 ? r.k : col == 4 ? r.d : col == 5 ? r.ts : r.i; }
+
+template <typename T>
+bool cmp(PredicateOp op, const T& a, const T& b) {
+    switch (op) {
+        case PredicateOp::kEq: return a == b;
+        case PredicateOp::kNe: return a != b;
+        case PredicateOp::kLt: return a < b;
+        case PredicateOp::kLe: return a <= b;
+        case PredicateOp::kGt: return a > b;
+        default: return a >= b;
+    }
+}
+
+// SQL truth of `col op lit` on a row (a NULL never satisfies a comparison).
+bool row_matches(const Row& r, int col, PredicateOp op, int64_t li, const std::string& ls) {
+    if (op == PredicateOp::kIsNull) return is_null_in(r, col);
+    if (op == PredicateOp::kIsNotNull) return !is_null_in(r, col);
+    if (is_null_in(r, col)) return false;
+    return col == 3 ? cmp(op, r.s, ls) : cmp(op, int_of(r, col), li);
+}
+
+// The partition value T(a) of literal a under field f ("N" null; "s:..." bytes; else a number).
+std::string t_of(const PartitionField& f, int col, int64_t li, const std::string& ls) {
+    Row r = make_row(1);
+    if (col == 1) r.id = li; else if (col == 2) r.k = li; else if (col == 3) r.s = ls;
+    else if (col == 4) r.d = li; else if (col == 5) r.ts = li; else r.i = li;
+    return expect_value(f, r);
+}
+
+bool vcmp(PredicateOp op, const std::string& p, const std::string& t) {
+    if (p.rfind("s:", 0) == 0) return cmp(op, p.substr(2), t.substr(2));
+    return cmp(op, std::stoll(p), std::stoll(t));
+}
+
+// The test's own model of the inclusive projection (see iceberg_partition.cpp's header table).
+bool tuple_may_match(const PartitionField& f, int col, const std::string& p, PredicateOp op, int64_t li,
+                     const std::string& ls) {
+    const TransformKind k = f.transform.kind;
+    if (k == TransformKind::kVoid) return true;
+    if (op == PredicateOp::kIsNull) return p == "N";
+    if (op == PredicateOp::kIsNotNull) return p != "N";
+    if (p == "N") return false;
+    if (k == TransformKind::kIdentity) return vcmp(op, p, t_of(f, col, li, ls));
+    if (k == TransformKind::kBucket) return op != PredicateOp::kEq || p == t_of(f, col, li, ls);
+    if (op == PredicateOp::kNe) return true;
+    if (k == TransformKind::kTruncate && col != 3) {                      // no projection when T(a) is not representable
+        const int64_t a = op == PredicateOp::kLt ? li - 1 : op == PredicateOp::kGt ? li + 1 : li;
+        int32_t t32 = 0; int64_t t64 = 0;
+        const bool ok = col == 6 ? (a >= INT32_MIN && a <= INT32_MAX && truncate_i32_checked(static_cast<int32_t>(a), f.transform.param, &t32))
+                                 : truncate_i64_checked(a, f.transform.param, &t64);
+        if (!ok) return true;
+    }
+    if (col == 3) {                                                       // truncate on a string
+        const std::string t = t_of(f, col, li, ls);
+        if (op == PredicateOp::kEq) return p == t;
+        return vcmp(op == PredicateOp::kLt || op == PredicateOp::kLe ? PredicateOp::kLe : PredicateOp::kGe, p, t);
+    }
+    switch (op) {                                                         // monotone on an integer source
+        case PredicateOp::kEq: return p == t_of(f, col, li, ls);
+        case PredicateOp::kLt: return vcmp(PredicateOp::kLe, p, t_of(f, col, li - 1, ls));
+        case PredicateOp::kLe: return vcmp(PredicateOp::kLe, p, t_of(f, col, li, ls));
+        case PredicateOp::kGt: return vcmp(PredicateOp::kGe, p, t_of(f, col, li + 1, ls));
+        default: return vcmp(PredicateOp::kGe, p, t_of(f, col, li, ls));
+    }
+}
+
+}  // namespace
+
+TEST(IcebergPartitioned, PruningKeepsEveryMatchingFileAndSkipsWhatTheProjectionExcludes) {
+    const struct { const char* transform; int col; } fields[] = {
+        {"identity", 2}, {"bucket[4]", 1}, {"truncate[10]", 6}, {"truncate[2]", 3}, {"day", 5}, {"month", 4},
+        {"year", 4}, {"hour", 5}, {"identity", 3}, {"truncate[100]", 1}, {"bucket[3]", 3}, {"void", 2},
+        {"bucket[5]", 4},
+    };
+    const PredicateOp ops[] = {PredicateOp::kEq, PredicateOp::kNe, PredicateOp::kLt, PredicateOp::kLe,
+                               PredicateOp::kGt, PredicateOp::kGe, PredicateOp::kIsNull, PredicateOp::kIsNotNull};
+    uint64_t checks = 0, skipped = 0, manifests_pruned = 0;
+    for (const auto& fd : fields) {
+        Table t;
+        create_table(&t, fresh_root(temp_base(), "prune"), spec_of({pf(fd.col, fd.transform, "p")}));
+        const std::vector<Row> all = rows_of(0, 80);
+        append_rows(&t, rows_of(0, 40));
+        append_rows(&t, rows_of(40, 80));
+        const PartitionField& f = table_metadata(t.th)->specs[0].fields[0];
+        const auto by_file = scan_by_file(t.root);
+        std::map<std::string, std::string> tuple_of;
+        for (const LiveFile& lf : live_files(&t)) tuple_of[lf.ref.file_path] = recorded_value(lf.ref.partition[0]);
+        std::vector<int64_t> ints;
+        std::vector<std::string> strs = {"", "c", "caf", "caf\xC3\xA9", "row-4", "row-5-tail", "zz"};
+        for (int64_t id : {0, 7, 13, 39, 40, 61, 79}) {
+            const Row r = make_row(id);
+            if (!is_null_in(r, fd.col) && fd.col != 3) { ints.push_back(int_of(r, fd.col)); ints.push_back(int_of(r, fd.col) + 1); }
+            if (fd.col == 3 && r.s != kNullS) strs.push_back(r.s);
+        }
+        ints.push_back(INT32_MIN);
+        ints.push_back(-1);
+        for (PredicateOp op : ops) {
+            const size_t nlit = fd.col == 3 ? strs.size() : ints.size();
+            for (size_t li = 0; li < nlit; ++li) {
+                const int64_t iv = fd.col == 3 ? 0 : ints[li];
+                const std::string sv = fd.col == 3 ? strs[li] : "";
+                Predicate p = fd.col == 3 ? pred_str("s", op, sv) : pred_i64(kColName[fd.col], op, iv);
+                if (fd.col == 6 && (iv < INT32_MIN || iv > INT32_MAX)) continue;
+                IcebergScanStats st{};
+                const std::set<std::string> kept = planned(t.root, &p, 1, &st);
+                manifests_pruned += st.manifests_pruned;
+                for (const auto& [path, rows] : by_file) {
+                    bool any = false;
+                    for (const Row& r : rows) any = any || row_matches(r, fd.col, op, iv, sv);
+                    const bool model_keep = tuple_may_match(f, fd.col, tuple_of[path], op, iv, sv);
+                    ++checks;
+                    if (any) EXPECT_TRUE(kept.count(path)) << fd.transform << " col " << fd.col << " op "
+                                                           << static_cast<int>(op) << " lit " << iv << "/" << sv
+                                                           << ": a file holding a matching row was skipped";
+                    // Column statistics may skip more; the partition projection must skip at least this much.
+                    if (!model_keep) EXPECT_FALSE(kept.count(path))
+                        << fd.transform << " col " << fd.col << " op " << static_cast<int>(op) << " lit " << iv
+                        << "/" << sv << " tuple " << tuple_of[path];
+                    skipped += kept.count(path) ? 0u : 1u;
+                }
+            }
+        }
+    }
+    EXPECT_GT(skipped, checks / 4) << "pruning skipped almost nothing";
+    EXPECT_GT(manifests_pruned, 0u) << "no manifest was ever pruned on its summaries";
+    std::printf("pruning: %llu file checks, %llu skipped, %llu manifests pruned\n", static_cast<unsigned long long>(checks),
+                static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(manifests_pruned));
+}
+
+// A reader tolerates an unknown transform (spec: such a field is ignored for filtering): the table still reads, and
+// no file is skipped on that field. The writer refuses to commit under such a spec.
+TEST(IcebergPartitioned, UnknownTransformIsReadButNeverPrunes) {
+    Table t;
+    create_table(&t, fresh_root(temp_base(), "unknown"), spec_of({pf(1, "bucket[4]", "id_b")}));
+    const std::vector<Row> all = rows_of(0, 40);
+    append_rows(&t, all);
+    Predicate p = pred_i64("id", PredicateOp::kEq, 17);
+    const size_t files = live_files(&t).size();
+    ASSERT_GT(files, 1u);
+    EXPECT_EQ(planned(t.root, &p, 1, nullptr).size(), 1u) << "bucket[4] prunes to one file";
+    const std::string path = latest_metadata_path(t.root);
+    std::string doc = read_file(path);
+    const size_t at = doc.find("\"bucket[4]\"");
+    ASSERT_NE(at, std::string::npos);
+    doc.replace(at, 11, "\"zorder[4]\"");
+    { std::ofstream o(path, std::ios::binary | std::ios::trunc); o << doc; }
+    EXPECT_EQ(scan_rows(t.root), model(all, [](const Row&) { return false; }));
+    IcebergScanStats st{};
+    const std::set<std::string> kept = planned(t.root, &p, 1, &st);
+    EXPECT_EQ(st.manifests_pruned, 0u);
+    // Column statistics still apply (the id bounds of each file); the partition field does not.
+    for (const auto& [f, rows] : scan_by_file(t.root)) {
+        bool has17 = false, in_range = false;
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (const Row& r : rows) { has17 = has17 || r.id == 17; lo = std::min(lo, r.id); hi = std::max(hi, r.id); }
+        in_range = lo <= 17 && 17 <= hi;
+        if (has17) EXPECT_TRUE(kept.count(f));
+        EXPECT_EQ(kept.count(f) != 0, in_range) << f;
+    }
+    Table w;
+    ASSERT_TRUE(table_open(&w.th, &w.arena, &t.os, t.root.c_str()));
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, w.th));
+    bolt::BoltBatch b{};
+    make_batch(&w.arena, &b, rows_of(100, 104));
+    ASSERT_TRUE(append_write(ah, &b));
+    EXPECT_FALSE(append_commit(ah)) << "a writer must not commit under a spec with an unknown transform";
+    EXPECT_EQ(table_last_commit_error(w.th), CommitError::kUnimplemented);
+}

@@ -150,6 +150,27 @@ int32_t truncate_i32(int32_t value, int32_t W) noexcept {
     return static_cast<int32_t>(static_cast<uint32_t>(value) - static_cast<uint32_t>(r));
 }
 
+bool truncate_i32_checked(int32_t value, int32_t W, int32_t* out) noexcept {
+    assert(out != nullptr);
+    assert(W > 0);
+    if (W <= 0) return false;
+    const int64_t r = (static_cast<int64_t>(value % W) + W) % W;
+    const int64_t t = static_cast<int64_t>(value) - r;
+    if (t < INT32_MIN) return false;
+    *out = static_cast<int32_t>(t);
+    return true;
+}
+
+bool truncate_i64_checked(int64_t value, int32_t W, int64_t* out) noexcept {
+    assert(out != nullptr);
+    assert(W > 0);
+    if (W <= 0) return false;
+    const int64_t r = ((value % W) + W) % W;
+    if (value < INT64_MIN + r) return false;
+    *out = value - r;
+    return true;
+}
+
 void truncate_decimal(int64_t hi, uint64_t lo, int32_t W, int64_t* out_hi, uint64_t* out_lo) noexcept {
     assert(out_hi != nullptr && out_lo != nullptr);
     assert(W > 0);

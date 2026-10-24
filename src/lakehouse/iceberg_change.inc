@@ -206,6 +206,6 @@ bool read_manifest_entries(TableHandle* th, const ManifestListEntry& mle, DataFi
 bool refuse_named(TableHandle* th, const char* what) noexcept {
     assert(th != nullptr && what != nullptr);
     th->last_error = CommitError::kUnimplemented;
-    std::fprintf(stderr, "[iceberg_writer] %s is not written yet (G2ICE-280); nothing was written\n", what);
+    std::fprintf(stderr, "[iceberg_writer] refused (kUnimplemented): %s; nothing was written\n", what);
     return false;
 }
