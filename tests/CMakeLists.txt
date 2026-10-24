@@ -2811,3 +2811,14 @@ add_test(NAME test_bolt_iceberg_foreign_commit_oracle
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_foreign_commit.py
                  $<TARGET_FILE:test_bolt_iceberg_foreign_commit> ${CMAKE_CURRENT_BINARY_DIR}/foreign_commit_fixture)
 set_tests_properties(test_bolt_iceberg_foreign_commit_oracle PROPERTIES SKIP_RETURN_CODE 2 TIMEOUT 120)
+
+# Nested STRUCT / LIST / MAP record assembly (parquet_read_nested_column)
+# against pyarrow: fixtures + expected dumps from
+# scripts/make_nested_read_fixtures.py, both produced by pyarrow.
+add_executable(test_bolt_parquet_read_nested test_bolt_parquet_read_nested.cpp)
+target_link_libraries(test_bolt_parquet_read_nested
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_parquet_read_nested PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_parquet_read_nested)
+add_test(NAME test_bolt_parquet_read_nested COMMAND test_bolt_parquet_read_nested)

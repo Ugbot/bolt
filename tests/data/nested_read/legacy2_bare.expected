@@ -1,0 +1,14 @@
+schema	0	nums[nums]
+schema	1	id
+row	0	[1,2,3]
+row	0	[]
+row	0	[7]
+row	0	[8,9]
+row	0	[]
+row	0	[42]
+row	1	100
+row	1	101
+row	1	102
+row	1	103
+row	1	104
+row	1	105

@@ -1,0 +1,7 @@
+schema	0	l[element{a,b}]
+row	0	[{a:1,b:2},{a:3,b:4}]
+row	0	null
+row	0	[]
+row	0	[{a:5,b:6}]
+row	0	[{a:7,b:8},{a:9,b:10}]
+row	0	null

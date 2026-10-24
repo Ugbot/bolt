@@ -2,6 +2,7 @@
 // See include/bolt/ingest/bolt_parquet_meta.h for scope + safety contract.
 
 #include "bolt/ingest/bolt_parquet_meta.h"
+#include "bolt_parquet_meta_internal.h"
 
 namespace bolt {
 namespace ingest {
@@ -249,6 +250,10 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
         if (ft != kTcStruct) { (void)tc_skip(c, ft, 0); continue; }
         switch (fid) {
             case 1: col->logical = static_cast<int32_t>(PqLogical::String);
+                    (void)tc_skip(c, ft, 0); break;
+            case 2: col->logical = static_cast<int32_t>(PqLogical::Map);
+                    (void)tc_skip(c, ft, 0); break;
+            case 3: col->logical = static_cast<int32_t>(PqLogical::List);
                     (void)tc_skip(c, ft, 0); break;
             case 5: col->logical = static_cast<int32_t>(PqLogical::Decimal);
                     parse_decimal_type(c, &col->scale, &col->precision); break;
@@ -810,6 +815,18 @@ bool parse_row_group(TcCursor* c, PqMeta* m, PqRowGroup* rg) noexcept {
 }
 
 }  // namespace
+
+bool pq_parse_schema_elem(TcCursor* c, PqRawElem* out) noexcept {
+    assert(c != nullptr && out != nullptr);
+    SchemaElem se;
+    if (!parse_schema_element(c, &se)) return false;
+    out->col = se.col;
+    out->num_children = se.num_children;
+    out->has_type = se.has_type ? 1u : 0u;
+    out->repeated = se.repeated ? 1u : 0u;
+    assert(out->num_children == se.num_children);
+    return true;
+}
 
 bool pq_locate_footer(const uint8_t* buf, uint64_t len,
                       uint64_t* meta_off, uint32_t* meta_len) noexcept {

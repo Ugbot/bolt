@@ -1,0 +1,7 @@
+schema	0	l[array{x}]
+row	0	[{x:20},{x:21}]
+row	0	null
+row	0	[]
+row	0	[{x:22}]
+row	0	[{x:23},{x:24},{x:25}]
+row	0	null
