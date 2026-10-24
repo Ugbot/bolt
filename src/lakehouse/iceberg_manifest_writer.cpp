@@ -747,13 +747,13 @@ bool manifest_write_avro_typed(const DataFileRef* files, uint32_t n_files, int64
 
 bool manifest_write_avro_fv(int32_t format_version, const DataFileRef* files, uint32_t n_files, int64_t snapshot_id,
                             int64_t sequence_number, const char* table_schema_json, uint32_t table_schema_len,
-                            const PartitionSpec* spec, const IcebergTypeInfo* result_types, Arena* scratch,
+                            int32_t partition_spec_id, const PartitionSpec* spec, const IcebergTypeInfo* result_types, Arena* scratch,
                             const uint8_t** out, uint64_t* out_len) noexcept {
     assert(scratch != nullptr);
     assert(out != nullptr && out_len != nullptr);
     if (spec != nullptr && spec->n_fields != 0u && result_types == nullptr) return false;
     return write_manifest(files, n_files, snapshot_id, sequence_number, table_schema_json, table_schema_len,
-                          spec != nullptr ? spec->spec_id : 0, spec, result_types, format_version, scratch, out, out_len);
+                          spec != nullptr ? spec->spec_id : partition_spec_id, spec, result_types, format_version, scratch, out, out_len);
 }
 
 bool manifest_list_write_avro(const ManifestListEntry* entries,

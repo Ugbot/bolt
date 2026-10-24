@@ -112,10 +112,10 @@ bool manifest_list_write_avro(const ManifestListEntry* entries,
 // G2ICE-276 — the writers at an explicit table format version (2 or 3; anything else is refused). v3 manifests add the
 // data_file fields first_row_id (written for data files with has_first_row_id), referenced_data_file (written when
 // non-empty), content_offset / content_size_in_bytes (written for is_dv entries, whose file_format is PUFFIN); a v3 list
-// adds first_row_id (written for data manifests with has_first_row_id). `spec` may be null (unpartitioned, spec 0).
+// adds first_row_id (written for data manifests with has_first_row_id). `spec` may be null (unpartitioned, `partition_spec_id`).
 bool manifest_write_avro_fv(int32_t format_version, const DataFileRef* files, uint32_t n_files, int64_t snapshot_id,
                             int64_t sequence_number, const char* table_schema_json, uint32_t table_schema_len,
-                            const PartitionSpec* spec, const IcebergTypeInfo* result_types, Arena* scratch,
+                            int32_t partition_spec_id, const PartitionSpec* spec, const IcebergTypeInfo* result_types, Arena* scratch,
                             const uint8_t** out, uint64_t* out_len) noexcept;
 bool manifest_list_write_avro_fv(int32_t format_version, const ManifestListEntry* entries,
                                  uint32_t n_entries, int64_t snapshot_id,

@@ -35,7 +35,7 @@ TEST(IcebergV3Write, ManifestCarriesRowLineageAndDeletionVectors) {
     bolt::Arena a;
     DataFileRef f[2] = {data_file("s3://b/t/data/a.parquet", 5, true, 40), data_file("s3://b/t/data/b.parquet", 3, false, 0)};
     const uint8_t* m = nullptr; uint64_t ml = 0;
-    ASSERT_TRUE(manifest_write_avro_fv(3, f, 2, 7, 7, kSchema, sizeof(kSchema) - 1, nullptr, nullptr, &a, &m, &ml));
+    ASSERT_TRUE(manifest_write_avro_fv(3, f, 2, 7, 7, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &m, &ml));
     DataFileRef back[4];
     uint32_t n = 0;
     ASSERT_TRUE(manifest_parse_avro(m, ml, &a, 0, back, 4, &n));
@@ -56,7 +56,7 @@ TEST(IcebergV3Write, ManifestCarriesRowLineageAndDeletionVectors) {
     dv.is_dv = true; dv.content_offset = 4; dv.content_size = 42;
     dv.stats.record_count = 2; dv.stats.file_size_in_bytes = 300;
     dv.has_first_row_id = true; dv.first_row_id = 99;                   // never written for a delete file
-    ASSERT_TRUE(manifest_write_avro_fv(3, &dv, 1, 8, 8, kSchema, sizeof(kSchema) - 1, nullptr, nullptr, &a, &m, &ml));
+    ASSERT_TRUE(manifest_write_avro_fv(3, &dv, 1, 8, 8, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &m, &ml));
     ASSERT_TRUE(manifest_parse_avro(m, ml, &a, 0, back, 4, &n));
     ASSERT_EQ(n, 1u);
     EXPECT_TRUE(back[0].is_dv);
@@ -65,7 +65,7 @@ TEST(IcebergV3Write, ManifestCarriesRowLineageAndDeletionVectors) {
     EXPECT_STREQ(back[0].referenced_data_file, "s3://b/t/data/a.parquet");
     EXPECT_FALSE(back[0].has_first_row_id);
     EXPECT_NE(std::string(reinterpret_cast<const char*>(m), ml).find("PUFFIN"), std::string::npos);
-    EXPECT_FALSE(manifest_write_avro_fv(4, &dv, 1, 8, 8, kSchema, sizeof(kSchema) - 1, nullptr, nullptr, &a, &m, &ml));
+    EXPECT_FALSE(manifest_write_avro_fv(4, &dv, 1, 8, 8, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &m, &ml));
 }
 
 TEST(IcebergV3Write, ManifestListCarriesFirstRowIdForDataManifestsOnly) {
