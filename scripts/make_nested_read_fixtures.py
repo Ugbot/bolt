@@ -281,6 +281,7 @@ def write(name, tab, legacy=False, **opts):
 
 def _legacy():
     import importlib.util
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location(
         "legacy", os.path.join(os.path.dirname(__file__), "make_legacy_list_fixtures.py"))
     mod = importlib.util.module_from_spec(spec)
