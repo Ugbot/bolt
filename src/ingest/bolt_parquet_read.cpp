@@ -1889,8 +1889,14 @@ bool rescale_ts(ColCtx* cx, int64_t row0, int64_t rows) noexcept {
         }
     }
     for (int64_t i = 0; i < rows; ++i) {       // bounded: chunk rows
-        if (cx->ts_rescale == 1) d[i] *= 1000;   // millis -> us
-        else                     d[i] /= 1000;   // nanos  -> us
+        if (cx->ts_rescale != 1) { d[i] /= 1000; continue; }   // nanos -> us
+        // millis -> us: a valid value past +-INT64_MAX/1000 has no microsecond
+        // form, so refuse rather than wrap. Null slots hold filler, skipped.
+        const int64_t row = row0 + i;
+        if (cx->validity != nullptr &&
+            ((cx->validity[row >> 3] >> (row & 7)) & 1u) == 0u) continue;
+        if (d[i] > INT64_MAX / 1000 || d[i] < INT64_MIN / 1000) return false;
+        d[i] *= 1000;
     }
     return true;
 }
@@ -2460,8 +2466,8 @@ bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         cx.validity = bm;
     }
     ListBuild b;
-    b.rep = arena->allocate_array<uint32_t>(out->n_slots);
-    b.def = arena->allocate_array<uint32_t>(out->n_slots);
+    b.rep = arena->allocate_array<uint32_t>(static_cast<size_t>(out->n_slots));
+    b.def = arena->allocate_array<uint32_t>(static_cast<size_t>(out->n_slots));
     if (b.rep == nullptr || b.def == nullptr) return false;
     b.n_slots = 0;
     b.cap_slots = out->n_slots;
@@ -2519,7 +2525,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         assert(R0 >= 1u && R0 <= kPqMaxRepLevels);
         for (uint32_t k = R0; k >= 1u; --k) {
             const int64_t containers = (k == 1u) ? n_rows_total : 0;
-            auto* offs = arena->allocate_array<int32_t>(containers + 1);
+            auto* offs = arena->allocate_array<int32_t>(static_cast<size_t>(containers) + 1u);
             if (offs == nullptr) return false;
             for (int64_t i = 0; i <= containers; ++i) offs[i] = 0;
             cur = BoltColumn::make_list(&cur, offs, containers, nullptr, arena);
@@ -2566,7 +2572,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         // bounded by n_slots -- every element ever created traces back to
         // exactly one leaf slot, so there can never be more of them.
         const int64_t cap = (k == 1u) ? n_rows_total : n_slots;
-        offs[k - 1] = arena->allocate_array<int32_t>(cap + 1);
+        offs[k - 1] = arena->allocate_array<int32_t>(static_cast<size_t>(cap) + 1u);
         if (offs[k - 1] == nullptr) return false;
         const uint64_t vb = (static_cast<uint64_t>(cap) + 7u) / 8u;
         lval[k - 1] = static_cast<uint8_t*>(arena->allocate(vb, 1));

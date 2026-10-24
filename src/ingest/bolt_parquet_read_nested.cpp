@@ -114,7 +114,7 @@ bool list_offsets(const NestCtx* x, const PqField& f, const PqLeafSlots* s,
                   int64_t n, int32_t** offs, int64_t* n_elems) noexcept {
     assert(x != nullptr && s != nullptr);
     assert(offs != nullptr && n_elems != nullptr);
-    auto* o = x->arena->allocate_array<int32_t>(n + 1);
+    auto* o = x->arena->allocate_array<int32_t>(static_cast<size_t>(n) + 1u);
     if (o == nullptr) return false;
     int64_t cont = -1, elems = 0;
     for (int64_t j = 0; j < s->n_slots; ++j) {
