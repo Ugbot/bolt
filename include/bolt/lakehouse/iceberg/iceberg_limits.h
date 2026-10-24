@@ -8,4 +8,5 @@ inline constexpr std::uint32_t kEqKeyMax         = 4096u;           // bytes of 
 inline constexpr std::uint64_t kMaxDvObjectBytes = 256ull << 20;    // one deletion-vector object
 inline constexpr std::uint32_t kMaxEqualityIds   = 16u;             // columns in one equality-delete key
 inline constexpr std::uint32_t kMaxEqualitySets  = 64u;             // distinct equality-id sets in one scan
+inline constexpr std::uint32_t kDefaultTextMax   = 128u;            // bytes of one field's initial-default JSON scalar (v3)
 }  // namespace bolt::lakehouse::iceberg::limits

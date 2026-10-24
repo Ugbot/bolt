@@ -11,6 +11,7 @@
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
+#include "bolt/lakehouse/iceberg/metadata.h"
 
 using namespace bolt::lakehouse::iceberg;
 
@@ -121,4 +122,33 @@ TEST(IcebergV3Write, PuffinFileHoldsEachVectorAtItsPlacement) {
         ASSERT_EQ(n, in[i].n);
         for (uint64_t k = 0; k < n; ++k) EXPECT_EQ(pos[k], in[i].positions[k]);
     }
+}
+
+TEST(IcebergV3Metadata, ParsesNextRowIdAndInitialDefaults) {
+    const std::string j = "{\"format-version\":3,\"table-uuid\":\"u\",\"location\":\"s3://b/t\",\"last-updated-ms\":1,\"next-row-id\":42,"
+        "\"last-column-id\":6,\"current-schema-id\":0,\"schemas\":[{\"schema-id\":0,\"type\":\"struct\",\"fields\":["
+        "{\"id\":1,\"name\":\"a\",\"required\":false,\"type\":\"long\",\"initial-default\":7},"
+        "{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\",\"initial-default\":\"x y\"},"
+        "{\"id\":3,\"name\":\"c\",\"required\":false,\"type\":\"boolean\",\"initial-default\":true},"
+        "{\"id\":4,\"name\":\"d\",\"required\":false,\"type\":\"long\",\"initial-default\":null},"
+        "{\"id\":5,\"name\":\"e\",\"required\":false,\"type\":{\"type\":\"struct\",\"fields\":[]},\"initial-default\":{}},"
+        "{\"id\":6,\"name\":\"f\",\"required\":false,\"type\":\"long\"}]}],"
+        "\"default-spec-id\":0,\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],\"snapshots\":[]}";
+    bolt::Arena a;
+    auto* m = a.allocate_array<Metadata>(1);
+    std::memset(m, 0, sizeof(*m));
+    ASSERT_TRUE(metadata_parse(reinterpret_cast<const uint8_t*>(j.data()), static_cast<uint32_t>(j.size()), &a, m));
+    EXPECT_TRUE(m->has_next_row_id);
+    EXPECT_EQ(m->next_row_id, 42);
+    const SchemaField* f = m->schemas[0].fields;
+    ASSERT_EQ(m->schemas[0].n_fields, 6u);
+    EXPECT_EQ(f[0].initial_default_kind, DefaultKind::kScalar);
+    EXPECT_STREQ(f[0].initial_default, "7");
+    EXPECT_EQ(f[1].initial_default_kind, DefaultKind::kString);
+    EXPECT_STREQ(f[1].initial_default, "x y");
+    EXPECT_EQ(f[2].initial_default_kind, DefaultKind::kScalar);
+    EXPECT_STREQ(f[2].initial_default, "true");
+    EXPECT_EQ(f[3].initial_default_kind, DefaultKind::kNone);
+    EXPECT_EQ(f[4].initial_default_kind, DefaultKind::kUnsupported) << "a struct default is not filled: the scan refuses it";
+    EXPECT_EQ(f[5].initial_default_kind, DefaultKind::kNone);
 }
