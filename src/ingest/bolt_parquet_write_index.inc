@@ -219,8 +219,10 @@ bool write_page_index(ParquetWriter* w) noexcept {
                 assert(rec.page_off + rec.page_count <= w->pages.size());
                 const PageRec* pp = w->pages.data() + rec.page_off;
                 if (pass == 0) {
+                    const PwLeaf& lf = w->leaves[c];
                     build_column_index(&buf, pp, rec.page_count,
-                                       w->opts.columns[c].type);
+                                       lf.nested ? lf.sch.type
+                                                 : w->cols[lf.col].type);
                 } else {
                     build_offset_index(&buf, pp, rec.page_count);
                 }

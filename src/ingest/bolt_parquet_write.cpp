@@ -305,8 +305,12 @@ struct PageRec {
 // nullable) is max_def == 2*kPwMaxListDepth + 1, max_rep == kPwMaxListDepth.
 // Not a general reader-side bound; that lives in bolt_parquet_meta.h as
 // kPqMaxLevelHistBuckets.
-constexpr std::size_t kPqWMaxDefBuckets = 2u * kPwMaxListDepth + 2u;
-constexpr std::size_t kPqWMaxRepBuckets = kPwMaxListDepth + 1u;
+// Nested columns (ParquetNestedNode) reach max_def <= depth + rep and
+// max_rep <= kPwMaxNestedRep, which dominates the LIST-chain bound.
+constexpr std::size_t kPqWMaxDefBuckets = kPwMaxNestedDepth + kPwMaxNestedRep + 1u;
+constexpr std::size_t kPqWMaxRepBuckets = kPwMaxNestedRep + 1u;
+static_assert(kPqWMaxDefBuckets >= 2u * kPwMaxListDepth + 2u, "list chain def");
+static_assert(kPqWMaxRepBuckets >= kPwMaxListDepth + 1u, "list chain rep");
 
 struct ChunkRec {
     std::int64_t num_values;
@@ -399,6 +403,21 @@ struct RowGroupRec {
     std::uint32_t         n_sorting_columns;
 };
 
+// One physical column chunk of the schema. A flat or LIST column is one leaf
+// (nested == false, encoded from ParquetWriter::cols[col]); a column declared
+// by a ParquetNestedNode tree is one leaf per leaf node, its path given as
+// indices into ParquetWriter::nodes.
+struct PwLeaf {
+    std::uint32_t      col;
+    bool               nested;
+    std::uint8_t       path_len;
+    std::uint8_t       max_def;
+    std::uint8_t       max_rep;
+    std::uint32_t      node_base;   // the column's table in ParquetWriter::nodes
+    std::uint32_t      path[kPwMaxNestedDepth];
+    ParquetWriteColumn sch;         // nested only: the leaf's flat schema
+};
+
 }  // namespace
 
 // Fully-defined writer state (opaque to callers).
@@ -418,6 +437,11 @@ struct ParquetWriter {
     // The column descriptors, copied out of whichever storage the caller's
     // opts used (inline or wide_columns). opts.columns is not read after open.
     std::vector<ParquetWriteColumn> cols;
+    // Physical leaf chunks in schema order, the nested columns' copied node
+    // tables, and each logical column's first leaf.
+    std::vector<PwLeaf>             leaves;
+    std::vector<ParquetNestedNode>  nodes;
+    std::vector<std::uint32_t>      col_first_leaf;
     std::int64_t      file_pos;        // bytes written
     std::uint64_t     sink_bytes = 0;
     std::uint64_t     sink_limit = INT64_MAX;
@@ -486,6 +510,7 @@ bool sink_ok(const ParquetWriter* w) noexcept {
 // ===== type validation ====================================================
 
 bool type_supported_flat(const ParquetWriteColumn& c) noexcept;
+bool nested_column_valid(const ParquetWriteColumn& c) noexcept;
 
 // G2PQ-27: normalizes a LIST column's nesting chain to `out[0..depth)`.
 // list_depth == 0 (every pre-G2PQ-27 caller) yields depth 1 built from the
@@ -508,6 +533,7 @@ std::uint32_t list_chain(const ParquetWriteColumn& sch,
 }
 
 bool type_supported(const ParquetWriteColumn& c) noexcept {
+    if (c.nested != nullptr || c.n_nested != 0u) return nested_column_valid(c);
     if(c.integer_bits && !((c.integer_bits==8 || c.integer_bits==16 || c.integer_bits==32) ? c.type==BoltType::Int32 : c.integer_bits==64 && c.type==BoltType::Int64)) return false;
     if(c.timestamp_unit>3 || (c.timestamp_unit && c.type!=BoltType::Timestamp)) return false;
     if(c.time_micros && c.type!=BoltType::Int64) return false;
@@ -1359,6 +1385,8 @@ struct PageSpec {
     std::int64_t  num_nulls;
     std::int32_t  encoding;
     std::uint32_t level_bytes;   // v2: leading payload bytes that are levels
+    std::uint32_t rep_bytes;     // v2: of those, the repetition levels
+    std::int64_t  num_rows;      // v2: records in the page; 0 = num_values
 };
 
 bool emit_page(ParquetWriter* w, ChunkOut* out,
@@ -1368,6 +1396,7 @@ bool emit_page(ParquetWriter* w, ChunkOut* out,
     assert(w != nullptr && rec != nullptr && out != nullptr);
     assert(spec.num_values >= 0 && spec.num_nulls >= 0);
     assert(spec.level_bytes <= payload.size());
+    assert(spec.rep_bytes <= spec.level_bytes);
     if (payload.size() > 0x7FFFFFFFull) return false;
     if (spec.num_values > 0x7FFFFFFF) return false;
     const std::int32_t unc = static_cast<std::int32_t>(payload.size());
@@ -1393,8 +1422,10 @@ bool emit_page(ParquetWriter* w, ChunkOut* out,
         write_page_header_v2(
             &hdr, unc, cmp, static_cast<std::int32_t>(spec.num_values),
             static_cast<std::int32_t>(spec.num_nulls),
-            static_cast<std::int32_t>(spec.num_values),   // flat: rows == values
-            spec.encoding, static_cast<std::int32_t>(lv), 0,
+            static_cast<std::int32_t>(spec.num_rows > 0 ? spec.num_rows
+                                                        : spec.num_values),
+            spec.encoding, static_cast<std::int32_t>(lv - spec.rep_bytes),
+            static_cast<std::int32_t>(spec.rep_bytes),
             w->opts.compression != 0u);
     } else {
         write_page_header(&hdr, unc, cmp,
@@ -1539,7 +1570,7 @@ bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         std::int64_t off = 0;
         std::int32_t sz = 0;
         PageSpec spec{false, w->opts.data_page_v2, r1 - r0, page_nulls,
-                      enc_code, lv};
+                      enc_code, lv, 0u, 0};
         if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
         if (rec->data_page_offset < 0) rec->data_page_offset = off;
         note_page(w, out, rec, off, sz, r0, page_nulls, r1 - r0, ps);
@@ -1629,7 +1660,7 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     std::int64_t doff = 0;
     // A dictionary page has no v2 variant -- the format defines only
     // DATA_PAGE_V2 -- so it is written the same way regardless.
-    PageSpec dspec{true, false, d.count, 0, kEncPlain, 0u};
+    PageSpec dspec{true, false, d.count, 0, kEncPlain, 0u, 0u, 0};
     if (!emit_page(w, out, dict_payload, dspec, rec, &doff, nullptr)) {
         return false;
     }
@@ -1674,7 +1705,7 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         std::int64_t off = 0;
         std::int32_t sz = 0;
         PageSpec spec{false, w->opts.data_page_v2, r1 - r0, (r1 - r0) - nv,
-                      kEncRleDict, lv};
+                      kEncRleDict, lv, 0u, 0};
         if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
         if (rec->data_page_offset < 0) rec->data_page_offset = off;
         note_page(w, out, rec, off, sz, r0, (r1 - r0) - nv, r1 - r0, ps);
@@ -2063,7 +2094,7 @@ bool chunk_write_list(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         for (std::int64_t i = s0; i < s1; ++i) {
             page_nulls += (lv.def[i] < max_def) ? 1 : 0;
         }
-        PageSpec spec{false, false, s1 - s0, page_nulls, kEncPlain, 0u};
+        PageSpec spec{false, false, s1 - s0, page_nulls, kEncPlain, 0u, 0u, 0};
         if (!emit_page(w, out, payload, spec, rec, &off, &sz)) return false;
         if (rec->data_page_offset < 0) rec->data_page_offset = off;
         StatBuf ps;
@@ -2359,6 +2390,9 @@ std::uint32_t schema_element_count(const ParquetWriteColumn& c) noexcept {
     return 2u * depth + 1u;
 }
 
+// STRUCT / LIST / MAP columns declared by a ParquetNestedNode tree.
+#include "bolt_parquet_write_nested.inc"
+
 // list<KeyValue>: KV::key/value must be NUL-terminated char arrays --
 // satisfied by both ParquetFileKeyValue and ParquetColumnKeyValue. Value is
 // thrift-optional but always written here (bolt never records a key without
@@ -2414,16 +2448,20 @@ void write_size_statistics(TcOut* o, const ChunkRec& rec) noexcept {
     tc_put_stop(o);
 }
 
+// `nl` is the chunk's nested leaf, or nullptr for a flat / LIST column.
 void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ParquetWriteColumn& sch,
-                       const ChunkRec& rec) noexcept {
+                       const ChunkRec& rec, const PwLeaf* nl) noexcept {
     ParquetListLevel meta_chain[kPwMaxListDepth];
-    const std::uint32_t meta_depth =
-        (sch.type == BoltType::List) ? list_chain(sch, meta_chain) : 0u;
+    const bool legacy_list = nl == nullptr && sch.type == BoltType::List;
+    const std::uint32_t meta_depth = legacy_list ? list_chain(sch, meta_chain) : 0u;
     tc_put_field(o, 1, kFI32);
-    tc_put_zigzag(o, bolt_to_pq_physical(
-        (sch.type == BoltType::List) ? meta_chain[meta_depth - 1u].type
-                                     : sch.type));
+    if (nl != nullptr) {
+        tc_put_zigzag(o, nested_leaf_physical(nl->sch));
+    } else {
+        tc_put_zigzag(o, bolt_to_pq_physical(
+            legacy_list ? meta_chain[meta_depth - 1u].type : sch.type));
+    }
     // encodings: the set actually used by this chunk. RLE always appears --
     // it encodes the definition levels even for a REQUIRED column's absent
     // stream, and parquet-mr lists it unconditionally. A dictionary chunk
@@ -2449,7 +2487,9 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     // repeated once per nesting level (G2PQ-27), 3 segments for depth == 1
     // exactly as before.
     tc_put_field(o, 3, kFList);
-    if (sch.type == BoltType::List) {
+    if (nl != nullptr) {
+        write_nested_path(o, w, *nl);
+    } else if (legacy_list) {
         tc_put_list_hdr(o, kFBinary, 1u + 2u * meta_depth);
         tc_put_string(o, sch.name);
         for (std::uint32_t k = 0; k < meta_depth; ++k) {
@@ -2541,7 +2581,7 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
 
 void write_column_chunk_struct(TcOut* o, const ParquetWriter* w,
                                const ParquetWriteColumn& sch,
-                               const ChunkRec& rec) noexcept {
+                               const ChunkRec& rec, const PwLeaf* nl) noexcept {
     // ColumnChunk: 2 = file_offset (i64, REQUIRED in parquet.thrift).
     // Deprecated by the spec ("writers should write 0") but thrift-generated
     // readers (pyarrow, DuckDB) throw INVALID_DATA when a required field is
@@ -2552,7 +2592,7 @@ void write_column_chunk_struct(TcOut* o, const ParquetWriter* w,
     tc_put_zigzag(o, 0);
     // ColumnChunk: 3 = meta_data (struct)
     tc_put_field(o, 3, kFStruct);
-    write_column_meta(o, w, sch, rec);
+    write_column_meta(o, w, sch, rec, nl);
     // 4/5 = offset_index_offset/length, 6/7 = column_index_offset/length.
     // These live on ColumnChunk, NOT on ColumnMetaData -- a reader looks
     // here to find the index region without parsing any page.
@@ -2578,8 +2618,9 @@ void write_row_group(TcOut* o, const ParquetWriter* w,
     tc_put_list_hdr(o, kFStruct, rg.chunk_count);
     for (std::uint32_t i = 0; i < rg.chunk_count; ++i) {
         const std::uint32_t ci = rg.chunk_off + i;
-        write_column_chunk_struct(o, w, w->cols[i],
-                                  w->chunks[ci]);
+        const PwLeaf& lf = w->leaves[i];
+        write_column_chunk_struct(o, w, w->cols[lf.col], w->chunks[ci],
+                                  lf.nested ? &lf : nullptr);
     }
     tc_put_field(o, 2, kFI64);
     tc_put_zigzag(o, rg.total_byte_size);
@@ -2592,8 +2633,8 @@ void write_row_group(TcOut* o, const ParquetWriter* w,
         tc_put_list_hdr(o, kFStruct, rg.n_sorting_columns);
         for (std::uint32_t i = 0; i < rg.n_sorting_columns; ++i) {
             const ParquetSortingColumn& sc = rg.sorting_columns[i];
-            tc_put_field(o, 1, kFI32);
-            tc_put_zigzag(o, static_cast<std::int64_t>(sc.column_idx));
+            tc_put_field(o, 1, kFI32);   // a LEAF index in parquet
+            tc_put_zigzag(o, static_cast<std::int64_t>(w->col_first_leaf[sc.column_idx]));
             // compact bools carry their value in the field type -- no
             // separate value byte, same as is_compressed/is_sorted above.
             tc_put_field(o, 2, sc.descending ? kFTrue : kFFalse);
@@ -2626,12 +2667,18 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     tc_put_field(&o, 2, kFList);
     std::uint32_t n_elems = 1u;                // the root
     for (std::uint32_t i = 0; i < n; ++i) {
-        n_elems += schema_element_count(w->cols[i]);
+        const PwLeaf& lf = w->leaves[w->col_first_leaf[i]];
+        n_elems += lf.nested ? nested_element_count(w, lf.node_base, w->cols[i].n_nested)
+                             : schema_element_count(w->cols[i]);
     }
     tc_put_list_hdr(&o, kFStruct, n_elems);
     write_schema_element_root(&o, n);
     for (std::uint32_t i = 0; i < n; ++i) {
-        if (w->cols[i].type == BoltType::List) {
+        const PwLeaf& lf = w->leaves[w->col_first_leaf[i]];
+        if (lf.nested) {
+            write_nested_elements(&o, w, lf.node_base, 0u,
+                                  w->nodes[lf.node_base].name, 0u);
+        } else if (w->cols[i].type == BoltType::List) {
             write_schema_elements_list(&o, w->cols[i]);
         } else {
             write_schema_element_col(&o, w->cols[i]);
@@ -2665,9 +2712,11 @@ void write_file_metadata(std::vector<std::uint8_t>* dst,
     // for FLOAT/DOUBLE, false < true for BOOLEAN, unsigned lexicographic
     // bytes for BYTE_ARRAY (compute_stats/compute_stats_utf8 above).
     // Decimal128 chunks emit no min/max, so the declaration is vacuous there.
+    // One per LEAF column.
+    const std::uint32_t n_leaves = static_cast<std::uint32_t>(w->leaves.size());
     tc_put_field(&o, 7, kFList);
-    tc_put_list_hdr(&o, kFStruct, n);
-    for (std::uint32_t i = 0; i < n; ++i) {
+    tc_put_list_hdr(&o, kFStruct, n_leaves);
+    for (std::uint32_t i = 0; i < n_leaves; ++i) {
         tc_put_field(&o, 1, kFStruct);   // ColumnOrder.TYPE_ORDER
         tc_put_stop(&o);                 // empty TypeDefinedOrder struct
         tc_put_stop(&o);                 // end ColumnOrder union
@@ -2718,6 +2767,41 @@ void pw_copy_columns(ParquetWriter* w, const ParquetWriteOpts* opts) noexcept {
         w->cols[i] = pw_opts_column(*opts, i);
     }
     w->opts.wide_columns = nullptr;
+}
+
+// One leaf per flat / LIST column, one per leaf node of a nested column. The
+// nested tables are copied (the caller's pointer was borrowed for open only)
+// and the root node becomes the column's name / nullability / field id.
+bool pw_plan_leaves(ParquetWriter* w) noexcept {
+    assert(w != nullptr);
+    assert(w->cols.size() == w->opts.n_columns);
+    w->col_first_leaf.resize(w->cols.size());
+    for (std::uint32_t i = 0; i < w->opts.n_columns; ++i) {   // bounded: kPwMaxColumns
+        ParquetWriteColumn& c = w->cols[i];
+        w->col_first_leaf[i] = static_cast<std::uint32_t>(w->leaves.size());
+        if (c.nested == nullptr) {
+            PwLeaf L{};
+            L.col = i;
+            w->leaves.push_back(L);
+            continue;
+        }
+        const std::uint32_t nb = static_cast<std::uint32_t>(w->nodes.size());
+        w->nodes.insert(w->nodes.end(), c.nested, c.nested + c.n_nested);
+        c.nested = nullptr;
+        const ParquetNestedNode& root = w->nodes[nb];
+        std::memcpy(c.name, root.name, sizeof(c.name));
+        c.nullable = root.nullable;
+        c.has_field_id = root.has_field_id;
+        c.field_id = root.field_id;
+        if (!plan_nested_leaves(w, i, nb, c.n_nested)) return false;
+        if (w->leaves.size() > kPwMaxColumns) return false;
+    }
+    for (const PwLeaf& L : w->leaves) {
+        if (L.nested && L.sch.integer_bits && !L.sch.integer_signed) {
+            w->opts.emit_statistics = false;
+        }
+    }
+    return w->leaves.size() <= kPwMaxColumns;
 }
 
 }  // namespace
@@ -2799,6 +2883,10 @@ ParquetWriter* parquet_write_open(const char* path,
     if (w == nullptr) return nullptr;
     w->opts = *opts;
     pw_copy_columns(w, opts);
+    if (!pw_plan_leaves(w)) {
+        delete w;
+        return nullptr;
+    }
     // Raw signed lanes with unsigned logical annotations must not acquire
     // signed min/max certificates. Value encoding still preserves every bit.
     for(std::uint32_t c=0;c<w->opts.n_columns;++c)
@@ -2903,6 +2991,10 @@ ParquetWriter* parquet_write_open_mem(const ParquetWriteOpts* opts,
     if (w == nullptr) return nullptr;
     w->opts = *opts;
     pw_copy_columns(w, opts);
+    if (!pw_plan_leaves(w)) {
+        delete w;
+        return nullptr;
+    }
     // Raw signed lanes with unsigned logical annotations must not acquire
     // signed min/max certificates. Value encoding still preserves every bit.
     for(std::uint32_t c=0;c<w->opts.n_columns;++c)
@@ -3034,23 +3126,32 @@ struct EncodeWave {
 // write), its own column's input, and the workspace/output at its own slot --
 // so no two tasks share mutable state and none of them touches file_pos, the
 // chunk list or the page list. Placement does all of that, serially, after.
+// Encode leaf chunk `leaf` into wave slot `slot`. A nested leaf walks the
+// unsliced batch column itself; everything else is sliced to the row group.
+bool encode_leaf(ParquetWriter* w, std::uint32_t slot, const BoltColumn* cols,
+                 std::int64_t start, std::int64_t rows, std::uint32_t leaf) noexcept {
+    assert(w != nullptr && cols != nullptr);
+    assert(leaf < w->leaves.size() && slot < w->outs.size());
+    const PwLeaf& L = w->leaves[leaf];
+    if (L.nested) {
+        return chunk_write_nested(w, &w->outs[slot], cols[L.col], L, start, rows);
+    }
+    const BoltColumn sc = slice_column(cols[L.col], w->cols[L.col].type, start,
+                                       rows, &w->ws[slot].off_slice);
+    return write_column_chunk(w, &w->ws[slot], &w->outs[slot], sc,
+                              w->cols[L.col], rows);
+}
+
 void encode_wave_task(void* user, std::uint32_t lo, std::uint32_t hi,
                       std::uint32_t /*thread_id*/) noexcept {
     EncodeWave* e = static_cast<EncodeWave*>(user);
     assert(e != nullptr);
     assert(lo <= hi);
     for (std::uint32_t i = lo; i < hi; ++i) {
-        const std::uint32_t c = e->base + i;
-        assert(c < e->w->opts.n_columns);
-        const BoltColumn sc = slice_column(e->cols[c],
-                                           e->w->cols[c].type,
-                                           e->start, e->rows,
-                                           &e->w->ws[i].off_slice);
         // Failure is recorded on the output (ChunkOut::ok) rather than
         // returned: a pool task has nowhere to return a status to, and the
         // placement pass checks every slot before writing anything.
-        (void)write_column_chunk(e->w, &e->w->ws[i], &e->w->outs[i], sc,
-                                 e->w->cols[c], e->rows);
+        (void)encode_leaf(e->w, i, e->cols, e->start, e->rows, e->base + i);
     }
 }
 
@@ -3058,11 +3159,12 @@ void encode_wave_task(void* user, std::uint32_t lo, std::uint32_t hi,
 // so this is also the scratch bound. Serial (1) unless a pool was supplied.
 std::uint32_t encode_wave_width(const ParquetWriter* w) noexcept {
     assert(w != nullptr);
+    const std::uint32_t n_leaves = static_cast<std::uint32_t>(w->leaves.size());
     if (w->opts.encode_pool == nullptr) return 1u;
-    if (w->opts.n_columns <= 1u) return 1u;
+    if (n_leaves <= 1u) return 1u;
     const std::uint32_t threads = w->opts.encode_pool->thread_count();
     std::uint32_t width = (threads > 0u) ? threads : 1u;
-    if (width > w->opts.n_columns) width = w->opts.n_columns;
+    if (width > n_leaves) width = n_leaves;
     if (width > kPwMaxEncodeWave) width = kPwMaxEncodeWave;
     assert(width >= 1u);
     return width;
@@ -3280,7 +3382,7 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     const std::int64_t rg_start = w->file_pos;
     rg.num_rows = rows;
     rg.chunk_off = static_cast<std::uint32_t>(w->chunks.size());
-    rg.chunk_count = w->opts.n_columns;
+    rg.chunk_count = static_cast<std::uint32_t>(w->leaves.size());
     // RowGroup.file_offset (field 5): byte offset to this row group's first
     // page. rg_start is exactly that -- nothing has been written for this
     // row group yet.
@@ -3298,20 +3400,12 @@ bool write_one_row_group(ParquetWriter* w, const BoltColumn* cols,
     // placement order is what makes the bytes independent of the pool size:
     // whatever order the workers finished in, column c always lands before
     // column c+1.
-    for (std::uint32_t base = 0; base < w->opts.n_columns; base += width) {
-        std::uint32_t n = w->opts.n_columns - base;
+    for (std::uint32_t base = 0; base < rg.chunk_count; base += width) {
+        std::uint32_t n = rg.chunk_count - base;
         if (n > width) n = width;
         if (n == 1u || w->opts.encode_pool == nullptr) {
             for (std::uint32_t i = 0; i < n; ++i) {
-                const std::uint32_t c = base + i;
-                const BoltColumn sc = slice_column(cols[c],
-                                                   w->cols[c].type,
-                                                   start, rows,
-                                                   &w->ws[i].off_slice);
-                if (!write_column_chunk(w, &w->ws[i], &w->outs[i], sc,
-                                        w->cols[c], rows)) {
-                    return false;
-                }
+                if (!encode_leaf(w, i, cols, start, rows, base + i)) return false;
             }
         } else {
             // Invalidate every slot BEFORE dispatching. The slots are reused

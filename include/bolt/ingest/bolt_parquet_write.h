@@ -82,21 +82,17 @@
 //                  (ParquetWriteColumn::column_kv) -- e.g. Arrow's
 //                  ARROW:schema or an Iceberg-style small column annotation.
 //
+//   - STRUCT / LIST / MAP of any shape: a column declared by a
+//                  ParquetNestedNode tree (ParquetWriteColumn::nested) writes
+//                  one physical chunk per leaf with full Dremel rep/def
+//                  levels and multi-segment path_in_schema. Leaves are PLAIN
+//                  (no dictionary / DELTA / bloom); statistics, page index,
+//                  size statistics and DATA_PAGE_V2 apply. The row group's
+//                  column-chunk list, column_orders and RowGroup
+//                  sorting_columns index LEAVES; ParquetSortingColumn and the
+//                  batch still index logical columns.
+//
 // Out of scope (open returns false, or the option is silently a no-op):
-//   - MAP / STRUCT columns (LIST, including nested LIST-of-LIST, is
-//     supported; see below). Both need one logical schema field to expand
-//     into MULTIPLE physical column chunks (each struct field / each of a
-//     map's key and value is its own leaf ColumnChunk with its own
-//     multi-segment path_in_schema) -- this writer's row-group loop
-//     (write_one_row_group / encode_wave_task / place_chunk / the footer's
-//     schema+path_in_schema emission) currently assumes exactly one
-//     physical chunk per ParquetWriteColumn slot, which a nested LIST still
-//     satisfies (deeper repetition, not a new column) but STRUCT/MAP do
-//     not. A follow-up would separate "schema slot count" from "physical
-//     leaf chunk count" (e.g. group-marker columns + a parent-group index,
-//     so a struct's fields are declared as ordinary leaf ParquetWriteColumn
-//     entries that inherit definition levels from their enclosing group) --
-//     tracked as a distinct ticket rather than folded into G2PQ-27.
 //   - encryption
 //
 // Tiger Style: noexcept everywhere, no exceptions / RTTI / smart pointers,
@@ -112,6 +108,7 @@
 
 #include "bolt/bolt_types.h"      // BoltType, kMaxColumns
 #include "bolt/bolt_column.h"     // BoltBatch / BoltColumn
+#include "bolt/ingest/bolt_parquet_write_limits.h"
 
 namespace bolt {
 
@@ -205,6 +202,54 @@ struct ParquetListLevel {
 // not a reason to reach for a dynamic container here.
 inline constexpr std::uint32_t kPwMaxListDepth = 4;
 
+// Caps on a nested column's node tree (kPwMaxNestedNodes / Depth / Rep) live
+// in bolt_parquet_write_limits.h.
+
+// One node of a nested column's schema tree. A table of these, root first,
+// describes a STRUCT / LIST / MAP column of any shape:
+//
+//   type Struct: n_children >= 1 fields, nodes [first_child, first_child+n).
+//                The batch column is a Nested Struct whose child_at(j) is
+//                field j, row-aligned with the struct.
+//   type List:   exactly one child, the element. Written
+//                `group name (LIST) { repeated group list { element } }`.
+//   type Map:    exactly two children, key then value. Written
+//                `group name (MAP) { repeated group key_value { key; value } }`.
+//                The key node must be REQUIRED (nullable = false), and a row
+//                holding a null key fails the row group. The batch column is
+//                a Nested Map: list-shaped, element a 2-field Struct {key, value}.
+//   any flat leaf type parquet_write_open accepts for a column: n_children 0.
+//
+// Children always come after their parent (first_child > own index), and every
+// node but the root has exactly one parent. `name` names a struct field (and
+// the root column); list elements and map keys/values take the canonical names
+// "element" / "key" / "value" and their `name` is ignored. Every node may carry
+// an Iceberg field id (SchemaElement field 9), including LIST/MAP groups and
+// their element/key/value; the synthetic "list" / "key_value" repeated groups
+// carry none. `nullable` is the node's own OPTIONAL/REQUIRED bit; a REQUIRED
+// node holding a null fails the row group.
+//
+// Leaf refinements mean exactly what the same-named ParquetWriteColumn fields
+// mean, and are ignored on group nodes.
+struct ParquetNestedNode {
+    char          name[64];
+    BoltType      type;
+    bool          nullable;
+    bool          has_field_id;
+    std::int32_t  field_id;
+    std::uint16_t first_child;    // index into the same table
+    std::uint16_t n_children;
+    std::uint8_t  precision;
+    std::uint8_t  scale;
+    std::uint8_t  logical;        // BoltLogical
+    bool          ts_local;
+    std::uint8_t  timestamp_unit;
+    bool          time_micros;
+    std::uint8_t  integer_bits;
+    bool          integer_signed;
+    std::uint32_t fixed_len;
+};
+
 // One column's worth of writer-side schema. Fixed-size POD.
 struct ParquetWriteColumn {
     char         name[64];      // NUL-terminated; truncated past 63 chars.
@@ -284,6 +329,17 @@ struct ParquetWriteColumn {
     // Binary only: > 0 writes FIXED_LEN_BYTE_ARRAY(fixed_len) (an Iceberg `fixed[L]`), PLAIN encoded; every value must be exactly
     // fixed_len bytes or the row group is refused. 0 (zero-init) keeps BYTE_ARRAY.
     std::uint32_t         fixed_len;
+    // Nested column (STRUCT / LIST / MAP of any shape): `n_nested` nodes,
+    // root first -- see ParquetNestedNode. Borrowed only for the open call;
+    // the writer copies the table. When set, `type` must equal nested[0].type
+    // and the root node supplies the column's name, nullability and field id
+    // (name/nullable/has_field_id/field_id above are overwritten); encoding
+    // must be Auto or Plain (leaves are PLAIN), logical 0 and list_depth 0.
+    // The column writes one physical chunk per leaf, in schema order, so a
+    // RowGroup's chunk count is the leaf count. nullptr (zero-init) keeps
+    // every existing caller's output byte-for-byte.
+    const ParquetNestedNode* nested;
+    std::uint32_t            n_nested;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,
