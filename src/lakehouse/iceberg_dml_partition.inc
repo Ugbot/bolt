@@ -74,6 +74,32 @@ int64_t del_group_of(TableHandle* th, DelGroup** gs, uint32_t* ng, uint32_t* cap
     return static_cast<int64_t>((*ng)++);
 }
 
+// (paths[i], pos[i]) in file_path then pos order, into arena arrays.
+bool sort_position_deletes(Arena* a, const char* const* paths, const int64_t* pos, uint32_t n, const char*** out_paths,
+                           int64_t** out_pos) noexcept {
+    assert(a != nullptr && paths != nullptr && pos != nullptr);
+    assert(out_paths != nullptr && out_pos != nullptr);
+    auto* order = a->allocate_array<uint32_t>(n + 1u);
+    *out_paths = a->allocate_array<const char*>(n + 1u);
+    *out_pos = a->allocate_array<int64_t>(n + 1u);
+    if (order == nullptr || *out_paths == nullptr || *out_pos == nullptr) return false;
+    for (uint32_t i = 0; i < n; ++i) order[i] = i;                        // bounded by n
+    for (uint32_t gap = n / 2u; gap > 0u; gap /= 2u)                      // shell sort: bounded, no recursion
+        for (uint32_t i = gap; i < n; ++i) {
+            const uint32_t x = order[i];
+            uint32_t j = i;
+            while (j >= gap) {
+                const int c = std::strcmp(paths[order[j - gap]], paths[x]);
+                if (c < 0 || (c == 0 && pos[order[j - gap]] <= pos[x])) break;
+                order[j] = order[j - gap];
+                j -= gap;
+            }
+            order[j] = x;
+        }
+    for (uint32_t i = 0; i < n; ++i) { (*out_paths)[i] = paths[order[i]]; (*out_pos)[i] = pos[order[i]]; }   // bounded
+    return true;
+}
+
 // One delete file per (spec, tuple) of the rows' data files. Rows stay in their given (file_path, pos) order.
 bool write_grouped_deletes(TableHandle* th, int64_t snap_id, const char* const* paths, const int64_t* pos, uint32_t n,
                            const LiveData* live, DataFileRef** out, char (**rels)[128], uint32_t* n_out) noexcept {

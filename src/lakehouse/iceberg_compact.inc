@@ -273,6 +273,7 @@ bool compact_visit(void* c, const dml::RowBatch* rb) noexcept {
     }
     if (rb->batch->num_rows == 0) return true;
     if (!o->file_open && !compact_open(o)) return false;
+    if (!conform_batch(o->th, rb->batch)) return false;
     if (!ingest::parquet::parquet_write_row_group(o->w, rb->batch)) return false;
     if (!lake_grow(o->th->arena, nullptr, &o->batches, o->n_batches, &o->cap_batches, o->n_batches + 1u)) return false;
     o->batches[o->n_batches++] = rb->batch;

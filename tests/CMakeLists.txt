@@ -2342,6 +2342,10 @@ target_link_libraries(test_bolt_iceberg_partitioned
 bolt_apply_hardening(test_bolt_iceberg_partitioned)
 add_test(NAME test_bolt_iceberg_partitioned COMMAND test_bolt_iceberg_partitioned)
 set_tests_properties(test_bolt_iceberg_partitioned PROPERTIES TIMEOUT 300)
+add_test(NAME test_bolt_iceberg_partition_oracle
+         COMMAND ${BOLT_DML_ORACLE_CMD} ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_partition_interop.py
+                 $<TARGET_FILE:test_bolt_iceberg_partitioned> ${CMAKE_CURRENT_BINARY_DIR}/iceberg_partition_fixture)
+set_tests_properties(test_bolt_iceberg_partition_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 # Oracle tool (not a test): scan a filesystem-catalog Iceberg table with bolt's reader; see scripts/oracles/verify_v3_external.py.
 add_executable(bolt_iceberg_scan_dump bolt_iceberg_scan_dump.cpp)

@@ -830,3 +830,221 @@ TEST(IcebergPartitioned, UnknownTransformIsReadButNeverPrunes) {
     EXPECT_FALSE(append_commit(ah)) << "a writer must not commit under a spec with an unknown transform";
     EXPECT_EQ(table_last_commit_error(w.th), CommitError::kUnimplemented);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fixture for scripts/iceberg_partition_interop.py (BOLT_ICEBERG_PART_DIR): a wide table per (transform, source
+// type), a multi-field table, a spec-evolution table with a void field, and delete / overwrite / compaction tables.
+// The script recomputes every row from the same formula (wide_* below), so the two must change together.
+// ---------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+const char* kWideNames[] = {"id", "k", "s", "d", "ts", "i", "tz", "tm", "dec", "u", "b", "fx"};
+const char* kWideTypes[] = {"long", "long", "string", "date", "timestamp", "int", "timestamptz", "time",
+                            "decimal(9,2)", "uuid", "binary", "fixed[4]"};
+constexpr uint32_t kWide = 12;
+
+Schema wide_schema() {
+    Schema s{};
+    static SchemaField f[kWide]{};
+    s.fields = f;
+    s.cap_fields = kWide;
+    s.n_fields = kWide;
+    for (uint32_t i = 0; i < kWide; ++i) {
+        f[i] = SchemaField{};
+        f[i].id = static_cast<int32_t>(i + 1u);
+        f[i].required = i == 0u;
+        std::strcpy(f[i].name, kWideNames[i]);
+        std::strcpy(f[i].type, kWideTypes[i]);
+    }
+    return s;
+}
+
+bool wide_null(int64_t id, uint32_t col) {
+    static const int64_t mod[] = {0, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43};
+    static const int64_t rem[] = {0, 3, 5, 7, 9, 2, 4, 6, 8, 10, 12, 14};
+    return col != 0u && id % mod[col] == rem[col];
+}
+
+int64_t wide_int(int64_t id, uint32_t col) {
+    const int64_t d = -400 + id * 37;
+    switch (col) {
+        case 0: return id;
+        case 1: return id % 4;
+        case 3: return d;
+        case 4: return (wide_null(id, 3) ? 0 : d) * kDayUs + (id % 24) * INT64_C(3600000000) - 1;
+        case 5: return -50 + id * 3;
+        case 6: return INT64_C(1510871468000000) + (id - 30) * INT64_C(7777777777);
+        case 7: return (id * INT64_C(1234567891)) % INT64_C(86400000000);
+        case 8: return id * 137 - 3000;                                  // decimal unscaled, scale 2
+        default: return 0;
+    }
+}
+
+std::string wide_bytes(int64_t id, uint32_t col) {
+    std::string v;
+    if (col == 2) return (id % 3 == 0 ? std::string("caf\xC3\xA9-") : std::string("row-")) + std::to_string(id % 9) +
+                         (id % 2 ? "-tail-long-enough-to-spill" : "");
+    const int64_t n = col == 9 ? 16 : col == 10 ? id % 5 : 4;
+    for (int64_t j = 0; j < n; ++j)
+        v.push_back(static_cast<char>(col == 9 ? (id * 17 + j * 31) % 256 : col == 10 ? (id + j * 13) % 256 : (id * 3 + j) % 256));
+    return v;
+}
+
+void wide_batch(bolt::Arena* a, bolt::BoltBatch* b, int64_t lo, int64_t hi) {
+    const int64_t n = hi - lo;
+    bolt::BoltBatch::init_empty(b);
+    b->arena = a;
+    b->num_rows = n;
+    b->num_cols = kWide;
+    ASSERT_TRUE(bolt::BoltBatch::alloc_columns(b, a, kWide));
+    const bolt::BoltType bt[] = {bolt::BoltType::Int64, bolt::BoltType::Int64, bolt::BoltType::Utf8,
+                                 bolt::BoltType::Date32, bolt::BoltType::Timestamp, bolt::BoltType::Int32,
+                                 bolt::BoltType::Timestamp, bolt::BoltType::Int64, bolt::BoltType::Decimal128,
+                                 bolt::BoltType::UUID, bolt::BoltType::Binary, bolt::BoltType::Binary};
+    auto* cols = b->columns[b->read_epoch];
+    for (uint32_t c = 0; c < kWide; ++c) {
+        b->schema.add_field(kWideNames[c], bt[c], c != 0u);
+        auto* valid = static_cast<uint8_t*>(a->allocate_zeroed(static_cast<size_t>(n) / 8u + 2u));
+        bool any_null = false;
+        const bool view = bt[c] == bolt::BoltType::Utf8 || bt[c] == bolt::BoltType::Binary;
+        const size_t w = view ? sizeof(bolt::StringView) : bolt::type_size(bt[c]);
+        auto* data = static_cast<uint8_t*>(a->allocate_zeroed(static_cast<size_t>(n) * w + 16u));
+        std::string spill;
+        for (int64_t r = 0; r < n; ++r) {
+            const int64_t id = lo + r;
+            if (wide_null(id, c)) { any_null = true; continue; }
+            valid[r >> 3] |= static_cast<uint8_t>(1u << (r & 7));
+            if (view) {
+                const std::string s = wide_bytes(id, c);
+                bolt::StringView sv{};
+                sv.length = static_cast<uint32_t>(s.size());
+                std::memcpy(sv.prefix, s.data(), std::min<size_t>(s.size(), 12u));
+                if (s.size() > 12u) { sv.ref.buf_idx = 0; sv.ref.offset = static_cast<uint32_t>(spill.size()); spill += s; }
+                std::memcpy(data + r * w, &sv, w);
+            } else if (bt[c] == bolt::BoltType::UUID) {
+                std::memcpy(data + r * 16, wide_bytes(id, 9).data(), 16);
+            } else if (bt[c] == bolt::BoltType::Decimal128) {
+                const int64_t lo64 = wide_int(id, c), hi64 = lo64 < 0 ? -1 : 0;
+                std::memcpy(data + r * 16, &lo64, 8);
+                std::memcpy(data + r * 16 + 8, &hi64, 8);
+            } else {
+                const int64_t v = wide_int(id, c);
+                if (w == 4) { const int32_t x = static_cast<int32_t>(v); std::memcpy(data + r * 4, &x, 4); }
+                else std::memcpy(data + r * 8, &v, 8);
+            }
+        }
+        cols[c] = bolt::BoltColumn::make_flat(data, any_null ? valid : nullptr, n, bt[c]);
+        cols[c].stats.all_valid = !any_null;
+        if (bt[c] == bolt::BoltType::Decimal128) cols[c].decimal_scale = 2;
+        if (view) {
+            auto* sp = a->allocate_array<uint8_t>(spill.size() + 1u);
+            std::memcpy(sp, spill.data(), spill.size());
+            cols[c].str_overflow_base = sp;
+        }
+    }
+}
+
+void wide_append(Table* t, int64_t lo, int64_t hi) {
+    AppendHandle* ah = nullptr;
+    ASSERT_TRUE(append_open(&ah, t->th));
+    auto* b = new (t->arena.allocate(sizeof(bolt::BoltBatch), alignof(bolt::BoltBatch))) bolt::BoltBatch();
+    wide_batch(&t->arena, b, lo, hi);
+    ASSERT_TRUE(append_write(ah, b));
+    ASSERT_TRUE(append_commit(ah)) << static_cast<int>(table_last_commit_error(t->th));
+    append_close(ah);
+}
+
+void wide_create(Table* t, const std::string& root, const PartitionSpec& spec) {
+    t->root = root;
+    ASSERT_TRUE(filesystem_object_store_init(&t->fs, root.c_str(), &t->os));
+    Schema sch = wide_schema();
+    WriteOptions wo; write_options_init(&wo);
+    ASSERT_TRUE(table_create(&t->th, &t->arena, &t->os, root.c_str(), &sch, &spec, nullptr, &wo));
+}
+
+int32_t col_id(const char* name) {
+    for (uint32_t i = 0; i < kWide; ++i) if (std::strcmp(kWideNames[i], name) == 0) return static_cast<int32_t>(i + 1u);
+    return -1;
+}
+
+}  // namespace
+
+TEST(IcebergPartitionFixture, WriteTables) {
+    const char* dir = std::getenv("BOLT_ICEBERG_PART_DIR");
+    if (dir == nullptr || dir[0] == '\0') GTEST_SKIP() << "BOLT_ICEBERG_PART_DIR unset";
+    const std::string base(dir);
+    const struct { const char* t; const char* col; } single[] = {
+        {"identity", "k"}, {"identity", "i"}, {"identity", "s"}, {"identity", "d"}, {"identity", "ts"},
+        {"identity", "tz"}, {"identity", "tm"}, {"identity", "dec"}, {"identity", "u"}, {"identity", "b"},
+        {"identity", "fx"},
+        {"bucket[4]", "id"}, {"bucket[3]", "i"}, {"bucket[5]", "s"}, {"bucket[4]", "d"}, {"bucket[6]", "ts"},
+        {"bucket[4]", "tz"}, {"bucket[3]", "tm"}, {"bucket[4]", "dec"}, {"bucket[5]", "u"}, {"bucket[3]", "b"},
+        {"bucket[4]", "fx"},
+        {"truncate[10]", "id"}, {"truncate[7]", "i"}, {"truncate[3]", "s"}, {"truncate[2]", "b"},
+        {"truncate[50]", "dec"},
+        {"year", "d"}, {"month", "d"}, {"day", "d"}, {"year", "ts"}, {"month", "ts"}, {"day", "ts"}, {"hour", "ts"},
+        {"day", "tz"}, {"hour", "tz"}, {"month", "tz"},
+        {"void", "k"},
+    };
+    std::ofstream list(base + "/tables.txt");
+    for (const auto& sp : single) {
+        std::string name = std::string(sp.t) + "_" + sp.col;
+        for (char& c : name) if (c == '[' || c == ']') c = '_';
+        Table t;
+        wide_create(&t, fresh_root(base, name.c_str()), spec_of({pf(col_id(sp.col), sp.t, "p")}));
+        wide_append(&t, 0, 30);
+        wide_append(&t, 30, 60);
+        list << name << " single\n";
+    }
+    {
+        Table t;
+        wide_create(&t, fresh_root(base, "multi"), spec_of({pf(2, "identity", "k"), pf(1, "bucket[3]", "id_b"),
+                                                            pf(3, "truncate[2]", "s_t"), pf(4, "month", "d_m")}));
+        wide_append(&t, 0, 30);
+        wide_append(&t, 30, 60);
+        list << "multi multi\n";
+    }
+    {
+        Table t;
+        wide_create(&t, fresh_root(base, "evolve"), spec_of({pf(2, "identity", "k")}));
+        wide_append(&t, 0, 30);
+        const PartitionSpec next = spec_of({pf(2, "void", "k"), pf(5, "day", "ts_day")});
+        ASSERT_TRUE(table_update_partition_spec(t.th, &next));
+        wide_append(&t, 30, 60);
+        list << "evolve evolve\n";
+    }
+    const PartitionSpec dml = spec_of({pf(2, "identity", "k"), pf(1, "bucket[3]", "id_b")});
+    {
+        Table t;
+        wide_create(&t, fresh_root(base, "dml_delete"), dml);
+        wide_append(&t, 0, 30);
+        wide_append(&t, 30, 60);
+        Predicate k1 = pred_i64("k", PredicateOp::kEq, 1);
+        ASSERT_TRUE(table_delete(t.th, &k1));
+        Predicate ilt = pred_i64("i", PredicateOp::kLt, 25);
+        ASSERT_TRUE(table_delete(t.th, &ilt));
+        list << "dml_delete delete\n";
+    }
+    {
+        Table t;
+        wide_create(&t, fresh_root(base, "dml_overwrite"), dml);
+        wide_append(&t, 0, 30);
+        wide_append(&t, 30, 60);
+        bolt::BoltBatch b{};
+        wide_batch(&t.arena, &b, 100, 112);
+        Predicate s4 = pred_str("s", PredicateOp::kEq, "row-4");
+        ASSERT_TRUE(table_overwrite(t.th, &s4, &b));
+        list << "dml_overwrite overwrite\n";
+    }
+    {
+        Table t;
+        wide_create(&t, fresh_root(base, "dml_compact"), dml);
+        wide_append(&t, 0, 30);
+        wide_append(&t, 30, 60);
+        Predicate ilt = pred_i64("i", PredicateOp::kLt, 25);
+        ASSERT_TRUE(table_delete(t.th, &ilt));
+        ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+        list << "dml_compact compact\n";
+    }
+}

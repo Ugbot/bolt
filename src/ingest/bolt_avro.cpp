@@ -342,6 +342,57 @@ bool sx_key(void* c, const char* b, int32_t len) noexcept {
     return true;
 }
 
+// The value of a "type" key: a record splices at "fields", a container/fixed resolves at its object's end, a
+// primitive commits a leaf (or a union branch).
+bool sx_type_string(SchemaCtx* s, SFrame* f, const char* b, uint32_t ln) noexcept {
+    assert(s != nullptr && f != nullptr);
+    assert(b != nullptr || ln == 0u);
+    const bool is_rec = (ln == 6u && std::memcmp(b, "record", 6) == 0);
+    if (is_rec) { f->is_record = true; return true; }  // splices at "fields"
+    // Containers resolve at the END of their type object, once "items" /
+    // "values" has been seen (JSON key order is not guaranteed).
+    // item_type is NOT reset here: it defaults to opaque at frame push and
+    // "items"/"values" may already have refined it (JSON key order is
+    // free, and resetting it silently un-modelled every such schema).
+    if (ln == 5u && std::memcmp(b, "array", 5) == 0) {
+        f->complex_kind = kCplxArray;
+        return true;
+    }
+    if (ln == 3u && std::memcmp(b, "map", 3) == 0) {
+        f->complex_kind = kCplxMap;
+        return true;
+    }
+    if (ln == 5u && std::memcmp(b, "fixed", 5) == 0) {
+        // Committed at the end of the object, once "size" is known (JSON key order is free).
+        if (f->kind != kFrObj) { s->ok = false; return true; }
+        f->is_fixed = true;
+        return true;
+    }
+    AvroType t = AvroType::kNull;
+    if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
+    // A union branch written as a type object ({"type":"int",
+    // "logicalType":"date"}) is a branch like "int", not a field: Iceberg
+    // declares every optional date/timestamp partition value this way.
+    if (f->kind == kFrObj && s->sp > 0u &&
+        s->st[s->sp - 1u].kind == kFrUnion) {
+        SFrame* u = &s->st[s->sp - 1u];
+        if (t == AvroType::kNull || u->union_have_type) {
+            s->ok = false;           // a second typed branch: not modelled
+            return true;
+        }
+        u->union_type      = t;
+        u->union_have_type = true;
+        if (u->union_n < 0xFEu) ++u->union_n;
+        return true;
+    }
+    bool crossed_union = false;
+    const int32_t fi = sx_enclosing_field(s, &crossed_union);
+    if (fi < 0) return true;         // a "type" outside any field
+    sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u,
+                   /*item_type=*/0u);
+    return true;
+}
+
 bool sx_string(void* c, const char* b, int32_t len) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* f = sx_top(s);
@@ -388,50 +439,7 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
 
     if (f->last_key == kKeyType) {
         f->last_key = kKeyNone;
-        const bool is_rec = (ln == 6u && std::memcmp(b, "record", 6) == 0);
-        if (is_rec) { f->is_record = true; return true; }  // splices at "fields"
-        // Containers resolve at the END of their type object, once "items" /
-        // "values" has been seen (JSON key order is not guaranteed).
-        // item_type is NOT reset here: it defaults to opaque at frame push and
-        // "items"/"values" may already have refined it (JSON key order is
-        // free, and resetting it silently un-modelled every such schema).
-        if (ln == 5u && std::memcmp(b, "array", 5) == 0) {
-            f->complex_kind = kCplxArray;
-            return true;
-        }
-        if (ln == 3u && std::memcmp(b, "map", 3) == 0) {
-            f->complex_kind = kCplxMap;
-            return true;
-        }
-        if (ln == 5u && std::memcmp(b, "fixed", 5) == 0) {
-            // Committed at the end of the object, once "size" is known (JSON key order is free).
-            if (f->kind != kFrObj) { s->ok = false; return true; }
-            f->is_fixed = true;
-            return true;
-        }
-        AvroType t = AvroType::kNull;
-        if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
-        // A union branch written as a type object ({"type":"int",
-        // "logicalType":"date"}) is a branch like "int", not a field: Iceberg
-        // declares every optional date/timestamp partition value this way.
-        if (f->kind == kFrObj && s->sp > 0u &&
-            s->st[s->sp - 1u].kind == kFrUnion) {
-            SFrame* u = &s->st[s->sp - 1u];
-            if (t == AvroType::kNull || u->union_have_type) {
-                s->ok = false;           // a second typed branch: not modelled
-                return true;
-            }
-            u->union_type      = t;
-            u->union_have_type = true;
-            if (u->union_n < 0xFEu) ++u->union_n;
-            return true;
-        }
-        bool crossed_union = false;
-        const int32_t fi = sx_enclosing_field(s, &crossed_union);
-        if (fi < 0) return true;         // a "type" outside any field
-        sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u,
-                       /*item_type=*/0u);
-        return true;
+        return sx_type_string(s, f, b, ln);
     }
     return true;
 }

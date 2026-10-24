@@ -367,6 +367,26 @@ const char* bolt_type_iceberg_name(BoltType t) noexcept {
     }
 }
 
+// The Parquet column for the Iceberg types beyond the basic ones (G2ICE-292): binary, uuid, fixed[L], decimal(P,S),
+// time. Strings and anything unlisted keep the Utf8 default; an unparseable fixed/decimal fails the write.
+bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, BoltType* bt) noexcept {
+    assert(t != nullptr && c != nullptr && bt != nullptr);
+    IcebergTypeInfo info{};
+    if (!iceberg_type_parse(t, &info)) return true;                       // nested / unknown: the legacy default
+    switch (info.type) {
+        case IcebergType::kBinary: *bt = BoltType::Binary; return true;
+        case IcebergType::kUuid:   *bt = BoltType::UUID; return true;
+        case IcebergType::kFixed:  *bt = BoltType::Binary; c->fixed_len = info.fixed_len; return true;
+        case IcebergType::kTime:   *bt = BoltType::Int64; c->time_micros = true; return true;
+        case IcebergType::kDecimal:
+            *bt = BoltType::Decimal128;
+            c->precision = info.precision;
+            c->scale = info.scale;
+            return true;
+        default: return true;
+    }
+}
+
 // Fills `po` for `sch`. A schema wider than the inline descriptor array
 // uses `wide` as its storage, so `wide` must outlive the writer open.
 bool make_pq_opts(const Schema* sch, const WriteOptions* w,
@@ -391,7 +411,9 @@ bool make_pq_opts(const Schema* sch, const WriteOptions* w,
         else if (std::strcmp(t, "float") == 0)   bt = BoltType::Float32;
         else if (std::strcmp(t, "boolean") == 0) bt = BoltType::Bool;
         else if (std::strcmp(t, "date") == 0)    bt = BoltType::Date32;
-        else if (std::strcmp(t, "timestamp") == 0) bt = BoltType::Timestamp;
+        else if (std::strcmp(t, "timestamp") == 0) { bt = BoltType::Timestamp; cols[i].ts_local = true; }
+        else if (std::strcmp(t, "timestamptz") == 0) bt = BoltType::Timestamp;
+        else if (!pq_iceberg_type(t, &cols[i], &bt)) return false;
         cols[i].type     = bt;
         cols[i].nullable = !sch->fields[i].required;
         cols[i].has_field_id = true;
@@ -1416,24 +1438,8 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
         pos[i] = dels[i].pos;
     }
     // Sorted by file_path then pos (spec: "Position Delete Files"), then one delete file per partition (G2ICE-292).
-    auto* order = a->allocate_array<uint32_t>(n);
-    auto* sp = a->allocate_array<const char*>(n);
-    auto* spos = a->allocate_array<int64_t>(n);
-    if (order == nullptr || sp == nullptr || spos == nullptr) return false;
-    for (uint32_t i = 0; i < n; ++i) order[i] = i;
-    for (uint32_t gap = n / 2u; gap > 0u; gap /= 2u)                      // shell sort: bounded, no recursion
-        for (uint32_t i = gap; i < n; ++i) {
-            const uint32_t x = order[i];
-            uint32_t j = i;
-            while (j >= gap) {
-                const int c = std::strcmp(paths[order[j - gap]], paths[x]);
-                if (c < 0 || (c == 0 && pos[order[j - gap]] <= pos[x])) break;
-                order[j] = order[j - gap];
-                j -= gap;
-            }
-            order[j] = x;
-        }
-    for (uint32_t i = 0; i < n; ++i) { sp[i] = paths[order[i]]; spos[i] = pos[order[i]]; }   // bounded by n
+    const char** sp = nullptr; int64_t* spos = nullptr;
+    if (!sort_position_deletes(a, paths, pos, n, &sp, &spos)) return false;
     LiveData live{};
     if (!live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);
