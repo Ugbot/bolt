@@ -4,37 +4,46 @@
 namespace {
 
 struct DmlOutputs {
-    DataFileRef del;
-    DataFileRef dat;
-    char        del_rel[128];
-    char        dat_rel[128];
-    bool        has_del;
-    bool        has_dat;
+    DataFileRef* dels;
+    char         (*del_rels)[128];
+    uint32_t     n_dels;
+    uint32_t     n_dats;
+    DataFileRef* dats;
+    char         (*dat_rels)[128];
 };
 
 void dml_complete(TableHandle* th, const DmlOutputs* o, bool committed) noexcept {
     assert(th != nullptr && o != nullptr);
-    if (o->has_del) data_file_complete(th, o->del_rel, committed);
-    if (o->has_dat) data_file_complete(th, o->dat_rel, committed);
+    for (uint32_t i = 0; i < o->n_dels; ++i) data_file_complete(th, o->del_rels[i], committed);   // bounded by n_dels
+    for (uint32_t i = 0; i < o->n_dats; ++i) data_file_complete(th, o->dat_rels[i], committed);   // bounded by n_dats
 }
 
-// Write the position-delete file and the new data file this change needs.
+// The added rows' data files: one, or one per tuple of the default spec when the table is partitioned (G2ICE-292).
+bool dml_add_files(TableHandle* th, int64_t snap_id, const BoltBatch* add, DmlOutputs* o) noexcept {
+    assert(th != nullptr && add != nullptr && o != nullptr);
+    const PartitionSpec* spec = metadata_spec(&th->meta, th->meta.current_spec_id);
+    const BoltBatch* one[1] = {add};
+    if (spec != nullptr && spec->n_fields != 0u)
+        return write_partitioned_files(th, spec, one, 1u, snap_id, &o->dats, &o->dat_rels, &o->n_dats);
+    o->dats = th->arena->allocate_array<DataFileRef>(1);
+    o->dat_rels = th->arena->allocate_array<char[128]>(1);
+    if (o->dats == nullptr || o->dat_rels == nullptr) return false;
+    if (!dml_data_file(th, snap_id, add, o->dat_rels[0], &o->dats[0])) return false;
+    o->n_dats = 1;
+    return true;
+}
+
+// Write the position-delete files and the new data files this change needs.
 bool dml_write_outputs(TableHandle* th, int64_t snap_id, const char* const* del_paths, const int64_t* del_pos,
-                       uint32_t n_del, const BoltBatch* add, DmlOutputs* o) noexcept {
-    assert(th != nullptr && o != nullptr);
+                       uint32_t n_del, const BoltBatch* add, const LiveData* live, DmlOutputs* o) noexcept {
+    assert(th != nullptr && o != nullptr && live != nullptr);
     assert(snap_id > 0);
     *o = DmlOutputs{};
-    if (n_del != 0) {
-        BoltBatch b{};
-        if (!pos_delete_batch(th->arena, del_paths, del_pos, n_del, &b)) return false;
-        if (!write_pos_delete_batch(th, snap_id, &b, o->del_rel, &o->del)) return false;
-        o->has_del = true;
-    }
-    if (add != nullptr && add->num_rows > 0) {
-        if (!dml_data_file(th, snap_id, add, o->dat_rel, &o->dat)) { dml_complete(th, o, false); return false; }
-        o->has_dat = true;
-    }
-    return true;
+    bool ok = n_del == 0 || write_grouped_deletes(th, snap_id, del_paths, del_pos, n_del, live, &o->dels,
+                                                  &o->del_rels, &o->n_dels);
+    ok = ok && (add == nullptr || add->num_rows <= 0 || dml_add_files(th, snap_id, add, o));
+    if (!ok) dml_complete(th, o, false);
+    return ok;
 }
 
 // The predicate names a column of the current schema (checked even when the table has no rows to read).
@@ -57,8 +66,6 @@ bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, Sn
     }
     if (!pred_column_known(th, pred)) return false;
     if (!handle_is_current(th)) return false;
-    const PartitionSpec* spec = metadata_spec(&th->meta, th->meta.current_spec_id);
-    if (spec != nullptr && spec->n_fields != 0) return refuse_named(th, "a delete or overwrite of a partitioned table");
     DmlPlan plan{th, nullptr, 0, 0};
     Arena* ra = scratch_arena(th);
     if (ra == nullptr) return false;
@@ -71,18 +78,20 @@ bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, Sn
     if ((add == nullptr || add->num_rows == 0) && n_rm == 0 && n_del == 0) { th->last_error = CommitError::kNone; return true; }
     if (th->file_io != nullptr && n_del != 0 && add != nullptr && add->num_rows > 0)
         return refuse_named(th, "an overwrite that also writes position deletes through FileWriteIO (one staged file per commit)");
+    LiveData live{};
+    if (n_del != 0 && !live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);
     DmlOutputs o{};
-    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &o)) return false;
+    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &live, &o)) return false;
     ChangeSet cs{};
     cs.op = op;
     cs.snap_id = snap_id;
     cs.rm_data = rm;
     cs.n_rm_data = n_rm;
-    cs.add_dels = o.has_del ? &o.del : nullptr;
-    cs.n_add_dels = o.has_del ? 1u : 0u;
-    cs.add_data = o.has_dat ? &o.dat : nullptr;
-    cs.n_add_data = o.has_dat ? 1u : 0u;
+    cs.add_dels = o.dels;
+    cs.n_add_dels = o.n_dels;
+    cs.add_data = o.dats;
+    cs.n_add_data = o.n_dats;
     const bool committed = commit_change(th, &cs);
     dml_complete(th, &o, committed);
     return committed;

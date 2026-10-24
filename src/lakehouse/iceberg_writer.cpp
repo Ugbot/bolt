@@ -1391,6 +1391,7 @@ bool position_delete_schema(Arena* a, Schema* out) noexcept {
 }  // namespace
 
 #include "iceberg_dml.inc"
+#include "iceberg_dml_partition.inc"
 #include "iceberg_dml_ops.inc"
 #include "iceberg_compact.inc"
 
@@ -1414,14 +1415,32 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
         paths[i] = dels[i].file_path;
         pos[i] = dels[i].pos;
     }
+    // Sorted by file_path then pos (spec: "Position Delete Files"), then one delete file per partition (G2ICE-292).
+    auto* order = a->allocate_array<uint32_t>(n);
+    auto* sp = a->allocate_array<const char*>(n);
+    auto* spos = a->allocate_array<int64_t>(n);
+    if (order == nullptr || sp == nullptr || spos == nullptr) return false;
+    for (uint32_t i = 0; i < n; ++i) order[i] = i;
+    for (uint32_t gap = n / 2u; gap > 0u; gap /= 2u)                      // shell sort: bounded, no recursion
+        for (uint32_t i = gap; i < n; ++i) {
+            const uint32_t x = order[i];
+            uint32_t j = i;
+            while (j >= gap) {
+                const int c = std::strcmp(paths[order[j - gap]], paths[x]);
+                if (c < 0 || (c == 0 && pos[order[j - gap]] <= pos[x])) break;
+                order[j] = order[j - gap];
+                j -= gap;
+            }
+            order[j] = x;
+        }
+    for (uint32_t i = 0; i < n; ++i) { sp[i] = paths[order[i]]; spos[i] = pos[order[i]]; }   // bounded by n
+    LiveData live{};
+    if (!live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);
-    BoltBatch b{};
-    if (!pos_delete_batch(a, paths, pos, n, &b)) return false;
-    char rel[128];
-    DataFileRef df{};
-    if (!write_pos_delete_batch(th, snap_id, &b, rel, &df)) return false;
-    const bool committed = publish_snapshot(th, &df, 1, SnapshotOp::kDelete, snap_id);
-    data_file_complete(th, rel, committed);
+    DataFileRef* dfs = nullptr; char (*rels)[128] = nullptr; uint32_t nd = 0;
+    bool committed = write_grouped_deletes(th, snap_id, sp, spos, n, &live, &dfs, &rels, &nd);
+    committed = committed && publish_snapshot(th, dfs, nd, SnapshotOp::kDelete, snap_id);
+    for (uint32_t i = 0; i < nd; ++i) data_file_complete(th, rels[i], committed);   // bounded by nd
     return committed;
 }
 

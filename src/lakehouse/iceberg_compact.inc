@@ -9,13 +9,25 @@
 // targets are all candidates (or files no longer live), since those deletes are now applied, and adds the outputs.
 // Equality-delete files are kept: they may still apply to other files, and the outputs' higher sequence number keeps
 // them from applying again. Row groups of the outputs are the scan's row groups (not re-chunked).
+//
+// Partitioned tables (G2ICE-292): files are only merged within one (spec, partition tuple). Candidates are grouped by
+// it; the two-files-or-a-delete rule applies per group, each group is read and written on its own, and its outputs
+// carry the group's spec id and tuple (a file never moves to another spec by being compacted).
 
 namespace {
 
 struct LiveFile {
-    const char* path;
-    int64_t     size;
-    int64_t     rows;
+    const char*        path;
+    int64_t            size;
+    int64_t            rows;
+    const DataFileRef* ref;          // its manifest entry (spec id and partition tuple), in the table arena
+};
+
+// The data files one position-delete file names.
+struct DelTargets {
+    const char** t;
+    uint32_t     n;
+    uint32_t     _pad;
 };
 
 struct CompactPlan {
@@ -26,10 +38,16 @@ struct CompactPlan {
     const char** cand;
     int64_t*     cand_size;
     uint8_t*     cand_dels;
+    uint32_t*    cand_group;         // (spec, tuple) group of each candidate
+    const DataFileRef** cand_ref;
     uint32_t     n_cand;
     uint32_t     n_cand_dels;
+    uint32_t     n_groups;
+    uint32_t     cur_group;          // the group being rewritten (compact_keep reads only its files)
+    const DataFileRef** group_like;
     RmIndex      cand_ix;
     RmIndex      live_ix;
+    DelTargets*  targets;            // per position-delete file
     const char** rm_dels;
     uint32_t     n_rm_dels;
     uint32_t     _pad;
@@ -38,7 +56,7 @@ struct CompactPlan {
 bool push_live(Arena* a, LiveFile** arr, uint32_t* n, uint32_t* cap, const DataFileRef& e) noexcept {
     assert(a != nullptr && arr != nullptr && n != nullptr);
     if (!lake_grow(a, nullptr, arr, *n, cap, *n + 1u)) return false;
-    (*arr)[(*n)++] = LiveFile{e.file_path, e.stats.file_size_in_bytes, e.stats.record_count};
+    (*arr)[(*n)++] = LiveFile{e.file_path, e.stats.file_size_in_bytes, e.stats.record_count, &e};
     return true;
 }
 
@@ -62,16 +80,41 @@ bool compact_collect(TableHandle* th, CompactPlan* p) noexcept {
     return true;
 }
 
+// Group of a candidate: same spec id and the same tuple.
+int64_t cand_group_of(TableHandle* th, CompactPlan* p, SwissTableGrowable* ix, const DataFileRef* e) noexcept {
+    assert(th != nullptr && p != nullptr && ix != nullptr && e != nullptr);
+    uint64_t key = tuple_hash(e->partition, e->n_partition, e->partition_spec_id);
+    for (uint32_t probe = 0; probe <= p->n_groups; ++probe, ++key) {      // bounded: one probe per existing group
+        const int32_t g = ix->find(key);
+        if (g < 0) break;
+        const DataFileRef* o = p->group_like[g];
+        if (o->partition_spec_id == e->partition_spec_id && o->n_partition == e->n_partition &&
+            tuple_equal(o->partition, e->partition, e->n_partition)) return g;
+    }
+    if (!ix->insert(key, p->n_groups)) return -1;
+    p->group_like[p->n_groups] = e;
+    return static_cast<int64_t>(p->n_groups++);
+}
+
 bool compact_candidates(TableHandle* th, CompactPlan* p, int64_t target) noexcept {
     assert(th != nullptr && p != nullptr && target > 0);
     Arena* a = th->arena;
     p->cand = a->allocate_array<const char*>(p->n_data + 1u);
     p->cand_size = a->allocate_array<int64_t>(p->n_data + 1u);
+    p->cand_group = a->allocate_array<uint32_t>(p->n_data + 1u);
+    p->cand_ref = a->allocate_array<const DataFileRef*>(p->n_data + 1u);
+    p->group_like = a->allocate_array<const DataFileRef*>(p->n_data + 1u);
     auto* live = a->allocate_array<const char*>(p->n_data + 1u);
-    if (p->cand == nullptr || p->cand_size == nullptr || live == nullptr) return false;
+    SwissTableGrowable ix{};
+    if (p->cand == nullptr || p->cand_size == nullptr || p->cand_group == nullptr || p->cand_ref == nullptr ||
+        p->group_like == nullptr || live == nullptr || !SwissTableGrowable::create(&ix, 16u, a)) return false;
     for (uint32_t i = 0; i < p->n_data; ++i) {                  // bounded by n_data
         live[i] = p->data[i].path;
         if (p->data[i].size >= target / 2) continue;
+        const int64_t g = cand_group_of(th, p, &ix, p->data[i].ref);
+        if (g < 0) return false;
+        p->cand_group[p->n_cand] = static_cast<uint32_t>(g);
+        p->cand_ref[p->n_cand] = p->data[i].ref;
         p->cand_size[p->n_cand] = p->data[i].size;
         p->cand[p->n_cand++] = p->data[i].path;
     }
@@ -80,21 +123,60 @@ bool compact_candidates(TableHandle* th, CompactPlan* p, int64_t target) noexcep
            rm_index_build(a, live, p->n_data, &p->live_ix);
 }
 
-// Which candidates have position deletes, and which position-delete files the rewrite fully applies.
+// Read every position-delete file's targets and mark the candidates with deletes.
 bool compact_deletes(TableHandle* th, Arena* ra, CompactPlan* p) noexcept {
     assert(th != nullptr && ra != nullptr && p != nullptr);
-    p->rm_dels = th->arena->allocate_array<const char*>(p->n_pos + 1u);
-    if (p->rm_dels == nullptr) return false;
+    p->targets = th->arena->allocate_array<DelTargets>(p->n_pos + 1u);
+    if (p->targets == nullptr) return false;
     for (uint32_t d = 0; d < p->n_pos; ++d) {                   // bounded by n_pos
         const uint8_t* body = nullptr; uint64_t len = 0;
         if (os_get(th->os, store_key_for(th->root, p->pos[d].path), ra, &body, &len) != kOsOk) return false;
-        const char** t = nullptr; uint32_t nt = 0;
-        if (!dml::position_delete_targets(ra, body, len, &t, &nt)) return false;
+        DelTargets& dt = p->targets[d];
+        dt = DelTargets{};
+        if (!dml::position_delete_targets(ra, body, len, &dt.t, &dt.n)) return false;
+        for (uint32_t k = 0; k < dt.n; ++k) {                   // bounded by n
+            const int64_t c = rm_index_find(&p->cand_ix, dt.t[k]);
+            if (c >= 0 && p->cand_dels[c] == 0) { p->cand_dels[c] = 1; ++p->n_cand_dels; }
+        }
+    }
+    return true;
+}
+
+// Keep only the candidates of groups worth rewriting (two or more files, or one with position deletes); returns the
+// number of such groups.
+bool compact_select(TableHandle* th, CompactPlan* p, uint32_t* n_worth) noexcept {
+    assert(th != nullptr && p != nullptr && n_worth != nullptr);
+    auto* files = static_cast<uint32_t*>(th->arena->allocate_zeroed((p->n_groups + 1u) * sizeof(uint32_t)));
+    auto* dels = static_cast<uint8_t*>(th->arena->allocate_zeroed(p->n_groups + 1u));
+    if (files == nullptr || dels == nullptr) return false;
+    for (uint32_t i = 0; i < p->n_cand; ++i) { ++files[p->cand_group[i]]; dels[p->cand_group[i]] |= p->cand_dels[i]; }
+    *n_worth = 0;
+    for (uint32_t g = 0; g < p->n_groups; ++g) *n_worth += (files[g] >= 2u || dels[g] != 0u) ? 1u : 0u;   // bounded
+    uint32_t w = 0;
+    p->n_cand_dels = 0;
+    for (uint32_t i = 0; i < p->n_cand; ++i) {                  // bounded by n_cand
+        const uint32_t g = p->cand_group[i];
+        if (files[g] < 2u && dels[g] == 0u) continue;
+        p->cand[w] = p->cand[i]; p->cand_size[w] = p->cand_size[i]; p->cand_group[w] = g;
+        p->cand_ref[w] = p->cand_ref[i]; p->cand_dels[w] = p->cand_dels[i];
+        p->n_cand_dels += p->cand_dels[i];
+        ++w;
+    }
+    p->n_cand = w;
+    return rm_index_build(th->arena, p->cand, p->n_cand, &p->cand_ix);
+}
+
+// The position-delete files the rewrite fully applies: every target is rewritten (or no longer live), and one is.
+bool compact_applied(TableHandle* th, CompactPlan* p) noexcept {
+    assert(th != nullptr && p != nullptr);
+    p->rm_dels = th->arena->allocate_array<const char*>(p->n_pos + 1u);
+    if (p->rm_dels == nullptr) return false;
+    for (uint32_t d = 0; d < p->n_pos; ++d) {                   // bounded by n_pos
         bool applied = true, reaches = false;
-        for (uint32_t k = 0; k < nt; ++k) {                     // bounded by nt
-            const int64_t c = rm_index_find(&p->cand_ix, t[k]);
-            if (c >= 0) { reaches = true; if (p->cand_dels[c] == 0) { p->cand_dels[c] = 1; ++p->n_cand_dels; } continue; }
-            if (rm_index_find(&p->live_ix, t[k]) >= 0) applied = false;   // still deletes rows of a file we keep
+        for (uint32_t k = 0; k < p->targets[d].n; ++k) {        // bounded by n
+            const char* t = p->targets[d].t[k];
+            if (rm_index_find(&p->cand_ix, t) >= 0) { reaches = true; continue; }
+            if (rm_index_find(&p->live_ix, t) >= 0) applied = false;   // still deletes rows of a file we keep
         }
         if (applied && reaches) p->rm_dels[p->n_rm_dels++] = p->pos[d].path;
     }
@@ -124,7 +206,8 @@ struct CompactOut {
 bool compact_keep(void* c, const DataFileRef* e) noexcept {
     const auto* p = static_cast<const CompactPlan*>(c);
     assert(p != nullptr && e != nullptr);
-    return rm_index_find(&p->cand_ix, e->file_path) >= 0;
+    const int64_t k = rm_index_find(&p->cand_ix, e->file_path);
+    return k >= 0 && p->cand_group[k] == p->cur_group;
 }
 
 bool compact_close(CompactOut* o) noexcept {
@@ -144,7 +227,10 @@ bool compact_close(CompactOut* o) noexcept {
     df = DataFileRef{};
     df.status = ManifestStatus::kAdded;
     df.content = FileContent::kData;
-    df.partition_spec_id = th->meta.current_spec_id;
+    const DataFileRef* like = o->plan->group_like[o->plan->cur_group];   // the group's spec and tuple
+    df.partition_spec_id = like->partition_spec_id;
+    df.n_partition = like->n_partition;
+    std::memcpy(df.partition, like->partition, sizeof(PartitionValue) * like->n_partition);
     df.snapshot_id = o->snap_id;
     if (!abs_location(th->root, o->rel, df.file_path, sizeof(df.file_path))) return false;
     df.stats.record_count = o->rows;
@@ -208,7 +294,17 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
     o.plan = p;
     o.snap_id = mint_snapshot_id(th);
     o.target = target;
-    bool ok = dml_read(th, ra, nullptr, compact_keep, p, compact_visit, &o) && compact_close(&o);
+    bool ok = true;
+    auto* worth = static_cast<uint8_t*>(th->arena->allocate_zeroed(p->n_groups + 1u));
+    if (worth == nullptr) return false;
+    for (uint32_t i = 0; i < p->n_cand; ++i) worth[p->cand_group[i]] = 1u;   // bounded by n_cand
+    for (uint32_t g = 0; g < p->n_groups && ok; ++g) {          // one read per group: outputs never mix partitions
+        if (worth[g] == 0u) continue;
+        p->cur_group = g;
+        o.cur_path = nullptr;
+        o.in_bytes = 0;
+        ok = dml_read(th, ra, nullptr, compact_keep, p, compact_visit, &o) && compact_close(&o);
+    }
     if (!ok) {
         if (th->last_error == CommitError::kNone) th->last_error = CommitError::kFailed;
         compact_discard(&o);
@@ -233,18 +329,17 @@ bool compact_table(TableHandle* th, int64_t target) noexcept {
     th->last_error = CommitError::kFailed;
     if (target <= 1) return false;
     if (!handle_is_current(th)) return false;
-    const PartitionSpec* spec = metadata_spec(&th->meta, th->meta.current_spec_id);
-    if (spec != nullptr && spec->n_fields != 0) return refuse_named(th, "compacting a partitioned table");
     if (th->meta.current_snapshot_id <= 0) { th->last_error = CommitError::kNone; return true; }
     CompactPlan p{};
     if (!compact_collect(th, &p) || !compact_candidates(th, &p, target)) return false;
     Arena* ra = scratch_arena(th);
     if (ra == nullptr) return false;
-    bool ok = compact_deletes(th, ra, &p);
+    uint32_t n_worth = 0;
+    bool ok = compact_deletes(th, ra, &p) && compact_select(th, &p, &n_worth) && compact_applied(th, &p);
     int64_t in_bytes = 0;
     for (uint32_t i = 0; i < p.n_cand; ++i) in_bytes += p.cand_size[i];   // bounded by n_cand
-    const bool worth = p.n_cand >= 2u || p.n_cand_dels != 0;
-    if (ok && worth && th->file_io != nullptr && in_bytes > target) {
+    const bool worth = n_worth != 0u;
+    if (ok && worth && th->file_io != nullptr && (in_bytes > target || n_worth > 1u)) {
         ra->~Arena();
         return refuse_named(th, "a compaction into more than one file through FileWriteIO (one staged file per commit)");
     }

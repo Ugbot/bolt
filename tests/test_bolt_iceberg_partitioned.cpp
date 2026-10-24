@@ -459,3 +459,162 @@ TEST(IcebergPartitioned, EveryTransformOnEverySourceType) {
         expect_files_match_rows(&t);
     }
 }
+
+namespace {
+
+Predicate pred_i64(const char* col, PredicateOp op, int64_t v) {
+    Predicate p{};
+    std::strncpy(p.column, col, sizeof(p.column) - 1u);
+    p.op = op;
+    p.value.type = bolt::BoltType::Int64;
+    p.value.i64 = v;
+    return p;
+}
+
+Predicate pred_str(const char* col, PredicateOp op, const std::string& v) {
+    Predicate p{};
+    std::strncpy(p.column, col, sizeof(p.column) - 1u);
+    p.op = op;
+    p.value.type = bolt::BoltType::Utf8;
+    std::memcpy(p.value.str, v.data(), v.size());
+    p.value.str_len = static_cast<uint32_t>(v.size());
+    return p;
+}
+
+// Every position-delete file's spec and tuple is that of a live data file, and no two delete files of one commit
+// share a (spec, tuple).
+void expect_deletes_scoped(Table* t) {
+    std::set<std::string> data_tuples;
+    std::map<int64_t, std::set<std::string>> per_snapshot;
+    for (const LiveFile& lf : live_files(t)) {
+        const std::string key = std::to_string(lf.ref.partition_spec_id) + "/" + recorded_tuple(lf.ref);
+        if (lf.ref.content == FileContent::kData) { data_tuples.insert(key); continue; }
+        ASSERT_EQ(lf.mle.content, ManifestContent::kDeleteManifest);
+        EXPECT_EQ(lf.mle.partition_spec_id, lf.ref.partition_spec_id);
+        EXPECT_TRUE(per_snapshot[lf.ref.snapshot_id].insert(key).second) << "two delete files of one partition";
+    }
+    for (const auto& [snap, keys] : per_snapshot)
+        for (const std::string& k : keys) EXPECT_TRUE(data_tuples.count(k)) << "delete file of " << k << " has no data file";
+}
+
+uint32_t count_content(Table* t, FileContent c) {
+    uint32_t n = 0;
+    for (const LiveFile& lf : live_files(t)) n += lf.ref.content == c ? 1u : 0u;
+    return n;
+}
+
+}  // namespace
+
+TEST(IcebergPartitioned, DeleteOverwriteAndCompactWorkPerPartition) {
+    Table t;
+    const PartitionSpec spec = spec_of({pf(2, "identity", "k"), pf(1, "bucket[3]", "id_b")});
+    create_table(&t, fresh_root(temp_base(), "dml"), spec);
+    std::vector<Row> all = rows_of(0, 40);
+    append_rows(&t, rows_of(0, 20));
+    append_rows(&t, rows_of(20, 40));
+    // k = 1 holds whole files: they are removed, no delete file.
+    Predicate k1 = pred_i64("k", PredicateOp::kEq, 1);
+    ASSERT_TRUE(table_delete(t.th, &k1));
+    EXPECT_EQ(count_content(&t, FileContent::kPositionDeletes), 0u);
+    auto gone = [](const Row& r) { return r.k == 1; };
+    EXPECT_EQ(scan_rows(t.root), model(all, gone));
+    // i < 25 (ids < 25) matches all of the first append's files and parts of the second's, in several partitions:
+    // one delete file per partition.
+    Predicate ilt = pred_i64("i", PredicateOp::kLt, 25);
+    ASSERT_TRUE(table_delete(t.th, &ilt)) << static_cast<int>(table_last_commit_error(t.th));
+    auto gone2 = [](const Row& r) { return r.k == 1 || (r.i != kNull && r.i < 25); };
+    EXPECT_EQ(scan_rows(t.root), model(all, gone2));
+    EXPECT_GT(count_content(&t, FileContent::kPositionDeletes), 1u);
+    expect_deletes_scoped(&t);
+    // Overwrite: delete s = 'row-4' (partial) and add rows that land in several partitions.
+    const std::vector<Row> add = rows_of(100, 112);
+    bolt::BoltBatch b{};
+    make_batch(&t.arena, &b, add);
+    Predicate s4 = pred_str("s", PredicateOp::kEq, "row-4");
+    ASSERT_TRUE(table_overwrite(t.th, &s4, &b));
+    all.insert(all.end(), add.begin(), add.end());
+    auto gone3 = [](const Row& r) { return (r.id < 100 && (r.k == 1 || (r.i != kNull && r.i < 25))) || r.s == "row-4"; };
+    EXPECT_EQ(scan_rows(t.root), model(all, gone3));
+    expect_deletes_scoped(&t);
+    expect_files_match_rows(&t);
+    // Compaction merges within each (spec, tuple) only, applies the deletes, keeps the rows.
+    ASSERT_TRUE(table_compact(t.th, 64ll << 20)) << static_cast<int>(table_last_commit_error(t.th));
+    EXPECT_EQ(scan_rows(t.root), model(all, gone3));
+    expect_files_match_rows(&t);
+    std::map<std::string, uint32_t> per_tuple;
+    for (const LiveFile& lf : live_files(&t))
+        if (lf.ref.content == FileContent::kData) ++per_tuple[recorded_tuple(lf.ref)];
+    for (const auto& [tuple, n] : per_tuple) EXPECT_EQ(n, 1u) << tuple << " was not compacted into one file";
+    EXPECT_EQ(count_content(&t, FileContent::kPositionDeletes), 0u) << "every delete was applied by the rewrite";
+}
+
+TEST(IcebergPartitioned, PositionDeletesByPathAreScopedToTheirPartition) {
+    Table t;
+    create_table(&t, fresh_root(temp_base(), "posdel"), spec_of({pf(2, "identity", "k")}));
+    append_rows(&t, rows_of(0, 30));
+    std::vector<PositionDeleteEntry> dels;
+    for (const LiveFile& lf : live_files(&t)) {
+        PositionDeleteEntry e{};
+        std::strncpy(e.file_path, lf.ref.file_path, sizeof(e.file_path) - 1u);
+        e.pos = 0;
+        dels.push_back(e);
+    }
+    ASSERT_GT(dels.size(), 1u);
+    ASSERT_TRUE(table_delete_positions(t.th, dels.data(), static_cast<uint32_t>(dels.size())));
+    EXPECT_EQ(count_content(&t, FileContent::kPositionDeletes), static_cast<uint32_t>(dels.size()));
+    expect_deletes_scoped(&t);
+    // The first row (in file order) of each k is gone.
+    std::set<int64_t> first;
+    std::set<int64_t> seen;
+    for (const Row& r : rows_of(0, 30)) if (seen.insert(r.k).second) first.insert(r.id);
+    const std::vector<Row> got = scan_rows(t.root);
+    EXPECT_EQ(got.size(), 30u - first.size());
+    for (const Row& r : got) EXPECT_FALSE(first.count(r.id)) << r.id;
+    PositionDeleteEntry stray{};
+    std::strncpy(stray.file_path, "/no/such/file.parquet", sizeof(stray.file_path) - 1u);
+    EXPECT_FALSE(table_delete_positions(t.th, &stray, 1)) << "a delete of a file not in the table names no partition";
+}
+
+TEST(IcebergPartitioned, SpecEvolutionKeepsEachFileOnItsSpec) {
+    Table t;
+    create_table(&t, fresh_root(temp_base(), "evolve"), spec_of({pf(2, "identity", "k")}));
+    std::vector<Row> all = rows_of(0, 30);
+    append_rows(&t, all);
+    const PartitionSpec next = spec_of({pf(2, "void", "k"), pf(4, "month", "d_month")});
+    ASSERT_TRUE(table_update_partition_spec(t.th, &next));
+    const Metadata* m = table_metadata(t.th);
+    ASSERT_EQ(m->n_specs, 2u);
+    EXPECT_EQ(m->current_spec_id, 1);
+    EXPECT_EQ(m->specs[1].fields[0].field_id, 1001) << "void(k) is not equivalent to identity(k): a new id";
+    EXPECT_EQ(m->specs[1].fields[1].field_id, 1002);
+    const std::vector<Row> more = rows_of(30, 60);
+    append_rows(&t, more);
+    all.insert(all.end(), more.begin(), more.end());
+    EXPECT_EQ(scan_rows(t.root), model(all, [](const Row&) { return false; }));
+    uint32_t spec0 = 0, spec1 = 0;
+    for (const LiveFile& lf : live_files(&t)) {
+        (lf.ref.partition_spec_id == 0 ? spec0 : spec1) += 1u;
+        if (lf.ref.partition_spec_id == 1) EXPECT_TRUE(lf.ref.partition[0].is_null) << "a void field is always null";
+    }
+    EXPECT_GT(spec0, 1u);
+    EXPECT_GT(spec1, 1u);
+    expect_files_match_rows(&t);
+    const std::string doc = read_file(latest_metadata_path(t.root));
+    EXPECT_NE(doc.find("\"last-partition-id\":1002"), std::string::npos);
+    // Delete and compact across both specs: each file keeps its spec, deletes carry their data file's.
+    Predicate ilt = pred_i64("i", PredicateOp::kLt, 40);
+    ASSERT_TRUE(table_delete(t.th, &ilt));
+    expect_deletes_scoped(&t);
+    auto gone = [](const Row& r) { return r.i != kNull && r.i < 40; };
+    EXPECT_EQ(scan_rows(t.root), model(all, gone));
+    append_rows(&t, rows_of(60, 75));
+    all = model([&] { auto v = all; auto x = rows_of(60, 75); v.insert(v.end(), x.begin(), x.end()); return v; }(), gone);
+    ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+    EXPECT_EQ(scan_rows(t.root), all);
+    expect_files_match_rows(&t);
+    // Going back to an equivalent spec makes it the default instead of adding a third.
+    const PartitionSpec back = spec_of({pf(2, "identity", "k")});
+    ASSERT_TRUE(table_update_partition_spec(t.th, &back));
+    EXPECT_EQ(table_metadata(t.th)->n_specs, 2u);
+    EXPECT_EQ(table_metadata(t.th)->current_spec_id, 0);
+}
