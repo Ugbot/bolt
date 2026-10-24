@@ -302,11 +302,13 @@ TEST(BoltParquetFlbaLogical, WrongWidthIntervalIsRefused) {
     EXPECT_FALSE(parquet_map_type(&c, &t, &scale));
 }
 
-TEST(BoltParquetFlbaLogical, RawFlbaOverSixteenBytesIsRefused) {
+// G2ICE-291: a raw FLBA wider than one slot (an Iceberg fixed[L], L > 16) reads as a byte-string lane, like a BYTE_ARRAY.
+TEST(BoltParquetFlbaLogical, RawFlbaOverSixteenBytesReadsAsByteStrings) {
     PqColumn c = make_col(PqType::FixedLenByteArray, 17, -1, PqLogical::None);
     bolt::BoltType t;
     std::uint8_t scale = 0;
-    EXPECT_FALSE(parquet_map_type(&c, &t, &scale));
+    ASSERT_TRUE(parquet_map_type(&c, &t, &scale));
+    EXPECT_EQ(t, bolt::BoltType::Utf8);
 }
 
 TEST(BoltParquetFlbaLogical, RawFlbaSixteenBytesIsAccepted) {

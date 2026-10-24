@@ -1232,6 +1232,7 @@ bool encoding_applies(PqWriteEncoding e, BoltType t) noexcept {
 PqWriteEncoding resolve_encoding(const ParquetWriteColumn& sch,
                                  const ParquetWriteOpts& o) noexcept {
     const PqWriteEncoding want = static_cast<PqWriteEncoding>(sch.encoding);
+    if (sch.type == BoltType::Binary && sch.fixed_len != 0u) return PqWriteEncoding::Plain;   // FLBA: plain only
     if (want != PqWriteEncoding::Auto) return want;
     if (o.use_dictionary && dict_eligible(sch.type)) {
         return PqWriteEncoding::Dictionary;
@@ -1271,6 +1272,15 @@ bool encode_plain_range(const BoltColumn& col, const ParquetWriteColumn& sch,
             return encode_plain_fixed(col, 8, r0, r1, def_bits, nullable, dst);
         case BoltType::Utf8:
         case BoltType::Binary:
+            if (sch.type == BoltType::Binary && sch.fixed_len != 0u) {    // FLBA: the bytes alone, each exactly fixed_len
+                for (std::int64_t r = r0; r < r1; ++r) {
+                    if (nullable && def_bits[r] == 0u) continue;
+                    const RowVal v = row_val_bytes(col, r);
+                    if (v.n != sch.fixed_len) return false;
+                    dst->insert(dst->end(), v.p, v.p + v.n);
+                }
+                return true;
+            }
             return encode_plain_byte_array(col, r0, r1, def_bits, nullable, dst);
         case BoltType::Decimal128: {
             const auto* p = static_cast<const std::uint8_t*>(col.data);
@@ -2110,7 +2120,7 @@ bool write_column_chunk(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
     // G2PQ-25: byte_array_data_bytes only -- a flat column's level histogram
     // is legal to omit per spec (see ChunkRec's comment) and is never set
     // here. LIST-of-BYTE_ARRAY is handled separately in chunk_write_list.
-    if (w->opts.emit_size_statistics &&
+    if (w->opts.emit_size_statistics && sch.fixed_len == 0u &&
         (sch.type == BoltType::Utf8 || sch.type == BoltType::Binary)) {
         std::int64_t bytes = 0;
         if (sum_byte_array_data_bytes(col, 0, n_rows, db, nullable, &bytes)) {
@@ -2160,11 +2170,15 @@ void write_schema_element_root(TcOut* o, std::uint32_t n_children) noexcept {
 
 void write_schema_element_col(TcOut* o,
                               const ParquetWriteColumn& c) noexcept {
+    const bool fixed = c.type == BoltType::Binary && c.fixed_len != 0u;
     tc_put_field(o, 1, kFI32);
-    tc_put_zigzag(o, bolt_to_pq_physical(c.type));
+    tc_put_zigzag(o, fixed ? kPtFlba : bolt_to_pq_physical(c.type));
     if (c.type == BoltType::Decimal128 || c.type == BoltType::UUID) {
         tc_put_field(o, 2, kFI32);
         tc_put_zigzag(o, 16);                // FLBA length
+    } else if (fixed) {
+        tc_put_field(o, 2, kFI32);
+        tc_put_zigzag(o, static_cast<std::int32_t>(c.fixed_len));
     }
     tc_put_field(o, 3, kFI32);
     tc_put_zigzag(o, c.nullable ? kRepOptional : kRepRequired);

@@ -281,6 +281,9 @@ struct ParquetWriteColumn {
     std::uint8_t          timestamp_unit;
     // INT64 only: LogicalType TIME(isAdjustedToUTC=false, MICROS) - an Iceberg `time` (micros since midnight).
     bool                  time_micros;
+    // Binary only: > 0 writes FIXED_LEN_BYTE_ARRAY(fixed_len) (an Iceberg `fixed[L]`), PLAIN encoded; every value must be exactly
+    // fixed_len bytes or the row group is refused. 0 (zero-init) keeps BYTE_ARRAY.
+    std::uint32_t         fixed_len;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,

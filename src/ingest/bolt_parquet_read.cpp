@@ -994,6 +994,11 @@ bool plain_flba_raw(ColCtx* cx, const uint8_t* v, uint64_t vlen,
 // Inline (<=12 byte) values still materialise into the view itself; they just
 // leave their copy in the overflow buffer unreferenced, which the cap already
 // accounts for.
+// FLBA wider than 16 bytes (fixed[L]): each L-byte value becomes a StringView, like a BYTE_ARRAY without length prefixes.
+bool plain_flba_binary(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                       const uint32_t* def, int64_t row0, uint32_t nrows,
+                       uint32_t nvalid) noexcept;
+
 bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
                 const uint32_t* def, int64_t row0, uint32_t nrows,
                 uint32_t nvalid) noexcept {
@@ -1014,6 +1019,26 @@ bool plain_utf8(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         if (pos + blen > vlen) return false;
         if (!sv_from_bytes(cx, v + pos, blen, &views[row0 + i])) return false;
         pos += blen;
+        ++src;
+    }
+    return src == nvalid;
+}
+
+bool plain_flba_binary(ColCtx* cx, const uint8_t* v, uint64_t vlen,
+                       const uint32_t* def, int64_t row0, uint32_t nrows,
+                       uint32_t nvalid) noexcept {
+    assert(cx != nullptr && cx->out != nullptr);
+    assert(cx->elem == 16u);
+    const uint32_t fw = static_cast<uint32_t>(cx->pc->type_length);
+    if (fw == 0u || static_cast<uint64_t>(nvalid) * fw > vlen) return false;
+    auto* views = reinterpret_cast<StringView*>(cx->out);
+    uint32_t src = 0;
+    for (uint32_t i = 0; i < nrows; ++i) {                            // bounded: page rows
+        if (def != nullptr && def[i] != cx->pc->max_def) {
+            null_row(cx, row0 + i);
+            continue;
+        }
+        if (!sv_from_bytes(cx, v + static_cast<uint64_t>(src) * fw, fw, &views[row0 + i])) return false;
         ++src;
     }
     return src == nvalid;
@@ -1197,6 +1222,7 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::FixedLenByteArray:
             ok = flba_is_decimal(cx->pc)
                      ? plain_flba(&tmp, v, vlen, nullptr, 0, n, n)
+                     : cx->type == BoltType::Utf8 ? plain_flba_binary(&tmp, v, vlen, nullptr, 0, n, n)
                      : plain_flba_raw(&tmp, v, vlen, nullptr, 0, n, n);
             break;
         case PqType::ByteArray:
@@ -1488,6 +1514,7 @@ bool decode_plain_values(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::FixedLenByteArray:
             return flba_is_decimal(cx->pc)
                        ? plain_flba(cx, v, vlen, def, row0, nvals, nvalid)
+                       : cx->type == BoltType::Utf8 ? plain_flba_binary(cx, v, vlen, def, row0, nvals, nvalid)
                        : plain_flba_raw(cx, v, vlen, def, row0, nvals, nvalid);
         case PqType::ByteArray:
             return plain_utf8(cx, v, vlen, def, row0, nvals, nvalid);
@@ -2062,7 +2089,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     for (uint32_t g = g0; g < g1; ++g) {       // bounded: n_row_groups
         const PqChunk* ch = &m->chunks[m->row_groups[g].chunk_off + c];
         if (pc->optional != 0 && ch->null_count != 0) needs_validity = true;
-        if (pc->physical == PqType::ByteArray &&
+        if ((pc->physical == PqType::ByteArray || (pc->physical == PqType::FixedLenByteArray && t == BoltType::Utf8)) &&
             ch->total_uncompressed_size > 0) {
             ovf += static_cast<uint64_t>(ch->total_uncompressed_size);
         }
@@ -2691,8 +2718,10 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                 col->type_length != 12) {
                 return false;                                // malformed writer
             }
-            if (col->type_length <= 0 || col->type_length > 16) return false;
-            *out_type = BoltType::FixedSizeBinary;
+            if (col->type_length <= 0) return false;
+            // A raw FLBA wider than one 16-byte slot (an Iceberg fixed[L], L > 16) reads like a BYTE_ARRAY (a Utf8 lane of
+            // byte strings, as every BYTE_ARRAY does): one L-byte value per row.
+            *out_type = col->type_length > 16 ? BoltType::Utf8 : BoltType::FixedSizeBinary;
             return true;
         default:
             return false;

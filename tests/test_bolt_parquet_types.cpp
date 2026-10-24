@@ -165,10 +165,10 @@ TEST(BoltParquetTypes, NonDecimalFlbaAcceptedAsFixedSizeBinary) {
     uint8_t s = 0;
     ASSERT_TRUE(parquet_map_type(&c, &t, &s));
     EXPECT_EQ(t, bolt::BoltType::FixedSizeBinary);
-    // Over the one-storage-slot ceiling (mirrors DECIMAL's existing cap) is
-    // still a documented, loud reject -- never a silent truncation.
+    // Over one storage slot (G2ICE-291, an Iceberg fixed[L]): a byte-string lane, one L-byte value per row.
     PqColumn wide = mk(PqType::FixedLenByteArray, PqLogical::None, 0, 0, 1, 0, 0, 17);
-    EXPECT_FALSE(parquet_map_type(&wide, &t, &s));
+    ASSERT_TRUE(parquet_map_type(&wide, &t, &s));
+    EXPECT_EQ(t, bolt::BoltType::Utf8);
 }
 
 // End-to-end: writer emits INT64 + ConvertedType TIMESTAMP_MICROS; the reader
