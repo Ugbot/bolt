@@ -159,6 +159,10 @@ struct ManifestListEntry {
     uint32_t              _pad_ps;
     PartitionFieldSummary partitions[kIcebergMaxSummaries];
     char         manifest_path[kIcebergMaxManifestPath];
+    // v3 (field 520): the first `_row_id` of the manifest's added data files; null for delete manifests and pre-v3 lists.
+    int64_t      first_row_id;
+    bool         has_first_row_id;
+    uint8_t      _pad_fr[7];
 };
 
 // One value of a partition tuple. Which member holds it follows from the partition field's result type (the
@@ -233,8 +237,11 @@ struct DataFileRef {
     bool           has_sequence_number;
     // The entry's file sequence number (field 4): explicit on EXISTING/DELETED entries, inherited when null (G2ICE-280).
     bool           has_file_sequence_number;
-    uint8_t        _pad5[6];
+    // v3 row lineage (field 142): the `_row_id` of the file's first row; null (inherited from the manifest's) when absent.
+    bool           has_first_row_id;
+    uint8_t        _pad5[5];
     int64_t        file_sequence_number;
+    int64_t        first_row_id;
 };
 // Pinned: the provenance flags came out of the 4 bytes of padding that used to
 // follow `n_partition`, so nothing after them moved and the struct is the same

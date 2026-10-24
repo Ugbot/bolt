@@ -68,3 +68,12 @@ static const char kManifestFileSchema[] =
     "],\"default\":null}],\"name\":\"r508\"}}],\"default\":null},{\"name\":\""
     "key_metadata\",\"field-id\":519,\"type\":[\"null\",\"bytes\"],\"default\""
     ":null}],\"name\":\"manifest_file\"}";
+
+// Format v3 (G2ICE-276): the data_file fields after sort_order_id, and manifest_file's first_row_id after key_metadata.
+static const char kManifestEntryV3Fields[] =
+    ",{\"name\":\"first_row_id\",\"field-id\":142,\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"referenced_d"
+    "ata_file\",\"field-id\":143,\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"content_offset\",\"field-id\":"
+    "144,\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"content_size_in_bytes\",\"field-id\":145,\"type\":[\"null\""
+    ",\"long\"],\"default\":null}";
+static const char kManifestFileV3Fields[] =
+    ",{\"name\":\"first_row_id\",\"field-id\":520,\"type\":[\"null\",\"long\"],\"default\":null}";

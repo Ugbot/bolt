@@ -96,7 +96,7 @@ struct MlCtx {
     uint32_t           n;
     Arena*             grow;    // non-null: `out` doubles here instead of refusing
     int32_t f_path, f_len, f_spec, f_content, f_snap, f_added;
-    int32_t f_seq, f_minseq;
+    int32_t f_seq, f_minseq, f_first_row;
     // G2ICE-49 -- the five file/row tallies `added_files_count` always had
     // schema siblings for, that this reader never bound.
     int32_t f_exist_f, f_del_f, f_added_r, f_exist_r, f_del_r;
@@ -186,6 +186,10 @@ bool ml_row(void* c, const ing::AvroValue* vals, uint32_t n,
     // the sequence number it was committed at (see ManifestListEntry).
     e->sequence_number     = i64_or(at(s->f_seq), 0);
     e->min_sequence_number = i64_or(at(s->f_minseq), 0);
+    if (const ing::AvroValue* fr = at(s->f_first_row); fr != nullptr && !fr->is_null) {
+        e->first_row_id = i64_or(fr, 0);
+        e->has_first_row_id = true;
+    }
     // `content` is v2-only (0 = data, 1 = deletes); v1 manifests are all data.
     e->content = static_cast<ManifestContent>(i64_or(at(s->f_content), 0));
     if (s->pend_row == row_index && !s->pend_overflow && s->n_pend > 0u) {
@@ -213,7 +217,7 @@ struct DfCtx {
     bool         have_pending;
 
     int32_t f_status, f_snap, f_content, f_path, f_records, f_size;
-    int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq, f_file_seq;
+    int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq, f_file_seq, f_first_row;
     // Partition struct leaves, in declared order.
     int32_t part_idx[kMaxPartCols];
     uint32_t n_part;
@@ -326,6 +330,10 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
         e->content_size   = i64_or(at(s->f_dv_size), 0);
         e->is_dv          = true;
     }
+    if (const ing::AvroValue* fr = at(s->f_first_row); fr != nullptr && !fr->is_null) {
+        e->first_row_id = i64_or(fr, 0);
+        e->has_first_row_id = true;
+    }
     if (const ing::AvroValue* v = at(s->f_dv_ref); v != nullptr && !v->is_null) {
         if (!fits(kIcebergMaxPath, v)) return false;
         copy_str(e->referenced_data_file, kIcebergMaxPath, v);
@@ -408,6 +416,7 @@ bool ml_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s.f_del_r   = find_field(h, "deleted_rows_count");
     s.f_seq     = find_field(h, "sequence_number");
     s.f_minseq  = find_field(h, "min_sequence_number");
+    s.f_first_row = find_field(h, "first_row_id");
     // Without a path there is nothing to point a scan at — that is not a
     // manifest list, so fail rather than emit path-less entries.
     if (s.f_path < 0) return false;
@@ -491,6 +500,7 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->f_dv_offset = find_field(h, "data_file.content_offset");
     s->f_dv_size   = find_field(h, "data_file.content_size_in_bytes");
     s->f_dv_ref    = find_field(h, "data_file.referenced_data_file");
+    s->f_first_row = find_field(h, "data_file.first_row_id");
     if (s->f_path < 0) return false;                // not a manifest
 
     // Partition struct leaves flatten to "data_file.partition.<col>".

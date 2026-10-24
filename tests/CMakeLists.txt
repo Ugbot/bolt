@@ -2882,3 +2882,10 @@ target_compile_definitions(test_bolt_parquet_read_nested PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_parquet_read_nested)
 add_test(NAME test_bolt_parquet_read_nested COMMAND test_bolt_parquet_read_nested)
+
+# G2ICE-276: v3 manifest / manifest-list writers and Puffin deletion-vector files.
+add_executable(test_bolt_iceberg_v3_write test_bolt_iceberg_v3_write.cpp)
+target_link_libraries(test_bolt_iceberg_v3_write
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_v3_write)
+add_test(NAME test_bolt_iceberg_v3_write COMMAND test_bolt_iceberg_v3_write)
