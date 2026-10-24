@@ -209,33 +209,52 @@ uint32_t enc_bytes_stat(uint8_t* dst, const uint8_t* b, uint32_t len) noexcept {
 constexpr uint32_t kStatMapBufCap = 16u +
     kIcebergMaxStatCols * (16u + 10u + kLakeMaxValBytes);
 
-// null_value_counts (or value_counts, if ever needed): one entry per column
-// this writer has a null_count for -- always present, because 0 is itself a
-// real measured value a caller (e.g. G2FEAT-356's null-safety gate) must be
-// able to trust as "certified zero nulls", not "unknown". Returns bytes
-// written into `dst`, or 0 when there is nothing to encode (st->n_cols == 0),
-// which the caller treats as "write null instead" — an empty map and an
-// absent map are both spec-legal but an absent one costs fewer bytes and
-// matches this writer's existing all-or-nothing null convention.
-uint32_t encode_null_count_map(const FileStats* st, uint8_t* dst,
-                               uint32_t cap) noexcept {
+// The four int-keyed long maps of a data file (G2ICE-296): column_sizes, value_counts, null_value_counts,
+// nan_value_counts. One entry per column that has the metric (ColumnStatEntry's has_* flags; a null count is present
+// unless `no_null_count` or negative). A measured 0 is a real value, never left out. Returns the bytes written into
+// `dst`, or 0 when no column has it (the caller writes the map null) or it does not fit.
+enum class CountMap : uint8_t { kColumnSizes, kValueCounts, kNullCounts, kNanCounts };
+
+bool count_of(const ColumnStatEntry& c, CountMap m, int64_t* v) noexcept {
+    assert(v != nullptr);
+    switch (m) {
+        case CountMap::kColumnSizes: *v = c.column_size; return c.has_column_size;
+        case CountMap::kValueCounts: *v = c.value_count; return c.has_value_count;
+        case CountMap::kNanCounts:   *v = c.nan_count;   return c.has_nan_count;
+        case CountMap::kNullCounts:  *v = c.null_count;  return !c.no_null_count && c.null_count >= 0;
+    }
+    return false;
+}
+
+uint32_t encode_count_map(const FileStats* st, CountMap m, uint8_t* dst, uint32_t cap) noexcept {
     assert(st != nullptr && dst != nullptr);
-    if (st->n_cols == 0u) return 0u;
     assert(st->n_cols <= kIcebergMaxStatCols);
-    uint32_t known = 0;                              // null_count < 0: unknown, left out of the map
-    for (uint32_t i = 0; i < st->n_cols; ++i) known += st->cols[i].null_count >= 0 ? 1u : 0u;
+    uint32_t known = 0;
+    int64_t v = 0;
+    for (uint32_t i = 0; i < st->n_cols; ++i) known += count_of(st->cols[i], m, &v) ? 1u : 0u;   // bounded: n_cols
     if (known == 0u) return 0u;
     uint32_t o = 0;
     if (o + 10u > cap) return 0u;
     o += enc_long_stat(static_cast<int64_t>(known), dst + o);
     for (uint32_t i = 0; i < st->n_cols; ++i) {      // bounded: n_cols
-        if (st->cols[i].null_count < 0) continue;
+        if (!count_of(st->cols[i], m, &v)) continue;
         if (o + 20u > cap) return 0u;
         o += enc_long_stat(st->cols[i].field_id, dst + o);
-        o += enc_long_stat(st->cols[i].null_count, dst + o);
+        o += enc_long_stat(v, dst + o);
     }
     if (o + 1u > cap) return 0u;
     o += enc_long_stat(0, dst + o);                  // terminator block
+    return o;
+}
+
+// split_offsets (G2ICE-296): array<long> of the row groups' start offsets; 0 when there are none.
+uint32_t encode_split_offsets(const FileStats* st, uint8_t* dst, uint32_t cap) noexcept {
+    assert(st != nullptr && dst != nullptr);
+    if (st->n_split_offsets == 0u || st->n_split_offsets > kIcebergMaxSplitOffsets) return 0u;
+    if (cap < 20u + 10u * st->n_split_offsets) return 0u;
+    uint32_t o = enc_long_stat(static_cast<int64_t>(st->n_split_offsets), dst);
+    for (uint32_t i = 0; i < st->n_split_offsets; ++i) o += enc_long_stat(st->split_offsets[i], dst + o);   // bounded
+    o += enc_long_stat(0, dst + o);
     return o;
 }
 
@@ -477,6 +496,107 @@ uint32_t encode_summaries(const ManifestListEntry* e, uint8_t* dst, uint32_t cap
 
 namespace {
 
+// One manifest entry being filled (G2ICE-296): its values, the next field, the variable-length bytes so far.
+struct EntryRow {
+    ing::AvroValue* v;
+    uint32_t        i;
+    uint64_t*       value_bytes;
+    Arena*          scratch;
+};
+
+void put_counted_str(EntryRow* r, const char* s) noexcept {
+    assert(r != nullptr && s != nullptr);
+    put_str(&r->v[r->i], s);
+    *r->value_bytes += r->v[r->i++].bytes_len;
+}
+
+// A container field from `n` encoded bytes (null when 0).
+void put_container(EntryRow* r, const uint8_t* buf, uint32_t n) noexcept {
+    assert(r != nullptr);
+    if (buf == nullptr || n == 0u) { put_null(&r->v[r->i++]); return; }
+    put_raw_container(&r->v[r->i], buf, n);
+    *r->value_bytes += n;
+    ++r->i;
+}
+
+// status .. file_size_in_bytes, the partition tuple inline after file_format.
+bool put_entry_head(EntryRow* r, const DataFileRef& d, const ing::AvroField* fields, uint32_t np, int64_t snapshot_id,
+                    int64_t sequence_number, bool v3) noexcept {
+    assert(r != nullptr && fields != nullptr);
+    ing::AvroValue* v = r->v;
+    put_long(&v[r->i++], static_cast<int64_t>(d.status));
+    put_long(&v[r->i++], d.snapshot_id != 0 ? d.snapshot_id : snapshot_id);
+    // An EXISTING or DELETED entry keeps the sequence numbers it was first committed with (spec: "Sequence Number
+    // Inheritance"); relabelling them would change which deletes apply to it.
+    const bool carried = d.status != ManifestStatus::kAdded;
+    put_long(&v[r->i++], carried && d.has_sequence_number ? d.sequence_number : sequence_number);
+    put_long(&v[r->i++], carried && d.has_file_sequence_number ? d.file_sequence_number : sequence_number);
+    put_long(&v[r->i++], static_cast<int64_t>(d.content));
+    put_counted_str(r, d.file_path);
+    put_counted_str(r, v3 && d.is_dv ? "PUFFIN" : kFileFormat);
+    for (uint32_t p = 0; p < np; ++p) {            // bounded: np
+        const PartitionValue& pv = d.partition[p];
+        if (pv.is_null) { put_null(&v[r->i++]); continue; }
+        if (!put_partition_value(&v[r->i], fields[7u + p], pv)) return false;
+        *r->value_bytes += v[r->i++].bytes_len;
+    }
+    put_long(&v[r->i++], d.stats.record_count);
+    put_long(&v[r->i++], d.stats.file_size_in_bytes);
+    return true;
+}
+
+// The six per-column metrics maps in wire order (spec "Manifests": column_sizes, value_counts, null_value_counts,
+// nan_value_counts, lower_bounds, upper_bounds), each null when no column has the metric. G2ICE-135 caught a
+// misaligned row here once: the row width is asserted by the caller.
+bool put_entry_metrics(EntryRow* r, const FileStats& st) noexcept {
+    assert(r != nullptr && r->scratch != nullptr);
+    const CountMap counts[4] = {CountMap::kColumnSizes, CountMap::kValueCounts, CountMap::kNullCounts, CountMap::kNanCounts};
+    for (uint32_t k = 0; k < 6u; ++k) {                                  // bounded: 6 maps
+        uint8_t* buf = r->scratch->allocate_array<uint8_t>(kStatMapBufCap);
+        if (buf == nullptr) return false;
+        const uint32_t n = k < 4u ? encode_count_map(&st, counts[k], buf, kStatMapBufCap)
+                                  : encode_bound_map(&st, k == 4u, buf, kStatMapBufCap);
+        put_container(r, buf, n);
+    }
+    return true;
+}
+
+// equality_ids as array<int>; 0 bytes when the file names none.
+uint32_t encode_equality_ids(const DataFileRef& d, uint8_t* dst, uint32_t cap) noexcept {
+    assert(dst != nullptr);
+    if (d.n_equality_ids == 0u || d.n_equality_ids > 8u || cap < 32u + 10u * d.n_equality_ids) return 0u;
+    uint32_t o = enc_long_stat(static_cast<int64_t>(d.n_equality_ids), dst);
+    for (uint32_t k = 0; k < d.n_equality_ids; ++k) o += enc_long_stat(d.equality_ids[k], dst + o);   // bounded: 8
+    o += enc_long_stat(0, dst + o);
+    return o;
+}
+
+// key_metadata .. sort_order_id, then the v3 fields (or v2's referenced_data_file).
+bool put_entry_tail(EntryRow* r, const DataFileRef& d, bool v3, bool v2_ref) noexcept {
+    assert(r != nullptr && r->scratch != nullptr);
+    put_null(&r->v[r->i++]);                                             // key_metadata
+    uint8_t* buf = r->scratch->allocate_array<uint8_t>(32u + 10u * kIcebergMaxSplitOffsets);
+    if (buf == nullptr) return false;
+    put_container(r, buf, encode_split_offsets(&d.stats, buf, 32u + 10u * kIcebergMaxSplitOffsets));
+    uint8_t* eq = r->scratch->allocate_array<uint8_t>(128u);
+    if (eq == nullptr) return false;
+    put_container(r, eq, d.content == FileContent::kEqualityDeletes ? encode_equality_ids(d, eq, 128u) : 0u);
+    if (d.stats.has_sort_order_id && d.content == FileContent::kData) put_long(&r->v[r->i++], d.stats.sort_order_id);
+    else put_null(&r->v[r->i++]);
+    if (v3) {
+        if (d.has_first_row_id && d.content == FileContent::kData) put_long(&r->v[r->i++], d.first_row_id);
+        else put_null(&r->v[r->i++]);
+        if (d.referenced_data_file[0] != '\0') put_counted_str(r, d.referenced_data_file);
+        else put_null(&r->v[r->i++]);
+        if (d.is_dv) { put_long(&r->v[r->i++], d.content_offset); put_long(&r->v[r->i++], d.content_size); }
+        else         { put_null(&r->v[r->i++]); put_null(&r->v[r->i++]); }
+    } else if (v2_ref) {
+        if (d.referenced_data_file[0] != '\0') put_counted_str(r, d.referenced_data_file);
+        else put_null(&r->v[r->i++]);
+    }
+    return true;
+}
+
 // Shared body. `spec == nullptr` (or zero fields) is the unpartitioned form
 // and encodes byte-identically to what this writer always produced.
 bool write_manifest(const DataFileRef* files, uint32_t n_files,
@@ -495,14 +615,17 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
     if (np != 0u && result_types == nullptr) return false;
     if (fv != 2 && fv != 3) return false;
     const bool v3 = fv == 3;
-    const uint32_t nf = kEntryFields + np + (v3 ? kEntryV3Fields : 0u);
+    bool v2_ref = false;                                  // G2ICE-323: v2 writes referenced_data_file when an entry has one
+    for (uint32_t r = 0; !v3 && r < n_files; ++r) v2_ref = v2_ref || files[r].referenced_data_file[0] != '\0';   // bounded: n_files
+    const uint32_t nf = kEntryFields + np + (v3 ? kEntryV3Fields : (v2_ref ? 1u : 0u));
 
     const char* entry_schema = kManifestEntrySchema;
     uint32_t    entry_schema_len =
         static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u);
-    if (v3 && !insert_fields(entry_schema, entry_schema_len, "],\"name\":\"r2\"", kManifestEntryV3Fields,
-                             static_cast<uint32_t>(sizeof(kManifestEntryV3Fields) - 1u), scratch, &entry_schema,
-                             &entry_schema_len)) {
+    const char* extra = v3 ? kManifestEntryV3Fields : kManifestEntryRefField;
+    const uint32_t extra_len = static_cast<uint32_t>(v3 ? sizeof(kManifestEntryV3Fields) - 1u : sizeof(kManifestEntryRefField) - 1u);
+    if ((v3 || v2_ref) && !insert_fields(entry_schema, entry_schema_len, "],\"name\":\"r2\"", extra, extra_len, scratch,
+                                         &entry_schema, &entry_schema_len)) {
         return false;
     }
     const char* spec_json = "[]";
@@ -542,6 +665,8 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
             set_field(&x[1], "referenced_data_file",  T::kString, true);
             set_field(&x[2], "content_offset",        T::kLong,   true);
             set_field(&x[3], "content_size_in_bytes", T::kLong,   true);
+        } else if (v2_ref) {
+            set_field(fields + kEntryFields + np, "referenced_data_file", ing::AvroType::kString, true);
         }
     }
 
@@ -569,88 +694,11 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
         // does not declare. Writing it anyway yields a manifest that PARSES
         // and reports the wrong partition — fail instead.
         if (d->n_partition != np) return false;
-        ing::AvroValue* v = rows + static_cast<uint64_t>(r) * nf;
-        uint32_t i = 0;
-        put_long(&v[i++], static_cast<int64_t>(d->status));
-        put_long(&v[i++], d->snapshot_id != 0 ? d->snapshot_id : snapshot_id);
-        // An EXISTING or DELETED entry keeps the sequence numbers it was first committed with (spec: "Sequence Number
-        // Inheritance"); relabelling them would change which deletes apply to it.
-        const bool carried = d->status != ManifestStatus::kAdded;
-        put_long(&v[i++], carried && d->has_sequence_number ? d->sequence_number : sequence_number);
-        put_long(&v[i++], carried && d->has_file_sequence_number ? d->file_sequence_number : sequence_number);
-        put_long(&v[i++], static_cast<int64_t>(d->content));
-        put_str(&v[i++], d->file_path);
-        put_str(&v[i++], v3 && d->is_dv ? "PUFFIN" : kFileFormat);
-        for (uint32_t p = 0; p < np; ++p) {            // bounded: np
-            const PartitionValue& pv = d->partition[p];
-            if (pv.is_null) { put_null(&v[i++]); continue; }
-            if (!put_partition_value(&v[i], fields[7u + p], pv)) return false;
-            value_bytes += v[i++].bytes_len;
-        }
-        put_long(&v[i++], d->stats.record_count);
-        put_long(&v[i++], d->stats.file_size_in_bytes);
-        // SEVEN fields here (was a flat put_null loop before G2ICE-135):
-        // column_sizes, value_counts, null_value_counts, nan_value_counts,
-        // lower_bounds, upper_bounds, key_metadata — exactly the six stats
-        // maps plus key_metadata, matching build_entry_fields's declared
-        // order. column_sizes/value_counts/nan_value_counts/key_metadata stay
-        // null (this writer has no per-column compressed-byte-size or NaN
-        // tracking, and value_counts has no downstream reader — see
-        // compute_file_stats's header comment in iceberg_writer.cpp for the
-        // scope decision). null_value_counts/lower_bounds/upper_bounds now
-        // carry REAL data when `d->stats.n_cols > 0` (populated by
-        // append_commit_ex / table_overwrite's compute_file_stats call).
-        //
-        // Historical note on the count (kept: still true and still the bug
-        // this session's predecessor found): writing nine values into a
-        // 19-wide row silently misaligned every following field and wrote one
-        // element past `rows`'s `+ 1u` slack — only visible because this
-        // repo's Release build keeps asserts live (G2ICE-4). The assert below
-        // is the same tripwire.
-        put_null(&v[i++]);                                   // column_sizes
-        put_null(&v[i++]);                                   // value_counts
-        {
-            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
-            const uint32_t n = (buf == nullptr)
-                ? 0u : encode_null_count_map(&d->stats, buf, kStatMapBufCap);
-            if (n == 0u) put_null(&v[i++]);
-            else         put_raw_container(&v[i++], buf, n);
-        }
-        put_null(&v[i++]);                                   // nan_value_counts
-        {
-            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
-            const uint32_t n = (buf == nullptr)
-                ? 0u : encode_bound_map(&d->stats, true, buf, kStatMapBufCap);
-            if (n == 0u) put_null(&v[i++]);
-            else         put_raw_container(&v[i++], buf, n);
-        }
-        {
-            uint8_t* buf = scratch->allocate_array<uint8_t>(kStatMapBufCap);
-            const uint32_t n = (buf == nullptr)
-                ? 0u : encode_bound_map(&d->stats, false, buf, kStatMapBufCap);
-            if (n == 0u) put_null(&v[i++]);
-            else         put_raw_container(&v[i++], buf, n);
-        }
-        put_null(&v[i++]);                                   // key_metadata
-        put_null(&v[i++]);                                   // split_offsets
-        put_null(&v[i++]);                                   // equality_ids
-        put_null(&v[i++]);                                   // sort_order_id
-        if (v3) {
-            if (d->has_first_row_id && d->content == FileContent::kData) put_long(&v[i++], d->first_row_id);
-            else put_null(&v[i++]);
-            if (d->referenced_data_file[0] != '\0') {
-                put_str(&v[i], d->referenced_data_file);
-                value_bytes += v[i++].bytes_len;
-            } else {
-                put_null(&v[i++]);
-            }
-            if (d->is_dv) { put_long(&v[i++], d->content_offset); put_long(&v[i++], d->content_size); }
-            else          { put_null(&v[i++]); put_null(&v[i++]); }
-        }
-        assert(i == nf);
-        value_bytes += v[5].bytes_len + v[6].bytes_len +
-                       v[11u + np].bytes_len + v[13u + np].bytes_len +
-                       v[14u + np].bytes_len;
+        EntryRow row{rows + static_cast<uint64_t>(r) * nf, 0u, &value_bytes, scratch};
+        if (!put_entry_head(&row, *d, fields, np, snapshot_id, sequence_number, v3)) return false;
+        if (!put_entry_metrics(&row, d->stats)) return false;
+        if (!put_entry_tail(&row, *d, v3, v2_ref)) return false;
+        assert(row.i == nf);
     }
 
     char spec_id_buf[16];

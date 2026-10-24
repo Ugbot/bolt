@@ -1,0 +1,384 @@
+// iceberg_parquet_metrics.inc — Iceberg data-file metrics from a parquet file (G2ICE-296). Included at the end of
+// iceberg_parquet_stats.cpp: it reuses that file's footer folding for the fixed-width integer types, whose parquet
+// statistics are exactly Iceberg's bounds. See bolt/lakehouse/iceberg/metrics.h for the rules.
+
+namespace {
+
+bool ascii_ieq(const char* a, uint32_t an, const char* b) noexcept {
+    assert(a != nullptr && b != nullptr);
+    const uint32_t bn = static_cast<uint32_t>(std::strlen(b));
+    if (an != bn) return false;
+    for (uint32_t i = 0; i < an; ++i) {                                  // bounded by an
+        const char x = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] + 32) : a[i];
+        if (x != b[i]) return false;
+    }
+    return true;
+}
+
+// Bytes of the UTF-8 sequence led by `b` (1 for a stray continuation or invalid lead: one unit, never a split).
+uint32_t utf8_seq_len(uint8_t b) noexcept {
+    if (b < 0x80u) return 1u;
+    if ((b & 0xE0u) == 0xC0u) return 2u;
+    if ((b & 0xF0u) == 0xE0u) return 3u;
+    if ((b & 0xF8u) == 0xF0u) return 4u;
+    return 1u;
+}
+
+uint32_t utf8_decode(const uint8_t* p, uint32_t n) noexcept {
+    assert(p != nullptr && n >= 1u && n <= 4u);
+    if (n == 1u) return p[0];
+    uint32_t cp = p[0] & (0xFFu >> (n + 1u));
+    for (uint32_t i = 1; i < n; ++i) cp = (cp << 6) | (p[i] & 0x3Fu);     // bounded: 4
+    return cp;
+}
+
+uint32_t utf8_encode(uint32_t cp, uint8_t* out) noexcept {
+    assert(out != nullptr && cp <= 0x10FFFFu);
+    if (cp < 0x80u) { out[0] = static_cast<uint8_t>(cp); return 1u; }
+    if (cp < 0x800u) { out[0] = static_cast<uint8_t>(0xC0u | (cp >> 6)); out[1] = static_cast<uint8_t>(0x80u | (cp & 0x3Fu)); return 2u; }
+    if (cp < 0x10000u) {
+        out[0] = static_cast<uint8_t>(0xE0u | (cp >> 12));
+        out[1] = static_cast<uint8_t>(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = static_cast<uint8_t>(0x80u | (cp & 0x3Fu));
+        return 3u;
+    }
+    out[0] = static_cast<uint8_t>(0xF0u | (cp >> 18));
+    out[1] = static_cast<uint8_t>(0x80u | ((cp >> 12) & 0x3Fu));
+    out[2] = static_cast<uint8_t>(0x80u | ((cp >> 6) & 0x3Fu));
+    out[3] = static_cast<uint8_t>(0x80u | (cp & 0x3Fu));
+    return 4u;
+}
+
+// Iceberg-Java UnicodeUtil.incrementCodePoint: skips the surrogate range; 0 = no successor.
+uint32_t next_code_point(uint32_t cp) noexcept {
+    if (cp == 0xD7FFu) return 0xE000u;
+    if (cp >= 0x10FFFFu) return 0u;
+    return cp + 1u;
+}
+
+// Byte offsets of the code points of out[0..n) into starts[]; the count.
+uint32_t utf8_starts(const uint8_t* p, uint32_t n, uint32_t* starts, uint32_t cap) noexcept {
+    assert(p != nullptr || n == 0u);
+    uint32_t k = 0, at = 0;
+    while (at < n && k < cap) {                                          // bounded by n
+        starts[k++] = at;
+        const uint32_t l = utf8_seq_len(p[at]);
+        at += (at + l <= n) ? l : 1u;
+    }
+    return k;
+}
+
+// Increment the truncated string prefix out[0..*n) in place (cap bytes): the last code point that has a successor
+// whose encoding still fits is replaced by it and everything after it dropped.
+bool utf8_increment(uint8_t* out, uint32_t* n, uint32_t cap) noexcept {
+    assert(out != nullptr && n != nullptr);
+    uint32_t starts[kLakeMaxValBytes + 1u];
+    const uint32_t k = utf8_starts(out, *n, starts, kLakeMaxValBytes + 1u);
+    for (uint32_t i = k; i > 0u; --i) {                                  // bounded by k
+        const uint32_t at = starts[i - 1u];
+        const uint32_t l = (i < k ? starts[i] : *n) - at;
+        const uint32_t nxt = next_code_point(l <= 4u ? utf8_decode(out + at, l) : 0x10FFFFu);
+        if (nxt == 0u) continue;
+        uint8_t enc[4];
+        const uint32_t el = utf8_encode(nxt, enc);
+        if (at + el > cap) continue;
+        std::memcpy(out + at, enc, el);
+        *n = at + el;
+        return true;
+    }
+    return false;
+}
+
+bool bytes_increment(uint8_t* out, uint32_t* n) noexcept {
+    assert(out != nullptr && n != nullptr);
+    while (*n > 0u) {                                                     // bounded by *n
+        if (out[*n - 1u] != 0xFFu) { ++out[*n - 1u]; return true; }
+        --*n;
+    }
+    return false;
+}
+
+}  // namespace
+
+uint32_t truncate_lower_len(bool utf8, const uint8_t* v, uint32_t n, uint32_t units, uint32_t cap) noexcept {
+    assert(v != nullptr || n == 0u);
+    if (!utf8) return n < units ? (n < cap ? n : cap) : (units < cap ? units : cap);
+    uint32_t at = 0, k = 0;
+    while (at < n && k < units) {                                        // bounded by n
+        const uint32_t l = utf8_seq_len(v[at]);
+        const uint32_t step = (at + l <= n) ? l : 1u;
+        if (at + step > cap) break;
+        at += step;
+        ++k;
+    }
+    return at;
+}
+
+bool truncate_upper(bool utf8, const uint8_t* v, uint32_t n, uint32_t units, uint8_t* out, uint32_t cap,
+                    uint32_t* out_len) noexcept {
+    assert(out != nullptr && out_len != nullptr);
+    assert(v != nullptr || n == 0u);
+    const uint32_t pl = truncate_lower_len(utf8, v, n, units, cap);
+    if (pl > 0u) std::memcpy(out, v, pl);
+    *out_len = pl;
+    if (pl == n) return true;                                            // nothing was cut: the value bounds itself
+    return utf8 ? utf8_increment(out, out_len, cap) : bytes_increment(out, out_len);
+}
+
+bool metrics_mode_parse(const char* s, uint32_t len, MetricsModeSpec* out) noexcept {
+    assert(out != nullptr);
+    if (s == nullptr) return false;
+    while (len > 0u && (s[0] == ' ')) { ++s; --len; }
+    while (len > 0u && s[len - 1u] == ' ') --len;
+    if (ascii_ieq(s, len, "none")) { *out = MetricsModeSpec{MetricsMode::kNone, 0u}; return true; }
+    if (ascii_ieq(s, len, "counts")) { *out = MetricsModeSpec{MetricsMode::kCounts, 0u}; return true; }
+    if (ascii_ieq(s, len, "full")) { *out = MetricsModeSpec{MetricsMode::kFull, 0u}; return true; }
+    if (len < 11u || !ascii_ieq(s, 9u, "truncate(") || s[len - 1u] != ')') return false;
+    uint64_t v = 0;
+    for (uint32_t i = 9u; i + 1u < len; ++i) {                            // bounded by len
+        if (s[i] < '0' || s[i] > '9' || v > UINT32_MAX / 10u) return false;
+        v = v * 10u + static_cast<uint32_t>(s[i] - '0');
+    }
+    if (v == 0u || v > UINT32_MAX) return false;
+    *out = MetricsModeSpec{MetricsMode::kTruncate, static_cast<uint32_t>(v)};
+    return true;
+}
+
+namespace {
+
+// The Iceberg type a parquet leaf was written for (decoded lanes: FLOAT widens to double; UUID / FLBA / decimal raw).
+IcebergTypeInfo leaf_type(const pq::PqColumn& c) noexcept {
+    IcebergTypeInfo t{};
+    const auto lg = static_cast<pq::PqLogical>(c.logical);
+    if (lg == pq::PqLogical::Decimal || c.converted == 5) {
+        t.type = IcebergType::kDecimal;
+        t.precision = static_cast<uint8_t>(c.precision > 0 ? c.precision : 0);
+        t.scale = static_cast<uint8_t>(c.scale > 0 ? c.scale : 0);
+        return t;
+    }
+    switch (c.physical) {
+        case pq::PqType::Float:  t.type = IcebergType::kFloat; break;
+        case pq::PqType::Double: t.type = IcebergType::kDouble; break;
+        case pq::PqType::ByteArray:
+            t.type = (lg == pq::PqLogical::String || lg == pq::PqLogical::Json || lg == pq::PqLogical::Enum ||
+                      c.converted == 0) ? IcebergType::kString : IcebergType::kBinary;
+            break;
+        case pq::PqType::FixedLenByteArray:
+            t.type = lg == pq::PqLogical::Uuid ? IcebergType::kUuid : IcebergType::kFixed;
+            t.fixed_len = static_cast<uint32_t>(c.type_length > 0 ? c.type_length : 0);
+            break;
+        default: t.type = IcebergType::kUnknown; break;   // integers, booleans, temporals: the footer's own bounds
+    }
+    return t;
+}
+
+// What one leaf's values contribute: NaN count and bounds. Strings / binary keep the smallest prefix (lower) and the
+// largest prefix one unit longer (upper: it shows whether the largest value was cut).
+struct ValueFold {
+    IcebergTypeInfo t;
+    MetricsModeSpec mode;
+    bool            ok = true;      // every value read
+    int64_t         nan = 0;
+    bool            have = false;
+    PartitionValue  lo, hi;         // non-byte types: identity values
+    uint8_t         lo_b[kLakeMaxValBytes];
+    uint8_t         hi_b[kLakeMaxValBytes + 4u];
+    uint32_t        lo_n = 0, hi_n = 0;
+};
+
+bool is_byte_type(IcebergType t) noexcept { return t == IcebergType::kString || t == IcebergType::kBinary; }
+
+uint32_t fold_units(const ValueFold& f) noexcept {
+    return f.mode.mode == MetricsMode::kTruncate ? f.mode.length : UINT32_MAX;
+}
+
+int bytes_cmp(const uint8_t* a, uint32_t an, const uint8_t* b, uint32_t bn) noexcept {
+    const uint32_t n = an < bn ? an : bn;
+    const int c = n == 0u ? 0 : std::memcmp(a, b, n);
+    return c != 0 ? c : (an > bn) - (an < bn);
+}
+
+void fold_bytes(ValueFold* f, const uint8_t* p, uint32_t n) noexcept {
+    assert(f != nullptr);
+    const bool u8 = f->t.type == IcebergType::kString;
+    const uint32_t units = fold_units(*f);
+    const uint32_t ln = truncate_lower_len(u8, p, n, units, kLakeMaxValBytes);
+    const uint32_t hn = truncate_lower_len(u8, p, n, units == UINT32_MAX ? units : units + 1u, kLakeMaxValBytes + 4u);
+    if (!f->have || bytes_cmp(p, ln, f->lo_b, f->lo_n) < 0) { if (ln > 0u) std::memcpy(f->lo_b, p, ln); f->lo_n = ln; }
+    if (!f->have || bytes_cmp(p, hn, f->hi_b, f->hi_n) > 0) { if (hn > 0u) std::memcpy(f->hi_b, p, hn); f->hi_n = hn; }
+    f->have = true;
+}
+
+void fold_row(ValueFold* f, const BoltColumn& c, int64_t r) noexcept {
+    assert(f != nullptr);
+    if (c.is_null(r)) return;
+    if (is_byte_type(f->t.type)) {
+        if (c.format != ColumnFormat::Flat && c.format != ColumnFormat::View && c.format != ColumnFormat::VarBinary) { f->ok = false; return; }
+        const uint8_t* p = nullptr;
+        int32_t n = 0;
+        c.utf8_at(r, &p, &n);
+        if (n < 0) { f->ok = false; return; }
+        fold_bytes(f, p, static_cast<uint32_t>(n));
+        return;
+    }
+    PartitionField id{};
+    id.transform.kind = TransformKind::kIdentity;
+    PartitionValue v;
+    if (!partition_value_of(id, f->t, c, r, &v)) { f->ok = false; return; }
+    if (v.is_null) return;
+    if (v.is_float && std::isnan(v.f64)) { ++f->nan; return; }
+    if (!f->have || partition_value_compare(f->t, v, f->lo, false) < 0) f->lo = v;
+    if (!f->have || partition_value_compare(f->t, v, f->hi, false) > 0) f->hi = v;
+    f->have = true;
+}
+
+}  // namespace
+
+namespace {
+
+// Every row group's values of leaf `c` folded into `f` (one decode per row group, its buffers released after).
+void fold_leaf_values(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta, uint16_t c, ValueFold* f) noexcept {
+    assert(meta != nullptr && f != nullptr);
+    Arena a;
+    for (uint32_t g = 0; g < meta->n_row_groups && f->ok; ++g) {        // bounded: kPqMaxRowGroups
+        a.reset();
+        BoltColumn col{};
+        int64_t rows = 0;
+        if (!pq::parquet_read_row_group_cols(bytes, len, meta, g, &c, 1u, &a, &col, &rows)) { f->ok = false; break; }
+        for (int64_t r = 0; r < rows && r < col.length; ++r) fold_row(f, col, r);   // bounded: the row group
+    }
+}
+
+void put_bound(ColumnStatEntry* e, bool lower, const uint8_t* b, uint32_t n) noexcept {
+    assert(e != nullptr && n <= kLakeMaxValBytes);
+    if (lower) { if (n > 0u) std::memcpy(e->lower, b, n); e->lower_len = static_cast<uint8_t>(n); e->has_lower = true; }
+    else       { if (n > 0u) std::memcpy(e->upper, b, n); e->upper_len = static_cast<uint8_t>(n); e->has_upper = true; }
+}
+
+// The bounds a value fold proves, in Iceberg's single-value encoding.
+void emit_value_bounds(const ValueFold& f, ColumnStatEntry* e) noexcept {
+    assert(e != nullptr);
+    if (!f.ok || !f.have || f.mode.mode == MetricsMode::kCounts) return;
+    if (is_byte_type(f.t.type)) {
+        put_bound(e, true, f.lo_b, f.lo_n);
+        uint8_t up[kLakeMaxValBytes];
+        uint32_t un = 0;
+        const bool u8 = f.t.type == IcebergType::kString;
+        if (truncate_upper(u8, f.hi_b, f.hi_n, fold_units(f), up, kLakeMaxValBytes, &un)) put_bound(e, false, up, un);
+        return;
+    }
+    uint8_t lo[kLakeMaxValBytes], hi[kLakeMaxValBytes];
+    uint32_t ln = 0, hn = 0;
+    if (f.t.type == IcebergType::kFloat) {                               // decoded as double: back to its 4 bytes
+        const float a = static_cast<float>(f.lo.f64), b = static_cast<float>(f.hi.f64);
+        std::memcpy(lo, &a, 4); std::memcpy(hi, &b, 4);
+        put_bound(e, true, lo, 4u); put_bound(e, false, hi, 4u);
+        return;
+    }
+    if (partition_value_encode(f.t, f.lo, lo, kLakeMaxValBytes, &ln)) put_bound(e, true, lo, ln);
+    if (partition_value_encode(f.t, f.hi, hi, kLakeMaxValBytes, &hn)) put_bound(e, false, hi, hn);
+}
+
+// Sizes and counts of leaf `c` from the footer. False = a malformed footer.
+bool footer_counts(const pq::PqMeta* meta, uint32_t c, bool counts, ColumnStatEntry* e) noexcept {
+    assert(meta != nullptr && e != nullptr);
+    int64_t size = 0, values = 0, nulls = 0;
+    bool nulls_known = true;
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {                 // bounded: kPqMaxRowGroups
+        const pq::PqRowGroup& rg = meta->row_groups[g];
+        if (c >= rg.chunk_count || rg.chunk_off + c >= meta->n_chunks) return false;
+        const pq::PqChunk& ch = meta->chunks[rg.chunk_off + c];
+        size += ch.total_compressed_size;
+        values += ch.num_values;
+        if (ch.null_count < 0) nulls_known = false; else nulls += ch.null_count;
+    }
+    e->has_column_size = true;
+    e->column_size = size;
+    e->no_null_count = !(counts && nulls_known);
+    e->null_count = e->no_null_count ? 0 : nulls;
+    e->has_value_count = counts;
+    e->value_count = counts ? values : 0;
+    return true;
+}
+
+// The integer-like bounds (booleans, ints, longs, dates, times, timestamps) straight from the footer statistics.
+void footer_bounds(const pq::PqMeta* meta, uint32_t c, ColumnStatEntry* e) noexcept {
+    assert(meta != nullptr && e != nullptr);
+    const BoundKind k = bound_kind(meta->columns[c]);
+    if (k == BoundKind::kNone || k == BoundKind::kFloat || k == BoundKind::kDouble || k == BoundKind::kBytes) return;
+    ColFold f{};
+    f.nulls_known = true;
+    f.lo_ok = f.hi_ok = true;
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {                 // bounded: kPqMaxRowGroups
+        const pq::PqRowGroup& rg = meta->row_groups[g];
+        fold_chunk(k, meta->chunks[rg.chunk_off + c], &f);
+    }
+    ColumnStatEntry b;
+    emit_col(k, e->field_id, f, &b);
+    if (b.has_lower) put_bound(e, true, reinterpret_cast<const uint8_t*>(b.lower), b.lower_len);
+    if (b.has_upper) put_bound(e, false, reinterpret_cast<const uint8_t*>(b.upper), b.upper_len);
+}
+
+// One leaf's entry. False = a malformed footer.
+bool leaf_metrics(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta, uint32_t c, const MetricsLeaf& lf,
+                  ColumnStatEntry* e) noexcept {
+    assert(meta != nullptr && e != nullptr);
+    std::memset(e, 0, sizeof(*e));
+    e->field_id = lf.field_id;
+    const pq::PqColumn& col = meta->columns[c];
+    const bool repeated = col.max_rep != 0u;                            // inside a list or map: its size only
+    if (!footer_counts(meta, c, !repeated, e)) return false;
+    if (repeated) return true;
+    ValueFold vf{};
+    vf.t = leaf_type(col);
+    vf.mode = lf.mode;
+    const bool floats = vf.t.type == IcebergType::kFloat || vf.t.type == IcebergType::kDouble;
+    const bool bounds = lf.mode.mode == MetricsMode::kTruncate || lf.mode.mode == MetricsMode::kFull;
+    if (vf.t.type == IcebergType::kUnknown) {
+        if (bounds) footer_bounds(meta, c, e);
+        return true;
+    }
+    if (!floats && !bounds) return true;
+    fold_leaf_values(bytes, len, meta, static_cast<uint16_t>(c), &vf);
+    if (floats && vf.ok) { e->has_nan_count = true; e->nan_count = vf.nan; }
+    emit_value_bounds(vf, e);
+    return true;
+}
+
+// split_offsets: each row group's first byte (its first column's dictionary page, else first data page).
+void split_offsets(const pq::PqMeta* meta, FileStats* out) noexcept {
+    assert(meta != nullptr && out != nullptr);
+    out->n_split_offsets = 0;
+    if (meta->n_row_groups == 0u || meta->n_row_groups > kIcebergMaxSplitOffsets || meta->n_columns == 0u) return;
+    for (uint32_t g = 0; g < meta->n_row_groups; ++g) {                 // bounded: kIcebergMaxSplitOffsets
+        const pq::PqRowGroup& rg = meta->row_groups[g];
+        if (rg.chunk_count == 0u || rg.chunk_off >= meta->n_chunks) { out->n_split_offsets = 0; return; }
+        const pq::PqChunk& ch = meta->chunks[rg.chunk_off];
+        out->split_offsets[g] = ch.dictionary_page_offset > 0 && ch.dictionary_page_offset < ch.data_page_offset
+                                    ? ch.dictionary_page_offset : ch.data_page_offset;
+    }
+    out->n_split_offsets = meta->n_row_groups;
+}
+
+}  // namespace
+
+bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta,
+                               const MetricsLeaf* leaves, uint32_t n_leaves, FileStats* out) noexcept {
+    assert(out != nullptr);
+    if (bytes == nullptr || meta == nullptr || out == nullptr || (leaves == nullptr && n_leaves != 0u)) return false;
+    if (meta->n_columns > kMaxColumns || meta->n_row_groups > pq::kPqMaxRowGroups) return false;
+    if (meta->n_row_groups > 0u && meta->chunks == nullptr) return false;
+    out->n_cols = 0;
+    const uint32_t nc = meta->n_columns < n_leaves ? meta->n_columns : n_leaves;
+    for (uint32_t c = 0; c < nc; ++c) {                                  // bounded: kMaxColumns
+        if (leaves[c].field_id <= 0 || leaves[c].mode.mode == MetricsMode::kNone) continue;
+        if (out->n_cols >= kIcebergMaxStatCols) break;                   // degrades pruning only
+        if (!leaf_metrics(bytes, len, meta, c, leaves[c], &out->cols[out->n_cols])) return false;
+        ++out->n_cols;
+    }
+    split_offsets(meta, out);
+    out->has_sort_order_id = true;                                       // synthesized rows follow no table sort order
+    out->sort_order_id = 0;
+    assert(out->n_cols <= kIcebergMaxStatCols);
+    return true;
+}

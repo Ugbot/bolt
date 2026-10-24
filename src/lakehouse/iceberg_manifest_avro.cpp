@@ -34,7 +34,7 @@ namespace {
 // table, so the element callback is a switch and not a string compare per row.
 enum : uint8_t {
     kRepNone = 0, kRepLower, kRepUpper, kRepNullCounts, kRepValueCounts,
-    kRepEqualityIds,
+    kRepEqualityIds, kRepColumnSizes, kRepNanCounts, kRepSplitOffsets,   // G2ICE-296: every data_file metric
 };
 
 constexpr uint32_t kMaxPartCols = kIcebergMaxPartitionValues;
@@ -73,6 +73,18 @@ bool fits(uint32_t cap, const ing::AvroValue* v) noexcept {
     assert(cap > 0u);
     return v == nullptr || v->is_null || v->bytes == nullptr ||
            v->bytes_len <= cap - 1u;
+}
+
+// A lower / upper bound's bytes into a kLakeMaxValBytes slot; false (no bound) when null or wider.
+bool copy_bound(char* dst, uint8_t* len, const ing::AvroValue* v) noexcept {
+    assert(dst != nullptr && len != nullptr);
+    *len = 0;
+    if (v == nullptr || v->is_null) return false;
+    if (v->bytes == nullptr) return v->bytes_len == 0u;
+    if (v->bytes_len > kLakeMaxValBytes) return false;
+    std::memcpy(dst, v->bytes, v->bytes_len);
+    *len = static_cast<uint8_t>(v->bytes_len);
+    return true;
 }
 
 // Copy a string/bytes value into a fixed char buffer, NUL-terminated and
@@ -218,6 +230,7 @@ struct DfCtx {
 
     int32_t f_status, f_snap, f_content, f_path, f_records, f_size;
     int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq, f_file_seq, f_first_row;
+    int32_t f_sort;   // G2ICE-296: data_file.sort_order_id
     // Partition struct leaves, in declared order.
     int32_t part_idx[kMaxPartCols];
     uint32_t n_part;
@@ -265,11 +278,18 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
     // Elements arrive before their row's row-callback, so start the row here.
     if (!s->have_pending || s->cur_row != row_index) df_reset_pending(s, row_index);
 
-    if (rep == kRepEqualityIds) {                       // array<long>
+    if (rep == kRepEqualityIds) {                       // array<int>
         if (n_vals < 1u || vals[0].is_null) return true;
         if (s->pending.n_equality_ids >= 8u) return true;   // bounded
         s->pending.equality_ids[s->pending.n_equality_ids++] =
             static_cast<int32_t>(vals[0].num.i64);
+        return true;
+    }
+    if (rep == kRepSplitOffsets) {                      // array<long>; more than a FileStats holds: none
+        FileStats& st = s->pending.stats;
+        if (n_vals < 1u || vals[0].is_null || st.n_split_offsets == UINT32_MAX) return true;
+        if (st.n_split_offsets >= kIcebergMaxSplitOffsets) { st.n_split_offsets = UINT32_MAX; return true; }
+        st.split_offsets[st.n_split_offsets++] = vals[0].num.i64;
         return true;
     }
     // The remaining three are array<record<key:int, value:...>>.
@@ -280,15 +300,18 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
     const ing::AvroValue* v = &vals[1];
     if (rep == kRepNullCounts) {
         col->null_count = i64_or(v, -1);
+    } else if (rep == kRepValueCounts || rep == kRepNanCounts || rep == kRepColumnSizes) {
+        const bool known = !v->is_null;
+        const int64_t x = i64_or(v, 0);
+        if (rep == kRepValueCounts) { col->has_value_count = known; col->value_count = x; }
+        else if (rep == kRepNanCounts) { col->has_nan_count = known; col->nan_count = x; }
+        else { col->has_column_size = known; col->column_size = x; }
     } else if (rep == kRepLower) {
-        // A cut bound is not a bound: drop it rather than prune on it.
-        col->lower_len = static_cast<uint8_t>(
-            copy_str(col->lower, kLakeMaxValBytes, v));
-        col->has_lower = !v->is_null && fits(kLakeMaxValBytes, v);
+        // A bound wider than the slot is not kept: drop it rather than prune on a cut copy. Binary (no NUL), so a
+        // bound of exactly kLakeMaxValBytes fits (G2ICE-296: truncate(16) of 4-byte code points is 64 bytes).
+        col->has_lower = copy_bound(col->lower, &col->lower_len, v);
     } else if (rep == kRepUpper) {
-        col->upper_len = static_cast<uint8_t>(
-            copy_str(col->upper, kLakeMaxValBytes, v));
-        col->has_upper = !v->is_null && fits(kLakeMaxValBytes, v);
+        col->has_upper = copy_bound(col->upper, &col->upper_len, v);
     }
     return true;
 }
@@ -338,6 +361,11 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
         if (!fits(kIcebergMaxPath, v)) return false;
         copy_str(e->referenced_data_file, kIcebergMaxPath, v);
     }
+    if (const ing::AvroValue* so = at(s->f_sort); so != nullptr && !so->is_null) {
+        e->stats.sort_order_id = static_cast<int32_t>(i64_or(so, 0));
+        e->stats.has_sort_order_id = true;
+    }
+    if (e->stats.n_split_offsets == UINT32_MAX) e->stats.n_split_offsets = 0;   // more than a FileStats holds: none
     e->stats.record_count       = i64_or(at(s->f_records), 0);
     e->stats.file_size_in_bytes = i64_or(at(s->f_size), 0);
 
@@ -501,6 +529,7 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->f_dv_size   = find_field(h, "data_file.content_size_in_bytes");
     s->f_dv_ref    = find_field(h, "data_file.referenced_data_file");
     s->f_first_row = find_field(h, "data_file.first_row_id");
+    s->f_sort      = find_field(h, "data_file.sort_order_id");
     if (s->f_path < 0) return false;                // not a manifest
 
     // Partition struct leaves flatten to "data_file.partition.<col>".
@@ -522,6 +551,9 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     bind_rep(s, h, "data_file.null_value_counts", kRepNullCounts);
     bind_rep(s, h, "data_file.value_counts",      kRepValueCounts);
     bind_rep(s, h, "data_file.equality_ids",      kRepEqualityIds);
+    bind_rep(s, h, "data_file.column_sizes",      kRepColumnSizes);
+    bind_rep(s, h, "data_file.nan_value_counts",  kRepNanCounts);
+    bind_rep(s, h, "data_file.split_offsets",     kRepSplitOffsets);
 
     int64_t rows = 0;
     const bool ok =
