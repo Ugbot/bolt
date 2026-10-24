@@ -477,6 +477,31 @@ uint32_t encode_summaries(const ManifestListEntry* e, uint8_t* dst, uint32_t cap
 
 namespace {
 
+// G2ICE-276 format v1: the written columns are the v2 ones minus the fields v1 does not have, plus constants. `keep[i]` names the
+// v2 column of output column i, or -1 for data_file.block_size_in_bytes (v1-only, required; Iceberg-Java writes 64 MiB).
+constexpr int64_t kV1BlockSize = int64_t{64} << 20;
+
+bool project_columns(const ing::AvroField* f, const ing::AvroValue* rows, uint32_t nf, uint32_t n, const int32_t* keep, uint32_t nk,
+                     Arena* a, ing::AvroField** of, ing::AvroValue** orows) noexcept {
+    assert(f != nullptr && keep != nullptr && a != nullptr && of != nullptr && orows != nullptr);
+    *of = a->allocate_array<ing::AvroField>(nk);
+    *orows = a->allocate_array<ing::AvroValue>(static_cast<uint64_t>(n) * nk + 1u);
+    if (*of == nullptr || *orows == nullptr) return false;
+    for (uint32_t c = 0; c < nk; ++c) {                                  // bounded: nk
+        if (keep[c] < 0) { set_field(&(*of)[c], "block_size_in_bytes", ing::AvroType::kLong, false); continue; }
+        if (static_cast<uint32_t>(keep[c]) >= nf) return false;
+        (*of)[c] = f[keep[c]];
+    }
+    for (uint32_t r = 0; r < n; ++r) {                                   // bounded: n
+        for (uint32_t c = 0; c < nk; ++c) {                              // bounded: nk
+            ing::AvroValue& dst = (*orows)[static_cast<uint64_t>(r) * nk + c];
+            if (keep[c] < 0) put_long(&dst, kV1BlockSize);
+            else dst = rows[static_cast<uint64_t>(r) * nf + static_cast<uint32_t>(keep[c])];
+        }
+    }
+    return true;
+}
+
 // Shared body. `spec == nullptr` (or zero fields) is the unpartitioned form
 // and encodes byte-identically to what this writer always produced.
 bool write_manifest(const DataFileRef* files, uint32_t n_files,
@@ -493,13 +518,13 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
     const uint32_t np = spec == nullptr ? 0u : spec->n_fields;
     if (np > kIcebergMaxFieldsPerSpec || np > kIcebergMaxPartitionValues) return false;
     if (np != 0u && result_types == nullptr) return false;
-    if (fv != 2 && fv != 3) return false;
-    const bool v3 = fv == 3;
+    if (fv != 1 && fv != 2 && fv != 3) return false;
+    const bool v3 = fv == 3, v1 = fv == 1;
     const uint32_t nf = kEntryFields + np + (v3 ? kEntryV3Fields : 0u);
 
-    const char* entry_schema = kManifestEntrySchema;
-    uint32_t    entry_schema_len =
-        static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u);
+    const char* entry_schema = v1 ? kManifestEntryV1Schema : kManifestEntrySchema;
+    uint32_t    entry_schema_len = v1 ? static_cast<uint32_t>(sizeof(kManifestEntryV1Schema) - 1u)
+                                      : static_cast<uint32_t>(sizeof(kManifestEntrySchema) - 1u);
     if (v3 && !insert_fields(entry_schema, entry_schema_len, "],\"name\":\"r2\"", kManifestEntryV3Fields,
                              static_cast<uint32_t>(sizeof(kManifestEntryV3Fields) - 1u), scratch, &entry_schema,
                              &entry_schema_len)) {
@@ -561,6 +586,7 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
         const bool d = (files[r].content != FileContent::kData);
         if (d != deletes_manifest) return false;
     }
+    if (v1 && deletes_manifest) return false;         // v1 has no delete files
 
     uint64_t value_bytes = 0;
     for (uint32_t r = 0; r < n_files; ++r) {          // bounded by n_files
@@ -665,24 +691,41 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
          spec_json_len, 0u},
         {"partition-spec-id", reinterpret_cast<const uint8_t*>(spec_id_buf),
          static_cast<uint32_t>(spec_id_len), 0u},
-        {"format-version", reinterpret_cast<const uint8_t*>(v3 ? "3" : "2"), 1u, 0u},
+        {"format-version", reinterpret_cast<const uint8_t*>(v3 ? "3" : v1 ? "1" : "2"), 1u, 0u},
         {"content",
          reinterpret_cast<const uint8_t*>(deletes_manifest ? "deletes"
                                                            : "data"),
          deletes_manifest ? 7u : 4u, 0u},
     };
-    constexpr uint32_t kNMeta = sizeof(meta) / sizeof(meta[0]);
+    const uint32_t kNMeta = v1 ? 4u : static_cast<uint32_t>(sizeof(meta) / sizeof(meta[0]));   // v1 manifests carry no content key
+    const ing::AvroField* wf = fields;
+    const ing::AvroValue* wr = rows;
+    uint32_t wn = nf;
+    if (v1) {                                         // drop sequence_number, file_sequence_number, content, equality_ids
+        int32_t keep[kEntryFields + kIcebergMaxPartitionValues + 1u];
+        uint32_t nk = 0;
+        for (uint32_t c = 0; c < nf; ++c) {           // bounded: nf
+            if (c == 2u || c == 3u || c == 4u || c == 17u + np) continue;
+            keep[nk++] = static_cast<int32_t>(c);
+            if (c == 8u + np) { keep[nk++] = -1; fields[1].nullable = false; }   // after file_size_in_bytes
+        }
+        ing::AvroField* pf = nullptr;
+        ing::AvroValue* pr = nullptr;
+        if (!project_columns(fields, rows, nf, n_files, keep, nk, scratch, &pf, &pr)) return false;
+        wf = pf; wr = pr; wn = nk;
+        value_bytes += static_cast<uint64_t>(n_files) * 10u;
+    }
 
     uint64_t meta_bytes = entry_schema_len + 1u + table_schema_len;
     for (uint32_t m = 0; m < kNMeta; ++m) meta_bytes += meta[m].val_len + 32u;
 
-    uint64_t cap = ing::avro_write_ex_max_len(fields, nf, value_bytes,
+    uint64_t cap = ing::avro_write_ex_max_len(wf, wn, value_bytes,
                                               n_files, meta_bytes);
     uint8_t* dst = scratch->allocate_array<uint8_t>(cap);
     if (dst == nullptr) return false;
 
     uint64_t len = cap;
-    if (!ing::avro_write_ex(fields, nf, rows, n_files, entry_schema,
+    if (!ing::avro_write_ex(wf, wn, wr, n_files, entry_schema,
                             entry_schema_len, meta, kNMeta, kSync, dst, &len)) {
         return false;
     }
@@ -771,16 +814,17 @@ bool manifest_list_write_avro_fv(int32_t format_version, const ManifestListEntry
     assert(out != nullptr && out_len != nullptr);
     if (entries == nullptr && n_entries != 0) return false;
     if (scratch == nullptr || out == nullptr || out_len == nullptr) return false;
-    if (format_version != 2 && format_version != 3) return false;
-    const bool v3 = format_version == 3;
+    if (format_version != 1 && format_version != 2 && format_version != 3) return false;
+    const bool v3 = format_version == 3, v1 = format_version == 1;
     const uint32_t nf = kListFields + (v3 ? 1u : 0u);
 
     ing::AvroField* fields = scratch->allocate_array<ing::AvroField>(nf);
     if (fields == nullptr) return false;
     build_list_fields(fields);
     if (v3) set_field(&fields[kListFields], "first_row_id", ing::AvroType::kLong, true);
-    const char* list_schema = kManifestFileSchema;
-    uint32_t list_schema_len = static_cast<uint32_t>(sizeof(kManifestFileSchema) - 1u);
+    const char* list_schema = v1 ? kManifestFileV1Schema : kManifestFileSchema;
+    uint32_t list_schema_len = v1 ? static_cast<uint32_t>(sizeof(kManifestFileV1Schema) - 1u)
+                                  : static_cast<uint32_t>(sizeof(kManifestFileSchema) - 1u);
     if (v3 && !insert_fields(list_schema, list_schema_len, "],\"name\":\"manifest_file\"", kManifestFileV3Fields,
                              static_cast<uint32_t>(sizeof(kManifestFileV3Fields) - 1u), scratch, &list_schema,
                              &list_schema_len)) {
@@ -806,10 +850,8 @@ bool manifest_list_write_avro_fv(int32_t format_version, const ManifestListEntry
         // one. Stamping every entry with `sequence_number` silently disarms
         // positional deletes — see ManifestListEntry::sequence_number.
         {
-            const int64_t seq =
-                e->sequence_number != 0 ? e->sequence_number : sequence_number;
-            const int64_t mseq =
-                e->min_sequence_number != 0 ? e->min_sequence_number : seq;
+            const int64_t seq = e->sequence_number_fixed || e->sequence_number != 0 ? e->sequence_number : sequence_number;
+            const int64_t mseq = e->sequence_number_fixed || e->min_sequence_number != 0 ? e->min_sequence_number : seq;
             put_long(&v[i++], seq);
             put_long(&v[i++], mseq);
         }
@@ -844,21 +886,33 @@ bool manifest_list_write_avro_fv(int32_t format_version, const ManifestListEntry
     }
 
     const ing::AvroMetaKV meta[] = {
-        {"format-version", reinterpret_cast<const uint8_t*>(v3 ? "3" : "2"), 1u, 0u},
+        {"format-version", reinterpret_cast<const uint8_t*>(v3 ? "3" : v1 ? "1" : "2"), 1u, 0u},
         {"content", reinterpret_cast<const uint8_t*>("data"), 4u, 0u},
     };
-    constexpr uint32_t kNMeta = sizeof(meta) / sizeof(meta[0]);
+    const uint32_t kNMeta = v1 ? 1u : static_cast<uint32_t>(sizeof(meta) / sizeof(meta[0]));
+    const ing::AvroField* wf = fields;
+    const ing::AvroValue* wr = rows;
+    uint32_t wn = nf;
+    if (v1) {                                         // drop content, sequence_number, min_sequence_number (v2 fields)
+        int32_t keep[kListFields];
+        uint32_t nk = 0;
+        for (uint32_t c = 0; c < nf; ++c) if (c < 3u || c > 5u) keep[nk++] = static_cast<int32_t>(c);   // bounded: nf
+        ing::AvroField* pf = nullptr;
+        ing::AvroValue* pr = nullptr;
+        if (!project_columns(fields, rows, nf, n_entries, keep, nk, scratch, &pf, &pr)) return false;
+        wf = pf; wr = pr; wn = nk;
+    }
 
     uint64_t meta_bytes = list_schema_len + 1u;
     for (uint32_t m = 0; m < kNMeta; ++m) meta_bytes += meta[m].val_len + 32u;
 
-    uint64_t cap = ing::avro_write_ex_max_len(fields, nf, value_bytes,
+    uint64_t cap = ing::avro_write_ex_max_len(wf, wn, value_bytes,
                                               n_entries, meta_bytes);
     uint8_t* dst = scratch->allocate_array<uint8_t>(cap);
     if (dst == nullptr) return false;
 
     uint64_t len = cap;
-    if (!ing::avro_write_ex(fields, nf, rows, n_entries, list_schema, list_schema_len,
+    if (!ing::avro_write_ex(wf, wn, wr, n_entries, list_schema, list_schema_len,
                             meta, kNMeta, kSync, dst, &len)) {
         return false;
     }

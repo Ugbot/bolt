@@ -152,3 +152,43 @@ TEST(IcebergV3Metadata, ParsesNextRowIdAndInitialDefaults) {
     EXPECT_EQ(f[4].initial_default_kind, DefaultKind::kUnsupported) << "a struct default is not filled: the scan refuses it";
     EXPECT_EQ(f[5].initial_default_kind, DefaultKind::kNone);
 }
+
+TEST(IcebergV1Write, ManifestAndListHaveTheV1ShapeAndReadBack) {
+    bolt::Arena a;
+    DataFileRef files[2] = {data_file("s3://b/t/data/a.parquet", 10, false, 0), data_file("s3://b/t/data/b.parquet", 5, false, 0)};
+    const uint8_t* bytes = nullptr;
+    uint64_t len = 0;
+    ASSERT_TRUE(manifest_write_avro_fv(1, files, 2, 77, 0, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &bytes, &len));
+    const std::string text(reinterpret_cast<const char*>(bytes), len);
+    EXPECT_NE(text.find("block_size_in_bytes"), std::string::npos);
+    EXPECT_EQ(text.find("sequence_number"), std::string::npos) << "v1 manifests carry no sequence numbers";
+    EXPECT_EQ(text.find("\"content\""), std::string::npos);
+    EXPECT_NE(text.find("format-version"), std::string::npos);
+    DataFileRef* got = nullptr;
+    uint32_t n = 0;
+    ASSERT_TRUE(manifest_parse_avro_grow(bytes, len, &a, 0, 4, &got, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_STREQ(got[0].file_path, "s3://b/t/data/a.parquet");
+    EXPECT_EQ(got[1].stats.record_count, 5);
+    EXPECT_EQ(got[0].snapshot_id, 77);
+    DataFileRef del = data_file("s3://b/t/data/d.parquet", 1, false, 0);
+    del.content = FileContent::kPositionDeletes;
+    EXPECT_FALSE(manifest_write_avro_fv(1, &del, 1, 77, 0, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &bytes, &len))
+        << "v1 has no delete files";
+
+    ManifestListEntry e;
+    std::memset(&e, 0, sizeof(e));
+    std::snprintf(e.manifest_path, sizeof(e.manifest_path), "%s", "s3://b/t/metadata/m.avro");
+    e.manifest_length = 100;
+    e.added_snapshot_id = 77;
+    e.added_files_count = 2;
+    e.added_rows_count = 15;
+    ASSERT_TRUE(manifest_list_write_avro_fv(1, &e, 1, 77, 0, &a, &bytes, &len));
+    const std::string lt(reinterpret_cast<const char*>(bytes), len);
+    EXPECT_EQ(lt.find("sequence_number"), std::string::npos);
+    ManifestListEntry* le = nullptr;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(bytes, len, &a, 4, &le, &n));
+    ASSERT_EQ(n, 1u);
+    EXPECT_STREQ(le[0].manifest_path, "s3://b/t/metadata/m.avro");
+    EXPECT_EQ(le[0].added_rows_count, 15);
+}

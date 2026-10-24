@@ -153,6 +153,9 @@ struct ManifestListEntry {
     // sequence number (the correct value for a manifest this commit added).
     int64_t      sequence_number;
     int64_t      min_sequence_number;
+    // Write sequence_number / min_sequence_number as they are, 0 included (a manifest carried from a v1 table into v2+ has
+    // sequence number 0; 0 otherwise means "this commit's").
+    bool         sequence_number_fixed;
     // partitions[] as read from the list; 0 when absent, unparsed, or the
     // spec has more than kIcebergMaxSummaries fields (then nothing prunes).
     uint32_t              n_partitions;
