@@ -91,6 +91,9 @@ struct ChangeState {
     SnapSummary      sum;
     RmIndex          rm_data;
     RmIndex          rm_dels;
+    uint64_t*        part_keys;     // (spec, tuple) hash of every file added or removed: changed-partition-count
+    uint32_t         n_part_keys, cap_part_keys;
+    uint32_t         n_manifests_added;
 };
 
 bool track_key(TableHandle* th, ChangeState* st, const char* key) noexcept {
@@ -144,14 +147,24 @@ void carry_entry(DataFileRef* e, const ManifestListEntry& mle, bool removed, int
     if (removed) e->snapshot_id = snap_id;
 }
 
-// Write one manifest of `files` (added, existing or deleted, per entry status) and its list entry.
+bool refuse_named(TableHandle* th, const char* what) noexcept;
+bool spec_types_for(const TableHandle* th, const PartitionSpec* spec, IcebergTypeInfo* src,
+                    IcebergTypeInfo* res) noexcept;
+
+// Write one manifest of `files` (added, existing or deleted, per entry status) under spec `spec_id` and its list
+// entry, with the entries' partition tuples and the list's partition summaries (G2ICE-292).
 bool write_manifest_entry(TableHandle* th, ChangeState* st, const DataFileRef* files, uint32_t nf, int32_t spec_id,
                           const char* tag, ManifestListEntry* out) noexcept {
     assert(th != nullptr && st != nullptr && out != nullptr);
     assert(files != nullptr && nf > 0 && tag != nullptr);
+    const PartitionSpec* spec = metadata_spec(&th->meta, spec_id);
+    if (spec == nullptr) { th->last_error = CommitError::kFailed; return false; }
+    IcebergTypeInfo src[kIcebergMaxFieldsPerSpec], res[kIcebergMaxFieldsPerSpec];
+    if (spec->n_fields != 0u && !spec_types_for(th, spec, src, res))
+        return refuse_named(th, "a manifest of a partition spec with an unknown transform, or one not defined for its source");
     const uint8_t* body = nullptr; uint64_t len = 0;
-    if (!manifest_write_avro(files, nf, st->cs->snap_id, st->seq, reinterpret_cast<const char*>(st->schema_json),
-                             st->schema_len, spec_id, th->arena, &body, &len)) { th->last_error = CommitError::kFailed; return false; }
+    if (!manifest_write_avro_typed(files, nf, st->cs->snap_id, st->seq, reinterpret_cast<const char*>(st->schema_json),
+                                   st->schema_len, spec, res, th->arena, &body, &len)) { th->last_error = CommitError::kFailed; return false; }
     char rel[128];
     const int rn = std::snprintf(rel, sizeof(rel), "metadata/manifest-%lld%s.avro",
                                  static_cast<long long>(st->cs->snap_id), tag);
@@ -178,6 +191,7 @@ bool write_manifest_entry(TableHandle* th, ChangeState* st, const DataFileRef* f
         *rc += d.stats.record_count;
     }
     if (!abs_location(th->root, rel, m.manifest_path, sizeof(m.manifest_path))) return false;
+    manifest_partition_summaries(files, nf, spec, res, &m);
     *out = m;
     return true;
 }

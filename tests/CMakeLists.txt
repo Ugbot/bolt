@@ -2334,6 +2334,15 @@ target_link_libraries(test_bolt_iceberg_transforms PRIVATE bolt::lakehouse GTest
 bolt_apply_hardening(test_bolt_iceberg_transforms)
 add_test(NAME test_bolt_iceberg_transforms COMMAND test_bolt_iceberg_transforms)
 
+# G2ICE-292 — partitioned appends, delete / overwrite / compaction per partition, spec evolution and partition
+# pruning, read back through bolt's own scan; the external verdict is scripts/iceberg_partition_interop.py.
+add_executable(test_bolt_iceberg_partitioned test_bolt_iceberg_partitioned.cpp)
+target_link_libraries(test_bolt_iceberg_partitioned
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_partitioned)
+add_test(NAME test_bolt_iceberg_partitioned COMMAND test_bolt_iceberg_partitioned)
+set_tests_properties(test_bolt_iceberg_partitioned PROPERTIES TIMEOUT 300)
+
 # Oracle tool (not a test): scan a filesystem-catalog Iceberg table with bolt's reader; see scripts/oracles/verify_v3_external.py.
 add_executable(bolt_iceberg_scan_dump bolt_iceberg_scan_dump.cpp)
 target_link_libraries(bolt_iceberg_scan_dump PRIVATE bolt::lakehouse bolt::ingest bolt::parse)

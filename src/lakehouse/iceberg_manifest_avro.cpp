@@ -110,13 +110,14 @@ struct MlCtx {
 };
 
 // A summary bound, kept only when it fits whole.
-void copy_bound(char* dst, uint8_t* len, bool* has,
+void copy_bound(char* dst, uint8_t* len, bool* has, bool* dropped,
                 const ing::AvroValue* v) noexcept {
     assert(dst != nullptr && len != nullptr && has != nullptr);
+    assert(dropped != nullptr);
     *has = false;
     *len = 0;
     if (v->is_null || v->bytes == nullptr) return;
-    if (v->bytes_len > kIcebergMaxSummaryBound) return;
+    if (v->bytes_len > kIcebergMaxSummaryBound) { *dropped = true; return; }
     std::memcpy(dst, v->bytes, v->bytes_len);
     *len = static_cast<uint8_t>(v->bytes_len);
     *has = true;
@@ -144,8 +145,10 @@ bool ml_elem(void* c, uint32_t field_index, int64_t row_index,
     PartitionFieldSummary* ps = &s->pend[s->n_pend++];
     std::memset(ps, 0, sizeof(*ps));
     ps->contains_null = !vals[0].is_null && vals[0].num.i64 != 0;
-    copy_bound(ps->lower, &ps->lower_len, &ps->has_lower, &vals[2]);
-    copy_bound(ps->upper, &ps->upper_len, &ps->has_upper, &vals[3]);
+    ps->has_nan = !vals[1].is_null;
+    ps->contains_nan = ps->has_nan && vals[1].num.i64 != 0;
+    copy_bound(ps->lower, &ps->lower_len, &ps->has_lower, &ps->bounds_dropped, &vals[2]);
+    copy_bound(ps->upper, &ps->upper_len, &ps->has_upper, &ps->bounds_dropped, &vals[3]);
     return true;
 }
 
@@ -343,14 +346,17 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
         p->field_id = static_cast<int32_t>(i);
         p->is_null  = v->is_null;
         if (v->is_null) continue;
-        if (v->type == ing::AvroType::kString || v->type == ing::AvroType::kBytes) {
-            if (!fits(kLakeMaxValBytes, v)) return false;
-            p->is_str = true;
-            copy_str(p->str, kLakeMaxValBytes, v);
+        if (v->type == ing::AvroType::kString || v->type == ing::AvroType::kBytes ||
+            v->type == ing::AvroType::kFixed) {
+            // A value wider than the slot is kept as a prefix marked partial: it reads, it never prunes.
+            p->is_str     = true;
+            p->is_partial = !fits(kLakeMaxValBytes, v);
+            p->str_len    = static_cast<uint8_t>(copy_str(p->str, kLakeMaxValBytes, v));
         } else if (v->type == ing::AvroType::kDouble ||
                    v->type == ing::AvroType::kFloat) {
-            p->is_int = false;
-            p->i64    = static_cast<int64_t>(v->num.f64);
+            p->is_float = true;
+            p->f64      = v->num.f64;
+            p->i64      = static_cast<int64_t>(v->num.f64);
         } else {
             p->is_int = true;
             p->i64    = v->num.i64;

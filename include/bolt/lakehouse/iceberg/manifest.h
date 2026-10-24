@@ -96,8 +96,8 @@ enum class ManifestStatus : uint8_t {
 // One manifest_file.partitions[i] field_summary (G2ICE-234): the bounds of
 // spec field i over every file the manifest names, in Iceberg's binary
 // single-value encoding. Bounds wider than kIcebergMaxSummaryBound bytes are
-// dropped (has_* false), which only ever disables pruning.
-static constexpr uint32_t kIcebergMaxSummaryBound = 16u;
+// dropped (has_* false, bounds_dropped true), which only ever disables pruning.
+static constexpr uint32_t kIcebergMaxSummaryBound = kLakeMaxValBytes;
 static constexpr uint32_t kIcebergMaxSummaries    = 8u;
 
 struct PartitionFieldSummary {
@@ -106,7 +106,13 @@ struct PartitionFieldSummary {
     bool    has_upper;
     uint8_t lower_len;
     uint8_t upper_len;
-    uint8_t _pad[3];
+    // contains_nan as written (G2ICE-292); has_nan false = the optional field was null (unknown).
+    bool    has_nan;
+    bool    contains_nan;
+    // A bound was present in the file but wider than kIcebergMaxSummaryBound: re-emitting this summary would turn
+    // "unknown" into "no bound", which a reader may take for "every value is null". A writer carrying it forward
+    // writes the manifest's partitions as null instead.
+    bool    bounds_dropped;
     char    lower[kIcebergMaxSummaryBound];
     char    upper[kIcebergMaxSummaryBound];
 };
@@ -155,15 +161,35 @@ struct ManifestListEntry {
     char         manifest_path[kIcebergMaxManifestPath];
 };
 
+// One value of a partition tuple. Which member holds it follows from the partition field's result type (the
+// transform's result over its source type, see partition_values.h):
+//   boolean / int / long / date / time / timestamp*  is_int, i64
+//   float / double                                   is_float, f64
+//   string / binary                                  is_str, str[0..str_len)
+//   uuid / fixed[L] / decimal                        is_str, str[0..str_len): the Avro fixed bytes, big-endian
+// `str` stays NUL-terminated (at most kLakeMaxValBytes - 1 bytes); str_len 0 with is_str is a legacy writer's
+// NUL-terminated string. `is_partial`: a value the reader could not hold whole (never used to prune).
 struct PartitionValue {
     int32_t  field_id;
     bool     is_int;
     bool     is_str;
     bool     is_null;
-    uint8_t  _pad;
+    uint8_t  str_len;
     int64_t  i64;
     char     str[kLakeMaxValBytes];
+    double   f64;
+    bool     is_float;
+    bool     is_partial;
+    uint8_t  _pad2[6];
 };
+
+// The bytes of an is_str value.
+inline uint32_t partition_value_bytes_len(const PartitionValue& v) noexcept {
+    if (v.str_len != 0u) return v.str_len;
+    uint32_t n = 0;
+    while (n + 1u < kLakeMaxValBytes && v.str[n] != '\0') ++n;   // bounded: legacy NUL-terminated form
+    return n;
+}
 
 struct DataFileRef {
     ManifestStatus status;

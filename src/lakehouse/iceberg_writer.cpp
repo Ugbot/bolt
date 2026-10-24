@@ -50,7 +50,9 @@
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
+#include "bolt/lakehouse/iceberg/partition_values.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
+#include "bolt/join/bolt_swiss_growable.h"
 #include "bolt/lakehouse/object_store.h"
 #include "iceberg_dml_read.h"
 
@@ -873,6 +875,10 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
 
 }  // namespace
 
+namespace {
+#include "iceberg_partition_spec.inc"
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // table_create / table_open / table_close
 // ---------------------------------------------------------------------------
@@ -908,9 +914,14 @@ bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
         if (s0 == nullptr || !schema_copy(s0, schema, arena, nullptr))
             return false;
     }
+    h->meta.n_specs = 0;
+    PartitionSpec first{};
+    int32_t equivalent = -1;
+    if (spec != nullptr && !normalize_spec(&h->meta, schema, spec, &first, &equivalent)) return false;
+    if (first.spec_id < 0) first.spec_id = 0;
     h->meta.n_specs          = 1;
-    if (spec != nullptr) h->meta.specs[0] = *spec;
-    else                  h->meta.specs[0].spec_id = 0;
+    h->meta.specs[0]         = first;
+    h->meta.current_spec_id  = first.spec_id;
     h->meta.n_sort_orders    = 1;
     if (sort != nullptr) h->meta.sort_orders[0] = *sort;
     else                  h->meta.sort_orders[0].order_id = 0;
@@ -1245,6 +1256,7 @@ int64_t mint_snapshot_id(const TableHandle* th) noexcept {
 }
 
 #include "iceberg_change.inc"
+#include "iceberg_partitioned.inc"
 #include "iceberg_summary.inc"
 #include "iceberg_change_commit.inc"
 
@@ -1277,6 +1289,9 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
     // Don't write a data file for a commit that has already lost.
     if (!handle_is_current(ah->th)) return false;
     const int64_t snap_id = mint_snapshot_id(ah->th);
+    const PartitionSpec* spec = metadata_spec(&ah->th->meta, ah->th->meta.current_spec_id);
+    if (spec != nullptr && spec->n_fields != 0u)
+        return append_partitioned(ah, spec, snap_id, out_path, out_path_cap, out_rows);
     char rel[128];
     int64_t size = 0, rows = 0;
     if (!write_data_file(ah->th, ah->pending, ah->n_pending, snap_id,

@@ -8,7 +8,7 @@
 //     is unpartitioned and REJECTS a partitioned file rather than writing it
 //     wrong; `manifest_write_avro_partitioned` derives the nested partition
 //     record from the spec itself, so the tuple shape and the spec cannot
-//     disagree. Only integral partition results are written.
+//     disagree. `manifest_write_avro_typed` writes any result type.
 //     Readers accept a null codec; the reference writer's `deflate` is not
 //     required.
 //
@@ -83,8 +83,21 @@ bool manifest_write_avro_partitioned(const DataFileRef* files, uint32_t n_files,
                                      Arena* scratch, const uint8_t** out,
                                      uint64_t* out_len) noexcept;
 
+struct IcebergTypeInfo;
+
+// The partitioned form with any result type (G2ICE-292): `result_types[i]` is the Iceberg type of spec field i's
+// value (partition_values.h), declared in the manifest's partition record with its Avro logical type (date,
+// time-micros, timestamp-micros / -nanos with adjust-to-utc, a fixed for uuid / fixed[L] / decimal). Each file's
+// value must have that type (an int/date within int32, a fixed of exactly its width); anything else fails the write.
+bool manifest_write_avro_typed(const DataFileRef* files, uint32_t n_files, int64_t snapshot_id,
+                               int64_t sequence_number, const char* table_schema_json,
+                               uint32_t table_schema_len, const PartitionSpec* spec,
+                               const IcebergTypeInfo* result_types, Arena* scratch,
+                               const uint8_t** out, uint64_t* out_len) noexcept;
+
 // Write `n_entries` manifest-list entries (the snapshot's `snap-*.avro`).
-// `partitions` and `key_metadata` are written null; the six required
+// `partitions` carries each entry's summaries (n_partitions > 0, none with a
+// dropped bound; else null, G2ICE-292) and `key_metadata` is written null; the six required
 // added/existing/deleted file+row counts (G2ICE-49) are written from the
 // matching `ManifestListEntry` fields, which the caller must have populated
 // with real tallies -- these are trusted by readers (pyiceberg's

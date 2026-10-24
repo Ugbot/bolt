@@ -390,11 +390,9 @@ TEST(IcebergWrite, AppendCommitEmitsAvroManifests) {
     EXPECT_FALSE(sm.exists);
 }
 
-// A partitioned table cannot be committed by this writer: the manifest schema
-// it emits declares no partition tuple, so the manifest would parse and then
-// report every file as unpartitioned — a reader prunes on that and silently
-// drops rows. Fail the commit; do not write something wrong.
-TEST(IcebergWrite, PartitionedCommitIsRefusedNotFaked) {
+// A partitioned table's commit records each file's partition tuple (G2ICE-292; it used to be refused because the
+// manifest schema had no partition record): identity(id) over ids 0..3 writes four files, each carrying its id.
+TEST(IcebergWrite, PartitionedCommitRecordsTheTuple) {
     bolt::Arena arena;
     const std::string root = unique_root("parted");
     FilesystemObjectStore fs{}; ObjectStore os{};
@@ -418,10 +416,31 @@ TEST(IcebergWrite, PartitionedCommitIsRefusedNotFaked) {
     AppendHandle* ah = nullptr;
     ASSERT_TRUE(append_open(&ah, th));
     ASSERT_TRUE(append_write(ah, &b0));
-    EXPECT_FALSE(append_commit(ah));
+    ASSERT_TRUE(append_commit(ah));
     append_close(ah);
-
-    // No snapshot was published, so no reader can ever see a wrong manifest.
-    EXPECT_EQ(table_metadata(th)->n_snapshots, 0u);
-    EXPECT_EQ(table_metadata(th)->current_snapshot_id, -1);
+    ASSERT_EQ(table_metadata(th)->n_snapshots, 1u);
+    const Snapshot& snap = table_metadata(th)->snapshots[0];
+    const std::string prefix = root + "/";
+    std::string key(snap.manifest_list);
+    if (key.compare(0, prefix.size(), prefix) == 0) key.erase(0, prefix.size());
+    const uint8_t* ml = nullptr; uint64_t mll = 0;
+    ASSERT_EQ(os_get(&os, key.c_str(), &arena, &ml, &mll), kOsOk);
+    ManifestListEntry* mle = nullptr; uint32_t nm = 0;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(ml, mll, &arena, 2u, &mle, &nm));
+    ASSERT_EQ(nm, 1u);
+    std::string mkey(mle[0].manifest_path);
+    if (mkey.compare(0, prefix.size(), prefix) == 0) mkey.erase(0, prefix.size());
+    const uint8_t* mb = nullptr; uint64_t mbl = 0;
+    ASSERT_EQ(os_get(&os, mkey.c_str(), &arena, &mb, &mbl), kOsOk);
+    DataFileRef* e = nullptr; uint32_t ne = 0;
+    ASSERT_TRUE(manifest_parse_avro_grow(mb, mbl, &arena, 0, 4u, &e, &ne));
+    ASSERT_EQ(ne, 4u);
+    int64_t seen = 0;
+    for (uint32_t i = 0; i < ne; ++i) {
+        ASSERT_EQ(e[i].n_partition, 1u);
+        ASSERT_TRUE(e[i].partition[0].is_int);
+        EXPECT_EQ(e[i].stats.record_count, 1);
+        seen |= int64_t{1} << e[i].partition[0].i64;
+    }
+    EXPECT_EQ(seen, 0xF);
 }

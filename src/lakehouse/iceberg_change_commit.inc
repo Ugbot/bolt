@@ -1,6 +1,33 @@
 // bolt/lakehouse/iceberg_change_commit.inc — commit_change (G2ICE-280). Included inside iceberg_writer.cpp's
 // anonymous namespace after iceberg_change.inc and iceberg_summary.inc; not a standalone TU.
 
+// Record the partition a changed file belongs to (spec: summary "changed-partition-count").
+bool note_partition(TableHandle* th, ChangeState* st, const DataFileRef& d) noexcept {
+    assert(th != nullptr && st != nullptr);
+    assert(d.n_partition <= kIcebergMaxPartitionValues);
+    if (!lake_grow(th->arena, nullptr, &st->part_keys, st->n_part_keys, &st->cap_part_keys, st->n_part_keys + 1u))
+        return false;
+    st->part_keys[st->n_part_keys++] = tuple_hash(d.partition, d.n_partition, d.partition_spec_id);
+    return true;
+}
+
+int64_t distinct_partitions(ChangeState* st) noexcept {
+    assert(st != nullptr);
+    uint64_t* k = st->part_keys;
+    const uint32_t n = st->n_part_keys;
+    for (uint32_t gap = n / 2u; gap > 0u; gap /= 2u)                      // shell sort: bounded, no recursion
+        for (uint32_t i = gap; i < n; ++i) {
+            const uint64_t x = k[i];
+            uint32_t j = i;
+            while (j >= gap && k[j - gap] > x) { k[j] = k[j - gap]; j -= gap; }
+            k[j] = x;
+        }
+    int64_t d = 0;
+    for (uint32_t i = 0; i < n; ++i) d += (i == 0u || k[i] != k[i - 1u]) ? 1 : 0;   // bounded by n
+    assert(d <= static_cast<int64_t>(n));
+    return d;
+}
+
 // Carry `mle` forward, or rewrite it when it holds a file the change removes.
 bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& mle,
                      ManifestListEntry* out) noexcept {
@@ -15,8 +42,6 @@ bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& 
     for (uint32_t i = 0; i < n && !hit; ++i)                    // bounded by n
         hit = e[i].status != ManifestStatus::kDeleted && rm_index_find(rm, e[i].file_path) >= 0;
     if (!hit) return true;
-    const PartitionSpec* sp = metadata_spec(&th->meta, mle.partition_spec_id);
-    if (sp == nullptr || sp->n_fields != 0) return refuse_named(th, "rewriting a partitioned manifest");
     uint32_t w = 0;
     for (uint32_t i = 0; i < n; ++i) {                          // bounded by n
         if (e[i].status == ManifestStatus::kDeleted) continue;
@@ -27,6 +52,7 @@ bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& 
             if (rm->found[k] != 0) { th->last_error = CommitError::kFailed; return false; }   // listed live twice
             rm->found[k] = 1;
             count_file(&st->sum, e[i], false);
+            if (!note_partition(th, st, e[i])) return false;
         }
         carry_entry(&e[i], mle, k >= 0, st->cs->snap_id);
         e[w++] = e[i];
@@ -106,18 +132,44 @@ bool publish_change(TableHandle* th, ChangeState* st, const ManifestListEntry* m
     return false;
 }
 
+// One manifest per spec id among `files` (a manifest is homogeneous by spec): new files are written under the
+// default spec, but a position delete carries its data file's spec (G2ICE-292).
+bool add_by_spec(TableHandle* th, ChangeState* st, const DataFileRef* files, uint32_t nf, ManifestListEntry* ml,
+                 uint32_t* n) noexcept {
+    assert(th != nullptr && st != nullptr && ml != nullptr && n != nullptr);
+    assert(files != nullptr || nf == 0u);
+    if (nf == 0u) return true;
+    auto* done = static_cast<uint8_t*>(th->arena->allocate_zeroed(nf));
+    auto* grp = th->arena->allocate_array<DataFileRef>(nf);
+    if (done == nullptr || grp == nullptr) return false;
+    for (uint32_t i = 0; i < nf; ++i) {                                   // bounded by nf
+        if (done[i] != 0u) continue;
+        const int32_t spec = files[i].partition_spec_id;
+        uint32_t g = 0;
+        for (uint32_t j = i; j < nf; ++j)                                 // bounded by nf
+            if (done[j] == 0u && files[j].partition_spec_id == spec) { done[j] = 1u; grp[g++] = files[j]; }
+        char tag[24];
+        const uint32_t k = st->n_manifests_added++;
+        tag[0] = '\0';
+        if (k != 0u) std::snprintf(tag, sizeof(tag), "-a%u", k);
+        if (!write_manifest_entry(th, st, grp, g, spec, tag, &ml[(*n)++])) return false;
+    }
+    return true;
+}
+
 bool change_add(TableHandle* th, ChangeState* st, ManifestListEntry* ml, uint32_t* n) noexcept {
     assert(th != nullptr && st != nullptr && ml != nullptr && n != nullptr);
     const ChangeSet* cs = st->cs;
-    for (uint32_t i = 0; i < cs->n_add_data; ++i) count_file(&st->sum, cs->add_data[i], true);   // bounded
-    for (uint32_t i = 0; i < cs->n_add_dels; ++i) count_file(&st->sum, cs->add_dels[i], true);   // bounded
-    const int32_t spec = th->meta.current_spec_id;
-    if (cs->n_add_data != 0 && !write_manifest_entry(th, st, cs->add_data, cs->n_add_data, spec, "", &ml[(*n)++]))
-        return false;
-    if (cs->n_add_dels != 0 &&
-        !write_manifest_entry(th, st, cs->add_dels, cs->n_add_dels, spec, cs->n_add_data != 0 ? "-d" : "", &ml[(*n)++]))
-        return false;
-    return true;
+    for (uint32_t i = 0; i < cs->n_add_data; ++i) {                       // bounded
+        count_file(&st->sum, cs->add_data[i], true);
+        if (!note_partition(th, st, cs->add_data[i])) return false;
+    }
+    for (uint32_t i = 0; i < cs->n_add_dels; ++i) {                       // bounded
+        count_file(&st->sum, cs->add_dels[i], true);
+        if (!note_partition(th, st, cs->add_dels[i])) return false;
+    }
+    return add_by_spec(th, st, cs->add_data, cs->n_add_data, ml, n) &&
+           add_by_spec(th, st, cs->add_dels, cs->n_add_dels, ml, n);
 }
 
 bool change_prepare(TableHandle* th, const ChangeSet* cs, ChangeState* st) noexcept {
@@ -139,24 +191,21 @@ bool commit_change(TableHandle* th, const ChangeSet* cs) noexcept {
     assert(th != nullptr && cs != nullptr && cs->snap_id > 0);
     assert(cs->add_data != nullptr || cs->n_add_data == 0);
     if (!handle_is_current(th)) return false;
-    // A manifest of a PARTITIONED table must carry each file's partition tuple; the unpartitioned manifest this
-    // writer emits would parse and then lie about where the rows are. Refuse; there is no correct fallback.
-    const PartitionSpec* spec = metadata_spec(&th->meta, th->meta.current_spec_id);
-    if (spec != nullptr && spec->n_fields != 0) return refuse_named(th, "a commit to a partitioned table");
     ChangeState st{};
     th->last_error = CommitError::kFailed;
     if (!change_prepare(th, cs, &st)) return false;
     const int64_t parent = th->meta.current_snapshot_id;
     ManifestListEntry* pml = nullptr; uint32_t pn = 0;
     if (!parent_list(th, parent, &pml, &pn)) return false;
-    auto* ml = th->arena->allocate_array<ManifestListEntry>(pn + 2u);
+    // One manifest per (content, spec) of the added files, at most one each per file.
+    auto* ml = th->arena->allocate_array<ManifestListEntry>(pn + cs->n_add_data + cs->n_add_dels + 2u);
     if (ml == nullptr) return false;
     uint32_t n = 0;
     bool ok = true;
     for (uint32_t i = 0; i < pn && ok; ++i) ok = filter_manifest(th, &st, pml[i], &ml[n++]);   // bounded by pn
     ok = ok && all_found(th, &st.rm_data, "data file") && all_found(th, &st.rm_dels, "delete file");
     ok = ok && change_add(th, &st, ml, &n);
-    st.sum.changed_partitions = (cs->n_add_data + cs->n_add_dels + cs->n_rm_data + cs->n_rm_dels) != 0 ? 1 : 0;
+    st.sum.changed_partitions = ok ? distinct_partitions(&st) : 0;
     ok = ok && summary_totals(th, parent, ml, n, &st.sum);
     ok = ok && publish_change(th, &st, ml, n);
     if (!ok) {

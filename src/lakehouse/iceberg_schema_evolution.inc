@@ -125,12 +125,26 @@ bool table_update_partition_spec(TableHandle* th,
                                   const PartitionSpec* spec) noexcept {
     assert(th != nullptr && spec != nullptr);
     if (!write_ready(th)) return false;
-    if (th->meta.n_specs >= kIcebergMaxSpecs) return false;
-    th->meta.specs[th->meta.n_specs] = *spec;
-    th->meta.current_spec_id = spec->spec_id;
-    th->meta.n_specs++;
+    // Field ids reused / continued and the spec id assigned per the spec (iceberg_partition_spec.inc, G2ICE-292); an
+    // equivalent existing spec becomes the default instead of a new one being added.
+    PartitionSpec next{};
+    int32_t equivalent = -1;
+    if (!normalize_spec(&th->meta, metadata_current_schema(&th->meta), spec, &next, &equivalent)) {
+        th->last_error = CommitError::kFailed;
+        return false;
+    }
+    const int32_t prev = th->meta.current_spec_id;
+    const uint32_t prev_n = th->meta.n_specs;
+    if (equivalent < 0) {
+        if (th->meta.n_specs >= kIcebergMaxSpecs) return false;
+        th->meta.specs[th->meta.n_specs++] = next;
+    }
+    th->meta.current_spec_id = next.spec_id;
     th->dirty_meta |= kDirtySpec;
-    return persist_metadata(th);
+    if (persist_metadata(th)) return true;
+    th->meta.current_spec_id = prev;
+    th->meta.n_specs = prev_n;
+    return false;
 }
 
 bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
