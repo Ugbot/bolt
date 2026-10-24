@@ -1,0 +1,6 @@
+schema	0	l[array]
+row	0	[1,null,3]
+row	0	null
+row	0	[]
+row	0	[4]
+row	0	[null]

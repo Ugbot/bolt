@@ -243,13 +243,15 @@ TEST_P(NestedOracle, MatchesPyarrow) {
     const std::string name = GetParam();
     const int64_t n = check_file(name, data_path(name + ".parquet"));
     EXPECT_GT(n, 0);
-    std::printf("[oracle] %s: %lld values compared\n", name.c_str(), static_cast<long long>(n));
+    std::printf("[oracle] %s: %lld rows compared\n", name.c_str(), static_cast<long long>(n));
 }
 
 INSTANTIATE_TEST_SUITE_P(Pyarrow, NestedOracle, ::testing::Values(
     "struct_v1_dict", "struct_v2_plain", "struct_v2_dict",
     "list_v1_dict", "list_v2_plain", "list_v2_dict", "list_item_v1",
-    "map_v1_dict", "map_v2_plain", "map_v2_dict"));
+    "map_v1_dict", "map_v2_plain", "map_v2_dict",
+    // hand-built: MAP_KEY_VALUE, Spark/parquet-mr bag.array, LogicalType-only
+    "legacy_map_kv", "legacy_bag_array", "legacy_logical_only"));
 
 // The spec-constructed 2-level LIST shapes (make_legacy_list_fixtures.py).
 TEST(NestedLegacy, TwoLevelShapesMatchPyarrow) {

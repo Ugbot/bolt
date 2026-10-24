@@ -275,6 +275,106 @@ def write(name, tab, legacy=False, **opts):
     print("wrote", name, "row groups", groups)
 
 
+# ---- hand-built legacy shapes pyarrow cannot write -------------------------
+# Built with make_legacy_list_fixtures.py's spec-level writer (no parquet
+# library), then read back by pyarrow for the expected dump like the rest.
+
+def _legacy():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "legacy", os.path.join(os.path.dirname(__file__), "make_legacy_list_fixtures.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _elem(lg, tc, name, rep, phys=None, n=None, conv=None, logical=None):
+    tc.struct_begin()
+    if phys is not None:
+        tc.i32(1, phys)
+    tc.i32(3, rep)
+    tc.binary(4, name)
+    if n is not None:
+        tc.i32(5, n)
+    if conv is not None:
+        tc.i32(6, conv)
+    if logical is not None:            # LogicalType union member, empty struct
+        tc.struct_begin(10)
+        tc.struct_begin(logical)
+        tc.struct_end()
+        tc.struct_end()
+    tc.struct_end()
+
+
+def _levels(rows, entry):
+    """rep/def/values for one leaf under one optional LIST/MAP level.
+    entry(x) -> (def, value-or-None) for a present element."""
+    rep, dl, vals = [], [], []
+    for r in rows:
+        if r is None:
+            rep.append(0); dl.append(0)
+        elif not r:
+            rep.append(0); dl.append(1)
+        else:
+            for j, x in enumerate(r):
+                d, v = entry(x)
+                rep.append(0 if j == 0 else 1); dl.append(d)
+                if v is not None:
+                    vals.append(v)
+    return rep, dl, vals
+
+
+def legacy_shapes():
+    lg = _legacy()
+    R, O, P = lg.REQUIRED, lg.OPTIONAL, lg.REPEATED
+    I32, I64 = lg.PHYS_I32, lg.PHYS_I64
+    # MAP_KEY_VALUE on the outer group (pre-MAP writers).
+    mrows = [None, [], [(1, 10), (2, None)], [(3, 30)], [(4, None), (5, 50), (6, 60)]]
+    kr, kd, kv = _levels(mrows, lambda e: (2, e[0]))
+    vr, vd, vv = _levels(mrows, lambda e: (3, e[1]) if e[1] is not None else (2, None))
+    leaves = [lg.Leaf(["m", "map", "key"], I64, kv, kr, kd, 1, 2),
+              lg.Leaf(["m", "map", "value"], I32, vv, vr, vd, 1, 3)]
+
+    def emit_mkv(tc):
+        _elem(lg, tc, "s", R, n=1)
+        _elem(lg, tc, "m", O, n=1, conv=2)
+        _elem(lg, tc, "map", P, n=2)
+        _elem(lg, tc, "key", R, phys=I64)
+        _elem(lg, tc, "value", O, phys=I32)
+    lg.write_file(os.path.join(OUT, "legacy_map_kv.parquet"), (5, emit_mkv), leaves, len(mrows))
+    # parquet-mr / Spark legacy 3-level: repeated group `bag` { optional `array` }.
+    lrows = [[1, None, 3], None, [], [4], [None]]
+    r, d, v = _levels(lrows, lambda e: (3, e) if e is not None else (2, None))
+
+    def emit_bag(tc):
+        _elem(lg, tc, "s", R, n=1)
+        _elem(lg, tc, "l", O, n=1, conv=3)
+        _elem(lg, tc, "bag", P, n=1)
+        _elem(lg, tc, "array", O, phys=I64)
+    lg.write_file(os.path.join(OUT, "legacy_bag_array.parquet"), (4, emit_bag),
+                  [lg.Leaf(["l", "bag", "array"], I64, v, r, d, 1, 3)], len(lrows))
+    # LIST and MAP annotated by LogicalType only (no ConvertedType).
+    leaves = [lg.Leaf(["l", "list", "element"], I64, v, r, d, 1, 3),
+              lg.Leaf(["mp", "key_value", "key"], I64, kv, kr, kd, 1, 2),
+              lg.Leaf(["mp", "key_value", "value"], I32, vv, vr, vd, 1, 3)]
+
+    def emit_logical(tc):
+        _elem(lg, tc, "s", R, n=2)
+        _elem(lg, tc, "l", O, n=1, logical=3)
+        _elem(lg, tc, "list", P, n=1)
+        _elem(lg, tc, "element", O, phys=I64)
+        _elem(lg, tc, "mp", O, n=1, logical=2)
+        _elem(lg, tc, "key_value", P, n=2)
+        _elem(lg, tc, "key", R, phys=I64)
+        _elem(lg, tc, "value", O, phys=I32)
+    assert len(lrows) == len(mrows)
+    lg.write_file(os.path.join(OUT, "legacy_logical_only.parquet"), (8, emit_logical),
+                  leaves, len(lrows))
+    for name in ("legacy_map_kv", "legacy_bag_array", "legacy_logical_only"):
+        dump(os.path.join(OUT, name + ".parquet"), os.path.join(OUT, name + ".expected"))
+        print("wrote", name)
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     for vname, opts in VARIANTS:
@@ -284,6 +384,7 @@ def main():
     # pyarrow's legacy (non-compliant) 3-level naming: list.item
     write("list_item_v1", table_list("item"), legacy=True,
           data_page_version="1.0", use_dictionary=True)
+    legacy_shapes()
     # Spec-constructed 2-level legacy shapes from make_legacy_list_fixtures.py.
     for name in ("legacy2_bare", "legacy2_annotated", "legacy2_multifield",
                  "legacy2_array"):

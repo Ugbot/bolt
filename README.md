@@ -99,7 +99,7 @@ build — there is no separate Bolt compile step.
 
 | Directory | What it provides |
 |-----------|-----------------|
-| `ingest/` | Parquet write (`bolt_parquet_write.h`), Parquet read (`bolt_parquet_read.h`), Avro (`bolt_avro.h`), Roaring bitmap (`bolt_roaring.h`), CSV, codecs (gzip/lz4/snappy/zstd) |
+| `ingest/` | Parquet write (`bolt_parquet_write.h`), Parquet read (`bolt_parquet_read.h`; nested STRUCT/LIST/MAP via `bolt_parquet_nested.h`), Avro (`bolt_avro.h`), Roaring bitmap (`bolt_roaring.h`), CSV, codecs (gzip/lz4/snappy/zstd) |
 | `lakehouse/` | Delta + Iceberg readers/writers; object stores (local FS, S3, Azure Blob, GCS); parallel scan + scan optimizer; REST catalog fleet: Iceberg REST (OAuth2/SigV4/pagination/multi-table-commit/views/snapshots/branches-tags/stats/vended-creds), Unity Catalog, AWS Glue, Hive Metastore (Thrift), Polaris, Nessie, Gravitino |
 | `crypto/` | Noise XX (X25519 + ChaCha20-Poly1305), Ed25519 sign/verify/keygen, SigV4 |
 | `net/` | `bolt_tls.h` (OpenSSL TLS socket), `bolt_http_client.h` (outbound HTTP/HTTPS) |
