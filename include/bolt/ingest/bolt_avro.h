@@ -59,6 +59,10 @@ enum class AvroType : uint8_t {
     // but they are SKIPPED on the wire so the fields after them stay aligned.
     // Without them a schema containing an array was unreadable entirely.
     kArray = 8, kMap = 9,
+    // `fixed`: AvroField::fixed_size raw bytes, no length prefix (Iceberg's
+    // uuid, fixed[L] and decimal). A record field or a union branch only; an
+    // array/map element of this type fails the schema parse closed.
+    kFixed = 10,
 };
 
 // AvroField::item_type when the element of an array/map is not a primitive
@@ -129,6 +133,8 @@ struct AvroField {
     // flat one-value-per-field model cannot carry N values. They exist so the
     // element's WIDTH is computable. Zero for every other field.
     uint16_t elem_fields;
+    // kFixed only: the declared "size" (1..65535). Zero for every other type.
+    uint16_t fixed_size;
 };
 
 // Parsed OCF header: schema fields + codec + sync marker.

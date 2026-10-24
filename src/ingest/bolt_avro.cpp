@@ -104,7 +104,7 @@ enum : uint8_t {
 };
 
 enum : uint8_t {
-    kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyItems, kKeyValues, kKeyOther
+    kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyItems, kKeyValues, kKeySize, kKeyOther
 };
 
 // A type object's container flavour.
@@ -134,6 +134,9 @@ struct SFrame {
     bool     have_name;       // kFrFieldObj: "name" seen
     bool     pushed_prefix;   // kFrFieldsArr: extended the dotted prefix
     uint32_t prefix_save;     // ...and the length to restore on ']'
+    bool     is_fixed;        // this object declared "type":"fixed"
+    uint16_t fixed_size;      // ...and its "size"
+    uint16_t union_fixed_size;  // kFrUnion: the size of its fixed branch
     char     name[kAvroMaxName];
 };
 
@@ -238,7 +241,7 @@ void sx_commit_leaf(SchemaCtx* s, int32_t fi, AvroType t, bool nullable,
         // the element is to compute its byte width, and a container nested
         // inside it would need its own block walk to do that. Fail rather than
         // model a width we cannot compute.
-        if (t == AvroType::kArray || t == AvroType::kMap) { s->ok = false; return; }
+        if (t == AvroType::kArray || t == AvroType::kMap || t == AvroType::kFixed) { s->ok = false; return; }
         // FAIL, never clamp: a truncated element under-states its width and
         // would mis-align every field after the container.
         if (s->elem_n >= kAvroMaxElemFields) { s->ok = false; return; }
@@ -334,6 +337,7 @@ bool sx_key(void* c, const char* b, int32_t len) noexcept {
     else if (k("fields")) f->last_key = kKeyFields;
     else if (k("items"))  f->last_key = kKeyItems;    // array element type
     else if (k("values")) f->last_key = kKeyValues;   // map value type
+    else if (k("size"))   f->last_key = kKeySize;     // fixed width
     else                  f->last_key = kKeyOther;
     return true;
 }
@@ -399,6 +403,12 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
             f->complex_kind = kCplxMap;
             return true;
         }
+        if (ln == 5u && std::memcmp(b, "fixed", 5) == 0) {
+            // Committed at the end of the object, once "size" is known (JSON key order is free).
+            if (f->kind != kFrObj) { s->ok = false; return true; }
+            f->is_fixed = true;
+            return true;
+        }
         AvroType t = AvroType::kNull;
         if (!type_from_str(b, ln, &t)) { s->ok = false; return true; }
         // A union branch written as a type object ({"type":"int",
@@ -452,6 +462,41 @@ bool sx_begin_obj(void* c) noexcept {
     return true;
 }
 
+// A `fixed` type object closes: as a union branch it is parked on the union (committed with the union's null index),
+// as a field's type it is the field's leaf.
+void sx_end_fixed(SchemaCtx* s, const SFrame* f) noexcept {
+    assert(s != nullptr && f != nullptr && f->is_fixed);
+    assert(s->sp > 0u);
+    const uint16_t size = f->fixed_size;
+    sx_pop(s);
+    if (size == 0u) { s->ok = false; return; }
+    SFrame* p = sx_top(s);
+    if (p->kind == kFrUnion) {
+        if (p->union_have_type || p->union_have_cont) { s->ok = false; return; }   // a multi-type union: not modelled
+        p->union_type       = AvroType::kFixed;
+        p->union_have_type  = true;
+        p->union_fixed_size = size;
+        if (p->union_n < 0xFEu) ++p->union_n;
+        return;
+    }
+    bool crossed_union = false;
+    const int32_t fi = sx_enclosing_field(s, &crossed_union);
+    const uint32_t before = s->n;
+    sx_commit_leaf(s, fi, AvroType::kFixed, /*nullable=*/false, /*null_branch=*/0u, /*item_type=*/0u);
+    if (s->n == before + 1u) s->fields[before].fixed_size = size;
+}
+
+bool sx_int64(void* c, int64_t v, const char* /*b*/, int32_t /*len*/) noexcept {
+    SchemaCtx* s = static_cast<SchemaCtx*>(c);
+    SFrame* f = sx_top(s);
+    if (f->last_key == kKeySize && !sx_suppressed(s)) {
+        if (v <= 0 || v > 0xFFFF) s->ok = false;
+        else f->fixed_size = static_cast<uint16_t>(v);
+    }
+    f->last_key = kKeyNone;
+    return true;
+}
+
 bool sx_end_obj(void* c) noexcept {
     SchemaCtx* s = static_cast<SchemaCtx*>(c);
     SFrame* f = sx_top(s);
@@ -474,6 +519,7 @@ bool sx_end_obj(void* c) noexcept {
         return true;
     }
     if (sx_suppressed(s)) { sx_pop(s); return true; }
+    if (f->is_fixed) { sx_end_fixed(s, f); return true; }
     if (f->complex_kind != kCplxNone) {             // an array/map type object
         const AvroType ct = (f->complex_kind == kCplxArray) ? AvroType::kArray
                                                             : AvroType::kMap;
@@ -568,6 +614,7 @@ bool sx_end_arr(void* c) noexcept {
         const bool     have_type = f->union_have_type;
         const AvroType ct        = f->union_ctype;
         const uint8_t  citem     = f->union_citem;
+        const uint16_t union_fixed = f->union_fixed_size;
         sx_pop(s);                       // `f` is stale past here — all read above
         bool crossed_union = false;
         const int32_t fi = sx_enclosing_field(s, &crossed_union);
@@ -578,7 +625,9 @@ bool sx_end_arr(void* c) noexcept {
             sx_commit_container(s, fi, ct, citem, nullable, nb);
             return true;
         }
+        const uint32_t before = s->n;
         sx_commit_leaf(s, fi, t, nullable, nb, /*item_type=*/0u);
+        if (t == AvroType::kFixed && s->n == before + 1u) s->fields[before].fixed_size = union_fixed;
         return true;
     }
     if (f->kind == kFrFieldsArr && f->pushed_prefix) {
@@ -611,6 +660,7 @@ uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
     h.on_end_array    = sx_end_arr;
     h.on_key          = sx_key;
     h.on_string       = sx_string;
+    h.on_int64        = sx_int64;
     if (!parse::json::sax_parse(json, static_cast<int32_t>(json_len), &h)) {
         return 0;
     }
@@ -1002,6 +1052,12 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
             case AvroType::kString:
                 if (!read_primitive(p, len, off, fd->type, val)) return false;
                 break;
+            case AvroType::kFixed:                   // raw bytes, no length prefix
+                if (fd->fixed_size == 0u || *off + fd->fixed_size > len) return false;
+                val->bytes     = p + *off;
+                val->bytes_len = fd->fixed_size;
+                *off += fd->fixed_size;
+                break;
         }
     }
     return true;
@@ -1361,6 +1417,12 @@ bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
                     if (b + 10u + v->bytes_len > cap) return false;
                     b += enc_bytes(dst + b, v->bytes, v->bytes_len); break;
                 }
+                case AvroType::kFixed:               // exactly fixed_size raw bytes
+                    if (v->bytes == nullptr || fd->fixed_size == 0u || v->bytes_len != fd->fixed_size) return false;
+                    if (b + v->bytes_len > cap) return false;
+                    std::memcpy(dst + b, v->bytes, v->bytes_len);
+                    b += v->bytes_len;
+                    break;
             }
         }
     }

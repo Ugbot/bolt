@@ -474,10 +474,7 @@ TEST(BoltAvroDatum, UnrepresentableTypesFailClosed) {
         "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
         "{\"name\":\"s\",\"type\":{\"type\":\"enum\",\"name\":\"S\","
         "\"symbols\":[\"A\",\"B\"]}}]}",
-        // fixed: N raw bytes, and the width has nowhere to live yet.
-        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
-        "{\"name\":\"h\",\"type\":{\"type\":\"fixed\",\"name\":\"H\","
-        "\"size\":16}}]}",
+        // (fixed is modelled since G2ICE-292: AvroField::fixed_size; see BoltAvro.FixedRoundTrip.)
         // A named-type REFERENCE needs a definition table to resolve.
         "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
         "{\"name\":\"x\",\"type\":\"SomeOtherRecord\"}]}",
@@ -1390,13 +1387,83 @@ TEST(BoltAvro, RejectsBadMagic) {
 
 }  // namespace
 
+// G2ICE-292: `fixed` (Iceberg's uuid / fixed[L] / decimal partition values), as a nullable union branch whose size
+// follows its type name and as a plain field whose size precedes it, round-trips through writer and reader.
+namespace {
+struct FixedRows { std::vector<std::string> a; std::vector<bool> a_null; std::vector<std::string> b; };
+bool collect_fixed(void* c, const AvroValue* v, uint32_t n, int64_t) noexcept {
+    auto* r = static_cast<FixedRows*>(c);
+    if (n != 2u) return false;
+    r->a_null.push_back(v[0].is_null);
+    r->a.emplace_back(v[0].is_null ? "" : std::string(reinterpret_cast<const char*>(v[0].bytes), v[0].bytes_len));
+    r->b.emplace_back(reinterpret_cast<const char*>(v[1].bytes), v[1].bytes_len);
+    return true;
+}
+}  // namespace
+
+TEST(BoltAvro, FixedRoundTrip) {
+    const char* schema = "{\"type\":\"record\",\"name\":\"r\",\"fields\":["
+        "{\"name\":\"a\",\"type\":[\"null\",{\"type\":\"fixed\",\"name\":\"u\",\"size\":16,\"logicalType\":\"uuid\"}]},"
+        "{\"name\":\"b\",\"type\":{\"size\":3,\"name\":\"f3\",\"type\":\"fixed\"}}]}";
+    AvroField fields[2];
+    std::memset(fields, 0, sizeof(fields));
+    std::strcpy(fields[0].name, "a"); fields[0].type = AvroType::kFixed; fields[0].nullable = true; fields[0].fixed_size = 16;
+    std::strcpy(fields[1].name, "b"); fields[1].type = AvroType::kFixed; fields[1].fixed_size = 3;
+    const uint8_t u[16] = {0xF7, 0x9C, 0x3E, 0x09, 0x00, 0x7C, 0x4B, 0xBD, 0xA4, 0x79, 0x3F, 0x34, 0x9C, 0xB7, 0x85, 0x00};
+    const uint8_t b0[3] = {0, 1, 2}, b1[3] = {0xff, 0, 0x80};
+    AvroValue rows[4];
+    std::memset(rows, 0, sizeof(rows));
+    rows[0].bytes = u; rows[0].bytes_len = 16;
+    rows[1].bytes = b0; rows[1].bytes_len = 3;
+    rows[2].is_null = true;
+    rows[3].bytes = b1; rows[3].bytes_len = 3;
+    uint8_t sync[kAvroSyncLen] = {};
+    const uint64_t cap = avro_write_ex_max_len(fields, 2, 64, 2, std::strlen(schema));
+    std::vector<uint8_t> buf(static_cast<size_t>(cap));
+    uint64_t len = cap;
+    ASSERT_TRUE(avro_write_ex(fields, 2, rows, 2, schema, static_cast<uint32_t>(std::strlen(schema)), nullptr, 0, sync,
+                              buf.data(), &len));
+    bolt::Arena arena;
+    AvroHeader hdr;
+    uint64_t body = 0;
+    ASSERT_TRUE(avro_read_header(buf.data(), len, &arena, &hdr, &body));
+    ASSERT_EQ(hdr.n_fields, 2u);
+    EXPECT_EQ(hdr.field[0].type, AvroType::kFixed);
+    EXPECT_TRUE(hdr.field[0].nullable);
+    EXPECT_EQ(hdr.field[0].fixed_size, 16u);
+    EXPECT_EQ(hdr.field[1].type, AvroType::kFixed);
+    EXPECT_EQ(hdr.field[1].fixed_size, 3u);
+    FixedRows got;
+    int64_t n = 0;
+    ASSERT_TRUE(avro_read(buf.data(), len, &arena, &got, collect_fixed, &n));
+    ASSERT_EQ(n, 2);
+    EXPECT_EQ(got.a[0], std::string(reinterpret_cast<const char*>(u), 16));
+    EXPECT_FALSE(got.a_null[0]);
+    EXPECT_TRUE(got.a_null[1]);
+    EXPECT_EQ(got.b[0], std::string(reinterpret_cast<const char*>(b0), 3));
+    EXPECT_EQ(got.b[1], std::string(reinterpret_cast<const char*>(b1), 3));
+    // A wrong-width value is refused, never padded or cut.
+    rows[1].bytes_len = 2;
+    len = cap;
+    EXPECT_FALSE(avro_write_ex(fields, 2, rows, 2, schema, static_cast<uint32_t>(std::strlen(schema)), nullptr, 0, sync,
+                               buf.data(), &len));
+}
+
+TEST(BoltAvro, FixedWithoutSizeFailsClosed) {
+    AvroField f[4];
+    const char* s1 = "{\"type\":\"record\",\"name\":\"r\",\"fields\":[{\"name\":\"a\",\"type\":{\"type\":\"fixed\",\"name\":\"x\"}}]}";
+    uint32_t n = 0;
+    EXPECT_FALSE(avro_parse_schema(reinterpret_cast<const uint8_t*>(s1), static_cast<uint32_t>(std::strlen(s1)), f, 4, &n));
+}
+
 // Modelling an element record needed one more field on AvroField (a single
 // item_type byte cannot say "record, N fields wide"). AvroField is multiplied
 // by kAvroMaxFields inside AvroHeader, so the cost is pinned here rather than
-// left to drift: 132 -> 134 bytes per field, 33,816 -> 34,328 per header.
+// left to drift: 132 -> 134 bytes per field, 33,816 -> 34,328 per header;
+// `fixed_size` (G2ICE-292) 134 -> 136, 34,328 -> 34,840.
 TEST(BoltAvro, AbiSizesPinned) {
-    static_assert(sizeof(AvroField) == 134, "AvroField ABI changed");
-    static_assert(sizeof(AvroHeader) == 34328, "AvroHeader ABI changed");
+    static_assert(sizeof(AvroField) == 136, "AvroField ABI changed");
+    static_assert(sizeof(AvroHeader) == 34840, "AvroHeader ABI changed");
     std::printf("sizeof(AvroField)=%zu sizeof(AvroHeader)=%zu\n",
                 sizeof(AvroField), sizeof(AvroHeader));
     EXPECT_EQ(offsetof(AvroField, elem_fields), 132u);
