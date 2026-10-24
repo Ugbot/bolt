@@ -84,7 +84,8 @@ int64_t truncate_i64(int64_t value, int32_t W) noexcept {
     if (W <= 0) return value;
     const int64_t w = static_cast<int64_t>(W);
     const int64_t r = ((value % w) + w) % w;
-    return value - r;
+    assert(r >= 0 && r < w);
+    return static_cast<int64_t>(static_cast<uint64_t>(value) - static_cast<uint64_t>(r));   // Java's wrap, no UB
 }
 
 namespace {

@@ -2328,6 +2328,12 @@ add_test(NAME test_bolt_iceberg_dml_oracle
                  $<TARGET_FILE:test_bolt_iceberg_dml> ${CMAKE_CURRENT_BINARY_DIR}/iceberg_dml_fixture)
 set_tests_properties(test_bolt_iceberg_dml_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+# G2ICE-292 — partition transform value kernels against the spec's Appendix B hash vectors and truncate examples.
+add_executable(test_bolt_iceberg_transforms test_bolt_iceberg_transforms.cpp)
+target_link_libraries(test_bolt_iceberg_transforms PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_transforms)
+add_test(NAME test_bolt_iceberg_transforms COMMAND test_bolt_iceberg_transforms)
+
 # Oracle tool (not a test): scan a filesystem-catalog Iceberg table with bolt's reader; see scripts/oracles/verify_v3_external.py.
 add_executable(bolt_iceberg_scan_dump bolt_iceberg_scan_dump.cpp)
 target_link_libraries(bolt_iceberg_scan_dump PRIVATE bolt::lakehouse bolt::ingest bolt::parse)
