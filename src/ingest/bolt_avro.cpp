@@ -1283,6 +1283,12 @@ bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
 
     if (!room(kAvroSyncLen)) return false;
     std::memcpy(dst + o, sync, kAvroSyncLen); o += kAvroSyncLen;
+    // No rows: a header and no object block, as Avro's Java writer writes it. A block of count 0 is rejected by readers
+    // (DuckDB 2.0: "Invalid Avro file block count or size"), and an Iceberg manifest of no entries is ordinary.
+    if (n_rows == 0) {
+        *dst_len = o;
+        return true;
+    }
 
     // One object block. Encode rows into the area after the block header, then
     // backfill count + size. Reserve up to 20 bytes for the two longs.
