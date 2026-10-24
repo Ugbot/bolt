@@ -224,7 +224,8 @@ BoltColumn build(const NS& ns, const std::vector<const V*>& vals, bolt::Arena* a
 
 void json_str(std::string* o, const std::string& s) {
     *o += '"';
-    for (unsigned char ch : s) {
+    for (const char c0 : s) {
+        const auto ch = static_cast<unsigned char>(c0);
         if (ch == '"' || ch == '\\') { *o += '\\'; *o += static_cast<char>(ch); }
         else if (ch < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", ch); *o += b; }
         else *o += static_cast<char>(ch);
@@ -234,7 +235,7 @@ void json_str(std::string* o, const std::string& s) {
 
 std::string hex(const std::string& s) {
     std::string h;
-    for (unsigned char ch : s) { char b[3]; std::snprintf(b, sizeof(b), "%02x", ch); h += b; }
+    for (const char c0 : s) { const auto ch = static_cast<unsigned char>(c0); char b[3]; std::snprintf(b, sizeof(b), "%02x", ch); h += b; }
     return h;
 }
 
@@ -651,7 +652,7 @@ Fixture fx_big(std::int64_t rows) {
         }
         for (std::int64_t e = 0; e < r % 4; ++e) {
             kv.push_back(S("k" + std::to_string(e)));
-            kv.push_back((r * e) % 7 == 3 ? N() : F(static_cast<double>(r) + e * 0.25));
+            kv.push_back((r * e) % 7 == 3 ? N() : F(static_cast<double>(r) + static_cast<double>(e) * 0.25));
         }
         fx.rows.push_back({(r % 17 == 5) ? N() : Q(el), I(r), (r % 19 == 7) ? N() : Q(kv)});
     }

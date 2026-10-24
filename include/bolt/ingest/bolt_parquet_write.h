@@ -43,9 +43,8 @@
 //                  at every level, independently. Still ONE physical leaf
 //                  chunk (PLAIN only, matching the single-level case above --
 //                  neither gets dictionary/DELTA/BYTE_STREAM_SPLIT/bloom).
-//                  STRUCT/MAP terminal element types remain out of scope
-//                  (see below) -- a chain must still terminate in a flat
-//                  leaf type.
+//                  A chain terminates in a flat leaf type; lists of structs
+//                  or maps are declared through ParquetWriteColumn::nested.
 //   - types:       Int32, Int64, Float32, Float64, Utf8, Binary,
 //                  Decimal128 (FLBA(16) BE two's-complement),
 //                  Date32 (INT32), Timestamp[us] (INT64 isAdjustedToUTC=true),
@@ -280,8 +279,8 @@ struct ParquetWriteColumn {
     // describes the element of nesting level i (0 = the outer column's own
     // element); its `type` is BoltType::List to continue nesting or the LEAF
     // scalar type to terminate, and element_type/element_nullable are then
-    // ignored. STRUCT/MAP fields are still refused (see the file's "out of
-    // scope" note) -- a terminal level's type must be a flat leaf type.
+    // ignored. A terminal level's type must be a flat leaf type; any other
+    // shape is declared through `nested` below.
     std::uint32_t     list_depth;
     ParquetListLevel  list_levels[kPwMaxListDepth];
     // G2ICE-117 — the parquet SchemaElement's Thrift field 9 (`field_id`).

@@ -118,6 +118,7 @@ bool nested_tree_valid(const ParquetNestedNode* t, std::uint32_t n) noexcept {
 bool nested_column_valid(const ParquetWriteColumn& c) noexcept {
     const ParquetNestedNode* t = c.nested;
     const std::uint32_t n = c.n_nested;
+    assert(t != nullptr || n != 0u);
     if (t == nullptr || n == 0u || n > kPwMaxNestedNodes) return false;
     if (!nested_is_group(t[0].type) || t[0].type != c.type) return false;
     if (t[0].name[0] == '\0') return false;
@@ -126,6 +127,7 @@ bool nested_column_valid(const ParquetWriteColumn& c) noexcept {
     for (std::uint32_t i = 0; i < n; ++i) {
         if (!nested_node_valid(t, n, i)) return false;
     }
+    assert(t[0].n_children >= 1u);   // a group root, validated above
     return nested_tree_valid(t, n);
 }
 
@@ -505,6 +507,7 @@ bool gather_dense_bytes(const BoltColumn& leaf, BoltType t,
 bool gather_dense(const BoltColumn& leaf, BoltType t,
                   const std::vector<std::int64_t>& vidx, DenseLeaf* d) noexcept {
     assert(d != nullptr);
+    assert(leaf.format != ColumnFormat::Nested);
     d->bytes.clear();
     d->offs.clear();
     if (t == BoltType::Utf8 || t == BoltType::Binary) {
