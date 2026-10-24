@@ -8,6 +8,7 @@
 // Signed decimal inside a JSON string value ("\"123\""); false on anything else.
 bool json_string_i64(const char* v, uint32_t n, int64_t* out) noexcept {
     assert(v != nullptr && out != nullptr);
+    assert(n <= kLakeMaxExprBytes * 1024u);
     if (n < 3u || v[0] != '"' || v[n - 1u] != '"') return false;
     int64_t x = 0;
     bool neg = false;

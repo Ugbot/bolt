@@ -98,6 +98,24 @@ def main() -> int:
         check("the table uuid and format version are unchanged", m.table_uuid == before.table_uuid and m.format_version == 2)
         got = after.scan().to_arrow().to_pydict()
         check("pyiceberg reads the old rows and bolt's new ones", sorted(got["id"]) == [1, 2, 3, 900, 901, 902], str(got))
+        # G2ICE-280: pyiceberg's own snapshot summary survives bolt's commit, and bolt's totals continue from it.
+        old = after.snapshot_by_id(sid).summary
+        check("pyiceberg's snapshot summary survives", old is not None and old.get("total-records") == before.snapshot_by_id(sid).summary.get("total-records"),
+              str(old))
+        new = after.current_snapshot().summary
+        check("bolt's append summary continues the totals", new.get("total-records") == "6" and new.get("added-records") == "3" and
+              new.get("total-data-files") == "2", str(new))
+        check("bolt deletes pyiceberg's whole file (id <= 3)", run_bolt(binary, loc, "delete") == 0)
+        del_path = os.path.join(loc, "metadata", "v3.metadata.json")
+        if os.path.exists(del_path):
+            dt = StaticTable.from_metadata(f"file://{del_path}")
+            ids = sorted(dt.scan().to_arrow().to_pydict()["id"])
+            check("pyiceberg reads only bolt's rows after the delete", ids == [900, 901, 902], str(ids))
+            ds = dt.current_snapshot().summary
+            check("the delete snapshot says what it did", ds.operation.value == "delete" and ds.get("deleted-data-files") == "1" and
+                  ds.get("deleted-records") == "3" and ds.get("total-records") == "3", str(ds))
+            check("the earlier summaries still survive", dt.snapshot_by_id(sid).summary.get("total-records") == "3",
+                  str(dt.snapshot_by_id(sid).summary))
         try:
             import duckdb
             con = duckdb.connect()

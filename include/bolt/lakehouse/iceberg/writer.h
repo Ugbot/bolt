@@ -128,7 +128,8 @@ void table_close(TableHandle* h) noexcept;
 // kUncertain: a conditional write may have succeeded. Candidate objects are
 // retained. This handle refuses further mutations; reconcile externally, then
 // reopen. Neither a read nor another mutation clears the uncertainty.
-// kUnimplemented: the operation is a known spec operation this writer has not built yet (G2ICE-280); nothing was written.
+// kUnimplemented: a known spec case this writer does not write yet (a partitioned table, a manifest holding equality
+// deletes or deletion vectors that would need rewriting, ...); the refusal names it on stderr and nothing was written.
 enum class CommitError : uint8_t { kNone = 0, kConflict = 1, kFailed = 2, kUncertain = 3, kUnimplemented = 4 };
 CommitError table_last_commit_error(const TableHandle* th) noexcept;
 // False (and zeroes *out) unless this handle has an uncertain candidate.
@@ -165,15 +166,28 @@ void append_close (AppendHandle* ah) noexcept;
 bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
                             uint32_t n) noexcept;
 
-// Overwrite: drop files matching the predicate and append new data.
+// Row-level delete (G2ICE-280). `pred` is evaluated on the current snapshot's LIVE rows (every delete applied) under
+// SQL three-valued logic: a NULL never matches a comparison; kIsNull / kIsNotNull test nullness. Literals: integer
+// for integer/date/timestamp/boolean columns, integer or float for float columns, a byte string for string/binary
+// columns (unsigned byte order). A data file whose every live row matches is removed; a file with some matching rows
+// gets one v2 position-delete file naming exactly those rows; other files are untouched. One snapshot, operation
+// "delete". A predicate that matches nothing commits nothing and returns true. A null predicate or one naming no
+// column fails (kFailed); an unsupported column/literal pairing or a partitioned table fails with kUnimplemented.
+// The commit fails with kConflict if a file it removes is no longer live (another writer committed first).
+bool table_delete(TableHandle* th, const Predicate* pred) noexcept;
+
+// table_delete(pred) plus an append of `batch`, in one snapshot with operation "overwrite" (committed even when the
+// predicate matches nothing). Under FileWriteIO it is refused when it would need both a delete file and a data file.
 bool table_overwrite(TableHandle* th, const Predicate* pred,
                      const BoltBatch* batch) noexcept;
 
-// Rewrite (compaction). Files smaller than target/2 are coalesced.
+// Compaction: live data files smaller than target/2 are rewritten, with every delete that applies to them applied,
+// into new files of at most ~target input bytes each, when there are at least two of them or one has position
+// deletes. The rewritten files and the position-delete files they fully apply are removed, in one snapshot with
+// operation "replace"; the rows the table returns are unchanged. Nothing to do commits nothing and returns true.
+// Under FileWriteIO it is refused when it would write more than one file. `opts` null = defaults; run_bin_pack false
+// does nothing.
 bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept;
-
-// Soft delete (snapshot kDelete) — predicate-based.
-bool table_delete(TableHandle* th, const Predicate* pred) noexcept;
 
 // Schema evolution. Each call is ADDITIVE (Iceberg spec): it appends a new,
 // immutable Schema with a new schema-id to metadata.json and moves
@@ -192,7 +206,7 @@ bool table_update_partition_spec(TableHandle* th,
 bool table_update_sort_order    (TableHandle* th,
                                   const SortOrder* sort) noexcept;
 
-// Compaction (alias for table_rewrite with target_file_size_bytes).
+// Compaction (table_rewrite with the target in bytes).
 bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept;
 
 // Snapshot lifecycle.

@@ -65,6 +65,15 @@ TEST(IcebergForeignCommit, AppendKeepsForeignMetadataOrRefuses) {
         EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(dir) / "metadata" / "v2.metadata.json"));
         return;
     }
+    if (std::strcmp(mode, "delete") == 0) {   // G2ICE-280: drops pyiceberg's whole data file (ids 1..3)
+        Predicate p{};
+        std::strcpy(p.column, "id");
+        p.op = PredicateOp::kLe;
+        p.value.type = bolt::BoltType::Int64;
+        p.value.i64 = 3;
+        ASSERT_TRUE(table_delete(th, &p)) << "commit error " << static_cast<int>(table_last_commit_error(th));
+        return;
+    }
     ASSERT_TRUE(append_open(&ah, th));
     ASSERT_TRUE(append_write(ah, &b));
     ASSERT_TRUE(append_commit(ah)) << "commit error " << static_cast<int>(table_last_commit_error(th));

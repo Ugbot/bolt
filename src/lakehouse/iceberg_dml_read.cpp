@@ -45,6 +45,8 @@ bool validity_words(const BoltColumn& c, int64_t rows, Arena* a,
 template <typename T>
 size_t cmp_dispatch(PredicateOp op, uint32_t* sel, size_t n, const T* v, T lit,
                     const uint64_t* nulls) noexcept {
+    assert(sel != nullptr && (v != nullptr || n == 0));
+    assert(op != PredicateOp::kIsNull && op != PredicateOp::kIsNotNull);
     switch (op) {
         case PredicateOp::kEq: return flt::cmp_scalar<CmpOp::Eq, T>(sel, nullptr, 0, n, v, lit, nulls);
         case PredicateOp::kNe: return flt::cmp_scalar<CmpOp::Ne, T>(sel, nullptr, 0, n, v, lit, nulls);
@@ -58,6 +60,8 @@ size_t cmp_dispatch(PredicateOp op, uint32_t* sel, size_t n, const T* v, T lit,
 size_t utf8_dispatch(PredicateOp op, uint32_t* sel, size_t n, const StringView* v,
                      const uint8_t* ovf, const uint8_t* lit, uint32_t len,
                      const uint64_t* nulls) noexcept {
+    assert(sel != nullptr && (v != nullptr || n == 0));
+    assert(lit != nullptr || len == 0);
     switch (op) {
         case PredicateOp::kEq: return flt::cmp_scalar_utf8<CmpOp::Eq>(sel, n, v, ovf, lit, len, nulls);
         case PredicateOp::kNe: return flt::cmp_scalar_utf8<CmpOp::Ne>(sel, n, v, ovf, lit, len, nulls);

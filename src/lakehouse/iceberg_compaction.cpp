@@ -1,8 +1,8 @@
 // bolt/lakehouse/iceberg_compaction.cpp — W5 compaction / rewrite path.
 //
-// table_rewrite + table_compact entry points live in iceberg_writer.cpp;
-// they emit a kReplace snapshot. Full rewrite-small-files logic (the
-// upstream design's "files < target/2 rewrite") is the next slice.
+// table_rewrite + table_compact live in iceberg_compact.inc (included by
+// iceberg_writer.cpp, G2ICE-280); the rows they rewrite are read through
+// iceberg_dml_read.cpp.
 
 #include "bolt/lakehouse/iceberg/writer.h"
 
