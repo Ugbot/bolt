@@ -356,6 +356,22 @@ const Entry* find_entry(const Recount& r, const std::string& path, ManifestStatu
     return nullptr;
 }
 
+// Four 5-row files compacted into two outputs (ids 0..9 and 10..19) that share ONE manifest; then id 12 deleted by
+// position (in the second output) and the first output dropped whole, which rewrites that shared manifest with the
+// second output as EXISTING. It must keep the sequence number it was committed with, or the position delete of id
+// 12 (one sequence number later) stops applying to it and the row comes back.
+void build_shared_manifest(Table* t, const std::string& root) {
+    create_table(t, root);
+    for (int f = 0; f < 4; ++f) append_rows(t, base_rows(f * 5, f * 5 + 5));
+    int64_t biggest = 0;
+    for (const Entry& e : recount(root, current(t->th)).entries) biggest = std::max(biggest, e.size);
+    ASSERT_TRUE(table_compact(t->th, 2 * biggest + biggest / 2));
+    Predicate p12 = pred_i64("id", PredicateOp::kEq, 12);
+    ASSERT_TRUE(table_delete(t->th, &p12));
+    Predicate low = pred_i64("id", PredicateOp::kLe, 9);
+    ASSERT_TRUE(table_delete(t->th, &low));
+}
+
 }  // namespace
 
 TEST(IcebergDml, DeleteDropsWholeFilesWritesPositionDeletesForPartialOnesAndLeavesTheRest) {
@@ -554,6 +570,23 @@ TEST(IcebergDml, SummariesSurviveAReopenedHandle) {
     for (uint32_t i = 0; i < table_metadata(h)->n_snapshots; ++i) expect_summary_matches(t.root, table_metadata(h)->snapshots[i]);
 }
 
+TEST(IcebergDml, ARewrittenManifestKeepsTheSequenceNumbersItsDeletesDependOn) {
+    Table t;
+    build_shared_manifest(&t, fresh_root(temp_base(), "shared"));
+    const Metadata* m = table_metadata(t.th);
+    ASSERT_GE(m->n_snapshots, 7u);
+    const Snapshot& compaction = m->snapshots[4];
+    const Recount rc_c = recount(t.root, compaction);
+    EXPECT_EQ(rc_c.c.at("added-data-files"), 2) << "the fixture needs two outputs in one manifest";
+    EXPECT_EQ(scan_rows(t.root), model(base_rows(0, 20), [](const Row& r) { return r.id <= 9 || r.id == 12; }));
+    const Recount rc = recount(t.root, current(t.th));
+    EXPECT_EQ(rc.c.at("deleted-data-files"), 1);
+    int existing = 0;
+    for (const Entry& e : rc.entries) existing += e.status == ManifestStatus::kExisting ? 1 : 0;
+    EXPECT_EQ(existing, 1) << "the second output is carried as EXISTING";
+    expect_summary_matches(t.root, current(t.th));
+}
+
 TEST(IcebergDml, NullPredicateIsRefused) {
     Table t;
     build_base(&t, fresh_root(temp_base(), "nullpred"));
@@ -595,5 +628,9 @@ TEST(IcebergDmlFixture, WriteTables) {
         Predicate p = pred_i64("id", PredicateOp::kEq, 17);
         ASSERT_TRUE(table_delete(t.th, &p));
         ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+    }
+    {
+        Table t;
+        build_shared_manifest(&t, fresh_root(base, "shared_tbl"));
     }
 }
