@@ -40,8 +40,9 @@
 //     LogicalType (SchemaElement field 10) is honored over ConvertedType,
 //     so nanosecond timestamps/times and un/signed IntType round-trip even
 //     when the writer omitted the legacy ConvertedType.
-//     Still unsupported (parquet_map_type returns false): FLBA wider than
-//     16 bytes (any annotation), and nested LIST/MAP/STRUCT.
+//     Nested STRUCT / LIST / MAP fields are assembled by
+//     bolt_parquet_nested.h (parquet_read_nested_column); the entry points
+//     here decode leaves one value per row.
 //   - OPTIONAL columns: validity bitmap built from definition levels.
 //     All-valid shortcut: when every chunk of a column reports
 //     statistics null_count == 0 the bitmap is not allocated at all.

@@ -1,0 +1,12 @@
+schema	0	l[element]
+schema	1	mp<key,value>
+row	0	[1,null,3]
+row	0	null
+row	0	[]
+row	0	[4]
+row	0	[null]
+row	1	null
+row	1	<>
+row	1	<1=10,2=null>
+row	1	<3=30>
+row	1	<4=null,5=50,6=60>

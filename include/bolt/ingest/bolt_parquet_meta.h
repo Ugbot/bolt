@@ -208,6 +208,9 @@ enum class PqLogical : int32_t {
     Interval = 14,   // DEPRECATED ConvertedType.INTERVAL (=21), FIXED[12];
                       // no LogicalType union member exists for it (thrift
                       // reserves union id 9 for it and never fills it in).
+    // GROUP annotations (LogicalType union 3 LIST / 2 MAP). Leaves never
+    // carry them; bolt_parquet_nested.h reads them off the group tree.
+    List = 15, Map = 16,
 };
 
 // parquet::CompressionCodec.

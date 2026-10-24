@@ -1,0 +1,6 @@
+schema	0	m<key,value>
+row	0	null
+row	0	<>
+row	0	<1=10,2=null>
+row	0	<3=30>
+row	0	<4=null,5=50,6=60>

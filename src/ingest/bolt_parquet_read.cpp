@@ -30,6 +30,7 @@
 #include "bolt/ingest/bolt_snappy.h"
 #include "bolt/ingest/bolt_zstd_dec.h"
 #include "bolt/ingest/bolt_inflate.h"
+#include "bolt_parquet_read_internal.h"
 #include "bolt/ingest/bolt_lz4.h"
 #include "bolt/ingest/bolt_lz4_raw.h"
 
@@ -1845,6 +1846,61 @@ bool assemble_v2_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
                       const uint8_t** out, uint64_t* out_len) noexcept;
 
 
+// Timestamp/Time unit normalization to microseconds (G2FEAT-46) over the
+// output range [row0, row0+rows) -- plain and dict alike. Invalid rows keep
+// garbage but their validity bit is already cleared.
+bool rescale_ts(ColCtx* cx, int64_t row0, int64_t rows) noexcept {
+    assert(cx != nullptr && cx->ts_rescale != 0);
+    assert(row0 >= 0 && rows >= 0);
+    int64_t* d = reinterpret_cast<int64_t*>(cx->out) + row0;
+    // G2PQ-35: BoltType::Timestamp/Duration ARE microseconds by
+    // definition (type_name "timestamp[us]", schema tag "tsu:"), so a
+    // NANOS-unit source column that carries a real sub-microsecond
+    // digit cannot be represented here. `d[i] /= 1000` would silently
+    // discard that digit and return a rounded value with no error --
+    // exactly the "silent data loss" this codebase's CLAUDE.md forbids.
+    // Refuse the read instead of guessing: scan every VALID row first
+    // (a null row's bytes are garbage, not a real value, so it can't
+    // "lose" precision) and fail loudly the moment one actually needs
+    // more than microsecond resolution. A file whose nanos happen to be
+    // exact multiples of 1000 (e.g. a microsecond source re-typed to
+    // NANOS) keeps working byte-identically -- only genuine precision
+    // loss is refused, never the unit label alone.
+    if (cx->ts_rescale == 2) {
+        for (int64_t i = 0; i < rows; ++i) {   // bounded: chunk rows
+            if (cx->validity != nullptr) {
+                const int64_t row = row0 + i;
+                const uint8_t valid =
+                    (cx->validity[row >> 3] >> (row & 7)) & 1u;
+                if (valid == 0) continue;      // null: no value to lose
+            }
+            if ((d[i] % 1000) != 0) {
+                std::fprintf(stderr,
+                    "bolt parquet: column '%s' is TIMESTAMP/DURATION "
+                    "with unit NANOS and row %lld carries sub-"
+                    "microsecond precision (%lld ns) -- this reader's "
+                    "Timestamp type is microseconds-only and cannot "
+                    "represent it, so the read is REFUSED rather than "
+                    "silently rounding the value away\n",
+                    cx->pc->name, static_cast<long long>(row0 + i),
+                    static_cast<long long>(d[i]));
+                return false;
+            }
+        }
+    }
+    for (int64_t i = 0; i < rows; ++i) {       // bounded: chunk rows
+        if (cx->ts_rescale != 1) { d[i] /= 1000; continue; }   // nanos -> us
+        // millis -> us: a valid value past +-INT64_MAX/1000 has no microsecond
+        // form, so refuse rather than wrap. Null slots hold filler, skipped.
+        const int64_t row = row0 + i;
+        if (cx->validity != nullptr &&
+            ((cx->validity[row >> 3] >> (row & 7)) & 1u) == 0u) continue;
+        if (d[i] > INT64_MAX / 1000 || d[i] < INT64_MIN / 1000) return false;
+        d[i] *= 1000;
+    }
+    return true;
+}
+
 // One column chunk: walk its pages, decode rows [row0, row0+rows).
 bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
                   ColCtx* cx, int64_t row0, int64_t rows,
@@ -1901,50 +1957,9 @@ bool decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
         }
         p = pay + static_cast<uint64_t>(h.cmp);
     }
-    // Timestamp/Time unit normalization to microseconds (G2FEAT-46), over
-    // the chunk's output range [row0, row0+rows) — plain and dict alike.
-    // Invalid rows keep garbage but their validity bit is already cleared.
-    if (cx->ts_rescale != 0 && rows_done == rows) {
-        int64_t* d = reinterpret_cast<int64_t*>(cx->out) + row0;
-        // G2PQ-35: BoltType::Timestamp/Duration ARE microseconds by
-        // definition (type_name "timestamp[us]", schema tag "tsu:"), so a
-        // NANOS-unit source column that carries a real sub-microsecond
-        // digit cannot be represented here. `d[i] /= 1000` would silently
-        // discard that digit and return a rounded value with no error --
-        // exactly the "silent data loss" this codebase's CLAUDE.md forbids.
-        // Refuse the read instead of guessing: scan every VALID row first
-        // (a null row's bytes are garbage, not a real value, so it can't
-        // "lose" precision) and fail loudly the moment one actually needs
-        // more than microsecond resolution. A file whose nanos happen to be
-        // exact multiples of 1000 (e.g. a microsecond source re-typed to
-        // NANOS) keeps working byte-identically -- only genuine precision
-        // loss is refused, never the unit label alone.
-        if (cx->ts_rescale == 2) {
-            for (int64_t i = 0; i < rows; ++i) {   // bounded: chunk rows
-                if (cx->validity != nullptr) {
-                    const int64_t row = row0 + i;
-                    const uint8_t valid =
-                        (cx->validity[row >> 3] >> (row & 7)) & 1u;
-                    if (valid == 0) continue;      // null: no value to lose
-                }
-                if ((d[i] % 1000) != 0) {
-                    std::fprintf(stderr,
-                        "bolt parquet: column '%s' is TIMESTAMP/DURATION "
-                        "with unit NANOS and row %lld carries sub-"
-                        "microsecond precision (%lld ns) -- this reader's "
-                        "Timestamp type is microseconds-only and cannot "
-                        "represent it, so the read is REFUSED rather than "
-                        "silently rounding the value away\n",
-                        cx->pc->name, static_cast<long long>(row0 + i),
-                        static_cast<long long>(d[i]));
-                    return false;
-                }
-            }
-        }
-        for (int64_t i = 0; i < rows; ++i) {       // bounded: chunk rows
-            if (cx->ts_rescale == 1) d[i] *= 1000;   // millis -> us
-            else                     d[i] /= 1000;   // nanos  -> us
-        }
+    if (cx->ts_rescale != 0 && rows_done == rows &&
+        !rescale_ts(cx, row0, rows)) {
+        return false;
     }
     return rows_done == rows;
 }
@@ -2213,8 +2228,41 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
 // rep==1 continues it), generalized: max_rep == 1 is simply R == 1 of the
 // general algorithm below, not a separate code path.
 
-// Per-page level decode for a repeated leaf. Fills `rep` and `def` with one
-// entry per leaf slot and returns the values pointer/length that follow.
+namespace {
+
+// One level stream of a data page. v1 prefixes it with a u32 byte length,
+// v2 carries the length in the header; a level whose maximum is 0 has no
+// stream at all (v1 writes no prefix either) and every slot reads 0.
+bool page_level_stream(const PageHdr* h, uint32_t max_lvl, int32_t v2_len,
+                       uint32_t nvals, const uint8_t** v, uint64_t* vlen,
+                       uint32_t* out) noexcept {
+    assert(h != nullptr && out != nullptr);
+    assert(v != nullptr && vlen != nullptr);
+    uint32_t n = 0;
+    if (h->v2 != 0) {
+        if (v2_len < 0) return false;
+        n = static_cast<uint32_t>(v2_len);
+    } else if (max_lvl != 0u) {
+        if (*vlen < 4) return false;
+        std::memcpy(&n, *v, 4);
+        *v += 4;
+        *vlen -= 4;
+    }
+    if (n > *vlen) return false;
+    if (max_lvl == 0u) {
+        for (uint32_t i = 0; i < nvals; ++i) out[i] = 0;
+    } else if (!rle_hybrid_decode(*v, n, level_bit_width(max_lvl), nvals,
+                                  out)) {
+        return false;
+    }
+    *v += n;
+    *vlen -= n;
+    return true;
+}
+
+// Per-page level decode for a leaf read slot by slot. Fills `rep` and `def`
+// with one entry per leaf slot and returns the values pointer/length that
+// follow. Repetition is stored first in both page formats.
 bool list_page_levels(const ColCtx* cx, const uint8_t* page, uint64_t plen,
                       const PageHdr* h, uint32_t nvals, uint32_t* rep,
                       uint32_t* def, const uint8_t** out_v,
@@ -2223,37 +2271,12 @@ bool list_page_levels(const ColCtx* cx, const uint8_t* page, uint64_t plen,
     assert(rep != nullptr && def != nullptr);
     const uint8_t* v = page;
     uint64_t vlen = plen;
-    const uint32_t max_rep = cx->pc->max_rep;
-    const uint32_t max_def = cx->pc->max_def;
-    // v1 prefixes each level stream with its own u32 byte length and stores
-    // repetition FIRST; v2 stores both raw with the lengths in the header.
-    // The flat path never had to read the repetition stream at all -- it only
-    // ever skipped it -- so this is the one place that consumes it.
-    uint32_t rl = 0, dl = 0;
-    if (h->v2 != 0) {
-        rl = static_cast<uint32_t>(h->rep_len);
-        dl = static_cast<uint32_t>(h->def_len);
-        if (static_cast<uint64_t>(rl) + dl > vlen) return false;
-    } else {
-        if (vlen < 4) return false;
-        std::memcpy(&rl, v, 4);
-        v += 4; vlen -= 4;
-        if (rl > vlen) return false;
-    }
-    if (!rle_hybrid_decode(v, rl, level_bit_width(max_rep), nvals, rep)) {
+    if (!page_level_stream(h, cx->pc->max_rep, h->rep_len, nvals, &v, &vlen,
+                           rep) ||
+        !page_level_stream(h, cx->pc->max_def, h->def_len, nvals, &v, &vlen,
+                           def)) {
         return false;
     }
-    v += rl; vlen -= rl;
-    if (h->v2 == 0) {
-        if (vlen < 4) return false;
-        std::memcpy(&dl, v, 4);
-        v += 4; vlen -= 4;
-        if (dl > vlen) return false;
-    }
-    if (!rle_hybrid_decode(v, dl, level_bit_width(max_def), nvals, def)) {
-        return false;
-    }
-    v += dl; vlen -= dl;
     *out_v = v;
     *out_vlen = vlen;
     return true;
@@ -2267,9 +2290,16 @@ struct ListBuild {
     int64_t   cap_slots;
 };
 
-// Decode one data page of a repeated leaf: record its levels, then decode the
-// ELEMENT values densely into `cx` starting at element slot `elem0`. Returns
-// the number of element slots this page contributed (elements, not rows).
+// Definition level at which a slot carries a value position of this leaf:
+// the def AT its innermost repeated ancestor, 0 when it has none.
+inline uint32_t slot_value_def(const PqColumn* pc) noexcept {
+    assert(pc != nullptr && pc->max_rep <= kPqMaxRepLevels);
+    return pc->max_rep == 0u ? 0u : pc->rep_defs[pc->max_rep - 1u];
+}
+
+// Decode one data page of a leaf: record its levels, then decode the VALUE
+// positions densely into `cx` starting at slot `elem0`. Returns the number
+// of value positions this page contributed (not rows, not slots).
 bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
                       const PageHdr* h, ListBuild* b, int64_t elem0,
                       uint32_t* out_elems, Arena* arena) noexcept {
@@ -2285,23 +2315,16 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
         return false;
     }
     b->n_slots += nvals;
-
-    // Compact the slots that actually carry an element. The empty/null-list
-    // markers occupy a leaf slot but no element, so passing the raw def array
-    // straight through would reserve an element slot for them and leave a gap
-    // no list's offset range points at.
-    //
-    // G2PQ-15: a slot carries a LEAF value iff the DEEPEST (innermost) level
-    // has an element -- an intermediate level being null/empty already means
-    // no leaf value exists for this slot, and it is the innermost level's own
-    // rep_def, not the outermost's, that says so for max_rep >= 2.
-    assert(cx->pc->max_rep >= 1u && cx->pc->max_rep <= kPqMaxRepLevels);
-    const uint32_t rep_def = cx->pc->rep_defs[cx->pc->max_rep - 1u];
+    // Compact the slots that carry a value position. Empty/null-list markers
+    // occupy a slot but no position, so passing the raw def array through
+    // would leave a gap no offset range points at. It is the INNERMOST
+    // level's threshold that decides (G2PQ-15).
+    const uint32_t vdef = slot_value_def(cx->pc);
     const uint32_t max_def = cx->pc->max_def;
     uint32_t n_elem = 0, nvalid = 0;
     for (uint32_t i = 0; i < nvals; ++i) {
-        const bool has_elem = def[i] >= rep_def;
-        n_elem += has_elem ? 1u : 0u;
+        if (def[i] > max_def || rep[i] > cx->pc->max_rep) return false;
+        n_elem += (def[i] >= vdef) ? 1u : 0u;
         nvalid += (def[i] == max_def) ? 1u : 0u;
     }
     *out_elems = n_elem;
@@ -2311,14 +2334,164 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
     if (edef == nullptr) return false;
     uint32_t k = 0;
     for (uint32_t i = 0; i < nvals; ++i) {
-        if (def[i] >= rep_def) edef[k++] = def[i];
+        if (def[i] >= vdef) edef[k++] = def[i];
     }
     assert(k == n_elem);
-    // A page whose elements are all non-null takes the dense path, which is
-    // both faster and what every non-nullable list hits.
+    if (nvalid != n_elem && cx->validity == nullptr) return false;
     const uint32_t* pass = (nvalid == n_elem) ? nullptr : edef;
     return decode_values_by_encoding(cx, v, vlen, h, pass, elem0, n_elem,
                                      nvalid, arena);
+}
+
+// Walk one chunk's pages, appending its slots to `b` and its values to `cx`.
+// The dictionary is reset PER CHUNK: carrying group 0's dictionary into
+// group 1 would gather real values from the wrong rows -- a silent misread.
+bool leaf_decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
+                       ColCtx* cx, ListBuild* b, int64_t* elem_n,
+                       Arena* arena) noexcept {
+    assert(buf != nullptr && ch != nullptr && cx != nullptr);
+    assert(b != nullptr && elem_n != nullptr && arena != nullptr);
+    const int64_t start = (ch->dictionary_page_offset > 0)
+        ? ch->dictionary_page_offset : ch->data_page_offset;
+    if (start <= 0 || ch->total_compressed_size <= 0) return false;
+    const uint64_t s = static_cast<uint64_t>(start);
+    const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
+    if (s > len || region > len - s) return false;
+    const uint64_t end = s + region;
+    uint64_t p = s;
+    void* zscratch = nullptr;
+    cx->dict = nullptr;
+    cx->dict_n = 0;
+    const int64_t want = b->n_slots + ch->num_values;
+    for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {
+        if (b->n_slots >= want) break;
+        if (p >= end) return false;
+        TcCursor c{buf + p, buf + end};
+        PageHdr h;
+        if (!parse_page_header(&c, &h)) return false;
+        const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
+        if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
+        const uint8_t* pd = buf + pay;
+        uint64_t pd_len = static_cast<uint64_t>(h.cmp);
+        if (!verify_page_crc(h, pd, pd_len)) return false;   // G2PQ-19
+        const bool ok = (h.type == kPageDataV2)
+            ? assemble_v2_page(ch->codec, pd, pd_len, &h, arena, &zscratch,
+                               &pd, &pd_len)
+            : decompress_page(ch->codec, pd, pd_len, h.unc, arena, &zscratch,
+                              &pd, &pd_len);
+        if (!ok) return false;
+        if (h.type == kPageDict) {
+            if (!decode_dict_page(cx, pd, pd_len, h.nvals, arena)) return false;
+        } else if (h.type == kPageData || h.type == kPageDataV2) {
+            uint32_t got = 0;
+            if (!list_decode_page(cx, pd, pd_len, &h, b, *elem_n, &got, arena)) {
+                return false;
+            }
+            *elem_n += got;
+        } else if (h.type != kPageIndex) {
+            return false;
+        }
+        p = pay + static_cast<uint64_t>(h.cmp);
+    }
+    return b->n_slots == want;
+}
+
+// Slot totals over [g0, g1). A row is at least one slot in every real file;
+// leaf_levels_rows_ok enforces that once levels are known.
+bool leaf_slot_totals(const PqMeta* meta, uint32_t g0, uint32_t g1,
+                      uint32_t col, int64_t* n_slots,
+                      int64_t* n_rows) noexcept {
+    assert(meta != nullptr && n_slots != nullptr && n_rows != nullptr);
+    assert(g0 < g1 && g1 <= meta->n_row_groups);
+    int64_t slots = 0, rows = 0;
+    for (uint32_t g = g0; g < g1; ++g) {
+        const PqRowGroup& rg = meta->row_groups[g];
+        if (rg.chunk_off > meta->n_chunks || col >= meta->n_chunks - rg.chunk_off) {
+            return false;
+        }
+        const PqChunk* ch = &meta->chunks[rg.chunk_off + col];
+        if (ch->num_values < 0 || rg.num_rows < 0) return false;
+        if (ch->num_values > (int64_t{1} << 40)) return false;
+        slots += ch->num_values;
+        rows += rg.num_rows;
+    }
+    *n_slots = slots;
+    *n_rows = rows;
+    return true;
+}
+
+// Rows start where rep == 0, and only there may a chunk begin.
+bool leaf_levels_rows_ok(const PqMeta* meta, uint32_t g0, uint32_t g1,
+                         uint32_t col, const PqLeafSlots* ls) noexcept {
+    assert(meta != nullptr && ls != nullptr);
+    int64_t rows = 0;
+    for (int64_t j = 0; j < ls->n_slots; ++j) rows += ls->rep[j] == 0u;
+    if (rows != ls->n_rows) return false;
+    int64_t at = 0;
+    for (uint32_t g = g0; g < g1; ++g) {
+        const PqChunk* ch = &meta->chunks[meta->row_groups[g].chunk_off + col];
+        if (ch->num_values > 0 && ls->rep[at] != 0u) return false;
+        at += ch->num_values;
+    }
+    assert(at == ls->n_slots);
+    return true;
+}
+
+}  // namespace
+
+bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
+                          uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
+                          PqLeafSlots* out) noexcept {
+    assert(meta != nullptr && arena != nullptr && out != nullptr);
+    if (buf == nullptr || g0 >= g1 || g1 > meta->n_row_groups ||
+        col >= meta->n_columns) return false;
+    const PqColumn* pc = &meta->columns[col];
+    if (pc->max_rep > kPqMaxRepLevels) return false;
+    std::memset(out, 0, sizeof(*out));
+    if (!leaf_slot_totals(meta, g0, g1, col, &out->n_slots, &out->n_rows)) {
+        return false;
+    }
+    BoltColumn elem = BoltColumn::make_empty();
+    ColCtx cx;
+    if (!init_col_ctx_any(meta, col, g0, g1, out->n_slots, arena, &elem, &cx)) {
+        return false;
+    }
+    if (out->n_slots == 0) { out->values = elem; return true; }
+    const uint64_t nb = (static_cast<uint64_t>(out->n_slots) + 7u) / 8u;
+    if (cx.validity == nullptr && pc->max_def > slot_value_def(pc)) {
+        auto* bm = static_cast<uint8_t*>(arena->allocate(nb, 1));
+        if (bm == nullptr) return false;
+        std::memset(bm, 0xFF, nb);
+        elem.validity = bm;
+        cx.validity = bm;
+    }
+    ListBuild b;
+    b.rep = arena->allocate_array<uint32_t>(static_cast<size_t>(out->n_slots));
+    b.def = arena->allocate_array<uint32_t>(static_cast<size_t>(out->n_slots));
+    if (b.rep == nullptr || b.def == nullptr) return false;
+    b.n_slots = 0;
+    b.cap_slots = out->n_slots;
+    int64_t elem_n = 0;
+    for (uint32_t g = g0; g < g1; ++g) {
+        const PqChunk* ch = &meta->chunks[meta->row_groups[g].chunk_off + col];
+        if (!leaf_decode_chunk(buf, len, ch, &cx, &b, &elem_n, arena)) return false;
+    }
+    out->rep = b.rep;
+    out->def = b.def;
+    if (b.n_slots != out->n_slots || !leaf_levels_rows_ok(meta, g0, g1, col, out)) {
+        return false;
+    }
+    if (cx.ts_rescale != 0 && !rescale_ts(&cx, 0, elem_n)) return false;
+    elem.length = elem_n;
+    bool any_null = false;
+    for (int64_t i = 0; elem.validity != nullptr && i < elem_n && !any_null; ++i) {
+        any_null = ((elem.validity[i >> 3] >> (i & 7)) & 1u) == 0u;
+    }
+    elem.stats.all_valid = !any_null;
+    if (!any_null) elem.validity = nullptr;
+    out->values = elem;
+    out->n_values = elem_n;
+    return true;
 }
 
 // Walk a repeated leaf's chunk and assemble the LIST column.
@@ -2326,11 +2499,6 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
 // column. A range rather than a single group because parquet_read_file builds
 // ONE batch for the whole file, exactly as the flat path does with
 // init_col_ctx_any(meta, c, 0, n_row_groups, ...).
-//
-// Row groups are independent on the wire -- each has its own chunk region and
-// its own dictionary -- so the walk resets the dictionary per group. Getting
-// that wrong is a silent misread, not a crash: group 1 would gather through
-// group 0's dictionary and return real strings from the wrong rows.
 bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
                        uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
                        BoltColumn* out_col, int64_t* out_rows) noexcept {
@@ -2338,13 +2506,11 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     assert(out_col != nullptr && out_rows != nullptr);
     if (g0 >= g1 || g1 > meta->n_row_groups) return false;
     const PqColumn* pc = &meta->columns[col];
-    int64_t n_slots = 0, n_rows_total = 0;
-    for (uint32_t g = g0; g < g1; ++g) {
-        const PqChunk* c2 = &meta->chunks[meta->row_groups[g].chunk_off + col];
-        if (c2->num_values < 0) return false;
-        n_slots += c2->num_values;
-        n_rows_total += meta->row_groups[g].num_rows;
+    PqLeafSlots ls;
+    if (!pq_decode_leaf_slots(buf, len, meta, g0, g1, col, arena, &ls)) {
+        return false;
     }
+    const int64_t n_slots = ls.n_slots, n_rows_total = ls.n_rows;
     *out_rows = 0;
     if (n_slots == 0) {
         // Chunks with no leaf values still have rows, every one of them an
@@ -2359,7 +2525,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         assert(R0 >= 1u && R0 <= kPqMaxRepLevels);
         for (uint32_t k = R0; k >= 1u; --k) {
             const int64_t containers = (k == 1u) ? n_rows_total : 0;
-            auto* offs = arena->allocate_array<int32_t>(containers + 1);
+            auto* offs = arena->allocate_array<int32_t>(static_cast<size_t>(containers) + 1u);
             if (offs == nullptr) return false;
             for (int64_t i = 0; i <= containers; ++i) offs[i] = 0;
             cur = BoltColumn::make_list(&cur, offs, containers, nullptr, arena);
@@ -2369,97 +2535,11 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         *out_rows = n_rows_total;
         return true;
     }
-
-    // Element column, sized to the upper bound: every leaf slot yields at
-    // most one element. The exact count is only known after the levels are
-    // read, so the length is trimmed at the end rather than guessed at.
-    BoltColumn elem = BoltColumn::make_empty();
-    ColCtx cx;
-    if (!init_col_ctx_any(meta, col, g0, g1, n_slots, arena, &elem, &cx)) {
-        return false;
-    }
-    // Elements can be null whenever there is a definition level between the
-    // repeated node and the leaf; init_col_ctx_any sized validity from the
-    // chunk's null_count, which counts NULL ELEMENTS and so is the right test.
-    int64_t range_nulls = 0;
-    for (uint32_t g = g0; g < g1; ++g) {
-        range_nulls += meta->chunks[meta->row_groups[g].chunk_off + col].null_count;
-    }
-    if (cx.validity == nullptr && pc->max_def > pc->rep_def &&
-        range_nulls != 0) {
-        const uint64_t nb = (static_cast<uint64_t>(n_slots) + 7u) / 8u;
-        auto* bm = static_cast<uint8_t*>(arena->allocate(nb, 1));
-        if (bm == nullptr) return false;
-        std::memset(bm, 0xFF, nb);
-        elem.validity = bm;
-        elem.stats.all_valid = false;
-        cx.validity = bm;
-    }
-
+    BoltColumn elem = ls.values;
+    const int64_t elem_n = ls.n_values;
     ListBuild b;
-    b.rep = static_cast<uint32_t*>(arena->allocate(uint64_t(n_slots) * 4u, 4));
-    b.def = static_cast<uint32_t*>(arena->allocate(uint64_t(n_slots) * 4u, 4));
-    if (b.rep == nullptr || b.def == nullptr) return false;
-    b.n_slots = 0;
-    b.cap_slots = n_slots;
-
-    int64_t elem_n = 0;
-    void* zscratch = nullptr;
-    for (uint32_t g = g0; g < g1; ++g) {
-        const PqChunk* ch = &meta->chunks[meta->row_groups[g].chunk_off + col];
-        const int64_t start = (ch->dictionary_page_offset > 0)
-            ? ch->dictionary_page_offset : ch->data_page_offset;
-        if (start <= 0 || ch->total_compressed_size <= 0) return false;
-        const uint64_t s = static_cast<uint64_t>(start);
-        const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
-        if (s > len || region > len - s) return false;
-        const uint64_t end = s + region;
-        uint64_t p = s;
-        // PER CHUNK, not per column: a dictionary belongs to one column chunk,
-        // so carrying group 0's dictionary into group 1 would gather real
-        // values from the wrong rows -- a silent misread.
-        cx.dict = nullptr;
-        cx.dict_n = 0;
-        const int64_t want = b.n_slots + ch->num_values;
-        for (uint32_t page = 0; page < kPqReadPageLoopBound; ++page) {
-            if (b.n_slots >= want) break;
-            if (p >= end) return false;
-            TcCursor c{buf + p, buf + end};
-            PageHdr h;
-            if (!parse_page_header(&c, &h)) return false;
-            const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
-            if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
-            const uint8_t* pd = buf + pay;
-            uint64_t pd_len = static_cast<uint64_t>(h.cmp);
-            if (!verify_page_crc(h, pd, pd_len)) return false;   // G2PQ-19
-            if (h.type == kPageDataV2) {
-                if (!assemble_v2_page(ch->codec, pd, pd_len, &h, arena,
-                                      &zscratch, &pd, &pd_len)) {
-                    return false;
-                }
-            } else if (!decompress_page(ch->codec, pd, pd_len, h.unc, arena,
-                                        &zscratch, &pd, &pd_len)) {
-                return false;
-            }
-            if (h.type == kPageDict) {
-                if (!decode_dict_page(&cx, pd, pd_len, h.nvals, arena)) {
-                    return false;
-                }
-            } else if (h.type == kPageData || h.type == kPageDataV2) {
-                uint32_t got = 0;
-                if (!list_decode_page(&cx, pd, pd_len, &h, &b, elem_n, &got,
-                                      arena)) {
-                    return false;
-                }
-                elem_n += got;
-            } else if (h.type != kPageIndex) {
-                return false;
-            }
-            p = pay + static_cast<uint64_t>(h.cmp);
-        }
-        if (b.n_slots != want) return false;
-    }
-    if (b.n_slots != n_slots) return false;
+    b.rep = ls.rep;
+    b.def = ls.def;
 
     // ---- assembly (G2PQ-15): cascade rep/def into R nested offset arrays --
     //
@@ -2492,7 +2572,7 @@ bool build_list_column(const uint8_t* buf, uint64_t len, const PqMeta* meta,
         // bounded by n_slots -- every element ever created traces back to
         // exactly one leaf slot, so there can never be more of them.
         const int64_t cap = (k == 1u) ? n_rows_total : n_slots;
-        offs[k - 1] = arena->allocate_array<int32_t>(cap + 1);
+        offs[k - 1] = arena->allocate_array<int32_t>(static_cast<size_t>(cap) + 1u);
         if (offs[k - 1] == nullptr) return false;
         const uint64_t vb = (static_cast<uint64_t>(cap) + 7u) / 8u;
         lval[k - 1] = static_cast<uint8_t*>(arena->allocate(vb, 1));
