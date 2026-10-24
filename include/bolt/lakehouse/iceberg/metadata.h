@@ -117,7 +117,8 @@ struct Metadata {
     // v3 row lineage: the table's `next-row-id` (has_next_row_id false when the document carries none).
     int64_t     next_row_id;
     bool        has_next_row_id;
-    uint8_t     _pad_nr[7];
+    bool        has_encryption_keys;   // v3 `encryption-keys` lists at least one key (the table's files may be encrypted)
+    uint8_t     _pad_nr[6];
 };
 
 // One top-level field of a name mapping: the Iceberg field id and the file column names that map to it.

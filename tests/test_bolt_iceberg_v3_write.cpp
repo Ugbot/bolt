@@ -192,3 +192,22 @@ TEST(IcebergV1Write, ManifestAndListHaveTheV1ShapeAndReadBack) {
     EXPECT_STREQ(le[0].manifest_path, "s3://b/t/metadata/m.avro");
     EXPECT_EQ(le[0].added_rows_count, 15);
 }
+
+TEST(IcebergV3Metadata, EncryptionKeysAreParsedNotProbed) {
+    auto doc = [](const char* extra, const char* col) {
+        return std::string("{\"format-version\":3,\"table-uuid\":\"u\",\"location\":\"s3://b/t\",\"last-updated-ms\":1,") + extra +
+               "\"current-schema-id\":0,\"schemas\":[{\"schema-id\":0,\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"" + col +
+               "\",\"required\":false,\"type\":\"long\"}]}],\"snapshots\":[]}";
+    };
+    auto keys = [](const std::string& j) {
+        bolt::Arena a;
+        auto* m = a.allocate_array<Metadata>(1);
+        std::memset(m, 0, sizeof(*m));
+        EXPECT_TRUE(metadata_parse(reinterpret_cast<const uint8_t*>(j.data()), static_cast<uint32_t>(j.size()), &a, m));
+        return m->has_encryption_keys;
+    };
+    EXPECT_FALSE(keys(doc("", "a")));
+    EXPECT_FALSE(keys(doc("\"encryption-keys\":[],", "a")));
+    EXPECT_FALSE(keys(doc("", "encryption-keys"))) << "a column of that name is not the member";
+    EXPECT_TRUE(keys(doc("\"encryption-keys\":[{\"key-id\":\"k\",\"encrypted-key-metadata\":\"AA==\"}],", "a")));
+}

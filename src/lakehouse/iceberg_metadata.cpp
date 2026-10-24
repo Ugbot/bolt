@@ -547,6 +547,14 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
         } else if (tok_eq(&idx, key, "next-row-id")) {
             read_int64(&it, &out->next_row_id);
             out->has_next_row_id = true;
+        } else if (tok_eq(&idx, key, "encryption-keys")) {
+            if (bj::iter_peek(&it) == bj::TokenType::BeginArray) {
+                const int32_t open = it.cursor;
+                skip_value(&it);
+                out->has_encryption_keys = it.cursor > open + 2;        // more than `[` `]`
+            } else {
+                skip_value(&it);
+            }
         } else if (tok_eq(&idx, key, "current-snapshot-id")) {
             if(saw_current_snapshot || !read_current_snapshot(&idx,&it,out)) return false;
             saw_current_snapshot=true;
