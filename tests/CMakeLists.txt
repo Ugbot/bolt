@@ -1761,6 +1761,22 @@ target_link_libraries(test_bolt_parquet_nested_list_write
 bolt_apply_hardening(test_bolt_parquet_nested_list_write)
 add_test(NAME test_bolt_parquet_nested_list_write COMMAND test_bolt_parquet_nested_list_write)
 
+# Nested STRUCT / LIST / MAP writer (ParquetNestedNode). The executable writes
+# the fixtures and their expected values; the pyarrow/DuckDB oracle re-reads
+# them independently (SKIP_RETURN_CODE 2 when pyarrow is missing).
+add_executable(test_bolt_parquet_nested_write test_bolt_parquet_nested_write.cpp)
+target_link_libraries(test_bolt_parquet_nested_write
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_nested_write)
+add_test(NAME test_bolt_parquet_nested_write COMMAND test_bolt_parquet_nested_write)
+set_tests_properties(test_bolt_parquet_nested_write PROPERTIES
+    FIXTURES_SETUP bolt_parquet_nested_write_files)
+add_test(NAME test_bolt_parquet_nested_write_pyarrow
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/parquet_nested_write_interop.py
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(test_bolt_parquet_nested_write_pyarrow PROPERTIES
+    SKIP_RETURN_CODE 2 FIXTURES_REQUIRED bolt_parquet_nested_write_files)
+
 # JSON / BSON / VARIANT logical refinements. JSON is an annotation over Utf8
 # STORAGE (Arrow's own model), not a new physical type -- so the key property
 # is that a JSON column still reads as an ordinary string column.
