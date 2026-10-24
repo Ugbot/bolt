@@ -220,10 +220,14 @@ uint32_t encode_null_count_map(const FileStats* st, uint8_t* dst,
     assert(st != nullptr && dst != nullptr);
     if (st->n_cols == 0u) return 0u;
     assert(st->n_cols <= kIcebergMaxStatCols);
+    uint32_t known = 0;                              // null_count < 0: unknown, left out of the map
+    for (uint32_t i = 0; i < st->n_cols; ++i) known += st->cols[i].null_count >= 0 ? 1u : 0u;
+    if (known == 0u) return 0u;
     uint32_t o = 0;
     if (o + 10u > cap) return 0u;
-    o += enc_long_stat(static_cast<int64_t>(st->n_cols), dst + o);
+    o += enc_long_stat(static_cast<int64_t>(known), dst + o);
     for (uint32_t i = 0; i < st->n_cols; ++i) {      // bounded: n_cols
+        if (st->cols[i].null_count < 0) continue;
         if (o + 20u > cap) return 0u;
         o += enc_long_stat(st->cols[i].field_id, dst + o);
         o += enc_long_stat(st->cols[i].null_count, dst + o);
@@ -457,8 +461,11 @@ bool write_manifest(const DataFileRef* files, uint32_t n_files,
         uint32_t i = 0;
         put_long(&v[i++], static_cast<int64_t>(d->status));
         put_long(&v[i++], d->snapshot_id != 0 ? d->snapshot_id : snapshot_id);
-        put_long(&v[i++], sequence_number);
-        put_long(&v[i++], sequence_number);
+        // An EXISTING or DELETED entry keeps the sequence numbers it was first committed with (spec: "Sequence Number
+        // Inheritance"); relabelling them would change which deletes apply to it.
+        const bool carried = d->status != ManifestStatus::kAdded;
+        put_long(&v[i++], carried && d->has_sequence_number ? d->sequence_number : sequence_number);
+        put_long(&v[i++], carried && d->has_file_sequence_number ? d->file_sequence_number : sequence_number);
         put_long(&v[i++], static_cast<int64_t>(d->content));
         put_str(&v[i++], d->file_path);
         put_str(&v[i++], kFileFormat);

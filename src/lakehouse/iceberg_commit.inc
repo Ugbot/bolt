@@ -138,10 +138,10 @@ bool persist_metadata(TableHandle* th) noexcept {
     const int64_t prev_updated_ms = th->meta.last_updated_ms;
     th->meta.last_updated_ms = now_ms();
     const uint8_t* body = nullptr; uint64_t blen = 0;
-    if (!metadata_json_emit(&th->meta, th->refs, th->n_refs, th->is_view,
-                            th->view_dialect, th->view_sql,
-                            th->view_version_id, has_prev ? &prev : nullptr,
-                            th->arena, &body, &blen)) {
+    if (!metadata_json_emit_ex(&th->meta, th->refs, th->n_refs, th->is_view,
+                               th->view_dialect, th->view_sql,
+                               th->view_version_id, has_prev ? &prev : nullptr,
+                               th->sums, th->n_sums, th->arena, &body, &blen)) {
         th->meta.last_updated_ms = prev_updated_ms;
         th->last_error = CommitError::kFailed;
         return false;

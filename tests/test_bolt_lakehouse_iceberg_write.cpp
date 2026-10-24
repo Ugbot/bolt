@@ -255,14 +255,14 @@ TEST(IcebergWrite, OverwriteAndDeleteAndCompact) {
     ASSERT_TRUE(table_create(&th, &arena, &os, root.c_str(), &sch, nullptr,
                               nullptr, &wo));
     bolt::BoltBatch b0{}; make_batch(&arena, &b0, 0, 3);
-    // These spec operations are not built yet (G2ICE-280): each must refuse and write nothing, never publish a snapshot labelled
-    // overwrite/delete/replace that changed no data.
+    // G2ICE-280 semantics are tested in test_bolt_iceberg_dml.cpp. Here: refusals write nothing, and an operation
+    // with nothing to do on an empty table publishes no snapshot.
     EXPECT_FALSE(table_overwrite(th, nullptr, &b0));
-    EXPECT_EQ(table_last_commit_error(th), CommitError::kUnimplemented);
+    EXPECT_EQ(table_last_commit_error(th), CommitError::kFailed);
     Predicate pred{};
-    EXPECT_FALSE(table_delete(th, &pred));
-    EXPECT_FALSE(table_rewrite(th, nullptr));
-    EXPECT_FALSE(table_compact(th, 64u * 1024u * 1024u));
+    EXPECT_FALSE(table_delete(th, &pred)) << "an empty column name names no column";
+    EXPECT_TRUE(table_rewrite(th, nullptr));
+    EXPECT_TRUE(table_compact(th, 64u * 1024u * 1024u));
     EXPECT_EQ(table_metadata(th)->n_snapshots, 0u);
 }
 

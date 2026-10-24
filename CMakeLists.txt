@@ -1037,6 +1037,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_manifest_writer.cpp
     src/lakehouse/iceberg_data_file_writer.cpp
     src/lakehouse/iceberg_compaction.cpp
+    src/lakehouse/iceberg_dml_read.cpp
     src/lakehouse/iceberg_expire.cpp
     src/lakehouse/iceberg_branches_tags.cpp
     src/lakehouse/iceberg_view.cpp

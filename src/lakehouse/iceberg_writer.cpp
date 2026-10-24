@@ -36,6 +36,7 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <new>
 #include <system_error>
 #include <vector>
 
@@ -51,6 +52,7 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/snapshot.h"
 #include "bolt/lakehouse/object_store.h"
+#include "iceberg_dml_read.h"
 
 #if defined(BOLT_BUILD_INGEST_PARQUET) || 1
 #include "bolt/ingest/bolt_parquet_write.h"
@@ -70,6 +72,8 @@ constexpr uint32_t kMaxPathLen      = 1024u;
 constexpr uint32_t kMaxRefName      = 64u;
 constexpr uint32_t kMaxPendingBatch = 256u;
 }  // namespace
+
+#include "iceberg_summary_types.inc"
 
 struct NamedRef {
     char    name[kMaxRefName];
@@ -108,6 +112,9 @@ struct TableHandle {
     uint32_t       dirty_meta;      // what the pending commit changes beyond its snapshot (kDirty*)
     uint32_t       n_dropped_refs;
     char           dropped_refs[16][64];
+    SumRec*        sums;            // summaries of the snapshots this handle committed (G2ICE-280)
+    uint32_t       n_sums;
+    uint32_t       cap_sums;
 };
 
 // iceberg_scan.cpp and iceberg_writer.cpp each define their OWN
@@ -550,11 +557,54 @@ bool emit_metadata_log(Buf* b, const Metadata* m,
 
 }  // namespace
 
+namespace {
+
+const SnapSummary* find_summary(const SumRec* sums, uint32_t n, int64_t id) noexcept {
+    assert(sums != nullptr || n == 0);
+    for (uint32_t i = n; i > 0; --i)                       // bounded by n; newest first
+        if (sums[i - 1u].snapshot_id == id) return &sums[i - 1u].s;
+    return nullptr;
+}
+
+// `"summary":{"operation":...,<counters>}` — counters as decimal strings (spec: string map).
+bool emit_summary(Buf* b, const char* op, const SnapSummary* s) noexcept {
+    assert(b != nullptr && op != nullptr);
+    if (!buf_fmt(b, "\"summary\":{\"operation\":\"%s\"", op)) return false;
+    if (s != nullptr) {
+        for (uint32_t k = 0; k < kSumKeys; ++k) {          // bounded
+            const bool total = k >= kSumFirstTotal;
+            if ((total && !s->has_totals) || (!total && s->v[k] == 0)) continue;
+            if (!buf_fmt(b, ",\"%s\":\"%lld\"", kSumNames[k], static_cast<long long>(s->v[k]))) return false;
+        }
+        if (!buf_fmt(b, ",\"changed-partition-count\":\"%lld\"",
+                     static_cast<long long>(s->changed_partitions))) return false;
+    }
+    return buf_put(b, "}");
+}
+
+}  // namespace
+
+bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
+                           bool is_view, const char* view_dialect,
+                           const char* view_sql, int64_t view_version_id,
+                           const MetadataLogEntry* pending_prev, const SumRec* sums, uint32_t n_sums,
+                           Arena* a, const uint8_t** out, uint64_t* out_len) noexcept;
+
 bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                         bool is_view, const char* view_dialect,
                         const char* view_sql, int64_t view_version_id,
                         const MetadataLogEntry* pending_prev,
                         Arena* a, const uint8_t** out, uint64_t* out_len) noexcept {
+    assert(m != nullptr && a != nullptr);
+    return metadata_json_emit_ex(m, refs, nr, is_view, view_dialect, view_sql, view_version_id, pending_prev,
+                                 nullptr, 0u, a, out, out_len);
+}
+
+bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
+                           bool is_view, const char* view_dialect,
+                           const char* view_sql, int64_t view_version_id,
+                           const MetadataLogEntry* pending_prev, const SumRec* sums, uint32_t n_sums,
+                           Arena* a, const uint8_t** out, uint64_t* out_len) noexcept {
     assert(m != nullptr && a != nullptr && out != nullptr && out_len != nullptr);
     Buf b;
     // First block; grows with the snapshot count.
@@ -730,7 +780,8 @@ bool metadata_json_emit(const Metadata* m, const NamedRef* refs, uint32_t nr,
                      static_cast<long long>(s.sequence_number))) return false;
         if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
         if (!buf_fmt(&b, "\"schema-id\":%d,", s.schema_id)) return false;
-        if (!buf_fmt(&b, "\"summary\":{\"operation\":\"%s\"}}", op)) return false;
+        if (!emit_summary(&b, op, find_summary(sums, n_sums, s.snapshot_id))) return false;
+        if (!buf_put(&b, "}")) return false;
     }
     if (!buf_put(&b, "],")) return false;
 
@@ -1191,220 +1242,26 @@ int64_t mint_snapshot_id(const TableHandle* th) noexcept {
     return 1;
 }
 
-// `snap_id` is minted by the caller so the data files it already stamped and
-// the snapshot record published here carry the SAME id. Callers with no data
-// files may pass 0 to have one minted.
+#include "iceberg_change.inc"
+#include "iceberg_summary.inc"
+#include "iceberg_change_commit.inc"
+
+// One snapshot adding `files` (all data, or all delete files) on top of the current one. `snap_id` is minted by the
+// caller so the files it already stamped and the snapshot record carry the SAME id; 0 mints one.
 bool publish_snapshot(TableHandle* th, const DataFileRef* files, uint32_t nf,
                       SnapshotOp op, int64_t snap_id) noexcept {
     assert(th != nullptr);
     assert(th->arena != nullptr && th->os != nullptr);
     if (files == nullptr && nf != 0) return false;
-    if (!handle_is_current(th)) return false;
-
-    // A manifest for a PARTITIONED table must carry each data file's partition
-    // tuple, whose shape comes from the spec. `manifest_write_avro` emits the
-    // unpartitioned schema only, and a manifest whose partition tuple does not
-    // match its spec parses cleanly and then LIES about where the rows are —
-    // a reader prunes on it and silently drops data. Refuse the commit; there
-    // is no correct fallback, and the old JSON one was not a manifest at all.
-    const PartitionSpec* spec = metadata_spec(&th->meta,
-                                              th->meta.current_spec_id);
-    if (spec != nullptr && spec->n_fields != 0) return false;
-
-    const int64_t parent = th->meta.current_snapshot_id;
-    if (snap_id == 0) snap_id = mint_snapshot_id(th);
-    assert(snap_id != 0);
-    // The manifest records the sequence number the snapshot is about to take,
-    // so it is computed here and asserted equal to the one committed below.
-    const int64_t seq = th->meta.last_sequence_number + 1;
-
-    // The table schema, carried in the manifest's `schema` metadata key.
-    const Schema* sch = metadata_current_schema(&th->meta);
-    if (sch == nullptr) return false;
-    const uint8_t* sch_json = nullptr; uint64_t sch_len = 0;
-    if (!emit_schema_json(th->arena, sch, &sch_json, &sch_len)) return false;
-    if (sch_len == 0) return false;
-    assert(sch_len <= 0xFFFFFFFFull);   // Buf::len is uint32_t: cast is safe
-
-    // Manifest body — Avro OCF, the only form Iceberg defines.
-    const uint8_t* manifest_body = nullptr; uint64_t manifest_len = 0;
-    if (!manifest_write_avro(files, nf, snap_id, seq,
-                             reinterpret_cast<const char*>(sch_json),
-                             static_cast<uint32_t>(sch_len),
-                             th->meta.current_spec_id, th->arena,
-                             &manifest_body, &manifest_len)) return false;
-    char mrel[128];
-    std::snprintf(mrel, sizeof(mrel), "metadata/manifest-%lld.avro",
-                  static_cast<long long>(snap_id));
-    if (!commit_object(th, mrel, manifest_body, manifest_len,
-                       CommitObjectKind::kManifest, snap_id)) return false;
-
-    // A snapshot's manifest list names EVERY manifest live at that snapshot,
-    // not just the one the commit added. This wrote a one-entry list, so each
-    // append REPLACED the table's contents: after two 6-row commits both
-    // pyiceberg and bolt saw 6 rows, and nothing noticed because the write
-    // tests assert snapshot COUNTS and bolt's reader, following the same
-    // one-entry list, agreed with the writer perfectly. pyiceberg reading the
-    // fixture is what surfaced it (G2ICE-84).
-    //
-    // Carried forward for APPEND only. Overwrite/replace/delete deliberately
-    // start a fresh list: their predicate semantics are still deferred (see
-    // table_overwrite/table_delete), and carrying files forward under an
-    // operation named "overwrite" would assert a table state the writer has
-    // not actually computed.
-    ManifestListEntry* mlist = nullptr;
-    uint32_t n_mlist = 0;
-    // kDelete joins kAppend here. A delete snapshot that started a fresh list
-    // would drop every data manifest and empty the table -- the delete would
-    // "work" by deleting everything. A positional-delete commit adds a delete
-    // manifest ON TOP of the state it inherits, which is exactly the append
-    // carry-forward, so the same code serves both.
-    if ((op == SnapshotOp::kAppend || op == SnapshotOp::kDelete) &&
-        parent > 0) {
-        const Snapshot* ps = nullptr;
-        for (uint32_t i = 0; i < th->meta.n_snapshots; ++i) {   // bounded
-            if (th->meta.snapshots[i].snapshot_id == parent) {
-                ps = &th->meta.snapshots[i];
-                break;
-            }
-        }
-        // An unresolvable parent would start a fresh list: every prior
-        // manifest dropped.
-        if (ps == nullptr) return false;
-        if (ps->manifest_list[0] != '\0') {
-            const uint8_t* pb = nullptr; uint64_t pl = 0;
-            const char* pkey = store_key_for(th->root, ps->manifest_list);
-            // A parent list the store cannot produce means manifests we would
-            // silently drop — fail the commit instead.
-            if (os_get(th->os, pkey, th->arena, &pb, &pl) != kOsOk) return false;
-            if (!manifest_list_parse_avro_grow(pb, pl, th->arena, 1u, &mlist,
-                                               &n_mlist)) return false;
-        }
-    }
-    // Room for the entry this commit adds.
-    {
-        ManifestListEntry* grown =
-            th->arena->allocate_array<ManifestListEntry>(n_mlist + 1u);
-        if (grown == nullptr) return false;
-        if (n_mlist != 0u)
-            std::memcpy(grown, mlist, sizeof(ManifestListEntry) * n_mlist);
-        mlist = grown;
-    }
-
-    // G2ICE-49 — the manifest-list must report REAL per-status file/row
-    // tallies, not just a file count. Every entry `files[]` holds for THIS
-    // manifest carries a ManifestStatus; sum `record_count` per status so a
-    // reader that trusts the manifest-list alone (pyiceberg's
-    // `inspect.manifests()`, DuckDB's iceberg extension, a snapshot-summary
-    // rollup) sees the truth without opening the manifest or its data files
-    // — exactly the class of bug `record_count` on a data file already is
-    // (see manifest_avro.h). Every current caller of publish_snapshot stamps
-    // every file it passes as kAdded (or passes nf=0), so this reduces to
-    // the old `nf`/`0` values there; it is also correct for a future caller
-    // that ever mixes statuses in one manifest.
-    int64_t files_added = 0, files_existing = 0, files_deleted = 0;
-    int64_t rows_added = 0, rows_existing = 0, rows_deleted = 0;
-    for (uint32_t r = 0; r < nf; ++r) {        // bounded: nf
-        const DataFileRef& d = files[r];
-        switch (d.status) {
-            case ManifestStatus::kAdded:
-                ++files_added;
-                rows_added += d.stats.record_count;
-                break;
-            case ManifestStatus::kExisting:
-                ++files_existing;
-                rows_existing += d.stats.record_count;
-                break;
-            case ManifestStatus::kDeleted:
-                ++files_deleted;
-                rows_deleted += d.stats.record_count;
-                break;
-            default:
-                break;   // kUnknown: uncounted, same as the old code's silence
-        }
-    }
-    assert(files_added + files_existing + files_deleted <=
-           static_cast<int64_t>(nf));
-
-    // Manifest-list body — Avro OCF likewise.
-    ManifestListEntry mle{};
-    mle.partition_spec_id = th->meta.current_spec_id;
-    // ManifestFile.content is 0=data, 1=deletes -- it does NOT distinguish
-    // positional from equality, which is a per-entry property. Anything that
-    // is not a data file makes this a deletes manifest.
-    mle.content           = (nf != 0 && files[0].content != FileContent::kData)
-                                ? ManifestContent::kDeleteManifest
-                                : ManifestContent::kDataManifest;
-    mle.manifest_length   = static_cast<int64_t>(manifest_len);
-    mle.added_snapshot_id = snap_id;
-    mle.added_files_count    = files_added;
-    mle.existing_files_count = files_existing;
-    mle.deleted_files_count  = files_deleted;
-    mle.added_rows_count     = rows_added;
-    mle.existing_rows_count  = rows_existing;
-    mle.deleted_rows_count   = rows_deleted;
-    // Added by THIS commit, so it takes this commit's sequence number.
-    mle.sequence_number     = seq;
-    mle.min_sequence_number = seq;
-    // Recorded absolute (G2ICE-84); the store is still keyed by `mrel`.
-    if (!abs_location(th->root, mrel, mle.manifest_path,
-                      sizeof(mle.manifest_path))) return false;
-    mlist[n_mlist++] = mle;
-    const uint8_t* mlb = nullptr; uint64_t mll = 0;
-    if (!manifest_list_write_avro(mlist, n_mlist, snap_id, seq, th->arena,
-                                  &mlb, &mll))
-        return false;
-    char mlrel[128];
-    std::snprintf(mlrel, sizeof(mlrel), "metadata/snap-%lld.avro",
-                  static_cast<long long>(snap_id));
-    // Resolved BEFORE the snapshot record is pushed below, so a late failure
-    // cannot leave a half-written snapshot in the metadata.
-    char mlabs[kIcebergMaxManifestPath];
-    if (!abs_location(th->root, mlrel, mlabs, sizeof(mlabs))) return false;
-    if (!commit_object(th, mlrel, mlb, mll, CommitObjectKind::kManifestList, snap_id)) {
-        if (!th->write_uncertain) (void)os_delete(th->os, mrel);
-        return false;
-    }
-
-    // Record the snapshot.
-    Snapshot s;
-    std::memset(&s, 0, sizeof(s));
-    s.snapshot_id        = snap_id;
-    s.parent_snapshot_id = parent;
-    s.timestamp_ms       = now_ms();
-    s.sequence_number    = ++th->meta.last_sequence_number;
-    assert(s.sequence_number == seq);   // what the manifests were written with
-    s.op                 = op;
-    // The schema this snapshot is committed under, recorded now so a later
-    // schema evolution cannot retroactively relabel it (G2ICE-50).
-    s.schema_id          = th->meta.current_schema_id;
-    std::strncpy(s.manifest_list, mlabs, sizeof(s.manifest_list) - 1u);
-    // Both pushes only append, so withdrawing is a count decrement.
-    const uint32_t n_log_saved = th->meta.n_snapshot_log;
-    const uint32_t n_snap_saved = th->meta.n_snapshots;
-    const bool pushed =
-        metadata_push_snapshot(&th->meta, &s) &&
-        metadata_snapshot_log_push(&th->meta, s.timestamp_ms, snap_id);
-    if (pushed) {
-        th->meta.current_snapshot_id = snap_id;
-        if (persist_metadata(th)) {
-            apply_retention_policy(th);
-            return true;
-        }
-    } else {
-        th->last_error = CommitError::kFailed;
-    }
-    // Restore the handle's base view. An uncertain publication may already
-    // reference these objects: retain them and require reconciliation/reopen.
-    th->meta.n_snapshot_log = n_log_saved;
-    th->meta.n_snapshots = n_snap_saved;
-    --th->meta.last_sequence_number;
-    th->meta.current_snapshot_id = parent;
-    if (!th->write_uncertain) {
-        (void)os_delete(th->os, mlrel);
-        (void)os_delete(th->os, mrel);
-    }
-    return false;
+    ChangeSet cs{};
+    cs.op = op;
+    cs.snap_id = snap_id != 0 ? snap_id : mint_snapshot_id(th);
+    const bool dels = nf != 0 && files[0].content != FileContent::kData;
+    cs.add_data = dels ? nullptr : files;
+    cs.n_add_data = dels ? 0u : nf;
+    cs.add_dels = dels ? files : nullptr;
+    cs.n_add_dels = dels ? nf : 0u;
+    return commit_change(th, &cs);
 }
 
 }  // namespace
@@ -1516,6 +1373,10 @@ bool position_delete_schema(Arena* a, Schema* out) noexcept {
 
 }  // namespace
 
+#include "iceberg_dml.inc"
+#include "iceberg_dml_ops.inc"
+#include "iceberg_compact.inc"
+
 bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
                             uint32_t n) noexcept {
     assert(th != nullptr);
@@ -1524,103 +1385,24 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     if (!write_ready(th)) return false;
     th->last_error = CommitError::kFailed;
     if (dels == nullptr || n == 0 || n > kIcebergMaxManifestEntries || !handle_is_current(th)) return false;
-
-    const int64_t snap_id = mint_snapshot_id(th);
-
-    // Build the two delete columns. The file_path column is Utf8; bolt's
-    // StringView carries an inline prefix plus a spill buffer, so the paths
-    // are copied into arena storage that outlives this frame.
-    uint32_t path_lengths[kIcebergMaxManifestEntries]{};
-    uint64_t spill_bytes = 0;
+    // A position delete is only meaningful against a real file, and a negative position names no row -- refuse
+    // rather than emit a delete file a reader will silently ignore.
+    Arena* a = th->arena;
+    auto* paths = a->allocate_array<const char*>(n);
+    auto* pos = a->allocate_array<int64_t>(n);
+    if (paths == nullptr || pos == nullptr) return false;
     for (uint32_t i = 0; i < n; ++i) {
         size_t length = 0;
-        if (!stage_text(dels[i].file_path, kIcebergMaxPath, &length) || length == 0 || dels[i].pos < 0 ||
-            length > UINT32_MAX - 1u - spill_bytes) return false;
-        path_lengths[i] = static_cast<uint32_t>(length);
-        spill_bytes += length;
-    }
-    Arena* a = th->arena;
-    auto* pos = a->allocate_array<int64_t>(n);
-    auto* svs = a->allocate_array<StringView>(n);
-    if (pos == nullptr || svs == nullptr) return false;
-    auto* spill = a->allocate_array<uint8_t>(spill_bytes + 1u);
-    if (spill == nullptr) return false;
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        // A position delete is only meaningful against a real file, and a
-        // negative position names no row -- refuse rather than emit a delete
-        // file a reader will silently ignore.
-        if (dels[i].file_path[0] == '\0' || dels[i].pos < 0) return false;
+        if (!stage_text(dels[i].file_path, kIcebergMaxPath, &length) || length == 0 || dels[i].pos < 0) return false;
+        paths[i] = dels[i].file_path;
         pos[i] = dels[i].pos;
-        const uint32_t len = path_lengths[i];
-        std::memcpy(spill + off, dels[i].file_path, len);
-        svs[i] = StringView::from_cstr(dels[i].file_path);
-        if (len > 12u) {                       // spilled: anchor the reference
-            svs[i].ref.buf_idx = 0;
-            svs[i].ref.offset  = off;
-        }
-        off += len;
     }
-
+    const int64_t snap_id = mint_snapshot_id(th);
     BoltBatch b{};
-    BoltBatch::init_empty(&b);
-    b.arena    = a;
-    b.num_rows = static_cast<int64_t>(n);
-    b.num_cols = 2;
-    if (!BoltBatch::alloc_columns(&b, a, 2)) return false;
-    b.schema.add_field("file_path", BoltType::Utf8,  false);
-    b.schema.add_field("pos",       BoltType::Int64, false);
-    BoltColumn* cols = b.columns[b.read_epoch];
-    cols[0].type = BoltType::Utf8;
-    cols[0].length = static_cast<int64_t>(n);
-    cols[0].data = svs;
-    cols[0].str_overflow_base = spill;
-    cols[1].type = BoltType::Int64;
-    cols[1].length = static_cast<int64_t>(n);
-    cols[1].data = pos;
-
+    if (!pos_delete_batch(a, paths, pos, n, &b)) return false;
     char rel[128];
-    const int rn = std::snprintf(rel, sizeof(rel),
-                                 "data/%lld-%016llx-deletes.parquet",
-                                 static_cast<long long>(snap_id),
-                                 static_cast<unsigned long long>(unique_u64()));
-    if (rn <= 0 || static_cast<uint32_t>(rn) >= sizeof(rel)) return false;
-    Schema dsch{};
-    if (!position_delete_schema(a, &dsch)) return false;
-    ingest::parquet::ParquetWriteOpts po{};
-    std::vector<ingest::parquet::ParquetWriteColumn> wide;
-    if (!make_pq_opts(&dsch, nullptr, &po, &wide)) return false;
-    // G2ICE-117 — stamp the spec-RESERVED field ids into the physical
-    // parquet footer. make_pq_opts now stamps all Iceberg source IDs; retain
-    // the explicit reserved-ID assignments here. Column order is fixed by
-    // `position_delete_schema()` immediately above: [0]=file_path,
-    // [1]=pos.
-    assert(po.n_columns == 2u && "position_delete_schema shape changed");
-    po.columns[0].has_field_id = true;
-    po.columns[0].field_id     = dsch.fields[0].id;   // 2147483546 file_path
-    po.columns[1].has_field_id = true;
-    po.columns[1].field_id     = dsch.fields[1].id;   // 2147483545 pos
-    auto* w = data_file_begin(th, rel, snap_id, &po);
-    if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
-    if (!ingest::parquet::parquet_write_row_group(w, &b)) {
-        data_file_abandon(th, w);
-        th->last_error = CommitError::kFailed;
-        return false;
-    }
-    int64_t size = 0;
-    if (!data_file_finish(th, rel, w, &size)) return false;
-
     DataFileRef df{};
-    df.status            = ManifestStatus::kAdded;
-    df.content           = FileContent::kPositionDeletes;
-    df.partition_spec_id = th->meta.current_spec_id;
-    df.snapshot_id       = snap_id;
-    if (!abs_location(th->root, rel, df.file_path, sizeof(df.file_path))) {
-        data_file_complete(th, rel, false);
-        return false;
-    }
-    df.stats.record_count       = static_cast<int64_t>(n);
-    df.stats.file_size_in_bytes = size;
+    if (!write_pos_delete_batch(th, snap_id, &b, rel, &df)) return false;
     const bool committed = publish_snapshot(th, &df, 1, SnapshotOp::kDelete, snap_id);
     data_file_complete(th, rel, committed);
     return committed;
@@ -1767,41 +1549,6 @@ bool table_update_sort_order(TableHandle* th, const SortOrder* sort) noexcept {
     th->meta.n_sort_orders++;
     th->dirty_meta |= kDirtySort;
     return persist_metadata(th);
-}
-
-// ---------------------------------------------------------------------------
-// Overwrite / delete / rewrite / compact — minimal correct snapshot bumps.
-// ---------------------------------------------------------------------------
-
-// Overwrite / delete / rewrite / compact are spec operations (snapshot operations overwrite, delete, replace) that this writer has not
-// built yet. They used to publish a snapshot LABELLED overwrite/delete/replace that removed nothing, which an Iceberg reader would trust:
-// table_overwrite appended while old rows stayed, table_delete deleted nothing. They now refuse loudly and write nothing until the real
-// implementations land (G2ICE-280: file-level deletes from manifest stats, row-level deletes via position/equality/DV, rewrite_data_files).
-static bool unimplemented_operation(TableHandle* th, const char* what) noexcept {
-    assert(th != nullptr && what != nullptr);
-    th->last_error = CommitError::kUnimplemented;
-    std::fprintf(stderr, "[iceberg_writer] %s is not implemented yet (G2ICE-280); nothing was written\n", what);
-    return false;
-}
-
-bool table_overwrite(TableHandle* th, const Predicate* /*pred*/, const BoltBatch* batch) noexcept {
-    assert(th != nullptr && batch != nullptr);
-    return unimplemented_operation(th, "table_overwrite");
-}
-
-bool table_delete(TableHandle* th, const Predicate* /*pred*/) noexcept {
-    assert(th != nullptr);
-    return unimplemented_operation(th, "table_delete");
-}
-
-bool table_rewrite(TableHandle* th, const OptimizeOptions* /*opts*/) noexcept {
-    assert(th != nullptr);
-    return unimplemented_operation(th, "table_rewrite");
-}
-
-bool table_compact(TableHandle* th, int64_t /*target_file_size_bytes*/) noexcept {
-    assert(th != nullptr);
-    return unimplemented_operation(th, "table_compact");
 }
 
 #include "iceberg_expire.inc"

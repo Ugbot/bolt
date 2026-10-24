@@ -94,7 +94,10 @@ struct ReadOptions {
     bool      include_deletes;
     bool      include_partition_columns;
     SnapshotSelection snapshot_selection;
-    uint8_t   _pad[5];
+    // Iceberg only: append the `_pos` metadata column (Int64, the row's 0-based
+    // position in its data file, counted before deletes) after the table columns.
+    bool      emit_row_position;
+    uint8_t   _pad[4];
 };
 
 inline void read_options_init(ReadOptions* o) noexcept {

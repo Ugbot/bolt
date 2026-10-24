@@ -485,6 +485,7 @@ struct ScanHandle {
     // Identity of the row group behind the most recent iceberg_scan_next_batch result.
     IcebergScanGroup last_group;
     IcebergGroupProvider provider;  // optional cache-hit supplier (G2ICE-262)
+    IcebergFileFilter    filter;    // optional planning restriction (G2ICE-280)
 };
 
 namespace {
@@ -593,14 +594,14 @@ bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
         return false;
     if (table_key_prefix != nullptr) {
         const size_t n = std::strlen(table_key_prefix);
-        if (n == 0u || n + 1u > sizeof(h->table_rel)) return false;
+        if (n + 1u > sizeof(h->table_rel)) return false;   // "" = the store is rooted at the table
         std::memcpy(h->table_rel, table_key_prefix, n + 1u);
     } else if (!key_prefix_from_location(h->meta.location, h->table_rel,
                                          sizeof(h->table_rel))) {
         return false;
     }
     h->meta_loaded = true;
-    assert(h->table_rel[0] != '\0' && h->fs_root[0] == '\0');
+    assert(h->fs_root[0] == '\0');
     *out = h;
     return true;
 }
@@ -838,6 +839,18 @@ bool sort_position_deletes(PositionDeleteSet* s, Arena* a, Budget* b) noexcept {
     return true;
 }
 
+// The `_pos` metadata column for one decoded group: base, base+1, ... (file positions, before deletes).
+bool fill_row_positions(Arena* a, uint64_t base, int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && out != nullptr);
+    assert(rows >= 0);
+    auto* d = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+    if (d == nullptr) return false;
+    for (int64_t r = 0; r < rows; ++r) d[r] = static_cast<int64_t>(base) + r;   // bounded by rows
+    *out = BoltColumn::make_flat(d, nullptr, rows, BoltType::Int64);
+    out->stats.all_valid = true;
+    return true;
+}
+
 // Keep only rows `sel[0..kept)` of every column, in place. Fails (never under-deletes) on a column shape it cannot compact.
 bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, uint32_t kept, int64_t* rows,
                       Arena* scratch, const char* what) noexcept {
@@ -1047,6 +1060,7 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
         return true;
     if (!stats_pass(e, v->sch, s->opts.predicates, s->opts.n_predicates))
         return true;
+    if (s->filter.keep != nullptr && !s->filter.keep(s->filter.ctx, e)) return true;
     if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e))) { v->failed = true; return false; }
     return true;
 }
@@ -1253,16 +1267,18 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             ++s->cur_file_idx;
             continue;
         }
+        // G2ICE-280: `_pos` rides as one extra trailing column through every delete filter below.
+        const uint32_t extra = s->opts.emit_row_position ? 1u : 0u;
         // G2FEAT-47: right-size columns[2] to this file's width before deref.
-        if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns))
+        if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns + extra))
             return false;
         BoltColumn* cols = out->columns[out->read_epoch];
         // With a schema map the file's own columns are decoded into `dec`, then conformed into `cols` (the table's current schema).
         BoltColumn* dec = cols;
         if (s->use_map) {
-            dec = s->scratch->allocate_array<BoltColumn>(s->decode_columns);
+            dec = s->scratch->allocate_array<BoltColumn>(s->decode_columns + extra);
             if (dec == nullptr) return false;
-            std::memset(dec, 0, sizeof(BoltColumn) * s->decode_columns);
+            std::memset(dec, 0, sizeof(BoltColumn) * (s->decode_columns + extra));
         }
         const uint32_t dec_columns = s->use_map ? s->decode_columns : s->output_columns;
         int64_t rows = 0;
@@ -1271,7 +1287,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // G2ICE-262: a caller may supply the group already decoded and already past positional deletes.
         int64_t decoded_rows = 0;
         bool supplied = false;
-        if (s->provider.provide != nullptr) {
+        if (s->provider.provide != nullptr && extra == 0u) {
             int64_t emitted = 0;
             supplied = s->provider.provide(s->provider.ctx, live_file.path, group_index, s->scratch, cols,
                                            s->output_columns, &decoded_rows, &emitted);
@@ -1290,6 +1306,10 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
                 return false;
             }
             decoded_rows = rows;
+            if (extra != 0u && !fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])) {
+                s->failed = true;
+                return false;
+            }
         }
         const uint64_t group_base = s->cur_file_row_base;
         ++s->cur_row_group;
@@ -1297,12 +1317,13 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         // advance by the pre-filter row count -- `decoded_rows` was captured before the filter can shrink `rows`.
         if (!supplied && !apply_position_deletes_to_group(&s->pos_dels, dv_for(s, live_file.path, live_file.seq), live_file.seq, live_file.path,
                                                           s->cur_file_row_base, dec,
-                                                          dec_columns, &rows,
+                                                          dec_columns + extra, &rows,
                                                           s->scratch)) {
             return false;
         }
         if (!supplied && s->use_map && !conform_group(s, dec, cols, rows)) { s->failed = true; return false; }
-        if (!supplied && !apply_equality_deletes(s, cols, s->output_columns, &rows)) { s->failed = true; return false; }
+        if (extra != 0u && s->use_map) cols[s->output_columns] = dec[dec_columns];
+        if (!supplied && !apply_equality_deletes(s, cols, s->output_columns + extra, &rows)) { s->failed = true; return false; }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         s->last_group.file_path = live_file.path;
         s->last_group.row_group = group_index;
@@ -1310,13 +1331,14 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         s->last_group.decoded_rows = static_cast<uint64_t>(decoded_rows);
         s->last_group.emitted_rows = static_cast<uint64_t>(rows);
         out->num_rows = rows;
-        out->num_cols = s->output_columns;
+        out->num_cols = s->output_columns + extra;
         for (uint32_t c = 0; c < s->output_columns; ++c) {
             const char* name = s->table->strict_pinned ? s->selected_schema->fields[c].name :
                 s->use_map ? s->map_schema->fields[c].name : s->cur_meta->columns[c].name;
             if (!s->table->strict_pinned && !s->use_map && s->cur_meta->columns[c].name_truncated != 0u) return false;
             if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
+        if (extra != 0u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
     }
@@ -1324,6 +1346,14 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
     // the guard cannot expire. Fail closed if the invariant ever breaks.
     assert(false && "iceberg scan advance did not make progress");
     return false;
+}
+
+void iceberg_scan_set_file_filter(ScanHandle* s, const IcebergFileFilter* filter) noexcept {
+    assert(s != nullptr);
+    assert(s == nullptr || !s->cur_file_open);
+    if (s == nullptr) return;
+    if (filter == nullptr) { s->filter = IcebergFileFilter{}; return; }
+    s->filter = *filter;
 }
 
 void iceberg_scan_set_group_provider(ScanHandle* s, const IcebergGroupProvider* provider) noexcept {

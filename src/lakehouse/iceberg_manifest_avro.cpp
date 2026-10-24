@@ -210,7 +210,7 @@ struct DfCtx {
     bool         have_pending;
 
     int32_t f_status, f_snap, f_content, f_path, f_records, f_size;
-    int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq;
+    int32_t f_dv_offset, f_dv_size, f_dv_ref, f_entry_seq, f_file_seq;
     // Partition struct leaves, in declared order.
     int32_t part_idx[kMaxPartCols];
     uint32_t n_part;
@@ -243,6 +243,7 @@ ColumnStatEntry* stat_slot(FileStats* st, int32_t field_id) noexcept {
     ColumnStatEntry* c = &st->cols[st->n_cols++];
     std::memset(c, 0, sizeof(*c));
     c->field_id = field_id;
+    c->null_count = -1;   // unknown until the null_value_counts map names this column
     return c;
 }
 
@@ -271,7 +272,7 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
     if (col == nullptr) return true;
     const ing::AvroValue* v = &vals[1];
     if (rep == kRepNullCounts) {
-        col->null_count = i64_or(v, 0);
+        col->null_count = i64_or(v, -1);
     } else if (rep == kRepLower) {
         // A cut bound is not a bound: drop it rather than prune on it.
         col->lower_len = static_cast<uint8_t>(
@@ -312,6 +313,10 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
     if (const ing::AvroValue* sq = at(s->f_entry_seq); sq != nullptr && !sq->is_null) {
         e->sequence_number = i64_or(sq, 0);
         e->has_sequence_number = true;
+    }
+    if (const ing::AvroValue* fs = at(s->f_file_seq); fs != nullptr && !fs->is_null) {
+        e->file_sequence_number = i64_or(fs, 0);
+        e->has_file_sequence_number = true;
     }
     if (const ing::AvroValue* off = at(s->f_dv_offset); off != nullptr && !off->is_null) {
         e->content_offset = i64_or(off, 0);
@@ -476,6 +481,7 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->f_records = find_field(h, "data_file.record_count");
     s->f_size    = find_field(h, "data_file.file_size_in_bytes");
     s->f_entry_seq = find_field(h, "sequence_number");
+    s->f_file_seq  = find_field(h, "file_sequence_number");
     s->f_dv_offset = find_field(h, "data_file.content_offset");
     s->f_dv_size   = find_field(h, "data_file.content_size_in_bytes");
     s->f_dv_ref    = find_field(h, "data_file.referenced_data_file");

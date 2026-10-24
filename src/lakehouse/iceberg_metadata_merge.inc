@@ -124,6 +124,78 @@ void mb_object_overlay(MergeBuf* b, const JsonMember* base, uint32_t nb, const J
     mb_put(b, "}", 1);
 }
 
+// The raw text of `key`'s value in the object at [obj, end); false when absent or malformed. `scratch` holds
+// kMergeMaxMembers members.
+bool object_value(const char* obj, const char* end, const char* key, JsonMember* scratch,
+                  const char** v, uint32_t* n) noexcept {
+    assert(obj != nullptr && key != nullptr);
+    assert(scratch != nullptr && v != nullptr && n != nullptr);
+    uint32_t nm = 0;
+    if (!json_object_members(obj, end, scratch, &nm)) return false;
+    for (uint32_t i = 0; i < nm; ++i)                       // bounded by nm
+        if (member_is(scratch[i], key)) { *v = scratch[i].val; *n = scratch[i].val_len; return true; }
+    return false;
+}
+
+// Next element of a JSON array: *p at the element (after '[' or ','); on success [*elem, *elem_end) is it and *p
+// moves past it and its separator. False at ']' or on malformed input.
+bool array_next(const char** p, const char* end, const char** elem, const char** elem_end) noexcept {
+    assert(p != nullptr && elem != nullptr && elem_end != nullptr);
+    const char* q = skip_ws(*p, end);
+    if (q >= end || *q == ']') return false;
+    const char* e = json_value_end(q, end);
+    if (e == nullptr) return false;
+    *elem = q;
+    *elem_end = e;
+    q = skip_ws(e, end);
+    if (q < end && *q == ',') ++q;
+    *p = q;
+    return true;
+}
+
+// The snapshot object of `prior_arr` whose snapshot-id text equals `id`/`id_len`, or nullptr.
+const char* prior_snapshot(const char* arr, const char* end, const char* id, uint32_t id_len, JsonMember* scratch,
+                           const char** out_end) noexcept {
+    assert(arr != nullptr && id != nullptr);
+    if (arr >= end || *arr != '[') return nullptr;
+    const char* p = arr + 1;
+    const char* e = nullptr;
+    const char* ee = nullptr;
+    while (array_next(&p, end, &e, &ee)) {                  // bounded by the document
+        const char* v = nullptr; uint32_t n = 0;
+        if (object_value(e, ee, "snapshot-id", scratch, &v, &n) && n == id_len && std::memcmp(v, id, n) == 0) {
+            *out_end = ee;
+            return e;
+        }
+    }
+    return nullptr;
+}
+
+// gen's snapshot list, but the prior document's own object for every snapshot both hold: snapshots are immutable,
+// and the prior object carries what this writer does not model (another writer's summary, for one).
+void mb_snapshots(MergeBuf* b, const JsonMember& prior, const JsonMember& gen, JsonMember* scratch) noexcept {
+    assert(b != nullptr && scratch != nullptr);
+    const char* pend = prior.val + prior.val_len;
+    const char* gend = gen.val + gen.val_len;
+    mb_put(b, "[", 1);
+    if (gen.val_len == 0 || gen.val[0] != '[') { b->ok = false; return; }
+    const char* p = gen.val + 1;
+    const char* e = nullptr;
+    const char* ee = nullptr;
+    bool first = true;
+    while (array_next(&p, gend, &e, &ee)) {                 // bounded by the document
+        const char* id = nullptr; uint32_t id_len = 0;
+        const char* pe = nullptr;
+        const char* po = object_value(e, ee, "snapshot-id", scratch, &id, &id_len)
+                             ? prior_snapshot(prior.val, pend, id, id_len, scratch, &pe) : nullptr;
+        if (!first) mb_put(b, ",", 1);
+        first = false;
+        if (po != nullptr) mb_put(b, po, static_cast<uint64_t>(pe - po));
+        else               mb_put(b, e, static_cast<uint64_t>(ee - e));
+    }
+    mb_put(b, "]", 1);
+}
+
 // What a commit through this handle changed, beyond its snapshot (set by the mutating table_* calls).
 constexpr uint32_t kDirtySchema = 1u, kDirtySpec = 2u, kDirtySort = 4u, kDirtyRefs = 8u, kDirtyProps = 16u;
 
@@ -164,6 +236,13 @@ bool metadata_merge(const uint8_t* prior, uint64_t prior_len, const uint8_t* gen
     for (uint32_t i = 0; i < np; ++i) {                     // bounded by the member cap
         const JsonMember& r = pmem[i];
         const JsonMember* g = find_member(gmem, ng, r);
+        if (g != nullptr && member_is(r, "snapshots")) {
+            if (!first) mb_put(&b, ",", 1);
+            first = false;
+            mb_put(&b, "\"snapshots\":", 12);
+            mb_snapshots(&b, r, *g, sub_p);
+            continue;
+        }
         if (g != nullptr && commit_owned_key(r, dirty)) { mb_member(&b, &first, r.key, r.key_len, g->val, g->val_len); continue; }
         if (g != nullptr && (member_is(r, "refs") || member_is(r, "properties"))) {
             uint32_t a1 = 0, a2 = 0;

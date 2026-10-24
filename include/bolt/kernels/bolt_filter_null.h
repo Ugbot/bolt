@@ -47,6 +47,9 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+
+#include "bolt/bolt_types.h"
 
 namespace bolt {
 namespace kernels {
@@ -201,6 +204,50 @@ inline std::size_t cmp_is_not_null(
         const bool valid = bitmap_get(nulls, row);
         out_sel[k] = static_cast<uint32_t>(row);
         k += static_cast<std::size_t>(valid);
+    }
+    return k;
+}
+
+// ----------------------------------------------------------------------------
+// UTF-8 / binary column vs a byte-string literal, byte-lexicographic order
+// (Iceberg and SQL string ordering: unsigned bytes, a proper prefix sorts
+// first). `lhs` is a Flat StringView column; a view longer than 12 bytes
+// points at `overflow + ref.offset` (BoltColumn::str_overflow_base). NULL rows
+// never match, as in cmp_scalar.
+// ----------------------------------------------------------------------------
+
+BOLT_FORCE_INLINE int bytes_cmp(const uint8_t* a, uint32_t na,
+                                const uint8_t* b, uint32_t nb) noexcept {
+    const uint32_t n = na < nb ? na : nb;
+    const int c = n == 0u ? 0 : std::memcmp(a, b, n);
+    if (c != 0) return c < 0 ? -1 : 1;
+    return na < nb ? -1 : (na > nb ? 1 : 0);
+}
+
+template <CmpOp Op>
+inline std::size_t cmp_scalar_utf8(
+        uint32_t* BOLT_RESTRICT         out_sel,
+        std::size_t                     in_len,
+        const StringView* BOLT_RESTRICT lhs,
+        const uint8_t*                  overflow,
+        const uint8_t*                  rhs,
+        uint32_t                        rhs_len,
+        const uint64_t* BOLT_RESTRICT   nulls) noexcept {
+    assert(out_sel != nullptr || in_len == 0);
+    assert(lhs != nullptr || in_len == 0);
+    assert(rhs != nullptr || rhs_len == 0);
+    std::size_t k = 0;
+    for (std::size_t row = 0; row < in_len; ++row) {
+        const StringView& v = lhs[row];
+        const bool valid = (nulls == nullptr) ? true : bitmap_get(nulls, row);
+        const uint8_t* bytes = v.length <= 12u
+            ? reinterpret_cast<const uint8_t*>(v.prefix)
+            : (overflow != nullptr ? overflow + v.ref.offset : nullptr);
+        const bool readable = valid && (bytes != nullptr || v.length == 0u);
+        const int c = readable ? bytes_cmp(bytes, v.length, rhs, rhs_len) : 0;
+        const bool match = cmp_one<Op, int>(c, 0);
+        out_sel[k] = static_cast<uint32_t>(row);
+        k += static_cast<std::size_t>(match & readable);
     }
     return k;
 }

@@ -205,7 +205,10 @@ struct DataFileRef {
     // The entry's own data sequence number (v2+): explicit on EXISTING entries, null (inherited from the manifest list) on ADDED ones.
     int64_t        sequence_number;
     bool           has_sequence_number;
-    uint8_t        _pad5[7];
+    // The entry's file sequence number (field 4): explicit on EXISTING/DELETED entries, inherited when null (G2ICE-280).
+    bool           has_file_sequence_number;
+    uint8_t        _pad5[6];
+    int64_t        file_sequence_number;
 };
 // Pinned: the provenance flags came out of the 4 bytes of padding that used to
 // follow `n_partition`, so nothing after them moved and the struct is the same

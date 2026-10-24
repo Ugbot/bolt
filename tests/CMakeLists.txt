@@ -2307,6 +2307,27 @@ bolt_apply_hardening(test_bolt_iceberg_position_delete_read)
 add_test(NAME test_bolt_iceberg_position_delete_read
          COMMAND test_bolt_iceberg_position_delete_read)
 
+# G2ICE-280 — table_delete(pred) / table_overwrite / table_compact: values, manifest state and summary counters
+# in-process; the external verdict (pyiceberg StaticTable + DuckDB iceberg_scan, against a model the script computes
+# itself, with negative controls) is scripts/iceberg_dml_interop.py, which runs this executable's fixture writer.
+add_executable(test_bolt_iceberg_dml test_bolt_iceberg_dml.cpp)
+target_link_libraries(test_bolt_iceberg_dml
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_dml)
+add_test(NAME test_bolt_iceberg_dml COMMAND test_bolt_iceberg_dml)
+set_tests_properties(test_bolt_iceberg_dml PROPERTIES TIMEOUT 120)
+find_program(BOLT_UV uv)
+if(BOLT_UV)
+    set(BOLT_DML_ORACLE_CMD ${BOLT_UV} run --no-project --python 3.12 --with pyiceberg[pyiceberg-core]
+        --with pyarrow --with duckdb==1.4.* python)
+else()
+    set(BOLT_DML_ORACLE_CMD python3)
+endif()
+add_test(NAME test_bolt_iceberg_dml_oracle
+         COMMAND ${BOLT_DML_ORACLE_CMD} ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_dml_interop.py
+                 $<TARGET_FILE:test_bolt_iceberg_dml> ${CMAKE_CURRENT_BINARY_DIR}/iceberg_dml_fixture)
+set_tests_properties(test_bolt_iceberg_dml_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 # Oracle tool (not a test): scan a filesystem-catalog Iceberg table with bolt's reader; see scripts/oracles/verify_v3_external.py.
 add_executable(bolt_iceberg_scan_dump bolt_iceberg_scan_dump.cpp)
 target_link_libraries(bolt_iceberg_scan_dump PRIVATE bolt::lakehouse bolt::ingest bolt::parse)

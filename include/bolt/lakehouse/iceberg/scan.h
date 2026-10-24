@@ -41,7 +41,8 @@ bool iceberg_table_open_store(TableHandle** out, Arena* arena,
 // through `store` (S3, GCS, Azure, filesystem). `store->impl` is borrowed and
 // must outlive the handle. `table_key_prefix` is the store key of the table's
 // `location`; nullptr derives it by dropping the location's scheme and
-// authority ("s3://bucket/wh/ns/t" -> "wh/ns/t").
+// authority ("s3://bucket/wh/ns/t" -> "wh/ns/t"). An empty prefix means the
+// store is rooted at the table location itself (keys "metadata/...", "data/...").
 bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
                                  const ObjectStore* store,
                                  const char* table_key_prefix,
@@ -139,6 +140,15 @@ struct IcebergGroupProvider {
     void* ctx;
 };
 void iceberg_scan_set_group_provider(ScanHandle* h, const IcebergGroupProvider* provider) noexcept;
+
+// Restrict planning to the live data files `keep` accepts (called once per live data entry, after pruning). Delete files
+// are unaffected. Set before the first iceberg_scan_next_batch / iceberg_scan_next_file. Copied; nullptr clears.
+struct DataFileRef;
+struct IcebergFileFilter {
+    bool (*keep)(void* ctx, const DataFileRef* entry) noexcept;
+    void* ctx;
+};
+void iceberg_scan_set_file_filter(ScanHandle* h, const IcebergFileFilter* filter) noexcept;
 
 void iceberg_scan_close(ScanHandle* h) noexcept;
 
