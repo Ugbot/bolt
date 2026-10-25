@@ -1,4 +1,4 @@
-// bolt/lakehouse/iceberg_eq_key.h — the canonical bytes of an equality-delete key (internal). The scan applies an equality
+// bolt/lakehouse/iceberg/eq_key.h — the canonical bytes of an equality-delete key. The scan applies an equality
 // delete by these bytes and the writer (G2ICE-283) checks what a delete it writes would remove by the same bytes, so the
 // two cannot disagree on what "equal" means.
 #pragma once

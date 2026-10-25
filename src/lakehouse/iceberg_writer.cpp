@@ -29,7 +29,7 @@
 #include "bolt/lakehouse/iceberg/metrics.h"
 #include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
-#include "iceberg_eq_key.h"
+#include "bolt/lakehouse/iceberg/eq_key.h"
 
 #include <atomic>
 #include <cassert>
