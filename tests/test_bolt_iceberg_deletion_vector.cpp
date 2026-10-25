@@ -299,5 +299,64 @@ TEST(IcebergSchemaBinding, RequiredColumnWithNoDataRefusesAndOptionalReadsNull) 
     with_extra(true);
     std::vector<int64_t> none;
     EXPECT_NE(scan(&none), 0) << "a required column with no data must refuse, not read as null";
+
+    // G2ICE-326: columns added with an initial-default of the remaining types read it (a file written before them lacks them).
+    {
+        std::string patched = original;
+        const size_t at = patched.find("\"fields\":[");
+        ASSERT_NE(at, std::string::npos);
+        patched.insert(at + 10, std::string(
+            "{\"id\":11,\"name\":\"tt\",\"required\":false,\"type\":\"time\",\"initial-default\":\"12:34:56.789012\"},"
+            "{\"id\":12,\"name\":\"ts\",\"required\":false,\"type\":\"timestamp\",\"initial-default\":\"2024-01-02T03:04:05.000006\"},"
+            "{\"id\":13,\"name\":\"d9\",\"required\":false,\"type\":\"decimal(9,2)\",\"initial-default\":\"-12.34\"},"
+            "{\"id\":14,\"name\":\"d30\",\"required\":false,\"type\":\"decimal(30,2)\",\"initial-default\":\"-12345678901234567890.12\"},"
+            "{\"id\":15,\"name\":\"uu\",\"required\":false,\"type\":\"uuid\",\"initial-default\":\"f79c3e09-677c-4bbd-a479-3f349cb785e7\"},"
+            "{\"id\":16,\"name\":\"ff\",\"required\":false,\"type\":\"fixed[3]\",\"initial-default\":\"0a0b0c\"},"
+            "{\"id\":17,\"name\":\"bb\",\"required\":false,\"type\":\"binary\",\"initial-default\":\"deadbeef\"},"
+            "{\"id\":18,\"name\":\"ss\",\"required\":false,\"type\":\"string\",\"initial-default\":\"a\\\"b\\u00e9\\ud83d\\ude00\"},"));
+        spit(meta_path, patched);
+        FilesystemCatalog cat_fs{}; Catalog cat{};
+        ASSERT_TRUE(filesystem_catalog_init(&cat_fs, base.generic_string().c_str(), &cat));
+        bolt::Arena ra;
+        TableHandle* rh = nullptr;
+        ASSERT_TRUE(iceberg_table_open(&rh, &ra, &cat, "default", "t"));
+        ReadOptions ro{}; read_options_init(&ro);
+        ScanHandle* sh = nullptr;
+        ASSERT_TRUE(iceberg_scan_open(&sh, rh, &ro));
+        bolt::BoltBatch bb{}; bool eof = false;
+        ASSERT_TRUE(iceberg_scan_next_batch(sh, &bb, &eof));
+        ASSERT_FALSE(eof);
+        ASSERT_EQ(bb.num_rows, 3);
+        const auto col = [&](const char* n) -> const bolt::BoltColumn& {
+            for (int32_t c = 0; c < bb.num_cols; ++c) if (std::strcmp(bb.schema.fields[c].name, n) == 0) return bb.columns[bb.read_epoch][c];
+            ADD_FAILURE() << n;
+            return bb.columns[bb.read_epoch][0];
+        };
+        for (int64_t r = 0; r < 3; ++r) {
+            EXPECT_EQ(col("tt").type, bolt::BoltType::Duration);
+            EXPECT_EQ(static_cast<const int64_t*>(col("tt").data)[r], int64_t{45296789012});
+            EXPECT_EQ(static_cast<const int64_t*>(col("ts").data)[r], int64_t{1704164645000006});
+            EXPECT_EQ(col("d9").type, bolt::BoltType::Decimal64);
+            EXPECT_EQ(col("d9").decimal_scale, 2u);
+            EXPECT_EQ(static_cast<const int64_t*>(col("d9").data)[r], int64_t{-1234});
+            EXPECT_EQ(col("d30").type, bolt::BoltType::Decimal128);
+            int64_t lo = 0, hi = 0;
+            std::memcpy(&lo, static_cast<const uint8_t*>(col("d30").data) + r * 16, 8);
+            std::memcpy(&hi, static_cast<const uint8_t*>(col("d30").data) + r * 16 + 8, 8);
+            EXPECT_EQ(hi, -67);                                          // -1234567890123456789012 as a two's-complement int128
+            EXPECT_EQ(static_cast<uint64_t>(lo), uint64_t{0x12edc4f427dfc5ecu});
+            const uint8_t uuid[16] = {0xf7, 0x9c, 0x3e, 0x09, 0x67, 0x7c, 0x4b, 0xbd, 0xa4, 0x79, 0x3f, 0x34, 0x9c, 0xb7, 0x85, 0xe7};
+            EXPECT_EQ(std::memcmp(static_cast<const uint8_t*>(col("uu").data) + r * 16, uuid, 16), 0);
+            EXPECT_EQ(col("ff").fixed_width, 3u);
+            EXPECT_EQ(std::memcmp(static_cast<const uint8_t*>(col("ff").data) + r * 16, "\x0a\x0b\x0c", 3), 0);
+            const auto* bv = static_cast<const bolt::StringView*>(col("bb").data) + r;
+            EXPECT_EQ(bv->length, 4u);
+            EXPECT_EQ(std::memcmp(bv->prefix, "\xde\xad\xbe\xef", 4), 0);
+            const auto* sv = static_cast<const bolt::StringView*>(col("ss").data) + r;
+            EXPECT_EQ(sv->length, 9u);                                   // a " b, é (2 bytes), the emoji (4)
+            EXPECT_EQ(std::memcmp(sv->prefix, "a\"b\xc3", 4), 0);
+        }
+        iceberg_scan_close(sh); iceberg_table_close(rh);
+    }
     spit(meta_path, original);
 }

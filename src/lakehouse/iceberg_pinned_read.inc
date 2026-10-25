@@ -305,6 +305,137 @@ bool date_days(const char* t, int32_t* out) noexcept {
     return true;
 }
 
+// G2ICE-326: the lane a column absent from a data file is filled in, for types `want_bolt_type` passes through (the type the
+// parquet decoder gives a present column of it); `fixed` is fixed[L]'s L, `scale` a decimal's.
+BoltType fill_bolt_type(const char* t, uint32_t* fixed, uint32_t* scale) noexcept {
+    assert(t != nullptr && fixed != nullptr && scale != nullptr);
+    *fixed = 0u;
+    *scale = 0u;
+    unsigned p = 0, sc = 0, len = 0;
+    if (std::strcmp(t, "time") == 0) return BoltType::Duration;
+    if (std::strcmp(t, "timestamp") == 0 || std::strcmp(t, "timestamptz") == 0) return BoltType::Timestamp;
+    if (std::strcmp(t, "uuid") == 0) return BoltType::UUID;
+    if (std::strcmp(t, "binary") == 0) return BoltType::Utf8;            // a BYTE_ARRAY decodes as a Utf8 lane of byte strings
+    if (std::sscanf(t, "decimal(%u,%u)", &p, &sc) == 2 && sc <= p && p <= 38u) {
+        *scale = sc;
+        return p <= 18u ? BoltType::Decimal64 : BoltType::Decimal128;
+    }
+    if (std::sscanf(t, "fixed[%u]", &len) == 1 && len > 0u) {
+        *fixed = len;
+        return len <= 16u ? BoltType::FixedSizeBinary : BoltType::Utf8;
+    }
+    return BoltType::NA;
+}
+
+// A JSON string body unescaped (\uXXXX with surrogate pairs to UTF-8) into `out` (cap bytes); its length, or -1 when malformed.
+int32_t json_unescape_into(const char* in, char* out, uint32_t cap) noexcept {
+    uint32_t n = 0;
+    const auto put = [&](uint32_t b) { if (n + 1u >= cap) return false; out[n++] = static_cast<char>(b); return true; };
+    const auto hex4 = [](const char* h, uint32_t* v) {
+        char tmp[5] = {h[0], h[1], h[2], h[3], '\0'};
+        char* e = nullptr;
+        if (std::strlen(tmp) != 4u) return false;
+        *v = static_cast<uint32_t>(std::strtoul(tmp, &e, 16));
+        return *e == '\0';
+    };
+    for (const char* q = in; *q != '\0'; ++q) {                               // bounded: the text
+        if (*q != '\\') { if (!put(static_cast<unsigned char>(*q))) return -1; continue; }
+        const char c = *++q;
+        uint32_t cp = 0;
+        switch (c) {
+            case '"': case '\\': case '/': cp = static_cast<unsigned char>(c); break;
+            case 'b': cp = '\b'; break;
+            case 'f': cp = '\f'; break;
+            case 'n': cp = '\n'; break;
+            case 'r': cp = '\r'; break;
+            case 't': cp = '\t'; break;
+            case 'u': {
+                if (!hex4(q + 1, &cp)) return -1;
+                q += 4;
+                if (cp >= 0xD800u && cp <= 0xDBFFu) {
+                    uint32_t lo = 0;
+                    if (q[1] != '\\' || q[2] != 'u' || !hex4(q + 3, &lo) || lo < 0xDC00u || lo > 0xDFFFu) return -1;
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                    q += 6;
+                } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+                    return -1;
+                }
+                break;
+            }
+            default: return -1;
+        }
+        bool ok = true;
+        if (cp < 0x80u) ok = put(cp);
+        else if (cp < 0x800u) ok = put(0xC0u | (cp >> 6)) && put(0x80u | (cp & 0x3Fu));
+        else if (cp < 0x10000u) ok = put(0xE0u | (cp >> 12)) && put(0x80u | ((cp >> 6) & 0x3Fu)) && put(0x80u | (cp & 0x3Fu));
+        else ok = put(0xF0u | (cp >> 18)) && put(0x80u | ((cp >> 12) & 0x3Fu)) && put(0x80u | ((cp >> 6) & 0x3Fu)) && put(0x80u | (cp & 0x3Fu));
+        if (!ok) return -1;
+    }
+    out[n] = '\0';
+    return static_cast<int32_t>(n);
+}
+
+// Hex text into bytes; the byte count, or -1.
+int32_t hex_into(const char* t, uint8_t* out, uint32_t cap) noexcept {
+    const auto nib = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    uint32_t n = 0;
+    for (const char* q = t; q[0] != '\0'; q += 2) {                          // bounded: the text
+        if (q[1] == '\0' || n >= cap) return -1;
+        const int h = nib(q[0]), l = nib(q[1]);
+        if (h < 0 || l < 0) return -1;
+        out[n++] = static_cast<uint8_t>((h << 4) | l);
+    }
+    return static_cast<int32_t>(n);
+}
+
+// A decimal's text at `scale` as a two's-complement little-endian int128 in `out` (16 bytes); false past 38 digits or the scale.
+bool decimal_le128(const char* t, uint32_t scale, uint8_t* out) noexcept {
+    const bool neg = t[0] == '-';
+    if (neg || t[0] == '+') ++t;
+    uint64_t lo = 0, hi = 0;
+    uint32_t frac = 0, digits = 0;
+    bool dot = false;
+    for (const char* q = t; ; ++q) {                                         // bounded: the text, then the scale
+        char c = *q;
+        if (c == '.' && !dot) { dot = true; continue; }
+        if (c == '\0') { if (frac >= scale) break; c = '0'; --q; }
+        if (c < '0' || c > '9' || (dot && frac >= scale)) return false;
+        if (dot) ++frac;
+        if (++digits > 39u) return false;
+        const uint64_t a = (lo & 0xFFFFFFFFu) * 10u + static_cast<uint64_t>(c - '0');
+        const uint64_t b = (lo >> 32) * 10u + (a >> 32);
+        lo = (b << 32) | (a & 0xFFFFFFFFu);
+        hi = hi * 10u + (b >> 32);
+    }
+    if ((hi >> 63) != 0u) return false;
+    if (neg) { lo = ~lo + 1u; hi = ~hi + (lo == 0u ? 1u : 0u); }
+    std::memcpy(out, &lo, 8u);
+    std::memcpy(out + 8, &hi, 8u);
+    return true;
+}
+
+// "[YYYY-MM-DDT]HH:MM:SS[.ffffff][+00:00|Z]" as micros (since the epoch, or since midnight when `time_only`).
+bool micros_of(const char* t, bool time_only, int64_t* out) noexcept {
+    int32_t days = 0;
+    const char* tp = t;
+    if (!time_only) {
+        char date[16] = {};
+        const char* tsep = std::strchr(t, 'T');
+        if (tsep == nullptr || tsep - t >= 15) return false;
+        std::memcpy(date, t, static_cast<size_t>(tsep - t));
+        if (!date_days(date, &days)) return false;
+        tp = tsep + 1;
+    }
+    int h = 0, mi = 0, se = 0, used = 0;
+    if (std::sscanf(tp, "%d:%d:%d%n", &h, &mi, &se, &used) != 3 || h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59) return false;
+    const char* q = tp + used;
+    int64_t frac = 0, unit = 1000000;
+    if (*q == '.') for (++q; *q >= '0' && *q <= '9'; ++q) if (unit > 1) { unit /= 10; frac += (*q - '0') * unit; }   // bounded: the text
+    if (*q != '\0' && std::strcmp(q, "+00:00") != 0 && std::strcmp(q, "Z") != 0) return false;
+    *out = ((static_cast<int64_t>(days) * 24 + h) * 60 + mi) * 60 * 1000000 + static_cast<int64_t>(se) * 1000000 + frac;
+    return true;
+}
+
 // Fill the bytes of one value of `want` from a default's text into `cell` (8 bytes); false when the text is not that type.
 bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
     const char* t = f.initial_default;
@@ -335,6 +466,35 @@ bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
             std::memcpy(cell, &d, 4);
             return true;
         }
+        case BoltType::Timestamp: case BoltType::Duration: {               // G2ICE-326: micros (since the epoch / midnight)
+            int64_t us = 0;
+            if (!str || !micros_of(t, want == BoltType::Duration, &us)) return false;
+            std::memcpy(cell, &us, 8);
+            return true;
+        }
+        case BoltType::Decimal64: case BoltType::Decimal128: {
+            uint32_t fixed = 0, scale = 0;
+            uint8_t v[16];
+            if (!str || fill_bolt_type(f.type, &fixed, &scale) != want || !decimal_le128(t, scale, v)) return false;
+            int64_t lo = 0, hi = 0;
+            std::memcpy(&lo, v, 8u);
+            std::memcpy(&hi, v + 8, 8u);
+            if (want == BoltType::Decimal64 && hi != (lo < 0 ? -1 : 0)) return false;   // a decimal(p <= 18) mantissa fits 64 bits
+            std::memcpy(cell, v, want == BoltType::Decimal64 ? 8u : 16u);
+            return true;
+        }
+        case BoltType::UUID: {
+            char hex[33] = {};
+            uint32_t k = 0;
+            for (const char* q = t; *q != '\0' && k < 32u; ++q) if (*q != '-') hex[k++] = *q;   // bounded: 36
+            return str && std::strlen(t) == 36u && hex_into(hex, cell, 16u) == 16;
+        }
+        case BoltType::FixedSizeBinary: {
+            uint32_t fixed = 0, scale = 0;
+            (void)fill_bolt_type(f.type, &fixed, &scale);
+            std::memset(cell, 0, 16u);
+            return str && fixed > 0u && hex_into(t, cell, 16u) == static_cast<int32_t>(fixed);
+        }
         default: return false;
     }
 }
@@ -343,25 +503,32 @@ bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
 bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a, BoltColumn* out) noexcept {
     assert(a != nullptr && out != nullptr);
     const size_t n = static_cast<size_t>(rows) + 1u;
-    if (want == BoltType::Utf8 && f.initial_default_kind == DefaultKind::kString && std::strchr(f.initial_default, '\\') == nullptr) {
-        const uint32_t len = static_cast<uint32_t>(std::strlen(f.initial_default));
+    if (want == BoltType::Utf8 && f.initial_default_kind == DefaultKind::kString) {
+        // A string's text unescaped; binary / fixed[L > 16] defaults are hex (spec Appendix D), read as their bytes.
+        char text[limits::kDefaultTextMax];
+        const bool bytes = std::strcmp(f.type, "string") != 0;
+        const int32_t got = bytes ? hex_into(f.initial_default, reinterpret_cast<uint8_t*>(text), sizeof(text))
+                                  : json_unescape_into(f.initial_default, text, sizeof(text));
+        if (got < 0) return false;
+        const uint32_t len = static_cast<uint32_t>(got);
         auto* sv = a->allocate_array<StringView>(n);
         auto* spill = static_cast<char*>(a->allocate(len + 1u));
         if (sv == nullptr || spill == nullptr) return false;
-        std::memcpy(spill, f.initial_default, len + 1u);
+        std::memcpy(spill, text, len);
+        spill[len] = '\0';
         StringView v;
         std::memset(&v, 0, sizeof(v));
         v.length = len;
-        std::memcpy(v.prefix, f.initial_default, len < 4u ? len : 4u);
-        if (len > 4u && len <= 12u) std::memcpy(v.inline_data, f.initial_default + 4, len - 4u);
+        std::memcpy(v.prefix, text, len < 4u ? len : 4u);
+        if (len > 4u && len <= 12u) std::memcpy(v.inline_data, text + 4, len - 4u);
         for (size_t r = 0; r < n; ++r) sv[r] = v;
         *out = BoltColumn::make_flat(sv, nullptr, rows, BoltType::Utf8);
         out->str_overflow_base = spill;
         return true;
     }
-    uint8_t cell[8] = {};
+    uint8_t cell[16] = {};
     const size_t width = want == BoltType::NA ? 0u : bolt::type_size(want);
-    if (f.initial_default_kind == DefaultKind::kUnsupported || width == 0u || width > 8u || !default_cell(f, want, cell)) {
+    if (f.initial_default_kind == DefaultKind::kUnsupported || width == 0u || width > 16u || !default_cell(f, want, cell)) {
         std::fprintf(stderr, "[iceberg_scan] REFUSED: column '%s' (field id %d) is absent from a data file and its initial-default ('%s', "
                      "type %s) is not one this reader fills (G2ICE-326)\n", f.name, f.id, f.initial_default, f.type);
         return false;
@@ -370,6 +537,11 @@ bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a,
     if (d == nullptr) return false;
     for (size_t r = 0; r < n; ++r) std::memcpy(d + r * width, cell, width);
     *out = BoltColumn::make_flat(d, nullptr, rows, want);
+    uint32_t fixed = 0, scale = 0;
+    if (fill_bolt_type(f.type, &fixed, &scale) == want) {           // G2ICE-326: as the decoder labels a present column
+        out->decimal_scale = static_cast<uint8_t>(scale);
+        if (want == BoltType::FixedSizeBinary) out->fixed_width = static_cast<uint8_t>(fixed);
+    }
     return true;
 }
 
@@ -384,8 +556,10 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
             continue;
         }
         // Absent from this file: the column was added after the file was written. Reads its v3 initial-default, else null.
+        uint32_t fixed = 0, scale = 0;
+        const BoltType absent = s->want_type[j] != BoltType::NA ? s->want_type[j] : fill_bolt_type(s->map_schema->fields[j].type, &fixed, &scale);
         if (s->map_schema->fields[j].initial_default_kind != DefaultKind::kNone) {
-            if (!default_column(s->map_schema->fields[j], s->want_type[j], rows, s->scratch, &out[j])) return false;
+            if (!default_column(s->map_schema->fields[j], absent, rows, s->scratch, &out[j])) return false;
             continue;
         }
         if (s->map_schema->fields[j].required) {
@@ -393,7 +567,7 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
                          name,s->map_schema->fields[j].id);
             return false;
         }
-        const BoltType t=s->want_type[j];
+        const BoltType t=absent;
         if (t==BoltType::NA) {
             std::fprintf(stderr,"[iceberg_scan] REFUSED: column '%s' is absent from a data file and its type cannot be null-filled here\n",name);
             return false;
