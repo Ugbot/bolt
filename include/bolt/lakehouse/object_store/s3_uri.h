@@ -15,6 +15,7 @@ S3UriStatus s3_uri_validate(const char* uri) noexcept;
 // its raw relative object key. Decodes exactly once; never strips another
 // authority or probes a table-relative fallback. A URI equal to root has no
 // object key and is refused. Root paths must end at a component boundary.
+// G2ICE-300: the URI may spell its scheme s3a:// or s3n:// (Hadoop's names for the same namespace); the root may not.
 S3UriStatus s3_uri_object_key(const char* root, const char* uri,
                             char* out, uint32_t capacity) noexcept;
 

@@ -85,9 +85,24 @@ S3UriStatus s3_uri_validate(const char* uri) noexcept {
                                  : Status::BadArg;
 }
 
+// G2ICE-300: Hadoop's s3a:// and s3n:// name the same bucket and key as s3:// (Iceberg-Java's S3FileIO and HadoopFileIO
+// read all three); a recorded path in either is mapped exactly as its s3:// spelling. Only the recorded path takes
+// the alias: a configured root stays canonical.
+static S3UriStatus s3_alias_object_key(const char* root, const char* uri, char* out, uint32_t capacity) noexcept {
+    assert(uri != nullptr);
+    char canon[kOsMaxKey];
+    const size_t n = std::strlen(uri);
+    if (n - 1u >= sizeof(canon)) return Status::Capacity;
+    std::memcpy(canon, "s3", 2);
+    std::memcpy(canon + 2, uri + 3, n - 3u + 1u);                        // "s3a://x" -> "s3://x"
+    return s3_uri_object_key(root, canon, out, capacity);
+}
+
 S3UriStatus s3_uri_object_key(const char* root, const char* uri,
                             char* out, uint32_t capacity) noexcept {
     assert(kOsMaxKey > 5); assert(sizeof(char) == 1);
+    if (uri != nullptr && (std::strncmp(uri, "s3a://", 6) == 0 || std::strncmp(uri, "s3n://", 6) == 0))
+        return s3_alias_object_key(root, uri, out, capacity);
     Span inputs[2]{};
     if (!admit(root, uri, out, capacity, inputs)) return Status::BadArg;
     const auto root_len = static_cast<uint32_t>(inputs[0].size - 1);
