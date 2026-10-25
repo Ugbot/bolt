@@ -380,6 +380,7 @@ TEST_F(IcebergObjectGraph, PositiveOwnedAvroGraphIncludesDataAndBothDeleteClasse
         std::strcpy(files[i].file_path,uri(paths[i]).c_str()); files[i].stats.file_size_in_bytes=static_cast<int64_t>(sizes[i]);
         files[i].stats.record_count=1;
     }
+    files[2].equality_ids[0]=1; files[2].n_equality_ids=1;   // an equality delete names its key (G2ICE-283)
     const uint8_t* bytes=nullptr; uint64_t size=0;
     ASSERT_TRUE(manifest_write_avro(files.data(),1,-1,1,schema,sizeof(schema)-1,0,&writer,&bytes,&size));
     origin.set("outside/data.json",std::string(reinterpret_cast<const char*>(bytes),static_cast<size_t>(size)));
