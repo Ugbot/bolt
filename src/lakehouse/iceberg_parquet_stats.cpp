@@ -12,7 +12,15 @@
 
 #include "bolt/lakehouse/iceberg/statistics.h"
 
+#include "bolt/bolt_arena.h"
+#include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
+#include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/lakehouse/iceberg/manifest.h"
+#include "bolt/lakehouse/iceberg/metadata.h"
+#include "bolt/lakehouse/iceberg/metrics.h"
+#include "bolt/lakehouse/iceberg/partition_values.h"
+#include "bolt/lakehouse/iceberg/transform.h"
 
 #include <cassert>
 #include <cmath>
@@ -43,8 +51,8 @@ BoundKind bound_kind(const pq::PqColumn& c) noexcept {
         case pq::PqType::Int64:
             // Millisecond timestamps are Iceberg micros only after scaling.
             if (plain || (sint && c.int_bits == 64u) ||
-                (lg == pq::PqLogical::Timestamp &&
-                 (c.time_unit == 2 || c.time_unit == 3))) {
+                (lg == pq::PqLogical::Timestamp && (c.time_unit == 2 || c.time_unit == 3)) ||
+                (lg == pq::PqLogical::Time && c.time_unit == 2)) {          // G2ICE-296: Iceberg time is micros
                 return BoundKind::kInt64;
             }
             return BoundKind::kNone;
@@ -217,6 +225,8 @@ bool file_stats_from_parquet_meta(const pq::PqMeta* meta,
     assert(out->n_cols <= kIcebergMaxStatCols);
     return true;
 }
+
+#include "iceberg_parquet_metrics.inc"   // G2ICE-296
 
 }  // namespace iceberg
 }  // namespace lakehouse

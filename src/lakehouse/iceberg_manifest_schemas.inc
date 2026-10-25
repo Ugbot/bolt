@@ -41,7 +41,7 @@ static const char kManifestEntrySchema[] =
     "ffsets\",\"field-id\":132,\"type\":[\"null\",{\"type\":\"array\",\"eleme"
     "nt-id\":133,\"items\":\"long\"}],\"default\":null},{\"name\":\"equality_"
     "ids\",\"field-id\":135,\"type\":[\"null\",{\"type\":\"array\",\"element-"
-    "id\":136,\"items\":\"long\"}],\"default\":null},{\"name\":\"sort_order_i"
+    "id\":136,\"items\":\"int\"}],\"default\":null},{\"name\":\"sort_order_i"
     "d\",\"field-id\":140,\"type\":[\"null\",\"int\"],\"default\":null}],\"na"
     "me\":\"r2\"}}],\"name\":\"manifest_entry\"}";
 
@@ -122,3 +122,7 @@ static const char kManifestFileV1Schema[] =
     "ull},{\"name\":\"upper_bound\",\"field-id\":511,\"type\":[\"null\",\"bytes\"],\"default\":null}],\"name\":\"r5"
     "08\"}}],\"default\":null},{\"name\":\"key_metadata\",\"field-id\":519,\"type\":[\"null\",\"bytes\"],\"default\""
     ":null}],\"name\":\"manifest_file\"}";
+
+// G2ICE-323: format v2 declares referenced_data_file (optional) too; written when an entry names one.
+static const char kManifestEntryRefField[] =
+    ",{\"name\":\"referenced_data_file\",\"field-id\":143,\"type\":[\"null\",\"string\"],\"default\":null}";

@@ -32,20 +32,38 @@ struct ColumnStatEntry {
     // the same size and leaves the JSON path's behaviour unchanged.
     uint8_t  lower_len;
     uint8_t  upper_len;
-    uint8_t  _pad[4];
+    // G2ICE-296 (spec Appendix F): which of the other per-column metrics are present. Carved from the padding, so a
+    // zeroed entry (every older producer) still means "null_count only", as before.
+    bool     has_value_count;
+    bool     has_nan_count;
+    bool     has_column_size;
+    bool     no_null_count;        // true: null_value_counts carries no entry for this field (metrics mode none, unknown)
     char     lower[kLakeMaxValBytes];
     char     upper[kLakeMaxValBytes];
+    int64_t  value_count;          // value_counts (nulls included); valid with has_value_count
+    int64_t  nan_count;            // nan_value_counts (float / double only); valid with has_nan_count
+    int64_t  column_size;          // column_sizes: the column's bytes on disk; valid with has_column_size
 };
-// 4 field_id + 4 alignment + 8 null_count + 4 flags/lengths + 4 pad + bounds.
-static_assert(sizeof(ColumnStatEntry) == 24u + 2u * kLakeMaxValBytes,
-              "ColumnStatEntry layout pinned: lengths came from padding");
+// 4 field_id + 4 alignment + 8 null_count + 8 flags/lengths + bounds + 3 x 8 counts.
+static_assert(sizeof(ColumnStatEntry) == 48u + 2u * kLakeMaxValBytes,
+              "ColumnStatEntry layout pinned: flags came from padding");
+
+// G2ICE-296: split_offsets kept per data file (the row groups' start offsets). A file with more row groups writes none:
+// the field is optional and a reader only loses split planning.
+static constexpr uint32_t kIcebergMaxSplitOffsets = 64u;
 
 struct FileStats {
     int64_t          record_count;
     int64_t          file_size_in_bytes;
     uint32_t         n_cols;
-    uint32_t         _pad;
+    uint32_t         n_split_offsets;   // G2ICE-296: 0 = split_offsets written null
     ColumnStatEntry  cols[kIcebergMaxStatCols];
+    int64_t          split_offsets[kIcebergMaxSplitOffsets];
+    // sort_order_id (field 140): the table sort order the file's rows are in; 0 is the unsorted order (what Iceberg-Java
+    // writes for a file whose rows follow no table order). has_sort_order_id false = null.
+    bool             has_sort_order_id;
+    uint8_t          _pad2[3];
+    int32_t          sort_order_id;
 };
 
 struct DataFileRef;

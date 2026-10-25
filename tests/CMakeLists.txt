@@ -2155,6 +2155,14 @@ target_link_libraries(test_bolt_iceberg_parquet_stats
 bolt_apply_hardening(test_bolt_iceberg_parquet_stats)
 add_test(NAME test_bolt_iceberg_parquet_stats COMMAND test_bolt_iceberg_parquet_stats)
 
+# G2ICE-296 — Iceberg data-file metrics (column sizes, value / null / NaN counts, truncated bounds, split offsets) from a
+# parquet file, checked against the bytes Iceberg-Java writes; G2ICE-323 v2 referenced_data_file.
+add_executable(test_bolt_iceberg_metrics test_bolt_iceberg_metrics.cpp)
+target_link_libraries(test_bolt_iceberg_metrics
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_metrics)
+add_test(NAME test_bolt_iceberg_metrics COMMAND test_bolt_iceberg_metrics)
+
 # G2ICE-135 — end-to-end: a real BoltBatch WITH nulls through append_commit_ex
 # (the exact TieringManager::upload_iceberg call), manifest bytes read back
 # OFF DISK and decoded by the pyiceberg-verified reader above. Proves
