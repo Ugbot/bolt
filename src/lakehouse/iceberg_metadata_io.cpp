@@ -1,5 +1,6 @@
 #include "bolt/lakehouse/iceberg/metadata_io.h"
 #include "bolt/crypto/sha256.h"
+#include "bolt/ingest/bolt_inflate.h"
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/object_store/s3_uri.h"
 
@@ -117,6 +118,15 @@ struct IdentityCheck {
     uint32_t depth = 0, selected = 0, seen = 0;
     bool mismatch = false;
 };
+// G2ICE-300: a recorded location equals the pinned (canonical s3://) one when they differ only by Hadoop's s3a:// or
+// s3n:// spelling of the scheme.
+bool same_location(const char* recorded, size_t n, const char* pinned) noexcept {
+    const size_t pn = std::strlen(pinned);
+    if (n == pn && std::memcmp(recorded, pinned, n) == 0) return true;
+    const bool alias = n >= 6 && (std::memcmp(recorded, "s3a://", 6) == 0 || std::memcmp(recorded, "s3n://", 6) == 0);
+    return alias && pn >= 5 && std::memcmp(pinned, "s3://", 5) == 0 && n - 1u == pn && std::memcmp(recorded + 6, pinned + 5, pn - 5) == 0;
+}
+
 IdentityCheck& identity_check(void* context) noexcept {
     assert(context != nullptr);
     auto& check = *static_cast<IdentityCheck*>(context);
@@ -150,8 +160,9 @@ bool json_string(void* context, const char* value, int32_t length) noexcept {
     if (length < 0 || std::memchr(value, '\\', static_cast<size_t>(length)) != nullptr)
         return false;
     const char* expected = check.selected == 1 ? check.expected->table_location : check.expected->table_uuid;
-    if (static_cast<size_t>(length) != std::strlen(expected) ||
-        std::memcmp(value, expected, static_cast<size_t>(length)) != 0) {
+    const bool same = check.selected == 1 ? same_location(value, static_cast<size_t>(length), expected)
+        : static_cast<size_t>(length) == std::strlen(expected) && std::memcmp(value, expected, static_cast<size_t>(length)) == 0;
+    if (!same) {
         check.mismatch = true; return false;
     }
     check.seen |= check.selected; check.selected = 0; return true;
@@ -179,11 +190,19 @@ Status decode_exact(const MetadataObjectIdentity& pinned, const uint8_t* bytes,
     uint32_t length, Arena* metadata, Metadata* staged, Metadata* out,
     MetadataLoadResult* result) noexcept {
     assert(bytes != nullptr && metadata != nullptr); assert(staged != nullptr && out != nullptr && result != nullptr);
-    auto status = original_identity(bytes, length, pinned);
+    // G2ICE-300: gzip-compressed metadata (.gz.metadata.json) is checked and parsed as its JSON; the hash is the object's.
+    const uint8_t* json = bytes;
+    uint64_t json_n = length;
+    if (ingest::is_gzip(bytes, length)) {
+        auto alloc = [](void* c, uint64_t k) { return static_cast<uint8_t*>(static_cast<Arena*>(c)->allocate(k, 8)); };
+        if (ingest::gunzip(bytes, length, (1u << 30) - 1u, alloc, metadata, &json, &json_n) != ingest::kInflateOk || json_n == 0u)
+            return Status::DecodeFailed;
+    }
+    auto status = original_identity(json, static_cast<uint32_t>(json_n), pinned);
     if (status != Status::Ok) return status;
-    if (!metadata_parse(bytes, length, metadata, staged) ||
+    if (!metadata_parse(json, static_cast<uint32_t>(json_n), metadata, staged) ||
         (staged->format_version < 1 || staged->format_version > 3)) return Status::DecodeFailed;  // spec v1-v3 are adopted; v4 is not
-    if (std::strcmp(staged->location, pinned.table_location) != 0 ||
+    if (!same_location(staged->location, std::strlen(staged->location), pinned.table_location) ||
         std::strcmp(staged->table_uuid, pinned.table_uuid) != 0) return Status::IdentityMismatch;
     MetadataLoadResult copied{}; copied.object = pinned;
     crypto::Sha256State hash{}; uint8_t digest[32]{};

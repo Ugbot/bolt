@@ -58,6 +58,9 @@ TEST(S3ExactUri, HadoopSchemeAliasesMapExactly) {
         EXPECT_STREQ(key.data(), "data/a.parquet");
         EXPECT_EQ(s3_uri_validate(uri), Status::Unsupported) << "validate stays canonical: " << uri;
     }
+    std::array<char, kOsMaxKey> part{};                                  // Spark's partition directories: '=' stays literal
+    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://bucket/root/data/p=1/b=2,c/f.parquet", part.data(), part.size()), Status::Ok);
+    EXPECT_STREQ(part.data(), "data/p=1/b=2,c/f.parquet");
     char out[32] = "unchanged";
     EXPECT_EQ(s3_uri_object_key("s3a://bucket/root", "s3://bucket/root/a", out, sizeof(out)), Status::Unsupported);
     EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://other/root/a", out, sizeof(out)), Status::OutsideRoot);

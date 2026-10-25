@@ -390,12 +390,13 @@ TableHandle* new_table_handle(Arena* a) noexcept {
 // arena, which is reset when the scan moves to the next manifest.
 struct FileTask {
     const char* path;
+    const char* partition_json;   // G2ICE-300: the `_partition` column's text; set only when metadata columns are emitted
     int64_t     seq;        // data sequence number: the entry's own, else its manifest's (v1 tables: 0)
     int32_t     spec_id;
     uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
 };
 
-constexpr uint32_t kMetadataColumns = 4u;   // _file, _pos, _spec_id, _deleted (G2ICE-300)
+constexpr uint32_t kMetadataColumns = 5u;   // _file, _pos, _spec_id, _deleted, _partition (G2ICE-300)
 constexpr uint32_t kMaxEqualityIds = limits::kMaxEqualityIds;
 constexpr uint32_t kMaxEqualitySets = limits::kMaxEqualitySets;
 struct EqSet {
@@ -421,6 +422,7 @@ struct EqSet {
 
 // Declared here, defined in iceberg_eq_delete.inc (open_next_file runs before that include).
 namespace { void select_equality_sets(ScanHandle* s, const FileTask& f) noexcept; }
+#include "iceberg_scan_partition_column.inc"
 
 struct PinnedParquet {
     ObjectStore* store;
@@ -901,7 +903,7 @@ bool fill_metadata_columns(Arena* a, const FileTask& t, uint64_t base, int64_t r
     out[2] = BoltColumn::make_flat(spec, nullptr, rows, BoltType::Int64);
     out[3] = BoltColumn::make_flat(del, nullptr, rows, BoltType::Int64);
     out[2].stats.all_valid = out[3].stats.all_valid = true;
-    return true;
+    return fill_const_utf8(a, t.partition_json != nullptr ? t.partition_json : "{}", rows, &out[4]);
 }
 
 // Keep only rows `sel[0..kept)` of every column, in place. Fails (never under-deletes) on a column shape it cannot compact.
@@ -1061,7 +1063,8 @@ struct VisitCtx {
     int64_t              mle_seq;   // the manifest's sequence number, inherited by entries that carry none
 };
 
-bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash) noexcept {
+bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash,
+               const char* partition_json = nullptr) noexcept {
     assert(s != nullptr && path != nullptr);
     const size_t len = std::strlen(path);
     const uint64_t before = s->tasks_cap;
@@ -1077,6 +1080,7 @@ bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, ui
     std::memcpy(p, path, len + 1u);
     FileTask& t = s->tasks[s->n_tasks++];
     t.path = p; t.seq = seq; t.spec_id = spec_id; t.part_hash = part_hash;
+    t.partition_json = partition_json;   // already in man_arena, charged
     ++s->stats.files_planned;
     return true;
 }
@@ -1114,7 +1118,17 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
     if (!stats_pass(e, v->sch, s->opts.predicates, s->opts.n_predicates))
         return true;
     if (s->filter.keep != nullptr && !s->filter.keep(s->filter.ctx, e)) return true;
-    if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e))) { v->failed = true; return false; }
+    const bool want_pj = s->opts.emit_metadata_columns;
+    char* pj = nullptr;
+    if (want_pj) {                                                        // sized to the value's worst case: never cut
+        const uint32_t cap = partition_json_bound(s->table->meta);
+        pj = s->man_arena->allocate_array<char>(cap);
+        if (pj == nullptr || !s->budget->try_reserve(cap)) { v->failed = true; return false; }
+        v->s->man_charged += cap;
+        if (!partition_json(s->table->meta, *e, pj, cap)) { v->failed = true; return false; }
+    }
+    if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e),
+                   want_pj ? pj : nullptr)) { v->failed = true; return false; }
     return true;
 }
 
@@ -1398,7 +1412,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         if (extra == 1u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
         if (extra == kMetadataColumns &&
             (!out->schema.add_field("_file", BoltType::Utf8, false) || !out->schema.add_field("_pos", BoltType::Int64, false) ||
-             !out->schema.add_field("_spec_id", BoltType::Int64, false) || !out->schema.add_field("_deleted", BoltType::Int64, false)))
+             !out->schema.add_field("_spec_id", BoltType::Int64, false) || !out->schema.add_field("_deleted", BoltType::Int64, false) ||
+             !out->schema.add_field("_partition", BoltType::Utf8, false)))
             return false;
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;

@@ -176,6 +176,18 @@ bool metadata_json_emit_plain(const Metadata* m, Arena* a,
 // Derive the RFC 4122 UUID this writer assigns to a table at `loc`. Stable for
 // a given location (the same table always gets the same id) and distinct
 // between locations. `cap` must be >= 37.
+// G2ICE-300: an absolute table location ("<scheme>:..." or "/..."). Formats v1-v3 require one; a relative or omitted
+// location is a format-v4 table (paths relative to the table), which a reader refuses by name rather than mis-resolves.
+inline bool table_location_absolute(const char* loc) noexcept {
+    if (loc == nullptr || loc[0] == '\0') return false;
+    if (loc[0] == '/') return true;
+    uint32_t i = 0;
+    while ((loc[i] >= 'a' && loc[i] <= 'z') || (loc[i] >= 'A' && loc[i] <= 'Z') || (i > 0 && ((loc[i] >= '0' && loc[i] <= '9') ||
+           loc[i] == '+' || loc[i] == '-' || loc[i] == '.')))
+        ++i;                                                              // bounded: NUL-terminated
+    return i > 0 && loc[i] == ':';
+}
+
 void table_uuid_from_location(const char* loc, char* dst,
                               uint32_t cap) noexcept;
 const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept;

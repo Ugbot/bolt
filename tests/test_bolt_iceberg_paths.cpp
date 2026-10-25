@@ -224,7 +224,7 @@ TEST(IcebergPaths, ReservedMetadataColumnsFollowTheTableColumns) {
         bool eof = false;
         ASSERT_TRUE(iceberg_scan_next_batch(sh, &b, &eof));
         if (eof) break;
-        ASSERT_EQ(b.num_cols, 4u + 4u);
+        ASSERT_EQ(b.num_cols, 4u + 5u);
         const int fi = b.schema.find_field("_file"), pi = b.schema.find_field("_pos"), si = b.schema.find_field("_spec_id"),
                   di = b.schema.find_field("_deleted");
         ASSERT_EQ(fi, 4); ASSERT_EQ(pi, 5); ASSERT_EQ(si, 6); ASSERT_EQ(di, 7);
@@ -238,6 +238,12 @@ TEST(IcebergPaths, ReservedMetadataColumnsFollowTheTableColumns) {
             pos_by_file[file].push_back(c[pi].typed_data<int64_t>()[r]);
             EXPECT_EQ(c[si].typed_data<int64_t>()[r], 0);
             EXPECT_EQ(c[di].typed_data<int64_t>()[r], 0);
+            const int qi = b.schema.find_field("_partition");
+            ASSERT_EQ(qi, 8);
+            c[qi].utf8_at(r, &p, &n);
+            const std::string part(reinterpret_cast<const char*>(p), static_cast<size_t>(n));
+            EXPECT_EQ(part.rfind("{\"sym\":\"", 0), 0u) << part;
+            EXPECT_EQ(part.back(), '}') << part;
         }
         rows += b.num_rows;
     }
@@ -249,4 +255,12 @@ TEST(IcebergPaths, ReservedMetadataColumnsFollowTheTableColumns) {
         std::sort(ps.begin(), ps.end());
         for (size_t i = 0; i < ps.size(); ++i) EXPECT_EQ(ps[i], static_cast<int64_t>(i)) << f;
     }
+}
+
+TEST(IcebergPaths, RelativeOrOmittedLocationsAreNotAbsolute) {
+    for (const char* loc : {"s3://b/t", "s3a://b/t", "file:/tmp/t", "file:///C:/t", "/tmp/t", "gs://b/t", "abfss://c@a/t"})
+        EXPECT_TRUE(table_location_absolute(loc)) << loc;
+    for (const char* loc : {"", "t", "warehouse/db/t", "./t", "1s3://b/t", ":x"})
+        EXPECT_FALSE(table_location_absolute(loc)) << loc;
+    EXPECT_FALSE(table_location_absolute(nullptr));
 }

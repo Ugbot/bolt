@@ -36,6 +36,13 @@ int upper_hex(unsigned char c) noexcept {
     return -1;
 }
 
+// G2ICE-300: RFC 3986 sub-delims and ':' / '@' are literal path characters (Spark writes partition directories such as
+// "p=1"; Iceberg-Java's S3FileIO maps the path to the key byte for byte). They stay literal: never decoded, never aliases.
+bool sub_delim(unsigned char c) noexcept {
+    return c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' || c == '+' || c == ',' ||
+           c == ';' || c == '=' || c == ':' || c == '@';
+}
+
 Status canonical(const char* uri, uint32_t length) noexcept {
     assert(uri != nullptr); assert(length < kOsMaxKey);
     if (length < 5 || std::memcmp(uri, "s3://", 5) != 0) return Status::Unsupported;
@@ -55,7 +62,7 @@ Status canonical(const char* uri, uint32_t length) noexcept {
     if (!components(path, n)) return Status::BadArg;
     for (uint32_t i = 0; i < n; ++i) {
         const auto c = static_cast<unsigned char>(path[i]);
-        if (oshttp::unreserved(c) || c == '/') continue;
+        if (oshttp::unreserved(c) || c == '/' || sub_delim(c)) continue;
         if (c != '%' || n - i < 3) return Status::BadArg;
         const int hi = upper_hex(static_cast<unsigned char>(path[i + 1]));
         const int lo = upper_hex(static_cast<unsigned char>(path[i + 2]));
