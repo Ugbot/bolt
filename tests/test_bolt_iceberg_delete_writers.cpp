@@ -167,11 +167,12 @@ PartitionField pf(int32_t source, const char* transform, const char* name) {
     return f;
 }
 
-void create_table(Table* t, const std::string& root, const PartitionField* part = nullptr) {
+void create_table(Table* t, const std::string& root, const PartitionField* part = nullptr, uint8_t fv = 2) {
     t->root = root;
     ASSERT_TRUE(filesystem_object_store_init(&t->fs, root.c_str(), &t->os));
     Schema sch = make_schema();
     WriteOptions wo; write_options_init(&wo);
+    wo.format_version = fv;
     PartitionSpec spec{};
     if (part != nullptr) spec.fields[spec.n_fields++] = *part;
     ASSERT_TRUE(table_create(&t->th, &t->arena, &t->os, root.c_str(), &sch, part != nullptr ? &spec : nullptr, nullptr, &wo));
@@ -198,8 +199,8 @@ void delete_position(Table* t, const std::string& file, int64_t pos) {
 }
 
 // Three files (ids 0..9, 10..19, 20..29), then position deletes of ids 15 and 22 (unpartitioned base only).
-void build_base(Table* t, const std::string& root, const PartitionField* part = nullptr) {
-    create_table(t, root, part);
+void build_base(Table* t, const std::string& root, const PartitionField* part = nullptr, uint8_t fv = 2) {
+    create_table(t, root, part, fv);
     append_rows(t, base_rows(0, 10));
     append_rows(t, base_rows(10, 20));
     append_rows(t, base_rows(20, 30));
@@ -291,7 +292,8 @@ DeleteOptions eq_opts(std::initializer_list<int32_t> ids = {}, bool global = fal
 }
 
 // The delete files of the current snapshot, with their content, spec, tuple width and equality ids.
-struct DelFile { FileContent content; int32_t spec; uint32_t n_part; std::vector<int32_t> eq; int64_t rows; std::string path; };
+struct DelFile { FileContent content; int32_t spec; uint32_t n_part; std::vector<int32_t> eq; int64_t rows; std::string path;
+                 bool dv; std::string ref; };
 
 std::string store_key(const std::string& root, const std::string& loc) {
     if (loc.size() > root.size() && loc.compare(0, root.size(), root) == 0) return loc.substr(root.size() + 1u);
@@ -315,7 +317,8 @@ std::vector<DelFile> delete_files(const Table& t) {
                                              mle[i].partition_spec_id, 4u, &e, &ne));
         for (uint32_t j = 0; j < ne; ++j) {
             if (e[j].content == FileContent::kData || e[j].status == ManifestStatus::kDeleted) continue;
-            DelFile d{e[j].content, e[j].partition_spec_id, e[j].n_partition, {}, e[j].stats.record_count, e[j].file_path};
+            DelFile d{e[j].content, e[j].partition_spec_id, e[j].n_partition, {}, e[j].stats.record_count, e[j].file_path,
+                      e[j].is_dv, e[j].referenced_data_file};
             for (uint32_t k = 0; k < e[j].n_equality_ids && k < limits::kMaxEqualityIds; ++k) d.eq.push_back(e[j].equality_ids[k]);
             if (d.spec == 0 && mle[i].partition_spec_id != 0) d.spec = mle[i].partition_spec_id;
             out.push_back(d);
@@ -419,6 +422,27 @@ void write_pos_row_partitioned(Table* t, const std::string& root) {
 }
 
 bool gone_pos(const Row& r) { return r.id == 15 || r.id == 22; }
+
+// v3: the base (position deletes of ids 15 and 22 become DVs), a predicate delete merging into C's DV, a positions delete,
+// a delete removing file A's last rows, and an equality delete.
+void write_v3(Table* t, const std::string& root) {
+    build_base(t, root, nullptr, 3);
+    Predicate p = pred_i64("id", PredicateOp::kGe, 27);                   // C: 27..29 join 22 in C's one DV
+    ASSERT_TRUE(table_delete(t->th, &p));
+    delete_position(t, t->files[0], 4);                                   // A: id 4
+    Predicate low = pred_i64("id", PredicateOp::kLt, 10);                 // every live row of A: the file goes
+    DeleteOptions none{};
+    ASSERT_TRUE(table_delete_with(t->th, &low, &none));
+    Predicate k = pred_i64("id", PredicateOp::kEq, 18);
+    DeleteOptions o = eq_opts();
+    ASSERT_TRUE(table_delete_with(t->th, &k, &o));
+    std::vector<Row> add{Row{100, 7, row_s(100)}, Row{101, 7, row_s(101)}};
+    append_rows(t, add);
+}
+
+bool gone_v3(const Row& r) { return r.id == 15 || r.id == 22 || r.id >= 27 || r.id < 10 || r.id == 18; }
+
+std::string metadata_text(const Table& t) { return read_file(latest_metadata_path(t.root)); }
 
 }  // namespace
 
@@ -543,6 +567,47 @@ TEST(IcebergDeleteWriters, KeysThatCannotCompareExactlyAreRefused) {
     EXPECT_EQ(scan_rows(t.root), model(base_rows(0, 30), gone_pos));
 }
 
+TEST(IcebergDeleteWriters, V3DeletesAreOneMergedDeletionVectorPerFileAndAppendsCarryRowLineage) {
+    Table t;
+    write_v3(&t, fresh_root(temp_base(), "v3"));
+    std::vector<Row> want = model(base_rows(0, 30), gone_v3);
+    want.push_back(Row{100, 7, row_s(100)});
+    want.push_back(Row{101, 7, row_s(101)});
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(scan_rows(t.root), want);
+    const auto d = delete_files(t);
+    size_t dvs = 0, pos = 0, eq = 0;
+    std::vector<std::string> refs;
+    for (const DelFile& f : d) {
+        if (f.dv) { ++dvs; refs.push_back(f.ref); }
+        else if (f.content == FileContent::kPositionDeletes) ++pos;
+        else ++eq;
+    }
+    EXPECT_EQ(pos, 0u) << "a v3 writer writes no position-delete files";
+    EXPECT_EQ(eq, 1u);
+    std::sort(refs.begin(), refs.end());
+    std::vector<std::string> want_refs{t.files[1], t.files[2]};
+    std::sort(want_refs.begin(), want_refs.end());
+    EXPECT_EQ(refs, want_refs) << "one DV per file: B (15) and C (22, 27..29); A was removed";
+    for (const DelFile& f : d) if (f.dv && f.ref == t.files[2]) EXPECT_EQ(f.rows, 4) << "C's DV holds 22 merged with 27..29";
+    const std::string md = metadata_text(t);
+    EXPECT_NE(md.find("\"format-version\":3"), std::string::npos);
+    EXPECT_NE(md.find("\"next-row-id\":32"), std::string::npos) << "30 base rows then 2 appended (deletes assign no ids)";
+    EXPECT_NE(md.find("\"first-row-id\":30,\"added-rows\":2"), std::string::npos) << md.substr(0, 400);
+}
+
+TEST(IcebergDeleteWriters, V3RefusesWhatItCannotWriteByName) {
+    Table t;
+    build_base(&t, fresh_root(temp_base(), "v3_refusals"), nullptr, 3);
+    Predicate p = pred_i64("id", PredicateOp::kEq, 4);
+    DeleteOptions row{};
+    row.position_row = true;
+    EXPECT_FALSE(table_delete_with(t.th, &p, &row)) << "DVs carry no row";
+    EXPECT_EQ(table_last_commit_error(t.th), CommitError::kUnimplemented);
+    EXPECT_FALSE(table_compact(t.th, 64ll << 20)) << "compaction must keep row ids (G2ICE-346)";
+    EXPECT_EQ(scan_rows(t.root), model(base_rows(0, 30), gone_pos));
+}
+
 // A key of ten columns (past the eight the manifest model kept before) round-trips through the manifest and applies.
 TEST(IcebergDeleteWriters, WideKeysRoundTrip) {
     Table t;
@@ -617,4 +682,5 @@ TEST(IcebergDeleteWritersFixture, WriteTables) {
     { Table t; write_upsert(&t, fresh_root(base, "upsert_tbl")); }
     { Table t; write_pos_row(&t, fresh_root(base, "pos_row_tbl")); }
     { Table t; write_pos_row_partitioned(&t, fresh_root(base, "pos_row_part_tbl")); }
+    { Table t; write_v3(&t, fresh_root(base, "v3_tbl")); }
 }

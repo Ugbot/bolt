@@ -28,7 +28,10 @@ struct SnapSummary {
     int64_t v[kSumKeys];
     int64_t changed_partitions;
     bool    has_totals;
-    uint8_t _pad[7];
+    bool    has_lineage;      // v3: first_row_id / added_rows below are the snapshot's row lineage (G2ICE-283)
+    uint8_t _pad[6];
+    int64_t first_row_id;
+    int64_t added_rows;
 };
 
 // One snapshot this handle committed, so a later re-emit of metadata.json keeps its summary.

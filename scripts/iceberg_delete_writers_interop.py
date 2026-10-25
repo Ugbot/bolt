@@ -80,6 +80,13 @@ TABLES = {
         want=keep(base_rows(0, 30), lambda r: POS_GONE(r) or r[1] == 1 or r[0] <= 2),
         wrong=keep(base_rows(0, 30), lambda r: POS_GONE(r) or r[1] == 1),
         ops=["append"] * 3 + ["delete"] * 4, eq=[], pos_rows=True),
+    # format v3: deletes are deletion vectors merged per file (15, 22, then 27..29 into C's), A removed whole, an equality
+    # delete of id 18, then rows 100 and 101 appended (row ids 30 and 31).
+    "v3_tbl": dict(
+        want=ordered(keep(base_rows(0, 30), lambda r: r[0] in (15, 22, 18) or r[0] >= 27 or r[0] < 10) +
+                     [(100, 7, row_s(100)), (101, 7, row_s(101))]),
+        wrong=ordered(keep(base_rows(0, 30), lambda r: r[0] in (15, 22, 18) or r[0] >= 27 or r[0] < 10)),
+        ops=["append"] * 3 + ["delete"] * 6 + ["append"], eq=[([1], 0)], v3=True),
     "pos_row_part_tbl": dict(
         want=keep(base_rows(0, 30), lambda r: r[0] >= 23), wrong=base_rows(0, 30),
         ops=["append"] * 3 + ["delete"], eq=[], pos_rows=True),

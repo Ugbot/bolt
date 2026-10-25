@@ -28,6 +28,28 @@ int64_t distinct_partitions(ChangeState* st) noexcept {
     return d;
 }
 
+// An entry the change removes: a listed file, or (v3) the deletion vector of a data file it replaces or removes.
+int64_t removed_entry(ChangeState* st, const DataFileRef& e, bool del, bool* dv) noexcept {
+    assert(st != nullptr);
+    *dv = del && e.is_dv && st->rm_dvs.n != 0u && rm_index_find(&st->rm_dvs, e.referenced_data_file) >= 0;
+    if (*dv) return 0;
+    return rm_index_find(del ? &st->rm_dels : &st->rm_data, e.file_path);
+}
+
+// v3: a carried data entry keeps its row ids, so an inherited first_row_id (the manifest's, plus the record counts of the
+// earlier entries that inherit) is written explicitly (spec "Row Lineage").
+void pin_first_row_ids(DataFileRef* e, uint32_t n, const ManifestListEntry& mle) noexcept {
+    assert(e != nullptr || n == 0u);
+    if (mle.content != ManifestContent::kDataManifest || !mle.has_first_row_id) return;
+    int64_t next = mle.first_row_id;
+    for (uint32_t i = 0; i < n; ++i) {                          // bounded by n, in manifest order
+        if (e[i].content != FileContent::kData || e[i].has_first_row_id) continue;
+        e[i].first_row_id = next;
+        e[i].has_first_row_id = true;
+        next += e[i].stats.record_count;
+    }
+}
+
 // Carry `mle` forward, or rewrite it when it holds a file the change removes.
 bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& mle,
                      ManifestListEntry* out) noexcept {
@@ -35,22 +57,23 @@ bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& 
     const bool del = mle.content == ManifestContent::kDeleteManifest;
     RmIndex* rm = del ? &st->rm_dels : &st->rm_data;
     *out = mle;
-    if (rm->n == 0) return true;
+    if (rm->n == 0 && (!del || st->rm_dvs.n == 0)) return true;
     DataFileRef* e = nullptr; uint32_t n = 0;
     if (!read_manifest_entries(th, mle, &e, &n)) { th->last_error = CommitError::kFailed; return false; }
-    bool hit = false;
+    bool hit = false, dv = false;
     for (uint32_t i = 0; i < n && !hit; ++i)                    // bounded by n
-        hit = e[i].status != ManifestStatus::kDeleted && rm_index_find(rm, e[i].file_path) >= 0;
+        hit = e[i].status != ManifestStatus::kDeleted && removed_entry(st, e[i], del, &dv) >= 0;
     if (!hit) return true;
+    pin_first_row_ids(e, n, mle);
     uint32_t w = 0;
     for (uint32_t i = 0; i < n; ++i) {                          // bounded by n
         if (e[i].status == ManifestStatus::kDeleted) continue;
-        if (del && (e[i].content == FileContent::kEqualityDeletes || e[i].is_dv || e[i].n_equality_ids != 0))
-            return refuse_named(th, "rewriting a delete manifest that holds equality deletes or deletion vectors");
-        const int64_t k = rm_index_find(rm, e[i].file_path);
-        if (k >= 0) {
+        const int64_t k = removed_entry(st, e[i], del, &dv);
+        if (k >= 0 && !dv) {
             if (rm->found[k] != 0) { th->last_error = CommitError::kFailed; return false; }   // listed live twice
             rm->found[k] = 1;
+        }
+        if (k >= 0) {
             count_file(&st->sum, e[i], false);
             if (!note_partition(th, st, e[i])) return false;
         }
@@ -90,13 +113,36 @@ bool parent_list(TableHandle* th, int64_t parent, ManifestListEntry** ml, uint32
     return manifest_list_parse_avro_grow(pb, pl, th->arena, 1u, ml, n);
 }
 
+// v3 (spec "Row Lineage"): every data manifest of the list without a first_row_id gets the table's next-row-id, which then
+// advances by its added and existing rows; the snapshot records where it started and how many ids it assigned.
+void assign_row_ids(TableHandle* th, ChangeState* st, ManifestListEntry* ml, uint32_t n) noexcept {
+    assert(th != nullptr && st != nullptr);
+    assert(ml != nullptr || n == 0u);
+    const int64_t first = th->meta.next_row_id;
+    for (uint32_t i = 0; i < n; ++i) {                          // bounded by the list
+        if (ml[i].content != ManifestContent::kDataManifest || ml[i].has_first_row_id) continue;
+        ml[i].first_row_id = th->meta.next_row_id;
+        ml[i].has_first_row_id = true;
+        th->meta.next_row_id += ml[i].added_rows_count + ml[i].existing_rows_count;
+    }
+    th->meta.has_next_row_id = true;
+    st->sum.has_lineage = true;
+    st->sum.first_row_id = first;
+    st->sum.added_rows = th->meta.next_row_id - first;
+}
+
 // Write the manifest list, record the snapshot and its summary, publish metadata.json.
 bool publish_change(TableHandle* th, ChangeState* st, const ManifestListEntry* ml, uint32_t n) noexcept {
     assert(th != nullptr && st != nullptr);
     const int64_t snap_id = st->cs->snap_id;
     const int64_t parent = th->meta.current_snapshot_id;
     const uint8_t* mlb = nullptr; uint64_t mll = 0;
-    if (!manifest_list_write_avro(ml, n, snap_id, st->seq, th->arena, &mlb, &mll)) return false;
+    const int64_t prior_next = th->meta.next_row_id;
+    if (th->meta.format_version >= 3) assign_row_ids(th, st, const_cast<ManifestListEntry*>(ml), n);
+    if (!manifest_list_write_avro_fv(th->meta.format_version, ml, n, snap_id, st->seq, th->arena, &mlb, &mll)) {
+        th->meta.next_row_id = prior_next;
+        return false;
+    }
     char mlrel[128];
     std::snprintf(mlrel, sizeof(mlrel), "metadata/snap-%lld.avro", static_cast<long long>(snap_id));
     char mlabs[kIcebergMaxManifestPath];
@@ -129,6 +175,7 @@ bool publish_change(TableHandle* th, ChangeState* st, const ManifestListEntry* m
     th->n_sums = n_sums;
     --th->meta.last_sequence_number;
     th->meta.current_snapshot_id = parent;
+    th->meta.next_row_id = prior_next;
     return false;
 }
 
@@ -182,8 +229,14 @@ bool change_prepare(TableHandle* th, const ChangeSet* cs, ChangeState* st) noexc
     if (sch == nullptr || !emit_schema_json(th->arena, sch, &sj, &sl) || sl == 0 || sl > UINT32_MAX) return false;
     st->schema_json = sj;
     st->schema_len = static_cast<uint32_t>(sl);
+    // v3: a removed data file's deletion vector goes with it (a DV names exactly one data file), as do the DVs a new one replaces.
+    const uint32_t n_dv = th->meta.format_version >= 3 ? cs->n_rm_dvs + cs->n_rm_data : 0u;
+    auto* dvs = th->arena->allocate_array<const char*>(n_dv + 1u);
+    if (dvs == nullptr) return false;
+    for (uint32_t i = 0; i < n_dv; ++i) dvs[i] = i < cs->n_rm_dvs ? cs->rm_dvs[i] : cs->rm_data[i - cs->n_rm_dvs];   // bounded by n_dv
     return rm_index_build(th->arena, cs->rm_data, cs->n_rm_data, &st->rm_data) &&
-           rm_index_build(th->arena, cs->rm_dels, cs->n_rm_dels, &st->rm_dels);
+           rm_index_build(th->arena, cs->rm_dels, cs->n_rm_dels, &st->rm_dels) &&
+           rm_index_build(th->arena, dvs, n_dv, &st->rm_dvs);
 }
 
 // The one commit path. Nothing it wrote survives a refused commit (unless uncertain: then it is retained).

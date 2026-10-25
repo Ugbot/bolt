@@ -106,6 +106,9 @@ struct DmlFile {
     uint32_t    cap_pos;
     BoltBatch** rows;        // with_rows: the matched rows, aligned with pos (G2ICE-283 position `row` column)
     uint32_t    n_rows, cap_rows;
+    uint8_t*    live;        // dv: bitmap of the positions read live (G2ICE-283 deletion vectors)
+    uint32_t    n_live;      // bytes of `live`
+    uint32_t    _pad;
 };
 
 struct DmlPlan {
@@ -114,7 +117,10 @@ struct DmlPlan {
     uint32_t     n_files;
     uint32_t     cap_files;
     bool         with_rows;
+    bool         dv;          // v3: deletes are deletion vectors (iceberg_delete_dv.inc)
 };
+
+bool dml_mark_live(Arena* a, DmlFile* f, int64_t pos) noexcept;
 
 // with_rows: the matched rows of `rb`, gathered in match order (as their positions are), appended to `f`.
 bool dml_keep_rows(Arena* a, DmlFile* f, const dml::RowBatch* rb) noexcept {
@@ -138,10 +144,12 @@ bool dml_visit(void* c, const dml::RowBatch* rb) noexcept {
         char* path = a->allocate_array<char>(len + 1u);
         if (path == nullptr) return false;
         std::memcpy(path, rb->file_path, len + 1u);
-        p->files[p->n_files++] = DmlFile{path, 0, nullptr, 0, 0, nullptr, 0, 0};
+        p->files[p->n_files++] = DmlFile{path, 0, nullptr, 0, 0, nullptr, 0, 0, nullptr, 0, 0};
     }
     DmlFile& f = p->files[p->n_files - 1];
     f.live_rows += rb->batch->num_rows;
+    for (int64_t r = 0; p->dv && r < rb->batch->num_rows; ++r)          // bounded by the batch
+        if (!dml_mark_live(a, &f, rb->pos[r])) return false;
     if (rb->n_match == 0) return true;
     if (static_cast<uint64_t>(f.n_pos) + rb->n_match > UINT32_MAX) return false;
     if (!lake_grow(a, nullptr, &f.pos, f.n_pos, &f.cap_pos, f.n_pos + rb->n_match)) return false;

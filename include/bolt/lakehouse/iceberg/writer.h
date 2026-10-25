@@ -41,7 +41,9 @@ struct WriteOptions {
     int32_t      target_row_group_rows;
     bool         emit_stats;
     bool         use_v2_format;
-    uint8_t      _pad1[2];
+    // G2ICE-283: the format version table_create writes, 0 or 2 = v2, 3 = v3 (row lineage; deletes are deletion vectors).
+    uint8_t      format_version;
+    uint8_t      _pad1[1];
 };
 
 inline void write_options_init(WriteOptions* o) noexcept {

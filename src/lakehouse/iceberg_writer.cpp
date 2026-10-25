@@ -30,6 +30,7 @@
 #include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
 #include "bolt/lakehouse/iceberg/eq_key.h"
+#include "bolt/lakehouse/iceberg/deletion_vector.h"
 
 #include <atomic>
 #include <cassert>
@@ -684,6 +685,7 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
                  static_cast<long long>(m->last_updated_ms))) return false;
     if (!buf_fmt(&b, "\"last-sequence-number\":%lld,",
                  static_cast<long long>(m->last_sequence_number))) return false;
+    if (m->format_version >= 3 && !buf_fmt(&b, "\"next-row-id\":%lld,", static_cast<long long>(m->next_row_id))) return false;
     if (!buf_fmt(&b, "\"current-snapshot-id\":%lld,",
                  static_cast<long long>(m->current_snapshot_id))) return false;
     if (!buf_fmt(&b, "\"current-schema-id\":%d,",
@@ -821,7 +823,11 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
                      static_cast<long long>(s.sequence_number))) return false;
         if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
         if (!buf_fmt(&b, "\"schema-id\":%d,", s.schema_id)) return false;
-        if (!emit_summary(&b, op, find_summary(sums, n_sums, s.snapshot_id))) return false;
+        const SnapSummary* sum = find_summary(sums, n_sums, s.snapshot_id);
+        if (sum != nullptr && sum->has_lineage &&                         // v3 row lineage of a snapshot this handle wrote
+            !buf_fmt(&b, "\"first-row-id\":%lld,\"added-rows\":%lld,", static_cast<long long>(sum->first_row_id),
+                     static_cast<long long>(sum->added_rows))) return false;
+        if (!emit_summary(&b, op, sum)) return false;
         if (!buf_put(&b, "}")) return false;
     }
     if (!buf_put(&b, "],")) return false;
@@ -938,7 +944,9 @@ bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
     h->os    = os;
     std::strncpy(h->root, path, sizeof(h->root) - 1u);
     metadata_init(&h->meta, arena, nullptr);
-    h->meta.format_version       = 2;
+    h->meta.format_version       = opts != nullptr && opts->format_version == 3u ? 3 : 2;
+    h->meta.has_next_row_id      = h->meta.format_version >= 3;   // v3: row ids start at 0 (spec "Row Lineage")
+    h->meta.next_row_id          = 0;
     h->meta.current_schema_id    = schema->schema_id;
     h->meta.current_spec_id      = spec ? spec->spec_id : 0;
     h->meta.default_sort_order_id = sort ? sort->order_id : 0;
@@ -1286,9 +1294,11 @@ bool position_delete_schema(Arena* a, Schema* out) noexcept {
 #include "iceberg_dml.inc"
 #include "iceberg_dml_partition.inc"
 #include "iceberg_delete_row.inc"
+#include "iceberg_delete_dv.inc"
 #include "iceberg_dml_ops.inc"
 #include "iceberg_delete_eq.inc"
 #include "iceberg_delete_eq_ops.inc"
+#include "iceberg_delete_dv_ops.inc"
 #include "iceberg_compact.inc"
 
 bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
@@ -1314,6 +1324,7 @@ bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,
     // Sorted by file_path then pos (spec: "Position Delete Files"), then one delete file per partition (G2ICE-292).
     const char** sp = nullptr; int64_t* spos = nullptr;
     if (!sort_position_deletes(a, paths, pos, n, &sp, &spos)) return false;
+    if (th->meta.format_version >= 3) return delete_positions_v3(th, sp, spos, n);   // G2ICE-283: deletion vectors
     LiveData live{};
     if (!live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);

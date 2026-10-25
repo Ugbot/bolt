@@ -10,6 +10,8 @@ struct DmlOutputs {
     uint32_t     n_dats;
     DataFileRef* dats;
     char         (*dat_rels)[128];
+    const char** replaced_dvs;      // v3: the data files whose DV the new ones replace
+    uint32_t     n_replaced_dvs;
 };
 
 void dml_complete(TableHandle* th, const DmlOutputs* o, bool committed) noexcept {
@@ -42,9 +44,11 @@ bool dml_write_outputs(TableHandle* th, int64_t snap_id, const char* const* del_
     assert(snap_id > 0);
     *o = DmlOutputs{};
     bool ok = n_del == 0 ||
-              (rows != nullptr ? write_row_deletes(th, snap_id, rows, live, &o->dels, &o->del_rels, &o->n_dels)
-                               : write_grouped_deletes(th, snap_id, del_paths, del_pos, n_del, live, &o->dels,
-                                                       &o->del_rels, &o->n_dels));
+              (rows != nullptr && rows->dv ? write_dvs(th, snap_id, rows, live, &o->dels, &o->del_rels, &o->n_dels, &o->replaced_dvs)
+               : rows != nullptr ? write_row_deletes(th, snap_id, rows, live, &o->dels, &o->del_rels, &o->n_dels)
+                                 : write_grouped_deletes(th, snap_id, del_paths, del_pos, n_del, live, &o->dels,
+                                                         &o->del_rels, &o->n_dels));
+    if (rows != nullptr && rows->dv) o->n_replaced_dvs = o->n_dels;
     ok = ok && (add == nullptr || add->num_rows <= 0 || dml_add_files(th, snap_id, add, o));
     if (!ok) dml_complete(th, o, false);
     return ok;
@@ -77,7 +81,7 @@ bool dml_change_in(TableHandle* th, const Predicate* pred, const BoltBatch* add,
     if (n_del != 0 && !live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);
     DmlOutputs o{};
-    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &live, plan->with_rows ? plan : nullptr, &o))
+    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &live, plan->with_rows || plan->dv ? plan : nullptr, &o))
         return false;
     ChangeSet cs{};
     cs.op = op;
@@ -88,6 +92,8 @@ bool dml_change_in(TableHandle* th, const Predicate* pred, const BoltBatch* add,
     cs.n_add_dels = o.n_dels;
     cs.add_data = o.dats;
     cs.n_add_data = o.n_dats;
+    cs.rm_dvs = o.replaced_dvs;
+    cs.n_rm_dvs = o.n_replaced_dvs;
     const bool committed = commit_change(th, &cs);
     dml_complete(th, &o, committed);
     return committed;
@@ -103,7 +109,9 @@ bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, Sn
     }
     if (!pred_column_known(th, pred)) return false;
     if (!handle_is_current(th)) return false;
-    DmlPlan plan{th, nullptr, 0, 0, opts != nullptr && opts->position_row};
+    DmlPlan plan{th, nullptr, 0, 0, opts != nullptr && opts->position_row, th->meta.format_version >= 3};
+    if (plan.with_rows && plan.dv)
+        return refuse_named(th, "a position delete `row` column on a format-version 3 table (its deletes are deletion vectors)");
     if (plan.with_rows && !row_schema_ok(th))
         return refuse_named(th, "a position delete `row` column for a schema with a nested column");
     Arena* ra = scratch_arena(th);

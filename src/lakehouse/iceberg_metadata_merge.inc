@@ -201,7 +201,7 @@ constexpr uint32_t kDirtySchema = 1u, kDirtySpec = 2u, kDirtySort = 4u, kDirtyRe
 
 bool commit_owned_key(const JsonMember& m, uint32_t dirty) noexcept {
     static const char* const kOwned[] = {"snapshots", "snapshot-log", "current-snapshot-id", "last-sequence-number",
-                                         "last-updated-ms", "metadata-log"};
+                                         "last-updated-ms", "metadata-log", "next-row-id"};
     for (const char* k : kOwned) if (member_is(m, k)) return true;
     if ((dirty & kDirtySchema) && (member_is(m, "schemas") || member_is(m, "current-schema-id") || member_is(m, "last-column-id"))) return true;
     if ((dirty & kDirtySpec) && (member_is(m, "partition-specs") || member_is(m, "default-spec-id") || member_is(m, "last-partition-id"))) return true;

@@ -355,6 +355,8 @@ bool compact_table(TableHandle* th, int64_t target) noexcept {
 bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept {
     assert(th != nullptr);
     if (!write_ready(th)) return false;
+    if (th->meta.format_version >= 3)   // rewritten rows must keep their _row_id / _last_updated_sequence_number (G2ICE-346)
+        return refuse_named(th, "compaction of a format-version 3 table (rows keeping their row ids is sequenced, G2ICE-346)");
     OptimizeOptions o;
     optimize_options_init(&o);
     if (opts != nullptr) o = *opts;
@@ -366,5 +368,7 @@ bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept {
 bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept {
     assert(th != nullptr);
     if (!write_ready(th)) return false;
+    if (th->meta.format_version >= 3)
+        return refuse_named(th, "compaction of a format-version 3 table (rows keeping their row ids is sequenced, G2ICE-346)");
     return compact_table(th, target_file_size_bytes);
 }

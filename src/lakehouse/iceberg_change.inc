@@ -24,6 +24,9 @@ struct ChangeSet {
     const char* const* rm_dels;
     uint32_t           n_rm_data;
     uint32_t           n_rm_dels;
+    const char* const* rm_dvs;      // v3: data files whose deletion vector this change replaces or orphans (G2ICE-283)
+    uint32_t           n_rm_dvs;
+    uint32_t           _pad2;
 };
 
 // Sorted (hash, index) pairs over one removal list, with a found flag per path.
@@ -91,6 +94,7 @@ struct ChangeState {
     SnapSummary      sum;
     RmIndex          rm_data;
     RmIndex          rm_dels;
+    RmIndex          rm_dvs;        // by referenced data file; no found check (a file may have had no DV)
     uint64_t*        part_keys;     // (spec, tuple) hash of every file added or removed: changed-partition-count
     uint32_t         n_part_keys, cap_part_keys;
     uint32_t         n_manifests_added;
@@ -163,8 +167,8 @@ bool write_manifest_entry(TableHandle* th, ChangeState* st, const DataFileRef* f
     if (spec->n_fields != 0u && !spec_types_for(th, spec, src, res))
         return refuse_named(th, "a manifest of a partition spec with an unknown transform, or one not defined for its source");
     const uint8_t* body = nullptr; uint64_t len = 0;
-    if (!manifest_write_avro_typed(files, nf, st->cs->snap_id, st->seq, reinterpret_cast<const char*>(st->schema_json),
-                                   st->schema_len, spec, res, th->arena, &body, &len)) { th->last_error = CommitError::kFailed; return false; }
+    if (!manifest_write_avro_fv(th->meta.format_version, files, nf, st->cs->snap_id, st->seq, reinterpret_cast<const char*>(st->schema_json),
+                                st->schema_len, spec_id, spec, res, th->arena, &body, &len)) { th->last_error = CommitError::kFailed; return false; }
     char rel[128];
     const int rn = std::snprintf(rel, sizeof(rel), "metadata/manifest-%lld%s.avro",
                                  static_cast<long long>(st->cs->snap_id), tag);

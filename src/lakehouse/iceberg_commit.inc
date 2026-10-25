@@ -12,8 +12,8 @@ bool write_ready(TableHandle* th) noexcept {
     assert(th != nullptr);
     assert(th->os != nullptr);
     th->file_io_configurable = false;
-    // G2ICE-279: only the v2 writer exists. An opened v1 or v3 table is refused by name, never rewritten as v2.
-    if (th->prior_meta != nullptr && th->meta.format_version != 2) {
+    // G2ICE-279 / G2ICE-283: v2 and v3 are written. An opened v1 table is refused by name, never rewritten as v2.
+    if (th->prior_meta != nullptr && th->meta.format_version != 2 && th->meta.format_version != 3) {
         th->last_error = CommitError::kUnimplemented;
         std::fprintf(stderr, "[iceberg_writer] format-version %d tables are not written yet (G2ICE-276); nothing was written\n",
                      th->meta.format_version);
