@@ -104,6 +104,8 @@ struct DmlFile {
     int64_t*    pos;
     uint32_t    n_pos;
     uint32_t    cap_pos;
+    BoltBatch** rows;        // with_rows: the matched rows, aligned with pos (G2ICE-283 position `row` column)
+    uint32_t    n_rows, cap_rows;
 };
 
 struct DmlPlan {
@@ -111,7 +113,20 @@ struct DmlPlan {
     DmlFile*     files;
     uint32_t     n_files;
     uint32_t     cap_files;
+    bool         with_rows;
 };
+
+// with_rows: the matched rows of `rb`, gathered in match order (as their positions are), appended to `f`.
+bool dml_keep_rows(Arena* a, DmlFile* f, const dml::RowBatch* rb) noexcept {
+    assert(a != nullptr && f != nullptr && rb != nullptr);
+    void* mem = a->allocate(sizeof(BoltBatch), alignof(BoltBatch));
+    if (mem == nullptr) return false;
+    BoltBatch* b = new (mem) BoltBatch();
+    if (!gather_batch(a, rb->batch, rb->match, rb->n_match, b)) return false;
+    if (!lake_grow(a, nullptr, &f->rows, f->n_rows, &f->cap_rows, f->n_rows + 1u)) return false;
+    f->rows[f->n_rows++] = b;
+    return true;
+}
 
 bool dml_visit(void* c, const dml::RowBatch* rb) noexcept {
     auto* p = static_cast<DmlPlan*>(c);
@@ -123,7 +138,7 @@ bool dml_visit(void* c, const dml::RowBatch* rb) noexcept {
         char* path = a->allocate_array<char>(len + 1u);
         if (path == nullptr) return false;
         std::memcpy(path, rb->file_path, len + 1u);
-        p->files[p->n_files++] = DmlFile{path, 0, nullptr, 0, 0};
+        p->files[p->n_files++] = DmlFile{path, 0, nullptr, 0, 0, nullptr, 0, 0};
     }
     DmlFile& f = p->files[p->n_files - 1];
     f.live_rows += rb->batch->num_rows;
@@ -131,7 +146,7 @@ bool dml_visit(void* c, const dml::RowBatch* rb) noexcept {
     if (static_cast<uint64_t>(f.n_pos) + rb->n_match > UINT32_MAX) return false;
     if (!lake_grow(a, nullptr, &f.pos, f.n_pos, &f.cap_pos, f.n_pos + rb->n_match)) return false;
     for (uint32_t i = 0; i < rb->n_match; ++i) f.pos[f.n_pos++] = rb->pos[rb->match[i]];   // bounded by n_match
-    return true;
+    return !p->with_rows || dml_keep_rows(a, &f, rb);
 }
 
 // The table's metadata document at the handle's version, into `a`.
@@ -166,13 +181,13 @@ bool dml_read(TableHandle* th, Arena* ra, const Predicate* pred, dml::FileKeepFn
     return false;
 }
 
-// Whole files to remove and the (path, pos) rows of the partial ones, in file_path then pos order.
-bool dml_split(TableHandle* th, const DmlPlan* p, const char*** rm, uint32_t* n_rm, const char*** del_paths,
-               int64_t** del_pos, uint32_t* n_del) noexcept {
+// Whole files to remove (`rm`), and the partly deleted files (`order_out`, by file_path) with their deleted row count.
+bool dml_partition_files(TableHandle* th, const DmlPlan* p, const char*** rm, uint32_t* n_rm, uint32_t** order_out,
+                         uint32_t* n_part_out, uint64_t* rows_out) noexcept {
     assert(th != nullptr && p != nullptr);
-    assert(rm != nullptr && n_rm != nullptr && n_del != nullptr);
+    assert(rm != nullptr && n_rm != nullptr && order_out != nullptr && n_part_out != nullptr && rows_out != nullptr);
     Arena* a = th->arena;
-    *n_rm = 0; *n_del = 0;
+    *n_rm = 0;
     uint64_t rows = 0;
     auto* order = a->allocate_array<uint32_t>(p->n_files + 1u);
     *rm = a->allocate_array<const char*>(p->n_files + 1u);
@@ -192,6 +207,23 @@ bool dml_split(TableHandle* th, const DmlPlan* p, const char*** rm, uint32_t* n_
             while (j >= gap && std::strcmp(p->files[order[j - gap]].path, p->files[x].path) > 0) { order[j] = order[j - gap]; j -= gap; }
             order[j] = x;
         }
+    *order_out = order;
+    *n_part_out = n_part;
+    *rows_out = rows;
+    return true;
+}
+
+// Whole files to remove and the (path, pos) rows of the partial ones, in file_path then pos order.
+bool dml_split(TableHandle* th, const DmlPlan* p, const char*** rm, uint32_t* n_rm, const char*** del_paths,
+               int64_t** del_pos, uint32_t* n_del) noexcept {
+    assert(th != nullptr && p != nullptr);
+    assert(rm != nullptr && n_rm != nullptr && n_del != nullptr);
+    Arena* a = th->arena;
+    *n_del = 0;
+    uint32_t* order = nullptr;
+    uint32_t n_part = 0;
+    uint64_t rows = 0;
+    if (!dml_partition_files(th, p, rm, n_rm, &order, &n_part, &rows)) return false;
     if (rows > UINT32_MAX) return false;
     *del_paths = a->allocate_array<const char*>(rows + 1u);
     *del_pos = a->allocate_array<int64_t>(rows + 1u);

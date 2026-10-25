@@ -181,6 +181,33 @@ bool table_delete(TableHandle* th, const Predicate* pred) noexcept;
 bool table_overwrite(TableHandle* th, const Predicate* pred,
                      const BoltBatch* batch) noexcept;
 
+// How a row delete is written (G2ICE-283). kPosition is table_delete's (file_path, pos) files. kEquality writes the
+// deleted rows' key values (`equality_ids`, or the schema's identifier-field-ids when n_equality_ids is 0): one file per
+// (spec, tuple) of the rows' data files, or with `global` one file under an unpartitioned spec that applies to every
+// partition (one is added to the table's specs when it has none). A key column must be a top-level primitive that is not
+// float, double or decimal(p > 18). A predicate delete in kEquality mode is refused (kConflict) when a key it deletes is
+// also carried by a live row the predicate keeps, in the same scope: an equality delete removes every older row with
+// that key. `position_row` adds the deleted row to each position delete, in the optional `row` column (field 2147483544).
+enum class DeleteFileKind : uint8_t { kPosition = 0, kEquality = 1 };
+struct DeleteOptions {
+    DeleteFileKind kind;
+    bool           position_row;
+    bool           global;
+    uint8_t        _pad;
+    uint32_t       n_equality_ids;
+    int32_t        equality_ids[limits::kMaxEqualityIds];
+};
+bool table_delete_with(TableHandle* th, const Predicate* pred, const DeleteOptions* opts) noexcept;
+bool table_overwrite_with(TableHandle* th, const Predicate* pred, const BoltBatch* batch,
+                          const DeleteOptions* opts) noexcept;
+
+// Equality delete by key, without reading the table (an upsert's delete half): every live row whose key columns equal a
+// row of `keys` is deleted. `keys` holds exactly the key columns, named as the schema names them; `opts` must be kEquality
+// (its equality_ids, or the identifier fields). On a partitioned table the delete is global unless every live data file
+// is under the default spec and each of its source columns is a key column; then one file is written per tuple. One
+// snapshot, operation "delete"; an empty `keys` commits nothing.
+bool table_delete_keys(TableHandle* th, const BoltBatch* keys, const DeleteOptions* opts) noexcept;
+
 // Compaction: live data files smaller than target/2 are rewritten, with every delete that applies to them applied,
 // into new files of at most ~target input bytes each, when there are at least two of them or one has position
 // deletes. The rewritten files and the position-delete files they fully apply are removed, in one snapshot with

@@ -29,6 +29,7 @@
 #include "bolt/lakehouse/iceberg/metrics.h"
 #include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
+#include "iceberg_eq_key.h"
 
 #include <atomic>
 #include <cassert>
@@ -1284,7 +1285,10 @@ bool position_delete_schema(Arena* a, Schema* out) noexcept {
 
 #include "iceberg_dml.inc"
 #include "iceberg_dml_partition.inc"
+#include "iceberg_delete_row.inc"
 #include "iceberg_dml_ops.inc"
+#include "iceberg_delete_eq.inc"
+#include "iceberg_delete_eq_ops.inc"
 #include "iceberg_compact.inc"
 
 bool table_delete_positions(TableHandle* th, const PositionDeleteEntry* dels,

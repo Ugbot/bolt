@@ -596,9 +596,9 @@ bool put_entry_metrics(EntryRow* r, const FileStats& st) noexcept {
 // equality_ids as array<int>; 0 bytes when the file names none.
 uint32_t encode_equality_ids(const DataFileRef& d, uint8_t* dst, uint32_t cap) noexcept {
     assert(dst != nullptr);
-    if (d.n_equality_ids == 0u || d.n_equality_ids > 8u || cap < 32u + 10u * d.n_equality_ids) return 0u;
+    if (d.n_equality_ids == 0u || d.n_equality_ids > limits::kMaxEqualityIds || cap < 32u + 10u * d.n_equality_ids) return 0u;
     uint32_t o = enc_long_stat(static_cast<int64_t>(d.n_equality_ids), dst);
-    for (uint32_t k = 0; k < d.n_equality_ids; ++k) o += enc_long_stat(d.equality_ids[k], dst + o);   // bounded: 8
+    for (uint32_t k = 0; k < d.n_equality_ids; ++k) o += enc_long_stat(d.equality_ids[k], dst + o);   // bounded: kMaxEqualityIds
     o += enc_long_stat(0, dst + o);
     return o;
 }
@@ -612,9 +612,11 @@ bool put_entry_tail(EntryRow* r, const DataFileRef& d, bool v3, bool v2_ref) noe
     uint8_t* buf = r->scratch->allocate_array<uint8_t>(static_cast<size_t>(scap));
     if (buf == nullptr) return false;
     put_container(r, buf, encode_split_offsets(&d.stats, buf, static_cast<uint32_t>(scap)));
-    uint8_t* eq = r->scratch->allocate_array<uint8_t>(128u);
+    uint8_t* eq = r->scratch->allocate_array<uint8_t>(256u);
     if (eq == nullptr) return false;
-    put_container(r, eq, d.content == FileContent::kEqualityDeletes ? encode_equality_ids(d, eq, 128u) : 0u);
+    const uint32_t eq_len = d.content == FileContent::kEqualityDeletes ? encode_equality_ids(d, eq, 256u) : 0u;
+    if (d.content == FileContent::kEqualityDeletes && eq_len == 0u) return false;   // an equality delete names its key
+    put_container(r, eq, eq_len);
     if (d.stats.has_sort_order_id && d.content == FileContent::kData) put_long(&r->v[r->i++], d.stats.sort_order_id);
     else put_null(&r->v[r->i++]);
     if (v3) {

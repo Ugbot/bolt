@@ -267,9 +267,9 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
 
     if (rep == kRepEqualityIds) {                       // array<int>
         if (n_vals < 1u || vals[0].is_null) return true;
-        if (s->pending.n_equality_ids >= 8u) return true;   // bounded
-        s->pending.equality_ids[s->pending.n_equality_ids++] =
-            static_cast<int32_t>(vals[0].num.i64);
+        if (s->pending.n_equality_ids < limits::kMaxEqualityIds)   // more are counted, not kept: consumers refuse
+            s->pending.equality_ids[s->pending.n_equality_ids] = static_cast<int32_t>(vals[0].num.i64);
+        if (s->pending.n_equality_ids <= limits::kMaxEqualityIds) ++s->pending.n_equality_ids;
         return true;
     }
     if (rep == kRepSplitOffsets) {                      // array<long>

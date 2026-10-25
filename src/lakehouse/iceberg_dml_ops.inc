@@ -34,13 +34,17 @@ bool dml_add_files(TableHandle* th, int64_t snap_id, const BoltBatch* add, DmlOu
 }
 
 // Write the position-delete files and the new data files this change needs.
+// `rows`: the plan whose matched rows go in each delete's `row` column (G2ICE-283); null writes (file_path, pos) only.
 bool dml_write_outputs(TableHandle* th, int64_t snap_id, const char* const* del_paths, const int64_t* del_pos,
-                       uint32_t n_del, const BoltBatch* add, const LiveData* live, DmlOutputs* o) noexcept {
+                       uint32_t n_del, const BoltBatch* add, const LiveData* live, const DmlPlan* rows,
+                       DmlOutputs* o) noexcept {
     assert(th != nullptr && o != nullptr && live != nullptr);
     assert(snap_id > 0);
     *o = DmlOutputs{};
-    bool ok = n_del == 0 || write_grouped_deletes(th, snap_id, del_paths, del_pos, n_del, live, &o->dels,
-                                                  &o->del_rels, &o->n_dels);
+    bool ok = n_del == 0 ||
+              (rows != nullptr ? write_row_deletes(th, snap_id, rows, live, &o->dels, &o->del_rels, &o->n_dels)
+                               : write_grouped_deletes(th, snap_id, del_paths, del_pos, n_del, live, &o->dels,
+                                                       &o->del_rels, &o->n_dels));
     ok = ok && (add == nullptr || add->num_rows <= 0 || dml_add_files(th, snap_id, add, o));
     if (!ok) dml_complete(th, o, false);
     return ok;
@@ -57,23 +61,14 @@ bool pred_column_known(TableHandle* th, const Predicate* pred) noexcept {
     return false;
 }
 
-bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, SnapshotOp op) noexcept {
-    assert(th != nullptr && th->arena != nullptr);
-    th->last_error = CommitError::kFailed;
-    if (pred == nullptr) {
-        std::fprintf(stderr, "[iceberg_writer] a row delete needs a predicate; nothing was written\n");
-        return false;
-    }
-    if (!pred_column_known(th, pred)) return false;
-    if (!handle_is_current(th)) return false;
-    DmlPlan plan{th, nullptr, 0, 0};
-    Arena* ra = scratch_arena(th);
-    if (ra == nullptr) return false;
-    bool ok = th->meta.current_snapshot_id <= 0 || dml_read(th, ra, pred, nullptr, nullptr, dml_visit, &plan);
+// The read, split and commit of dml_change; `ra` holds the read's batches (the kept rows share its bytes) until it returns.
+bool dml_change_in(TableHandle* th, const Predicate* pred, const BoltBatch* add, SnapshotOp op, DmlPlan* plan,
+                   Arena* ra) noexcept {
+    assert(th != nullptr && plan != nullptr && ra != nullptr);
+    bool ok = th->meta.current_snapshot_id <= 0 || dml_read(th, ra, pred, nullptr, nullptr, dml_visit, plan);
     const char** rm = nullptr; const char** del_paths = nullptr; int64_t* del_pos = nullptr;
     uint32_t n_rm = 0, n_del = 0;
-    ok = ok && dml_split(th, &plan, &rm, &n_rm, &del_paths, &del_pos, &n_del);
-    ra->~Arena();
+    ok = ok && dml_split(th, plan, &rm, &n_rm, &del_paths, &del_pos, &n_del);
     if (!ok) return false;
     if ((add == nullptr || add->num_rows == 0) && n_rm == 0 && n_del == 0) { th->last_error = CommitError::kNone; return true; }
     if (th->file_io != nullptr && n_del != 0 && add != nullptr && add->num_rows > 0)
@@ -82,7 +77,8 @@ bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, Sn
     if (n_del != 0 && !live_data_build(th, &live)) return false;
     const int64_t snap_id = mint_snapshot_id(th);
     DmlOutputs o{};
-    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &live, &o)) return false;
+    if (!dml_write_outputs(th, snap_id, del_paths, del_pos, n_del, add, &live, plan->with_rows ? plan : nullptr, &o))
+        return false;
     ChangeSet cs{};
     cs.op = op;
     cs.snap_id = snap_id;
@@ -97,17 +93,37 @@ bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, Sn
     return committed;
 }
 
+bool dml_change(TableHandle* th, const Predicate* pred, const BoltBatch* add, SnapshotOp op,
+                const DeleteOptions* opts) noexcept {
+    assert(th != nullptr && th->arena != nullptr);
+    th->last_error = CommitError::kFailed;
+    if (pred == nullptr) {
+        std::fprintf(stderr, "[iceberg_writer] a row delete needs a predicate; nothing was written\n");
+        return false;
+    }
+    if (!pred_column_known(th, pred)) return false;
+    if (!handle_is_current(th)) return false;
+    DmlPlan plan{th, nullptr, 0, 0, opts != nullptr && opts->position_row};
+    if (plan.with_rows && !row_schema_ok(th))
+        return refuse_named(th, "a position delete `row` column for a schema with a nested column");
+    Arena* ra = scratch_arena(th);
+    if (ra == nullptr) return false;
+    const bool ok = dml_change_in(th, pred, add, op, &plan, ra);
+    ra->~Arena();
+    return ok;
+}
+
 }  // namespace
 
 bool table_overwrite(TableHandle* th, const Predicate* pred, const BoltBatch* batch) noexcept {
     assert(th != nullptr);
     if (!write_ready(th)) return false;
     if (batch == nullptr) { th->last_error = CommitError::kFailed; return false; }
-    return dml_change(th, pred, batch, SnapshotOp::kOverwrite);
+    return dml_change(th, pred, batch, SnapshotOp::kOverwrite, nullptr);
 }
 
 bool table_delete(TableHandle* th, const Predicate* pred) noexcept {
     assert(th != nullptr);
     if (!write_ready(th)) return false;
-    return dml_change(th, pred, nullptr, SnapshotOp::kDelete);
+    return dml_change(th, pred, nullptr, SnapshotOp::kDelete, nullptr);
 }

@@ -225,8 +225,8 @@ struct DataFileRef {
     bool           binary_bounds;
     uint8_t        _pad2[2];
     FileStats      stats;
-    int32_t        equality_ids[8];
-    uint32_t       n_equality_ids;
+    int32_t        equality_ids[limits::kMaxEqualityIds];
+    uint32_t       n_equality_ids;    // every id the entry names; > kMaxEqualityIds = more than are kept (refused)
     uint32_t       _pad3;
     // v3 deletion vector: a Puffin `deletion-vector-v1` blob located by (file_path, content_offset, content_size) that deletes
     // rows of exactly `referenced_data_file`. is_dv is set only when the manifest carried a non-null content_offset.

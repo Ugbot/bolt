@@ -7,10 +7,7 @@
 // partition (a delete written under an unpartitioned spec is global). Key equality is by value, never by position.
 
 
-uint64_t fnv64(const uint8_t* p, uint64_t n, uint64_t h = 1469598103934665603ull) noexcept {
-    for (uint64_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
+using eqkey::fnv64;
 
 // Hash of a partition tuple, identical for a data file and a delete file in the same partition of the same spec.
 uint64_t partition_hash(const DataFileRef& e) noexcept {
@@ -33,48 +30,14 @@ bool put_u32(uint8_t* b, uint32_t cap, uint32_t* n, uint32_t v) noexcept {
     std::memcpy(b + *n, &v, 4); *n += 4; return true;
 }
 
-// Canonical bytes of one row's equality columns. Every integer-like type compares as a signed 64-bit value, floats by value (-0.0 == 0.0),
-// strings by bytes; a type with no defined equality here fails the scan by name rather than comparing wrongly.
+// One row's equality columns as their canonical key bytes (iceberg_eq_key.h); a type with no defined equality fails the scan
+// by name rather than comparing wrongly.
 bool encode_eq_key(const BoltColumn* const* cols, uint32_t n, int64_t r, uint8_t* buf, uint32_t* len) noexcept {
-    uint32_t o = 0;
-    for (uint32_t c = 0; c < n; ++c) {
-        const BoltColumn& col = *cols[c];
-        if (o + 9 > kEqKeyMax) return false;
-        if (col.is_null(r)) { buf[o++] = 0; continue; }
-        switch (col.type) {
-            case BoltType::Bool: case BoltType::Int8: case BoltType::Int16: case BoltType::Int32: case BoltType::Int64:
-            case BoltType::UInt8: case BoltType::UInt16: case BoltType::UInt32: case BoltType::UInt64:
-            case BoltType::Date32: case BoltType::Date64: case BoltType::Timestamp: case BoltType::Duration: case BoltType::Decimal64: {
-                int64_t v = 0;
-                switch (col.type_size_bytes) {
-                    case 1: v = static_cast<const int8_t*>(col.data)[r]; break;
-                    case 2: v = static_cast<const int16_t*>(col.data)[r]; break;
-                    case 4: v = static_cast<const int32_t*>(col.data)[r]; break;
-                    default: v = static_cast<const int64_t*>(col.data)[r]; break;
-                }
-                buf[o++] = 1; std::memcpy(buf + o, &v, 8); o += 8; break;
-            }
-            case BoltType::Float32: case BoltType::Float64: {
-                double d = col.type == BoltType::Float32 ? static_cast<double>(static_cast<const float*>(col.data)[r])
-                                                          : static_cast<const double*>(col.data)[r];
-                if (d == 0.0) d = 0.0;
-                buf[o++] = 2; std::memcpy(buf + o, &d, 8); o += 8; break;
-            }
-            case BoltType::Utf8: case BoltType::Binary: {
-                const uint8_t* d = nullptr; int32_t sl = 0;
-                col.utf8_at(r, &d, &sl);
-                if (sl < 0 || o + 5 + static_cast<uint32_t>(sl) > kEqKeyMax) return false;
-                buf[o++] = 3; const uint32_t u = static_cast<uint32_t>(sl); std::memcpy(buf + o, &u, 4); o += 4;
-                if (sl > 0) std::memcpy(buf + o, d, static_cast<size_t>(sl));
-                o += static_cast<uint32_t>(sl); break;
-            }
-            default:
-                std::fprintf(stderr, "[iceberg_scan] REFUSED: equality delete on a column of decoded type %d, which has no defined equality here\n", static_cast<int>(col.type));
-                return false;
-        }
-    }
-    *len = o;
-    return true;
+    if (eqkey::encode(cols, n, r, buf, len)) return true;
+    for (uint32_t c = 0; c < n; ++c)
+        if (!eqkey::type_keyable(cols[c]->type))
+            std::fprintf(stderr, "[iceberg_scan] REFUSED: equality delete on a column of decoded type %d, which has no defined equality here\n", static_cast<int>(cols[c]->type));
+    return false;
 }
 
 bool eq_set_probe(const EqSet& set, uint64_t h, const uint8_t* key, uint32_t len) noexcept {

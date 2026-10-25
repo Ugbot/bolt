@@ -43,6 +43,7 @@
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
 #include "bolt/lakehouse/object_store/s3_uri.h"
+#include "iceberg_eq_key.h"
 
 #include <cassert>
 #include <cstdio>

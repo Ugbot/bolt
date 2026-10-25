@@ -11,6 +11,7 @@
 
 #include <cstdint>
 
+#include "bolt/lakehouse/iceberg/iceberg_limits.h"
 #include "bolt/lakehouse/iceberg/statistics.h"
 
 namespace bolt {
@@ -49,8 +50,8 @@ struct DeleteFileRef {
     char        path[kIcebergMaxPath];
     int64_t     file_size_in_bytes;
     int64_t     record_count;
-    int32_t     equality_ids[8];
-    uint32_t    n_equality_ids;
+    int32_t     equality_ids[limits::kMaxEqualityIds];
+    uint32_t    n_equality_ids;    // every id the file names; > kMaxEqualityIds = more than are kept (refused by readers)
     uint32_t    _pad2;
 };
 

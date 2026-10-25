@@ -2344,6 +2344,26 @@ add_test(NAME test_bolt_iceberg_dml_oracle
                  $<TARGET_FILE:test_bolt_iceberg_dml> ${CMAKE_CURRENT_BINARY_DIR}/iceberg_dml_fixture)
 set_tests_properties(test_bolt_iceberg_dml_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+# G2ICE-283 — equality-delete files (predicate, by key, scoped and global) and position deletes with the `row` column;
+# the external verdict (DuckDB, pyiceberg, pyarrow) is scripts/iceberg_delete_writers_interop.py.
+add_executable(test_bolt_iceberg_delete_writers test_bolt_iceberg_delete_writers.cpp)
+target_link_libraries(test_bolt_iceberg_delete_writers
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_delete_writers)
+add_test(NAME test_bolt_iceberg_delete_writers COMMAND test_bolt_iceberg_delete_writers)
+set_tests_properties(test_bolt_iceberg_delete_writers PROPERTIES TIMEOUT 300)
+# DuckDB 2.0: 1.4.5 fails with INTERNAL Error "Comparison on NULL values" on an equality delete whose partition value is null.
+if(BOLT_UV)
+    set(BOLT_DELETE_ORACLE_CMD ${BOLT_UV} run --no-project --python 3.12 --with pyiceberg[pyiceberg-core]
+        --with pyarrow --with duckdb==2.0.* python)
+else()
+    set(BOLT_DELETE_ORACLE_CMD python3)
+endif()
+add_test(NAME test_bolt_iceberg_delete_writers_oracle
+         COMMAND ${BOLT_DELETE_ORACLE_CMD} ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/iceberg_delete_writers_interop.py
+                 $<TARGET_FILE:test_bolt_iceberg_delete_writers> ${CMAKE_CURRENT_BINARY_DIR}/iceberg_delete_writers_fixture)
+set_tests_properties(test_bolt_iceberg_delete_writers_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 # G2ICE-292 — partition transform value kernels against the spec's Appendix B hash vectors and truncate examples.
 add_executable(test_bolt_iceberg_transforms test_bolt_iceberg_transforms.cpp)
 target_link_libraries(test_bolt_iceberg_transforms PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)

@@ -232,10 +232,8 @@ void read_eq_ids(const bj::StructuralIndex* /*idx*/, bj::Iterator* it,
         if (t == bj::TokenType::EndArray) { bj::iter_advance(it); break; }
         if (t == bj::TokenType::Int64) {
             int64_t v = 0; bj::iter_int64(it, &v); bj::iter_advance(it);
-            if (out->n_equality_ids < 8) {
-                out->equality_ids[out->n_equality_ids++] =
-                    static_cast<int32_t>(v);
-            }
+            if (out->n_equality_ids < limits::kMaxEqualityIds) out->equality_ids[out->n_equality_ids] = static_cast<int32_t>(v);
+            if (out->n_equality_ids <= limits::kMaxEqualityIds) ++out->n_equality_ids;   // more are counted: refused
         } else {
             skip_value(it);
         }
