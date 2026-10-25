@@ -185,8 +185,9 @@ bool table_overwrite(TableHandle* th, const Predicate* pred,
 // into new files of at most ~target input bytes each, when there are at least two of them or one has position
 // deletes. The rewritten files and the position-delete files they fully apply are removed, in one snapshot with
 // operation "replace"; the rows the table returns are unchanged. Nothing to do commits nothing and returns true.
-// Under FileWriteIO it is refused when it would write more than one file. `opts` null = defaults; run_bin_pack false
-// does nothing.
+// Under FileWriteIO each output is published as it closes; the previous output's local source is released when the next
+// one stages (the last keeps its source until the commit resolves), and a commit that definitely fails removes every
+// published output (an uncertain one removes none). `opts` null = defaults; run_bin_pack false does nothing.
 bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept;
 
 // Schema evolution. Each call is ADDITIVE (Iceberg spec): it appends a new,
