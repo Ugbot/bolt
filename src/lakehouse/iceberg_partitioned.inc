@@ -303,7 +303,7 @@ bool write_partitioned_files(TableHandle* th, const PartitionSpec* spec, const B
         if (!abs_location(th->root, (*rels)[g], df.file_path, sizeof(df.file_path))) return false;
         df.stats.record_count = rows;
         df.stats.file_size_in_bytes = size;
-        if (const Schema* cur = metadata_current_schema(&th->meta)) compute_file_stats(pg.batches, pg.n_batches, cur, &df.stats);
+        if (!compute_file_stats(th, pg.batches, pg.n_batches, &df.stats)) return false;
     }
     return true;
 }

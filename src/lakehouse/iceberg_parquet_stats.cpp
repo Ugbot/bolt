@@ -13,6 +13,8 @@
 #include "bolt/lakehouse/iceberg/statistics.h"
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_budget.h"
+#include "bolt/bolt_resource.h"
 #include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_read.h"
@@ -123,7 +125,7 @@ int cmp_bound(BoundKind k, const uint8_t* a, uint32_t al, const uint8_t* b,
 bool chunk_bound_ok(BoundKind k, const pq::PqChunk& ch, bool want_min) noexcept {
     const uint32_t len = want_min ? ch.min_len : ch.max_len;
     const uint8_t* b   = want_min ? ch.min_bytes : ch.max_bytes;
-    if (len == 0u || len > kLakeMaxValBytes) return false;
+    if (len == 0u) return false;
     if (k == BoundKind::kBytes) {
         const uint32_t flag = want_min ? pq::kPqStatMinIsValueField
                                        : pq::kPqStatMaxIsValueField;
@@ -141,8 +143,8 @@ struct ColFold {
     bool     lo_ok, hi_ok;     // still eligible for a bound
     bool     have;             // at least one non-all-null row group seen
     uint32_t lo_len, hi_len;
-    uint8_t  lo[kLakeMaxValBytes];
-    uint8_t  hi[kLakeMaxValBytes];
+    const uint8_t* lo;         // into the footer's chunk statistics
+    const uint8_t* hi;
 };
 
 void fold_chunk(BoundKind k, const pq::PqChunk& ch, ColFold* f) noexcept {
@@ -158,35 +160,24 @@ void fold_chunk(BoundKind k, const pq::PqChunk& ch, ColFold* f) noexcept {
     if (!hi_in) f->hi_ok = false;
     if (f->lo_ok && (!f->have ||
                      cmp_bound(k, ch.min_bytes, ch.min_len, f->lo, f->lo_len) < 0)) {
-        std::memcpy(f->lo, ch.min_bytes, ch.min_len);
+        f->lo = ch.min_bytes;
         f->lo_len = ch.min_len;
     }
     if (f->hi_ok && (!f->have ||
                      cmp_bound(k, ch.max_bytes, ch.max_len, f->hi, f->hi_len) > 0)) {
-        std::memcpy(f->hi, ch.max_bytes, ch.max_len);
+        f->hi = ch.max_bytes;
         f->hi_len = ch.max_len;
     }
     f->have = true;
 }
 
-void emit_col(BoundKind k, int32_t field_id, const ColFold& f,
-              ColumnStatEntry* e) noexcept {
-    assert(e != nullptr);
-    assert(field_id > 0);
-    std::memset(e, 0, sizeof(*e));
-    e->field_id   = field_id;
-    e->null_count = f.nulls;
-    if (k == BoundKind::kNone || !f.have) return;
-    if (f.lo_ok) {
-        e->has_lower = true;
-        e->lower_len = static_cast<uint8_t>(f.lo_len);
-        std::memcpy(e->lower, f.lo, f.lo_len);
-    }
-    if (f.hi_ok) {
-        e->has_upper = true;
-        e->upper_len = static_cast<uint8_t>(f.hi_len);
-        std::memcpy(e->upper, f.hi, f.hi_len);
-    }
+// The folded bounds into e (whose counts the caller set). False = a bound over iceberg_bound_bytes (refused).
+bool emit_bounds(BoundKind k, const ColFold& f, ColumnStatEntry* e, Arena* a) noexcept {
+    assert(e != nullptr && a != nullptr);
+    if (k == BoundKind::kNone || !f.have) return true;
+    if (f.lo_ok && !stats_set_bound(e, a, true, f.lo, f.lo_len)) return false;
+    if (f.hi_ok && !stats_set_bound(e, a, false, f.hi, f.hi_len)) return false;
+    return true;
 }
 
 }  // namespace
@@ -194,9 +185,9 @@ void emit_col(BoundKind k, int32_t field_id, const ColFold& f,
 bool file_stats_from_parquet_meta(const pq::PqMeta* meta,
                                   const int32_t* field_ids,
                                   uint32_t n_field_ids,
-                                  FileStats* out) noexcept {
+                                  Arena* a, FileStats* out) noexcept {
     assert(out != nullptr);
-    if (meta == nullptr || field_ids == nullptr || out == nullptr) return false;
+    if (meta == nullptr || field_ids == nullptr || out == nullptr || a == nullptr) return false;
     if (meta->n_columns > kMaxColumns) return false;
     if (meta->n_row_groups > pq::kPqMaxRowGroups) return false;
     if (meta->n_row_groups > 0u && meta->chunks == nullptr) return false;
@@ -204,7 +195,6 @@ bool file_stats_from_parquet_meta(const pq::PqMeta* meta,
     const uint32_t nc = meta->n_columns < n_field_ids ? meta->n_columns : n_field_ids;
     for (uint32_t c = 0; c < nc; ++c) {                     // bounded: kMaxColumns
         if (field_ids[c] <= 0) continue;
-        if (out->n_cols >= kIcebergMaxStatCols) break;      // degrades pruning only
         const pq::PqColumn& col = meta->columns[c];
         if (col.max_rep != 0u) continue;                    // repeated: not a leaf value
         const BoundKind k = bound_kind(col);
@@ -219,10 +209,11 @@ bool file_stats_from_parquet_meta(const pq::PqMeta* meta,
             fold_chunk(k, meta->chunks[rg.chunk_off + c], &f);
         }
         if (!f.nulls_known) continue;
-        emit_col(k, field_ids[c], f, &out->cols[out->n_cols]);
-        ++out->n_cols;
+        ColumnStatEntry* e = stats_add_col(out, a, field_ids[c]);
+        if (e == nullptr) return false;                     // over iceberg_stat_columns
+        e->null_count = f.nulls;
+        if (!emit_bounds(k, f, e, a)) return false;
     }
-    assert(out->n_cols <= kIcebergMaxStatCols);
     return true;
 }
 

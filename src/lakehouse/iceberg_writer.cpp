@@ -1045,11 +1045,14 @@ namespace {
 // G2ICE-296: the full Iceberg metrics of the batches (value / null / NaN counts, truncate(16) bounds for every primitive
 // type: NaN excluded, -0.0 before +0.0, strings / binary truncated with an incremented upper, decimals, uuids, fixed) via
 // file_metrics_from_batches. Before, floats could carry a NaN bound and strings / decimals had none.
-bool compute_file_stats(const BoltBatch* const* batches, uint32_t n_batches,
-                        const Schema* sch, FileStats* out) noexcept {
-    assert(batches != nullptr && sch != nullptr && out != nullptr);
-    assert(n_batches > 0 && sch->n_fields > 0);
-    return file_metrics_from_batches(batches, n_batches, sch, MetricsModeSpec{}, out);
+// G2ICE-336: the metrics live in the table handle's arena; a budget refusal (iceberg_stat_columns,
+// iceberg_bound_bytes) fails the write rather than committing a file with metrics missing.
+bool compute_file_stats(TableHandle* th, const BoltBatch* const* batches, uint32_t n_batches, FileStats* out) noexcept {
+    assert(th != nullptr && batches != nullptr && out != nullptr);
+    assert(n_batches > 0);
+    const Schema* sch = metadata_current_schema(&th->meta);
+    if (sch == nullptr) return true;                                     // no schema: record_count / size only
+    return file_metrics_from_batches(batches, n_batches, sch, MetricsModeSpec{}, th->arena, out);
 }
 
 // Internal: write one Parquet data file from a list of batches and return the
@@ -1187,12 +1190,10 @@ bool append_commit_ex(AppendHandle* ah, char* out_path, uint32_t out_path_cap,
     }
     df.stats.record_count       = rows;
     df.stats.file_size_in_bytes = size;
-    // G2ICE-135 — real per-column null_count + numeric bounds from the exact
-    // batches just serialized above. Best-effort: a schema lookup miss or an
-    // unmapped column still commits the file (record_count/size stay real
-    // either way); it just carries no column-level stats, same as before.
-    if (const Schema* cur = metadata_current_schema(&ah->th->meta)) {
-        compute_file_stats(ah->pending, ah->n_pending, cur, &df.stats);
+    // G2ICE-135 — real per-column metrics from the exact batches just serialized above.
+    if (!compute_file_stats(ah->th, ah->pending, ah->n_pending, &df.stats)) {
+        data_file_complete(ah->th, rel, false);
+        return false;
     }
     if (!publish_snapshot(ah->th, &df, 1, SnapshotOp::kAppend, snap_id)) {
         // Only a definitive refusal proves this file was not published.

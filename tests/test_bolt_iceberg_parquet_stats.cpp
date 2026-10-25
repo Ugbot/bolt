@@ -156,7 +156,7 @@ void fold(bolt::Arena* a, ice::FileStats* st) {
     ASSERT_EQ(meta->n_row_groups, 3u);
     const int32_t fids[4] = {1, 2, 3, 4};
     std::memset(st, 0, sizeof(*st));
-    ASSERT_TRUE(ice::file_stats_from_parquet_meta(meta, fids, 4, st));
+    ASSERT_TRUE(ice::file_stats_from_parquet_meta(meta, fids, 4, a, st));
 }
 
 }  // namespace
@@ -207,11 +207,11 @@ TEST(IcebergParquetStats, SkipsUnmappedColumnsAndRejectsNull) {
     ASSERT_TRUE(pq::parquet_read_meta(buf, len, &a, meta));
     const int32_t fids[4] = {0, 7, -1, 0};
     ice::FileStats st{};
-    ASSERT_TRUE(ice::file_stats_from_parquet_meta(meta, fids, 4, &st));
+    ASSERT_TRUE(ice::file_stats_from_parquet_meta(meta, fids, 4, &a, &st));
     ASSERT_EQ(st.n_cols, 1u);
     EXPECT_EQ(st.cols[0].field_id, 7);
-    EXPECT_FALSE(ice::file_stats_from_parquet_meta(nullptr, fids, 4, &st));
-    EXPECT_FALSE(ice::file_stats_from_parquet_meta(meta, nullptr, 4, &st));
+    EXPECT_FALSE(ice::file_stats_from_parquet_meta(nullptr, fids, 4, &a, &st));
+    EXPECT_FALSE(ice::file_stats_from_parquet_meta(meta, nullptr, 4, &a, &st));
 }
 
 // The stats survive the manifest writer and the pyiceberg-verified reader.

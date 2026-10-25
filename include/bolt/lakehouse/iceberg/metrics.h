@@ -13,8 +13,9 @@
 //     incremented, dropping trailing code points (bytes) that cannot be; no upper bound when none can;
 //   - decimal bounds are the unscaled value, two's-complement big-endian, minimal bytes; uuid 16 bytes big-endian;
 //     fixed[L] its L bytes, never truncated.
-// A bound wider than a ColumnStatEntry slot is truncated the same way (still a valid bound), or dropped for types
-// that are never truncated. Tiger Style: bounded loops, no allocation outside the caller's arena.
+// Every column and every bound is kept, in the caller's arena: a file with more metric columns than the
+// iceberg_stat_columns budget, or a bound longer than iceberg_bound_bytes (full mode keeps the whole value), is refused
+// with ResourceExhausted naming the knob, never cut. Tiger Style: bounded loops, no allocation outside that arena.
 
 #pragma once
 
@@ -55,16 +56,16 @@ struct MetricsLeaf {
 };
 
 // The metrics of the parquet file `bytes[0..len)` whose footer is `meta`; `leaves[c]` describes meta->columns[c]
-// (n_leaves may be shorter: the rest are skipped). Writes out->n_cols / cols / split_offsets / sort_order_id;
-// record_count and file_size_in_bytes stay the caller's. A column whose values cannot be decoded keeps its counts and
-// loses only what needs the values (bounds, NaN count). False only for a malformed footer.
+// (n_leaves may be shorter: the rest are skipped). Writes out->n_cols / cols / split_offsets / sort_order_id, storage
+// in `a`; record_count and file_size_in_bytes stay the caller's. A column whose values cannot be decoded keeps its
+// counts and loses only what needs the values (bounds, NaN count). False for a malformed footer or a refused budget.
 bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const ::bolt::ingest::parquet::PqMeta* meta,
-                               const MetricsLeaf* leaves, uint32_t n_leaves, FileStats* out) noexcept;
+                               const MetricsLeaf* leaves, uint32_t n_leaves, Arena* a, FileStats* out) noexcept;
 
 // The same metrics from the batches a writer is about to serialize as one file, for each primitive field of `sch` the batches
 // carry by name, all under `mode`: counts, NaN counts and bounds; no column_sizes or split_offsets (they belong to the file).
 bool file_metrics_from_batches(const BoltBatch* const* batches, uint32_t n_batches, const Schema* sch, const MetricsModeSpec& mode,
-                               FileStats* out) noexcept;
+                               Arena* a, FileStats* out) noexcept;
 
 // Truncation (spec "Appendix F", Iceberg-Java UnicodeUtil / BinaryUtil). `utf8` truncates to `units` code points, else
 // to `units` bytes; the result also fits `cap` bytes. Lower: the prefix length. Upper: the incremented prefix written

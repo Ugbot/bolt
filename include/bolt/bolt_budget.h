@@ -51,6 +51,13 @@
     X(lake_metadata_budget_mb, kBudget, "MiB", 1024, 1, (UINT64_MAX >> 20),     \
       "BOLT_LAKE_METADATA_BUDGET_MB", nullptr,                                  \
       "Iceberg/Delta metadata held by one table handle or one scan")          \
+    X(iceberg_stat_columns, kBudget, "columns", 32768, 1, UINT32_MAX,          \
+      "BOLT_ICEBERG_STAT_COLUMNS", nullptr,                                     \
+      "Iceberg data file: columns whose metrics one file carries")           \
+    X(iceberg_bound_bytes, kBudget, "bytes", 16777216, 1, UINT32_MAX,           \
+      "BOLT_ICEBERG_BOUND_BYTES", nullptr,                                      \
+      "Iceberg data file: bytes of one lower / upper bound (full mode keeps " \
+      "the whole value)")                                                     \
     X(max_vector_dim, kInvariant, "dims", 65535, 65535, 65535, nullptr,         \
       nullptr, "vector dimension validation ceiling (bolt::kMaxVectorDim)")      \
     X(max_columns, kInvariant, "columns", 32768, 32768, 32768, nullptr,         \

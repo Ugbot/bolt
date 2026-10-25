@@ -235,7 +235,7 @@ bool compact_close(CompactOut* o) noexcept {
     if (!abs_location(th->root, o->rel, df.file_path, sizeof(df.file_path))) return false;
     df.stats.record_count = o->rows;
     df.stats.file_size_in_bytes = size;
-    if (const Schema* cur = metadata_current_schema(&th->meta)) compute_file_stats(o->batches, o->n_batches, cur, &df.stats);
+    if (!compute_file_stats(th, o->batches, o->n_batches, &df.stats)) return false;
     o->n_batches = 0;
     o->rows = 0;
     return true;

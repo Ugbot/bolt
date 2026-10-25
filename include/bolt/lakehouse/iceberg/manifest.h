@@ -45,11 +45,11 @@
 //     use. Joining the ordinal against a v2 spec's field-id (>= 1000) matches
 //     nothing, so before that flag existed partition pruning silently did
 //     NOTHING for a real manifest.
-//   - Bounds are truncated at kLakeMaxValBytes (64); `lower_len`/`upper_len`
-//     report the stored length, and `DataFileRef::binary_bounds` says they are
-//     Iceberg's binary single-value encoding rather than ASCII.
-//   - Per-column stats past kIcebergMaxStatCols (32) are dropped — stats are a
-//     pruning aid, so this degrades pruning, never correctness.
+//   - Bounds are kept whole, in the parse arena (G2ICE-336); `lower_len` /
+//     `upper_len` report their length, and `DataFileRef::binary_bounds` says
+//     they are Iceberg's binary single-value encoding rather than ASCII. A
+//     bound over iceberg_bound_bytes, or more metric columns than
+//     iceberg_stat_columns, refuses the manifest (ResourceExhausted).
 //   - `zstd`-coded OCFs are unsupported (null / deflate / snappy are).
 //
 // JSON Manifest-list:

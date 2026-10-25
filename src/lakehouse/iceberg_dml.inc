@@ -218,7 +218,7 @@ bool dml_data_file(TableHandle* th, int64_t snap_id, const BoltBatch* batch, cha
     if (!abs_location(th->root, rel, df->file_path, sizeof(df->file_path))) { data_file_complete(th, rel, false); return false; }
     df->stats.record_count = rows;
     df->stats.file_size_in_bytes = size;
-    if (const Schema* cur = metadata_current_schema(&th->meta)) compute_file_stats(one, 1u, cur, &df->stats);
+    if (!compute_file_stats(th, one, 1u, &df->stats)) { data_file_complete(th, rel, false); return false; }
     return true;
 }
 
