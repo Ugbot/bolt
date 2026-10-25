@@ -36,6 +36,13 @@ int upper_hex(unsigned char c) noexcept {
     return -1;
 }
 
+// G2ICE-300: RFC 3986 sub-delims and ':' / '@' are literal path characters (Spark writes partition directories such as
+// "p=1"; Iceberg-Java's S3FileIO maps the path to the key byte for byte). They stay literal: never decoded, never aliases.
+bool sub_delim(unsigned char c) noexcept {
+    return c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' || c == '+' || c == ',' ||
+           c == ';' || c == '=' || c == ':' || c == '@';
+}
+
 Status canonical(const char* uri, uint32_t length) noexcept {
     assert(uri != nullptr); assert(length < kOsMaxKey);
     if (length < 5 || std::memcmp(uri, "s3://", 5) != 0) return Status::Unsupported;
@@ -55,7 +62,7 @@ Status canonical(const char* uri, uint32_t length) noexcept {
     if (!components(path, n)) return Status::BadArg;
     for (uint32_t i = 0; i < n; ++i) {
         const auto c = static_cast<unsigned char>(path[i]);
-        if (oshttp::unreserved(c) || c == '/') continue;
+        if (oshttp::unreserved(c) || c == '/' || sub_delim(c)) continue;
         if (c != '%' || n - i < 3) return Status::BadArg;
         const int hi = upper_hex(static_cast<unsigned char>(path[i + 1]));
         const int lo = upper_hex(static_cast<unsigned char>(path[i + 2]));
@@ -85,9 +92,24 @@ S3UriStatus s3_uri_validate(const char* uri) noexcept {
                                  : Status::BadArg;
 }
 
+// G2ICE-300: Hadoop's s3a:// and s3n:// name the same bucket and key as s3:// (Iceberg-Java's S3FileIO and HadoopFileIO
+// read all three); a recorded path in either is mapped exactly as its s3:// spelling. Only the recorded path takes
+// the alias: a configured root stays canonical.
+static S3UriStatus s3_alias_object_key(const char* root, const char* uri, char* out, uint32_t capacity) noexcept {
+    assert(uri != nullptr);
+    char canon[kOsMaxKey];
+    const size_t n = std::strlen(uri);
+    if (n - 1u >= sizeof(canon)) return Status::Capacity;
+    std::memcpy(canon, "s3", 2);
+    std::memcpy(canon + 2, uri + 3, n - 3u + 1u);                        // "s3a://x" -> "s3://x"
+    return s3_uri_object_key(root, canon, out, capacity);
+}
+
 S3UriStatus s3_uri_object_key(const char* root, const char* uri,
                             char* out, uint32_t capacity) noexcept {
     assert(kOsMaxKey > 5); assert(sizeof(char) == 1);
+    if (uri != nullptr && (std::strncmp(uri, "s3a://", 6) == 0 || std::strncmp(uri, "s3n://", 6) == 0))
+        return s3_alias_object_key(root, uri, out, capacity);
     Span inputs[2]{};
     if (!admit(root, uri, out, capacity, inputs)) return Status::BadArg;
     const auto root_len = static_cast<uint32_t>(inputs[0].size - 1);

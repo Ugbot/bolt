@@ -2206,6 +2206,14 @@ target_compile_definitions(test_bolt_iceberg_real_scan PRIVATE
 bolt_apply_hardening(test_bolt_iceberg_real_scan)
 add_test(NAME test_bolt_iceberg_real_scan COMMAND test_bolt_iceberg_real_scan)
 
+add_executable(test_bolt_iceberg_paths test_bolt_iceberg_paths.cpp)
+target_link_libraries(test_bolt_iceberg_paths
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_iceberg_paths PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_iceberg_paths)
+add_test(NAME test_bolt_iceberg_paths COMMAND test_bolt_iceberg_paths)
+
 add_executable(test_bolt_iceberg_ranged_scan test_bolt_iceberg_ranged_scan.cpp)
 target_link_libraries(test_bolt_iceberg_ranged_scan
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)

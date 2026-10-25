@@ -208,20 +208,27 @@ bool key_from_location(const char* location, const char* table_rel,
     return path_join(table_rel, rel, out, cap);
 }
 
-// Read whatever an Iceberg path points at, trying each rebasing in turn:
-// location-relative first (a relocated table), then the historical
-// strip-root and join-table-rel attempts (unchanged for W4 callers).
+bool has_scheme(const char* p) noexcept {
+    assert(p != nullptr);
+    return std::strncmp(p, "file:", 5) == 0 || std::strstr(p, "://") != nullptr;
+}
+
+// Read whatever an Iceberg path points at (G2ICE-300: exact rules, so a path never resolves to another object):
+//   1. a path under the table's `location` (scheme-insensitive: s3:// = s3a:// = s3n://, file:/x = /x) is read at its
+//      location-relative key and nowhere else: a relocated table;
+//   2. otherwise a path under the store root is read with the root stripped;
+//   3. otherwise a scheme-less path is read as given, then under the table (the W4 fixtures' relative paths);
+//   4. a URI outside both the location and the root is refused.
 bool read_ref(ObjectStore* os, const char* location, const char* fs_root,
               const char* table_rel, const char* path, Arena* scratch,
               const uint8_t** out_body, uint64_t* out_len) noexcept {
     assert(os != nullptr && path != nullptr);
     assert(out_body != nullptr && out_len != nullptr);
     char key[kCatMaxPath];
-    if (key_from_location(location, table_rel, path, key, sizeof(key)) &&
-        os_get(os, key, scratch, out_body, out_len) == kOsOk) {
-        return true;
-    }
+    if (key_from_location(location, table_rel, path, key, sizeof(key)))
+        return os_get(os, key, scratch, out_body, out_len) == kOsOk;
     const char* stripped = strip_root(fs_root, path);
+    if (stripped == path && has_scheme(path) && location != nullptr && location[0] != '\0') return false;
     if (os_get(os, stripped, scratch, out_body, out_len) == kOsOk) return true;
     if (path_join(table_rel, stripped, key, sizeof(key)) &&
         os_get(os, key, scratch, out_body, out_len) == kOsOk) {
@@ -268,9 +275,17 @@ int read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
 // warehouse uses:
 //   Hadoop catalog     "v12.metadata.json"                    -> 12
 //   catalog-managed    "00002-<uuid>.metadata.json"           -> 2
+//   either, gzipped    "v3.gz.metadata.json", "00003-<uuid>.metadata.json.gz"
 // The second is what pyiceberg's SqlCatalog, the Iceberg REST catalog, Glue
 // and Hive all write, and the pre-G2FEAT-125 reader recognised neither it nor
 // the absence of version-hint.text that goes with it.
+// G2ICE-300: the metadata suffixes Iceberg-Java reads: plain, gzip per the spec (".gz.metadata.json") and the legacy
+// ".metadata.json.gz". The bytes are recognised by content when parsed.
+bool metadata_suffix(const char* s) noexcept {
+    return std::strcmp(s, ".metadata.json") == 0 || std::strcmp(s, ".gz.metadata.json") == 0 ||
+           std::strcmp(s, ".metadata.json.gz") == 0;
+}
+
 bool metadata_version_of(const char* tail, int64_t* out) noexcept {
     assert(tail != nullptr && out != nullptr);
     const char* p = tail;
@@ -283,9 +298,9 @@ bool metadata_version_of(const char* tail, int64_t* out) noexcept {
     if (digits == 0u) return false;
     if (*p == '-') {                        // "<NNNNN>-<uuid>.metadata.json"
         if (p == tail) return false;        // a bare "-..." is not a version
-        const char* dot = std::strstr(p, ".metadata.json");
-        if (dot == nullptr || dot[14] != '\0') return false;
-    } else if (std::strcmp(p, ".metadata.json") != 0) {
+        const char* dot = std::strchr(p, '.');
+        if (dot == nullptr || !metadata_suffix(dot)) return false;
+    } else if (!metadata_suffix(p)) {
         return false;
     }
     *out = v;
@@ -386,11 +401,13 @@ TableHandle* new_table_handle(Arena* a) noexcept {
 // arena, which is reset when the scan moves to the next manifest.
 struct FileTask {
     const char* path;
+    const char* partition_json;   // G2ICE-300: the `_partition` column's text; set only when metadata columns are emitted
     int64_t     seq;        // data sequence number: the entry's own, else its manifest's (v1 tables: 0)
     int32_t     spec_id;
     uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
 };
 
+constexpr uint32_t kMetadataColumns = 5u;   // _file, _pos, _spec_id, _deleted, _partition (G2ICE-300)
 constexpr uint32_t kMaxEqualityIds = limits::kMaxEqualityIds;
 constexpr uint32_t kMaxEqualitySets = limits::kMaxEqualitySets;
 struct EqSet {
@@ -416,6 +433,7 @@ struct EqSet {
 
 // Declared here, defined in iceberg_eq_delete.inc (open_next_file runs before that include).
 namespace { void select_equality_sets(ScanHandle* s, const FileTask& f) noexcept; }
+#include "iceberg_scan_partition_column.inc"
 
 struct PinnedParquet {
     ObjectStore* store;
@@ -864,6 +882,43 @@ bool fill_row_positions(Arena* a, uint64_t base, int64_t rows, BoltColumn* out) 
     return true;
 }
 
+// A Utf8 column of `rows` copies of `str` (one arena copy, every view pointing at it).
+bool fill_const_utf8(Arena* a, const char* str, int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && str != nullptr && out != nullptr);
+    const uint32_t n = static_cast<uint32_t>(std::strlen(str));
+    char* bytes = static_cast<char*>(a->allocate(n + 1u, 8u));
+    if (bytes == nullptr) return false;
+    std::memcpy(bytes, str, n + 1u);
+    BoltColumn c = BoltColumn::make_flat_alloc(rows, BoltType::Utf8, a);
+    if (rows > 0 && c.data == nullptr) return false;
+    StringView v;
+    std::memset(&v, 0, sizeof(v));
+    v.length = n;
+    std::memcpy(v.prefix, bytes, n < 4u ? n : 4u);
+    if (n <= 12u) { if (n > 4u) std::memcpy(v.inline_data, bytes + 4, n - 4u); }
+    else { v.ref.buf_idx = 0; v.ref.offset = 0; }
+    auto* sv = static_cast<StringView*>(c.data);
+    for (int64_t r = 0; r < rows; ++r) sv[r] = v;                         // bounded by rows
+    c.str_overflow_base = bytes;
+    c.stats.all_valid = true;
+    *out = c;
+    return true;
+}
+
+// The four reserved metadata columns of one decoded group (G2ICE-300), into out[0..4).
+bool fill_metadata_columns(Arena* a, const FileTask& t, uint64_t base, int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && out != nullptr && t.path != nullptr);
+    if (!fill_const_utf8(a, t.path, rows, &out[0]) || !fill_row_positions(a, base, rows, &out[1])) return false;
+    auto* spec = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+    auto* del = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+    if (spec == nullptr || del == nullptr) return false;
+    for (int64_t r = 0; r < rows; ++r) { spec[r] = t.spec_id; del[r] = 0; }   // bounded by rows
+    out[2] = BoltColumn::make_flat(spec, nullptr, rows, BoltType::Int64);
+    out[3] = BoltColumn::make_flat(del, nullptr, rows, BoltType::Int64);
+    out[2].stats.all_valid = out[3].stats.all_valid = true;
+    return fill_const_utf8(a, t.partition_json != nullptr ? t.partition_json : "{}", rows, &out[4]);
+}
+
 // Keep only rows `sel[0..kept)` of every column, in place. Fails (never under-deletes) on a column shape it cannot compact.
 bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, uint32_t kept, int64_t* rows,
                       Arena* scratch, const char* what) noexcept {
@@ -1021,7 +1076,8 @@ struct VisitCtx {
     int64_t              mle_seq;   // the manifest's sequence number, inherited by entries that carry none
 };
 
-bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash) noexcept {
+bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash,
+               const char* partition_json = nullptr) noexcept {
     assert(s != nullptr && path != nullptr);
     const size_t len = std::strlen(path);
     const uint64_t before = s->tasks_cap;
@@ -1037,6 +1093,7 @@ bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, ui
     std::memcpy(p, path, len + 1u);
     FileTask& t = s->tasks[s->n_tasks++];
     t.path = p; t.seq = seq; t.spec_id = spec_id; t.part_hash = part_hash;
+    t.partition_json = partition_json;   // already in man_arena, charged
     ++s->stats.files_planned;
     return true;
 }
@@ -1074,7 +1131,17 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
     if (!stats_pass(e, v->sch, s->opts.predicates, s->opts.n_predicates))
         return true;
     if (s->filter.keep != nullptr && !s->filter.keep(s->filter.ctx, e)) return true;
-    if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e))) { v->failed = true; return false; }
+    const bool want_pj = s->opts.emit_metadata_columns;
+    char* pj = nullptr;
+    if (want_pj) {                                                        // sized to the value's worst case: never cut
+        const uint32_t cap = partition_json_bound(s->table->meta);
+        pj = s->man_arena->allocate_array<char>(cap);
+        if (pj == nullptr || !s->budget->try_reserve(cap)) { v->failed = true; return false; }
+        v->s->man_charged += cap;
+        if (!partition_json(s->table->meta, *e, pj, cap)) { v->failed = true; return false; }
+    }
+    if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e),
+                   want_pj ? pj : nullptr)) { v->failed = true; return false; }
     return true;
 }
 
@@ -1281,7 +1348,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             continue;
         }
         // G2ICE-280: `_pos` rides as one extra trailing column through every delete filter below.
-        const uint32_t extra = s->opts.emit_row_position ? 1u : 0u;
+        if (s->opts.emit_row_position && s->opts.emit_metadata_columns) { s->failed = true; return false; }
+        const uint32_t extra = s->opts.emit_row_position ? 1u : s->opts.emit_metadata_columns ? kMetadataColumns : 0u;
         // G2FEAT-47: right-size columns[2] to this file's width before deref.
         if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns + extra))
             return false;
@@ -1319,7 +1387,10 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
                 return false;
             }
             decoded_rows = rows;
-            if (extra != 0u && !fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])) {
+            const bool filled = extra == 0u ||
+                (extra == 1u ? fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])
+                             : fill_metadata_columns(s->scratch, live_file, s->cur_file_row_base, rows, &dec[dec_columns]));
+            if (!filled) {
                 s->failed = true;
                 return false;
             }
@@ -1335,7 +1406,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         }
         if (!supplied && s->use_map && !conform_group(s, dec, cols, rows)) { s->failed = true; return false; }
-        if (extra != 0u && s->use_map) cols[s->output_columns] = dec[dec_columns];
+        for (uint32_t x = 0; s->use_map && x < extra; ++x) cols[s->output_columns + x] = dec[dec_columns + x];   // bounded: 4
         if (!supplied && !apply_equality_deletes(s, cols, s->output_columns + extra, &rows)) { s->failed = true; return false; }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         s->last_group.file_path = live_file.path;
@@ -1351,7 +1422,12 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             if (!s->table->strict_pinned && !s->use_map && s->cur_meta->columns[c].name_truncated != 0u) return false;
             if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
-        if (extra != 0u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (extra == 1u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (extra == kMetadataColumns &&
+            (!out->schema.add_field("_file", BoltType::Utf8, false) || !out->schema.add_field("_pos", BoltType::Int64, false) ||
+             !out->schema.add_field("_spec_id", BoltType::Int64, false) || !out->schema.add_field("_deleted", BoltType::Int64, false) ||
+             !out->schema.add_field("_partition", BoltType::Utf8, false)))
+            return false;
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
     }

@@ -7,6 +7,7 @@
 // corrupt or hostile stream returns an error rather than misbehaving.
 
 #include "bolt/ingest/bolt_inflate.h"
+#include "bolt/ingest/bolt_deflate.h"
 
 #include <cassert>
 #include <cstring>
@@ -290,6 +291,55 @@ int inflate_raw(const uint8_t* src, uint64_t src_len,
         }
     }
     return kInflateBadInput;                        // never terminated
+}
+
+namespace {
+
+// Offset of the deflate body after a gzip member header, or 0 when the header is malformed / truncated.
+uint64_t gzip_body_offset(const uint8_t* src, uint64_t len) noexcept {
+    if (!is_gzip(src, len) || len < 18u) return 0u;
+    const uint8_t flg = src[3];
+    if ((flg & 0xE0u) != 0u) return 0u;                                  // reserved flag bits must be zero
+    uint64_t off = 10u;
+    if ((flg & 0x04u) != 0u) {                                           // FEXTRA
+        if (off + 2u > len) return 0u;
+        off += 2u + (static_cast<uint64_t>(src[off]) | (static_cast<uint64_t>(src[off + 1]) << 8));
+    }
+    for (uint32_t z = 0; z < 2u; ++z) {                                  // FNAME then FCOMMENT, NUL-terminated
+        if ((flg & (z == 0u ? 0x08u : 0x10u)) == 0u) continue;
+        while (off < len && src[off] != 0u) ++off;                       // bounded by len
+        ++off;
+    }
+    if ((flg & 0x02u) != 0u) off += 2u;                                  // FHCRC
+    return off + 8u <= len ? off : 0u;
+}
+
+}  // namespace
+
+int gunzip(const uint8_t* src, uint64_t src_len, uint64_t max_out, GunzipAllocFn alloc, void* ctx,
+           const uint8_t** out, uint64_t* out_len) noexcept {
+    if (alloc == nullptr || out == nullptr || out_len == nullptr) return kInflateBadInput;
+    const uint64_t off = gzip_body_offset(src, src_len);
+    if (off == 0u) return src_len < 18u ? kInflateTruncSrc : kInflateBadInput;
+    const uint8_t* t = src + src_len - 8u;
+    const uint32_t crc = static_cast<uint32_t>(t[0]) | (static_cast<uint32_t>(t[1]) << 8) |
+                         (static_cast<uint32_t>(t[2]) << 16) | (static_cast<uint32_t>(t[3]) << 24);
+    const uint32_t isize = static_cast<uint32_t>(t[4]) | (static_cast<uint32_t>(t[5]) << 8) |
+                           (static_cast<uint32_t>(t[6]) << 16) | (static_cast<uint32_t>(t[7]) << 24);
+    uint64_t need = 0;
+    int rc = inflate_raw(src + off, src_len - off - 8u, nullptr, 0u, &need);
+    if (rc != kInflateNeedMore && rc != kInflateOk) return rc;
+    if (need > max_out) { *out_len = need; return kInflateNeedMore; }
+    uint8_t* dst = alloc(ctx, need + 1u);
+    if (dst == nullptr) return kInflateNeedMore;
+    uint64_t got = 0;
+    rc = inflate_raw(src + off, src_len - off - 8u, dst, need, &got);
+    if (rc != kInflateOk || got != need) return rc != kInflateOk ? rc : kInflateBadInput;
+    if (static_cast<uint32_t>(got) != isize || crc32_ieee(dst, got, 0u) != crc) return kInflateBadInput;
+    dst[got] = 0u;
+    *out = dst;
+    *out_len = got;
+    return kInflateOk;
 }
 
 }  // namespace ingest

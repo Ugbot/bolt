@@ -40,13 +40,32 @@ TEST(S3ExactUri, RefusesAuthorityPrefixAndTableRebaseAmbiguity) {
 }
 
 TEST(S3ExactUri, UnsupportedSchemesNeverBecomeStoreKeys) {
-    for (const char* uri : {"https://bucket/root/a", "s3a://bucket/root/a",
+    for (const char* uri : {"https://bucket/root/a", "gs://bucket/root/a",
                             "file:///root/a", "root/a", ""}) {
         char out[32] = "unchanged";
         EXPECT_EQ(s3_uri_validate(uri), Status::Unsupported);
         EXPECT_EQ(s3_uri_object_key("s3://bucket/root", uri, out, sizeof(out)), Status::Unsupported);
         EXPECT_STREQ(out, "unchanged");
     }
+}
+
+// G2ICE-300: a recorded s3a:// or s3n:// path names the same object as its s3:// spelling; a configured root may not
+// use the alias, and an alias outside the root is still outside it.
+TEST(S3ExactUri, HadoopSchemeAliasesMapExactly) {
+    for (const char* uri : {"s3a://bucket/root/data/a.parquet", "s3n://bucket/root/data/a.parquet"}) {
+        std::array<char, kOsMaxKey> key{};
+        EXPECT_EQ(s3_uri_object_key("s3://bucket/root", uri, key.data(), key.size()), Status::Ok) << uri;
+        EXPECT_STREQ(key.data(), "data/a.parquet");
+        EXPECT_EQ(s3_uri_validate(uri), Status::Unsupported) << "validate stays canonical: " << uri;
+    }
+    std::array<char, kOsMaxKey> part{};                                  // Spark's partition directories: '=' stays literal
+    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://bucket/root/data/p=1/b=2,c/f.parquet", part.data(), part.size()), Status::Ok);
+    EXPECT_STREQ(part.data(), "data/p=1/b=2,c/f.parquet");
+    char out[32] = "unchanged";
+    EXPECT_EQ(s3_uri_object_key("s3a://bucket/root", "s3://bucket/root/a", out, sizeof(out)), Status::Unsupported);
+    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://other/root/a", out, sizeof(out)), Status::OutsideRoot);
+    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://bucket/root/a%2fb", out, sizeof(out)), Status::BadArg);
+    EXPECT_STREQ(out, "unchanged");
 }
 
 TEST(S3ExactUri, NoncanonicalAndTraversalFormsRefuseWithoutOutput) {
