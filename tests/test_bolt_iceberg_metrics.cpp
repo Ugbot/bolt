@@ -21,6 +21,7 @@
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
+#include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/metrics.h"
 
 namespace ice = bolt::lakehouse::iceberg;
@@ -78,8 +79,9 @@ bolt::BoltColumn flat_col(bolt::Arena* a, const std::vector<T>& v, const std::ve
 
 const double kNaN = std::numeric_limits<double>::quiet_NaN();
 
-// One row group, the Java probe's values: id, f (float), d (double), s (string), bin (binary), zero (double).
-bool write_file(bolt::Arena* a, const uint8_t** out, uint64_t* out_len) {
+// One row group, the Java probe's values: id, f (float), d (double), s (string), bin (binary), zero (double). `batch_out`
+// (optional) receives the batch written.
+bool write_file(bolt::Arena* a, const uint8_t** out, uint64_t* out_len, const bolt::BoltBatch** batch_out = nullptr) {
     const std::vector<bool> none(4, false), n3 = {false, false, true, false};
     pq::ParquetWriteOpts o{};
     o.n_columns = 6;
@@ -112,6 +114,7 @@ bool write_file(bolt::Arena* a, const uint8_t** out, uint64_t* out_len) {
     c[5] = flat_col<double>(a, {0.0, -0.0, 0.0, 0.0}, none, bolt::BoltType::Float64);
     pq::ParquetWriter* w = pq::parquet_write_open_mem(&o);
     if (w == nullptr || !pq::parquet_write_row_group(w, b)) return false;
+    if (batch_out != nullptr) *batch_out = b;
     return pq::parquet_write_close_mem(w, a, out, out_len);
 }
 
@@ -295,4 +298,44 @@ TEST(IcebergMetrics, V2ManifestCarriesReferencedDataFile) {
     const std::string body(reinterpret_cast<const char*>(mbuf), mlen);
     EXPECT_NE(body.find("\"field-id\":143"), std::string::npos);
     EXPECT_NE(body.find("format-version"), std::string::npos);
+}
+
+// bolt's own Iceberg writer computes metrics from the batches it is about to write: they equal the ones read off the file.
+TEST(IcebergMetrics, WriterBatchesAgreeWithTheWrittenFile) {
+    bolt::Arena a;
+    const uint8_t* buf = nullptr;
+    uint64_t len = 0;
+    const bolt::BoltBatch* batch = nullptr;
+    ASSERT_TRUE(write_file(&a, &buf, &len, &batch));
+    auto* meta = a.allocate_array<pq::PqMeta>(1);
+    ASSERT_TRUE(pq::parquet_read_meta(buf, len, &a, meta));
+    ice::MetricsLeaf leaves[6];
+    for (uint32_t i = 0; i < 6; ++i) leaves[i].field_id = static_cast<int32_t>(i + 1u);
+    ice::FileStats file{}, mem{};
+    ASSERT_TRUE(ice::file_metrics_from_parquet(buf, len, meta, leaves, 6, &file));
+    ice::SchemaField fields[6]{};
+    const char* names[6] = {"id", "f", "d", "s", "bin", "zero"};
+    const char* types[6] = {"long", "float", "double", "string", "binary", "double"};
+    for (uint32_t i = 0; i < 6; ++i) {
+        fields[i].id = static_cast<int32_t>(i + 1u);
+        std::snprintf(fields[i].name, sizeof(fields[i].name), "%s", names[i]);
+        std::snprintf(fields[i].type, sizeof(fields[i].type), "%s", types[i]);
+    }
+    ice::Schema sch{};
+    sch.n_fields = 6;
+    sch.fields = fields;
+    ASSERT_TRUE(ice::file_metrics_from_batches(&batch, 1u, &sch, ice::MetricsModeSpec{}, &mem));
+    ASSERT_EQ(mem.n_cols, 6u);
+    for (uint32_t i = 1; i <= 6; ++i) {
+        const ice::ColumnStatEntry* f = find(file, static_cast<int32_t>(i));
+        const ice::ColumnStatEntry* g = find(mem, static_cast<int32_t>(i));
+        ASSERT_NE(g, nullptr);
+        EXPECT_EQ(g->value_count, f->value_count) << i;
+        EXPECT_EQ(g->null_count, f->null_count) << i;
+        EXPECT_EQ(g->has_nan_count, f->has_nan_count) << i;
+        EXPECT_EQ(g->nan_count, f->nan_count) << i;
+        EXPECT_EQ(lo(g), lo(f)) << i;
+        EXPECT_EQ(hi(g), hi(f)) << i;
+        EXPECT_FALSE(g->has_column_size) << "a size belongs to the written file";
+    }
 }

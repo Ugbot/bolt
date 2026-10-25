@@ -24,12 +24,15 @@
 
 namespace bolt {
 class Arena;
+struct BoltBatch;
 namespace ingest { namespace parquet { struct PqMeta; } }
 }
 
 namespace bolt {
 namespace lakehouse {
 namespace iceberg {
+
+struct Schema;
 
 enum class MetricsMode : uint8_t { kNone = 0, kCounts = 1, kTruncate = 2, kFull = 3 };
 
@@ -57,6 +60,11 @@ struct MetricsLeaf {
 // loses only what needs the values (bounds, NaN count). False only for a malformed footer.
 bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const ::bolt::ingest::parquet::PqMeta* meta,
                                const MetricsLeaf* leaves, uint32_t n_leaves, FileStats* out) noexcept;
+
+// The same metrics from the batches a writer is about to serialize as one file, for each primitive field of `sch` the batches
+// carry by name, all under `mode`: counts, NaN counts and bounds; no column_sizes or split_offsets (they belong to the file).
+bool file_metrics_from_batches(const BoltBatch* const* batches, uint32_t n_batches, const Schema* sch, const MetricsModeSpec& mode,
+                               FileStats* out) noexcept;
 
 // Truncation (spec "Appendix F", Iceberg-Java UnicodeUtil / BinaryUtil). `utf8` truncates to `units` code points, else
 // to `units` bytes; the result also fits `cap` bytes. Lower: the prefix length. Upper: the incremented prefix written
