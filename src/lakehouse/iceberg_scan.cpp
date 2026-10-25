@@ -46,6 +46,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -68,6 +69,16 @@ namespace lakehouse {
 namespace iceberg {
 
 namespace pq = bolt::ingest::parquet;
+
+namespace {
+// G2ICE-298: the scan reads the adopted versions (v1-v3); any other is refused by name, never guessed at.
+bool readable_version(const bolt::lakehouse::iceberg::Metadata& m) noexcept {
+    if (m.format_version >= 1 && m.format_version <= 3) return true;
+    std::fprintf(stderr, "[iceberg_scan] REFUSED: format-version %d is not an adopted Iceberg version this reader implements (v1-v3)\n",
+                 m.format_version);
+    return false;
+}
+}  // namespace
 
 namespace {
 
@@ -521,6 +532,7 @@ bool load_latest_metadata(TableHandle* h) noexcept {
     if (os_get(&h->os, key, h->arena, &body, &blen) != kOsOk) return false;
     if (!metadata_parse(body, static_cast<uint32_t>(blen), h->arena, &h->meta))
         return false;
+    if (!readable_version(h->meta)) return false;
     h->meta_loaded = true;
     return true;
 }
@@ -610,6 +622,7 @@ bool iceberg_table_open_on_store(TableHandle** out, Arena* arena,
     h->os = *store;
     if (!metadata_parse(metadata_json, metadata_len, arena, &h->meta))
         return false;
+    if (!readable_version(h->meta)) return false;
     if (table_key_prefix != nullptr) {
         const size_t n = std::strlen(table_key_prefix);
         if (n + 1u > sizeof(h->table_rel)) return false;   // "" = the store is rooted at the table

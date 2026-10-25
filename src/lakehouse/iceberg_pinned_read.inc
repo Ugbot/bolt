@@ -294,6 +294,85 @@ bool promote_column(const BoltColumn& src, BoltType want, int64_t rows, Arena* a
     return false;
 }
 
+// "YYYY-MM-DD" as days since 1970-01-01 (proleptic Gregorian).
+bool date_days(const char* t, int32_t* out) noexcept {
+    int y = 0, m = 0, d = 0, used = 0;
+    if (std::sscanf(t, "%d-%d-%d%n", &y, &m, &d, &used) != 3 || t[used] != '\0' || m < 1 || m > 12 || d < 1 || d > 31) return false;
+    y -= m <= 2 ? 1 : 0;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
+    const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    *out = static_cast<int32_t>(era * 146097 + doe - 719468);
+    return true;
+}
+
+// Fill the bytes of one value of `want` from a default's text into `cell` (8 bytes); false when the text is not that type.
+bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
+    const char* t = f.initial_default;
+    char* end = nullptr;
+    const bool str = f.initial_default_kind == DefaultKind::kString;
+    switch (want) {
+        case BoltType::Int64: case BoltType::Int32: {
+            const long long v = std::strtoll(t, &end, 10);
+            if (str || end == t || *end != '\0') return false;
+            if (want == BoltType::Int64) { const int64_t x = v; std::memcpy(cell, &x, 8); }
+            else { const int32_t x = static_cast<int32_t>(v); std::memcpy(cell, &x, 4); }
+            return true;
+        }
+        case BoltType::Float64: case BoltType::Float32: {
+            const double v = std::strtod(t, &end);
+            if (str || end == t || *end != '\0') return false;
+            if (want == BoltType::Float64) std::memcpy(cell, &v, 8);
+            else { const float x = static_cast<float>(v); std::memcpy(cell, &x, 4); }
+            return true;
+        }
+        case BoltType::Bool:
+            if (str || (std::strcmp(t, "true") != 0 && std::strcmp(t, "false") != 0)) return false;
+            cell[0] = t[0] == 't' ? 1u : 0u;
+            return true;
+        case BoltType::Date32: {
+            int32_t d = 0;
+            if (!str || !date_days(t, &d)) return false;
+            std::memcpy(cell, &d, 4);
+            return true;
+        }
+        default: return false;
+    }
+}
+
+// A column of `rows` copies of the field's v3 initial-default (spec "Default values": a reader fills it for files without the field).
+bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a, BoltColumn* out) noexcept {
+    assert(a != nullptr && out != nullptr);
+    const size_t n = static_cast<size_t>(rows) + 1u;
+    if (want == BoltType::Utf8 && f.initial_default_kind == DefaultKind::kString && std::strchr(f.initial_default, '\\') == nullptr) {
+        const uint32_t len = static_cast<uint32_t>(std::strlen(f.initial_default));
+        auto* sv = a->allocate_array<StringView>(n);
+        auto* spill = static_cast<char*>(a->allocate(len + 1u));
+        if (sv == nullptr || spill == nullptr) return false;
+        std::memcpy(spill, f.initial_default, len + 1u);
+        StringView v;
+        std::memset(&v, 0, sizeof(v));
+        v.length = len;
+        std::memcpy(v.prefix, f.initial_default, len < 4u ? len : 4u);
+        if (len > 4u && len <= 12u) std::memcpy(v.inline_data, f.initial_default + 4, len - 4u);
+        for (size_t r = 0; r < n; ++r) sv[r] = v;
+        *out = BoltColumn::make_flat(sv, nullptr, rows, BoltType::Utf8);
+        out->str_overflow_base = spill;
+        return true;
+    }
+    uint8_t cell[8] = {};
+    const size_t width = want == BoltType::NA ? 0u : bolt::type_size(want);
+    if (f.initial_default_kind == DefaultKind::kUnsupported || width == 0u || width > 8u || !default_cell(f, want, cell)) {
+        std::fprintf(stderr, "[iceberg_scan] REFUSED: column '%s' (field id %d) is absent from a data file and its initial-default ('%s', "
+                     "type %s) is not one this reader fills (G2ICE-326)\n", f.name, f.id, f.initial_default, f.type);
+        return false;
+    }
+    auto* d = static_cast<uint8_t*>(a->allocate(width * n, 8));
+    if (d == nullptr) return false;
+    for (size_t r = 0; r < n; ++r) std::memcpy(d + r * width, cell, width);
+    *out = BoltColumn::make_flat(d, nullptr, rows, want);
+    return true;
+}
+
 // Build the emitted columns (current-schema order) from the decoded file columns.
 bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_t rows) noexcept {
     assert(s!=nullptr && s->use_map && s->map_schema!=nullptr);
@@ -304,7 +383,11 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
             if (!promote_column(dec[s->colmap[j]],s->want_type[j],rows,s->scratch,&out[j],name)) return false;
             continue;
         }
-        // Absent from this file: the column was added after the file was written. Reads as null (v3 initial-default is refused at the gate).
+        // Absent from this file: the column was added after the file was written. Reads its v3 initial-default, else null.
+        if (s->map_schema->fields[j].initial_default_kind != DefaultKind::kNone) {
+            if (!default_column(s->map_schema->fields[j], s->want_type[j], rows, s->scratch, &out[j])) return false;
+            continue;
+        }
         if (s->map_schema->fields[j].required) {
             std::fprintf(stderr,"[iceberg_scan] REFUSED: required column '%s' (field id %d) has no data in a data file and no default; the file or the table is corrupt\n",
                          name,s->map_schema->fields[j].id);

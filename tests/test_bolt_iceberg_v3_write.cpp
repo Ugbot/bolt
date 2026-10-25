@@ -11,6 +11,7 @@
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/manifest_avro.h"
+#include "bolt/lakehouse/iceberg/metadata.h"
 
 using namespace bolt::lakehouse::iceberg;
 
@@ -121,4 +122,92 @@ TEST(IcebergV3Write, PuffinFileHoldsEachVectorAtItsPlacement) {
         ASSERT_EQ(n, in[i].n);
         for (uint64_t k = 0; k < n; ++k) EXPECT_EQ(pos[k], in[i].positions[k]);
     }
+}
+
+TEST(IcebergV3Metadata, ParsesNextRowIdAndInitialDefaults) {
+    const std::string j = "{\"format-version\":3,\"table-uuid\":\"u\",\"location\":\"s3://b/t\",\"last-updated-ms\":1,\"next-row-id\":42,"
+        "\"last-column-id\":6,\"current-schema-id\":0,\"schemas\":[{\"schema-id\":0,\"type\":\"struct\",\"fields\":["
+        "{\"id\":1,\"name\":\"a\",\"required\":false,\"type\":\"long\",\"initial-default\":7},"
+        "{\"id\":2,\"name\":\"b\",\"required\":false,\"type\":\"string\",\"initial-default\":\"x y\"},"
+        "{\"id\":3,\"name\":\"c\",\"required\":false,\"type\":\"boolean\",\"initial-default\":true},"
+        "{\"id\":4,\"name\":\"d\",\"required\":false,\"type\":\"long\",\"initial-default\":null},"
+        "{\"id\":5,\"name\":\"e\",\"required\":false,\"type\":{\"type\":\"struct\",\"fields\":[]},\"initial-default\":{}},"
+        "{\"id\":6,\"name\":\"f\",\"required\":false,\"type\":\"long\"}]}],"
+        "\"default-spec-id\":0,\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],\"snapshots\":[]}";
+    bolt::Arena a;
+    auto* m = a.allocate_array<Metadata>(1);
+    std::memset(m, 0, sizeof(*m));
+    ASSERT_TRUE(metadata_parse(reinterpret_cast<const uint8_t*>(j.data()), static_cast<uint32_t>(j.size()), &a, m));
+    EXPECT_TRUE(m->has_next_row_id);
+    EXPECT_EQ(m->next_row_id, 42);
+    const SchemaField* f = m->schemas[0].fields;
+    ASSERT_EQ(m->schemas[0].n_fields, 6u);
+    EXPECT_EQ(f[0].initial_default_kind, DefaultKind::kScalar);
+    EXPECT_STREQ(f[0].initial_default, "7");
+    EXPECT_EQ(f[1].initial_default_kind, DefaultKind::kString);
+    EXPECT_STREQ(f[1].initial_default, "x y");
+    EXPECT_EQ(f[2].initial_default_kind, DefaultKind::kScalar);
+    EXPECT_STREQ(f[2].initial_default, "true");
+    EXPECT_EQ(f[3].initial_default_kind, DefaultKind::kNone);
+    EXPECT_EQ(f[4].initial_default_kind, DefaultKind::kUnsupported) << "a struct default is not filled: the scan refuses it";
+    EXPECT_EQ(f[5].initial_default_kind, DefaultKind::kNone);
+}
+
+TEST(IcebergV1Write, ManifestAndListHaveTheV1ShapeAndReadBack) {
+    bolt::Arena a;
+    DataFileRef files[2] = {data_file("s3://b/t/data/a.parquet", 10, false, 0), data_file("s3://b/t/data/b.parquet", 5, false, 0)};
+    const uint8_t* bytes = nullptr;
+    uint64_t len = 0;
+    ASSERT_TRUE(manifest_write_avro_fv(1, files, 2, 77, 0, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &bytes, &len));
+    const std::string text(reinterpret_cast<const char*>(bytes), len);
+    EXPECT_NE(text.find("block_size_in_bytes"), std::string::npos);
+    EXPECT_EQ(text.find("sequence_number"), std::string::npos) << "v1 manifests carry no sequence numbers";
+    EXPECT_EQ(text.find("\"content\""), std::string::npos);
+    EXPECT_NE(text.find("format-version"), std::string::npos);
+    DataFileRef* got = nullptr;
+    uint32_t n = 0;
+    ASSERT_TRUE(manifest_parse_avro_grow(bytes, len, &a, 0, 4, &got, &n));
+    ASSERT_EQ(n, 2u);
+    EXPECT_STREQ(got[0].file_path, "s3://b/t/data/a.parquet");
+    EXPECT_EQ(got[1].stats.record_count, 5);
+    EXPECT_EQ(got[0].snapshot_id, 77);
+    DataFileRef del = data_file("s3://b/t/data/d.parquet", 1, false, 0);
+    del.content = FileContent::kPositionDeletes;
+    EXPECT_FALSE(manifest_write_avro_fv(1, &del, 1, 77, 0, kSchema, sizeof(kSchema) - 1, 0, nullptr, nullptr, &a, &bytes, &len))
+        << "v1 has no delete files";
+
+    ManifestListEntry e;
+    std::memset(&e, 0, sizeof(e));
+    std::snprintf(e.manifest_path, sizeof(e.manifest_path), "%s", "s3://b/t/metadata/m.avro");
+    e.manifest_length = 100;
+    e.added_snapshot_id = 77;
+    e.added_files_count = 2;
+    e.added_rows_count = 15;
+    ASSERT_TRUE(manifest_list_write_avro_fv(1, &e, 1, 77, 0, &a, &bytes, &len));
+    const std::string lt(reinterpret_cast<const char*>(bytes), len);
+    EXPECT_EQ(lt.find("sequence_number"), std::string::npos);
+    ManifestListEntry* le = nullptr;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(bytes, len, &a, 4, &le, &n));
+    ASSERT_EQ(n, 1u);
+    EXPECT_STREQ(le[0].manifest_path, "s3://b/t/metadata/m.avro");
+    EXPECT_EQ(le[0].added_rows_count, 15);
+}
+
+TEST(IcebergV3Metadata, EncryptionKeysAreParsedNotProbed) {
+    auto doc = [](const char* extra, const char* col) {
+        return std::string("{\"format-version\":3,\"table-uuid\":\"u\",\"location\":\"s3://b/t\",\"last-updated-ms\":1,") + extra +
+               "\"current-schema-id\":0,\"schemas\":[{\"schema-id\":0,\"type\":\"struct\",\"fields\":[{\"id\":1,\"name\":\"" + col +
+               "\",\"required\":false,\"type\":\"long\"}]}],\"snapshots\":[]}";
+    };
+    auto keys = [](const std::string& j) {
+        bolt::Arena a;
+        auto* m = a.allocate_array<Metadata>(1);
+        std::memset(m, 0, sizeof(*m));
+        EXPECT_TRUE(metadata_parse(reinterpret_cast<const uint8_t*>(j.data()), static_cast<uint32_t>(j.size()), &a, m));
+        return m->has_encryption_keys;
+    };
+    EXPECT_FALSE(keys(doc("", "a")));
+    EXPECT_FALSE(keys(doc("\"encryption-keys\":[],", "a")));
+    EXPECT_FALSE(keys(doc("", "encryption-keys"))) << "a column of that name is not the member";
+    EXPECT_TRUE(keys(doc("\"encryption-keys\":[{\"key-id\":\"k\",\"encrypted-key-metadata\":\"AA==\"}],", "a")));
 }

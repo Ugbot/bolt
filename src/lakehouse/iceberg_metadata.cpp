@@ -199,6 +199,26 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
     return id_present;
 }
 
+// G2ICE-276: a field's `initial-default` (Appendix D JSON single value), kept as text for the reader to convert.
+void read_default(const bj::StructuralIndex* idx, bj::Iterator* it, SchemaField* out) noexcept {
+    assert(idx != nullptr && it != nullptr && out != nullptr);
+    const bj::TokenType t = bj::iter_peek(it);
+    out->initial_default_kind = DefaultKind::kUnsupported;
+    if (t == bj::TokenType::Null) { out->initial_default_kind = DefaultKind::kNone; bj::iter_advance(it); return; }
+    if (t == bj::TokenType::BoolTrue || t == bj::TokenType::BoolFalse) {
+        std::strcpy(out->initial_default, t == bj::TokenType::BoolTrue ? "true" : "false");
+        out->initial_default_kind = DefaultKind::kScalar;
+        bj::iter_advance(it);
+        return;
+    }
+    const bool str = t == bj::TokenType::String;
+    if (!str && t != bj::TokenType::Int64 && t != bj::TokenType::Float64) { skip_value(it); return; }
+    if (idx->tokens[it->cursor].length >= static_cast<int32_t>(limits::kDefaultTextMax)) { bj::iter_advance(it); return; }
+    copy_tok(idx, it->cursor, out->initial_default, limits::kDefaultTextMax);
+    out->initial_default_kind = str ? DefaultKind::kString : DefaultKind::kScalar;
+    bj::iter_advance(it);
+}
+
 bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
                  SchemaField* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
@@ -236,6 +256,8 @@ bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
             const bj::TokenType t = bj::iter_peek(it);
             out->required = (t == bj::TokenType::BoolTrue);
             bj::iter_advance(it);
+        } else if (tok_eq(idx, key, "initial-default")) {
+            read_default(idx, it, out);
         } else {
             skip_value(it);
         }
@@ -561,6 +583,17 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
             read_int64(&it, &out->last_updated_ms);
         } else if (tok_eq(&idx, key, "last-sequence-number")) {
             read_int64(&it, &out->last_sequence_number);
+        } else if (tok_eq(&idx, key, "next-row-id")) {
+            read_int64(&it, &out->next_row_id);
+            out->has_next_row_id = true;
+        } else if (tok_eq(&idx, key, "encryption-keys")) {
+            if (bj::iter_peek(&it) == bj::TokenType::BeginArray) {
+                const int32_t open = it.cursor;
+                skip_value(&it);
+                out->has_encryption_keys = it.cursor > open + 2;        // more than `[` `]`
+            } else {
+                skip_value(&it);
+            }
         } else if (tok_eq(&idx, key, "current-snapshot-id")) {
             if(saw_current_snapshot || !read_current_snapshot(&idx,&it,out)) return false;
             saw_current_snapshot=true;

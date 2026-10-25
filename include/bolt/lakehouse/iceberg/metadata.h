@@ -24,12 +24,18 @@ static constexpr uint32_t kIcebergMaxTypeName   = 32u;
 // Metadata::budget, and only table_expire_snapshots shrinks them.
 static constexpr uint32_t kIcebergMaxMetadataLog = 64u;
 
+// v3 `initial-default` of a field: kNone (absent or null), a string or another JSON scalar (text as written), or kUnsupported (an
+// object / array, or longer than kDefaultTextMax); a reader that needs an unsupported default refuses.
+enum class DefaultKind : uint8_t { kNone = 0, kString = 1, kScalar = 2, kUnsupported = 3 };
+
 struct SchemaField {
-    int32_t  id;
-    bool     required;
-    uint8_t  _pad[3];
-    char     name[kIcebergMaxFieldName];
-    char     type[kIcebergMaxTypeName];
+    int32_t     id;
+    bool        required;
+    DefaultKind initial_default_kind;
+    uint8_t     _pad[2];
+    char        name[kIcebergMaxFieldName];
+    char        type[kIcebergMaxTypeName];
+    char        initial_default[limits::kDefaultTextMax];
 };
 
 // `fields` lives in an arena; a Schema copied by value shares it. Use
@@ -109,6 +115,11 @@ struct Metadata {
     const char* name_mapping_json;
     uint32_t    name_mapping_len;
     uint32_t    _pad_nm;
+    // v3 row lineage: the table's `next-row-id` (has_next_row_id false when the document carries none).
+    int64_t     next_row_id;
+    bool        has_next_row_id;
+    bool        has_encryption_keys;   // v3 `encryption-keys` lists at least one key (the table's files may be encrypted)
+    uint8_t     _pad_nr[6];
 };
 
 // One top-level field of a name mapping: the Iceberg field id and the file column names that map to it.
