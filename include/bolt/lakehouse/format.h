@@ -97,7 +97,11 @@ struct ReadOptions {
     // Iceberg only: append the `_pos` metadata column (Int64, the row's 0-based
     // position in its data file, counted before deletes) after the table columns.
     bool      emit_row_position;
-    uint8_t   _pad[4];
+    // Iceberg only (G2ICE-300): append the spec's reserved metadata columns after the table columns, in this order:
+    // _file (Utf8, the data file's path as its manifest records it), _pos (Int64), _spec_id (Int64, the file's
+    // partition spec), _deleted (Int64 0/1: false, deleted rows are not read). Exclusive with emit_row_position.
+    bool      emit_metadata_columns;
+    uint8_t   _pad[3];
 };
 
 inline void read_options_init(ReadOptions* o) noexcept {

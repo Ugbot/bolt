@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <memory>
 #include <unistd.h>
@@ -17,6 +19,7 @@
 #include "bolt/ingest/bolt_deflate.h"
 #include "bolt/ingest/bolt_inflate.h"
 #include "bolt/lakehouse/catalog.h"
+#include "bolt/lakehouse/format.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/scan.h"
 #include "bolt/lakehouse/iceberg/writer.h"
@@ -200,4 +203,50 @@ TEST(IcebergPaths, UriOutsideTheLocationIsRefused) {
                  "\"location\":\"s3://elsewhere/db/trades\"");
     EXPECT_EQ(scan_rows(root), -1) << "paths that name another location are never guessed at";
     fs::remove_all(root);
+}
+
+TEST(IcebergPaths, ReservedMetadataColumnsFollowTheTableColumns) {
+    Arena arena;
+    FilesystemCatalog fsc{};
+    Catalog cat{};
+    TableHandle* th = nullptr;
+    ScanHandle* sh = nullptr;
+    ASSERT_TRUE(filesystem_catalog_init(&fsc, (std::string(BOLT_TEST_DATA_DIR) + "/golden_iceberg_table").c_str(), &cat));
+    ASSERT_TRUE(iceberg_table_open(&th, &arena, &cat, "db", "trades"));
+    ReadOptions ro;
+    read_options_init(&ro);
+    ro.emit_metadata_columns = true;
+    ASSERT_TRUE(iceberg_scan_open(&sh, th, &ro));
+    std::map<std::string, std::vector<int64_t>> pos_by_file;
+    int64_t rows = 0;
+    for (uint32_t g = 0; g < 1024u; ++g) {
+        BoltBatch b{};
+        bool eof = false;
+        ASSERT_TRUE(iceberg_scan_next_batch(sh, &b, &eof));
+        if (eof) break;
+        ASSERT_EQ(b.num_cols, 4u + 4u);
+        const int fi = b.schema.find_field("_file"), pi = b.schema.find_field("_pos"), si = b.schema.find_field("_spec_id"),
+                  di = b.schema.find_field("_deleted");
+        ASSERT_EQ(fi, 4); ASSERT_EQ(pi, 5); ASSERT_EQ(si, 6); ASSERT_EQ(di, 7);
+        const BoltColumn* c = b.columns[b.read_epoch];
+        for (int64_t r = 0; r < b.num_rows; ++r) {
+            const uint8_t* p = nullptr;
+            int32_t n = 0;
+            c[fi].utf8_at(r, &p, &n);
+            const std::string file(reinterpret_cast<const char*>(p), static_cast<size_t>(n));
+            EXPECT_EQ(file.rfind("file://", 0), 0u) << "the path as the manifest records it: " << file;
+            pos_by_file[file].push_back(c[pi].typed_data<int64_t>()[r]);
+            EXPECT_EQ(c[si].typed_data<int64_t>()[r], 0);
+            EXPECT_EQ(c[di].typed_data<int64_t>()[r], 0);
+        }
+        rows += b.num_rows;
+    }
+    iceberg_scan_close(sh);
+    iceberg_table_close(th);
+    EXPECT_EQ(rows, 9);
+    EXPECT_EQ(pos_by_file.size(), 5u) << "five data files";
+    for (auto& [f, ps] : pos_by_file) {
+        std::sort(ps.begin(), ps.end());
+        for (size_t i = 0; i < ps.size(); ++i) EXPECT_EQ(ps[i], static_cast<int64_t>(i)) << f;
+    }
 }

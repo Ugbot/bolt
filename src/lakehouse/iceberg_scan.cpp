@@ -395,6 +395,7 @@ struct FileTask {
     uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
 };
 
+constexpr uint32_t kMetadataColumns = 4u;   // _file, _pos, _spec_id, _deleted (G2ICE-300)
 constexpr uint32_t kMaxEqualityIds = limits::kMaxEqualityIds;
 constexpr uint32_t kMaxEqualitySets = limits::kMaxEqualitySets;
 struct EqSet {
@@ -866,6 +867,43 @@ bool fill_row_positions(Arena* a, uint64_t base, int64_t rows, BoltColumn* out) 
     return true;
 }
 
+// A Utf8 column of `rows` copies of `str` (one arena copy, every view pointing at it).
+bool fill_const_utf8(Arena* a, const char* str, int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && str != nullptr && out != nullptr);
+    const uint32_t n = static_cast<uint32_t>(std::strlen(str));
+    char* bytes = static_cast<char*>(a->allocate(n + 1u, 8u));
+    if (bytes == nullptr) return false;
+    std::memcpy(bytes, str, n + 1u);
+    BoltColumn c = BoltColumn::make_flat_alloc(rows, BoltType::Utf8, a);
+    if (rows > 0 && c.data == nullptr) return false;
+    StringView v;
+    std::memset(&v, 0, sizeof(v));
+    v.length = n;
+    std::memcpy(v.prefix, bytes, n < 4u ? n : 4u);
+    if (n <= 12u) { if (n > 4u) std::memcpy(v.inline_data, bytes + 4, n - 4u); }
+    else { v.ref.buf_idx = 0; v.ref.offset = 0; }
+    auto* sv = static_cast<StringView*>(c.data);
+    for (int64_t r = 0; r < rows; ++r) sv[r] = v;                         // bounded by rows
+    c.str_overflow_base = bytes;
+    c.stats.all_valid = true;
+    *out = c;
+    return true;
+}
+
+// The four reserved metadata columns of one decoded group (G2ICE-300), into out[0..4).
+bool fill_metadata_columns(Arena* a, const FileTask& t, uint64_t base, int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && out != nullptr && t.path != nullptr);
+    if (!fill_const_utf8(a, t.path, rows, &out[0]) || !fill_row_positions(a, base, rows, &out[1])) return false;
+    auto* spec = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+    auto* del = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+    if (spec == nullptr || del == nullptr) return false;
+    for (int64_t r = 0; r < rows; ++r) { spec[r] = t.spec_id; del[r] = 0; }   // bounded by rows
+    out[2] = BoltColumn::make_flat(spec, nullptr, rows, BoltType::Int64);
+    out[3] = BoltColumn::make_flat(del, nullptr, rows, BoltType::Int64);
+    out[2].stats.all_valid = out[3].stats.all_valid = true;
+    return true;
+}
+
 // Keep only rows `sel[0..kept)` of every column, in place. Fails (never under-deletes) on a column shape it cannot compact.
 bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, uint32_t kept, int64_t* rows,
                       Arena* scratch, const char* what) noexcept {
@@ -1283,7 +1321,8 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             continue;
         }
         // G2ICE-280: `_pos` rides as one extra trailing column through every delete filter below.
-        const uint32_t extra = s->opts.emit_row_position ? 1u : 0u;
+        if (s->opts.emit_row_position && s->opts.emit_metadata_columns) { s->failed = true; return false; }
+        const uint32_t extra = s->opts.emit_row_position ? 1u : s->opts.emit_metadata_columns ? kMetadataColumns : 0u;
         // G2FEAT-47: right-size columns[2] to this file's width before deref.
         if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns + extra))
             return false;
@@ -1321,7 +1360,10 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
                 return false;
             }
             decoded_rows = rows;
-            if (extra != 0u && !fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])) {
+            const bool filled = extra == 0u ||
+                (extra == 1u ? fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])
+                             : fill_metadata_columns(s->scratch, live_file, s->cur_file_row_base, rows, &dec[dec_columns]));
+            if (!filled) {
                 s->failed = true;
                 return false;
             }
@@ -1337,7 +1379,7 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             return false;
         }
         if (!supplied && s->use_map && !conform_group(s, dec, cols, rows)) { s->failed = true; return false; }
-        if (extra != 0u && s->use_map) cols[s->output_columns] = dec[dec_columns];
+        for (uint32_t x = 0; s->use_map && x < extra; ++x) cols[s->output_columns + x] = dec[dec_columns + x];   // bounded: 4
         if (!supplied && !apply_equality_deletes(s, cols, s->output_columns + extra, &rows)) { s->failed = true; return false; }
         s->cur_file_row_base += static_cast<uint64_t>(decoded_rows);
         s->last_group.file_path = live_file.path;
@@ -1353,7 +1395,11 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             if (!s->table->strict_pinned && !s->use_map && s->cur_meta->columns[c].name_truncated != 0u) return false;
             if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
-        if (extra != 0u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (extra == 1u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (extra == kMetadataColumns &&
+            (!out->schema.add_field("_file", BoltType::Utf8, false) || !out->schema.add_field("_pos", BoltType::Int64, false) ||
+             !out->schema.add_field("_spec_id", BoltType::Int64, false) || !out->schema.add_field("_deleted", BoltType::Int64, false)))
+            return false;
         if (rows == 0) continue;  // whole group deleted -- advance, don't emit empty
         return true;
     }
