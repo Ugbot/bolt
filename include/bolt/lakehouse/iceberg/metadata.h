@@ -38,8 +38,9 @@ struct Schema {
     int32_t      schema_id;
     uint32_t     n_fields;
     uint32_t     cap_fields;
-    uint32_t     _pad;
+    uint32_t     n_identifier;    // G2ICE-300: identifier-field-ids (spec "Identifier Field IDs"), in the arena too
     SchemaField* fields;
+    int32_t*     identifier_ids;
 };
 
 // One `snapshot-log` entry: `snapshot_id` became current at `timestamp_ms`.

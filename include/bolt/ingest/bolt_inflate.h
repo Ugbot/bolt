@@ -54,5 +54,18 @@ enum : int {
 int inflate_raw(const uint8_t* src, uint64_t src_len,
                 uint8_t* dst, uint64_t dst_cap, uint64_t* out_len) noexcept;
 
+// True when src[0..len) begins with a gzip member header (RFC 1952: 1f 8b, deflate).
+inline bool is_gzip(const uint8_t* src, uint64_t len) noexcept {
+    return src != nullptr && len >= 3u && src[0] == 0x1Fu && src[1] == 0x8Bu && src[2] == 0x08u;
+}
+
+// Decode ONE gzip member (header incl. FEXTRA/FNAME/FCOMMENT/FHCRC, deflate body, CRC32 + ISIZE trailer, both
+// verified) into a buffer allocated from `alloc(ctx, n)`. `max_out` bounds the decompressed size (kInflateNeedMore
+// past it). kInflateOk with *out / *out_len on success; any malformed or truncated member is kInflateBadInput /
+// kInflateTruncSrc, a trailer mismatch kInflateBadInput.
+using GunzipAllocFn = uint8_t* (*)(void* ctx, uint64_t n);
+int gunzip(const uint8_t* src, uint64_t src_len, uint64_t max_out, GunzipAllocFn alloc, void* ctx,
+           const uint8_t** out, uint64_t* out_len) noexcept;
+
 }  // namespace ingest
 }  // namespace bolt

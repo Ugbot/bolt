@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "bolt/ingest/bolt_inflate.h"
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/transform.h"
 #include "lake_grow.h"
@@ -243,6 +244,24 @@ bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
     return id_present;
 }
 
+// identifier-field-ids: an array of field ids (G2ICE-300). A non-integer or out-of-range entry refuses the schema.
+bool parse_identifier_ids(const bj::StructuralIndex* idx, bj::Iterator* it, Arena* a, Budget* b, Schema* out) noexcept {
+    assert(idx != nullptr && it != nullptr && a != nullptr && out != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginArray) return false;
+    bj::iter_advance(it);
+    uint32_t cap = 0;
+    const uint32_t guard = array_guard(idx);
+    for (uint32_t g = 0; bj::iter_peek(it) != bj::TokenType::EndArray && g < guard; ++g) {   // bounded: the array
+        int64_t v = 0;
+        if (!read_exact_integer(idx, it, &v) || v <= 0 || v > INT32_MAX) return false;
+        if (!lake_grow(a, b, &out->identifier_ids, out->n_identifier, &cap, out->n_identifier + 1u)) return false;
+        out->identifier_ids[out->n_identifier++] = static_cast<int32_t>(v);
+    }
+    if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
+    bj::iter_advance(it);
+    return true;
+}
+
 bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
                   Arena* a, Budget* b, Schema* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
@@ -275,6 +294,8 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
             }
             if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(it);
+        } else if (tok_eq(idx, key, "identifier-field-ids")) {
+            if (out->n_identifier != 0u || !parse_identifier_ids(idx, it, a, b, out)) return false;
         } else {
             skip_value(it);
         }
@@ -489,10 +510,28 @@ bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
     return metadata_parse_budget(src, len, scratch, nullptr, out);
 }
 
+namespace {
+
+uint8_t* gunzip_arena(void* ctx, uint64_t n) noexcept {
+    return static_cast<uint8_t*>(static_cast<Arena*>(ctx)->allocate(static_cast<size_t>(n), 8u));
+}
+
+}  // namespace
+
 bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
                            Budget* budget, Metadata* out) noexcept {
     assert(src != nullptr && scratch != nullptr && out != nullptr);
     assert(len > 0u && len < (1u << 30));
+    // G2ICE-300: gzip-compressed metadata (spec "File System Tables": v<V>.gz.metadata.json; Java also reads
+    // .metadata.json.gz), recognised by content so every caller (files, REST bodies, pinned bytes) reads it.
+    if (ingest::is_gzip(src, len)) {
+        const uint8_t* raw = nullptr;
+        uint64_t raw_len = 0;
+        if (ingest::gunzip(src, len, (1u << 30) - 1u, gunzip_arena, scratch, &raw, &raw_len) != ingest::kInflateOk ||
+            raw_len == 0u || ingest::is_gzip(raw, raw_len))
+            return false;
+        return metadata_parse_budget(raw, static_cast<uint32_t>(raw_len), scratch, budget, out);
+    }
     metadata_init(out, scratch, budget);
     out->format_version = 0;
     out->current_snapshot_id = -1;
@@ -688,6 +727,12 @@ bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept {
     if (src->n_fields != 0u)
         std::memcpy(out.fields, src->fields, sizeof(SchemaField) * src->n_fields);
     out.n_fields = src->n_fields;
+    if (src->n_identifier != 0u) {
+        uint32_t cap = 0;
+        if (!lake_grow(a, b, &out.identifier_ids, 0u, &cap, src->n_identifier)) return false;
+        std::memcpy(out.identifier_ids, src->identifier_ids, sizeof(int32_t) * src->n_identifier);
+        out.n_identifier = src->n_identifier;
+    }
     *dst = out;
     return true;
 }

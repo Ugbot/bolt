@@ -264,6 +264,17 @@ bool buf_fmt(Buf* b, const char* fmt, ...) noexcept {
     return buf_putn(b, tmp, static_cast<uint32_t>(n));
 }
 
+// `,"identifier-field-ids":[...]` when the schema names any (G2ICE-300), else nothing.
+bool emit_identifier_ids(Buf* b, const Schema* s) noexcept {
+    assert(b != nullptr && s != nullptr);
+    if (s->n_identifier == 0u) return true;
+    if (!buf_put(b, ",\"identifier-field-ids\":[")) return false;
+    for (uint32_t k = 0; k < s->n_identifier; ++k) {                     // bounded: the identifier fields
+        if (!buf_fmt(b, k == 0u ? "%d" : ",%d", s->identifier_ids[k])) return false;
+    }
+    return buf_put(b, "]");
+}
+
 bool path_join(const char* a, const char* b, char* out, uint32_t cap) noexcept {
     assert(a != nullptr && b != nullptr && out != nullptr);
     const size_t al = std::strlen(a);
@@ -716,7 +727,9 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
             if (!buf_fmt(&b, "\"required\":%s}",
                          f.required ? "true" : "false")) return false;
         }
-        if (!buf_put(&b, "]}")) return false;
+        if (!buf_put(&b, "]")) return false;
+        if (!emit_identifier_ids(&b, &s)) return false;
+        if (!buf_put(&b, "}")) return false;
     }
     if (!buf_put(&b, "],")) return false;
 
@@ -890,7 +903,9 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
         if (!buf_kv_str(&b, "type", f.type, false)) return false;
         if (!buf_put(&b, "}")) return false;
     }
-    if (!buf_put(&b, "]}")) return false;
+    if (!buf_put(&b, "]")) return false;
+    if (!emit_identifier_ids(&b, s)) return false;
+    if (!buf_put(&b, "}")) return false;
     *out     = b.data;
     *out_len = b.len;
     return true;

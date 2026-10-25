@@ -92,6 +92,11 @@ bool table_drop_column(TableHandle* th, const char* name) noexcept {
     Schema next{};
     Schema* s = &next;
     if (!begin_schema_evolution(th, s)) return false;
+    for (uint32_t i = 0; i < s->n_fields; ++i) {                         // bounded: n_fields
+        if (std::strcmp(s->fields[i].name, name) != 0) continue;
+        for (uint32_t k = 0; k < s->n_identifier; ++k)                   // Java refuses dropping an identifier field
+            if (s->fields[i].id == s->identifier_ids[k]) return false;
+    }
     uint32_t out = 0;
     bool dropped = false;
     for (uint32_t i = 0; i < s->n_fields; ++i) {

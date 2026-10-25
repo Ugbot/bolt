@@ -197,20 +197,27 @@ bool key_from_location(const char* location, const char* table_rel,
     return path_join(table_rel, rel, out, cap);
 }
 
-// Read whatever an Iceberg path points at, trying each rebasing in turn:
-// location-relative first (a relocated table), then the historical
-// strip-root and join-table-rel attempts (unchanged for W4 callers).
+bool has_scheme(const char* p) noexcept {
+    assert(p != nullptr);
+    return std::strncmp(p, "file:", 5) == 0 || std::strstr(p, "://") != nullptr;
+}
+
+// Read whatever an Iceberg path points at (G2ICE-300: exact rules, so a path never resolves to another object):
+//   1. a path under the table's `location` (scheme-insensitive: s3:// = s3a:// = s3n://, file:/x = /x) is read at its
+//      location-relative key and nowhere else: a relocated table;
+//   2. otherwise a path under the store root is read with the root stripped;
+//   3. otherwise a scheme-less path is read as given, then under the table (the W4 fixtures' relative paths);
+//   4. a URI outside both the location and the root is refused.
 bool read_ref(ObjectStore* os, const char* location, const char* fs_root,
               const char* table_rel, const char* path, Arena* scratch,
               const uint8_t** out_body, uint64_t* out_len) noexcept {
     assert(os != nullptr && path != nullptr);
     assert(out_body != nullptr && out_len != nullptr);
     char key[kCatMaxPath];
-    if (key_from_location(location, table_rel, path, key, sizeof(key)) &&
-        os_get(os, key, scratch, out_body, out_len) == kOsOk) {
-        return true;
-    }
+    if (key_from_location(location, table_rel, path, key, sizeof(key)))
+        return os_get(os, key, scratch, out_body, out_len) == kOsOk;
     const char* stripped = strip_root(fs_root, path);
+    if (stripped == path && has_scheme(path) && location != nullptr && location[0] != '\0') return false;
     if (os_get(os, stripped, scratch, out_body, out_len) == kOsOk) return true;
     if (path_join(table_rel, stripped, key, sizeof(key)) &&
         os_get(os, key, scratch, out_body, out_len) == kOsOk) {
@@ -257,9 +264,17 @@ int read_version_hint(ObjectStore* os, const char* table_rel, Arena* scratch,
 // warehouse uses:
 //   Hadoop catalog     "v12.metadata.json"                    -> 12
 //   catalog-managed    "00002-<uuid>.metadata.json"           -> 2
+//   either, gzipped    "v3.gz.metadata.json", "00003-<uuid>.metadata.json.gz"
 // The second is what pyiceberg's SqlCatalog, the Iceberg REST catalog, Glue
 // and Hive all write, and the pre-G2FEAT-125 reader recognised neither it nor
 // the absence of version-hint.text that goes with it.
+// G2ICE-300: the metadata suffixes Iceberg-Java reads: plain, gzip per the spec (".gz.metadata.json") and the legacy
+// ".metadata.json.gz". The bytes are recognised by content when parsed.
+bool metadata_suffix(const char* s) noexcept {
+    return std::strcmp(s, ".metadata.json") == 0 || std::strcmp(s, ".gz.metadata.json") == 0 ||
+           std::strcmp(s, ".metadata.json.gz") == 0;
+}
+
 bool metadata_version_of(const char* tail, int64_t* out) noexcept {
     assert(tail != nullptr && out != nullptr);
     const char* p = tail;
@@ -272,9 +287,9 @@ bool metadata_version_of(const char* tail, int64_t* out) noexcept {
     if (digits == 0u) return false;
     if (*p == '-') {                        // "<NNNNN>-<uuid>.metadata.json"
         if (p == tail) return false;        // a bare "-..." is not a version
-        const char* dot = std::strstr(p, ".metadata.json");
-        if (dot == nullptr || dot[14] != '\0') return false;
-    } else if (std::strcmp(p, ".metadata.json") != 0) {
+        const char* dot = std::strchr(p, '.');
+        if (dot == nullptr || !metadata_suffix(dot)) return false;
+    } else if (!metadata_suffix(p)) {
         return false;
     }
     *out = v;
