@@ -221,7 +221,7 @@ TEST_F(IcebergObjectGraph, CompleteDigestAndRetainedExtentBindTheSuppliedIdentit
 TEST_F(IcebergObjectGraph, UriEscapesAndOutsideReferencesRefuseWithoutRebasing) {
     for (const char* reference:{"relative.parquet","s3://another-bucket/root%20space/data.parquet",
          "s3://graph-bucket/root%20spaces/data.parquet","s3://graph-bucket/root%20space/../data.parquet",
-         "s3://graph-bucket/root%20space/a%2Fb.parquet","s3://graph-bucket/root%20space/a%41.parquet"}) {
+         "s3://graph-bucket/root%20space/a?b.parquet","s3://graph-bucket/root%20space/a#b.parquet"}) {
         one_manifest("["+file_entry(reference,7)+"]");
         const auto rc=admit(); EXPECT_TRUE(rc==Status::Conflict || rc==Status::Unsupported) << reference;
         unchanged();

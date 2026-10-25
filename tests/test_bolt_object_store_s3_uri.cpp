@@ -8,21 +8,23 @@ namespace {
 using namespace bolt::lakehouse;
 using Status = S3UriStatus;
 
-TEST(S3ExactUri, CanonicalRoundTripDecodesExactlyOnce) {
-    struct Case { const char* root; const char* key; const char* uri; };
+// G2ICE-342: the path is the key, byte for byte (Iceberg-Java's S3FileIO, pyiceberg): Spark's URL-encoded partition
+// values ("%25", "+") stay literal, raw UTF-8 and spaces too.
+TEST(S3ExactUri, PathIsTheKeyLiterally) {
+    struct Case { const char* root; const char* key; };
     const Case cases[]{
-        {"s3://bucket", "outside/table.avro", "s3://bucket/outside/table.avro"},
-        {"s3://bucket/root", "a b/plus+?.json", "s3://bucket/root/a%20b/plus%2B%3F.json"},
-        {"s3://bucket/root%20space", "percent%2F", "s3://bucket/root%20space/percent%252F"},
-        {"s3://bucket", "utf8/\xC3\xA9", "s3://bucket/utf8/%C3%A9"},
-        {"s3://bucket", "hash#colon:", "s3://bucket/hash%23colon%3A"}
+        {"s3://bucket", "outside/table.avro"},
+        {"s3://bucket/root", "data/s=a%25b+c/f.parquet"},
+        {"s3://bucket/root", "data/s=100%/a b/\xE2\x82\xAC/f.parquet"},
+        {"s3://bucket/root%20space", "percent%2F"},
+        {"s3://bucket", "p=1/b=2,c:@!$&'()*;/x"},
     };
     for (const auto& item : cases) {
-        std::array<char, kOsMaxKey> out{};
-        ASSERT_EQ(s3_uri_for_object_key(item.root, item.key, out.data(), out.size()), Status::Ok);
-        EXPECT_STREQ(out.data(), item.uri);
-        ASSERT_EQ(s3_uri_object_key(item.root, item.uri, out.data(), out.size()), Status::Ok);
-        EXPECT_STREQ(out.data(), item.key);
+        std::array<char, kOsMaxKey> uri{}, key{};
+        ASSERT_EQ(s3_uri_for_object_key(item.root, item.key, uri.data(), uri.size()), Status::Ok) << item.key;
+        EXPECT_EQ(std::string(uri.data()), std::string(item.root) + "/" + item.key);
+        ASSERT_EQ(s3_uri_object_key(item.root, uri.data(), key.data(), key.size()), Status::Ok) << uri.data();
+        EXPECT_STREQ(key.data(), item.key);
     }
 }
 
@@ -64,16 +66,15 @@ TEST(S3ExactUri, HadoopSchemeAliasesMapExactly) {
     char out[32] = "unchanged";
     EXPECT_EQ(s3_uri_object_key("s3a://bucket/root", "s3://bucket/root/a", out, sizeof(out)), Status::Unsupported);
     EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://other/root/a", out, sizeof(out)), Status::OutsideRoot);
-    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://bucket/root/a%2fb", out, sizeof(out)), Status::BadArg);
+    EXPECT_EQ(s3_uri_object_key("s3://bucket/root", "s3a://bucket/root/a?b", out, sizeof(out)), Status::BadArg);
     EXPECT_STREQ(out, "unchanged");
 }
 
 TEST(S3ExactUri, NoncanonicalAndTraversalFormsRefuseWithoutOutput) {
     for (const char* uri : {"s3://Bucket/a", "s3://ab/a", "s3://-bucket/a", "s3://bucket./a",
              "s3://bucket/", "s3://bucket//a", "s3://bucket/a/../b", "s3://bucket/./b",
-             "s3://bucket/a?x=1", "s3://bucket/a#x", "s3://bucket/a%2fb", "s3://bucket/a%2Fb",
-             "s3://bucket/%61", "s3://bucket/%2E%2E/b", "s3://bucket/a%5Cb", "s3://bucket/%00",
-             "s3://bucket/%7F", "s3://bucket/%", "s3://bucket/%0G", "s3://bucket/a b"}) {
+             "s3://bucket/a?x=1", "s3://bucket/a#x", "s3://bucket/a\\b", "s3://bucket/a\x01b",
+             "s3://bucket/a\x7F"}) {
         char out[64] = "unchanged";
         EXPECT_EQ(s3_uri_validate(uri), Status::BadArg) << uri;
         EXPECT_EQ(s3_uri_object_key("s3://bucket", uri, out, sizeof(out)), Status::BadArg) << uri;
@@ -82,7 +83,7 @@ TEST(S3ExactUri, NoncanonicalAndTraversalFormsRefuseWithoutOutput) {
 }
 
 TEST(S3ExactUri, InvalidRawKeysNeverEncodeASecondAuthority) {
-    for (const char* key : {"", "/absolute", "a//b", "a/../b", "./a", "a/", "a\\b", "a\nb"}) {
+    for (const char* key : {"", "/absolute", "a//b", "a/../b", "./a", "a/", "a\\b", "a\nb", "a?b", "a#b"}) {
         char out[64] = "unchanged";
         EXPECT_EQ(s3_uri_for_object_key("s3://bucket", key, out, sizeof(out)), Status::BadArg);
         EXPECT_STREQ(out, "unchanged");
@@ -96,7 +97,7 @@ TEST(S3ExactUri, ExactCapacityAndUnterminatedBounds) {
     char exact[5]{};
     ASSERT_EQ(s3_uri_object_key("s3://bucket", "s3://bucket/abcd", exact, sizeof(exact)), Status::Ok);
     EXPECT_STREQ(exact, "abcd");
-    EXPECT_EQ(s3_uri_for_object_key("s3://bucket", "a b", tiny, sizeof(tiny)), Status::Capacity);
+    EXPECT_EQ(s3_uri_for_object_key("s3://bucket", "ab", tiny, sizeof(tiny)), Status::Capacity);
     EXPECT_STREQ(tiny, "old");
     std::array<char, kOsMaxKey> unterminated{}; unterminated.fill('a');
     EXPECT_EQ(s3_uri_validate(unterminated.data()), Status::BadArg);

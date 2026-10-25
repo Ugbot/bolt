@@ -12,8 +12,8 @@ namespace bl = bolt::lakehouse;
 namespace ice = bl::iceberg;
 using Status = ice::MetadataLoadStatus;
 constexpr char kUuid[] = "12345678-1234-1234-1234-123456789abc";
-constexpr char kTable[] = "s3://data-bucket/independent%20table";
-constexpr char kJson[] = R"({"format-version":2,"table-uuid":"12345678-1234-1234-1234-123456789abc","location":"s3://data-bucket/independent%20table","last-updated-ms":999,"last-sequence-number":17,"current-snapshot-id":19,"current-schema-id":9,"schemas":[{"type":"struct","schema-id":9,"fields":[{"id":7,"name":"value","required":true,"type":"long"}]}],"default-spec-id":4,"partition-specs":[{"spec-id":4,"fields":[]}],"default-sort-order-id":3,"sort-orders":[{"order-id":3,"fields":[]}],"snapshots":[{"snapshot-id":19,"sequence-number":17,"timestamp-ms":999,"schema-id":9,"manifest-list":"s3://metadata-bucket/root/snap.avro"}]})";
+constexpr char kTable[] = "s3://data-bucket/independent table";
+constexpr char kJson[] = R"({"format-version":2,"table-uuid":"12345678-1234-1234-1234-123456789abc","location":"s3://data-bucket/independent table","last-updated-ms":999,"last-sequence-number":17,"current-snapshot-id":19,"current-schema-id":9,"schemas":[{"type":"struct","schema-id":9,"fields":[{"id":7,"name":"value","required":true,"type":"long"}]}],"default-spec-id":4,"partition-specs":[{"spec-id":4,"fields":[]}],"default-sort-order-id":3,"sort-orders":[{"order-id":3,"fields":[]}],"snapshots":[{"snapshot-id":19,"sequence-number":17,"timestamp-ms":999,"schema-id":9,"manifest-list":"s3://metadata-bucket/root/snap.avro"}]})";
 
 struct Origin {
     std::string bytes = kJson;
@@ -66,9 +66,9 @@ protected:
     std::array<uint8_t, sizeof(out)> out_before{};
     std::array<uint8_t, sizeof(result)> result_before{};
     void SetUp() override {
-        std::strcpy(id.store_location, "s3://metadata-bucket/root%20space");
+        std::strcpy(id.store_location, "s3://metadata-bucket/root space");
         std::strcpy(id.table_location, kTable); std::strcpy(id.table_uuid, kUuid);
-        std::strcpy(id.metadata_uri, "s3://metadata-bucket/root%20space/metadata/target%25.json");
+        std::strcpy(id.metadata_uri, "s3://metadata-bucket/root space/metadata/target%.json");
         std::strcpy(id.object_key, "metadata/target%.json");
         std::strcpy(id.version.etag, "\"revision-A\""); id.version.size = origin.bytes.size();
         metadata.set_growth_enabled(false); io.set_growth_enabled(false);
@@ -104,7 +104,7 @@ TEST_F(IcebergMetadataIO, ExactPinnedObjectOwnsSchemaCountersAndCompleteHash) {
 
 TEST_F(IcebergMetadataIO, BucketOnlyStoreRootDoesNotRestrictIndependentTableLocation) {
     std::strcpy(id.store_location, "s3://metadata-bucket");
-    std::strcpy(id.metadata_uri, "s3://metadata-bucket/metadata/target%25.json");
+    std::strcpy(id.metadata_uri, "s3://metadata-bucket/metadata/target%.json");
     ASSERT_EQ(load(), Status::Ok); EXPECT_STREQ(out.location, kTable); no_discovery();
 }
 
@@ -164,14 +164,14 @@ TEST_F(IcebergMetadataIO, ExtentRequestAndParserRepresentabilityBudgetsRefuseBef
 TEST_F(IcebergMetadataIO, UnsupportedSchemesAndNoncanonicalMappingsNeverRead) {
     const auto original = id;
     for (const char* root : {"https://metadata-bucket/root", "file:///root", "s3://metadata-bucket/root/",
-             "s3://metadata-bucket/root%2fspace", "s3://metadata-bucket/root%2Fspace",
-             "s3://metadata-bucket/root%41", "s3://metadata-bucket/../root", "s3://metadata-bucket//root"}) {
+             "s3://metadata-bucket/root?space", "s3://metadata-bucket/root#space",
+             "s3://metadata-bucket/root\\x", "s3://metadata-bucket/../root", "s3://metadata-bucket//root"}) {
         id = original; std::strcpy(id.store_location, root);
         const Status status = load();
         EXPECT_TRUE(status == Status::BadArg || status == Status::Unsupported);
         unchanged();
     }
-    id = original; std::strcpy(id.metadata_uri, "s3://other-bucket/root/metadata/target%25.json");
+    id = original; std::strcpy(id.metadata_uri, "s3://other-bucket/root/metadata/target%.json");
     EXPECT_EQ(load(), Status::IdentityMismatch); unchanged();
     id = original; std::strcpy(id.object_key, "metadata/../target.json");
     EXPECT_EQ(load(), Status::BadArg); id = original; std::memset(id.object_key, 'x', sizeof(id.object_key));
@@ -189,7 +189,7 @@ TEST_F(IcebergMetadataIO, ParsedUuidAndTableLocationMustMatchUntruncatedIdentity
 
 TEST_F(IcebergMetadataIO, MalformedMissingAndDuplicateIdentityJsonCannotPublish) {
     for (const auto& body : {std::string("{malformed}"), std::string("{}"),
-         std::string(kJson).insert(1, "\"location\":\"s3://data-bucket/independent%20table\","),
+         std::string(kJson).insert(1, "\"location\":\"s3://data-bucket/independent table\","),
          std::string(kJson).insert(1, "\"table-uuid\":12,")}) {
         origin.bytes = body; id.version.size = body.size(); origin.next = 0;
         EXPECT_EQ(load(), Status::DecodeFailed); unchanged(); no_discovery();
@@ -222,7 +222,7 @@ TEST_F(IcebergMetadataIO, EscapedOnlyRootIdentitySpellingsCannotPublish) {
 }
 
 TEST_F(IcebergMetadataIO, EscapedIdentityValuesAreExplicitlyRefusedEvenWhenRawUuidMatches) {
-    for (const auto& value : {std::array<const char*, 2>{kTable, R"(s3:\/\/data-bucket/independent%20table)"},
+    for (const auto& value : {std::array<const char*, 2>{kTable, R"(s3:\/\/data-bucket/independent table)"},
              std::array<const char*, 2>{kUuid, R"(\u00312345678-1234-1234-1234-123456789abc)"}}) {
         origin.bytes = kJson;
         const auto position = origin.bytes.find(value[0]);

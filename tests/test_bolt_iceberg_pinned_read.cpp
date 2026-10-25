@@ -18,8 +18,8 @@ using namespace bolt;
 using namespace bolt::lakehouse;
 using namespace bolt::lakehouse::iceberg;
 namespace pq = bolt::ingest::parquet;
-constexpr char kRoot[] = "s3://read-bucket/root%20space";
-constexpr char kTable[] = "s3://read-bucket/root%20space/tables/orders";
+constexpr char kRoot[] = "s3://read-bucket/root space";
+constexpr char kTable[] = "s3://read-bucket/root space/tables/orders";
 constexpr char kUuid[] = "12345678-1234-1234-1234-123456789abc";
 constexpr uint32_t kRequest = 64;
 enum Slot : uint32_t { MetadataSlot, ExactList, LatestList, ExactManifest,
@@ -308,7 +308,7 @@ struct Fixture {
     }
     bool prepare(int64_t exact_id = -1, bool absent = false, Columns mode = Columns::Valid) {
         const char* keys[SlotCount]{"retained/generation.json", "lists/exact.json", "lists/latest.json",
-            "manifests/exact.json", "manifests/latest.json", "shared/exact%part.parquet", "shared/latest.parquet",
+            "manifests/exact.json", "manifests/latest.json", "shared/exact%25part.parquet", "shared/latest.parquet",
             "manifests/deletes.json","shared/positions.parquet"};
         for (uint32_t i = 0; i < SlotCount; ++i) origin.objects[i].key = keys[i];
         if (!parquet_bytes(&origin.objects[ExactData].bytes,false,mode) ||
@@ -503,7 +503,7 @@ TEST(IcebergPinnedRead, UnadmittedReferencesAreRejectedWithoutOriginProbe) {
 
 TEST(IcebergPinnedRead, CrossBucketOutsideRootAndRelativeReferencesCannotRebase) {
     for (const Slot level : {MetadataSlot,ExactList,ExactManifest}) {
-        for (const char* invalid : {"s3://other-bucket/root%20space/shared/exact%25part.parquet",
+        for (const char* invalid : {"s3://other-bucket/root space/shared/exact%part.parquet",
              "s3://read-bucket/outside/exact.parquet", "shared/exact%25part.parquet"}) {
             Fixture f; ASSERT_TRUE(f.prepare());
             if (level==MetadataSlot) {
