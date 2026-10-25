@@ -102,17 +102,14 @@ TEST(IcebergManifestWrite, ManifestRoundTrip) {
 TEST(IcebergManifestWrite, ColumnStatsRoundTrip) {
     bolt::Arena arena;
     ice::DataFileRef in = make_file("s3://wh/db/t/data/b-1.parquet", 5, 99, 1);
-    in.stats.n_cols = 2;
     // id: field_id 1, zero nulls (real, certified), bound [10, 50].
-    ice::ColumnStatEntry& c0 = in.stats.cols[0];
-    c0.field_id   = 1;
+    ice::ColumnStatEntry& c0 = *ice::stats_add_col(&in.stats, &arena, 1);
     c0.null_count = 0;
     const int64_t id_lo = 10, id_hi = 50;
-    std::memcpy(c0.lower, &id_lo, 8u); c0.lower_len = 8u; c0.has_lower = true;
-    std::memcpy(c0.upper, &id_hi, 8u); c0.upper_len = 8u; c0.has_upper = true;
+    ASSERT_TRUE(ice::stats_set_bound(&c0, &arena, true, &id_lo, 8u));
+    ASSERT_TRUE(ice::stats_set_bound(&c0, &arena, false, &id_hi, 8u));
     // score: field_id 2, three real nulls, no bound recorded.
-    ice::ColumnStatEntry& c1 = in.stats.cols[1];
-    c1.field_id   = 2;
+    ice::ColumnStatEntry& c1 = *ice::stats_add_col(&in.stats, &arena, 2);
     c1.null_count = 3;
     c1.has_lower  = false;
     c1.has_upper  = false;

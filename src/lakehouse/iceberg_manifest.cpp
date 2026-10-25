@@ -80,122 +80,84 @@ bool read_str(const bj::StructuralIndex* idx, bj::Iterator* it,
     return true;
 }
 
-void read_stat_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
-                     ColumnStatEntry* slot, bool is_lower) noexcept {
-    assert(idx != nullptr && it != nullptr && slot != nullptr);
-    if (bj::iter_peek(it) != bj::TokenType::BeginObject) {
-        skip_value(it); return;
-    }
+// One {field-id, value} bound into its column's entry, the value kept whole in `a` (G2ICE-336). False = refused
+// (iceberg_stat_columns / iceberg_bound_bytes).
+bool read_stat_entry(const bj::StructuralIndex* idx, bj::Iterator* it, FileStats* stats, Arena* a,
+                     bool is_lower) noexcept {
+    assert(idx != nullptr && it != nullptr && stats != nullptr && a != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginObject) { skip_value(it); return true; }
     bj::iter_advance(it);
-    char val[kLakeMaxValBytes]; val[0] = '\0';
+    char num[32]; num[0] = '\0';
+    const char* val = nullptr;
+    uint32_t val_len = 0;
     int32_t field_id = -1;
-    bool have_val = false;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
         if (tok_eq(idx, key, "field-id") || tok_eq(idx, key, "field_id")) {
             int64_t v = 0; read_int64(it, &v); field_id = static_cast<int32_t>(v);
-        } else if (tok_eq(idx, key, "value")) {
-            const bj::TokenType t = bj::iter_peek(it);
-            if (t == bj::TokenType::String) {
-                // A cut bound is not a bound: drop it rather than prune on it.
-                const bool fits = idx->tokens[it->cursor].length <
-                                  static_cast<int32_t>(sizeof(val));
-                read_str(idx, it, val, sizeof(val));
-                have_val = fits;
-            } else if (t == bj::TokenType::Int64 ||
-                       t == bj::TokenType::Float64) {
-                int64_t iv = 0; read_int64(it, &iv);
-                std::snprintf(val, sizeof(val), "%lld",
-                              static_cast<long long>(iv));
-                have_val = true;
-            } else {
-                skip_value(it);
-            }
+            continue;
+        }
+        if (!tok_eq(idx, key, "value")) { skip_value(it); continue; }
+        const bj::TokenType t = bj::iter_peek(it);
+        if (t == bj::TokenType::String) {
+            const bj::Token& tk = idx->tokens[it->cursor];
+            val = reinterpret_cast<const char*>(idx->src + tk.start);
+            val_len = static_cast<uint32_t>(tk.length);
+            bj::iter_advance(it);
+        } else if (t == bj::TokenType::Int64 || t == bj::TokenType::Float64) {
+            int64_t iv = 0; read_int64(it, &iv);
+            const int n = std::snprintf(num, sizeof(num), "%lld", static_cast<long long>(iv));
+            val = num;
+            val_len = static_cast<uint32_t>(n);
         } else {
             skip_value(it);
         }
     }
     if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    slot->field_id = field_id;
-    if (have_val) {
-        if (is_lower) {
-            std::strncpy(slot->lower, val, kLakeMaxValBytes - 1u);
-            slot->lower[kLakeMaxValBytes - 1u] = '\0';
-            slot->has_lower = true;
-            // JSON bounds are text, so the length is just the stored string's.
-            slot->lower_len =
-                static_cast<uint8_t>(std::strlen(slot->lower));
-        } else {
-            std::strncpy(slot->upper, val, kLakeMaxValBytes - 1u);
-            slot->upper[kLakeMaxValBytes - 1u] = '\0';
-            slot->has_upper = true;
-            slot->upper_len =
-                static_cast<uint8_t>(std::strlen(slot->upper));
-        }
-    }
+    if (val == nullptr) return true;
+    ColumnStatEntry* slot = stats_col(stats, a, field_id);
+    return slot != nullptr && stats_set_bound(slot, a, is_lower, val, val_len);
 }
 
-ColumnStatEntry* upsert_stat(FileStats* stats, int32_t field_id) noexcept {
-    assert(stats != nullptr);
-    for (uint32_t i = 0; i < stats->n_cols; ++i) {
-        if (stats->cols[i].field_id == field_id) return &stats->cols[i];
-    }
-    if (stats->n_cols >= kIcebergMaxStatCols) return nullptr;
-    ColumnStatEntry* slot = &stats->cols[stats->n_cols++];
-    std::memset(slot, 0, sizeof(*slot));
-    slot->field_id = field_id;
-    return slot;
-}
-
-void read_stat_array(const bj::StructuralIndex* idx, bj::Iterator* it,
-                     FileStats* stats, int kind) noexcept {
-    assert(idx != nullptr && it != nullptr && stats != nullptr);
-    if (bj::iter_peek(it) != bj::TokenType::BeginArray) { skip_value(it); return; }
+bool read_stat_array(const bj::StructuralIndex* idx, bj::Iterator* it,
+                     FileStats* stats, Arena* a, int kind) noexcept {
+    assert(idx != nullptr && it != nullptr && stats != nullptr && a != nullptr);
+    if (bj::iter_peek(it) != bj::TokenType::BeginArray) { skip_value(it); return true; }
     bj::iter_advance(it);
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
            g++ < kIterGuard) {
         if (kind < 2) {
-            ColumnStatEntry tmp{}; tmp.field_id = -1;
-            read_stat_entry(idx, it, &tmp, kind == 0);
-            ColumnStatEntry* slot = upsert_stat(stats, tmp.field_id);
-            if (slot != nullptr) {
-                if (kind == 0 && tmp.has_lower) {
-                    std::memcpy(slot->lower, tmp.lower, sizeof(slot->lower));
-                    slot->has_lower = true;
-                }
-                if (kind == 1 && tmp.has_upper) {
-                    std::memcpy(slot->upper, tmp.upper, sizeof(slot->upper));
-                    slot->has_upper = true;
-                }
-            }
-        } else {
-            bj::iter_advance(it);
-            int32_t fid = -1; int64_t nc = 0;
-            uint32_t g2 = 0;
-            while (bj::iter_peek(it) == bj::TokenType::Key &&
-                   g2++ < kIterGuard) {
-                const int32_t key = it->cursor;
-                bj::iter_advance(it);
-                if (tok_eq(idx, key, "field-id") ||
-                    tok_eq(idx, key, "field_id")) {
-                    int64_t v = 0; read_int64(it, &v);
-                    fid = static_cast<int32_t>(v);
-                } else if (tok_eq(idx, key, "value")) {
-                    read_int64(it, &nc);
-                } else {
-                    skip_value(it);
-                }
-            }
-            if (bj::iter_peek(it) == bj::TokenType::EndObject)
-                bj::iter_advance(it);
-            ColumnStatEntry* slot = upsert_stat(stats, fid);
-            if (slot != nullptr) slot->null_count = nc;
+            if (!read_stat_entry(idx, it, stats, a, kind == 0)) return false;
+            continue;
         }
+        bj::iter_advance(it);
+        int32_t fid = -1; int64_t nc = 0;
+        uint32_t g2 = 0;
+        while (bj::iter_peek(it) == bj::TokenType::Key &&
+               g2++ < kIterGuard) {
+            const int32_t key = it->cursor;
+            bj::iter_advance(it);
+            if (tok_eq(idx, key, "field-id") ||
+                tok_eq(idx, key, "field_id")) {
+                int64_t v = 0; read_int64(it, &v);
+                fid = static_cast<int32_t>(v);
+            } else if (tok_eq(idx, key, "value")) {
+                read_int64(it, &nc);
+            } else {
+                skip_value(it);
+            }
+        }
+        if (bj::iter_peek(it) == bj::TokenType::EndObject)
+            bj::iter_advance(it);
+        ColumnStatEntry* slot = stats_col(stats, a, fid);
+        if (slot == nullptr) return false;
+        slot->null_count = nc;
     }
     if (bj::iter_peek(it) == bj::TokenType::EndArray) bj::iter_advance(it);
+    return true;
 }
 
 bool read_partition_array(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -295,7 +257,7 @@ bool read_file_content(const bj::StructuralIndex* idx, bj::Iterator* it,
     return bj::iter_advance(it);
 }
 
-bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
+bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it, Arena* a,
                      DataFileRef* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) {
@@ -332,13 +294,13 @@ bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
             read_int64(it, &out->stats.file_size_in_bytes);
         } else if (tok_eq(idx, key, "lower_bounds") ||
                    tok_eq(idx, key, "lower-bounds")) {
-            read_stat_array(idx, it, &out->stats, 0);
+            if (!read_stat_array(idx, it, &out->stats, a, 0)) return false;
         } else if (tok_eq(idx, key, "upper_bounds") ||
                    tok_eq(idx, key, "upper-bounds")) {
-            read_stat_array(idx, it, &out->stats, 1);
+            if (!read_stat_array(idx, it, &out->stats, a, 1)) return false;
         } else if (tok_eq(idx, key, "null_value_counts") ||
                    tok_eq(idx, key, "null-value-counts")) {
-            read_stat_array(idx, it, &out->stats, 2);
+            if (!read_stat_array(idx, it, &out->stats, a, 2)) return false;
         } else if (tok_eq(idx, key, "content_offset") ||
                    tok_eq(idx, key, "content-offset")) {
             if (bj::iter_peek(it) == bj::TokenType::Int64) { read_int64(it, &out->content_offset); out->is_dv = true; }
@@ -364,7 +326,7 @@ bool parse_data_file(const bj::StructuralIndex* idx, bj::Iterator* it,
 }
 
 bool parse_manifest_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
-                          DataFileRef* out) noexcept {
+                          Arena* a, DataFileRef* out) noexcept {
     assert(idx != nullptr && it != nullptr && out != nullptr);
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
@@ -392,7 +354,7 @@ bool parse_manifest_entry(const bj::StructuralIndex* idx, bj::Iterator* it,
             read_int64(it, &out->snapshot_id);
         } else if (tok_eq(idx, key, "data_file") ||
                    tok_eq(idx, key, "data-file")) {
-            if (!parse_data_file(idx, it, out)) return false;
+            if (!parse_data_file(idx, it, a, out)) return false;
         } else {
             skip_value(it);
         }
@@ -488,7 +450,7 @@ bool manifest_parse_json(const uint8_t* src, uint32_t len, Arena* scratch,
            g++ < kIterGuard) {
         if (*out_n >= cap) return false;   // caller retries with more room
         DataFileRef* slot = &out[*out_n];
-        if (!parse_manifest_entry(&idx, &it, slot)) return false;
+        if (!parse_manifest_entry(&idx, &it, scratch, slot)) return false;
         if (slot->partition_spec_id < 0) slot->partition_spec_id = default_spec_id;
         ++*out_n;
     }

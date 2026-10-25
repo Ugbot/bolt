@@ -164,7 +164,7 @@ TEST(LoudIcebergManifest, PartitionValuesPastCapAreRefused) {
                                      &arena, 0, out, 1, &n));
 }
 
-TEST(LoudIcebergManifest, OverlongPathIsRefusedAndCutBoundIsDropped) {
+TEST(LoudIcebergManifest, OverlongPathIsRefusedAndLongBoundIsKept) {
     using namespace bolt::lakehouse::iceberg;
     bolt::Arena arena;
     DataFileRef* out = arena.allocate_array<DataFileRef>(1);
@@ -185,7 +185,8 @@ TEST(LoudIcebergManifest, OverlongPathIsRefusedAndCutBoundIsDropped) {
     for (uint32_t c = 0; c < out[0].stats.n_cols; ++c) {
         if (out[0].stats.cols[c].field_id != 1) continue;
         saw = true;
-        EXPECT_FALSE(out[0].stats.cols[c].has_upper);   // a prefix is no bound
+        ASSERT_TRUE(out[0].stats.cols[c].has_upper);    // G2ICE-336: kept whole, not cut to a slot
+        EXPECT_EQ(std::string(out[0].stats.cols[c].upper, out[0].stats.cols[c].upper_len), big);
         EXPECT_TRUE(out[0].stats.cols[c].has_lower);
     }
     EXPECT_TRUE(saw);

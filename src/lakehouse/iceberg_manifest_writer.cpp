@@ -28,6 +28,7 @@
 #include "bolt/lakehouse/iceberg/partition_values.h"
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_resource.h"
 #include "bolt/ingest/bolt_avro.h"
 #include "bolt/lakehouse/iceberg/delete_file.h"
 #include "bolt/lakehouse/iceberg/statistics.h"
@@ -203,11 +204,17 @@ uint32_t enc_bytes_stat(uint8_t* dst, const uint8_t* b, uint32_t len) noexcept {
     return n + len;
 }
 
-// Bound on one encoded stat-map: count varint (<=10) + up to kIcebergMaxStatCols
-// entries of (key varint <=5 + widest value <=10 for a long, or <=10+kLakeMaxValBytes
-// for a bytes bound) + terminator varint (<=10). Generous, fixed, Tiger-Style.
-constexpr uint32_t kStatMapBufCap = 16u +
-    kIcebergMaxStatCols * (16u + 10u + kLakeMaxValBytes);
+// Bytes one encoded stat map can take (G2ICE-336: sized to the file's columns and bounds): count varint + per entry a
+// key varint and a long (or a length varint and the bound) + terminator.
+uint64_t stat_map_cap(const FileStats& st, uint32_t map) noexcept {
+    uint64_t n = 32u;
+    for (uint32_t i = 0; i < st.n_cols; ++i) {                           // bounded: n_cols
+        n += 32u;
+        if (map == 4u && st.cols[i].has_lower) n += st.cols[i].lower_len;
+        if (map == 5u && st.cols[i].has_upper) n += st.cols[i].upper_len;
+    }
+    return n;
+}
 
 // The four int-keyed long maps of a data file (G2ICE-296): column_sizes, value_counts, null_value_counts,
 // nan_value_counts. One entry per column that has the metric (ColumnStatEntry's has_* flags; a null count is present
@@ -228,7 +235,6 @@ bool count_of(const ColumnStatEntry& c, CountMap m, int64_t* v) noexcept {
 
 uint32_t encode_count_map(const FileStats* st, CountMap m, uint8_t* dst, uint32_t cap) noexcept {
     assert(st != nullptr && dst != nullptr);
-    assert(st->n_cols <= kIcebergMaxStatCols);
     uint32_t known = 0;
     int64_t v = 0;
     for (uint32_t i = 0; i < st->n_cols; ++i) known += count_of(st->cols[i], m, &v) ? 1u : 0u;   // bounded: n_cols
@@ -250,7 +256,7 @@ uint32_t encode_count_map(const FileStats* st, CountMap m, uint8_t* dst, uint32_
 // split_offsets (G2ICE-296): array<long> of the row groups' start offsets; 0 when there are none.
 uint32_t encode_split_offsets(const FileStats* st, uint8_t* dst, uint32_t cap) noexcept {
     assert(st != nullptr && dst != nullptr);
-    if (st->n_split_offsets == 0u || st->n_split_offsets > kIcebergMaxSplitOffsets) return 0u;
+    if (st->n_split_offsets == 0u) return 0u;
     if (cap < 20u + 10u * st->n_split_offsets) return 0u;
     uint32_t o = enc_long_stat(static_cast<int64_t>(st->n_split_offsets), dst);
     for (uint32_t i = 0; i < st->n_split_offsets; ++i) o += enc_long_stat(st->split_offsets[i], dst + o);   // bounded
@@ -266,7 +272,6 @@ uint32_t encode_bound_map(const FileStats* st, bool want_lower, uint8_t* dst,
                           uint32_t cap) noexcept {
     assert(st != nullptr && dst != nullptr);
     if (st->n_cols == 0u) return 0u;
-    assert(st->n_cols <= kIcebergMaxStatCols);
     uint32_t n_present = 0;
     for (uint32_t i = 0; i < st->n_cols; ++i) {
         if (want_lower ? st->cols[i].has_lower : st->cols[i].has_upper) {
@@ -283,7 +288,7 @@ uint32_t encode_bound_map(const FileStats* st, bool want_lower, uint8_t* dst,
         if (!present) continue;
         const char* bytes = want_lower ? c.lower : c.upper;
         const uint32_t blen = want_lower ? c.lower_len : c.upper_len;
-        if (o + 15u + blen > cap) return 0u;
+        if (static_cast<uint64_t>(o) + 15u + blen > cap) return 0u;
         o += enc_long_stat(c.field_id, dst + o);
         o += enc_bytes_stat(dst + o, reinterpret_cast<const uint8_t*>(bytes),
                             blen);
@@ -552,10 +557,12 @@ bool put_entry_metrics(EntryRow* r, const FileStats& st) noexcept {
     assert(r != nullptr && r->scratch != nullptr);
     const CountMap counts[4] = {CountMap::kColumnSizes, CountMap::kValueCounts, CountMap::kNullCounts, CountMap::kNanCounts};
     for (uint32_t k = 0; k < 6u; ++k) {                                  // bounded: 6 maps
-        uint8_t* buf = r->scratch->allocate_array<uint8_t>(kStatMapBufCap);
+        const uint64_t cap = stat_map_cap(st, k);
+        if (cap > UINT32_MAX) { set_resource_exhausted("iceberg_bound_bytes", cap, UINT32_MAX); return false; }
+        uint8_t* buf = r->scratch->allocate_array<uint8_t>(static_cast<size_t>(cap));
         if (buf == nullptr) return false;
-        const uint32_t n = k < 4u ? encode_count_map(&st, counts[k], buf, kStatMapBufCap)
-                                  : encode_bound_map(&st, k == 4u, buf, kStatMapBufCap);
+        const uint32_t c32 = static_cast<uint32_t>(cap);
+        const uint32_t n = k < 4u ? encode_count_map(&st, counts[k], buf, c32) : encode_bound_map(&st, k == 4u, buf, c32);
         put_container(r, buf, n);
     }
     return true;
@@ -575,9 +582,11 @@ uint32_t encode_equality_ids(const DataFileRef& d, uint8_t* dst, uint32_t cap) n
 bool put_entry_tail(EntryRow* r, const DataFileRef& d, bool v3, bool v2_ref) noexcept {
     assert(r != nullptr && r->scratch != nullptr);
     put_null(&r->v[r->i++]);                                             // key_metadata
-    uint8_t* buf = r->scratch->allocate_array<uint8_t>(32u + 10u * kIcebergMaxSplitOffsets);
+    const uint64_t scap = 32u + 10u * uint64_t{d.stats.n_split_offsets};
+    if (scap > UINT32_MAX) return false;
+    uint8_t* buf = r->scratch->allocate_array<uint8_t>(static_cast<size_t>(scap));
     if (buf == nullptr) return false;
-    put_container(r, buf, encode_split_offsets(&d.stats, buf, 32u + 10u * kIcebergMaxSplitOffsets));
+    put_container(r, buf, encode_split_offsets(&d.stats, buf, static_cast<uint32_t>(scap)));
     uint8_t* eq = r->scratch->allocate_array<uint8_t>(128u);
     if (eq == nullptr) return false;
     put_container(r, eq, d.content == FileContent::kEqualityDeletes ? encode_equality_ids(d, eq, 128u) : 0u);

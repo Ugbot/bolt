@@ -16,10 +16,12 @@
 
 #include <cassert>
 #include <cstring>
+#include <new>
 
 #include "bolt/bolt_arena.h"
 #include "bolt/ingest/bolt_avro.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
+#include "bolt/lakehouse/iceberg/statistics.h"
 #include "lake_grow.h"
 
 namespace bolt {
@@ -75,16 +77,12 @@ bool fits(uint32_t cap, const ing::AvroValue* v) noexcept {
            v->bytes_len <= cap - 1u;
 }
 
-// A lower / upper bound's bytes into a kLakeMaxValBytes slot; false (no bound) when null or wider.
-bool copy_bound(char* dst, uint8_t* len, const ing::AvroValue* v) noexcept {
-    assert(dst != nullptr && len != nullptr);
-    *len = 0;
-    if (v == nullptr || v->is_null) return false;
-    if (v->bytes == nullptr) return v->bytes_len == 0u;
-    if (v->bytes_len > kLakeMaxValBytes) return false;
-    std::memcpy(dst, v->bytes, v->bytes_len);
-    *len = static_cast<uint8_t>(v->bytes_len);
-    return true;
+// A lower / upper bound's bytes, whole, into `a` (G2ICE-336). True with no bound when null; false = refused
+// (iceberg_bound_bytes, or arena exhaustion).
+bool copy_bound(ColumnStatEntry* e, Arena* a, bool lower, const ing::AvroValue* v) noexcept {
+    assert(e != nullptr && a != nullptr);
+    if (v == nullptr || v->is_null) return true;
+    return stats_set_bound(e, a, lower, v->bytes, v->bytes == nullptr ? 0u : v->bytes_len);
 }
 
 // Copy a string/bytes value into a fixed char buffer, NUL-terminated and
@@ -224,6 +222,9 @@ struct DfCtx {
     DataFileVisitFn visit;      // non-null: entries go here, `out` is unused
     void*        visit_ctx;
 
+    Arena*       stats_arena;   // the pending row's metrics storage (G2ICE-336)
+    Arena*       row_arena;     // visit mode: stats_arena, reset at each row (a visitor copies what it keeps)
+    uint32_t     split_cap;
     DataFileRef  pending;      // accumulates elements + scalars for one row
     int64_t      cur_row;
     bool         have_pending;
@@ -241,6 +242,8 @@ struct DfCtx {
 void df_reset_pending(DfCtx* s, int64_t row) noexcept {
     assert(s != nullptr);
     std::memset(&s->pending, 0, sizeof(s->pending));
+    s->split_cap = 0;
+    if (s->row_arena != nullptr) s->row_arena->reset();
     s->pending.partition_spec_id = s->default_spec_id;
     // Provenance, so pruning knows how to read what this parser produces:
     // partition field_ids are struct ordinals, bounds are Iceberg's binary
@@ -249,22 +252,6 @@ void df_reset_pending(DfCtx* s, int64_t row) noexcept {
     s->pending.binary_bounds         = true;
     s->cur_row      = row;
     s->have_pending = true;
-}
-
-// Find (or append) the per-column stat slot for `field_id`. Bounded by
-// kIcebergMaxStatCols; past that, extra columns are dropped rather than
-// overflowing — stats are a pruning aid, so losing some is degraded, not wrong.
-ColumnStatEntry* stat_slot(FileStats* st, int32_t field_id) noexcept {
-    assert(st != nullptr);
-    for (uint32_t i = 0; i < st->n_cols; ++i) {         // bounded: n_cols
-        if (st->cols[i].field_id == field_id) return &st->cols[i];
-    }
-    if (st->n_cols >= kIcebergMaxStatCols) return nullptr;
-    ColumnStatEntry* c = &st->cols[st->n_cols++];
-    std::memset(c, 0, sizeof(*c));
-    c->field_id = field_id;
-    c->null_count = -1;   // unknown until the null_value_counts map names this column
-    return c;
 }
 
 bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
@@ -285,18 +272,20 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
             static_cast<int32_t>(vals[0].num.i64);
         return true;
     }
-    if (rep == kRepSplitOffsets) {                      // array<long>; more than a FileStats holds: none
+    if (rep == kRepSplitOffsets) {                      // array<long>
         FileStats& st = s->pending.stats;
-        if (n_vals < 1u || vals[0].is_null || st.n_split_offsets == UINT32_MAX) return true;
-        if (st.n_split_offsets >= kIcebergMaxSplitOffsets) { st.n_split_offsets = UINT32_MAX; return true; }
+        if (n_vals < 1u || vals[0].is_null) return true;
+        if (!lake_grow(s->stats_arena, nullptr, &st.split_offsets, st.n_split_offsets, &s->split_cap,
+                       st.n_split_offsets + 1u))
+            return false;
         st.split_offsets[st.n_split_offsets++] = vals[0].num.i64;
         return true;
     }
     // The remaining three are array<record<key:int, value:...>>.
     if (n_vals < 2u || vals[0].is_null) return true;
     const int32_t fid = static_cast<int32_t>(vals[0].num.i64);
-    ColumnStatEntry* col = stat_slot(&s->pending.stats, fid);
-    if (col == nullptr) return true;
+    ColumnStatEntry* col = stats_col(&s->pending.stats, s->stats_arena, fid);
+    if (col == nullptr) return false;                   // over iceberg_stat_columns: refused, never dropped
     const ing::AvroValue* v = &vals[1];
     if (rep == kRepNullCounts) {
         col->null_count = i64_or(v, -1);
@@ -306,12 +295,8 @@ bool df_elem(void* c, uint32_t field_index, int64_t row_index, int64_t,
         if (rep == kRepValueCounts) { col->has_value_count = known; col->value_count = x; }
         else if (rep == kRepNanCounts) { col->has_nan_count = known; col->nan_count = x; }
         else { col->has_column_size = known; col->column_size = x; }
-    } else if (rep == kRepLower) {
-        // A bound wider than the slot is not kept: drop it rather than prune on a cut copy. Binary (no NUL), so a
-        // bound of exactly kLakeMaxValBytes fits (G2ICE-296: truncate(16) of 4-byte code points is 64 bytes).
-        col->has_lower = copy_bound(col->lower, &col->lower_len, v);
-    } else if (rep == kRepUpper) {
-        col->has_upper = copy_bound(col->upper, &col->upper_len, v);
+    } else if (rep == kRepLower || rep == kRepUpper) {
+        return copy_bound(col, s->stats_arena, rep == kRepLower, v);
     }
     return true;
 }
@@ -365,7 +350,6 @@ bool df_row(void* c, const ing::AvroValue* vals, uint32_t n,
         e->stats.sort_order_id = static_cast<int32_t>(i64_or(so, 0));
         e->stats.has_sort_order_id = true;
     }
-    if (e->stats.n_split_offsets == UINT32_MAX) e->stats.n_split_offsets = 0;   // more than a FileStats holds: none
     e->stats.record_count       = i64_or(at(s->f_records), 0);
     e->stats.file_size_in_bytes = i64_or(at(s->f_size), 0);
 
@@ -517,6 +501,7 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     s->grow            = proto->grow;
     s->visit           = proto->visit;
     s->visit_ctx       = proto->visit_ctx;
+    s->stats_arena     = s->grow != nullptr ? s->grow : scratch;
     s->f_status  = find_field(h, "status");
     s->f_snap    = find_field(h, "snapshot_id");
     s->f_content = find_field(h, "data_file.content");
@@ -555,9 +540,16 @@ bool df_parse(const uint8_t* src, uint64_t len, Arena* scratch,
     bind_rep(s, h, "data_file.nan_value_counts",  kRepNanCounts);
     bind_rep(s, h, "data_file.split_offsets",     kRepSplitOffsets);
 
+    if (s->visit != nullptr) {
+        void* m = scratch->allocate(sizeof(Arena), alignof(Arena));
+        if (m == nullptr) return false;
+        s->row_arena = new (m) Arena();
+        s->stats_arena = s->row_arena;
+    }
     int64_t rows = 0;
     const bool ok =
         ing::avro_read_ex(src, len, scratch, s, df_row, df_elem, &rows);
+    if (s->row_arena != nullptr) s->row_arena->~Arena();
     *out_n = s->n;
     if (out != nullptr) *out = s->out;
     return ok;

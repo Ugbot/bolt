@@ -34,6 +34,16 @@ bool parse_i64(const char* s, int64_t* out) noexcept {
     return true;
 }
 
+// A text bound (JSON manifests) of `n` bytes, not NUL-terminated.
+bool parse_i64_n(const char* p, uint32_t n, int64_t* out) noexcept {
+    assert(out != nullptr);
+    char buf[32];
+    if (p == nullptr || n == 0u || n >= sizeof(buf)) return false;
+    std::memcpy(buf, p, n);
+    buf[n] = '\0';
+    return parse_i64(buf, out);
+}
+
 bool pred_as_i64(const PredicateValue& v, int64_t* out) noexcept {
     assert(out != nullptr);
     if (v.type == BoltType::Int64 || v.type == BoltType::Int32) {
@@ -49,13 +59,7 @@ bool pred_as_i64(const PredicateValue& v, int64_t* out) noexcept {
     return false;
 }
 
-const ColumnStatEntry* find_stat(const FileStats* s, int32_t fid) noexcept {
-    assert(s != nullptr);
-    for (uint32_t i = 0; i < s->n_cols; ++i) {
-        if (s->cols[i].field_id == fid) return &s->cols[i];
-    }
-    return nullptr;
-}
+const ColumnStatEntry* find_stat(const FileStats* s, int32_t fid) noexcept { return stats_find(s, fid); }
 
 int32_t schema_field_id(const Schema* sch, const char* name) noexcept {
     assert(sch != nullptr && name != nullptr);
@@ -153,10 +157,10 @@ void bounds_of(const ColumnStatEntry* cs, const DataFileRef* f,
         return;
     }
     int64_t v = 0;
-    if (cs->has_lower && parse_i64(cs->lower, &v)) {
+    if (cs->has_lower && parse_i64_n(cs->lower, cs->lower_len, &v)) {
         *lo = static_cast<double>(v); *have_lo = true;
     }
-    if (cs->has_upper && parse_i64(cs->upper, &v)) {
+    if (cs->has_upper && parse_i64_n(cs->upper, cs->upper_len, &v)) {
         *hi = static_cast<double>(v); *have_hi = true;
     }
 }
