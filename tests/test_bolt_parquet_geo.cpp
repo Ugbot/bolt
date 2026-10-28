@@ -156,6 +156,12 @@ TEST(GeoType, ParsesJavaGrammar) {
     EXPECT_EQ(g.kind, ice::GeoKind::kGeography);
     EXPECT_EQ(g.algorithm, 4u);
     EXPECT_EQ(std::string(g.crs, g.crs_len), "EPSG:4326");
+    ASSERT_TRUE(parse("geography('EPSG:4326', 'karney')")) << "pyiceberg 0.12 quotes the parameters";
+    EXPECT_EQ(std::string(g.crs, g.crs_len), "EPSG:4326");
+    EXPECT_EQ(g.algorithm, 4u);
+    ASSERT_TRUE(parse("geometry(\"srid:3857\")"));
+    EXPECT_EQ(std::string(g.crs, g.crs_len), "srid:3857");
+    EXPECT_FALSE(parse("geometry('')"));
     EXPECT_FALSE(parse("geometry()"));
     EXPECT_FALSE(parse("geography(a, nope)"));
     EXPECT_FALSE(parse("geometry(a, spherical)"));

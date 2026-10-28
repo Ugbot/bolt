@@ -1,6 +1,6 @@
 // bolt/lakehouse/iceberg/geo_type.h — Iceberg v3 geometry / geography type names (G2ICE-327).
 //
-// The grammar is Iceberg-Java's Types.fromTypeName (1.12), case-insensitive, whitespace-tolerant:
+// The grammar is Iceberg-Java's Types.fromTypeName (1.12), case-insensitive, whitespace-tolerant, parameters optionally quoted:
 //   geometry                      geometry(<crs>)          <crs>: no ')' , non-empty
 //   geography                     geography(<crs>)         geography(<crs>, <algorithm>)   <crs>: no ','
 // <algorithm> is one of spherical / vincenty / thomas / andoyer / karney (EdgeAlgorithm; Parquet's
@@ -49,6 +49,13 @@ inline void trim(const char** p, uint32_t* n) noexcept {
     while (*n > 0u && space((*p)[*n - 1u])) --*n;
 }
 
+// pyiceberg (0.12) writes the parameters quoted, geometry('srid:4326'); Iceberg-Java and the spec do not. A matching pair of
+// quotes around a parameter is dropped, so both spellings name the same type.
+inline void unquote(const char** p, uint32_t* n) noexcept {
+    trim(p, n);
+    if (*n >= 2u && ((**p == '\'' && (*p)[*n - 1u] == '\'') || (**p == '"' && (*p)[*n - 1u] == '"'))) { ++*p; *n -= 2u; }
+}
+
 }  // namespace geo_detail
 
 // Is `n[0..len)` a geometry / geography type name? False (kind kNone) for any other name, and for a malformed
@@ -84,12 +91,12 @@ inline bool geo_type_parse(const char* name, uint32_t len, GeoTypeInfo* out) noe
             break;
         }
     }
-    geo_detail::trim(&in, &in_n);
+    geo_detail::unquote(&in, &in_n);
     if (in_n == 0u) return false;                       // Java: "Invalid CRS: (empty string)"
     out->kind = k;
     if (!geo_detail::ieq(in, in_n, kGeoDefaultCrs)) { out->crs = in; out->crs_len = in_n; }
     if (alg != nullptr) {
-        geo_detail::trim(&alg, &alg_n);
+        geo_detail::unquote(&alg, &alg_n);
         uint32_t a = 0;
         while (a < 5u && !geo_detail::ieq(alg, alg_n, kGeoAlgorithms[a])) ++a;   // bounded: 5
         if (a == 5u) { *out = GeoTypeInfo{}; return false; }

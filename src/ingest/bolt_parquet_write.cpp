@@ -2512,8 +2512,9 @@ void write_size_statistics(TcOut* o, const ChunkRec& rec) noexcept {
 }
 
 // `nl` is the chunk's nested leaf, or nullptr for a flat / LIST column.
-// G2ICE-327: GeospatialStatistics {1: BoundingBox bbox, 2: list<i32> geospatial_types}. The box is written for GEOMETRY
-// only (a GEOGRAPHY box must cover curved edges: spec-legal to omit); z / m ranges when any value had them.
+// G2ICE-327: GeospatialStatistics {1: BoundingBox bbox, 2: list<i32> geospatial_types} of a GEOMETRY chunk, as parquet-java
+// writes it (checked against Iceberg-Java 1.12's files): z / m ranges when any value had them. A GEOGRAPHY chunk gets none,
+// as parquet-java writes (a geography box would also have to cover curved edges).
 void write_geospatial_statistics(TcOut* o, const ChunkRec& rec) noexcept {
     assert(o != nullptr && rec.geo != 0u);
     const kernels::wkb::Bounds& b = rec.geo_bounds;
@@ -2660,7 +2661,7 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
         tc_put_field(o, 16, kFStruct);
         write_size_statistics(o, rec);
     }
-    if (rec.geo != 0u && !rec.geo_bounds.incomplete && rec.geo_bounds.n_types > 0u) {
+    if (rec.geo == 1u && !rec.geo_bounds.incomplete && rec.geo_bounds.n_types > 0u) {
         tc_put_field(o, 17, kFStruct);
         write_geospatial_statistics(o, rec);
     }
