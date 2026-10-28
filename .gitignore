@@ -13,3 +13,4 @@ compile_commands.json
 *.o
 *.obj
 build-tests/
+__pycache__/
