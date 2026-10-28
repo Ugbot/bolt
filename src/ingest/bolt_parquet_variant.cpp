@@ -378,18 +378,90 @@ bool put_value(const Ctx& x, int32_t g, const BoltColumn& gc, int64_t i, uint32_
     return bin_at(*vc, i, &p, &n) && n > 0u && put(x.out, p, n);
 }
 
-// The footer with every NANOS leaf of the subtree left raw: the reader rescales TIMESTAMP(NANOS) to micros otherwise.
-bool raw_time_meta(const PqMeta* meta, const PqField& f, Arena* a, PqMeta* out) noexcept {
+bool is_variant_group(const PqSchemaTree* t, int32_t f) noexcept;
+
+// Every NANOS leaf under a VARIANT group of field `f` left raw (the reader rescales TIMESTAMP(NANOS) to micros otherwise); millis
+// under a variant group has no variant primitive and fails.
+bool raw_variant_leaves(const PqSchemaTree* t, int32_t f, PqColumn* cols, uint32_t depth) noexcept {
+    if (depth > kMaxDepth) return false;
+    const PqField& fd = t->fields[f];
+    if (is_variant_group(t, f)) {
+        for (uint32_t c = fd.col_begin; c < fd.col_end; ++c) {            // bounded: the group's leaves
+            if (cols[c].time_unit == 3) cols[c].time_unit = 0;
+            if (cols[c].time_unit == 1) return false;
+        }
+        return true;
+    }
+    int32_t c = fd.first_child;
+    for (uint32_t k = 0; c >= 0 && k < fd.n_children; ++k) {              // bounded by the children
+        if (!raw_variant_leaves(t, c, cols, depth + 1u)) return false;
+        c = t->fields[c].next_sibling;
+    }
+    return true;
+}
+
+bool raw_time_meta(const PqMeta* meta, const PqSchemaTree* t, int32_t f, Arena* a, PqMeta* out) noexcept {
     *out = *meta;
     auto* cols = static_cast<PqColumn*>(a->allocate(sizeof(PqColumn) * (meta->n_columns > 0u ? meta->n_columns : 1u), 8));
     if (cols == nullptr) return false;
     std::memcpy(cols, meta->columns, sizeof(PqColumn) * meta->n_columns);
-    for (uint32_t c = f.col_begin; c < f.col_end; ++c) {                  // bounded: the group's leaves
-        if (cols[c].time_unit == 3) cols[c].time_unit = 0;
-        if (cols[c].time_unit == 1) return false;                         // millis: no variant primitive
-    }
     out->columns = cols;
+    return raw_variant_leaves(t, f, cols, 0u);
+}
+
+// The VARIANT group `gf` assembled as `gc` ({metadata, value?, typed_value?}) as make_variant({metadata, value}).
+bool unshred_group(const PqSchemaTree* tree, const PqMeta* meta, int32_t gf, const BoltColumn& gc, Arena* arena, BoltColumn* out) noexcept {
+    const int64_t rows = gc.length;
+    const BoltColumn* md = gc.child_at(0);
+    if (md == nullptr || md->length != rows) return false;
+    Buf b{nullptr, 0, 0, arena};
+    auto* offs = static_cast<int32_t*>(arena->allocate(sizeof(int32_t) * static_cast<size_t>(rows + 1), 8));
+    if (offs == nullptr) return false;
+    Ctx x;
+    x.t = tree;
+    x.meta = meta;
+    x.out = &b;
+    for (int64_t i = 0; i < rows; ++i) {                                   // bounded by the column
+        offs[i] = static_cast<int32_t>(b.n);
+        if (gc.is_null(i)) continue;
+        const uint8_t* mp = nullptr;
+        uint32_t ml = 0;
+        if (!bin_at(*md, i, &mp, &ml) || !dict_open(mp, ml, &x.dict)) return false;
+        if (!put_present(x, gf, gc, i, 0u) || b.n > static_cast<uint64_t>(INT32_MAX)) return false;
+    }
+    offs[rows] = static_cast<int32_t>(b.n);
+    uint8_t* data = b.p != nullptr ? b.p : static_cast<uint8_t*>(arena->allocate(1, 8));
+    if (data == nullptr) return false;
+    const BoltColumn value = BoltColumn::make_var_binary(data, nullptr, offs, rows, BoltType::Binary, arena);
+    *out = BoltColumn::make_variant(md, &value, rows, gc.validity, arena);
+    return out->data != nullptr;
+}
+
+// Replace every VARIANT group under field `f` (assembled as `col`) by its unshredded column, in place.
+bool unshred_tree(const PqSchemaTree* t, const PqMeta* meta, int32_t f, BoltColumn* col, Arena* a, uint32_t depth) noexcept {
+    if (depth > kMaxDepth) return false;
+    if (is_variant_group(t, f)) return unshred_group(t, meta, f, *col, a, col);
+    const PqField& fd = t->fields[f];
+    if (fd.kind == PqFieldKind::Leaf) return true;
+    if (!col->is_nested() || col->data == nullptr) return false;
+    auto* kids = static_cast<BoltColumn*>(const_cast<void*>(col->data));
+    int32_t c = fd.first_child;
+    for (int64_t k = 0; c >= 0 && k < static_cast<int64_t>(fd.n_children); ++k) {   // bounded by the children
+        if (k >= col->child_count() || !unshred_tree(t, meta, c, &kids[k], a, depth + 1u)) return false;
+        c = t->fields[c].next_sibling;
+    }
     return true;
+}
+
+bool has_variant_group(const PqSchemaTree* t, int32_t f, uint32_t depth) noexcept {
+    if (depth > kMaxDepth) return false;
+    if (is_variant_group(t, f)) return true;
+    int32_t c = t->fields[f].first_child;
+    for (uint32_t k = 0; c >= 0 && k < t->fields[f].n_children; ++k) {   // bounded by the children
+        if (has_variant_group(t, c, depth + 1u)) return true;
+        c = t->fields[c].next_sibling;
+    }
+    return false;
 }
 
 }  // namespace
@@ -407,6 +479,14 @@ bool pq_variant_group_ok(const PqSchemaTree* tree, int32_t f) noexcept {
     return (v >= 0 || t >= 0) && 1u + (v >= 0 ? 1u : 0u) + (t >= 0 ? 1u : 0u) == g.n_children;
 }
 
+namespace {
+bool is_variant_group(const PqSchemaTree* t, int32_t f) noexcept {
+    const PqField& fd = t->fields[f];
+    return fd.node >= 0 && static_cast<uint32_t>(fd.node) < t->n_nodes &&
+           t->nodes[fd.node].logical == static_cast<int32_t>(PqLogical::Variant) && pq_variant_group_ok(t, f);
+}
+}  // namespace
+
 bool pq_variant_group_shredded(const PqSchemaTree* tree, int32_t f) noexcept {
     int64_t pos = 0;
     return pq_variant_group_ok(tree, f) && child_named(tree, f, "typed_value", &pos) >= 0;
@@ -421,32 +501,29 @@ bool parquet_read_variant_column(const uint8_t* buf, uint64_t len, const PqMeta*
     PqMeta raw{};
     BoltColumn gc;
     int64_t rows = 0;
-    if (!raw_time_meta(meta, tree->fields[gf], arena, &raw) ||
-        !parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, &gc, &rows)) return false;
-    const BoltColumn* md = gc.child_at(0);
-    if (md == nullptr || md->length != rows) return false;
-    Buf b{nullptr, 0, 0, arena};
-    auto* offs = static_cast<int32_t*>(arena->allocate(sizeof(int32_t) * static_cast<size_t>(rows + 1), 8));
-    if (offs == nullptr) return false;
-    Ctx x;
-    x.t = tree;
-    x.meta = meta;
-    x.out = &b;
-    for (int64_t i = 0; i < rows; ++i) {                                   // bounded by the row group
-        offs[i] = static_cast<int32_t>(b.n);
-        if (gc.is_null(i)) continue;
-        const uint8_t* mp = nullptr;
-        uint32_t ml = 0;
-        if (!bin_at(*md, i, &mp, &ml) || !dict_open(mp, ml, &x.dict)) return false;
-        if (!put_present(x, gf, gc, i, 0u) || b.n > static_cast<uint64_t>(INT32_MAX)) return false;
+    // The top-level group is taken by its shape alone (a writer may leave the VARIANT annotation off it).
+    if (!raw_time_meta(meta, tree, gf, arena, &raw)) return false;
+    for (uint32_t c = tree->fields[gf].col_begin; c < tree->fields[gf].col_end; ++c) {   // bounded: the group's leaves
+        if (raw.columns[c].time_unit == 1) return false;
+        if (raw.columns[c].time_unit == 3) raw.columns[c].time_unit = 0;
     }
-    offs[rows] = static_cast<int32_t>(b.n);
-    uint8_t* data = b.p != nullptr ? b.p : static_cast<uint8_t*>(arena->allocate(1, 8));
-    if (data == nullptr) return false;
-    const BoltColumn value = BoltColumn::make_var_binary(data, nullptr, offs, rows, BoltType::Binary, arena);
-    *out = BoltColumn::make_variant(md, &value, rows, gc.validity, arena);
+    if (!parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, &gc, &rows)) return false;
+    if (!unshred_group(tree, meta, gf, gc, arena, out)) return false;
     *out_rows = rows;
-    return out->data != nullptr;
+    return true;
+}
+
+bool parquet_read_nested_column_variants(const uint8_t* buf, uint64_t len, const PqMeta* meta, const PqSchemaTree* tree,
+                                         uint32_t row_group, uint32_t top_field, Arena* arena, BoltColumn* out,
+                                         int64_t* out_rows) noexcept {
+    if (buf == nullptr || meta == nullptr || tree == nullptr || arena == nullptr || out == nullptr || out_rows == nullptr) return false;
+    if (top_field >= tree->n_top) return false;
+    const int32_t f = tree->top[top_field];
+    if (!has_variant_group(tree, f, 0u)) return parquet_read_nested_column_tree(buf, len, meta, tree, row_group, top_field, arena, out, out_rows);
+    PqMeta raw{};
+    if (!raw_time_meta(meta, tree, f, arena, &raw) ||
+        !parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, out, out_rows)) return false;
+    return unshred_tree(tree, meta, f, out, arena, 0u);
 }
 
 }  // namespace parquet

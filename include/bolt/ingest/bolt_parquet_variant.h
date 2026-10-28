@@ -44,6 +44,13 @@ bool parquet_read_variant_column(const uint8_t* buf, uint64_t len, const PqMeta*
                                  uint32_t row_group, uint32_t top_field, Arena* arena, BoltColumn* out,
                                  int64_t* out_rows) noexcept;
 
+// parquet_read_nested_column_tree with every VARIANT-annotated group inside the field (a struct field, a list element, a map value
+// at any depth) read as above: each such group's column is make_variant({metadata, value}). A field with no variant group reads as
+// parquet_read_nested_column_tree does.
+bool parquet_read_nested_column_variants(const uint8_t* buf, uint64_t len, const PqMeta* meta, const PqSchemaTree* tree,
+                                         uint32_t row_group, uint32_t top_field, Arena* arena, BoltColumn* out,
+                                         int64_t* out_rows) noexcept;
+
 }  // namespace parquet
 }  // namespace ingest
 }  // namespace bolt
