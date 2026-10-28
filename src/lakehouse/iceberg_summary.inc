@@ -100,6 +100,10 @@ bool summary_totals(TableHandle* th, int64_t parent, const ManifestListEntry* ml
     s->v[kSumTotalDeleteFiles] = p.v[kSumTotalDeleteFiles] + d[kSumAddedDeleteFiles] - d[kSumRemovedDeleteFiles];
     s->v[kSumTotalPosDeletes]  = p.v[kSumTotalPosDeletes] + d[kSumAddedPosDeletes] - d[kSumRemovedPosDeletes];
     s->v[kSumTotalEqDeletes]   = p.v[kSumTotalEqDeletes] + d[kSumAddedEqDeletes] - d[kSumRemovedEqDeletes];
+    // The parent's totals come from another writer's metadata (input, not an invariant): totals that this commit would take below
+    // zero are inconsistent with the manifests, so they are recounted from them rather than carried forward or trusted.
+    for (uint32_t k = kSumFirstTotal; k < kSumKeys; ++k)                       // bounded: the summary keys
+        if (s->v[k] < 0) return recount_totals(th, ml, n, s);
     s->has_totals = true;
     assert(s->v[kSumTotalDataFiles] >= 0);
     return true;
