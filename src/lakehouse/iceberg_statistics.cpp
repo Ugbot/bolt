@@ -165,6 +165,49 @@ void bounds_of(const ColumnStatEntry* cs, const DataFileRef* f,
     }
 }
 
+// Exact integer bounds for an integral column (G2ICE-244): a double holds no more than 53 bits, so two distinct
+// nanosecond timestamps (or longs) can round to one double and a strict comparison on doubles would drop a file
+// that holds a matching row. False when the column is not integral or a bound is not decoded.
+bool bounds_of_i64(const ColumnStatEntry* cs, const DataFileRef* f, const SchemaField* sf, int64_t* lo, bool* have_lo,
+                   int64_t* hi, bool* have_hi) noexcept {
+    assert(cs != nullptr && f != nullptr);
+    assert(lo != nullptr && hi != nullptr && have_lo != nullptr && have_hi != nullptr);
+    *have_lo = false;
+    *have_hi = false;
+    if (!f->binary_bounds) {
+        *have_lo = cs->has_lower && parse_i64_n(cs->lower, cs->lower_len, lo);
+        *have_hi = cs->has_upper && parse_i64_n(cs->upper, cs->upper_len, hi);
+        return true;
+    }
+    if (sf == nullptr) return false;
+    bool is_float = false;
+    const uint32_t w = bound_width(sf->type, &is_float);
+    if (w == 0u || is_float) return false;
+    auto dec = [w](const char* b, uint32_t len, int64_t* out) noexcept {
+        if (len != w) return false;
+        if (w == 1u) { *out = b[0] != 0 ? 1 : 0; return true; }
+        if (w == 4u) { int32_t v = 0; std::memcpy(&v, b, 4u); *out = v; return true; }
+        std::memcpy(out, b, 8u);
+        return true;
+    };
+    *have_lo = cs->has_lower && dec(cs->lower, cs->lower_len, lo);
+    *have_hi = cs->has_upper && dec(cs->upper, cs->upper_len, hi);
+    return true;
+}
+
+// 0 = the predicate excludes [lo, hi]; 1 = it may match.
+template <typename T>
+bool range_may_match(PredicateOp op, T pv, T lo, bool have_lo, T hi, bool have_hi) noexcept {
+    switch (op) {
+        case PredicateOp::kEq: return !(have_lo && pv < lo) && !(have_hi && pv > hi);
+        case PredicateOp::kLt: return !(have_lo && pv <= lo);
+        case PredicateOp::kLe: return !(have_lo && pv < lo);
+        case PredicateOp::kGt: return !(have_hi && pv >= hi);
+        case PredicateOp::kGe: return !(have_hi && pv > hi);
+        default:               return true;
+    }
+}
+
 }  // namespace
 
 bool stats_pass(const DataFileRef* f, const Schema* sch,
@@ -178,40 +221,29 @@ bool stats_pass(const DataFileRef* f, const Schema* sch,
         const ColumnStatEntry* cs = find_stat(&f->stats, fid);
         if (cs == nullptr) continue;
         if (pr.op == PredicateOp::kIsNull) {
-            if (cs->null_count == 0) return false;
+            if (!cs->no_null_count && cs->null_count == 0) return false;   // unknown count: may hold nulls
             continue;
         }
         if (pr.op == PredicateOp::kIsNotNull) {
-            if (cs->null_count > 0 && f->stats.record_count > 0 &&
+            if (!cs->no_null_count && cs->null_count > 0 && f->stats.record_count > 0 &&
                 cs->null_count >= f->stats.record_count) return false;
             continue;
         }
-        double pv = 0.0;
-        if (!pred_as_f64(pr.value, &pv)) continue;
-        double lo = 0.0, hi = 0.0;
+        const SchemaField* sf = schema_field(sch, pr.column);
+        int64_t iv = 0, ilo = 0, ihi = 0;
         bool have_lo = false, have_hi = false;
-        bounds_of(cs, f, schema_field(sch, pr.column),
-                  &lo, &have_lo, &hi, &have_hi);
-        switch (pr.op) {
-            case PredicateOp::kEq:
-                if (have_lo && pv < lo) return false;
-                if (have_hi && pv > hi) return false;
-                break;
-            case PredicateOp::kLt:
-                if (have_lo && pv <= lo) return false;
-                break;
-            case PredicateOp::kLe:
-                if (have_lo && pv < lo) return false;
-                break;
-            case PredicateOp::kGt:
-                if (have_hi && pv >= hi) return false;
-                break;
-            case PredicateOp::kGe:
-                if (have_hi && pv > hi) return false;
-                break;
-            default:
-                break;
+        if (pr.value.type == BoltType::Utf8 || pr.value.type == BoltType::Binary) continue;   // string bounds: not decoded here
+        const bool int_pred = pr.value.type != BoltType::Float64 && pr.value.type != BoltType::Float32 &&
+                              pred_as_i64(pr.value, &iv);
+        if (int_pred && bounds_of_i64(cs, f, sf, &ilo, &have_lo, &ihi, &have_hi)) {
+            if (!range_may_match(pr.op, iv, ilo, have_lo, ihi, have_hi)) return false;
+            continue;
         }
+        double pv = 0.0;
+        if (!pred_as_f64(pr.value, &pv) || pv != pv) continue;
+        double lo = 0.0, hi = 0.0;
+        bounds_of(cs, f, sf, &lo, &have_lo, &hi, &have_hi);
+        if (!range_may_match(pr.op, pv, lo, have_lo, hi, have_hi)) return false;
     }
     return true;
 }

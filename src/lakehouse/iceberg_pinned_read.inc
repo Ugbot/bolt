@@ -210,7 +210,7 @@ BoltType want_bolt_type(const char* t) noexcept {
     if (std::strcmp(t,"long")==0) return BoltType::Int64;
     if (std::strcmp(t,"int")==0) return BoltType::Int32;
     if (std::strcmp(t,"double")==0) return BoltType::Float64;
-    if (std::strcmp(t,"float")==0) return BoltType::Float32;
+    if (std::strcmp(t,"float")==0) return BoltType::Float64;   // the parquet decoder widens FLOAT to Float64 (G2ICE-379)
     if (std::strcmp(t,"boolean")==0) return BoltType::Bool;
     if (std::strcmp(t,"string")==0) return BoltType::Utf8;
     if (std::strcmp(t,"date")==0) return BoltType::Date32;

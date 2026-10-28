@@ -27,6 +27,7 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/partition.h"
 #include "bolt/lakehouse/iceberg/scan.h"
+#include "bolt/lakehouse/iceberg/statistics.h"
 #include "bolt/lakehouse/object_store.h"
 
 namespace {
@@ -188,6 +189,48 @@ TEST(IcebergManifestPruning, MissingSummariesNeverPrune) {
     EXPECT_FALSE(manifest_may_match(&e, &spec, &sch, &q, 1));
     e.partitions[0].has_upper = false;                         // half a bound
     EXPECT_TRUE(manifest_may_match(&e, &spec, &sch, &q, 1));
+}
+
+// G2ICE-244: integer column bounds compare exactly. 2^60 - 1 and 2^60 are one double, so the old double comparison
+// pruned a file holding 2^60 for `v > 2^60 - 1`.
+TEST(IcebergStatsPruning, IntegerBoundsCompareExactly) {
+    const int64_t big = INT64_C(1) << 60;
+    SchemaField fld;
+    std::memset(&fld, 0, sizeof(fld));
+    fld.id = 3;
+    std::strcpy(fld.name, "v");
+    std::strcpy(fld.type, "long");
+    Schema sch;
+    std::memset(&sch, 0, sizeof(sch));
+    sch.n_fields = 1;
+    sch.fields = &fld;
+    ColumnStatEntry cs;
+    std::memset(&cs, 0, sizeof(cs));
+    cs.field_id = 3;
+    cs.has_lower = cs.has_upper = true;
+    cs.lower = reinterpret_cast<const char*>(&big);
+    cs.upper = reinterpret_cast<const char*>(&big);
+    cs.lower_len = cs.upper_len = 8;
+    static DataFileRef f;
+    std::memset(&f, 0, sizeof(f));
+    f.binary_bounds = true;
+    f.stats.record_count = 1;
+    f.stats.n_cols = f.stats.cap_cols = 1;
+    f.stats.cols = &cs;
+    const Predicate gt = pred("v", PredicateOp::kGt, big - 1);
+    EXPECT_TRUE(stats_pass(&f, &sch, &gt, 1));
+    const Predicate le = pred("v", PredicateOp::kLe, big - 1);
+    EXPECT_FALSE(stats_pass(&f, &sch, &le, 1));
+    const Predicate eq = pred("v", PredicateOp::kEq, big + 1);
+    EXPECT_FALSE(stats_pass(&f, &sch, &eq, 1));
+    const Predicate eq_hit = pred("v", PredicateOp::kEq, big);
+    EXPECT_TRUE(stats_pass(&f, &sch, &eq_hit, 1));
+    // A file whose null counts were not written may hold nulls.
+    cs.no_null_count = true;
+    Predicate isnull = pred("v", PredicateOp::kIsNull, 0);
+    EXPECT_TRUE(stats_pass(&f, &sch, &isnull, 1));
+    cs.no_null_count = false;
+    EXPECT_FALSE(stats_pass(&f, &sch, &isnull, 1));
 }
 
 }  // namespace
