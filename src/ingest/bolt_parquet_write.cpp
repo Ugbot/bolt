@@ -44,6 +44,7 @@
 //   Statistics            {3 null_count, 5 max_value, 6 min_value}
 
 #include "bolt/ingest/bolt_parquet_write.h"
+#include "bolt/kernels/bolt_wkb.h"
 
 #include <cassert>
 #include <cstdint>
@@ -202,6 +203,15 @@ inline void tc_put_string(TcOut* o, const char* s) noexcept {
 // Thrift compact element types we use.
 constexpr std::uint8_t kFByte = 3, kFI16 = 4, kFI32 = 5, kFI64 = 6, kFBinary = 8,
                       kFList = 9, kFStruct = 12, kFTrue = 1, kFFalse = 2;
+constexpr std::uint8_t kFDouble = 7;
+
+// A compact-protocol double: 8 bytes, little-endian (G2ICE-327 BoundingBox).
+inline void tc_put_double(TcOut* o, double v) noexcept {
+    assert(o != nullptr && o->buf != nullptr);
+    std::uint8_t b[8];
+    std::memcpy(b, &v, 8u);
+    o->buf->insert(o->buf->end(), b, b + 8);
+}
 
 // ===== bit / def-level encoding ===========================================
 //
@@ -349,6 +359,9 @@ struct ChunkRec {
     std::uint8_t  max_rep;
     std::int64_t  def_hist[kPqWMaxDefBuckets];
     std::int64_t  rep_hist[kPqWMaxRepBuckets];
+    // G2ICE-327: GeospatialStatistics (ColumnMetaData field 17) of a GEOMETRY / GEOGRAPHY chunk.
+    std::uint8_t  geo;                 // the column's ParquetWriteColumn::geo (0: none)
+    kernels::wkb::Bounds geo_bounds;   // zero-initialized by the chunk's memset = an empty fold
 };
 
 // One column chunk, encoded but not yet placed in the file. Every offset in
@@ -434,6 +447,9 @@ struct ParquetWriter {
     // memory sink.
     char              path[kPwMaxPathLen];
     ParquetWriteOpts  opts;
+    // G2ICE-327: every GEOMETRY / GEOGRAPHY crs, copied at open (the caller's strings are borrowed for open only).
+    // Reserved once at its final size, so the cols' / nodes' geo_crs pointers into it never move.
+    std::vector<char> geo_text;
     // The column descriptors, copied out of whichever storage the caller's
     // opts used (inline or wide_columns). opts.columns is not read after open.
     std::vector<ParquetWriteColumn> cols;
@@ -532,8 +548,17 @@ std::uint32_t list_chain(const ParquetWriteColumn& sch,
     return sch.list_depth;
 }
 
+// G2ICE-327: a GEOMETRY / GEOGRAPHY annotation is a plain BYTE_ARRAY column (no other annotation, no fixed length).
+bool geo_column_ok(const ParquetWriteColumn& c) noexcept {
+    if (c.geo == 0u) return c.geo_crs_len == 0u;
+    if (c.geo > 2u || c.geo_algorithm > 4u || c.type != BoltType::Binary || c.fixed_len != 0u || c.logical != 0u) return false;
+    if (c.geo_crs_len > kPwMaxGeoCrsBytes || (c.geo_crs == nullptr && c.geo_crs_len != 0u)) return false;
+    return c.geo == 2u || c.geo_algorithm == 0u;
+}
+
 bool type_supported(const ParquetWriteColumn& c) noexcept {
     if (c.nested != nullptr || c.n_nested != 0u) return nested_column_valid(c);
+    if (!geo_column_ok(c)) return false;
     if(c.integer_bits && !((c.integer_bits==8 || c.integer_bits==16 || c.integer_bits==32) ? c.type==BoltType::Int32 : c.integer_bits==64 && c.type==BoltType::Int64)) return false;
     if(c.timestamp_unit>3 || (c.timestamp_unit && c.type!=BoltType::Timestamp)) return false;
     if(c.time_micros && c.type!=BoltType::Int64) return false;
@@ -829,6 +854,11 @@ bool compute_stats_utf8(const BoltColumn& col, std::int64_t r_begin,
     return true;
 }
 
+// G2ICE-327: a GEOMETRY / GEOGRAPHY chunk carries no min / max (its sort order is undefined); its values' WKB is folded
+// into GeospatialStatistics instead. `def` (nullable only) marks defined rows; rows [r0, r1) of `col`.
+void geo_chunk_stats(const BoltColumn& col, std::int64_t r0, std::int64_t r1, const std::uint8_t* def,
+                     std::uint8_t geo, ChunkRec* rec) noexcept;
+
 bool compute_stats(const BoltColumn& col, std::int64_t r_begin,
                    std::int64_t r_end,
                    const std::uint8_t* def_bits, bool nullable,
@@ -946,6 +976,22 @@ bool compute_stats(const BoltColumn& col, std::int64_t r_begin,
         default:
             // Decimal128: min/max skipped (v1 gap, documented in the header).
             return true;
+    }
+}
+
+void geo_chunk_stats(const BoltColumn& col, std::int64_t r0, std::int64_t r1, const std::uint8_t* def,
+                     std::uint8_t geo, ChunkRec* rec) noexcept {
+    assert(rec != nullptr && geo != 0u);
+    assert(r0 >= 0 && r1 >= r0);
+    rec->st.have_stats = false;
+    rec->geo = geo;
+    for (std::int64_t r = r0; r < r1 && !rec->geo_bounds.incomplete; ++r) {   // bounded: the chunk's rows
+        if ((def != nullptr && def[r] == 0u) || col.is_null(r)) continue;
+        const std::uint8_t* p = nullptr;
+        std::int32_t n = 0;
+        col.utf8_at(r, &p, &n);
+        if (n < 0) { rec->geo_bounds.incomplete = true; break; }
+        (void)kernels::wkb::bounds_add(&rec->geo_bounds, p, static_cast<std::size_t>(n));
     }
 }
 
@@ -1566,6 +1612,7 @@ bool chunk_write_direct(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
             !compute_stats(col, r0, r1, def_bits, nullable, &ps)) {
             return false;
         }
+        if (sch.geo != 0u) ps.have_stats = false;   // G2ICE-327
         const std::int64_t page_nulls = count_nulls(def_bits, nullable, r0, r1);
         std::int64_t off = 0;
         std::int32_t sz = 0;
@@ -1702,6 +1749,7 @@ bool chunk_write_dict(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
             !compute_stats(col, r0, r1, def_bits, nullable, &ps)) {
             return false;
         }
+        if (sch.geo != 0u) ps.have_stats = false;   // G2ICE-327
         std::int64_t off = 0;
         std::int32_t sz = 0;
         PageSpec spec{false, w->opts.data_page_v2, r1 - r0, (r1 - r0) - nv,
@@ -2148,6 +2196,7 @@ bool write_column_chunk(ParquetWriter* w, ChunkWorkspace* ws, ChunkOut* out,
         !compute_stats(col, 0, n_rows, db, nullable, &rec->st)) {
         return false;
     }
+    if (sch.geo != 0u) geo_chunk_stats(col, 0, n_rows, db, sch.geo, rec);
     // G2PQ-25: byte_array_data_bytes only -- a flat column's level histogram
     // is legal to omit per spec (see ChunkRec's comment) and is never set
     // here. LIST-of-BYTE_ARRAY is handled separately in chunk_write_list.
@@ -2258,6 +2307,20 @@ void write_schema_element_col(TcOut* o,
         tc_put_field(o, (lg == BoltLogical::Enum) ? 4 : 11, kFStruct);
         tc_put_stop(o);                      // empty EnumType / NullType
         tc_put_stop(o);                      // end LogicalType union
+    }
+    if (c.geo != 0u) {                       // G2ICE-327: LogicalType GEOMETRY (17) / GEOGRAPHY (18)
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, c.geo == 1u ? 17 : 18, kFStruct);
+        if (c.geo_crs != nullptr) {
+            tc_put_field(o, 1, kFBinary);
+            tc_put_binary(o, reinterpret_cast<const std::uint8_t*>(c.geo_crs), c.geo_crs_len);
+        }
+        if (c.geo == 2u) {
+            tc_put_field(o, 2, kFI32);       // EdgeInterpolationAlgorithm
+            tc_put_zigzag(o, c.geo_algorithm);
+        }
+        tc_put_stop(o);
+        tc_put_stop(o);
     }
     if (c.type == BoltType::UUID) {
         tc_put_field(o, 10, kFStruct);
@@ -2449,6 +2512,27 @@ void write_size_statistics(TcOut* o, const ChunkRec& rec) noexcept {
 }
 
 // `nl` is the chunk's nested leaf, or nullptr for a flat / LIST column.
+// G2ICE-327: GeospatialStatistics {1: BoundingBox bbox, 2: list<i32> geospatial_types}. The box is written for GEOMETRY
+// only (a GEOGRAPHY box must cover curved edges: spec-legal to omit); z / m ranges when any value had them.
+void write_geospatial_statistics(TcOut* o, const ChunkRec& rec) noexcept {
+    assert(o != nullptr && rec.geo != 0u);
+    const kernels::wkb::Bounds& b = rec.geo_bounds;
+    if (rec.geo == 1u && b.x.have && b.y.have) {
+        tc_put_field(o, 1, kFStruct);
+        tc_put_field(o, 1, kFDouble); tc_put_double(o, b.x.lo);
+        tc_put_field(o, 2, kFDouble); tc_put_double(o, b.x.hi);
+        tc_put_field(o, 3, kFDouble); tc_put_double(o, b.y.lo);
+        tc_put_field(o, 4, kFDouble); tc_put_double(o, b.y.hi);
+        if (b.z.have) { tc_put_field(o, 5, kFDouble); tc_put_double(o, b.z.lo); tc_put_field(o, 6, kFDouble); tc_put_double(o, b.z.hi); }
+        if (b.m.have) { tc_put_field(o, 7, kFDouble); tc_put_double(o, b.m.lo); tc_put_field(o, 8, kFDouble); tc_put_double(o, b.m.hi); }
+        tc_put_stop(o);
+    }
+    tc_put_field(o, 2, kFList);
+    tc_put_list_hdr(o, kFI32, b.n_types);
+    for (std::uint32_t i = 0; i < b.n_types; ++i) tc_put_zigzag(o, static_cast<std::int64_t>(b.types[i]));   // bounded: k_max_types
+    tc_put_stop(o);
+}
+
 void write_column_meta(TcOut* o, const ParquetWriter* w,
                        const ParquetWriteColumn& sch,
                        const ChunkRec& rec, const PwLeaf* nl) noexcept {
@@ -2575,6 +2659,10 @@ void write_column_meta(TcOut* o, const ParquetWriter* w,
     if (rec.byte_array_bytes_known || rec.level_hist_known) {
         tc_put_field(o, 16, kFStruct);
         write_size_statistics(o, rec);
+    }
+    if (rec.geo != 0u && !rec.geo_bounds.incomplete && rec.geo_bounds.n_types > 0u) {
+        tc_put_field(o, 17, kFStruct);
+        write_geospatial_statistics(o, rec);
     }
     tc_put_stop(o);
 }
@@ -2759,12 +2847,28 @@ bool sorting_columns_valid(const ParquetWriteOpts* opts) noexcept {
 
 namespace {
 
+// A borrowed crs string into the writer's own storage (capacity reserved by pw_copy_columns).
+const char* pw_own_text(ParquetWriter* w, const char* p, std::uint32_t n) noexcept {
+    if (p == nullptr) return nullptr;
+    assert(w->geo_text.size() + n <= w->geo_text.capacity());
+    const std::size_t at = w->geo_text.size();
+    w->geo_text.insert(w->geo_text.end(), p, p + n);
+    return w->geo_text.data() + at;
+}
+
 void pw_copy_columns(ParquetWriter* w, const ParquetWriteOpts* opts) noexcept {
     assert(w != nullptr && opts != nullptr);
     assert(opts->n_columns >= 1u && opts->n_columns <= kPwMaxColumns);
     w->cols.resize(opts->n_columns);
+    std::size_t text = 0;
     for (std::uint32_t i = 0; i < opts->n_columns; ++i) {   // bounded: kPwMaxColumns
         w->cols[i] = pw_opts_column(*opts, i);
+        text += w->cols[i].geo_crs_len;
+        for (std::uint32_t k = 0; w->cols[i].nested != nullptr && k < w->cols[i].n_nested; ++k) text += w->cols[i].nested[k].geo_crs_len;
+    }
+    w->geo_text.reserve(text);
+    for (std::uint32_t i = 0; i < opts->n_columns; ++i) {   // bounded: kPwMaxColumns
+        w->cols[i].geo_crs = pw_own_text(w, w->cols[i].geo_crs, w->cols[i].geo_crs_len);
     }
     w->opts.wide_columns = nullptr;
 }
@@ -2788,6 +2892,9 @@ bool pw_plan_leaves(ParquetWriter* w) noexcept {
         const std::uint32_t nb = static_cast<std::uint32_t>(w->nodes.size());
         w->nodes.insert(w->nodes.end(), c.nested, c.nested + c.n_nested);
         c.nested = nullptr;
+        for (std::uint32_t k = nb; k < w->nodes.size(); ++k) {   // bounded: kPwMaxNestedNodes
+            w->nodes[k].geo_crs = pw_own_text(w, w->nodes[k].geo_crs, w->nodes[k].geo_crs_len);
+        }
         const ParquetNestedNode& root = w->nodes[nb];
         std::memcpy(c.name, root.name, sizeof(c.name));
         c.nullable = root.nullable;

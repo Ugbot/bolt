@@ -11,5 +11,7 @@ inline constexpr std::uint32_t kPwMaxNestedNodes = 64;
 inline constexpr std::uint32_t kPwMaxNestedDepth = 16;
 // Kind A: repeated (LIST / MAP) nodes on one path; the reader's kPqMaxRepLevels.
 inline constexpr std::uint32_t kPwMaxNestedRep = 8;
+// Kind A: bytes of one GEOMETRY / GEOGRAPHY crs annotation (G2ICE-327); a longer one is refused at open.
+inline constexpr std::uint32_t kPwMaxGeoCrsBytes = 65536;
 
 }  // namespace bolt::ingest::parquet

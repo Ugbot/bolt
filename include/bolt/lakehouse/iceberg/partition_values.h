@@ -22,6 +22,7 @@ namespace iceberg {
 enum class IcebergType : uint8_t {
     kUnknown = 0, kBoolean, kInt, kLong, kFloat, kDouble, kDate, kTime, kTimestamp, kTimestampTz,
     kTimestampNs, kTimestampTzNs, kString, kBinary, kUuid, kFixed, kDecimal,
+    kGeometry, kGeography,   // G2ICE-327: WKB values; no identity/bucket/truncate/temporal transform, no partition value
 };
 
 struct IcebergTypeInfo {

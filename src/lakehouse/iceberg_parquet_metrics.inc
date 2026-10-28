@@ -161,6 +161,8 @@ IcebergTypeInfo leaf_type(const pq::PqColumn& c) noexcept {
         case pq::PqType::ByteArray:
             t.type = (lg == pq::PqLogical::String || lg == pq::PqLogical::Json || lg == pq::PqLogical::Enum ||
                       c.converted == 0) ? IcebergType::kString : IcebergType::kBinary;
+            if (lg == pq::PqLogical::Geometry) t.type = IcebergType::kGeometry;     // G2ICE-327
+            if (lg == pq::PqLogical::Geography) t.type = IcebergType::kGeography;
             break;
         case pq::PqType::FixedLenByteArray:
             t.type = lg == pq::PqLogical::Uuid ? IcebergType::kUuid : IcebergType::kFixed;
@@ -185,6 +187,7 @@ struct ValueFold {
     uint8_t*        lo_b = nullptr;
     uint8_t*        hi_b = nullptr;
     uint32_t        lo_n = 0, hi_n = 0, lo_cap = 0, hi_cap = 0;
+    kernels::wkb::Bounds geo;       // G2ICE-327: a geometry's x / y box (Iceberg-Java GeometryBoundsBuilder)
 };
 
 // Fixed is compared and kept as bytes too (never truncated; unbounded by a PartitionValue's width).
@@ -245,6 +248,16 @@ void fold_bytes(ValueFold* f, const uint8_t* p, uint32_t n) noexcept {
 void fold_row(ValueFold* f, const BoltColumn& c, int64_t r) noexcept {
     assert(f != nullptr);
     if (c.is_null(r) || f->refused) return;
+    if (f->t.type == IcebergType::kGeography) return;                  // Iceberg-Java keeps counts only
+    if (f->t.type == IcebergType::kGeometry) {
+        if (c.format != ColumnFormat::Flat && c.format != ColumnFormat::View && c.format != ColumnFormat::VarBinary) { f->ok = false; return; }
+        const uint8_t* p = nullptr;
+        int32_t n = 0;
+        c.utf8_at(r, &p, &n);
+        if (n < 0) f->geo.incomplete = true;
+        else (void)kernels::wkb::bounds_add(&f->geo, p, static_cast<size_t>(n));
+        return;
+    }
     if (f->t.type == IcebergType::kFixed && (c.type == BoltType::FixedSizeBinary || c.type == BoltType::UUID)) {
         // fixed[L <= 16] decodes into 16-byte slots (wider decodes as variable bytes, below)
         if (c.data == nullptr || f->t.fixed_len == 0u || f->t.fixed_len > 16u) { f->ok = false; return; }
@@ -292,6 +305,12 @@ void fold_leaf_values(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta
 bool emit_value_bounds(const ValueFold& f, ColumnStatEntry* e, Arena* a) noexcept {
     assert(e != nullptr && a != nullptr);
     if (f.refused) return false;
+    if (f.t.type == IcebergType::kGeometry) {                           // G2ICE-327: (xmin, ymin) / (xmax, ymax)
+        uint8_t lo[16], hi[16];
+        if (!f.ok || f.mode.mode == MetricsMode::kCounts || !kernels::wkb::iceberg_xy_bounds(f.geo, lo, hi)) return true;
+        return stats_set_bound(e, a, true, lo, 16u) && stats_set_bound(e, a, false, hi, 16u);
+    }
+    if (f.t.type == IcebergType::kGeography) return true;
     if (!f.ok || !f.have || f.mode.mode == MetricsMode::kCounts) return true;
     if (is_byte_type(f.t.type)) {
         if (!stats_set_bound(e, a, true, f.lo_b, f.lo_n)) return false;
@@ -368,7 +387,7 @@ bool leaf_metrics(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta, ui
     if (vf.t.type == IcebergType::kUnknown) {
         return !bounds || footer_bounds(meta, c, e, a);
     }
-    if (!floats && !bounds) return true;
+    if ((!floats && !bounds) || vf.t.type == IcebergType::kGeography) return true;   // G2ICE-327: geography: counts only
     fold_leaf_values(bytes, len, meta, static_cast<uint16_t>(c), &vf);
     if (floats && vf.ok && !vf.refused) { e->has_nan_count = true; e->nan_count = vf.nan; }
     return emit_value_bounds(vf, e, a);

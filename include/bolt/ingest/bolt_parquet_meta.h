@@ -211,6 +211,9 @@ enum class PqLogical : int32_t {
     // GROUP annotations (LogicalType union 3 LIST / 2 MAP). Leaves never
     // carry them; bolt_parquet_nested.h reads them off the group tree.
     List = 15, Map = 16,
+    // G2ICE-327: LogicalType union 17 GEOMETRY / 18 GEOGRAPHY over BYTE_ARRAY (ISO WKB). The edge algorithm of a
+    // GEOGRAPHY is PqColumn::geo_algorithm; the CRS string is not kept (readers take it from the table schema).
+    Geometry = 17, Geography = 18,
 };
 
 // parquet::CompressionCodec.
@@ -279,6 +282,8 @@ struct PqColumn {
     // `name` was cut to fit kPqMaxNameBytes: anything that binds this column
     // BY NAME must refuse it (a prefix can collide with a sibling).
     uint8_t  name_truncated;
+    // G2ICE-327: GEOGRAPHY's EdgeInterpolationAlgorithm (0 spherical, 1 vincenty, 2 thomas, 3 andoyer, 4 karney).
+    uint8_t  geo_algorithm;
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

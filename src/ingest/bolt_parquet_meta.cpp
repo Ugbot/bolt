@@ -239,6 +239,18 @@ void parse_decimal_type(TcCursor* c, int32_t* scale, int32_t* prec) noexcept {
     }
 }
 
+// GeographyType {1: optional string crs, 2: optional EdgeInterpolationAlgorithm algorithm}; the crs is skipped.
+void parse_geography_type(TcCursor* c, uint8_t* algorithm) noexcept {
+    assert(c != nullptr && algorithm != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        int64_t v = 0;
+        if (fid == 2 && tc_zigzag(c, &v)) { if (v >= 0 && v <= 4) *algorithm = static_cast<uint8_t>(v); }
+        else if (fid != 2 && !tc_skip(c, ft, 0)) return;
+    }
+}
+
 // LogicalType union (SchemaElement field 10). The set field id selects the
 // member: 5 DECIMAL, 6 DATE, 7 TIME, 8 TIMESTAMP, 10 INTEGER, 1 STRING,
 // 12 JSON, 13 BSON, 14 UUID, 15 FLOAT16, 16 VARIANT (G2PQ-16).
@@ -288,6 +300,11 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
                      (void)tc_skip(c, ft, 0); break;
             case 16: col->logical = static_cast<int32_t>(PqLogical::Variant);
                      (void)tc_skip(c, ft, 0); break;
+            // G2ICE-327: GeometryType {1: crs}, GeographyType {1: crs, 2: algorithm}.
+            case 17: col->logical = static_cast<int32_t>(PqLogical::Geometry);
+                     (void)tc_skip(c, ft, 0); break;
+            case 18: col->logical = static_cast<int32_t>(PqLogical::Geography);
+                     parse_geography_type(c, &col->geo_algorithm); break;
             // G2PQ-17: union id 11 NullType (UNKNOWN) -- every value null,
             // no compatible ConvertedType exists for it.
             case 11: col->logical = static_cast<int32_t>(PqLogical::Unknown);
