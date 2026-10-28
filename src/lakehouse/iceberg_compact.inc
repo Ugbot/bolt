@@ -244,6 +244,10 @@ bool compact_close(CompactOut* o) noexcept {
 bool compact_open(CompactOut* o) noexcept {
     assert(o != nullptr && !o->file_open);
     TableHandle* th = o->th;
+    // G2ICE-270: FileWriteIO holds one staged receipt. The previous output is published (its remote copy is the data), so its
+    // local source is released for this one to stage; compact_discard removes every published output if the commit fails.
+    // The last output keeps its source until the commit resolves, exactly as a one-file compaction always did.
+    if (th->file_io != nullptr && o->n_outs > 0) data_file_complete(th, o->rels[o->n_outs - 1u], true);
     const int n = std::snprintf(o->rel, sizeof(o->rel), "data/%lld-%016llx.parquet",
                                 static_cast<long long>(o->snap_id), static_cast<unsigned long long>(unique_u64()));
     if (n <= 0 || static_cast<size_t>(n) >= sizeof(o->rel)) return false;
@@ -283,8 +287,16 @@ bool compact_visit(void* c, const dml::RowBatch* rb) noexcept {
 
 void compact_discard(CompactOut* o) noexcept {
     assert(o != nullptr && o->th != nullptr);
-    if (o->file_open) { data_file_abandon(o->th, o->w); data_file_complete(o->th, o->rel, false); o->file_open = false; }
-    for (uint32_t i = 0; i < o->n_outs; ++i) data_file_complete(o->th, o->rels[i], false);   // bounded by n_outs
+    TableHandle* th = o->th;
+    const bool was_open = o->file_open;                          // then every closed output's source was released (compact_open)
+    if (o->file_open) { data_file_abandon(th, o->w); data_file_complete(th, o->rel, false); o->file_open = false; }
+    for (uint32_t i = 0; i < o->n_outs; ++i) {                   // bounded by n_outs
+        const bool released = th->file_io != nullptr && (was_open || i + 1u < o->n_outs);
+        if (!released) { data_file_complete(th, o->rels[i], false); continue; }
+        if (th->write_uncertain) continue;                       // an uncertain commit may reference it: keep it
+        const int rc = os_delete(th->os, o->rels[i]);
+        (void)rc;
+    }
 }
 
 // Read and write the candidates' live rows, then commit the replace. `ra` holds every batch until the commit.
@@ -313,6 +325,7 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
     }
     ChangeSet cs{};
     cs.op = SnapshotOp::kReplace;
+    cs.merge_manifests = 1u;
     cs.snap_id = o.snap_id;
     cs.add_data = o.outs;
     cs.n_add_data = o.n_outs;
@@ -337,13 +350,7 @@ bool compact_table(TableHandle* th, int64_t target) noexcept {
     if (ra == nullptr) return false;
     uint32_t n_worth = 0;
     bool ok = compact_deletes(th, ra, &p) && compact_select(th, &p, &n_worth) && compact_applied(th, &p);
-    int64_t in_bytes = 0;
-    for (uint32_t i = 0; i < p.n_cand; ++i) in_bytes += p.cand_size[i];   // bounded by n_cand
     const bool worth = n_worth != 0u;
-    if (ok && worth && th->file_io != nullptr && (in_bytes > target || n_worth > 1u)) {
-        ra->~Arena();
-        return refuse_named(th, "a compaction into more than one file through FileWriteIO (one staged file per commit)");
-    }
     if (ok && !worth) { ra->~Arena(); th->last_error = CommitError::kNone; return true; }
     ok = ok && compact_rewrite(th, ra, &p, target);
     ra->~Arena();

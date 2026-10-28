@@ -64,7 +64,8 @@ struct Store {
     FilesystemObjectStore fs{};
     ObjectStore origin{}, adapter{};
     bool metadata_loss = false;
-    uint32_t creates = 0, deletes = 0;
+    const char* fail_create = nullptr;   // a definite (non-uncertain) failure of every create whose key starts with it
+    uint32_t creates = 0, deletes = 0, data_deletes = 0;
     static Store& self(void* p) { return *static_cast<Store*>(p); }
     static int get(void* p, const char* k, bolt::Arena* a, const uint8_t** d, uint64_t* n) noexcept {
         return os_get(&self(p).origin, k, a, d, n);
@@ -73,10 +74,14 @@ struct Store {
     static int list(void* p, const char* k, ObjectEntry* e, uint32_t c, uint32_t* n) noexcept {
         return os_list(&self(p).origin, k, e, c, n);
     }
-    static int remove(void* p, const char* k) noexcept { auto& s = self(p); ++s.deletes; return os_delete(&s.origin, k); }
+    static int remove(void* p, const char* k) noexcept {
+        auto& s = self(p); ++s.deletes; s.data_deletes += std::strncmp(k, "data/", 5) == 0 ? 1u : 0u;
+        return os_delete(&s.origin, k);
+    }
     static int head(void* p, const char* k, ObjectMeta* m) noexcept { return os_head(&self(p).origin, k, m); }
     static int create(void* p, const char* k, const uint8_t* d, uint64_t n) noexcept {
         auto& s = self(p); ++s.creates;
+        if (s.fail_create != nullptr && std::strncmp(k, s.fail_create, std::strlen(s.fail_create)) == 0) return kOsIoError;
         const int rc = os_put_if_absent(&s.origin, k, d, n);
         return s.metadata_loss && std::strcmp(k, "metadata/v2.metadata.json") == 0 && rc == kOsOk ? kOsWriteUncertain : rc;
     }
@@ -435,3 +440,78 @@ TEST_F(IcebergWriteIO, ReceiptOutputsCannotOverwriteBorrowedObjectStoreOrVtable)
     }
 }
 }  // namespace
+namespace {
+std::string newest_metadata(const std::filesystem::path& remote) {
+    std::string best; uint64_t version = 0;
+    for (const auto& e : std::filesystem::directory_iterator(remote / "metadata")) {
+        const std::string n = e.path().filename().string();
+        if (n.size() < 15 || n[0] != 'v' || n.find(".metadata.json") == std::string::npos) continue;
+        const uint64_t v = std::strtoull(n.c_str() + 1, nullptr, 10);
+        if (v > version) { version = v; best = e.path().generic_string(); }
+    }
+    FILE* f = std::fopen(best.c_str(), "rb");
+    std::string out;
+    if (f == nullptr) return out;
+    char buf[4096];
+    for (size_t n; (n = std::fread(buf, 1, sizeof(buf), f)) > 0;) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+// The current snapshot's summary value for `key`.
+std::string current_total(const std::string& json, const char* key) {
+    const std::string cur = "\"current-snapshot-id\":";
+    const size_t c = json.find(cur);
+    if (c == std::string::npos) return "";
+    const std::string id = json.substr(c + cur.size(), json.find_first_of(",}", c + cur.size()) - c - cur.size());
+    const size_t s = json.find("\"snapshot-id\":" + id, json.find("\"snapshots\""));
+    if (s == std::string::npos) return "";
+    const std::string k = std::string("\"") + key + "\":\"";
+    const size_t v = json.find(k, s);
+    if (v == std::string::npos) return "";
+    return json.substr(v + k.size(), json.find('"', v + k.size()) - v - k.size());
+}
+size_t data_files(const std::filesystem::path& remote) {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(remote / "data", ec)) n += e.is_regular_file() ? 1u : 0u;
+    return n;
+}
+uint64_t one_file_bytes(const std::filesystem::path& remote) {
+    for (const auto& e : std::filesystem::recursive_directory_iterator(remote / "data")) if (e.is_regular_file()) return e.file_size();
+    return 0;
+}
+}  // namespace
+// G2ICE-270: compaction through FileWriteIO writes as many outputs as the bins need (it used to refuse past one file).
+TEST_F(IcebergWriteIO, CompactionWritesSeveralStagedOutputsAndKeepsEveryRow) {
+    auto options = config(); ASSERT_TRUE(table_set_file_write_io(table, &options));
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(append());
+    ASSERT_EQ(data_files(remote), 5u);
+    ASSERT_EQ(current_total(newest_metadata(remote), "total-records"), "20");
+    const uint64_t s = one_file_bytes(remote);
+    ASSERT_GT(s, 0u);
+    const uint32_t before = publisher.calls;
+    ASSERT_TRUE(table_compact(table, static_cast<int64_t>(2 * s + s / 2))) << "bins of two files: three outputs";
+    EXPECT_EQ(publisher.calls - before, 3u);
+    const std::string meta = newest_metadata(remote);
+    EXPECT_EQ(current_total(meta, "total-data-files"), "3");
+    EXPECT_EQ(current_total(meta, "total-records"), "20");
+    EXPECT_NE(meta.find("\"operation\":\"replace\""), std::string::npos);
+    EXPECT_EQ(data_files(remote), 8u) << "the inputs stay (an older snapshot references them); three outputs added";
+    EXPECT_TRUE(std::filesystem::is_empty(staging)) << "every staged source was released";
+}
+// A definite commit failure removes every published output, not only the last receipt's.
+TEST_F(IcebergWriteIO, FailedCompactionCommitRemovesEveryPublishedOutput) {
+    auto options = config(); ASSERT_TRUE(table_set_file_write_io(table, &options));
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(append());
+    const uint64_t s = one_file_bytes(remote);
+    const std::string meta_before = newest_metadata(remote);
+    store.fail_create = "metadata/snap-";   // the manifest list fails definitively, after every output was published
+    const uint32_t deletes = store.data_deletes, before = publisher.calls;
+    EXPECT_FALSE(table_compact(table, static_cast<int64_t>(2 * s + s / 2)));
+    EXPECT_NE(table_last_commit_error(table), CommitError::kUncertain);
+    EXPECT_EQ(publisher.calls - before, 3u);
+    EXPECT_EQ(store.data_deletes - deletes, 3u) << "all three published outputs are removed, no input file";
+    EXPECT_EQ(data_files(remote), 5u);
+    EXPECT_TRUE(std::filesystem::is_empty(staging));
+    EXPECT_EQ(newest_metadata(remote), meta_before) << "nothing was committed";
+}

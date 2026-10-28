@@ -496,6 +496,43 @@ TEST(IcebergDml, CompactionAppliesPendingDeletesAndKeepsTheRows) {
     EXPECT_EQ(table_metadata(t.th)->n_snapshots, n);
 }
 
+// G2ICE-270: a compaction also consolidates the manifests, so the current snapshot's manifest count stays bounded however
+// many appends and compactions came before (a replace used to carry every manifest forward, rewritten, for ever).
+TEST(IcebergDml, CompactionMergesManifestsSoTheirCountStaysBounded) {
+    Table t;
+    create_table(&t, fresh_root(temp_base(), "compact_merge"));
+    std::vector<Row> all;
+    const auto manifests = [&t]() {
+        bolt::Arena a;
+        const std::string ml = read_file(t.root + "/" + store_key(t.root, current(t.th).manifest_list));
+        ManifestListEntry* mle = nullptr; uint32_t nm = 0;
+        EXPECT_TRUE(manifest_list_parse_avro_grow(reinterpret_cast<const uint8_t*>(ml.data()), ml.size(), &a, 4u, &mle, &nm));
+        return nm;
+    };
+    int next = 0;
+    for (int round = 0; round < 4; ++round) {
+        for (int f = 0; f < 5; ++f, next += 3) {
+            const std::vector<Row> rows = base_rows(next, next + 3);
+            append_rows(&t, rows);
+            all.insert(all.end(), rows.begin(), rows.end());
+        }
+        if (round == 1) delete_position(&t, t.files.back(), 1);
+        const uint32_t before = manifests();
+        EXPECT_GE(before, 5u) << "each append adds a manifest";
+        ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+        ASSERT_EQ(table_last_commit_error(t.th), CommitError::kNone);
+        const Snapshot& s = current(t.th);
+        EXPECT_EQ(op_of(t.root, s.snapshot_id), "replace");
+        EXPECT_LE(manifests(), 3u) << "round " << round << ": one carried manifest per content + the compaction's own";
+        const Recount rc = recount(t.root, s);
+        EXPECT_EQ(rc.c.at("total-data-files"), 1);
+        EXPECT_EQ(rc.c.at("total-delete-files"), 0);
+        expect_summary_matches(t.root, s);
+        if (round == 1) { all.erase(std::find_if(all.begin(), all.end(), [&](const Row& r) { return r.id == next - 2; })); }
+        EXPECT_EQ(scan_rows(t.root), model(all, [](const Row&) { return false; })) << "round " << round;
+    }
+}
+
 TEST(IcebergDml, CompactionKeepsADeleteFileThatStillAppliesToAKeptFile) {
     Table t;
     create_table(&t, fresh_root(temp_base(), "compact_keep"));
@@ -519,7 +556,9 @@ TEST(IcebergDml, CompactionKeepsADeleteFileThatStillAppliesToAKeptFile) {
     EXPECT_EQ(rc.c.at("deleted-data-files"), 2);
     EXPECT_EQ(rc.c.at("removed-delete-files"), 0) << "the delete file still deletes a row of the kept file";
     EXPECT_EQ(rc.c.at("total-delete-files"), 1);
-    EXPECT_NE(find_entry(rc, t.files[2], ManifestStatus::kAdded), nullptr);
+    const Entry* kept = find_entry(rc, t.files[2], ManifestStatus::kExisting);   // merged into one manifest (G2ICE-270)
+    ASSERT_NE(kept, nullptr);
+    EXPECT_EQ(kept->snapshot_id, big->snapshot_id) << "a carried entry keeps the snapshot that added it";
     expect_summary_matches(t.root, s);
 }
 
