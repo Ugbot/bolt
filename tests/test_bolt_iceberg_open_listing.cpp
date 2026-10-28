@@ -1,5 +1,5 @@
 // G2ICE-245: finding the current metadata file lists metadata/ once in constant memory (list_visit), never the doubling
-// relists of os_list_all; with a version hint only `metadata/v` keys are listed, and the hint stays advisory.
+// relists of os_list_all; a version hint stays advisory.
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_port.h"
 #include "bolt/lakehouse/catalog.h"
@@ -142,7 +142,7 @@ TEST_F(IcebergOpenListing, CatalogManagedNamesManyObjectsListedOnceInConstantMem
     EXPECT_EQ(cs.last_prefix, "t/metadata/");
 }
 
-TEST_F(IcebergOpenListing, StaleHintIsAdvisoryAndOnlyHadoopNamesAreListed) {
+TEST_F(IcebergOpenListing, StaleHintIsAdvisory) {
     write_meta("v1.metadata.json", 1);
     write_meta("v2.metadata.json", 2);
     write_meta("v3.metadata.json", 3);
@@ -150,8 +150,18 @@ TEST_F(IcebergOpenListing, StaleHintIsAdvisoryAndOnlyHadoopNamesAreListed) {
     write_file("t/metadata/version-hint.text", "1");
     CountingStore cs;
     EXPECT_EQ(open_marker(&cs), 3);
-    EXPECT_EQ(cs.last_prefix, "t/metadata/v");
-    EXPECT_EQ(cs.keys, 4u);   // v1..v3 and version-hint.text, never the manifests
+    EXPECT_EQ(cs.visits, 1u);
+    EXPECT_EQ(cs.lists, 0u);
+}
+
+TEST_F(IcebergOpenListing, HadoopTableWithACatalogManagedNameBesideItRanksBoth) {
+    write_meta("v1.metadata.json", 1);
+    write_meta("v2.metadata.json", 2);
+    write_meta("00099-00000000-0000-0000-0000-000000000099.metadata.json", 99);   // a delta snapshot written beside it
+    write_file("t/metadata/version-hint.text", "2");
+    CountingStore cs;
+    EXPECT_EQ(open_marker(&cs), 99);
+    EXPECT_EQ(cs.last_prefix, "t/metadata/");
 }
 
 TEST_F(IcebergOpenListing, HintAtAMissingFileFindsTheRetainedLatest) {

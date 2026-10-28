@@ -2283,7 +2283,7 @@ bolt_apply_hardening(test_bolt_iceberg_uncertain_commit)
 add_test(NAME test_bolt_iceberg_uncertain_commit COMMAND test_bolt_iceberg_uncertain_commit)
 set_tests_properties(test_bolt_iceberg_uncertain_commit PROPERTIES TIMEOUT 30)
 
-# G2ICE-245: current-metadata discovery lists once in constant memory; a hint narrows the listing to metadata/v.
+# G2ICE-245: current-metadata discovery lists once in constant memory; a version hint stays advisory.
 add_executable(test_bolt_iceberg_open_listing test_bolt_iceberg_open_listing.cpp)
 target_link_libraries(test_bolt_iceberg_open_listing
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)

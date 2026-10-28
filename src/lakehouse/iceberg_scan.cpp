@@ -328,12 +328,10 @@ int rank_metadata_key(void* ctx, const char* k, uint64_t /*size*/) noexcept {
 }
 
 // G2ICE-245: one listing pass in constant memory (os_list_visit), never the doubling relists of os_list_all, whose
-// 2 KiB-per-entry arrays cost ~140 MiB at 20k metadata/ objects. With a readable version-hint.text the table is in the
-// Hadoop layout, whose metadata files are all `v<N>[.gz].metadata.json`, so only keys under `metadata/v` are listed (on S3
-// the prefix is filtered by the server: the manifests and manifest lists beside them are never enumerated). The hint is
-// still advisory (its write can lose a race after the commit, and versions may be retained with gaps): the listing ranks
-// every version, exactly as before. Without a hint (pyiceberg, REST, Glue, Hive: `<NNNNN>-<uuid>.metadata.json`) the whole
-// metadata/ prefix is visited. Hint-object and listing I/O errors fail closed.
+// 2 KiB-per-entry arrays cost ~140 MiB at 20k metadata/ objects. The hint is advisory (its write can lose a race after the
+// commit, versions may be retained with gaps, and a Hadoop-layout table can also carry catalog-managed
+// `<NNNNN>-<uuid>.metadata.json` names, e.g. a delta snapshot written beside it), so the whole metadata/ prefix is ranked
+// either way. Hint-object and listing I/O errors fail closed.
 bool find_latest_metadata(ObjectStore* os, const char* table_rel,
                           Arena* scratch, char* out_key,
                           uint32_t cap) noexcept {
@@ -359,7 +357,7 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
         else lm.key[0] = '\0';
     }
     char prefix[kCatMaxPath];
-    if (!path_join(table_rel, hr == kOsOk ? "metadata/v" : "metadata/", prefix, sizeof(prefix))) return false;
+    if (!path_join(table_rel, "metadata/", prefix, sizeof(prefix))) return false;
     if (os_list_visit(os, prefix, scratch, &rank_metadata_key, &lm) != kOsOk) return false;
     if (lm.best < 0) return false;
     const size_t len = std::strlen(lm.key);
