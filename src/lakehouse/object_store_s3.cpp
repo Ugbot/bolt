@@ -399,6 +399,32 @@ int s3_put_if_absent(void* impl, const char* key, const uint8_t* data,
     return resp.status / 100 == 2 ? kOsOk : kOsIoError;
 }
 
+// s3_put_if_absent reporting the version the PutObject response acknowledged (its ETag, the body's length).
+int s3_put_if_absent_versioned(void* impl, const char* key, const uint8_t* data, uint64_t len,
+                               ObjectVersion* out) noexcept {
+    assert(impl != nullptr && key != nullptr && out != nullptr);
+    assert(data != nullptr || len == 0);
+    *out = {};
+    if (len > net::kHttpMaxBody)
+        return multipart_contiguous(static_cast<S3ObjectStore*>(impl), key, data, len, true);
+    Arena scratch;
+    net::HttpResponse resp;
+    const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "PUT", key, "",
+                           data, len, true, &scratch, &resp);
+    if (rc != kOsOk) return rc == kOsIoError ? kOsWriteUncertain : rc;
+    if (resp.status == 412) return kOsExists;
+    if (resp.status == 409 || resp.status >= 500) return kOsWriteUncertain;
+    if (resp.status / 100 != 2) return kOsIoError;
+    const char* etag = nullptr;
+    ObjectVersion v{};
+    v.size = len;
+    if (single_header(resp, "ETag", &etag) && std::strlen(etag) < sizeof(v.etag)) {
+        std::memcpy(v.etag, etag, std::strlen(etag) + 1u);
+        if (os_object_version_valid(&v)) *out = v;
+    }
+    return kOsOk;
+}
+
 int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
             uint32_t* out_n) noexcept {
     assert(impl != nullptr);
@@ -492,7 +518,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head, s3_put_if_absent,
-    s3_get_range, s3_head_versioned, s3_get_range_if_match,
+    s3_get_range, s3_head_versioned, s3_get_range_if_match, s3_put_if_absent_versioned,
 };
 
 constexpr uint32_t kUploadResponseBytes = 64u * 1024u;

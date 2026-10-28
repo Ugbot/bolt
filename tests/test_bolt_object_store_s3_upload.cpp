@@ -71,7 +71,7 @@ enum class UploadMode { Success, PartError, AbortError, MissingEtag, OversizeEta
     Error200, Truncated, Dropped, Conditional412, Conflict409, MalformedInit,
     WrongKey, MalformedComplete, ChunkedComplete, NumericId, InitOversize,
     InitDuplicate, InitBadEntity, InitBadDeclaration, SmallPutDropped, SmallPutTruncated,
-    SmallPutServerError };
+    SmallPutServerError, SmallPutEtag };
 
 struct UploadStats { unsigned parts = 0; uint64_t bytes = 0; };
 
@@ -278,6 +278,7 @@ private:
             if (mode == UploadMode::SmallPutDropped) return true;
             if (mode == UploadMode::SmallPutTruncated)
                 return socket_send(fd, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nx");
+            if (mode == UploadMode::SmallPutEtag) return respond(fd, 200, "", "ETag: \"created-tag\"\r\n");
             return respond(fd, 200, "");
         }
         if (upload == 0) return false;
@@ -680,3 +681,27 @@ TEST(S3MultipartUpload, ConcurrentCallsKeepIdsProgressAndSourceBuffersIndependen
     }
 }
 }  // namespace
+
+// G2ICE-349: a conditional create reports the version its response acknowledged; without an ETag the version is zeroed.
+TEST(S3MultipartUpload, VersionedConditionalPutReportsTheAcknowledgedEtag) {
+    for (UploadMode mode : {UploadMode::SmallPutEtag, UploadMode::Success, UploadMode::Conditional412}) {
+        SCOPED_TRACE(static_cast<unsigned>(mode));
+        UploadServer server;
+        server.mode = mode;
+        ASSERT_TRUE(server.start());
+        S3ObjectStore config;
+        ObjectStore store;
+        ASSERT_TRUE(server.store(&config, &store));
+        const uint8_t bytes[] = {'s', 'm', 'a', 'l', 'l'};
+        ObjectVersion v{};
+        std::strcpy(v.etag, "\"stale\"");
+        const int rc = os_put_if_absent_versioned(&store, kUploadKey, bytes, sizeof(bytes), &v);
+        server.stop();
+        EXPECT_TRUE(server.valid);
+        EXPECT_EQ(server.conditional_puts, 1u);
+        if (mode == UploadMode::Conditional412) { EXPECT_EQ(rc, kOsExists); EXPECT_EQ(v.etag[0], 0); continue; }
+        EXPECT_EQ(rc, kOsOk);
+        if (mode == UploadMode::SmallPutEtag) { EXPECT_STREQ(v.etag, "\"created-tag\""); EXPECT_EQ(v.size, sizeof(bytes)); }
+        else EXPECT_EQ(v.etag[0], 0) << "no ETag in the response: zeroed, the caller HEADs";
+    }
+}

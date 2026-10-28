@@ -105,6 +105,10 @@ struct ObjectStoreVT {
     int (*get_range_if_match)(void* impl, const char* key, const ObjectVersion* expected,
                               uint64_t offset, uint32_t length, Arena* scratch,
                               uint8_t* dst, uint32_t* out_length) noexcept = nullptr;
+    // put_if_absent that also reports the version the store acknowledged for the object it created (G2ICE-349): on kOsOk *out
+    // is {len, the response's strong ETag}, or zeroed when the response named none (the caller then HEADs). Optional.
+    int (*put_if_absent_versioned)(void* impl, const char* key, const uint8_t* data, uint64_t len,
+                                   ObjectVersion* out) noexcept = nullptr;
 };
 
 struct ObjectStore {
@@ -171,6 +175,15 @@ inline int os_put_if_absent(ObjectStore* s, const char* key, const uint8_t* d,
     assert(key != nullptr && (d != nullptr || n == 0));
     if (s->vt->put_if_absent == nullptr) return kOsNotImplemented;
     return s->vt->put_if_absent(s->impl, key, d, n);
+}
+// os_put_if_absent with the acknowledged version (zeroed when the store reports none, or has no versioned create).
+inline int os_put_if_absent_versioned(ObjectStore* s, const char* key, const uint8_t* d,
+                                      uint64_t n, ObjectVersion* out) noexcept {
+    assert(s != nullptr && s->vt != nullptr);
+    assert(key != nullptr && out != nullptr && (d != nullptr || n == 0));
+    *out = {};
+    if (s->vt->put_if_absent_versioned != nullptr) return s->vt->put_if_absent_versioned(s->impl, key, d, n, out);
+    return os_put_if_absent(s, key, d, n);
 }
 
 // Invalid writable aliases are rejected without output writes. Present providers

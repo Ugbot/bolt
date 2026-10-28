@@ -76,6 +76,16 @@ int create(void* context, const char* key, const uint8_t* data, uint64_t length)
     return os_put_if_absent(&state->origin, full, data, length);
 }
 
+int create_versioned(void* context, const char* key, const uint8_t* data, uint64_t length, ObjectVersion* out) noexcept {
+    assert(data != nullptr || length == 0);
+    assert(context != nullptr && out != nullptr);
+    auto* state = state_of(context);
+    char full[kOsMaxKey]{};
+    *out = {};
+    if (!joined(state, key, true, full)) return kOsBadArg;
+    return os_put_if_absent_versioned(&state->origin, full, data, length, out);
+}
+
 int erase(void* context, const char* key) noexcept {
     assert(context != nullptr);
     assert(key != nullptr);
@@ -203,7 +213,8 @@ bool prefix_object_store_init(PrefixObjectStore* state, const ObjectStore* origi
         copy.vt->put_if_absent == nullptr ? nullptr : create,
         copy.vt->get_range == nullptr ? nullptr : range,
         copy.vt->head_versioned == nullptr ? nullptr : version,
-        copy.vt->get_range_if_match == nullptr ? nullptr : pinned_range};
+        copy.vt->get_range_if_match == nullptr ? nullptr : pinned_range,
+        copy.vt->put_if_absent == nullptr ? nullptr : create_versioned};
     out->vt = &state->vtable;
     out->impl = state;
     assert(state->prefix_length > 0 && out->impl == state);
