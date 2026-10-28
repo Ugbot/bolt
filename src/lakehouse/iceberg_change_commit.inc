@@ -50,39 +50,90 @@ void pin_first_row_ids(DataFileRef* e, uint32_t n, const ManifestListEntry& mle)
     }
 }
 
-// Carry `mle` forward, or rewrite it when it holds a file the change removes.
-bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& mle,
-                     ManifestListEntry* out) noexcept {
-    assert(th != nullptr && st != nullptr && out != nullptr);
+// Append the entries of `mle` that stay in the table, carried (the change's removals become this snapshot's DELETED entries,
+// earlier DELETED entries are dropped), to out[*n_out..], grown in the arena. *hit: the change removes one of them.
+bool carry_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& mle, DataFileRef** out, uint32_t* n_out,
+                    uint32_t* cap_out, bool* hit) noexcept {
+    assert(th != nullptr && st != nullptr && out != nullptr && n_out != nullptr);
+    assert(cap_out != nullptr && hit != nullptr);
     const bool del = mle.content == ManifestContent::kDeleteManifest;
-    RmIndex* rm = del ? &st->rm_dels : &st->rm_data;
-    *out = mle;
-    if (rm->n == 0 && (!del || st->rm_dvs.n == 0)) return true;
+    RmIndex* removal = del ? &st->rm_dels : &st->rm_data;
     DataFileRef* e = nullptr; uint32_t n = 0;
     if (!read_manifest_entries(th, mle, &e, &n)) { th->last_error = CommitError::kFailed; return false; }
-    bool hit = false, dv = false;
-    for (uint32_t i = 0; i < n && !hit; ++i)                    // bounded by n
-        hit = e[i].status != ManifestStatus::kDeleted && removed_entry(st, e[i], del, &dv) >= 0;
-    if (!hit) return true;
+    bool dv = false;
+    *hit = false;
+    for (uint32_t i = 0; i < n && !*hit; ++i)                   // bounded by n
+        *hit = e[i].status != ManifestStatus::kDeleted && removed_entry(st, e[i], del, &dv) >= 0;
     pin_first_row_ids(e, n, mle);
-    uint32_t w = 0;
+    if (!lake_grow(th->arena, nullptr, out, *n_out, cap_out, *n_out + n)) return false;
     for (uint32_t i = 0; i < n; ++i) {                          // bounded by n
         if (e[i].status == ManifestStatus::kDeleted) continue;
         const int64_t k = removed_entry(st, e[i], del, &dv);
         if (k >= 0 && !dv) {
-            if (rm->found[k] != 0) { th->last_error = CommitError::kFailed; return false; }   // listed live twice
-            rm->found[k] = 1;
+            if (removal->found[k] != 0) { th->last_error = CommitError::kFailed; return false; }   // listed live twice
+            removal->found[k] = 1;
         }
         if (k >= 0) {
             count_file(&st->sum, e[i], false);
             if (!note_partition(th, st, e[i])) return false;
         }
         carry_entry(&e[i], mle, k >= 0, st->cs->snap_id);
-        e[w++] = e[i];
+        (*out)[(*n_out)++] = e[i];
     }
+    return true;
+}
+
+// Carry `mle` forward, or rewrite it when it holds a file the change removes.
+bool filter_manifest(TableHandle* th, ChangeState* st, const ManifestListEntry& mle,
+                     ManifestListEntry* out) noexcept {
+    assert(th != nullptr && st != nullptr && out != nullptr);
+    const bool del = mle.content == ManifestContent::kDeleteManifest;
+    const RmIndex* removal = del ? &st->rm_dels : &st->rm_data;
+    *out = mle;
+    if (removal->n == 0 && (!del || st->rm_dvs.n == 0)) return true;
+    DataFileRef* e = nullptr; uint32_t n = 0, cap = 0;
+    bool hit = false;
+    if (!carry_manifest(th, st, mle, &e, &n, &cap, &hit)) return false;
+    if (!hit) return true;
     char tag[24];
     std::snprintf(tag, sizeof(tag), "-r%u", st->n_rewritten++);
-    return write_manifest_entry(th, st, e, w, mle.partition_spec_id, tag, out);
+    return write_manifest_entry(th, st, e, n, mle.partition_spec_id, tag, out);
+}
+
+// ChangeSet::merge_manifests: each (content, spec) group of the parent's manifests becomes one manifest of its carried
+// entries; a group of one manifest goes through filter_manifest. Without it a replace keeps every manifest, so the current
+// snapshot's manifest count only grows and every reader and admission of it pays for all of them (G2ICE-270).
+bool merge_manifests(TableHandle* th, ChangeState* st, const ManifestListEntry* pml, uint32_t pn, ManifestListEntry* ml,
+                     uint32_t* n) noexcept {
+    assert(th != nullptr && st != nullptr && ml != nullptr && n != nullptr);
+    assert(pml != nullptr || pn == 0);
+    auto* done = static_cast<uint8_t*>(th->arena->allocate_zeroed(pn + 1u));
+    if (done == nullptr) return false;
+    const auto same = [&](uint32_t a, uint32_t b) noexcept {
+        return pml[a].content == pml[b].content && pml[a].partition_spec_id == pml[b].partition_spec_id;
+    };
+    for (uint32_t i = 0; i < pn; ++i) {                         // bounded by pn
+        if (done[i] != 0u) continue;
+        uint32_t members = 0;
+        for (uint32_t j = i; j < pn; ++j) members += same(i, j) ? 1u : 0u;   // bounded by pn
+        if (members == 1u) {
+            done[i] = 1u;
+            if (!filter_manifest(th, st, pml[i], &ml[(*n)++])) return false;
+            continue;
+        }
+        DataFileRef* e = nullptr; uint32_t ne = 0, cap = 0;
+        for (uint32_t j = i; j < pn; ++j) {                     // bounded by pn
+            if (!same(i, j)) continue;
+            done[j] = 1u;
+            bool hit = false;
+            if (!carry_manifest(th, st, pml[j], &e, &ne, &cap, &hit)) return false;
+        }
+        if (ne == 0) continue;                                  // nothing live and nothing removed: the group is gone
+        char tag[24];
+        std::snprintf(tag, sizeof(tag), "-g%u", st->n_rewritten++);
+        if (!write_manifest_entry(th, st, e, ne, pml[i].partition_spec_id, tag, &ml[(*n)++])) return false;
+    }
+    return true;
 }
 
 bool all_found(TableHandle* th, const RmIndex* r, const char* what) noexcept {
@@ -255,7 +306,8 @@ bool commit_change(TableHandle* th, const ChangeSet* cs) noexcept {
     if (ml == nullptr) return false;
     uint32_t n = 0;
     bool ok = true;
-    for (uint32_t i = 0; i < pn && ok; ++i) ok = filter_manifest(th, &st, pml[i], &ml[n++]);   // bounded by pn
+    if (cs->merge_manifests != 0u) ok = merge_manifests(th, &st, pml, pn, ml, &n);
+    else for (uint32_t i = 0; i < pn && ok; ++i) ok = filter_manifest(th, &st, pml[i], &ml[n++]);   // bounded by pn
     ok = ok && all_found(th, &st.rm_data, "data file") && all_found(th, &st.rm_dels, "delete file");
     ok = ok && change_add(th, &st, ml, &n);
     st.sum.changed_partitions = ok ? distinct_partitions(&st) : 0;

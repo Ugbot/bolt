@@ -14,7 +14,8 @@
 
 struct ChangeSet {
     SnapshotOp         op;
-    uint8_t            _pad[7];
+    uint8_t            merge_manifests;   // 1: one manifest per (content, spec) of the parent's (a compaction's replace)
+    uint8_t            _pad[6];
     int64_t            snap_id;
     const DataFileRef* add_data;
     uint32_t           n_add_data;

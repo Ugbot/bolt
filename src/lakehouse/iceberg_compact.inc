@@ -325,6 +325,7 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
     }
     ChangeSet cs{};
     cs.op = SnapshotOp::kReplace;
+    cs.merge_manifests = 1u;
     cs.snap_id = o.snap_id;
     cs.add_data = o.outs;
     cs.n_add_data = o.n_outs;
