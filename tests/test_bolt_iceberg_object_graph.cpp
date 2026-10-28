@@ -555,3 +555,59 @@ TEST_F(IcebergObjectGraph, SortedAdmittedDirectoryInitializesSealedSourceAndPinn
     ASSERT_NE(table,nullptr); no_io();
 }
 } // namespace
+
+// G2ICE-349: a second admission of the same graph with the first one's pins and the bodies it read makes no origin request;
+// a hinted version whose object was replaced since is still admitted, and its first pinned read fails closed.
+struct Known {
+    std::vector<PinnedObject> pins;
+    std::vector<std::pair<std::string, std::string>> bodies;   // key -> bytes read under the pin's version
+    static Known& self(void* c) { return *static_cast<Known*>(c); }
+    static bool version(void* c, const char* key, ObjectVersion* out) noexcept {
+        for (const auto& p : self(c).pins) if (std::strcmp(p.key, key) == 0) { *out = p.version; return true; }
+        return false;
+    }
+    static bool bytes(void* c, const char* key, const ObjectVersion* v, uint8_t* dst, uint64_t size) noexcept {
+        for (const auto& p : self(c).pins)
+            if (std::strcmp(p.key, key) == 0 && (p.version.size != v->size || std::strcmp(p.version.etag, v->etag) != 0)) return false;
+        for (const auto& b : self(c).bodies)
+            if (b.first == key && b.second.size() == size) { std::memcpy(dst, b.second.data(), size); return true; }
+        return false;
+    }
+    static void read(void* c, const char* key, const ObjectVersion*, const uint8_t* d, uint64_t n) noexcept {
+        self(c).bodies.emplace_back(key, std::string(reinterpret_cast<const char*>(d), n));
+    }
+};
+TEST_F(IcebergObjectGraph, HintsReplaceHeadsAndReadsOfObjectsTheCallerAlreadyProved) {
+    Known k;
+    GraphAdmissionHints h{nullptr, nullptr, Known::read, &k};
+    request.hints = &h;
+    ASSERT_EQ(admit(), Status::Ok);
+    const uint32_t heads = origin.head_count, ranges = origin.range_count;
+    EXPECT_EQ(result.heads, heads); EXPECT_EQ(result.ranged_reads, ranges); EXPECT_EQ(result.reused_versions, 0u);
+    EXPECT_EQ(k.bodies.size(), 3u) << "the list and both manifests";
+    k.pins.assign(directory.begin(), directory.begin() + result.object_count);
+    const uint32_t objects = result.object_count;
+    const uint64_t total = result.total_metadata_bytes;
+    h = GraphAdmissionHints{Known::version, Known::bytes, nullptr, &k};
+    ASSERT_EQ(admit(), Status::Ok);
+    EXPECT_EQ(origin.head_count, heads) << "no HEAD for a pinned object"; EXPECT_EQ(origin.range_count, ranges) << "no GET";
+    EXPECT_EQ(result.heads, 0u); EXPECT_EQ(result.ranged_reads, 0u);
+    EXPECT_EQ(result.reused_versions, objects - 1u) << "every pin but the retained metadata"; EXPECT_EQ(result.reused_bodies, 3u);
+    EXPECT_EQ(result.object_count, objects); EXPECT_EQ(result.total_metadata_bytes, total);
+    for (uint32_t i = 0; i < objects; ++i) EXPECT_EQ(std::memcmp(&directory[i], &k.pins[i], sizeof(PinnedObject)), 0);
+    Stored& d = origin.set("outside/data.parquet", std::string(7, 'x'));   // replaced, same extent
+    std::strcpy(d.version.etag, "\"version-two\"");
+    ASSERT_EQ(admit(), Status::Ok) << "the hint stands in for the HEAD";
+    PinnedObject replaced{};
+    for (uint32_t i = 0; i < result.object_count; ++i) if (std::strcmp(directory[i].key, "outside/data.parquet") == 0) replaced = directory[i];
+    uint8_t one[1]; uint32_t got = 0; Arena scratch;
+    EXPECT_EQ(origin.conditional(&origin, replaced.key, &replaced.version, 0, 1, &scratch, one, &got), kOsPreconditionFailed)
+        << "its first pinned read fails closed";
+    k.pins.assign(directory.begin(), directory.begin() + result.object_count);
+    for (auto& p : k.pins) if (std::strcmp(p.key, "outside/data.parquet") == 0) p.version.size = 6;   // declared extent is 7
+    const uint32_t h0 = origin.head_count;
+    ASSERT_EQ(admit(), Status::Ok);
+    EXPECT_EQ(origin.head_count, h0 + 1u) << "a hint whose extent disagrees with the manifest is not used: that object is HEADed";
+    EXPECT_EQ(result.heads, 1u);
+    no_forbidden();
+}

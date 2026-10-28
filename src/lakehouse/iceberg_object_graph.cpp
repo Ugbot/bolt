@@ -26,6 +26,7 @@ struct Graph {
     uint32_t* next = nullptr;
     Role* roles = nullptr;
     uint32_t count = 0, visits = 0;
+    uint32_t heads = 0, ranged_reads = 0, reused_versions = 0, reused_bodies = 0;
     uint64_t bytes = 0;
     ManifestContent manifest_class = ManifestContent::kDataManifest;
     Status status = Status::Ok;
@@ -179,7 +180,15 @@ Status pin_reference(Graph& g, const char* uri, Role role, int64_t declared,
     if (!*fresh) return Status::Ok;
     if (has_extent && declared<0) return Status::Conflict;
     if (g.count==g.limits->max_objects) return Status::Capacity;
-    ObjectVersion version{}; g.work->io->reset();
+    ObjectVersion version{};
+    const GraphAdmissionHints* h=g.request->hints;
+    if (h && h->known_version && h->known_version(h->ctx,key,&version) && os_object_version_valid(&version) &&
+        (!has_extent || version.size==static_cast<uint64_t>(declared))) {
+        ++g.reused_versions;                                     // the pin the caller already holds: no HEAD
+        return append_pin(g,key,version,role,hash,at);
+    }
+    version={}; g.work->io->reset();
+    ++g.heads;
     rc=transport(os_head_versioned(g.store,key,g.work->io,&version));
     if (rc!=Status::Ok) return rc;
     if (!os_object_version_valid(&version)) return Status::Unsupported;
@@ -196,19 +205,27 @@ Status read_metadata(Graph& g, uint32_t at, Arena* arena, const uint8_t** out) n
     auto* bytes=arena->allocate_array<uint8_t>(static_cast<size_t>(size));
     if (!bytes) return Status::Capacity;
     g.bytes+=size;
+    const GraphAdmissionHints* h=g.request->hints;
+    if (h && h->known_bytes && h->known_bytes(h->ctx,pin.key,&pin.version,bytes,size)) {
+        ++g.reused_bodies;                                       // exactly this version's bytes, already held: no GET
+        *out=bytes; return Status::Ok;
+    }
     uint64_t offset=0;
     const uint64_t steps=(size-1)/g.limits->request_bytes+1;
     for (uint64_t i=0;i<steps;++i) {
         const uint32_t n=static_cast<uint32_t>(size-offset<g.limits->request_bytes ?
             size-offset : g.limits->request_bytes);
         uint32_t got=0; g.work->io->reset();
+        ++g.ranged_reads;
         const auto rc=transport(os_get_range_if_match(g.store,pin.key,&pin.version,
             offset,n,g.work->io,bytes+static_cast<size_t>(offset),&got));
         if (rc!=Status::Ok) return rc;
         if (got!=n) return Status::IoError;
         offset+=n;
     }
-    assert(offset==size); *out=bytes; return Status::Ok;
+    assert(offset==size);
+    if (h && h->on_read) h->on_read(h->ctx,pin.key,&pin.version,bytes,size);
+    *out=bytes; return Status::Ok;
 }
 
 bool visit_file(void* ctx, const DataFileRef* file) noexcept {
@@ -578,6 +595,8 @@ GraphAdmissionStatus iceberg_admit_object_graph(ObjectStore* store,
     GraphAdmissionResult staged{}; staged.metadata=metadata;
     staged.selection=request->selection; staged.snapshot_id=request->snapshot_id;
     staged.objects=work->objects; staged.object_count=g.count; staged.total_metadata_bytes=g.bytes;
+    staged.heads=g.heads; staged.ranged_reads=g.ranged_reads;
+    staged.reused_versions=g.reused_versions; staged.reused_bodies=g.reused_bodies;
     *result=staged;
     assert(result->objects==work->objects); assert(result->object_count>0);
     return Status::Ok;

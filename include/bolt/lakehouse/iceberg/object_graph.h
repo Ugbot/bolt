@@ -6,6 +6,22 @@
 #include "bolt/lakehouse/object_store/pinned.h"
 
 namespace bolt::lakehouse::iceberg {
+// G2ICE-349: evidence the caller already holds, so an admission need not re-read what it can prove unchanged. All optional.
+//  known_version: the version a previous admission pinned for `key`, or that a create-only PUT of the caller confirmed. Used in
+//    place of the object's HEAD when its declared extent agrees (else the HEAD runs). Reads of the admitted directory stay
+//    If-Match pinned, so an object replaced since fails closed at its first read.
+//  known_bytes: copies into `dst` exactly `size` bytes the caller holds for (key, version): bytes it read under that version or
+//    wrote and confirmed as it. Used in place of the ranged GETs of a metadata object (list, manifest).
+//  on_read: told the bytes of every metadata object the admission read from the origin (under its pinned version).
+using GraphKnownVersionFn = bool (*)(void* ctx, const char* key, ObjectVersion* out) noexcept;
+using GraphKnownBytesFn = bool (*)(void* ctx, const char* key, const ObjectVersion* version, uint8_t* dst, uint64_t size) noexcept;
+using GraphReadFn = void (*)(void* ctx, const char* key, const ObjectVersion* version, const uint8_t* bytes, uint64_t size) noexcept;
+struct GraphAdmissionHints {
+    GraphKnownVersionFn known_version = nullptr;
+    GraphKnownBytesFn known_bytes = nullptr;
+    GraphReadFn on_read = nullptr;
+    void* ctx = nullptr;
+};
 struct GraphAdmissionRequest {
     MetadataObjectIdentity object{};
     MetadataLoadLimits metadata_limits{};
@@ -14,6 +30,7 @@ struct GraphAdmissionRequest {
     char sha256[65]{};
     SnapshotSelection selection = SnapshotSelection::Empty;
     int64_t snapshot_id = 0;
+    const GraphAdmissionHints* hints = nullptr;   // G2ICE-349, optional
 };
 struct GraphAdmissionLimits {
     uint32_t max_objects = 0; // 1..65536, including retained metadata
@@ -39,6 +56,8 @@ struct GraphAdmissionResult {
     const PinnedObject* objects = nullptr; // borrowed from work.objects
     uint32_t object_count = 0;
     uint64_t total_metadata_bytes = 0;
+    // Origin requests this admission made, and the pins / metadata bodies it took from the hints instead (G2ICE-349).
+    uint32_t heads = 0, ranged_reads = 0, reused_versions = 0, reused_bodies = 0;
 };
 enum class GraphAdmissionStatus : uint8_t {
     Ok, BadArg, NotFound, Changed, IoError, Capacity, DecodeFailed, Unsupported, Conflict
