@@ -18,6 +18,7 @@
 #include "bolt/bolt_column.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/kernels/bolt_wkb.h"
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/metrics.h"

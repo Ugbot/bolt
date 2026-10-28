@@ -3,6 +3,7 @@
 
 #include "bolt/lakehouse/iceberg/partition_values.h"
 
+#include "bolt/lakehouse/iceberg/geo_type.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 
 #include <cassert>
@@ -67,7 +68,8 @@ TimeUnit unit_of(IcebergType t) noexcept {
 // The transform is defined for the source type (spec table "Partition Transforms").
 bool transform_defined(TransformKind k, IcebergType s) noexcept {
     switch (k) {
-        case TransformKind::kIdentity: return s != IcebergType::kUnknown;
+        case TransformKind::kIdentity:   // spec: any type except geometry, geography and variant
+            return s != IcebergType::kUnknown && s != IcebergType::kGeometry && s != IcebergType::kGeography;
         case TransformKind::kVoid:     return true;
         case TransformKind::kBucket:
             return s == IcebergType::kInt || s == IcebergType::kLong || s == IcebergType::kDecimal ||
@@ -274,6 +276,11 @@ bool iceberg_type_parse(const char* name, IcebergTypeInfo* out) noexcept {
     };
     for (const auto& e : kNames)                                          // bounded: 14
         if (name_is(name, e.n)) { out->type = e.t; out->fixed_len = e.t == IcebergType::kUuid ? 16u : 0u; return true; }
+    GeoTypeInfo g{};
+    if (geo_type_parse(name, static_cast<uint32_t>(std::strlen(name)), &g)) {   // G2ICE-327
+        out->type = g.kind == GeoKind::kGeometry ? IcebergType::kGeometry : IcebergType::kGeography;
+        return true;
+    }
     int32_t a = 0, b = 0;
     if (parse_params(name, "fixed[", ']', &a, nullptr) && a > 0) {
         out->type = IcebergType::kFixed;
@@ -554,7 +561,9 @@ uint32_t partition_avro_type_json(const IcebergTypeInfo& t, int32_t field_id, ch
                               "\"logicalType\":\"decimal\",\"precision\":%u,\"scale\":%u}",
                               t.precision, t.scale, field_id, t.fixed_len, t.precision, t.scale);
             break;
-        case IcebergType::kUnknown: return 0u;
+        case IcebergType::kUnknown:
+        case IcebergType::kGeometry:
+        case IcebergType::kGeography: return 0u;   // never a partition result (void over geo keeps no value)
     }
     if (simple != nullptr) n = std::snprintf(out, cap, "%s", simple);
     if (n <= 0 || static_cast<uint32_t>(n) >= cap) return 0u;

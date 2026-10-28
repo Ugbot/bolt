@@ -31,6 +31,7 @@
 #include "bolt/lakehouse/iceberg/view.h"
 #include "bolt/lakehouse/iceberg/eq_key.h"
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
+#include "bolt/lakehouse/iceberg/geo_type.h"
 
 #include <atomic>
 #include <cassert>
@@ -388,6 +389,15 @@ bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, Bolt
     assert(t != nullptr && c != nullptr && bt != nullptr);
     IcebergTypeInfo info{};
     if (!iceberg_type_parse(t, &info)) return true;                       // nested / unknown: the legacy default
+    GeoTypeInfo g{};
+    if (geo_type_parse(t, static_cast<uint32_t>(std::strlen(t)), &g)) {   // G2ICE-327: WKB with the GEOMETRY / GEOGRAPHY
+        *bt = BoltType::Binary;                                           // logical type; the crs points into `t`, which
+        c->geo = static_cast<uint8_t>(g.kind);                            // outlives the writer's open (it copies)
+        c->geo_algorithm = g.algorithm;
+        c->geo_crs = g.crs_len != 0u ? g.crs : kGeoDefaultCrs;
+        c->geo_crs_len = g.crs_len != 0u ? g.crs_len : static_cast<uint32_t>(std::strlen(kGeoDefaultCrs));
+        return true;
+    }
     switch (info.type) {
         case IcebergType::kBinary: *bt = BoltType::Binary; return true;
         case IcebergType::kUuid:   *bt = BoltType::UUID; return true;

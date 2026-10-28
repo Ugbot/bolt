@@ -2925,3 +2925,11 @@ target_link_libraries(test_bolt_iceberg_v3_write
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_iceberg_v3_write)
 add_test(NAME test_bolt_iceberg_v3_write COMMAND test_bolt_iceberg_v3_write)
+
+# G2ICE-327 — WKB bounds (Iceberg-Java GeometryBoundsBuilder rules), Parquet GEOMETRY / GEOGRAPHY logical types with no
+# min / max and GeospatialStatistics, the geo type grammar, and geo data-file metrics (geometry box, geography counts).
+add_executable(test_bolt_parquet_geo test_bolt_parquet_geo.cpp)
+target_link_libraries(test_bolt_parquet_geo
+    PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_geo)
+add_test(NAME test_bolt_parquet_geo COMMAND test_bolt_parquet_geo)

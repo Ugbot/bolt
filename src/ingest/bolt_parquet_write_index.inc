@@ -220,6 +220,7 @@ bool write_page_index(ParquetWriter* w) noexcept {
                 const PageRec* pp = w->pages.data() + rec.page_off;
                 if (pass == 0) {
                     const PwLeaf& lf = w->leaves[c];
+                    if ((lf.nested ? lf.sch.geo : w->cols[lf.col].geo) != 0u) continue;   // G2ICE-327: no defined order
                     build_column_index(&buf, pp, rec.page_count,
                                        lf.nested ? lf.sch.type
                                                  : w->cols[lf.col].type);

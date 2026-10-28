@@ -247,6 +247,15 @@ struct ParquetNestedNode {
     std::uint8_t  integer_bits;
     bool          integer_signed;
     std::uint32_t fixed_len;
+    // G2ICE-327: Binary only. 1 writes LogicalType GEOMETRY, 2 GEOGRAPHY (ISO WKB values). Their sort order is undefined, so
+    // no min / max statistics and no ColumnIndex are written for the column; a GEOMETRY chunk's ColumnMetaData carries
+    // geospatial_statistics (types and box, as parquet-java writes). `geo_crs[0..geo_crs_len)` is the annotation's crs (nullptr:
+    // none written), borrowed for the open call only, at most kPwMaxGeoCrsBytes; `geo_algorithm` is GEOGRAPHY's
+    // EdgeInterpolationAlgorithm (0 spherical .. 4 karney), always written.
+    std::uint8_t  geo;
+    std::uint8_t  geo_algorithm;
+    std::uint32_t geo_crs_len;
+    const char*   geo_crs;
 };
 
 // One column's worth of writer-side schema. Fixed-size POD.
@@ -339,6 +348,15 @@ struct ParquetWriteColumn {
     // every existing caller's output byte-for-byte.
     const ParquetNestedNode* nested;
     std::uint32_t            n_nested;
+    // G2ICE-327: Binary only. 1 writes LogicalType GEOMETRY, 2 GEOGRAPHY (ISO WKB values). Their sort order is undefined, so
+    // no min / max statistics and no ColumnIndex are written for the column; a GEOMETRY chunk's ColumnMetaData carries
+    // geospatial_statistics (types and box, as parquet-java writes). `geo_crs[0..geo_crs_len)` is the annotation's crs (nullptr:
+    // none written), borrowed for the open call only, at most kPwMaxGeoCrsBytes; `geo_algorithm` is GEOGRAPHY's
+    // EdgeInterpolationAlgorithm (0 spherical .. 4 karney), always written.
+    std::uint8_t  geo;
+    std::uint8_t  geo_algorithm;
+    std::uint32_t geo_crs_len;
+    const char*   geo_crs;
 };
 
 // One caller-declared sort-order claim for RowGroup.sorting_columns (B6,

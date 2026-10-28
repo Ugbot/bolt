@@ -50,6 +50,10 @@ ParquetWriteColumn nested_leaf_column(const ParquetNestedNode& n,
     c.timestamp_unit = n.timestamp_unit;
     c.time_micros = n.time_micros;
     c.fixed_len = n.fixed_len;
+    c.geo = n.geo;
+    c.geo_algorithm = n.geo_algorithm;
+    c.geo_crs = n.geo_crs;
+    c.geo_crs_len = n.geo_crs_len;
     return c;
 }
 
@@ -65,7 +69,7 @@ bool nested_leaf_logical_ok(const ParquetWriteColumn& c) noexcept {
     }
     if (lg == BoltLogical::Enum && c.type != BoltType::Utf8) return false;
     if (lg == BoltLogical::Unknown && !c.nullable) return false;
-    return true;
+    return geo_column_ok(c);
 }
 
 bool nested_node_valid(const ParquetNestedNode* t, std::uint32_t n,
@@ -79,7 +83,13 @@ bool nested_node_valid(const ParquetNestedNode* t, std::uint32_t n,
         const ParquetWriteColumn c = nested_leaf_column(nd, "leaf");
         return type_supported(c) && nested_leaf_logical_ok(c);
     }
-    if (nd.logical != 0u || nd.n_children == 0u) return false;
+    if (nd.n_children == 0u || nd.geo != 0u) return false;
+    // G2ICE-327: VARIANT annotates a struct of {metadata: required binary, value: binary} (unshredded) or
+    // {metadata, value: optional binary, typed_value} (shredded); the children's shapes are the caller's.
+    if (nd.logical != 0u && !(nd.type == BoltType::Struct && nd.logical == static_cast<std::uint8_t>(BoltLogical::Variant) &&
+                              nd.n_children >= 2u && nd.n_children <= 3u)) {
+        return false;
+    }
     if (nd.type == BoltType::List && nd.n_children != 1u) return false;
     if (nd.type == BoltType::Map && nd.n_children != 2u) return false;
     // Children strictly after their parent: no cycles, single forward pass.
@@ -212,6 +222,14 @@ void write_nested_group(TcOut* o, const ParquetNestedNode& nd, const char* name,
     tc_put_string(o, name);
     tc_put_field(o, 5, kFI32);
     tc_put_zigzag(o, static_cast<std::int64_t>(n_children));
+    if (nd.type == BoltType::Struct && nd.logical == static_cast<std::uint8_t>(BoltLogical::Variant)) {
+        tc_put_field(o, 10, kFStruct);
+        tc_put_field(o, 16, kFStruct);             // LogicalType VARIANT
+        tc_put_field(o, 1, kFByte);                // specification_version
+        tc_put_u8(o, 1u);
+        tc_put_stop(o);
+        tc_put_stop(o);
+    }
     if (nd.type != BoltType::Struct) {
         const bool list = nd.type == BoltType::List;
         tc_put_field(o, 6, kFI32);
@@ -636,6 +654,7 @@ bool nested_emit_pages(ParquetWriter* w, ChunkOut* out, const PwLeaf& L,
         if (w->opts.emit_page_index && w->opts.emit_statistics) {
             (void)compute_stats(d.col, v0, v1, nullptr, false, &ps);
         }
+        if (L.sch.geo != 0u) ps.have_stats = false;   // G2ICE-327
         note_page(w, out, rec, off, sz, r0, nulls, s1 - s0, ps);
         r0 = r1;
         if (r0 >= rows) break;
@@ -656,6 +675,7 @@ void nested_chunk_stats(const ParquetWriter* w, const PwLeaf& L,
     if (w->opts.emit_statistics) {
         (void)compute_stats(d.col, 0, n_vals, nullptr, false, &rec->st);
     }
+    if (L.sch.geo != 0u) geo_chunk_stats(d.col, 0, n_vals, nullptr, L.sch.geo, rec);
     if (!w->opts.emit_size_statistics) return;
     if (L.max_def > 1u || L.max_rep > 0u) {
         rec->level_hist_known = true;

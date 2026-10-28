@@ -239,6 +239,18 @@ void parse_decimal_type(TcCursor* c, int32_t* scale, int32_t* prec) noexcept {
     }
 }
 
+// GeographyType {1: optional string crs, 2: optional EdgeInterpolationAlgorithm algorithm}; the crs is skipped.
+void parse_geography_type(TcCursor* c, uint8_t* algorithm) noexcept {
+    assert(c != nullptr && algorithm != nullptr);
+    int16_t fid = 0;
+    uint8_t ft;
+    while (tc_field(c, &fid, &ft)) {           // bounded: finite slice
+        int64_t v = 0;
+        if (fid == 2 && tc_zigzag(c, &v)) { if (v >= 0 && v <= 4) *algorithm = static_cast<uint8_t>(v); }
+        else if (fid != 2 && !tc_skip(c, ft, 0)) return;
+    }
+}
+
 // LogicalType union (SchemaElement field 10). The set field id selects the
 // member: 5 DECIMAL, 6 DATE, 7 TIME, 8 TIMESTAMP, 10 INTEGER, 1 STRING,
 // 12 JSON, 13 BSON, 14 UUID, 15 FLOAT16, 16 VARIANT (G2PQ-16).
@@ -288,6 +300,11 @@ void parse_logical_type(TcCursor* c, PqColumn* col) noexcept {
                      (void)tc_skip(c, ft, 0); break;
             case 16: col->logical = static_cast<int32_t>(PqLogical::Variant);
                      (void)tc_skip(c, ft, 0); break;
+            // G2ICE-327: GeometryType {1: crs}, GeographyType {1: crs, 2: algorithm}.
+            case 17: col->logical = static_cast<int32_t>(PqLogical::Geometry);
+                     (void)tc_skip(c, ft, 0); break;
+            case 18: col->logical = static_cast<int32_t>(PqLogical::Geography);
+                     parse_geography_type(c, &col->geo_algorithm); break;
             // G2PQ-17: union id 11 NullType (UNKNOWN) -- every value null,
             // no compatible ConvertedType exists for it.
             case 11: col->logical = static_cast<int32_t>(PqLogical::Unknown);
@@ -899,6 +916,8 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     uint8_t  rdef;     // def AT the innermost REPEATED node
                     uint16_t plen;     // dotted-path length so far
                     bool     cut;      // the dotted path was truncated
+                    uint8_t  vdepth;   // G2ICE-327: 1 = this group is VARIANT, 2 = below one (shredded), 0 = neither
+                    int32_t  vfid;     // the VARIANT group's field id
                     // G2PQ-15: one (ldef,rdef) pair per repeated ancestor seen
                     // so far, index k-1 for level k. ldef/rdef above track
                     // only the INNERMOST (most recent) repeated ancestor, same
@@ -922,6 +941,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
                         stk[0].ldef = 0; stk[0].rdef = 0;
                         stk[0].cut = false;
+                        stk[0].vdepth = 0; stk[0].vfid = 0;
                         for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
                             stk[0].ldefs[z] = 0; stk[0].rdefs[z] = 0;
                         }
@@ -968,6 +988,13 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         }
                         stk[sp].plen = plen;
                         stk[sp].cut = cut;
+                        if (se.col.logical == static_cast<int32_t>(PqLogical::Variant)) {
+                            stk[sp].vdepth = 1;
+                            stk[sp].vfid = se.col.has_field_id != 0u ? se.col.field_id : 0;
+                        } else {
+                            stk[sp].vdepth = stk[sp - 1].vdepth != 0u ? 2u : 0u;
+                            stk[sp].vfid = stk[sp - 1].vfid;
+                        }
                         ++sp;
                         continue;
                     }
@@ -1012,6 +1039,14 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     }
                     col.name[w] = '\0';
                     col.name_truncated = cut ? 1u : 0u;
+                    col.variant_leaf = 0;
+                    col.variant_field_id = 0;
+                    if (stk[sp - 1].vdepth != 0u) {            // G2ICE-327: a VARIANT group's leaves
+                        const bool direct = stk[sp - 1].vdepth == 1u;
+                        col.variant_leaf = !direct ? 3u : std::strcmp(se.col.name, "metadata") == 0 ? 1u
+                                                        : std::strcmp(se.col.name, "value") == 0 ? 2u : 3u;
+                        col.variant_field_id = stk[sp - 1].vfid;
+                    }
                     out->columns[out->n_columns++] = col;
                     (void)base;
                     // close finished groups
