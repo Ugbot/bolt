@@ -51,6 +51,7 @@ constexpr std::uint8_t kTypeStruct     = 13;
 constexpr std::int16_t kPrecisionDouble = 2;  // FloatingPoint::Precision
 constexpr std::int16_t kDateUnitDay     = 0;  // DateUnit::DAY
 constexpr std::int16_t kTimeUnitMicro   = 2;  // TimeUnit::MICROSECOND
+constexpr std::int16_t kTimeUnitNano    = 3;  // TimeUnit::NANOSECOND
 constexpr std::int32_t kDecimal128BitWidth  = 128;
 constexpr std::int32_t kDecimal128Precision = 38;  // bolt tracks no
                                                     // narrower precision;
@@ -227,7 +228,7 @@ std::uint32_t fb_finish(Fb* b, std::uint32_t root) noexcept {
 // `children` vector, built by the caller (build_all_fields below), not
 // here.
 std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
-                               std::uint8_t* out_tag) noexcept {
+                               std::uint8_t time_unit, std::uint8_t* out_tag) noexcept {
     assert(out_tag != nullptr);
     if (t == BoltType::Int64) {
         *out_tag = kTypeInt;
@@ -267,7 +268,7 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
         // bolt's Timestamp is epoch micros, no zone (timestamp[us]).
         *out_tag = kTypeTimestamp;
         fb_start_table(b);
-        fb_field_scalar<std::int16_t>(b, 0, kTimeUnitMicro);  // unit
+        fb_field_scalar<std::int16_t>(b, 0, time_unit == kIpcTimeNano ? kTimeUnitNano : kTimeUnitMicro);
         return fb_end_table(b);
     }
     if (t == BoltType::Decimal128) {
@@ -353,6 +354,8 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         fd.n_children = static_cast<std::uint8_t>(s->n_children);
         fd.decimal_scale =
             (s->type == BoltType::Decimal128) ? s->decimal_scale : 0;
+        if (s->time_unit > kIpcTimeNano) return false;
+        fd.time_unit = (s->type == BoltType::Timestamp) ? s->time_unit : 0;
         fd.first_child = 0;
         if (s->n_children == 0) continue;
 
@@ -411,7 +414,7 @@ bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
         }
         std::uint8_t tag = 0;
         const std::uint32_t type_pos = build_type_table(
-            b, static_cast<BoltType>(fd.type), fd.decimal_scale, &tag);
+            b, static_cast<BoltType>(fd.type), fd.decimal_scale, fd.time_unit, &tag);
         if (type_pos == 0) return false;
         const std::uint32_t name_pos = fb_string(b, name_buf[i]);
         fb_start_table(b);
@@ -906,6 +909,14 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
                     const BoltType* types, const char* const* names,
                     std::uint16_t n_cols,
                     const std::uint8_t* decimal_scales) noexcept {
+    return arrow_ipc_open_units(w, f, types, names, n_cols, decimal_scales, nullptr);
+}
+
+bool arrow_ipc_open_units(ArrowIpcWriter* w, std::FILE* f,
+                          const BoltType* types, const char* const* names,
+                          std::uint16_t n_cols,
+                          const std::uint8_t* decimal_scales,
+                          const std::uint8_t* time_units) noexcept {
     assert(w != nullptr);
     if (types == nullptr) return false;
     if (n_cols == 0 || n_cols > kIpcMaxCols) return false;
@@ -931,6 +942,7 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
             (decimal_scales != nullptr) ? decimal_scales[c] : 0;
         specs[c].n_children = 0;
         specs[c].children = nullptr;
+        specs[c].time_unit = (time_units != nullptr) ? time_units[c] : 0;
     }
     const bool ok = arrow_ipc_open_nested(w, f, specs, n_cols);
     std::free(specs);

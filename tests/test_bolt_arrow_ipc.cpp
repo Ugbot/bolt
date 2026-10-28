@@ -24,6 +24,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_types.h"
 #include "bolt/ingest/bolt_arrow_ipc.h"
+#include "bolt/ingest/bolt_arrow_ipc_reader.h"
 
 using bolt::BoltBatch;
 using bolt::BoltColumn;
@@ -803,4 +804,65 @@ TEST(ArrowIpc, WritesPyarrowOracleTimestampFixture) {
     bolt_aligned_free(batch);
     std::free(w);
     ::testing::Test::RecordProperty("fixture", path);
+}
+
+// G2ICE-309: a Timestamp column declared nanoseconds is written as
+// timestamp[ns] with its raw values; the default stays timestamp[us]; a unit
+// outside IpcTimeUnit fails closed at open.
+TEST(ArrowIpc, TimestampUnitNanosRoundTrips) {
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    auto* w = static_cast<ArrowIpcWriter*>(std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_NE(w, nullptr);
+    static std::int64_t ns[3] = {1704164645123456789LL, -1LL, 0LL};
+    static std::int64_t us[3] = {1704164645123456LL, -1LL, 0LL};
+    bolt::Arena arena;
+    BoltBatch* batch = allocate_batch(&arena, 2u);
+    ASSERT_NE(batch, nullptr);
+    batch->num_rows = 3;
+    batch->num_cols = 2;
+    for (int c = 0; c < 2; ++c) {
+        BoltColumn& col = batch->columns[batch->read_epoch][c];
+        col.type = BoltType::Timestamp; col.format = ColumnFormat::Flat;
+        col.data = c == 0 ? ns : us; col.length = 3; col.type_size_bytes = 8;
+    }
+    const BoltType tys[2] = {BoltType::Timestamp, BoltType::Timestamp};
+    const char* names[2] = {"tn", "tu"};
+    const std::uint8_t bad[2] = {7, 0};
+    EXPECT_FALSE(arrow_ipc_open_units(w, f, tys, names, 2, nullptr, bad));
+    std::memset(w, 0, sizeof(*w));
+    const std::uint8_t units[2] = {kIpcTimeNano, kIpcTimeMicro};
+    ASSERT_TRUE(arrow_ipc_open_units(w, f, tys, names, 2, nullptr, units));
+    ASSERT_TRUE(arrow_ipc_write_batch(w, batch));
+    ASSERT_TRUE(arrow_ipc_close(w));
+    const long n = std::ftell(f);
+    ASSERT_GT(n, 0);
+    std::rewind(f);
+    void* buf = bolt_aligned_alloc(64, static_cast<std::size_t>(n));
+    ASSERT_NE(buf, nullptr);
+    ASSERT_EQ(std::fread(buf, 1, static_cast<std::size_t>(n), f), static_cast<std::size_t>(n));
+    std::fclose(f);
+    IpcReadLimits lim{};
+    std::uint64_t ws = 0;
+    ASSERT_EQ(arrow_ipc_reader_workspace_size(lim, ws), IpcReadStatus::Ok);
+    void* wsp = bolt_aligned_alloc(64, static_cast<std::size_t>(ws));
+    ASSERT_NE(wsp, nullptr);
+    ArrowIpcReader r{};
+    ASSERT_EQ(arrow_ipc_reader_open(buf, static_cast<std::uint64_t>(n), lim, wsp, ws, r), IpcReadStatus::Ok);
+    IpcReadSchema sch{};
+    ASSERT_EQ(arrow_ipc_reader_schema(r, sch), IpcReadStatus::Ok);
+    ASSERT_EQ(sch.field_count, 2u);
+    EXPECT_EQ(sch.fields[0].unit, 3);   // TimeUnit::NANOSECOND
+    EXPECT_EQ(sch.fields[1].unit, 2);   // TimeUnit::MICROSECOND
+    const BoltBatch* out = nullptr;
+    ASSERT_EQ(arrow_ipc_reader_next(r, out), IpcReadStatus::Ok);
+    ASSERT_NE(out, nullptr);
+    const auto* v = static_cast<const std::int64_t*>(out->columns[out->read_epoch][0].data);
+    EXPECT_EQ(v[0], ns[0]);
+    EXPECT_EQ(v[1], ns[1]);
+    arrow_ipc_reader_close(r);
+    bolt_aligned_free(wsp);
+    bolt_aligned_free(buf);
+    bolt_aligned_free(batch);
+    std::free(w);
 }
