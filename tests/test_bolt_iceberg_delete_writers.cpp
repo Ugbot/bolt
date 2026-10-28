@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -444,6 +445,51 @@ bool gone_v3(const Row& r) { return r.id == 15 || r.id == 22 || r.id >= 27 || r.
 
 std::string metadata_text(const Table& t) { return read_file(latest_metadata_path(t.root)); }
 
+// Each live row's (_row_id, _last_updated_sequence_number) by id, from the scan's row-lineage columns (-1: null).
+std::map<int64_t, std::pair<int64_t, int64_t>> lineage_by_id(const std::string& root) {
+    bolt::Arena a;
+    FilesystemObjectStore fs{}; ObjectStore os{};
+    EXPECT_TRUE(filesystem_object_store_init(&fs, root.c_str(), &os));
+    const std::string meta = read_file(latest_metadata_path(root));
+    TableHandle* rh = nullptr;
+    EXPECT_TRUE(iceberg_table_open_on_store(&rh, &a, &os, "", reinterpret_cast<const uint8_t*>(meta.data()),
+                                            static_cast<uint32_t>(meta.size())));
+    std::map<int64_t, std::pair<int64_t, int64_t>> out;
+    if (rh == nullptr) return out;
+    ReadOptions ro; read_options_init(&ro);
+    ro.emit_row_position = true;
+    ro.emit_row_lineage = true;
+    ScanHandle* sh = nullptr;
+    EXPECT_TRUE(iceberg_scan_open(&sh, rh, &ro));
+    if (sh == nullptr) return out;
+    for (int guard = 0; guard < 10000; ++guard) {
+        bolt::BoltBatch b{};
+        bool eof = false;
+        EXPECT_TRUE(iceberg_scan_next_batch(sh, &b, &eof));
+        if (eof) break;
+        const auto* cols = b.columns[b.read_epoch];
+        EXPECT_STREQ(b.schema.field(static_cast<int>(b.num_cols - 2u)).name, "_row_id");
+        const bolt::BoltColumn& rid = cols[b.num_cols - 2u];
+        const bolt::BoltColumn& seq = cols[b.num_cols - 1u];
+        for (int64_t r = 0; r < b.num_rows; ++r) {
+            const int64_t id = static_cast<const int64_t*>(cols[0].data)[r];
+            out[id] = {rid.is_null(r) ? -1 : static_cast<const int64_t*>(rid.data)[r],
+                       seq.is_null(r) ? -1 : static_cast<const int64_t*>(seq.data)[r]};
+        }
+    }
+    iceberg_scan_close(sh);
+    return out;
+}
+
+// The last value of `key` in a metadata document (the newest snapshot's, for snapshot fields).
+std::string json_i64(const std::string& md, const std::string& key) {
+    const std::string k = "\"" + key + "\":";
+    const size_t at = md.rfind(k);
+    if (at == std::string::npos) return std::string();
+    const size_t b = at + k.size();
+    return md.substr(b, md.find_first_of(",}", b) - b);
+}
+
 }  // namespace
 
 TEST(IcebergDeleteWriters, EqualityDeleteByPredicateUsesTheIdentifierAndAStringKey) {
@@ -583,6 +629,7 @@ TEST(IcebergDeleteWriters, V3DeletesAreOneMergedDeletionVectorPerFileAndAppendsC
         else if (f.content == FileContent::kPositionDeletes) ++pos;
         else ++eq;
     }
+    EXPECT_EQ(dvs, 2u);
     EXPECT_EQ(pos, 0u) << "a v3 writer writes no position-delete files";
     EXPECT_EQ(eq, 1u);
     std::sort(refs.begin(), refs.end());
@@ -604,8 +651,146 @@ TEST(IcebergDeleteWriters, V3RefusesWhatItCannotWriteByName) {
     row.position_row = true;
     EXPECT_FALSE(table_delete_with(t.th, &p, &row)) << "DVs carry no row";
     EXPECT_EQ(table_last_commit_error(t.th), CommitError::kUnimplemented);
-    EXPECT_FALSE(table_compact(t.th, 64ll << 20)) << "compaction must keep row ids (G2ICE-346)";
     EXPECT_EQ(scan_rows(t.root), model(base_rows(0, 30), gone_pos));
+}
+
+// G2ICE-346: compaction of a v3 table keeps every row's _row_id and _last_updated_sequence_number (written explicitly in the
+// outputs, spec "Row Lineage"), applies and drops the deletion vectors of the files it rewrites, and records row lineage.
+TEST(IcebergCompaction, V3KeepsRowLineageAndDropsTheRewrittenFilesDeletionVectors) {
+    Table t;
+    write_v3(&t, fresh_root(temp_base(), "v3_compact"));
+    std::vector<Row> want = model(base_rows(0, 30), gone_v3);
+    want.push_back(Row{100, 7, row_s(100)});
+    want.push_back(Row{101, 7, row_s(101)});
+    std::sort(want.begin(), want.end());
+    const auto before = lineage_by_id(t.root);
+    ASSERT_EQ(before.size(), want.size());
+    EXPECT_EQ(before.at(100).first, 30) << "the appended rows took ids 30 and 31";
+    const std::string nri = json_i64(metadata_text(t), "next-row-id");
+    ASSERT_FALSE(nri.empty());
+    ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+    EXPECT_EQ(scan_rows(t.root), want);
+    EXPECT_EQ(lineage_by_id(t.root), before) << "rows copied by a compaction keep their ids and sequence numbers";
+    size_t dvs = 0, eq = 0;
+    for (const DelFile& f : delete_files(t)) {
+        dvs += f.dv ? 1u : 0u;
+        eq += f.content == FileContent::kEqualityDeletes ? 1u : 0u;
+    }
+    EXPECT_EQ(dvs, 0u) << "every file a DV named was rewritten: its DV is applied and dropped";
+    EXPECT_EQ(eq, 1u) << "equality deletes stay (the outputs' sequence number keeps them from applying again)";
+    const std::string md = metadata_text(t);
+    EXPECT_NE(md.find("\"operation\":\"replace\""), std::string::npos);
+    const int64_t first = std::stoll(json_i64(md, "first-row-id")), added = std::stoll(json_i64(md, "added-rows"));
+    EXPECT_EQ(first, std::stoll(nri)) << "the replace's row ids start at the table's next-row-id";
+    EXPECT_EQ(added, static_cast<int64_t>(want.size())) << "the rewritten rows' new data file counts its rows";
+    EXPECT_EQ(std::stoll(json_i64(md, "next-row-id")), first + added);
+}
+
+// The negative control of the check above: outputs written without the lineage columns give the rows new ids.
+TEST(IcebergCompaction, V3WithoutWrittenLineageColumnsTheRowsGetNewIds) {
+    Table t;
+    write_v3(&t, fresh_root(temp_base(), "v3_compact_nc"));
+    const auto before = lineage_by_id(t.root);
+    ::setenv("BOLT_TEST_COMPACT_DROP_LINEAGE", "1", 1);
+    const bool ok = table_compact(t.th, 64ll << 20);
+    ::unsetenv("BOLT_TEST_COMPACT_DROP_LINEAGE");
+    ASSERT_TRUE(ok);
+    const auto after = lineage_by_id(t.root);
+    ASSERT_EQ(after.size(), before.size());
+    EXPECT_NE(after, before);
+    EXPECT_GE(after.at(100).first, 32) << "inherited from the new file's first_row_id";
+}
+
+namespace {
+const Snapshot* current_snapshot(const Metadata* m) {
+    for (uint32_t i = 0; i < m->n_snapshots; ++i) if (m->snapshots[i].snapshot_id == m->current_snapshot_id) return &m->snapshots[i];
+    return nullptr;
+}
+
+const char kV1Schema[] = "{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":true,\"type\":\"long\"},"
+                         "{\"id\":2,\"name\":\"k\",\"required\":false,\"type\":\"long\"},{\"id\":3,\"name\":\"s\",\"required\":false,\"type\":\"string\"}]}";
+
+// Re-describe the three files of `w` as a format-version 1 table (one v1 manifest, a v1 list, a v1 document) at its next version.
+void make_v1(Table* w, const std::string& root) {
+    std::vector<DataFileRef> files;
+    bolt::Arena a;
+    const Snapshot* cur = current_snapshot(table_metadata(w->th));
+    ASSERT_NE(cur, nullptr);
+    const std::string ml = read_file(root + "/" + store_key(root, cur->manifest_list));
+    ManifestListEntry* mle = nullptr; uint32_t nm = 0;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(reinterpret_cast<const uint8_t*>(ml.data()), ml.size(), &a, 8u, &mle, &nm));
+    for (uint32_t i = 0; i < nm; ++i) {
+        const std::string body = read_file(root + "/" + store_key(root, mle[i].manifest_path));
+        DataFileRef* e = nullptr; uint32_t ne = 0;
+        ASSERT_TRUE(manifest_parse_avro_grow(reinterpret_cast<const uint8_t*>(body.data()), body.size(), &a, 0, 8u, &e, &ne));
+        for (uint32_t j = 0; j < ne; ++j) { e[j].status = ManifestStatus::kAdded; e[j].snapshot_id = 77; files.push_back(e[j]); }
+    }
+    ASSERT_EQ(files.size(), 3u);
+    const uint8_t* mb = nullptr; uint64_t mlen = 0;
+    ASSERT_TRUE(manifest_write_avro_fv(1, files.data(), 3u, 77, 0, kV1Schema, sizeof(kV1Schema) - 1u, 0, nullptr, nullptr, &a, &mb, &mlen));
+    std::ofstream(root + "/metadata/v1-m0.avro", std::ios::binary).write(reinterpret_cast<const char*>(mb), static_cast<std::streamsize>(mlen));
+    ManifestListEntry e{};
+    std::snprintf(e.manifest_path, sizeof(e.manifest_path), "%s/metadata/v1-m0.avro", root.c_str());
+    e.manifest_length = static_cast<int64_t>(mlen);
+    e.added_snapshot_id = 77;
+    e.added_files_count = 3;
+    e.added_rows_count = 30;
+    const uint8_t* lb = nullptr; uint64_t ll = 0;
+    ASSERT_TRUE(manifest_list_write_avro_fv(1, &e, 1, 77, 0, &a, &lb, &ll));
+    std::ofstream(root + "/metadata/snap-77-v1.avro", std::ios::binary).write(reinterpret_cast<const char*>(lb), static_cast<std::streamsize>(ll));
+    const std::string md = std::string("{\"format-version\":1,\"table-uuid\":\"4f2a0c1e-3b6d-4e8f-9a1b-2c3d4e5f6a7b\",\"location\":\"") + root +
+        "\",\"last-updated-ms\":1,\"last-column-id\":3,\"schema\":" + kV1Schema + ",\"schemas\":[" + kV1Schema + "],\"current-schema-id\":0,"
+        "\"partition-spec\":[],\"partition-specs\":[{\"spec-id\":0,\"fields\":[]}],\"default-spec-id\":0,\"last-partition-id\":999,"
+        "\"properties\":{},\"current-snapshot-id\":77,\"snapshots\":[{\"snapshot-id\":77,\"timestamp-ms\":1,\"manifest-list\":\"" + root +
+        "/metadata/snap-77-v1.avro\",\"summary\":{\"operation\":\"append\"},\"schema-id\":0}],\"snapshot-log\":[{\"timestamp-ms\":1,"
+        "\"snapshot-id\":77}],\"metadata-log\":[],\"sort-orders\":[{\"order-id\":0,\"fields\":[]}],\"default-sort-order-id\":0}";
+    const int64_t v = std::stoll(read_file(root + "/metadata/version-hint.text")) + 1;
+    std::ofstream(root + "/metadata/v" + std::to_string(v) + ".metadata.json") << md;
+    std::ofstream(root + "/metadata/version-hint.text", std::ios::trunc) << v;
+}
+}  // namespace
+
+// G2ICE-346: a v1 table (no sequence numbers, v1 manifests) is compacted as v1, never rewritten as v2.
+TEST(IcebergCompaction, V1IsCompactedAsV1) {
+    Table w;
+    const std::string root = fresh_root(temp_base(), "v1_compact");
+    create_table(&w, root);
+    append_rows(&w, base_rows(0, 10));
+    append_rows(&w, base_rows(10, 20));
+    append_rows(&w, base_rows(20, 30));
+    make_v1(&w, root);
+    ASSERT_EQ(scan_rows(root), base_rows(0, 30));
+    Table t;
+    t.root = root;
+    ASSERT_TRUE(filesystem_object_store_init(&t.fs, root.c_str(), &t.os));
+    ASSERT_TRUE(table_open(&t.th, &t.arena, &t.os, root.c_str()));
+    Predicate p = pred_i64("id", PredicateOp::kEq, 4);
+    EXPECT_FALSE(table_delete(t.th, &p)) << "other writes to a v1 table stay refused";
+    table_close(t.th);
+    ASSERT_TRUE(table_open(&t.th, &t.arena, &t.os, root.c_str()));
+    ASSERT_TRUE(table_compact(t.th, 64ll << 20));
+    EXPECT_EQ(scan_rows(root), base_rows(0, 30));
+    const std::string out = metadata_text(t);
+    EXPECT_NE(out.find("\"format-version\":1"), std::string::npos);
+    EXPECT_EQ(out.find("sequence-number"), std::string::npos) << "a v1 document carries no sequence numbers";
+    EXPECT_NE(out.find("\"operation\":\"replace\""), std::string::npos);
+    EXPECT_NE(out.find("\"partition-spec\":[]"), std::string::npos) << "the document's other members stay as they were";
+    const Snapshot* cur = current_snapshot(table_metadata(t.th));
+    ASSERT_NE(cur, nullptr);
+    bolt::Arena a;
+    const std::string list = read_file(root + "/" + store_key(root, cur->manifest_list));
+    EXPECT_EQ(list.find("sequence_number"), std::string::npos) << "a v1 manifest list";
+    ManifestListEntry* mle = nullptr; uint32_t nm = 0;
+    ASSERT_TRUE(manifest_list_parse_avro_grow(reinterpret_cast<const uint8_t*>(list.data()), list.size(), &a, 8u, &mle, &nm));
+    ASSERT_GE(nm, 1u);
+    for (uint32_t i = 0; i < nm; ++i)
+        EXPECT_EQ(read_file(root + "/" + store_key(root, mle[i].manifest_path)).find("sequence_number"), std::string::npos) << "v1 manifests";
+    ExpireOptions eo{};
+    eo.older_than_ms = INT64_MAX;
+    eo.retain_last = 1;
+    ExpireResult er{};
+    EXPECT_TRUE(table_expire_snapshots_ex(t.th, &eo, &er)) << "expiry of a v1 table";
+    EXPECT_EQ(scan_rows(root), base_rows(0, 30));
 }
 
 // A key of ten columns (past the eight the manifest model kept before) round-trips through the manifest and applies.

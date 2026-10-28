@@ -12,8 +12,10 @@ bool write_ready(TableHandle* th) noexcept {
     assert(th != nullptr);
     assert(th->os != nullptr);
     th->file_io_configurable = false;
-    // G2ICE-279 / G2ICE-283: v2 and v3 are written. An opened v1 table is refused by name, never rewritten as v2.
-    if (th->prior_meta != nullptr && th->meta.format_version != 2 && th->meta.format_version != 3) {
+    // G2ICE-279 / G2ICE-283: v2 and v3 are written. An opened v1 table is refused by name, never rewritten as v2, except by
+    // compaction and expiry (G2ICE-346), which need no v2 feature and write it as v1 (no sequence numbers, v1 manifests).
+    const bool v1_ok = th->meta.format_version == 1 && th->v1_maintenance != 0u;
+    if (th->prior_meta != nullptr && th->meta.format_version != 2 && th->meta.format_version != 3 && !v1_ok) {
         th->last_error = CommitError::kUnimplemented;
         std::fprintf(stderr, "[iceberg_writer] format-version %d tables are not written yet (G2ICE-276); nothing was written\n",
                      th->meta.format_version);

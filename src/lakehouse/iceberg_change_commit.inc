@@ -43,7 +43,8 @@ void pin_first_row_ids(DataFileRef* e, uint32_t n, const ManifestListEntry& mle)
     if (mle.content != ManifestContent::kDataManifest || !mle.has_first_row_id) return;
     int64_t next = mle.first_row_id;
     for (uint32_t i = 0; i < n; ++i) {                          // bounded by n, in manifest order
-        if (e[i].content != FileContent::kData || e[i].has_first_row_id) continue;
+        // DELETED entries take no ids: the manifest list counts added + existing rows only (Iceberg-Java's ManifestReader).
+        if (e[i].content != FileContent::kData || e[i].status == ManifestStatus::kDeleted || e[i].has_first_row_id) continue;
         e[i].first_row_id = next;
         e[i].has_first_row_id = true;
         next += e[i].stats.record_count;

@@ -189,13 +189,15 @@ struct ReadCtx {
     const Predicate* pred;
     RowVisitFn      visit;
     void*           ctx;
+    bool            lineage;
 };
 
 // One scan batch: strip `_pos`, evaluate the predicate, hand it on.
 ReadStatus deliver(ReadCtx* rc, BoltBatch* b, const IcebergScanGroup& g) noexcept {
     assert(rc != nullptr && b != nullptr);
-    assert(b->num_cols >= 1u);
-    const uint32_t n_cols = b->num_cols - 1u;
+    const uint32_t extra = rc->lineage ? 3u : 1u;   // `_pos` (and `_row_id`, `_last_updated_sequence_number`)
+    if (b->num_cols < extra) return ReadStatus::kFailed;
+    const uint32_t n_cols = b->num_cols - extra;
     const BoltColumn& pc = b->columns[b->read_epoch][n_cols];
     if (pc.type != BoltType::Int64 || pc.format != ColumnFormat::Flat || pc.length != b->num_rows)
         return ReadStatus::kFailed;
@@ -203,6 +205,7 @@ ReadStatus deliver(ReadCtx* rc, BoltBatch* b, const IcebergScanGroup& g) noexcep
     rb.file_path = g.file_path;
     rb.batch = b;
     rb.pos = static_cast<const int64_t*>(pc.data);
+    rb.lineage = rc->lineage ? &b->columns[b->read_epoch][n_cols + 1u] : nullptr;
     if (rc->pred != nullptr) {
         uint32_t* sel = nullptr;
         const ReadStatus st = eval_predicate(b, n_cols, rc->pred, rc->arena, &sel, &rb.n_match);
@@ -217,7 +220,7 @@ ReadStatus deliver(ReadCtx* rc, BoltBatch* b, const IcebergScanGroup& g) noexcep
 
 ReadStatus read_live_rows(Arena* arena, const ObjectStore* store, const uint8_t* meta_json,
                           uint32_t meta_len, int64_t snapshot_id, const Predicate* pred,
-                          FileKeepFn keep, void* keep_ctx, RowVisitFn visit, void* ctx) noexcept {
+                          FileKeepFn keep, void* keep_ctx, RowVisitFn visit, void* ctx, bool lineage) noexcept {
     assert(arena != nullptr && store != nullptr && meta_json != nullptr);
     assert(visit != nullptr && snapshot_id > 0);
     TableHandle* rh = nullptr;
@@ -228,6 +231,7 @@ ReadStatus read_live_rows(Arena* arena, const ObjectStore* store, const uint8_t*
     ro->snapshot_id = snapshot_id;
     ro->snapshot_selection = SnapshotSelection::Exact;
     ro->emit_row_position = true;
+    ro->emit_row_lineage = lineage;
     if (pred != nullptr) { ro->predicates[0] = *pred; ro->n_predicates = 1u; }
     ScanHandle* sh = nullptr;
     if (!iceberg_scan_open(&sh, rh, ro)) return ReadStatus::kFailed;
@@ -235,7 +239,7 @@ ReadStatus read_live_rows(Arena* arena, const ObjectStore* store, const uint8_t*
         const IcebergFileFilter f{keep, keep_ctx};
         iceberg_scan_set_file_filter(sh, &f);
     }
-    ReadCtx rc{arena, pred, visit, ctx};
+    ReadCtx rc{arena, pred, visit, ctx, lineage};
     ReadStatus st = ReadStatus::kOk;
     for (uint64_t guard = 0; guard < (UINT64_C(1) << 40); ++guard) {   // bounded: the scan ends
         auto* b = arena->allocate_array<BoltBatch>(1);

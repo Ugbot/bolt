@@ -10,11 +10,23 @@
 // Equality-delete files are kept: they may still apply to other files, and the outputs' higher sequence number keeps
 // them from applying again. Row groups of the outputs are the scan's row groups (not re-chunked).
 //
+// Format versions (G2ICE-346): v1 tables are compacted as v1 (no delete files exist there). At v3 a deletion vector names one
+// data file; a candidate with a DV is rewritten like one with position deletes, and the commit drops the DVs of the removed files.
+// Rewritten rows keep their row lineage: each output file writes `_row_id` and `_last_updated_sequence_number` (field ids
+// 2147483540 / 2147483539) as the values the rows read before (spec "Row Lineage": a row copied by a compaction keeps them).
+//
 // Partitioned tables (G2ICE-292): files are only merged within one (spec, partition tuple). Candidates are grouped by
 // it; the two-files-or-a-delete rule applies per group, each group is read and written on its own, and its outputs
 // carry the group's spec id and tuple (a file never moves to another spec by being compacted).
 
 namespace {
+
+// Test-only negative control (G2ICE-346 drill): BOLT_TEST_COMPACT_DROP_LINEAGE=1 writes v3 outputs without the lineage columns,
+// so readers inherit fresh row ids. Never set in production.
+bool lineage_test_drop() noexcept {
+    const char* v = std::getenv("BOLT_TEST_COMPACT_DROP_LINEAGE");
+    return v != nullptr && v[0] == '1';
+}
 
 struct LiveFile {
     const char*        path;
@@ -35,6 +47,8 @@ struct CompactPlan {
     uint32_t     n_data, cap_data;
     LiveFile*    pos;
     uint32_t     n_pos, cap_pos;
+    LiveFile*    dvs;                // v3 deletion vectors; `path` is the data file each one names
+    uint32_t     n_dvs, cap_dvs;
     const char** cand;
     int64_t*     cand_size;
     uint8_t*     cand_dels;
@@ -70,7 +84,12 @@ bool compact_collect(TableHandle* th, CompactPlan* p) noexcept {
         if (!read_manifest_entries(th, ml[m], &e, &ne)) return false;
         for (uint32_t i = 0; i < ne; ++i) {                     // bounded by ne
             if (e[i].status == ManifestStatus::kDeleted) continue;
-            if (e[i].is_dv) return refuse_named(th, "compacting a table with deletion vectors");
+            if (e[i].is_dv) {
+                if (th->meta.format_version < 3) return refuse_named(th, "a deletion vector in a table below format-version 3");
+                if (!push_live(th->arena, &p->dvs, &p->n_dvs, &p->cap_dvs, e[i])) return false;
+                p->dvs[p->n_dvs - 1u].path = e[i].referenced_data_file;
+                continue;
+            }
             const bool ok = e[i].content == FileContent::kData ? push_live(th->arena, &p->data, &p->n_data, &p->cap_data, e[i])
                           : e[i].content == FileContent::kPositionDeletes ? push_live(th->arena, &p->pos, &p->n_pos, &p->cap_pos, e[i])
                           : true;
@@ -139,6 +158,10 @@ bool compact_deletes(TableHandle* th, Arena* ra, CompactPlan* p) noexcept {
             if (c >= 0 && p->cand_dels[c] == 0) { p->cand_dels[c] = 1; ++p->n_cand_dels; }
         }
     }
+    for (uint32_t d = 0; d < p->n_dvs; ++d) {                   // bounded by n_dvs: a DV names exactly one data file
+        const int64_t c = rm_index_find(&p->cand_ix, p->dvs[d].path);
+        if (c >= 0 && p->cand_dels[c] == 0) { p->cand_dels[c] = 1; ++p->n_cand_dels; }
+    }
     return true;
 }
 
@@ -201,7 +224,54 @@ struct CompactOut {
     char                (*rels)[128];
     uint32_t            cap_rels;
     bool                file_open;
+    bool                lineage;          // v3: outputs write _row_id / _last_updated_sequence_number
 };
+
+// The current schema plus the two row-lineage fields, for a v3 output file (arena copy; the table's schema is untouched).
+const Schema* lineage_schema(TableHandle* th, const Schema* sch) noexcept {
+    assert(th != nullptr && sch != nullptr);
+    auto* f = th->arena->allocate_array<SchemaField>(sch->n_fields + 2u);
+    auto* out = th->arena->allocate_array<Schema>(1);
+    if (f == nullptr || out == nullptr) return nullptr;
+    std::memcpy(f, sch->fields, sizeof(SchemaField) * sch->n_fields);
+    const struct { int32_t id; const char* name; } extra[2] = {{2147483540, "_row_id"}, {2147483539, "_last_updated_sequence_number"}};
+    for (uint32_t k = 0; k < 2; ++k) {                          // bounded: two reserved fields
+        SchemaField& x = f[sch->n_fields + k];
+        std::memset(&x, 0, sizeof(x));
+        x.id = extra[k].id;
+        x.required = false;
+        std::strncpy(x.name, extra[k].name, sizeof(x.name) - 1u);
+        std::strncpy(x.type, "long", sizeof(x.type) - 1u);
+    }
+    *out = *sch;
+    out->fields = f;
+    out->n_fields = sch->n_fields + 2u;
+    out->cap_fields = out->n_fields;
+    return out;
+}
+
+// The table columns of `b` followed by the row's lineage columns, as one batch for the writer.
+BoltBatch* with_lineage(Arena* a, const BoltBatch* b, const BoltColumn* lineage) noexcept {
+    assert(a != nullptr && b != nullptr && lineage != nullptr);
+    auto* w = a->allocate_array<BoltBatch>(1);
+    if (w == nullptr) return nullptr;
+    BoltBatch::init_empty(w);
+    w->arena = a;
+    if (!BoltBatch::alloc_columns(w, a, b->num_cols + 2u)) return nullptr;
+    const BoltColumn* src = b->columns[b->read_epoch];
+    BoltColumn* dst = w->columns[w->read_epoch];
+    for (uint32_t c = 0; c < b->num_cols; ++c) {                // bounded by num_cols
+        dst[c] = src[c];
+        if (!w->schema.add_field(b->schema.field(static_cast<int>(c)).name, src[c].type, true)) return nullptr;
+    }
+    dst[b->num_cols] = lineage[0];
+    dst[b->num_cols + 1u] = lineage[1];
+    if (!w->schema.add_field("_row_id", BoltType::Int64, true) ||
+        !w->schema.add_field("_last_updated_sequence_number", BoltType::Int64, true)) return nullptr;
+    w->num_cols = b->num_cols + 2u;
+    w->num_rows = b->num_rows;
+    return w;
+}
 
 bool compact_keep(void* c, const DataFileRef* e) noexcept {
     const auto* p = static_cast<const CompactPlan*>(c);
@@ -253,6 +323,7 @@ bool compact_open(CompactOut* o) noexcept {
     if (n <= 0 || static_cast<size_t>(n) >= sizeof(o->rel)) return false;
     const Schema* sch = metadata_current_schema(&th->meta);
     if (sch == nullptr) return false;
+    if (o->lineage && (sch = lineage_schema(th, sch)) == nullptr) return false;
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
     if (!make_pq_opts(sch, nullptr, &po, &wide)) return false;
@@ -278,7 +349,9 @@ bool compact_visit(void* c, const dml::RowBatch* rb) noexcept {
     if (rb->batch->num_rows == 0) return true;
     if (!o->file_open && !compact_open(o)) return false;
     if (!conform_batch(o->th, rb->batch)) return false;
-    if (!ingest::parquet::parquet_write_row_group(o->w, rb->batch)) return false;
+    const BoltBatch* out = rb->batch;
+    if (o->lineage && (rb->lineage == nullptr || (out = with_lineage(o->th->arena, rb->batch, rb->lineage)) == nullptr)) return false;
+    if (!ingest::parquet::parquet_write_row_group(o->w, out)) return false;
     if (!lake_grow(o->th->arena, nullptr, &o->batches, o->n_batches, &o->cap_batches, o->n_batches + 1u)) return false;
     o->batches[o->n_batches++] = rb->batch;
     o->rows += rb->batch->num_rows;
@@ -307,6 +380,7 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
     o.plan = p;
     o.snap_id = mint_snapshot_id(th);
     o.target = target;
+    o.lineage = th->meta.format_version >= 3 && !lineage_test_drop();   // the drop is the negative control only
     bool ok = true;
     auto* worth = static_cast<uint8_t*>(th->arena->allocate_zeroed(p->n_groups + 1u));
     if (worth == nullptr) return false;
@@ -316,7 +390,7 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
         p->cur_group = g;
         o.cur_path = nullptr;
         o.in_bytes = 0;
-        ok = dml_read(th, ra, nullptr, compact_keep, p, compact_visit, &o) && compact_close(&o);
+        ok = dml_read(th, ra, nullptr, compact_keep, p, compact_visit, &o, o.lineage) && compact_close(&o);
     }
     if (!ok) {
         if (th->last_error == CommitError::kNone) th->last_error = CommitError::kFailed;
@@ -361,21 +435,19 @@ bool compact_table(TableHandle* th, int64_t target) noexcept {
 
 bool table_rewrite(TableHandle* th, const OptimizeOptions* opts) noexcept {
     assert(th != nullptr);
-    if (!write_ready(th)) return false;
-    if (th->meta.format_version >= 3)   // rewritten rows must keep their _row_id / _last_updated_sequence_number (G2ICE-346)
-        return refuse_named(th, "compaction of a format-version 3 table (rows keeping their row ids is sequenced, G2ICE-346)");
     OptimizeOptions o;
     optimize_options_init(&o);
     if (opts != nullptr) o = *opts;
-    if (!o.run_bin_pack) { th->last_error = CommitError::kNone; return true; }   // no strategy asked for
+    if (!o.run_bin_pack) { th->last_error = CommitError::kNone; return write_ready(th); }   // no strategy asked for
     if (o.target_file_size_mb <= 0) { th->last_error = CommitError::kFailed; return false; }
-    return compact_table(th, static_cast<int64_t>(o.target_file_size_mb) << 20);
+    return table_compact(th, static_cast<int64_t>(o.target_file_size_mb) << 20);
 }
 
 bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept {
     assert(th != nullptr);
-    if (!write_ready(th)) return false;
-    if (th->meta.format_version >= 3)
-        return refuse_named(th, "compaction of a format-version 3 table (rows keeping their row ids is sequenced, G2ICE-346)");
-    return compact_table(th, target_file_size_bytes);
+    const uint8_t was = th->v1_maintenance;
+    th->v1_maintenance = 1u;                                     // a v1 table is compacted as v1 (write_ready)
+    const bool ok = write_ready(th) && compact_table(th, target_file_size_bytes);
+    th->v1_maintenance = was;
+    return ok;
 }

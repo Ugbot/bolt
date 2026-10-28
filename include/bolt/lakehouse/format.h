@@ -101,7 +101,11 @@ struct ReadOptions {
     // _file (Utf8, the data file's path as its manifest records it), _pos (Int64), _spec_id (Int64, the file's
     // partition spec), _deleted (Int64 0/1: false, deleted rows are not read). Exclusive with emit_row_position.
     bool      emit_metadata_columns;
-    uint8_t   _pad[3];
+    // Iceberg only, with emit_row_position (G2ICE-346): also append `_row_id` and `_last_updated_sequence_number` (Int64) after
+    // `_pos`, each the value the data file wrote, else inherited: the file's first_row_id + `_pos` (null when the file has none)
+    // and the file's data sequence number (spec "Row Lineage").
+    bool      emit_row_lineage;
+    uint8_t   _pad[2];
 };
 
 inline void read_options_init(ReadOptions* o) noexcept {

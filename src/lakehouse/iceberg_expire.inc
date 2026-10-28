@@ -115,8 +115,8 @@ uint32_t delete_expired_files(TableHandle* th, const Snapshot* gone,
 
 }  // namespace
 
-bool table_expire_snapshots_ex(TableHandle* th, const ExpireOptions* o,
-                               ExpireResult* r) noexcept {
+namespace {
+bool expire_snapshots(TableHandle* th, const ExpireOptions* o, ExpireResult* r) noexcept {
     assert(th != nullptr && o != nullptr);
     if (!write_ready(th)) return false;
     ExpireResult res{};
@@ -176,6 +176,17 @@ bool table_expire_snapshots_ex(TableHandle* th, const ExpireOptions* o,
     if (o->delete_files) res.files_deleted = delete_expired_files(th, gone, ng);
     if (r != nullptr) *r = res;
     return true;
+}
+}  // namespace
+
+bool table_expire_snapshots_ex(TableHandle* th, const ExpireOptions* o,
+                               ExpireResult* r) noexcept {
+    assert(th != nullptr && o != nullptr);
+    const uint8_t was = th->v1_maintenance;
+    th->v1_maintenance = 1u;                                     // G2ICE-346: expiry of a v1 table writes it as v1
+    const bool ok = expire_snapshots(th, o, r);
+    th->v1_maintenance = was;
+    return ok;
 }
 
 bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,

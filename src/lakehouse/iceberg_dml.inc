@@ -177,12 +177,12 @@ Arena* scratch_arena(TableHandle* th) noexcept {
 
 // Read the live rows of the current snapshot into `visit`. kUnsupported / kFailed set last_error.
 bool dml_read(TableHandle* th, Arena* ra, const Predicate* pred, dml::FileKeepFn keep, void* keep_ctx,
-              dml::RowVisitFn visit, void* ctx) noexcept {
+              dml::RowVisitFn visit, void* ctx, bool lineage = false) noexcept {
     assert(th != nullptr && ra != nullptr && visit != nullptr);
     const uint8_t* meta = nullptr; uint32_t ml = 0;
     if (!current_metadata_bytes(th, ra, &meta, &ml)) { th->last_error = CommitError::kFailed; return false; }
     const dml::ReadStatus st = dml::read_live_rows(ra, th->os, meta, ml, th->meta.current_snapshot_id, pred,
-                                                   keep, keep_ctx, visit, ctx);
+                                                   keep, keep_ctx, visit, ctx, lineage);
     if (st == dml::ReadStatus::kOk) return true;
     if (st == dml::ReadStatus::kUnsupported) return refuse_named(th, "a predicate of this column / literal type");
     th->last_error = CommitError::kFailed;

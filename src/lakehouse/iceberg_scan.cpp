@@ -405,7 +405,10 @@ struct FileTask {
     const char* partition_json;   // G2ICE-300: the `_partition` column's text; set only when metadata columns are emitted
     int64_t     seq;        // data sequence number: the entry's own, else its manifest's (v1 tables: 0)
     int32_t     spec_id;
+    bool        has_first_row_id;   // v3: the file's first `_row_id`, explicit or inherited from its manifest (spec "Row Lineage")
+    uint8_t     _pad[3];
     uint64_t    part_hash;  // hash of the partition tuple, matched against equality deletes' partitions
+    int64_t     first_row_id;
 };
 
 constexpr uint32_t kMetadataColumns = 5u;   // _file, _pos, _spec_id, _deleted, _partition (G2ICE-300)
@@ -906,6 +909,49 @@ bool fill_const_utf8(Arena* a, const char* str, int64_t rows, BoltColumn* out) n
     return true;
 }
 
+constexpr int32_t kRowIdFieldId = 2147483540;        // spec "Row Lineage": _row_id
+constexpr int32_t kRowSeqFieldId = 2147483539;       // _last_updated_sequence_number
+
+// The decoded column of `meta` written under Iceberg field id `id`, or -1.
+int32_t lineage_column(const pq::PqMeta* meta, uint32_t decoded, int32_t id) noexcept {
+    assert(meta != nullptr);
+    for (uint32_t c = 0; c < meta->n_columns && c < decoded; ++c)   // bounded by the file's columns
+        if (meta->columns[c].has_field_id && meta->columns[c].field_id == id) return static_cast<int32_t>(c);
+    return -1;
+}
+
+// `_row_id` and `_last_updated_sequence_number` of one decoded group into out[0..2) (G2ICE-346): the file's own value where it wrote
+// one, else the inherited one. `dec` holds the file's decoded columns.
+bool fill_row_lineage(Arena* a, const FileTask& t, const pq::PqMeta* meta, const BoltColumn* dec, uint32_t n_dec, uint64_t base,
+                      int64_t rows, BoltColumn* out) noexcept {
+    assert(a != nullptr && meta != nullptr && dec != nullptr && out != nullptr);
+    assert(rows >= 0);
+    const int32_t pid = lineage_column(meta, n_dec, kRowIdFieldId), pseq = lineage_column(meta, n_dec, kRowSeqFieldId);
+    const BoltColumn* phys[2] = {pid >= 0 ? &dec[pid] : nullptr, pseq >= 0 ? &dec[pseq] : nullptr};
+    for (const BoltColumn* c : phys)
+        if (c != nullptr && (c->format != ColumnFormat::Flat || c->type != BoltType::Int64 || c->length < rows)) return false;
+    for (uint32_t k = 0; k < 2; ++k) {
+        auto* d = a->allocate_array<int64_t>(static_cast<size_t>(rows) + 1u);
+        auto* val = static_cast<uint8_t*>(a->allocate_zeroed((static_cast<size_t>(rows) + 7u) / 8u + 1u));
+        if (d == nullptr || val == nullptr) return false;
+        const auto* p = phys[k] != nullptr ? static_cast<const int64_t*>(phys[k]->data) : nullptr;
+        uint32_t nulls = 0;
+        for (int64_t r = 0; r < rows; ++r) {                                  // bounded by rows
+            bool valid = true;
+            if (p != nullptr && !phys[k]->is_null(r)) d[r] = p[r];
+            else if (k == 1) d[r] = t.seq;
+            else if (t.has_first_row_id) d[r] = t.first_row_id + static_cast<int64_t>(base) + r;
+            else { d[r] = 0; valid = false; }
+            if (valid) val[r >> 3] |= static_cast<uint8_t>(1u << (r & 7));
+            else ++nulls;
+        }
+        out[k] = BoltColumn::make_flat(d, nulls != 0 ? val : nullptr, rows, BoltType::Int64);
+        out[k].stats.null_count = nulls;
+        out[k].stats.all_valid = nulls == 0;
+    }
+    return true;
+}
+
 // The four reserved metadata columns of one decoded group (G2ICE-300), into out[0..4).
 bool fill_metadata_columns(Arena* a, const FileTask& t, uint64_t base, int64_t rows, BoltColumn* out) noexcept {
     assert(a != nullptr && out != nullptr && t.path != nullptr);
@@ -1073,12 +1119,14 @@ struct VisitCtx {
     ManifestContent      mc;
     bool                 deletes_pass;
     bool                 failed;
-    uint8_t              _pad[5];
+    bool                 has_row_ids;   // the data manifest carries a first_row_id (v3)
+    uint8_t              _pad[4];
     int64_t              mle_seq;   // the manifest's sequence number, inherited by entries that carry none
+    int64_t              next_row_id;   // first_row_id of the next live data entry that carries none (spec "Row Lineage")
 };
 
 bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, uint64_t part_hash,
-               const char* partition_json = nullptr) noexcept {
+               const char* partition_json = nullptr, bool has_first_row_id = false, int64_t first_row_id = 0) noexcept {
     assert(s != nullptr && path != nullptr);
     const size_t len = std::strlen(path);
     const uint64_t before = s->tasks_cap;
@@ -1095,6 +1143,8 @@ bool push_task(ScanHandle* s, const char* path, int64_t seq, int32_t spec_id, ui
     FileTask& t = s->tasks[s->n_tasks++];
     t.path = p; t.seq = seq; t.spec_id = spec_id; t.part_hash = part_hash;
     t.partition_json = partition_json;   // already in man_arena, charged
+    t.has_first_row_id = has_first_row_id;
+    t.first_row_id = first_row_id;
     ++s->stats.files_planned;
     return true;
 }
@@ -1126,6 +1176,14 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
     }
     const ScanHandle* s = v->s;
     ++v->s->stats.entries_visited;
+    // Row lineage inheritance runs over every live data entry in manifest order, pruned or not (Iceberg-Java's ManifestReader).
+    bool has_first = e->has_first_row_id;
+    int64_t first = e->first_row_id;
+    if (!has_first && v->has_row_ids) {
+        has_first = true;
+        first = v->next_row_id;
+        v->next_row_id += e->stats.record_count;
+    }
     if (!partition_passes(e, v->spec, v->sch, s->opts.predicates,
                           s->opts.n_predicates))
         return true;
@@ -1142,7 +1200,7 @@ bool visit_entry(void* c, const DataFileRef* e) noexcept {
         if (!partition_json(s->table->meta, *e, pj, cap)) { v->failed = true; return false; }
     }
     if (!push_task(v->s, e->file_path, e->has_sequence_number ? e->sequence_number : v->mle_seq, e->partition_spec_id, partition_hash(*e),
-                   want_pj ? pj : nullptr)) { v->failed = true; return false; }
+                   want_pj ? pj : nullptr, has_first, first)) { v->failed = true; return false; }
     return true;
 }
 
@@ -1166,6 +1224,8 @@ bool evaluate_manifest(ScanHandle* s, const ManifestListEntry& mle,
     v.sch = h->strict_pinned ? s->selected_schema : metadata_current_schema(&h->meta);
     v.mc = mle.content;
     v.mle_seq = mle.sequence_number;
+    v.has_row_ids = mle.content == ManifestContent::kDataManifest && mle.has_first_row_id;
+    v.next_row_id = mle.first_row_id;
     v.deletes_pass = deletes_pass;
     uint32_t n = 0;
     if (is_avro_ocf(body, blen)) {
@@ -1350,7 +1410,9 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
         }
         // G2ICE-280: `_pos` rides as one extra trailing column through every delete filter below.
         if (s->opts.emit_row_position && s->opts.emit_metadata_columns) { s->failed = true; return false; }
-        const uint32_t extra = s->opts.emit_row_position ? 1u : s->opts.emit_metadata_columns ? kMetadataColumns : 0u;
+        if (s->opts.emit_row_lineage && (!s->opts.emit_row_position || s->table->strict_pinned)) { s->failed = true; return false; }
+        const bool lineage = s->opts.emit_row_lineage;
+        const uint32_t extra = s->opts.emit_row_position ? (lineage ? 3u : 1u) : s->opts.emit_metadata_columns ? kMetadataColumns : 0u;
         // G2FEAT-47: right-size columns[2] to this file's width before deref.
         if (!BoltBatch::alloc_columns(out, s->scratch, s->output_columns + extra))
             return false;
@@ -1389,8 +1451,11 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             }
             decoded_rows = rows;
             const bool filled = extra == 0u ||
-                (extra == 1u ? fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns])
-                             : fill_metadata_columns(s->scratch, live_file, s->cur_file_row_base, rows, &dec[dec_columns]));
+                (s->opts.emit_row_position
+                     ? fill_row_positions(s->scratch, s->cur_file_row_base, rows, &dec[dec_columns]) &&
+                           (!lineage || fill_row_lineage(s->scratch, live_file, s->cur_meta, dec, dec_columns, s->cur_file_row_base,
+                                                         rows, &dec[dec_columns + 1u]))
+                     : fill_metadata_columns(s->scratch, live_file, s->cur_file_row_base, rows, &dec[dec_columns]));
             if (!filled) {
                 s->failed = true;
                 return false;
@@ -1423,7 +1488,10 @@ bool iceberg_scan_next_batch(ScanHandle* s, BoltBatch* out,
             if (!s->table->strict_pinned && !s->use_map && s->cur_meta->columns[c].name_truncated != 0u) return false;
             if (!out->schema.add_field(name, cols[c].type, true)) return false;
         }
-        if (extra == 1u && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (s->opts.emit_row_position && !out->schema.add_field("_pos", BoltType::Int64, false)) return false;
+        if (lineage && (!out->schema.add_field("_row_id", BoltType::Int64, true) ||
+                        !out->schema.add_field("_last_updated_sequence_number", BoltType::Int64, true)))
+            return false;
         if (extra == kMetadataColumns &&
             (!out->schema.add_field("_file", BoltType::Utf8, false) || !out->schema.add_field("_pos", BoltType::Int64, false) ||
              !out->schema.add_field("_spec_id", BoltType::Int64, false) || !out->schema.add_field("_deleted", BoltType::Int64, false) ||

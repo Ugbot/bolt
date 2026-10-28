@@ -34,6 +34,7 @@ struct RowBatch {
     const uint32_t* match;       // rows of `batch` the predicate accepts (nullptr without a predicate)
     uint32_t        n_match;
     uint32_t        _pad;
+    const BoltColumn* lineage;   // with `lineage`: each row's _row_id and _last_updated_sequence_number (two Int64 columns)
 };
 
 using RowVisitFn = bool (*)(void* ctx, const RowBatch* b) noexcept;
@@ -49,7 +50,7 @@ ReadStatus read_live_rows(Arena* arena, const ObjectStore* store,
                           const uint8_t* meta_json, uint32_t meta_len,
                           int64_t snapshot_id, const Predicate* pred,
                           FileKeepFn keep, void* keep_ctx,
-                          RowVisitFn visit, void* ctx) noexcept;
+                          RowVisitFn visit, void* ctx, bool lineage = false) noexcept;
 
 // Rows of `b` (first `n_cols` columns are searched for the predicate column by
 // name) where `pred` is TRUE under SQL three-valued logic: a NULL value never

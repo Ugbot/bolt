@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -108,7 +109,7 @@ struct TableHandle {
     int64_t        view_version_id;
     CommitError    last_error;
     bool           write_uncertain;
-    uint8_t        _pad;
+    uint8_t        v1_maintenance;  // G2ICE-346: inside table_compact / table_rewrite / expiry, a v1 table is written (as v1)
     CommitCandidate candidate;
     FileWriteState* file_io;
     bool file_io_configurable;
@@ -683,7 +684,7 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
     if (!buf_fmt(&b, "\"last-partition-id\":%d,", last_part_id)) return false;
     if (!buf_fmt(&b, "\"last-updated-ms\":%lld,",
                  static_cast<long long>(m->last_updated_ms))) return false;
-    if (!buf_fmt(&b, "\"last-sequence-number\":%lld,",
+    if (m->format_version >= 2 && !buf_fmt(&b, "\"last-sequence-number\":%lld,",   // v1 has no sequence numbers
                  static_cast<long long>(m->last_sequence_number))) return false;
     if (m->format_version >= 3 && !buf_fmt(&b, "\"next-row-id\":%lld,", static_cast<long long>(m->next_row_id))) return false;
     if (!buf_fmt(&b, "\"current-snapshot-id\":%lld,",
@@ -818,9 +819,9 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
         if (s.parent_snapshot_id > 0 &&
             !buf_fmt(&b, "\"parent-snapshot-id\":%lld,",
                      static_cast<long long>(s.parent_snapshot_id))) return false;
-        if (!buf_fmt(&b, "\"timestamp-ms\":%lld,\"sequence-number\":%lld,",
-                     static_cast<long long>(s.timestamp_ms),
-                     static_cast<long long>(s.sequence_number))) return false;
+        if (!buf_fmt(&b, "\"timestamp-ms\":%lld,", static_cast<long long>(s.timestamp_ms))) return false;
+        if (m->format_version >= 2 &&
+            !buf_fmt(&b, "\"sequence-number\":%lld,", static_cast<long long>(s.sequence_number))) return false;
         if (!buf_kv_str(&b, "manifest-list", s.manifest_list, true)) return false;
         if (!buf_fmt(&b, "\"schema-id\":%d,", s.schema_id)) return false;
         const SnapSummary* sum = find_summary(sums, n_sums, s.snapshot_id);
