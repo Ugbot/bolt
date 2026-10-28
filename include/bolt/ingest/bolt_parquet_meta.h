@@ -284,6 +284,10 @@ struct PqColumn {
     uint8_t  name_truncated;
     // G2ICE-327: GEOGRAPHY's EdgeInterpolationAlgorithm (0 spherical, 1 vincenty, 2 thomas, 3 andoyer, 4 karney).
     uint8_t  geo_algorithm;
+    // G2ICE-327: a leaf directly under a VARIANT-annotated group: 1 `metadata`, 2 `value`, 3 anything else (a shredded
+    // `typed_value`, or a leaf below it); 0 otherwise. `variant_field_id` is the group's field id (0: none).
+    uint8_t  variant_leaf;
+    int32_t  variant_field_id;
 };
 
 // PqChunk::stats_flags bits (G2FEAT-21): record WHICH thrift Statistics

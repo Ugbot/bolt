@@ -916,6 +916,8 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     uint8_t  rdef;     // def AT the innermost REPEATED node
                     uint16_t plen;     // dotted-path length so far
                     bool     cut;      // the dotted path was truncated
+                    uint8_t  vdepth;   // G2ICE-327: 1 = this group is VARIANT, 2 = below one (shredded), 0 = neither
+                    int32_t  vfid;     // the VARIANT group's field id
                     // G2PQ-15: one (ldef,rdef) pair per repeated ancestor seen
                     // so far, index k-1 for level k. ldef/rdef above track
                     // only the INNERMOST (most recent) repeated ancestor, same
@@ -939,6 +941,7 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         stk[0].def = 0; stk[0].rep = 0; stk[0].plen = 0;
                         stk[0].ldef = 0; stk[0].rdef = 0;
                         stk[0].cut = false;
+                        stk[0].vdepth = 0; stk[0].vfid = 0;
                         for (uint32_t z = 0; z < kPqMaxRepLevels; ++z) {
                             stk[0].ldefs[z] = 0; stk[0].rdefs[z] = 0;
                         }
@@ -985,6 +988,13 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                         }
                         stk[sp].plen = plen;
                         stk[sp].cut = cut;
+                        if (se.col.logical == static_cast<int32_t>(PqLogical::Variant)) {
+                            stk[sp].vdepth = 1;
+                            stk[sp].vfid = se.col.has_field_id != 0u ? se.col.field_id : 0;
+                        } else {
+                            stk[sp].vdepth = stk[sp - 1].vdepth != 0u ? 2u : 0u;
+                            stk[sp].vfid = stk[sp - 1].vfid;
+                        }
                         ++sp;
                         continue;
                     }
@@ -1029,6 +1039,14 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
                     }
                     col.name[w] = '\0';
                     col.name_truncated = cut ? 1u : 0u;
+                    col.variant_leaf = 0;
+                    col.variant_field_id = 0;
+                    if (stk[sp - 1].vdepth != 0u) {            // G2ICE-327: a VARIANT group's leaves
+                        const bool direct = stk[sp - 1].vdepth == 1u;
+                        col.variant_leaf = !direct ? 3u : std::strcmp(se.col.name, "metadata") == 0 ? 1u
+                                                        : std::strcmp(se.col.name, "value") == 0 ? 2u : 3u;
+                        col.variant_field_id = stk[sp - 1].vfid;
+                    }
                     out->columns[out->n_columns++] = col;
                     (void)base;
                     // close finished groups

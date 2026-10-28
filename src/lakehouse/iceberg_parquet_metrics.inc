@@ -377,6 +377,11 @@ bool leaf_metrics(const uint8_t* bytes, uint64_t len, const pq::PqMeta* meta, ui
     const pq::PqColumn& col = meta->columns[c];
     const bool repeated = col.max_rep != 0u;                            // inside a list or map: its size only
     if (!footer_counts(meta, c, !repeated, e)) return false;
+    if (col.variant_leaf != 0u) {                                       // G2ICE-327: Iceberg-Java's variant metrics: the group's
+        e->has_column_size = false;                                     // value / null counts (from its metadata leaf), no size,
+        e->column_size = 0;                                             // no bounds (shredded bounds: G2ICE-310)
+        return true;
+    }
     if (repeated) return true;
     ValueFold vf{};
     vf.t = leaf_type(col);
@@ -425,6 +430,7 @@ bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const pq::PqM
     const uint32_t nc = meta->n_columns < n_leaves ? meta->n_columns : n_leaves;
     for (uint32_t c = 0; c < nc; ++c) {                                  // bounded: kMaxColumns
         if (leaves[c].field_id <= 0 || leaves[c].mode.mode == MetricsMode::kNone) continue;
+        if (meta->columns[c].variant_leaf > 1u) continue;                // G2ICE-327: a variant counts once, on its metadata leaf
         ColumnStatEntry* e = stats_add_col(out, a, leaves[c].field_id);
         if (e == nullptr) return false;                                  // over iceberg_stat_columns
         if (!leaf_metrics(bytes, len, meta, c, leaves[c], e, a)) return false;
