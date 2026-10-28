@@ -50,6 +50,10 @@ struct ObjectMeta {
     uint8_t  _pad[7];
 };
 
+// Visitor for list_visit / os_list_visit (G2ICE-245): called once per key under the prefix, in store order. Return kOsOk to
+// continue; any other code stops the walk and is returned by the listing.
+using ObjectVisitFn = int (*)(void* ctx, const char* key, uint64_t size) noexcept;
+
 // The trait. `impl` carries the implementation's state (filesystem root, S3
 // config, ...). Every function pointer takes that `impl` first.
 struct ObjectStoreVT {
@@ -109,6 +113,10 @@ struct ObjectStoreVT {
     // is {len, the response's strong ETag}, or zeroed when the response named none (the caller then HEADs). Optional.
     int (*put_if_absent_versioned)(void* impl, const char* key, const uint8_t* data, uint64_t len,
                                    ObjectVersion* out) noexcept = nullptr;
+    // Visit every key under `prefix` without materializing the listing (G2ICE-245): constant memory however many objects
+    // the prefix holds, one pass (S3: one request per page). Same completeness contract as list_prefix: a walk that cannot
+    // finish returns an error, never kOsOk over a short walk. Optional; os_list_visit falls back to os_list_all.
+    int (*list_visit)(void* impl, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept = nullptr;
 };
 
 struct ObjectStore {
@@ -163,6 +171,23 @@ inline int os_list_all(ObjectStore* s, const char* prefix, Arena* arena,
         cap *= 2u;
     }
     return kOsBufferSmall;
+}
+// Visit every key under `prefix` (G2ICE-245). A store with list_visit walks in constant memory; one without it lists into
+// `scratch` (os_list_all) and visits the result, so every store answers exactly.
+inline int os_list_visit(ObjectStore* s, const char* prefix, Arena* scratch,
+                         ObjectVisitFn fn, void* ctx) noexcept {
+    assert(s != nullptr && s->vt != nullptr);
+    assert(scratch != nullptr && fn != nullptr);
+    if (s->vt->list_visit != nullptr) return s->vt->list_visit(s->impl, prefix, fn, ctx);
+    ObjectEntry* all = nullptr;
+    uint32_t n = 0;
+    const int rc = os_list_all(s, prefix, scratch, 256u, &all, &n);
+    if (rc != kOsOk) return rc;
+    for (uint32_t i = 0; i < n; ++i) {   // bounded: the listing
+        const int v = fn(ctx, all[i].key, all[i].size);
+        if (v != kOsOk) return v;
+    }
+    return kOsOk;
 }
 inline int os_head(ObjectStore* s, const char* key, ObjectMeta* m) noexcept {
     assert(s != nullptr && s->vt != nullptr);

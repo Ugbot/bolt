@@ -308,13 +308,40 @@ bool metadata_version_of(const char* tail, int64_t* out) noexcept {
     return true;
 }
 
+struct LatestMetadata {
+    int64_t best;
+    char    key[kCatMaxPath];
+};
+
+int rank_metadata_key(void* ctx, const char* k, uint64_t /*size*/) noexcept {
+    LatestMetadata* lm = static_cast<LatestMetadata*>(ctx);
+    assert(lm != nullptr && k != nullptr);
+    const char* slash = std::strrchr(k, '/');
+    const char* tail = slash ? slash + 1 : k;
+    int64_t v = 0;
+    if (!metadata_version_of(tail, &v) || v <= lm->best) return kOsOk;
+    const size_t len = std::strlen(k);
+    if (len >= sizeof(lm->key)) return kOsBadArg;   // never skip a newer version
+    lm->best = v;
+    std::memcpy(lm->key, k, len + 1u);
+    return kOsOk;
+}
+
+// G2ICE-245: one listing pass in constant memory (os_list_visit), never the doubling relists of os_list_all, whose
+// 2 KiB-per-entry arrays cost ~140 MiB at 20k metadata/ objects. With a readable version-hint.text the table is in the
+// Hadoop layout, whose metadata files are all `v<N>[.gz].metadata.json`, so only keys under `metadata/v` are listed (on S3
+// the prefix is filtered by the server: the manifests and manifest lists beside them are never enumerated). The hint is
+// still advisory (its write can lose a race after the commit, and versions may be retained with gaps): the listing ranks
+// every version, exactly as before. Without a hint (pyiceberg, REST, Glue, Hive: `<NNNNN>-<uuid>.metadata.json`) the whole
+// metadata/ prefix is visited. Hint-object and listing I/O errors fail closed.
 bool find_latest_metadata(ObjectStore* os, const char* table_rel,
                           Arena* scratch, char* out_key,
                           uint32_t cap) noexcept {
     assert(os != nullptr && table_rel != nullptr && out_key != nullptr);
     assert(scratch != nullptr && cap > 0u);
-    int64_t best = -1;
-    char best_key[kCatMaxPath]{};
+    LatestMetadata lm;
+    lm.best = -1;
+    lm.key[0] = '\0';
     int64_t hint = 0;
     const int hr = read_version_hint(os, table_rel, scratch, &hint);
     if (hr != kOsOk && hr != kOsNotFound && hr != kOsBadArg) return false;
@@ -324,38 +351,20 @@ bool find_latest_metadata(ObjectStore* os, const char* table_rel,
                                      "metadata/v%lld.metadata.json",
                                      static_cast<long long>(hint));
         if (n <= 0 || static_cast<size_t>(n) >= sizeof(rel)) return false;
-        if (!path_join(table_rel, rel, best_key, sizeof(best_key))) return false;
+        if (!path_join(table_rel, rel, lm.key, sizeof(lm.key))) return false;
         const uint8_t* body = nullptr; uint64_t blen = 0;
-        const int rc = os_get(os, best_key, scratch, &body, &blen);
-        if (rc == kOsOk) best = hint;
+        const int rc = os_get(os, lm.key, scratch, &body, &blen);
+        if (rc == kOsOk) lm.best = hint;
         else if (rc != kOsNotFound) return false;
+        else lm.key[0] = '\0';
     }
-    // The hint is advisory: its write can fail or lose a race AFTER metadata
-    // commits. Rank the complete listing, including retained version gaps and
-    // catalog-managed names. A failed listing is not an unchanged table.
     char prefix[kCatMaxPath];
-    if (!path_join(table_rel, "metadata/", prefix, sizeof(prefix))) return false;
-    ObjectEntry* listing = nullptr;
-    uint32_t nl = 0;
-    if (os_list_all(os, prefix, scratch, 256u, &listing, &nl) != kOsOk)
-        return false;
-    for (uint32_t i = 0; i < nl; ++i) {
-        const char* k = listing[i].key;
-        const char* slash = std::strrchr(k, '/');
-        const char* tail = slash ? slash + 1 : k;
-        int64_t v = 0;
-        if (!metadata_version_of(tail, &v)) continue;
-        if (v > best) {
-            const size_t len = std::strlen(k);
-            if (len >= sizeof(best_key)) return false;
-            best = v;
-            std::memcpy(best_key, k, len + 1u);
-        }
-    }
-    if (best < 0) return false;
-    const size_t len = std::strlen(best_key);
+    if (!path_join(table_rel, hr == kOsOk ? "metadata/v" : "metadata/", prefix, sizeof(prefix))) return false;
+    if (os_list_visit(os, prefix, scratch, &rank_metadata_key, &lm) != kOsOk) return false;
+    if (lm.best < 0) return false;
+    const size_t len = std::strlen(lm.key);
     if (len >= cap) return false;
-    std::memcpy(out_key, best_key, len + 1u);
+    std::memcpy(out_key, lm.key, len + 1u);
     return true;
 }
 

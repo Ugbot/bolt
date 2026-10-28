@@ -106,12 +106,10 @@ int fs_put(void* impl, const char* key, const uint8_t* data,
     return kOsOk;
 }
 
-int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
-            uint32_t* out_n) noexcept {
-    assert(impl != nullptr);
-    assert(out != nullptr && out_n != nullptr);
-    FilesystemObjectStore* fs = static_cast<FilesystemObjectStore*>(impl);
-    *out_n = 0;
+// Walk every regular file under `prefix`, calling fn(ctx, key, size); a non-kOsOk return from fn stops the walk with it.
+int fs_walk(FilesystemObjectStore* fs, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept {
+    assert(fs != nullptr);
+    assert(fn != nullptr);
     std::error_code ec;
     const size_t root_len = std::strlen(fs->root);
     // Start the walk at the deepest directory the prefix names, never at the
@@ -141,7 +139,6 @@ int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         start, std::filesystem::directory_options::skip_permission_denied, ec);
     std::filesystem::recursive_directory_iterator end;
     if (ec) return kOsIoError;
-    uint32_t count = 0;
     while (it != end) {   // bounded by the directory tree
         if (it->is_regular_file(ec)) {
             std::string full = it->path().generic_string();
@@ -155,13 +152,8 @@ int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
                                (rl >= pl && std::memcmp(rel, prefix, pl) == 0));
                 if (match && rl >= kOsMaxKey) return kOsIoError;  // never skip
                 if (match) {
-                    if (count == cap) {        // more than the caller holds
-                        *out_n = count;
-                        return kOsBufferSmall;
-                    }
-                    std::memcpy(out[count].key, rel, rl + 1u);
-                    out[count].size = static_cast<uint64_t>(it->file_size(ec));
-                    ++count;
+                    const int v = fn(ctx, rel, static_cast<uint64_t>(it->file_size(ec)));
+                    if (v != kOsOk) return v;
                 }
             }
         }
@@ -171,8 +163,38 @@ int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         // number, and a truncated listing corrupts the table.
         if (ec) return kOsIoError;
     }
-    *out_n = count;
     return kOsOk;
+}
+
+struct FsFill {
+    ObjectEntry* out;
+    uint32_t     cap;
+    uint32_t     n;
+};
+
+int fs_fill(void* ctx, const char* key, uint64_t size) noexcept {
+    FsFill* f = static_cast<FsFill*>(ctx);
+    assert(f != nullptr && key != nullptr);
+    if (f->n == f->cap) return kOsBufferSmall;   // more than the caller holds
+    std::memcpy(f->out[f->n].key, key, std::strlen(key) + 1u);
+    f->out[f->n].size = size;
+    ++f->n;
+    return kOsOk;
+}
+
+int fs_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
+            uint32_t* out_n) noexcept {
+    assert(impl != nullptr);
+    assert(out != nullptr && out_n != nullptr);
+    FsFill f{out, cap, 0u};
+    const int rc = fs_walk(static_cast<FilesystemObjectStore*>(impl), prefix, &fs_fill, &f);
+    *out_n = f.n;
+    return rc;
+}
+
+int fs_list_visit(void* impl, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept {
+    assert(impl != nullptr && fn != nullptr);
+    return fs_walk(static_cast<FilesystemObjectStore*>(impl), prefix, fn, ctx);
 }
 
 int fs_delete(void* impl, const char* key) noexcept {
@@ -306,7 +328,7 @@ int fs_put_if_absent(void* impl, const char* key, const uint8_t* data,
 
 const ObjectStoreVT kFilesystemVT = {
     fs_get, fs_put, fs_list, fs_delete, fs_head, fs_put_if_absent,
-    fs_get_range,
+    fs_get_range, nullptr, nullptr, nullptr, fs_list_visit,
 };
 
 }  // namespace

@@ -24,7 +24,16 @@ this interface does not add a durable reconciliation journal.
 The path-based reader treats `version-hint.text` as advisory and ranks a complete
 bounded metadata listing even when the hinted version exists. This discovers
 accepted commits whose hint update was never acknowledged, including retained
-version gaps. Hint-object and listing I/O errors fail closed. An explicit
+version gaps. Hint-object and listing I/O errors fail closed.
+
+G2ICE-245 (2026-10-28): the listing is one constant-memory pass
+(`os_list_visit`; filesystem and S3 implement `list_visit`, other stores fall
+back to `os_list_all`), never the doubling relists that cost ~140 MiB at 20k
+metadata/ objects. With a readable hint the table is in the Hadoop layout, so
+only keys under `metadata/v` are listed (S3 filters by prefix server-side; the
+manifests beside them are not enumerated). A Hadoop-layout directory that also
+holds catalog-managed `<NNNNN>-<uuid>` names is not ranked across both, as in
+Iceberg-Java's HadoopTableOperations. An explicit
 catalog-provided metadata open remains authoritative and does not list.
 
 ## Verification on 2026-10-21
