@@ -1765,6 +1765,13 @@ target_link_libraries(test_bolt_parquet_nested_list_write
 bolt_apply_hardening(test_bolt_parquet_nested_list_write)
 add_test(NAME test_bolt_parquet_nested_list_write COMMAND test_bolt_parquet_nested_list_write)
 
+# G2ICE-310: a shredded VARIANT group read back in the variant encoding.
+add_executable(test_bolt_parquet_variant test_bolt_parquet_variant.cpp)
+target_link_libraries(test_bolt_parquet_variant
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_variant)
+add_test(NAME test_bolt_parquet_variant COMMAND test_bolt_parquet_variant)
+
 # Nested STRUCT / LIST / MAP writer (ParquetNestedNode). The executable writes
 # the fixtures and their expected values; the pyarrow/DuckDB oracle re-reads
 # them independently (SKIP_RETURN_CODE 2 when pyarrow is missing).

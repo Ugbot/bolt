@@ -722,6 +722,7 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_parquet_bloom.cpp
         src/ingest/bolt_parquet_read.cpp
         src/ingest/bolt_parquet_read_nested.cpp
+        src/ingest/bolt_parquet_variant.cpp
         src/ingest/bolt_parquet_schema_tree.cpp
         src/ingest/bolt_parquet_source.cpp
         src/ingest/bolt_parquet_write.cpp
