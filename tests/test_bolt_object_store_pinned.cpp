@@ -85,7 +85,7 @@ struct PinnedMemoryOrigin {
         return kOsOk;
     }
     void initialize() {
-        static const ObjectStoreVT vt{get, put, list, remove, head, put, range, version, conditional, nullptr, stream};
+        static const ObjectStoreVT vt{get, put, list, remove, head, put, range, version, conditional, nullptr, nullptr, stream};
         store = {&vt, this};
         resize(2u * kRequest + 7u);
     }
