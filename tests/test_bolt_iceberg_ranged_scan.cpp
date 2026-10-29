@@ -3,6 +3,9 @@
 #include "bolt/bolt_column.h"
 #include "bolt/lakehouse/iceberg/scan.h"
 #include "bolt/lakehouse/iceberg/writer.h"
+#include "bolt_iceberg_nested_json.h"
+#include <cstdlib>
+#include <fstream>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -168,6 +171,68 @@ bool write_store(const std::string& root, FilesystemObjectStore* fs, ObjectStore
     if (!std::filesystem::create_directory(root+"/table",error) || error) return false;
     return filesystem_object_store_init(fs,(root+"/table").c_str(),store);
 }
+bool prepare_nested_deletes(const char* root) {
+    const char* file = std::getenv("BOLT_NESTED_SCAN_DELETE_FILE");
+    if (file == nullptr) return true;
+    const std::string directory = std::string(root) + "/db/nested";
+    FilesystemObjectStore fs{}; ObjectStore store{}; Arena arena;
+    if (!filesystem_object_store_init(&fs,directory.c_str(),&store)) return false;
+    TableHandle* table = nullptr;
+    if (!table_open(&table,&arena,&store,directory.c_str())) return false;
+    PositionDeleteEntry entries[2]{};
+    if (std::strlen(file) >= sizeof(entries[0].file_path)) return false;
+    std::strcpy(entries[0].file_path,file); entries[0].pos = 0;
+    std::strcpy(entries[1].file_path,file); entries[1].pos = 4;
+    const bool ok = table_delete_positions(table,entries,2);
+    table_close(table); return ok;
+}
+
+TEST(IcebergRangedScan, ExternalNestedOracle) {
+    const char* root = std::getenv("BOLT_NESTED_SCAN_ROOT");
+    const char* result = std::getenv("BOLT_NESTED_SCAN_OUTPUT");
+    ASSERT_NE(root,nullptr); ASSERT_NE(result,nullptr);
+    ASSERT_TRUE(prepare_nested_deletes(root));
+    Origin origin; ASSERT_TRUE(origin.init(root));
+    const bool ranged = std::getenv("BOLT_NESTED_SCAN_WHOLE") == nullptr;
+    ObjectStore store = ranged ? origin.store : origin.base;
+    Arena owner; TableHandle* table = nullptr;
+    ASSERT_TRUE(iceberg_table_open_store(&table,&owner,&store,"db/nested"));
+    const auto* schema = metadata_current_schema(iceberg_table_metadata(table)); ASSERT_NE(schema,nullptr);
+    Arena transport{{65536,65536,64,false}};
+    std::vector<uint8_t> workspace(1u << 20);
+    IcebergScanIO io{workspace.data(),workspace.size(),&transport,37};
+    ScanHandle* scan = nullptr;
+    ASSERT_TRUE(ranged ? iceberg_scan_open_with_io(&scan,table,nullptr,&io)
+                       : iceberg_scan_open(&scan,table,nullptr));
+    std::string json = "["; bool first = true, finished = false;
+    const bool refuse = std::getenv("BOLT_NESTED_SCAN_REFUSE") != nullptr;
+    for (uint32_t group = 0; group < 128; ++group) {
+        BoltBatch batch{}; bool eof = false;
+        const bool ok = iceberg_scan_next_batch(scan,&batch,&eof);
+        if (refuse) { EXPECT_FALSE(ok); EXPECT_FALSE(eof); iceberg_scan_close(scan); return; }
+        ASSERT_TRUE(ok);
+        if (eof) { finished = true; break; }
+        ASSERT_EQ(batch.num_cols,schema->n_fields);
+        const auto* cols = batch.columns[batch.read_epoch];
+        for (int64_t row = 0; row < batch.num_rows; ++row) {
+            if (!first) json += ",";
+            first = false; json += "{";
+            for (uint32_t col = 0; col < schema->n_fields; ++col) {
+                const auto& field = schema->fields[col];
+                EXPECT_STREQ(batch.schema.fields[col].name,field.name);
+                if (col) json += ",";
+                json += nested_oracle::quote(reinterpret_cast<const uint8_t*>(field.name),std::strlen(field.name)) + ":";
+                ASSERT_TRUE(nested_oracle::value(field,cols[col],row,0,&json)) << field.name;
+            }
+            json += "}";
+        }
+    }
+    ASSERT_TRUE(finished); EXPECT_FALSE(first); json += "]";
+    iceberg_scan_close(scan);
+    if (ranged) { EXPECT_GT(origin.ranges,0u); EXPECT_EQ(origin.whole_parquet,0u); EXPECT_LE(origin.largest,37u); }
+    std::ofstream output(result); output << json; ASSERT_TRUE(output.good());
+}
+
 }  // namespace
 
 TEST(IcebergRangedScan, IndependentGoldenValuesWithTinyRequestsAndNoWholeDataGet) {

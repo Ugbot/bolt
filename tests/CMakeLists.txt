@@ -2232,7 +2232,7 @@ target_link_libraries(test_bolt_iceberg_ranged_scan
 target_compile_definitions(test_bolt_iceberg_ranged_scan PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_iceberg_ranged_scan)
-add_test(NAME test_bolt_iceberg_ranged_scan COMMAND test_bolt_iceberg_ranged_scan)
+add_test(NAME test_bolt_iceberg_ranged_scan COMMAND test_bolt_iceberg_ranged_scan --gtest_filter=-IcebergRangedScan.ExternalNestedOracle)
 set_tests_properties(test_bolt_iceberg_ranged_scan PROPERTIES TIMEOUT 120)
 
 add_executable(test_bolt_iceberg_metadata_io test_bolt_iceberg_metadata_io.cpp)

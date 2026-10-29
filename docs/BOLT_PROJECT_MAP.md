@@ -34,8 +34,10 @@ struct/list/map columns using one compressed leaf chunk of reusable workspace.
 Both preserve transactional outputs and propagate Changed/IoError/Capacity
 without repinning. Native PyArrow-value fixtures cover V1/V2, dictionaries,
 legacy list/map shapes, late-leaf failures and poisoned scratch lifetimes.
-This primitive is not yet wired through the Iceberg scanner or SQL; their
-strict flat-footer validation remains in place.
+The ordinary Iceberg scanner now consumes this tree, maps top-level and
+child columns by stable ID, fills optional additions and applies nested row
+selection for positional deletes. The strict private pinned reader retains its
+flat-footer validation; typed SQL materialization remains unfinished.
 
 `lakehouse/iceberg/metadata_io.h` loads one caller-selected immutable metadata
 object through strong conditional ranges, distinct finite retained/scratch
@@ -378,3 +380,11 @@ Windows without vcpkg.
 G2CHK-714 clone bounds and format/refusal contracts: [Utf8 clone copy bound](research/utf8-clone-copy-bound.md).
 
 Event-loop compile-time allocation bounds live in `include/bolt/api/net/event_loop_limits.h` (kind B): 16 callback pins and 256 readiness events. The registry and epoll/kqueue share these declarations.
+
+`kernels/bolt_nested_gather.h` gathers Flat leaves and Nested struct/list/map
+columns into arena-owned child arrays, list offsets, validity and flat slots.
+Order, duplicates and empty selections are preserved; publication is staged.
+StringView spill bytes remain borrowed from the source, which must outlive the
+result. The ordinary Iceberg scanner uses it for row-delete filtering.
+Nested Parquet value fixtures, real Java-reader parity for schema evolution
+and cross-row-group position deletes, and existing reader regressions pass.

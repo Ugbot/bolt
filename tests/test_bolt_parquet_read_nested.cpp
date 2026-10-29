@@ -22,6 +22,7 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include "bolt/kernels/bolt_utf8.h"
+#include "bolt/kernels/bolt_nested_gather.h"
 
 namespace {
 
@@ -283,6 +284,30 @@ TEST_P(NestedOracle, PinnedRangesMatchPyarrow) {
     const int64_t n = check_file(name, data_path(name + ".parquet"), true);
     EXPECT_GT(n, 0);
     std::printf("[range oracle] %s: %lld values compared\n", name.c_str(), static_cast<long long>(n));
+}
+
+TEST_P(NestedOracle, RowSelectionPreservesTypedValues) {
+    const std::string name = GetParam(); const auto buf = slurp(data_path(name + ".parquet"));
+    ASSERT_FALSE(buf.empty()); Arena arena, selected;
+    auto* meta = arena.allocate_array<PqMeta>(1); PqSchemaTree tree{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(),buf.size(),&arena,meta));
+    ASSERT_TRUE(parquet_read_schema_tree(buf.data(),buf.size(),&arena,&tree));
+    for (uint32_t col = 0; col < tree.n_top; ++col) {
+        BoltColumn source{}; int64_t rows = 0;
+        ASSERT_TRUE(parquet_read_nested_column_tree(buf.data(),buf.size(),meta,&tree,0,col,&arena,&source,&rows));
+        ASSERT_GT(rows,0);
+        const uint32_t selection[]{static_cast<uint32_t>(rows-1),0,static_cast<uint32_t>(rows/2),0};
+        BoltColumn gathered{};
+        ASSERT_TRUE(kernels::nested_gather(source,selection,4,&selected,&gathered));
+        for (uint32_t i = 0; i < 4; ++i)
+            EXPECT_EQ(render(tree,tree.top[col],gathered,i),render(tree,tree.top[col],source,selection[i]));
+        ASSERT_TRUE(kernels::nested_gather(source,nullptr,0,&selected,&gathered));
+        EXPECT_EQ(gathered.length,0);
+        gathered.length = 777;
+        const uint32_t bad[]{static_cast<uint32_t>(rows)};
+        EXPECT_FALSE(kernels::nested_gather(source,bad,1,&selected,&gathered));
+        EXPECT_EQ(gathered.length,777);
+    }
 }
 
 TEST_P(NestedOracle, MatchesPyarrow) {

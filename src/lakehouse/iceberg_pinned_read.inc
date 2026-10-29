@@ -530,10 +530,13 @@ bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a,
     return true;
 }
 
+#include "iceberg_nested_scan.inc"
+
 // Build the emitted columns (current-schema order) from the decoded file columns.
 bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_t rows) noexcept {
     assert(s!=nullptr && s->use_map && s->map_schema!=nullptr);
     assert(dec!=nullptr && out!=nullptr);
+    if (s->nested_layout) return conform_nested_group(s, dec, out, rows);
     for (uint32_t j=0; j<s->map_schema->n_fields; ++j) {
         const char* name=s->map_schema->fields[j].name;
         if (s->colmap[j]>=0) {
@@ -573,7 +576,12 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
 bool bind_data_columns(ScanHandle* s, const pq::PqMeta* meta) noexcept {
     assert(s!=nullptr && meta!=nullptr); assert(s->table!=nullptr);
     s->output_columns=meta->n_columns;
-    if (!s->table->strict_pinned) return bind_current_schema(s,meta);
+    s->nested_layout = false;
+    if (!s->table->strict_pinned) {
+        const auto* schema = metadata_current_schema(&s->table->meta);
+        if (s->pinned.nested || schema_has_nested(schema)) return bind_nested_schema(s, meta, schema);
+        return bind_current_schema(s,meta);
+    }
     const auto* schema=s->selected_schema;
     if (schema==nullptr || meta->n_columns>kMaxColumns) return false;
     for (uint32_t i=0; i<meta->n_columns; ++i) {

@@ -53,7 +53,9 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
+#include "bolt/kernels/bolt_nested_gather.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
 #include "bolt/ingest/bolt_parquet_read.h"
 #include "bolt/ingest/bolt_parquet_source.h"
 #include "bolt/lakehouse/iceberg/delete_file.h"
@@ -449,6 +451,8 @@ struct PinnedParquet {
     ObjectVersion version;
     char key[kCatMaxPath];
     pq::ParquetByteSource source;
+    pq::PqSchemaTree tree;
+    bool nested;
 };
 
 // Manifests are evaluated one at a time as the scan reaches them (delete
@@ -512,6 +516,7 @@ struct ScanHandle {
     // Non-pinned scans conform each file's columns to the table's CURRENT schema by Iceberg field id (spec: columns are identified by id,
     // never by name or position). use_map => decode_columns file columns are read, then mapped into output_columns schema columns.
     bool          use_map;
+    bool          nested_layout;
     uint32_t      decode_columns;
     const Schema* map_schema;
     int32_t*      colmap;     // per schema field: file column index, or -1 (absent in this file: read as null)
@@ -976,6 +981,12 @@ bool compact_selected(BoltColumn* cols, uint32_t n_cols, const uint32_t* sel, ui
     assert(cols != nullptr && sel != nullptr && rows != nullptr && scratch != nullptr);
     for (uint32_t c = 0; c < n_cols; ++c) {
         BoltColumn& col = cols[c];
+        if (col.format == ColumnFormat::Nested) {
+            BoltColumn selected{};
+            if (!bolt::kernels::nested_gather(col, sel, kept, scratch, &selected)) return false;
+            col = selected;
+            continue;
+        }
         if (col.format != ColumnFormat::Flat || col.type_size_bytes == 0) {
             std::fprintf(stderr,
                 "[iceberg_scan] REFUSED: %s matched a row, but column %u (format=%d, width=%u) cannot be safely "

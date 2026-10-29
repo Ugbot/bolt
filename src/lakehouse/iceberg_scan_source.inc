@@ -162,12 +162,16 @@ bool open_parquet(ScanHandle* s, const char* path, Arena* metadata,
     uint64_t* length) noexcept {
     assert(s != nullptr && file != nullptr && meta != nullptr);
     assert(metadata != nullptr && body != nullptr && length != nullptr);
-    if (!s->ranged) {
-        return read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
-                        s->table->table_rel, path, s->scratch, body, length) &&
-               pq::parquet_read_meta(*body, *length, metadata, meta);
-    }
     *file = PinnedParquet{};
+    if (!s->ranged) {
+        const bool loaded = read_ref(&s->table->os, s->table->meta.location, s->table->fs_root,
+                        s->table->table_rel, path, s->scratch, body, length) &&
+               pq::parquet_read_meta(*body, *length, metadata, meta) &&
+               pq::parquet_read_schema_tree(*body, *length, metadata, &file->tree);
+        if (loaded) for (uint32_t i = 0; i < file->tree.n_top; ++i)
+            file->nested |= file->tree.fields[file->tree.top[i]].kind != pq::PqFieldKind::Leaf;
+        return loaded;
+    }
     if (!scan_source_key(s, path, file->key)) return false;
     file->store = &s->table->os;
     file->io = s->transport_arena;
@@ -178,8 +182,11 @@ bool open_parquet(ScanHandle* s, const char* path, Arena* metadata,
     if (s->table->strict_pinned)
         return pq::parquet_read_meta_source_flat_strict(&file->source,&s->source_workspace,
             metadata,meta)==pq::ParquetSourceStatus::Ok;
-    return pq::parquet_read_meta_source(&file->source, &s->source_workspace,
-                                        metadata, meta) == pq::ParquetSourceStatus::Ok;
+    const bool loaded = pq::parquet_read_meta_source_nested(&file->source, &s->source_workspace,
+        metadata, meta, &file->tree) == pq::ParquetSourceStatus::Ok;
+    if (loaded) for (uint32_t i = 0; i < file->tree.n_top; ++i)
+        file->nested |= file->tree.fields[file->tree.top[i]].kind != pq::PqFieldKind::Leaf;
+    return loaded;
 }
 
 bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
@@ -187,6 +194,20 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
     BoltColumn* columns, int64_t* rows, uint32_t selected=0) noexcept {
     assert(s != nullptr && meta != nullptr && columns != nullptr);
     assert(rows != nullptr);
+    if (file->nested) {
+        const uint32_t count = selected == 0 ? file->tree.n_top : selected;
+        if (count > file->tree.n_top || count > kMaxColumns) return false;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t top = s->source_indices[i];
+            const bool ok = s->ranged
+                ? pq::parquet_read_nested_column_source(&file->source, &s->source_workspace,
+                    meta, &file->tree, row_group, top, s->scratch, &columns[i], rows) == pq::ParquetSourceStatus::Ok
+                : pq::parquet_read_nested_column_tree(body, length, meta, &file->tree,
+                    row_group, top, s->scratch, &columns[i], rows);
+            if (!ok) return false;
+        }
+        return true;
+    }
     if (!s->ranged) return pq::parquet_read_row_group(body, length, meta, row_group,
                                                     s->scratch, columns, rows);
     if (meta->n_columns == 0 || meta->n_columns > kMaxColumns) return false;
