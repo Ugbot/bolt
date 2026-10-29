@@ -1023,6 +1023,8 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_transform.cpp
     src/lakehouse/iceberg_transform_values.cpp
     src/lakehouse/iceberg_metadata.cpp
+    src/lakehouse/iceberg_schema.cpp
+    src/lakehouse/iceberg_schema_match.cpp
     src/lakehouse/iceberg_metadata_io.cpp
     src/lakehouse/iceberg_snapshot.cpp
     src/lakehouse/iceberg_manifest.cpp

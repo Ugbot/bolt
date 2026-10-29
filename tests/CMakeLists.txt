@@ -2194,6 +2194,11 @@ bolt_apply_hardening(test_bolt_iceberg_metadata_interop)
 add_test(NAME test_bolt_iceberg_metadata_interop
          COMMAND test_bolt_iceberg_metadata_interop)
 
+add_executable(test_bolt_iceberg_nested_schema test_bolt_iceberg_nested_schema.cpp)
+target_link_libraries(test_bolt_iceberg_nested_schema PRIVATE bolt::lakehouse bolt::ingest GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_nested_schema)
+add_test(NAME test_bolt_iceberg_nested_schema COMMAND test_bolt_iceberg_nested_schema --gtest_filter=-IcebergNestedSchema.ExternalOracle)
+
 # G2ICE-6 — metadata.json snapshot-log + metadata-log: emitted, reopened,
 # bounded, pruned on expiry, withdrawn on a lost commit.
 add_executable(test_bolt_iceberg_history_logs test_bolt_iceberg_history_logs.cpp)

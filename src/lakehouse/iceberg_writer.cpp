@@ -531,6 +531,19 @@ namespace {
 // DERIVED from the schema on every emit rather than stored on Metadata, for
 // the same reason `last-column-id` is: a mapping that can drift from the
 // schema it describes projects the WRONG COLUMN, silently.
+bool emit_name_mapping_field(Buf* out,const SchemaField& field,uint32_t depth) noexcept {
+    assert(out);assert(field.id>0);
+    if (depth>kIcebergSchemaMaxDepth || !buf_fmt(out,"{\"field-id\":%d,\"names\":[\"",field.id) ||
+        !buf_put_jstr(out,field.name) || !buf_put(out,"\"]")) return false;
+    const bool group=std::strcmp(field.type,"struct")==0 || std::strcmp(field.type,"list")==0 || std::strcmp(field.type,"map")==0;
+    if (group) {
+        if ((field.n_children && !field.children) || !buf_put(out,",\"fields\":[")) return false;
+        for (uint32_t i=0;i<field.n_children;++i)
+            if ((i && !buf_put(out,",")) || !emit_name_mapping_field(out,field.children[i],depth+1u)) return false;
+        if (!buf_put(out,"]")) return false;
+    }
+    return buf_put(out,"}");
+}
 bool emit_name_mapping_json(Arena* a, const Schema* s,
                             const char** out) noexcept {
     assert(a != nullptr && out != nullptr);
@@ -542,10 +555,7 @@ bool emit_name_mapping_json(Arena* a, const Schema* s,
     if (!buf_put(&b, "[")) return false;
     for (uint32_t i = 0; i < s->n_fields; ++i) {          // bounded
         if (i > 0 && !buf_put(&b, ",")) return false;
-        if (!buf_fmt(&b, "{\"field-id\":%d,\"names\":[\"",
-                     s->fields[i].id)) return false;
-        if (!buf_put_jstr(&b, s->fields[i].name)) return false;
-        if (!buf_put(&b, "\"]}")) return false;
+        if (!emit_name_mapping_field(&b,s->fields[i],0u)) return false;
     }
     if (!buf_put(&b, "]")) return false;
     if (b.len + 1u > b.cap) return false;
@@ -633,6 +643,7 @@ bool emit_summary(Buf* b, const char* op, const SnapSummary* s) noexcept {
     return buf_put(b, "}");
 }
 
+#include "iceberg_schema_emit.inc"
 }  // namespace
 
 bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
@@ -671,9 +682,8 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
     int32_t last_col_id = 0;
     for (uint32_t i = 0; i < m->n_schemas; ++i) {          // bounded
         const Schema& s = m->schemas[i];
-        for (uint32_t j = 0; j < s.n_fields; ++j) {        // bounded
-            if (s.fields[j].id > last_col_id) last_col_id = s.fields[j].id;
-        }
+        int32_t max=0;if (!schema_max_field_id(&s,&max)) return false;
+        last_col_id=std::max(last_col_id,max);
     }
     if (!buf_fmt(&b, "\"last-column-id\":%d,", last_col_id)) return false;
 
@@ -711,6 +721,7 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
     for (uint32_t i = 0; i < m->n_schemas; ++i) {
         if (i > 0 && !buf_put(&b, ",")) return false;
         const Schema& s = m->schemas[i];
+        if (!schema_validate(&s,a,m->budget)) return false;
         // An Iceberg schema IS a struct type, so it carries "type":"struct"
         // beside its fields. This was omitted here while `emit_schema_json`
         // (the manifest's copy of the very same structure) always had it —
@@ -723,23 +734,7 @@ bool metadata_json_emit_ex(const Metadata* m, const NamedRef* refs, uint32_t nr,
         for (uint32_t j = 0; j < s.n_fields; ++j) {
             if (j > 0 && !buf_put(&b, ",")) return false;
             const SchemaField& f = s.fields[j];
-            // `SchemaField::type` is a primitive type NAME. A nested field's
-            // type is a JSON OBJECT, which this flat POD cannot hold — the
-            // parser collapses one to the literal string "struct" (see
-            // parse_field). Re-emitting that as `"type":"struct"` would
-            // describe a struct with no fields and silently drop every nested
-            // column, so it fails the emit instead, exactly as an
-            // unrepresentable partition transform does below.
-            if (std::strcmp(f.type, "struct") == 0 ||
-                std::strcmp(f.type, "list") == 0 ||
-                std::strcmp(f.type, "map") == 0) {
-                return false;
-            }
-            if (!buf_fmt(&b, "{\"id\":%d,", f.id)) return false;
-            if (!buf_kv_str(&b, "name", f.name, true)) return false;
-            if (!buf_kv_str(&b, "type", f.type, true)) return false;
-            if (!buf_fmt(&b, "\"required\":%s}",
-                         f.required ? "true" : "false")) return false;
+            if (!emit_schema_field(&b,f,0u)) return false;
         }
         if (!buf_put(&b, "]")) return false;
         if (!emit_identifier_ids(&b, &s)) return false;
@@ -907,6 +902,7 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
                       uint64_t* out_len) noexcept {
     assert(a != nullptr && s != nullptr);
     assert(out != nullptr && out_len != nullptr);
+    if (!schema_validate(s,a,nullptr)) return false;
     Buf b;
     if (!buf_init(&b, a, 64u * 1024u)) return false;
     if (!buf_fmt(&b, "{\"type\":\"struct\",\"schema-id\":%d,\"fields\":[",
@@ -914,12 +910,7 @@ bool emit_schema_json(Arena* a, const Schema* s, const uint8_t** out,
     for (uint32_t i = 0; i < s->n_fields; ++i) {     // bounded by n_fields
         if (i > 0 && !buf_put(&b, ",")) return false;
         const SchemaField& f = s->fields[i];
-        if (!buf_fmt(&b, "{\"id\":%d,", f.id)) return false;
-        if (!buf_kv_str(&b, "name", f.name, true)) return false;
-        if (!buf_fmt(&b, "\"required\":%s,",
-                     f.required ? "true" : "false")) return false;
-        if (!buf_kv_str(&b, "type", f.type, false)) return false;
-        if (!buf_put(&b, "}")) return false;
+        if (!emit_schema_field(&b,f,0u)) return false;
     }
     if (!buf_put(&b, "]")) return false;
     if (!emit_identifier_ids(&b, s)) return false;

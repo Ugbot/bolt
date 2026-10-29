@@ -181,27 +181,7 @@ bool select_pinned_schema(ScanHandle* s) noexcept {
 }
 
 bool pinned_type_matches(const SchemaField& field, const pq::PqColumn& column) noexcept {
-    assert(field.id>0); assert(column.has_field_id);
-    const auto logical=static_cast<pq::PqLogical>(column.logical);
-    const bool plain=logical==pq::PqLogical::None && column.converted<0;
-    const bool integer=plain || (logical==pq::PqLogical::Int && column.int_signed &&
-        column.int_bits==(column.physical==pq::PqType::Int64 ? 64 : 32));
-    const char* type=field.type;
-    if (std::strcmp(type,"long")==0) return integer && column.physical==pq::PqType::Int64;
-    if (std::strcmp(type,"int")==0) return integer && column.physical==pq::PqType::Int32;
-    if (std::strcmp(type,"float")==0) return plain && column.physical==pq::PqType::Float;
-    if (std::strcmp(type,"double")==0) return plain && column.physical==pq::PqType::Double;
-    if (std::strcmp(type,"boolean")==0) return plain && column.physical==pq::PqType::Boolean;
-    if (std::strcmp(type,"string")==0) return (logical==pq::PqLogical::String ||
-        (logical==pq::PqLogical::None && column.converted==0)) && column.physical==pq::PqType::ByteArray;
-    if (std::strcmp(type,"binary")==0) return plain && column.physical==pq::PqType::ByteArray;
-    if (std::strcmp(type,"date")==0) return logical==pq::PqLogical::Date && column.physical==pq::PqType::Int32;
-    if (std::strcmp(type,"time")==0) return logical==pq::PqLogical::Time && column.time_unit==2 &&
-        column.physical==pq::PqType::Int64;
-    if (std::strcmp(type,"timestamp")==0 || std::strcmp(type,"timestamptz")==0)
-        return logical==pq::PqLogical::Timestamp && column.time_unit==2 &&
-            column.ts_utc==(std::strcmp(type,"timestamptz")==0) && column.physical==pq::PqType::Int64;
-    return false; // nested/decimal/fixed/UUID materialization must not be guessed
+    return schema_leaf_matches_parquet(field,column);
 }
 
 // The decoded type an Iceberg primitive type implies; Invalid for types this check does not model (decimal, binary, nested, ...).

@@ -2,6 +2,8 @@
 
 #pragma once
 
+namespace bolt::ingest::parquet { struct PqColumn; struct PqMeta; struct PqSchemaTree; }
+
 #include <cstdint>
 
 #include "bolt/lakehouse/iceberg/iceberg_limits.h"
@@ -36,7 +38,15 @@ struct SchemaField {
     char        name[kIcebergMaxFieldName];
     char        type[kIcebergMaxTypeName];
     char        initial_default[limits::kDefaultTextMax];
+    // Arena-owned type tree. struct: named fields; list: element; map: key,value.
+    // Element/key/value IDs and requiredness live on those child fields. A
+    // primitive has no children. Copy with schema_copy for independent ownership.
+    SchemaField* children = nullptr;
+    uint32_t     n_children = 0;
+    uint32_t     cap_children = 0;
 };
+
+inline constexpr uint32_t kIcebergSchemaMaxDepth = 32u;
 
 // `fields` lives in an arena; a Schema copied by value shares it. Use
 // schema_copy for an independent copy.
@@ -122,7 +132,7 @@ struct Metadata {
     uint8_t     _pad_nr[6];
 };
 
-// One top-level field of a name mapping: the Iceberg field id and the file column names that map to it.
+// One field of a name mapping: the Iceberg field id and its file-name aliases.
 static constexpr uint32_t kNameMapMaxNames = limits::kNameMapMaxNames;
 struct NameMapEntry {
     int32_t  field_id;
@@ -130,7 +140,7 @@ struct NameMapEntry {
     char     names[kNameMapMaxNames][kIcebergMaxFieldName];
 };
 
-// Parse the default name mapping into arena-owned entries (top-level fields only: the scan reads flat columns). *n = 0 and true when
+// Parse the default name mapping into arena-owned entries, including nested fields, list elements and map keys/values. *n = 0 and true when
 // the table has no mapping. False on a malformed mapping (never guessed around).
 bool metadata_name_mapping(const Metadata* m, Arena* scratch, NameMapEntry** out, uint32_t* n) noexcept;
 
@@ -163,8 +173,19 @@ Schema* metadata_push_schema(Metadata* m) noexcept;   // zeroed, fields empty
 bool schema_reserve(Schema* s, Arena* a, Budget* b, uint32_t n) noexcept;
 bool schema_push_field(Schema* s, Arena* a, Budget* b,
                        const SchemaField* f) noexcept;
-// Deep copy: dst gets its own field array.
+// Deep copy: dst gets independent fields, nested type trees and identifier IDs.
 bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept;
+// Includes struct children, list element IDs and map key/value IDs; refuses
+// malformed/cyclic trees or depth beyond kIcebergSchemaMaxDepth.
+bool schema_max_field_id(const Schema* schema, int32_t* out) noexcept;
+// Shape, positive/global-unique field IDs, and bounded depth. Scratch is
+// arena/budget charged; validation never changes the schema.
+bool schema_validate(const Schema* schema, Arena* arena, Budget* budget) noexcept;
+bool schema_leaf_matches_parquet(const SchemaField& field, const ingest::parquet::PqColumn& column) noexcept;
+// Exact field-ID/type/requiredness match of a nested Parquet field tree.
+// Names/order may differ. Materialization/evolution is a separate operation.
+bool schema_field_matches_parquet(const SchemaField& field, const ingest::parquet::PqMeta* metadata,
+                                 const ingest::parquet::PqSchemaTree* tree, int32_t parquet_field) noexcept;
 
 // snapshot-log grows; metadata-log drops its oldest entry when full.
 bool metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,

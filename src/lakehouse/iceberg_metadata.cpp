@@ -9,6 +9,7 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 
 #include <cassert>
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include "bolt/ingest/bolt_inflate.h"
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/transform.h"
+#include "bolt/kernels/bolt_json_path.h"
 #include "lake_grow.h"
 
 namespace bolt {
@@ -229,52 +231,7 @@ void read_default(const bj::StructuralIndex* idx, bj::Iterator* it, SchemaField*
     bj::iter_advance(it);
 }
 
-bool parse_field(const bj::StructuralIndex* idx, bj::Iterator* it,
-                 SchemaField* out) noexcept {
-    assert(idx != nullptr && it != nullptr && out != nullptr);
-    assert(it->idx==idx);
-    if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
-    bj::iter_advance(it);
-    std::memset(out, 0, sizeof(*out));
-    bool id_present=false;
-    uint32_t g = 0;
-    while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
-        const int32_t key = it->cursor;
-        bj::iter_advance(it);
-        if (tok_eq(idx, key, "id")) {
-            int64_t v = 0;
-            if (id_present || !read_exact_integer(idx,it,&v) || v<=0 || v>INT32_MAX) return false;
-            out->id = static_cast<int32_t>(v); id_present=true;
-        } else if (tok_eq(idx, key, "name")) {
-            // A cut name can collide with a sibling: refuse the schema.
-            if (bj::iter_peek(it) == bj::TokenType::String &&
-                idx->tokens[it->cursor].length >=
-                    static_cast<int32_t>(kIcebergMaxFieldName))
-                return false;
-            read_str(idx, it, out->name, kIcebergMaxFieldName);
-        } else if (tok_eq(idx, key, "type")) {
-            if (bj::iter_peek(it) == bj::TokenType::String) {
-                if (idx->tokens[it->cursor].length >=
-                    static_cast<int32_t>(kIcebergMaxTypeName))
-                    return false;
-                read_str(idx, it, out->type, kIcebergMaxTypeName);
-            } else {
-                std::strcpy(out->type, "struct");
-                skip_value(it);
-            }
-        } else if (tok_eq(idx, key, "required")) {
-            const bj::TokenType t = bj::iter_peek(it);
-            out->required = (t == bj::TokenType::BoolTrue);
-            bj::iter_advance(it);
-        } else if (tok_eq(idx, key, "initial-default")) {
-            read_default(idx, it, out);
-        } else {
-            skip_value(it);
-        }
-    }
-    if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    return id_present;
-}
+#include "iceberg_schema_parse.inc"
 
 // identifier-field-ids: an array of field ids (G2ICE-300). A non-integer or out-of-range entry refuses the schema.
 bool parse_identifier_ids(const bj::StructuralIndex* idx, bj::Iterator* it, Arena* a, Budget* b, Schema* out) noexcept {
@@ -321,7 +278,7 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
             while (bj::iter_peek(it) == bj::TokenType::BeginObject &&
                    g2++ < guard) {
                 SchemaField f;
-                if (!parse_field(idx, it, &f)) return false;
+                if (!parse_field(idx, it, &f, a, b, 0u)) return false;
                 if (!schema_push_field(out, a, b, &f)) return false;
             }
             if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
@@ -333,7 +290,7 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
         }
     }
     if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    return true;
+    return schema_validate(out, a, b);
 }
 
 bool parse_pspec_field(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -760,26 +717,6 @@ bool schema_push_field(Schema* s, Arena* a, Budget* b,
     return true;
 }
 
-bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept {
-    assert(dst != nullptr && src != nullptr && a != nullptr);
-    assert(dst != src);
-    Schema out;
-    std::memset(&out, 0, sizeof(out));
-    out.schema_id = src->schema_id;
-    if (!schema_reserve(&out, a, b, src->n_fields)) return false;
-    if (src->n_fields != 0u)
-        std::memcpy(out.fields, src->fields, sizeof(SchemaField) * src->n_fields);
-    out.n_fields = src->n_fields;
-    if (src->n_identifier != 0u) {
-        uint32_t cap = 0;
-        if (!lake_grow(a, b, &out.identifier_ids, 0u, &cap, src->n_identifier)) return false;
-        std::memcpy(out.identifier_ids, src->identifier_ids, sizeof(int32_t) * src->n_identifier);
-        out.n_identifier = src->n_identifier;
-    }
-    *dst = out;
-    return true;
-}
-
 bool metadata_snapshot_log_push(Metadata* m, int64_t timestamp_ms,
                                 int64_t snapshot_id) noexcept {
     assert(m != nullptr);
@@ -824,77 +761,33 @@ const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept 
 namespace bolt { namespace lakehouse { namespace iceberg {
 
 namespace {
-// The property value is a JSON document inside a JSON string, so its quotes arrive escaped.
-uint32_t unescape_json_string(const char* in, uint32_t n, char* out) noexcept {
-    uint32_t o = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (in[i] == '\\' && i + 1 < n) {
-            const char c = in[++i];
-            out[o++] = c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c;   // \" \\ \/ and the common controls
-        } else {
-            out[o++] = in[i];
-        }
-    }
-    out[o] = '\0';
-    return o;
-}
+#include "iceberg_name_mapping.inc"
 }  // namespace
 
 bool metadata_name_mapping(const Metadata* m, Arena* scratch, NameMapEntry** out, uint32_t* n) noexcept {
-    assert(m != nullptr && scratch != nullptr && out != nullptr && n != nullptr);
-    *out = nullptr; *n = 0;
-    if (m->name_mapping_json == nullptr || m->name_mapping_len == 0) return true;
-    char* doc = scratch->allocate_array<char>(static_cast<size_t>(m->name_mapping_len) + 1u);
-    if (doc == nullptr) return false;
-    const uint32_t len = unescape_json_string(m->name_mapping_json, m->name_mapping_len, doc);
+    assert(m && scratch);assert(out && n);
+    *out=nullptr;*n=0;
+    if (!m->name_mapping_json || !m->name_mapping_len) return true;
+    const auto size=m->name_mapping_len;if (size>static_cast<uint32_t>(INT32_MAX)-3u) return false;
+    char* quoted=scratch->allocate_array<char>(static_cast<size_t>(size)+3u);
+    char* document=scratch->allocate_array<char>(static_cast<size_t>(size)+1u);
+    if (!quoted || !document) return false;
+    quoted[0]='"';std::memcpy(quoted+1,m->name_mapping_json,size);quoted[size+1u]='"';
+    const bolt::kernels::json::JsonSpan span{quoted,size+2u};
+    const auto len=bolt::kernels::json::json_span_unquote(span,document,size);
+    if (len<0) return false;document[len]=0;
     bj::StructuralIndex idx{};
-    if (!bj::build_index(reinterpret_cast<const uint8_t*>(doc), static_cast<int32_t>(len), scratch, &idx)) return false;
-    bj::Iterator it{};
-    if (!bj::iter_init(&idx, &it) || bj::iter_peek(&it) != bj::TokenType::BeginArray) return false;
-    bj::iter_advance(&it);
-    uint32_t cap = 16, count = 0;
-    NameMapEntry* entries = scratch->allocate_array<NameMapEntry>(cap);
-    if (entries == nullptr) return false;
-    uint32_t guard = 0;
-    while (bj::iter_peek(&it) == bj::TokenType::BeginObject && guard++ < 65536u) {
-        if (count == cap) {
-            NameMapEntry* bigger = scratch->allocate_array<NameMapEntry>(cap * 2u);
-            if (bigger == nullptr) return false;
-            std::memcpy(bigger, entries, sizeof(NameMapEntry) * count);
-            entries = bigger; cap *= 2u;
-        }
-        NameMapEntry& e = entries[count];
-        std::memset(&e, 0, sizeof(e));
-        e.field_id = -1;
-        bj::iter_advance(&it);
-        uint32_t g2 = 0;
-        while (bj::iter_peek(&it) == bj::TokenType::Key && g2++ < 4096u) {
-            const int32_t key = it.cursor;
-            bj::iter_advance(&it);
-            if (tok_eq(&idx, key, "field-id")) {
-                int64_t v = 0;
-                if (bj::iter_peek(&it) == bj::TokenType::Int64) { read_int64(&it, &v); e.field_id = static_cast<int32_t>(v); }
-                else if (!skip_value(&it)) return false;
-            } else if (tok_eq(&idx, key, "names")) {
-                if (bj::iter_peek(&it) != bj::TokenType::BeginArray) return false;
-                bj::iter_advance(&it);
-                while (bj::iter_peek(&it) == bj::TokenType::String) {
-                    if (e.n_names >= kNameMapMaxNames) return false;     // more aliases than modelled: refuse, never drop one
-                    copy_tok(&idx, it.cursor, e.names[e.n_names++], kIcebergMaxFieldName);
-                    bj::iter_advance(&it);
-                }
-                if (bj::iter_peek(&it) != bj::TokenType::EndArray) return false;
-                bj::iter_advance(&it);
-            } else {
-                if (!skip_value(&it)) return false;                  // nested "fields": not needed for flat columns
-            }
-        }
-        if (bj::iter_peek(&it) != bj::TokenType::EndObject) return false;
-        bj::iter_advance(&it);
-        if (e.field_id >= 0) ++count;
+    if (!bj::build_index(reinterpret_cast<const uint8_t*>(document),len,scratch,&idx)) return false;
+    bj::Iterator it{};if (!bj::iter_init(&idx,&it)) return false;
+    NameMappingRead state{};state.arena=scratch;
+    if (!read_name_mapping_array(&idx,&it,state,0u) || bj::iter_peek(&it)!=bj::TokenType::End) return false;
+    if (state.count>1u) {
+        auto* ids=scratch->allocate_array<int32_t>(state.count);if (!ids) return false;
+        for (uint32_t i=0;i<state.count;++i) ids[i]=state.entries[i].field_id;
+        std::sort(ids,ids+state.count);
+        for (uint32_t i=1;i<state.count;++i) if (ids[i]==ids[i-1u]) return false;
     }
-    *out = entries; *n = count;
-    return true;
+    *out=state.entries;*n=state.count;return true;
 }
 
 }}}  // namespace bolt::lakehouse::iceberg

@@ -76,9 +76,10 @@ bool table_add_column(TableHandle* th, const char* name, BoltType type,
     int32_t max_id = 0;
     for (uint32_t i = 0; i < th->meta.n_schemas; ++i) {       // bounded
         const Schema& o = th->meta.schemas[i];
-        for (uint32_t j = 0; j < o.n_fields; ++j)
-            if (o.fields[j].id > max_id) max_id = o.fields[j].id;
+        int32_t id=0;if (!schema_max_field_id(&o,&id)) return false;
+        max_id=std::max(max_id,id);
     }
+    if (max_id==INT32_MAX) return false;
     f.id = max_id + 1;
     f.required = !nullable;
     std::strncpy(f.name, name, sizeof(f.name) - 1u);
