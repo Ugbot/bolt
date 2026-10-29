@@ -47,6 +47,15 @@ TEST(NestedColumn, EncodingMatchesEveryExistingDurableRowByte) {
     Arena input, output; const auto source = fixture(input); const auto type = named(source); BoltColumn bytes{};
     ASSERT_TRUE(nr::encode_column(type,source,&output,{},&bytes));
     const auto* offsets = static_cast<const int32_t*>(bytes.dict_child->data);
+    // Literal legacy bytes, independent of either current encode entry point.
+    const uint8_t golden[]{
+        1,2,0,0,0,1,11,0,0,0,0,0,0,0,1,22,0,0,0,0,0,0,0,
+        1,0,0,0,0,
+        1,1,0,0,0,1,33,0,0,0,0,0,0,0};
+    static_assert(sizeof(golden) == 42);
+    const int32_t golden_offsets[]{0,23,23,28,42};
+    EXPECT_EQ(std::memcmp(offsets,golden_offsets,sizeof(golden_offsets)),0);
+    EXPECT_EQ(std::memcmp(bytes.data,golden,sizeof(golden)),0);
     for (int64_t row = 0; row < source.length; ++row) {
         if (source.is_null(row)) { EXPECT_EQ(offsets[row],offsets[row+1]); continue; }
         const auto size = nr::encode_row(type.values,source,row,nullptr,0);
@@ -66,6 +75,8 @@ TEST(NestedColumn, BoundsAndMalformedValuesNeverPublish) {
     EXPECT_FALSE(nr::decode_column(type,bytes,&output,limit,&unchanged)); EXPECT_EQ(unchanged.length,713);
     auto* offsets = static_cast<int32_t*>(bytes.dict_child->data);
     const auto saved = offsets[4]; offsets[4] = offsets[3]-1;
+    EXPECT_FALSE(nr::decode_column(type,bytes,&output,{},&unchanged)); EXPECT_EQ(unchanged.length,713);
+    offsets[4] = saved + 1; static_cast<uint8_t*>(bytes.data)[saved] = 0;
     EXPECT_FALSE(nr::decode_column(type,bytes,&output,{},&unchanged)); EXPECT_EQ(unchanged.length,713);
     offsets[4] = saved;
     auto* data = static_cast<uint8_t*>(bytes.data); const auto flag = data[0]; data[0] = 2;
@@ -153,6 +164,8 @@ TEST(NestedColumn, NamedSchemaWireIsCanonicalAndRefusesTruncationOrUnknownVersio
     }
     wire[3] = '2'; EXPECT_FALSE(nr::named_type_wire_decode(wire.data(),size,&decoded));
     EXPECT_EQ(decoded.values.n,777u);
+    wire[3] = '1'; wire.push_back(0);
+    EXPECT_FALSE(nr::named_type_wire_decode(wire.data(),size+1,&decoded)); EXPECT_EQ(decoded.values.n,777u);
 }
 
 TEST(NestedColumn, NamedMapsRequirePresentEntriesAndKeys) {
