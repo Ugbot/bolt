@@ -213,6 +213,9 @@ BoltType want_bolt_type(const char* t) noexcept {
     if (std::strcmp(t,"float")==0) return BoltType::Float64;   // the parquet decoder widens FLOAT to Float64 (G2ICE-379)
     if (std::strcmp(t,"boolean")==0) return BoltType::Bool;
     if (std::strcmp(t,"string")==0) return BoltType::Utf8;
+    if (std::strcmp(t,"binary")==0) return BoltType::Binary;
+    unsigned fixed = 0;
+    if (std::sscanf(t,"fixed[%u]",&fixed)==1 && fixed>16u) return BoltType::Binary;
     if (std::strcmp(t,"date")==0) return BoltType::Date32;
     return BoltType::NA;
 }
@@ -274,6 +277,7 @@ bool promote_column(const BoltColumn& src, BoltType want, int64_t rows, Arena* a
     const auto date_like=[](BoltType t){ return t==BoltType::Date32 || t==BoltType::Int32; };
     const bool same_repr=(want==BoltType::Bool && byte_like(src.type)) || (date_like(want) && date_like(src.type) && want==BoltType::Date32) ||
         (want==BoltType::Utf8 && src.type==BoltType::Binary);
+    if (want==BoltType::Binary && src.type==BoltType::Utf8) { *out=src;out->type=BoltType::Binary;return true; }
     if (want==BoltType::NA || src.type==want || same_repr) { *out=src; return true; }
     if (src.format==ColumnFormat::Flat && src.type==BoltType::Int32 && want==BoltType::Int64) {
         auto* d=a->allocate_array<int64_t>(static_cast<size_t>(rows)+1u);
@@ -315,14 +319,14 @@ BoltType fill_bolt_type(const char* t, uint32_t* fixed, uint32_t* scale) noexcep
     if (std::strcmp(t, "time") == 0) return BoltType::Duration;
     if (std::strcmp(t, "timestamp") == 0 || std::strcmp(t, "timestamptz") == 0) return BoltType::Timestamp;
     if (std::strcmp(t, "uuid") == 0) return BoltType::UUID;
-    if (std::strcmp(t, "binary") == 0) return BoltType::Utf8;            // a BYTE_ARRAY decodes as a Utf8 lane of byte strings
+    if (std::strcmp(t, "binary") == 0) return BoltType::Binary;
     if (std::sscanf(t, "decimal(%u,%u)", &p, &sc) == 2 && sc <= p && p <= 38u) {
         *scale = sc;
         return p <= 18u ? BoltType::Decimal64 : BoltType::Decimal128;
     }
     if (std::sscanf(t, "fixed[%u]", &len) == 1 && len > 0u) {
         *fixed = len;
-        return len <= 16u ? BoltType::FixedSizeBinary : BoltType::Utf8;
+        return len <= 16u ? BoltType::FixedSizeBinary : BoltType::Binary;
     }
     return BoltType::NA;
 }
@@ -503,7 +507,7 @@ bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
 bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a, BoltColumn* out) noexcept {
     assert(a != nullptr && out != nullptr);
     const size_t n = static_cast<size_t>(rows) + 1u;
-    if (want == BoltType::Utf8 && f.initial_default_kind == DefaultKind::kString) {
+    if ((want == BoltType::Utf8 || want == BoltType::Binary) && f.initial_default_kind == DefaultKind::kString) {
         // A string's text unescaped; binary / fixed[L > 16] defaults are hex (spec Appendix D), read as their bytes.
         char text[limits::kDefaultTextMax];
         const bool bytes = std::strcmp(f.type, "string") != 0;
@@ -522,7 +526,8 @@ bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a,
         std::memcpy(v.prefix, text, len < 4u ? len : 4u);
         if (len > 4u && len <= 12u) std::memcpy(v.inline_data, text + 4, len - 4u);
         for (size_t r = 0; r < n; ++r) sv[r] = v;
-        *out = BoltColumn::make_flat(sv, nullptr, rows, BoltType::Utf8);
+        *out = BoltColumn::make_flat(sv, nullptr, rows, want);
+        if (want == BoltType::Binary) out->type_size_bytes = sizeof(StringView);
         out->str_overflow_base = spill;
         return true;
     }
@@ -572,11 +577,13 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
             std::fprintf(stderr,"[iceberg_scan] REFUSED: column '%s' is absent from a data file and its type cannot be null-filled here\n",name);
             return false;
         }
-        const size_t width=bolt::type_size(t);
+        const size_t width=t==BoltType::Binary?sizeof(StringView):bolt::type_size(t);
         void* d=s->scratch->allocate_zeroed(width*(static_cast<size_t>(rows)+1u));
         auto* v=static_cast<uint8_t*>(s->scratch->allocate_zeroed((static_cast<size_t>(rows)+7u)/8u+1u));
         if (d==nullptr || v==nullptr) return false;
         out[j]=BoltColumn::make_flat(d,v,rows,t);
+        if (t==BoltType::Binary) out[j].type_size_bytes=sizeof(StringView);
+        if (t==BoltType::FixedSizeBinary) out[j].fixed_width=static_cast<uint8_t>(fixed);
         out[j].stats.all_valid=(rows==0);
         out[j].stats.null_count=rows;
     }
