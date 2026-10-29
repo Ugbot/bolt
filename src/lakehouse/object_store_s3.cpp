@@ -425,15 +425,12 @@ int s3_put_if_absent_versioned(void* impl, const char* key, const uint8_t* data,
     return kOsOk;
 }
 
-int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
-            uint32_t* out_n) noexcept {
-    assert(impl != nullptr);
-    assert(out != nullptr && out_n != nullptr);
-    *out_n = 0;
-    S3ObjectStore* s3 = static_cast<S3ObjectStore*>(impl);
+// ListObjectsV2, one request per page, calling fn(ctx, key, size) per key; a non-kOsOk return from fn stops with it.
+int s3_walk(S3ObjectStore* s3, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept {
+    assert(s3 != nullptr);
+    assert(fn != nullptr);
     char token[1024] = "";
-    uint32_t count = 0;
-    char spill[kOsMaxKey];
+    char key[kOsMaxKey];
     bool more = true;
     for (uint32_t page = 0; page < 4096u && more; ++page) {
         char qb[4096];
@@ -454,18 +451,15 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         if (resp.status / 100 != 2) return kOsIoError;
         const char* x = reinterpret_cast<const char*>(resp.body);
         uint32_t pos = 0;
-        while (oshttp::xml_next(x, resp.body_len, &pos, "Key",
-                                count < cap ? out[count].key : spill,
-                                kOsMaxKey)) {
-            if (count == cap) { *out_n = count; return kOsBufferSmall; }
-            oshttp::xml_unescape(out[count].key);
+        while (oshttp::xml_next(x, resp.body_len, &pos, "Key", key, kOsMaxKey)) {
+            oshttp::xml_unescape(key);
             char sz[32];
             if (!oshttp::xml_next(x, resp.body_len, &pos, "Size", sz,
                                   sizeof(sz))) {
                 return kOsIoError;
             }
-            out[count].size = std::strtoull(sz, nullptr, 10);
-            ++count;
+            const int v = fn(ctx, key, std::strtoull(sz, nullptr, 10));
+            if (v != kOsOk) return v;
         }
         char trunc[8] = "";
         uint32_t tp = 0;
@@ -473,7 +467,6 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
                                sizeof(trunc));
         if (std::strcmp(trunc, "true") != 0 &&
             std::strcmp(trunc, "True") != 0) { more = false; break; }
-        if (count == cap) { *out_n = count; return kOsBufferSmall; }
         tp = 0;
         if (!oshttp::xml_next(x, resp.body_len, &tp, "NextContinuationToken",
                               token, sizeof(token))) {
@@ -482,9 +475,39 @@ int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
         oshttp::xml_unescape(token);
     }
     if (more) return kOsIoError;   // page bound hit: never a short listing
-    *out_n = count;
-    assert(count <= cap);
     return kOsOk;
+}
+
+struct S3Fill {
+    ObjectEntry* out;
+    uint32_t     cap;
+    uint32_t     n;
+};
+
+int s3_fill(void* ctx, const char* key, uint64_t size) noexcept {
+    S3Fill* f = static_cast<S3Fill*>(ctx);
+    assert(f != nullptr && key != nullptr);
+    if (f->n == f->cap) return kOsBufferSmall;
+    std::memcpy(f->out[f->n].key, key, std::strlen(key) + 1u);
+    f->out[f->n].size = size;
+    ++f->n;
+    return kOsOk;
+}
+
+int s3_list(void* impl, const char* prefix, ObjectEntry* out, uint32_t cap,
+            uint32_t* out_n) noexcept {
+    assert(impl != nullptr);
+    assert(out != nullptr && out_n != nullptr);
+    S3Fill f{out, cap, 0u};
+    const int rc = s3_walk(static_cast<S3ObjectStore*>(impl), prefix, &s3_fill, &f);
+    *out_n = f.n;
+    assert(f.n <= cap);
+    return rc;
+}
+
+int s3_list_visit(void* impl, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept {
+    assert(impl != nullptr && fn != nullptr);
+    return s3_walk(static_cast<S3ObjectStore*>(impl), prefix, fn, ctx);
 }
 
 int s3_delete(void* impl, const char* key) noexcept {
@@ -519,6 +542,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head, s3_put_if_absent,
     s3_get_range, s3_head_versioned, s3_get_range_if_match, s3_put_if_absent_versioned,
+    s3_list_visit,
 };
 
 constexpr uint32_t kUploadResponseBytes = 64u * 1024u;
