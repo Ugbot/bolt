@@ -11,6 +11,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "bolt/ingest/bolt_inflate.h"
@@ -23,6 +24,15 @@ namespace lakehouse {
 namespace iceberg {
 
 namespace bj = bolt::parse::json;
+
+bool metadata_version_readable(const Metadata* m) noexcept {
+    assert(m != nullptr);
+    assert(sizeof(m->format_version) == 4u);
+    if (m->format_version >= 1 && m->format_version <= 3) return true;
+    std::fprintf(stderr, "[iceberg] REFUSED: format-version %d is unsupported; this reader implements v1-v3\n",
+                 m->format_version);
+    return false;
+}
 
 namespace {
 

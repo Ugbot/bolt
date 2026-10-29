@@ -201,6 +201,8 @@ inline bool table_location_absolute(const char* loc) noexcept {
 
 void table_uuid_from_location(const char* loc, char* dst,
                               uint32_t cap) noexcept;
+// Refuse unsupported/missing versions by name before exposing a read/write handle.
+bool metadata_version_readable(const Metadata* m) noexcept;
 const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept;
 
 }  // namespace iceberg

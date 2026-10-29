@@ -74,10 +74,7 @@ namespace pq = bolt::ingest::parquet;
 namespace {
 // G2ICE-298: the scan reads the adopted versions (v1-v3); any other is refused by name, never guessed at.
 bool readable_version(const bolt::lakehouse::iceberg::Metadata& m) noexcept {
-    if (m.format_version >= 1 && m.format_version <= 3) return true;
-    std::fprintf(stderr, "[iceberg_scan] REFUSED: format-version %d is not an adopted Iceberg version this reader implements (v1-v3)\n",
-                 m.format_version);
-    return false;
+    return metadata_version_readable(&m);
 }
 }  // namespace
 

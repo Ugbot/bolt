@@ -1009,6 +1009,7 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
                 const char* path) noexcept {
     assert(out != nullptr && arena != nullptr && os != nullptr);
     assert(path != nullptr);
+    *out = nullptr;
     TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
     std::memset(h, 0, sizeof(*h));
@@ -1040,6 +1041,7 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     if (os_get(os, rel, arena, &mb, &ml) != kOsOk) return false;
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
+    if (!metadata_version_readable(&h->meta)) return false;
     h->prior_meta = mb;
     h->prior_meta_len = ml;
     h->file_io_configurable = true;
