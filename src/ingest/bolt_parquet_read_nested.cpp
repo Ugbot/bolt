@@ -213,13 +213,27 @@ bool parquet_read_nested_column_tree(const uint8_t* buf, uint64_t len,
                                   f.col_begin + k, arena, &leaves[k]) ||
             leaves[k].n_rows != rows) return false;
     }
-    const NestCtx x{tree, leaves, f.col_begin, n, arena};
-    BoltColumn col;
-    if (!build(&x, tree->top[top_field], 0u, &col) || col.length != rows) {
+    return pq_assemble_nested(meta, tree, row_group, top_field, leaves, n,
+                              arena, out, out_rows);
+}
+
+bool pq_assemble_nested(const PqMeta* meta, const PqSchemaTree* tree,
+    uint32_t row_group, uint32_t top_field, const PqLeafSlots* leaves,
+    uint32_t count, Arena* arena, BoltColumn* out, int64_t* rows) noexcept {
+    assert(meta != nullptr && tree != nullptr && leaves != nullptr);
+    assert(arena != nullptr && out != nullptr && rows != nullptr);
+    if (row_group >= meta->n_row_groups || top_field >= tree->n_top) return false;
+    const PqField& f = tree->fields[tree->top[top_field]];
+    if (!tree_matches(meta, tree, f) || count != f.col_end - f.col_begin) return false;
+    const int64_t expected = meta->row_groups[row_group].num_rows;
+    for (uint32_t i = 0; i < count; ++i)
+        if (leaves[i].n_rows != expected) return false;
+    const NestCtx x{tree, leaves, f.col_begin, count, arena};
+    BoltColumn staged{};
+    if (!build(&x, tree->top[top_field], 0u, &staged) || staged.length != expected)
         return false;
-    }
-    *out = col;
-    *out_rows = rows;
+    *out = staged;
+    *rows = expected;
     return true;
 }
 

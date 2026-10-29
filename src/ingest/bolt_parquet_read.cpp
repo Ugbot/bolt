@@ -2348,13 +2348,14 @@ bool list_decode_page(ColCtx* cx, const uint8_t* page, uint64_t plen,
 // group 1 would gather real values from the wrong rows -- a silent misread.
 bool leaf_decode_chunk(const uint8_t* buf, uint64_t len, const PqChunk* ch,
                        ColCtx* cx, ListBuild* b, int64_t* elem_n,
-                       Arena* arena) noexcept {
+                       Arena* arena, uint64_t base) noexcept {
     assert(buf != nullptr && ch != nullptr && cx != nullptr);
     assert(b != nullptr && elem_n != nullptr && arena != nullptr);
     const int64_t start = (ch->dictionary_page_offset > 0)
         ? ch->dictionary_page_offset : ch->data_page_offset;
     if (start <= 0 || ch->total_compressed_size <= 0) return false;
-    const uint64_t s = static_cast<uint64_t>(start);
+    if (static_cast<uint64_t>(start) < base) return false;
+    const uint64_t s = static_cast<uint64_t>(start) - base;
     const uint64_t region = static_cast<uint64_t>(ch->total_compressed_size);
     if (s > len || region > len - s) return false;
     const uint64_t end = s + region;
@@ -2441,10 +2442,10 @@ bool leaf_levels_rows_ok(const PqMeta* meta, uint32_t g0, uint32_t g1,
 
 bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
                           uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
-                          PqLeafSlots* out) noexcept {
+                          PqLeafSlots* out, uint64_t base) noexcept {
     assert(meta != nullptr && arena != nullptr && out != nullptr);
     if (buf == nullptr || g0 >= g1 || g1 > meta->n_row_groups ||
-        col >= meta->n_columns) return false;
+        col >= meta->n_columns || (base != 0 && g1 != g0 + 1u)) return false;
     const PqColumn* pc = &meta->columns[col];
     if (pc->max_rep > kPqMaxRepLevels) return false;
     std::memset(out, 0, sizeof(*out));
@@ -2474,7 +2475,7 @@ bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     int64_t elem_n = 0;
     for (uint32_t g = g0; g < g1; ++g) {
         const PqChunk* ch = &meta->chunks[meta->row_groups[g].chunk_off + col];
-        if (!leaf_decode_chunk(buf, len, ch, &cx, &b, &elem_n, arena)) return false;
+        if (!leaf_decode_chunk(buf, len, ch, &cx, &b, &elem_n, arena, base)) return false;
     }
     out->rep = b.rep;
     out->def = b.def;

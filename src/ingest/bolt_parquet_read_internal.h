@@ -14,6 +14,8 @@ class Arena;
 namespace ingest {
 namespace parquet {
 
+struct PqSchemaTree;
+
 // rep/def hold one level per leaf slot across the row-group range. `values`
 // holds one entry per VALUE POSITION -- a slot whose def reaches the leaf's
 // innermost repeated ancestor (every slot when the leaf has none) -- valid
@@ -31,7 +33,12 @@ struct PqLeafSlots {
 // and every chunk must open a row. All storage from `arena`.
 bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
                           uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
-                          PqLeafSlots* out) noexcept;
+                          PqLeafSlots* out, uint64_t base = 0) noexcept;
+
+// Assemble an already decoded subtree; leaf buffers never borrow transport scratch.
+bool pq_assemble_nested(const PqMeta* meta, const PqSchemaTree* tree,
+    uint32_t row_group, uint32_t top_field, const PqLeafSlots* leaves,
+    uint32_t count, Arena* arena, BoltColumn* out, int64_t* rows) noexcept;
 
 }  // namespace parquet
 }  // namespace ingest

@@ -27,6 +27,16 @@ durable publication remain caller responsibilities. Unsupported types/options
 are enumerated in the pinned-read public header; this is not a complete mounted
 Iceberg service or read/write cache.
 
+`ingest/bolt_parquet_source.h` also provides a nested pinned-source door:
+`parquet_read_meta_source_nested` retains leaf metadata and the schema tree from
+one exact footer; `parquet_read_nested_column_source` assembles typed
+struct/list/map columns using one compressed leaf chunk of reusable workspace.
+Both preserve transactional outputs and propagate Changed/IoError/Capacity
+without repinning. Native PyArrow-value fixtures cover V1/V2, dictionaries,
+legacy list/map shapes, late-leaf failures and poisoned scratch lifetimes.
+This primitive is not yet wired through the Iceberg scanner or SQL; their
+strict flat-footer validation remains in place.
+
 `lakehouse/iceberg/metadata_io.h` loads one caller-selected immutable metadata
 object through strong conditional ranges, distinct finite retained/scratch
 arenas, exact table identity and complete SHA-256. It performs no discovery or

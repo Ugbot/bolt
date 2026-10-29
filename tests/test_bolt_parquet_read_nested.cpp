@@ -7,9 +7,11 @@
 
 #include "bolt/ingest/bolt_parquet_nested.h"
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/ingest/bolt_parquet_source.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -199,9 +201,26 @@ Expected load_expected(const std::string& name) {
     return e;
 }
 
+struct PinnedMemory {
+    const std::vector<uint8_t>* file;
+    uint64_t calls = 0;
+    uint64_t fail_call = UINT64_MAX;
+    ParquetSourceStatus failure = ParquetSourceStatus::Changed;
+    static ParquetSourceStatus read(void* ctx, uint64_t offset, uint32_t length,
+                                    uint8_t* out) noexcept {
+        auto& memory = *static_cast<PinnedMemory*>(ctx);
+        ++memory.calls;
+        if (memory.calls == memory.fail_call) return memory.failure;
+        if (length == 0 || length > 37u || offset > memory.file->size() ||
+            length > memory.file->size() - offset) return ParquetSourceStatus::IoError;
+        std::memcpy(out, memory.file->data() + offset, length);
+        return ParquetSourceStatus::Ok;
+    }
+};
+
 // Reads every top-level field of every row group and compares with pyarrow.
 // Returns the number of value lines compared.
-int64_t check_file(const std::string& name, const std::string& parquet) {
+int64_t check_file(const std::string& name, const std::string& parquet, bool ranged = false) {
     const std::vector<uint8_t> buf = slurp(parquet);
     EXPECT_FALSE(buf.empty()) << parquet;
     if (buf.empty()) return 0;
@@ -212,6 +231,22 @@ int64_t check_file(const std::string& name, const std::string& parquet) {
     PqSchemaTree tree;
     EXPECT_TRUE(parquet_read_meta(buf.data(), buf.size(), &arena, meta));
     EXPECT_TRUE(parquet_read_schema_tree(buf.data(), buf.size(), &arena, &tree));
+    // Budget is the largest compressed chunk or footer, strictly less than the file.
+    uint32_t footer = 0;
+    std::memcpy(&footer, buf.data() + buf.size() - 8u, 4);
+    uint64_t capacity = footer;
+    for (uint32_t i = 0; i < meta->n_chunks; ++i)
+        capacity = std::max(capacity, static_cast<uint64_t>(meta->chunks[i].total_compressed_size));
+    std::vector<uint8_t> scratch(static_cast<size_t>(capacity));
+    PinnedMemory memory{&buf};
+    ParquetByteSource source{buf.size(), &memory, PinnedMemory::read};
+    ParquetSourceWorkspace workspace{scratch.data(), capacity, 37};
+    if (ranged) {
+        EXPECT_LT(capacity, buf.size());
+        EXPECT_EQ(parquet_read_meta_source_nested(&source, &workspace, &arena, meta, &tree),
+                  ParquetSourceStatus::Ok);
+        std::memset(scratch.data(), 0xDA, scratch.size());
+    }
     EXPECT_EQ(tree.n_top, exp.schema.size()) << name;
     if (tree.n_top != exp.schema.size()) return 0;
     int64_t compared = 0;
@@ -221,8 +256,12 @@ int64_t check_file(const std::string& name, const std::string& parquet) {
         for (uint32_t g = 0; g < meta->n_row_groups; ++g) {
             BoltColumn col;
             int64_t rows = 0;
-            const bool ok = parquet_read_nested_column_tree(
-                buf.data(), buf.size(), meta, &tree, g, k, &arena, &col, &rows);
+            const bool ok = ranged
+                ? parquet_read_nested_column_source(&source, &workspace, meta, &tree, g, k,
+                    &arena, &col, &rows) == ParquetSourceStatus::Ok
+                : parquet_read_nested_column_tree(buf.data(), buf.size(), meta, &tree, g, k,
+                    &arena, &col, &rows);
+            if (ranged) std::memset(scratch.data(), 0xDA, scratch.size());
             EXPECT_TRUE(ok) << name << " field " << k << " group " << g;
             if (!ok) return compared;
             for (int64_t r = 0; r < rows; ++r) got.push_back(render(tree, tree.top[k], col, r));
@@ -238,6 +277,13 @@ int64_t check_file(const std::string& name, const std::string& parquet) {
 }
 
 class NestedOracle : public ::testing::TestWithParam<const char*> {};
+
+TEST_P(NestedOracle, PinnedRangesMatchPyarrow) {
+    const std::string name = GetParam();
+    const int64_t n = check_file(name, data_path(name + ".parquet"), true);
+    EXPECT_GT(n, 0);
+    std::printf("[range oracle] %s: %lld values compared\n", name.c_str(), static_cast<long long>(n));
+}
 
 TEST_P(NestedOracle, MatchesPyarrow) {
     const std::string name = GetParam();
@@ -259,6 +305,7 @@ TEST(NestedLegacy, TwoLevelShapesMatchPyarrow) {
                              "legacy2_multifield", "legacy2_array"}) {
         const std::string p = std::string(BOLT_TEST_DATA_DIR) + "/" + name + ".parquet";
         EXPECT_GT(check_file(name, p), 0) << name;
+        EXPECT_GT(check_file(name, p, true), 0) << name;
     }
 }
 
@@ -408,6 +455,81 @@ TEST(NestedRobust, CorruptBytesNeverCrash) {
     EXPECT_LT(ok, calls);
     std::printf("[fuzz] %lld reads, %lld succeeded\n", static_cast<long long>(calls),
                 static_cast<long long>(ok));
+}
+
+TEST(NestedSource, MetadataOutputsPublishTogether) {
+    const auto buf = slurp(data_path("map_v2_dict.parquet"));
+    ASSERT_FALSE(buf.empty());
+    Arena arena;
+    auto* meta = arena.allocate_array<PqMeta>(1);
+    *meta = PqMeta{};
+    meta->n_columns = 712;
+    PqSchemaTree tree{};
+    tree.n_top = 713;
+    std::vector<uint8_t> scratch(buf.size());
+    PinnedMemory memory{&buf};
+    ParquetByteSource source{buf.size(), &memory, PinnedMemory::read};
+    ParquetSourceWorkspace w{scratch.data(), scratch.size(), 37};
+    memory.fail_call = 3; // Exact footer read fails after both magic reads.
+    EXPECT_EQ(parquet_read_meta_source_nested(&source, &w, &arena, meta, &tree),
+              ParquetSourceStatus::Changed);
+    EXPECT_EQ(meta->n_columns, 712u);
+    EXPECT_EQ(tree.n_top, 713u);
+    EXPECT_EQ(memory.calls, 3u);
+    memory.fail_call = UINT64_MAX;
+    const auto before = memory.calls;
+    w.bytes = reinterpret_cast<uint8_t*>(&tree);
+    EXPECT_EQ(parquet_read_meta_source_nested(&source, &w, &arena, meta, &tree),
+              ParquetSourceStatus::BadArg);
+    EXPECT_EQ(memory.calls, before);
+    EXPECT_EQ(meta->n_columns, 712u);
+    EXPECT_EQ(tree.n_top, 713u);
+}
+
+TEST(NestedSource, ErrorsNeverPublishOrRepin) {
+    const auto buf = slurp(data_path("struct_v2_dict.parquet"));
+    ASSERT_FALSE(buf.empty());
+    Arena metadata, output;
+    auto* meta = metadata.allocate_array<PqMeta>(1);
+    PqSchemaTree tree{};
+    std::vector<uint8_t> scratch(buf.size());
+    PinnedMemory memory{&buf};
+    ParquetByteSource source{buf.size(), &memory, PinnedMemory::read};
+    ParquetSourceWorkspace w{scratch.data(), scratch.size(), 37};
+    ASSERT_EQ(parquet_read_meta_source_nested(&source, &w, &metadata, meta, &tree),
+              ParquetSourceStatus::Ok);
+    BoltColumn col = BoltColumn::make_empty();
+    col.length = 712;
+    int64_t rows = 713;
+    for (const auto failure : {ParquetSourceStatus::Changed, ParquetSourceStatus::IoError,
+                              ParquetSourceStatus::Capacity}) {
+        memory.failure = failure;
+        // Fail after a complete earlier leaf, not merely the initial request.
+        const auto& field = tree.fields[tree.top[1]];
+        ASSERT_GT(field.col_end - field.col_begin, 1u);
+        const auto& chunk = meta->chunks[meta->row_groups[0].chunk_off + field.col_begin];
+        memory.fail_call = memory.calls +
+            (static_cast<uint64_t>(chunk.total_compressed_size) + 36u) / 37u + 2u;
+        EXPECT_EQ(parquet_read_nested_column_source(&source, &w, meta, &tree, 0, 1,
+                   &output, &col, &rows), failure);
+        EXPECT_EQ(memory.calls, memory.fail_call);
+        EXPECT_EQ(col.length, 712);
+        EXPECT_EQ(rows, 0);
+    }
+    const auto before = memory.calls;
+    w.capacity = 1;
+    EXPECT_EQ(parquet_read_nested_column_source(&source, &w, meta, &tree, 0, 1,
+               &output, &col, &rows), ParquetSourceStatus::Capacity);
+    EXPECT_EQ(memory.calls, before);
+    EXPECT_EQ(col.length, 712);
+    rows = 713;
+    w.capacity = scratch.size();
+    w.bytes = reinterpret_cast<uint8_t*>(tree.fields);
+    EXPECT_EQ(parquet_read_nested_column_source(&source, &w, meta, &tree, 0, 1,
+               &output, &col, &rows), ParquetSourceStatus::BadArg);
+    EXPECT_EQ(memory.calls, before);
+    EXPECT_EQ(rows, 713);
+    EXPECT_EQ(col.length, 712);
 }
 
 }  // namespace

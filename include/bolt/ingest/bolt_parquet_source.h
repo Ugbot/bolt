@@ -6,6 +6,7 @@
 
 namespace bolt { class Arena; struct BoltColumn; }
 namespace bolt::ingest::parquet {
+struct PqSchemaTree;
 
 enum class ParquetSourceStatus : uint8_t {
     Ok, BadArg, IoError, Changed, Capacity, DecodeFailed
@@ -60,4 +61,18 @@ ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* 
     ParquetSourceWorkspace* workspace, const PqMeta* meta, uint32_t row_group,
     const uint16_t* col_idx, uint32_t n_idx, Arena* output_arena,
     BoltColumn* out_cols, int64_t* out_rows) noexcept;
+// Fetch one exact footer and retain both leaf metadata and the nested schema.
+// Both outputs publish together only on success; neither borrows the workspace.
+ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace, Arena* metadata_arena, PqMeta* out,
+    PqSchemaTree* tree) noexcept;
+
+// Assemble a top-level nested field using one compressed leaf chunk at a time.
+// Same status, immutable-source and transactional output contracts as the flat
+// projection above. meta/tree must come from the same exact footer. Struct,
+// list and map values retain their typed child columns and null distinctions.
+ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace, const PqMeta* meta, const PqSchemaTree* tree,
+    uint32_t row_group, uint32_t top_field, Arena* output_arena,
+    BoltColumn* out, int64_t* out_rows) noexcept;
 }  // namespace bolt::ingest::parquet

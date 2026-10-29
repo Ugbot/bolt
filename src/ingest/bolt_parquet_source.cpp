@@ -1,5 +1,7 @@
 #include "bolt/ingest/bolt_parquet_source.h"
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
+#include "bolt_parquet_read_internal.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include <algorithm>
@@ -155,14 +157,18 @@ Status projection_extents(const ParquetByteSource& source, const ParquetSourceWo
     }
     return Status::Ok;
 }
+#include "bolt_parquet_source_nested.inc"
 }  // namespace
 
 template<bool FlatStrict>
 static ParquetSourceStatus read_meta_source(const ParquetByteSource* source,
-    ParquetSourceWorkspace* w, Arena* arena, PqMeta* out) noexcept {
+    ParquetSourceWorkspace* w, Arena* arena, PqMeta* out,
+    PqSchemaTree* tree = nullptr) noexcept {
     assert(source != nullptr && w != nullptr);
     assert(arena != nullptr && out != nullptr);
     if (!admitted(source, w) || !metadata_spans(source, w, arena, out)) return Status::BadArg;
+    if (tree != nullptr && !nested_metadata_spans(source, w, arena, out, tree))
+        return Status::BadArg;
     if (arena->overlaps_backing(w->bytes, static_cast<size_t>(w->capacity))) return Status::BadArg;
     if (source->size < 12) return Status::DecodeFailed;
     uint8_t magic[4]{}, tail[8]{};
@@ -191,7 +197,11 @@ static ParquetSourceStatus read_meta_source(const ParquetByteSource* source,
         if (parsed!=PqMetaParseStatus::Ok) return Status::DecodeFailed;
     }
     if (!metadata_extents(*staged, footer)) return Status::DecodeFailed;
+    PqSchemaTree staged_tree{};
+    if (tree != nullptr && !parquet_schema_tree_slice(w->bytes, length, arena, &staged_tree))
+        return Status::DecodeFailed;
     *out = *staged;
+    if (tree != nullptr) *tree = staged_tree;
     return Status::Ok;
 }
 
@@ -236,6 +246,53 @@ ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* 
     }
     std::memcpy(out, staged, sizeof(BoltColumn) * count);
     *rows = group.num_rows;
+    return Status::Ok;
+}
+ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* source,
+    ParquetSourceWorkspace* w, Arena* arena, PqMeta* out, PqSchemaTree* tree) noexcept {
+    assert(source != nullptr && arena != nullptr);
+    assert(out != nullptr && w != nullptr);
+    if (tree == nullptr) return Status::BadArg;
+    return read_meta_source<false>(source, w, arena, out, tree);
+}
+
+ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* source,
+    ParquetSourceWorkspace* w, const PqMeta* meta, const PqSchemaTree* tree,
+    uint32_t row_group, uint32_t top_field, Arena* arena,
+    BoltColumn* out, int64_t* rows) noexcept {
+    assert(source != nullptr && w != nullptr && meta != nullptr);
+    assert(arena != nullptr && out != nullptr && rows != nullptr);
+    if (!admitted(source, w) || !nested_spans(source, w, meta, tree, arena, out, rows))
+        return Status::BadArg;
+    if (arena->overlaps_backing(w->bytes, static_cast<size_t>(w->capacity))) return Status::BadArg;
+    if (top_field >= tree->n_top || row_group >= meta->n_row_groups) return Status::BadArg;
+    const auto& f = tree->fields[tree->top[top_field]];
+    const Status admitted_extent = nested_extents(*source, *w, *meta, *tree, row_group, f);
+    if (admitted_extent == Status::BadArg) return admitted_extent;
+    *rows = 0;
+    if (admitted_extent != Status::Ok) return admitted_extent;
+    const uint32_t count = f.col_end - f.col_begin;
+    auto* leaves = arena->allocate_array<PqLeafSlots>(count);
+    if (leaves == nullptr) return Status::Capacity;
+    const auto& group = meta->row_groups[row_group];
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t col = f.col_begin + i;
+        const auto& chunk = meta->chunks[group.chunk_off + col];
+        uint64_t offset = 0, length = 0;
+        if (chunk.num_values != 0 || chunk.total_compressed_size != 0) {
+            if (!chunk_extent(chunk, source->size - 8u, &offset, &length)) return Status::DecodeFailed;
+            const Status status = read_exact(*source, *w, offset, length, w->bytes);
+            if (status != Status::Ok) return status;
+        }
+        if (!pq_decode_leaf_slots(w->bytes, length, meta, row_group, row_group + 1u,
+                                   col, arena, &leaves[i], offset)) return Status::DecodeFailed;
+    }
+    BoltColumn staged{};
+    int64_t decoded = 0;
+    if (!pq_assemble_nested(meta, tree, row_group, top_field, leaves, count, arena,
+                            &staged, &decoded)) return Status::DecodeFailed;
+    *out = staged;
+    *rows = decoded;
     return Status::Ok;
 }
 }  // namespace bolt::ingest::parquet
