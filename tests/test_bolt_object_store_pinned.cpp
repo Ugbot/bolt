@@ -1,7 +1,9 @@
 #include "bolt/lakehouse/object_store/pinned.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <vector>
 #include <cstring>
 #include <utility>
 
@@ -66,8 +68,24 @@ struct PinnedMemoryOrigin {
         s.bytes_read += actual; *got = actual;
         return kOsOk;
     }
+    // G2ICE-381: one streamed request: the whole range through the sink, in buffer-sized pieces.
+    uint32_t streams = 0;
+    static int stream(void* p, const char* key, const ObjectVersion* pin, uint64_t offset, uint64_t length,
+                      const ObjectRangeSink* sink, uint64_t* delivered) noexcept {
+        auto& s = self(p); ++s.streams; *delivered = 0;
+        if (std::strcmp(key, "a") != 0 || pin->size != s.current.size || std::strcmp(pin->etag, s.current.etag) != 0)
+            return kOsPreconditionFailed;
+        if (offset > s.current.size || length > s.current.size - offset) return kOsBadArg;
+        for (uint64_t at = 0; at < length;) {
+            const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(length - at, sink->buf_cap));
+            std::memcpy(sink->buf, s.body + static_cast<size_t>(offset + at), n);
+            if (!sink->fn(sink->ctx, sink->buf, n)) return kOsCancelled;
+            at += n; *delivered = at;
+        }
+        return kOsOk;
+    }
     void initialize() {
-        static const ObjectStoreVT vt{get, put, list, remove, head, put, range, version, conditional};
+        static const ObjectStoreVT vt{get, put, list, remove, head, put, range, version, conditional, nullptr, stream};
         store = {&vt, this};
         resize(2u * kRequest + 7u);
     }
@@ -411,5 +429,26 @@ TEST_F(PinnedObjectStoreTest, WorkspaceObjectAliasesRefuseBeforeAnyProposedArena
     EXPECT_EQ(std::memcmp(adapter.vt, &saved_adapter_vt, sizeof(saved_adapter_vt)), 0);
     for (uint32_t i = 0; i < kRequest; ++i) EXPECT_EQ(backing[i], 0xa5);
     EXPECT_EQ(origin.ranges, 0u);
+}
+
+struct Gathered { std::vector<uint8_t> bytes; };
+bool gather(void* ctx, const uint8_t* d, uint32_t n) noexcept {
+    auto* g = static_cast<Gathered*>(ctx);
+    g->bytes.insert(g->bytes.end(), d, d + n);
+    return true;
+}
+TEST_F(PinnedObjectStoreTest, StreamedRangeIsOneOriginRequestPastTheRequestCapUnderThePin) {
+    Gathered g; uint8_t buf[16]; uint64_t delivered = 0;
+    const ObjectRangeSink sink{&gather, &g, buf, sizeof(buf), 0};
+    const uint64_t length = origin.current.size - 3u;   // more than one kRequest: one stream, no chunking
+    ASSERT_EQ(os_get_range_if_match_stream(&adapter, "a", &pins[0].version, 3, length, &sink, &delivered), kOsOk);
+    EXPECT_EQ(delivered, length); EXPECT_EQ(origin.streams, 1u); EXPECT_EQ(origin.ranges, 0u);
+    ASSERT_EQ(g.bytes.size(), length);
+    EXPECT_EQ(std::memcmp(g.bytes.data(), origin.body + 3, static_cast<size_t>(length)), 0);
+    ObjectVersion other = pins[0].version; std::strcpy(other.etag, "\"generation-2\"");
+    EXPECT_EQ(os_get_range_if_match_stream(&adapter, "a", &other, 0, 1, &sink, &delivered), kOsPreconditionFailed);
+    EXPECT_EQ(os_get_range_if_match_stream(&adapter, "missing", &pins[0].version, 0, 1, &sink, &delivered), kOsNotFound);
+    EXPECT_EQ(os_get_range_if_match_stream(&adapter, "a", &pins[0].version, 1, origin.current.size, &sink, &delivered), kOsBadArg);
+    EXPECT_EQ(origin.streams, 1u);
 }
 }  // namespace

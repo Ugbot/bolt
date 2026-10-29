@@ -177,6 +177,17 @@ int pinned_range(void* context, const char* key, const ObjectVersion* expected,
     if (!joined(state, key, true, full)) { *got = 0; return kOsBadArg; }
     return os_get_range_if_match(&state->origin, full, expected, offset, length, scratch, dst, got);
 }
+
+int pinned_stream(void* context, const char* key, const ObjectVersion* expected, uint64_t offset, uint64_t length,
+                  const ObjectRangeSink* sink, uint64_t* delivered) noexcept {
+    assert(expected != nullptr && sink != nullptr);
+    assert(delivered != nullptr);
+    auto* state = state_of(context);
+    *delivered = 0;
+    char full[kOsMaxKey]{};
+    if (!joined(state, key, true, full)) return kOsBadArg;
+    return os_get_range_if_match_stream(&state->origin, full, expected, offset, length, sink, delivered);
+}
 }  // namespace
 
 bool prefix_object_store_init(PrefixObjectStore* state, const ObjectStore* origin,
@@ -214,7 +225,8 @@ bool prefix_object_store_init(PrefixObjectStore* state, const ObjectStore* origi
         copy.vt->get_range == nullptr ? nullptr : range,
         copy.vt->head_versioned == nullptr ? nullptr : version,
         copy.vt->get_range_if_match == nullptr ? nullptr : pinned_range,
-        copy.vt->put_if_absent == nullptr ? nullptr : create_versioned};
+        copy.vt->put_if_absent == nullptr ? nullptr : create_versioned,
+        copy.vt->get_range_if_match_stream == nullptr ? nullptr : pinned_stream};
     out->vt = &state->vtable;
     out->impl = state;
     assert(state->prefix_length > 0 && out->impl == state);

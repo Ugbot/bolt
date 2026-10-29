@@ -64,6 +64,24 @@ bool http_url_authority(const char* url, char* out, uint32_t cap) noexcept;
 int http_send(bolt::Arena* arena, const HttpRequest* req,
               HttpResponse* out) noexcept;
 
+// Streamed response (G2ICE-381): the same request rules as http_send, but the body is handed to on_body in pieces of at most
+// buf_cap bytes from the caller's buffer instead of being materialized, so a large ranged GET is one request. on_head sees the
+// parsed head (body null) before any body byte and may refuse it. The body must be Content-Length framed and at most max_body
+// (chunked, close-delimited or larger bodies are refused after on_head, before any body byte); a head with no body (HEAD, 204,
+// 304) calls on_head only.
+// timeout_ms bounds connect, the head, and each wait for more body bytes (time without progress), not the whole transfer.
+// 0: every declared byte delivered; -4: a callback refused; -6: unsupported framing; other negatives: transport or a short body.
+struct HttpBodyStream {
+    bool (*on_head)(void* ctx, const HttpResponse* head) noexcept;
+    bool (*on_body)(void* ctx, const uint8_t* data, uint32_t n) noexcept;
+    void*    ctx;
+    uint8_t* buf;
+    uint32_t buf_cap;
+    uint32_t _pad;
+    uint64_t max_body;
+};
+int http_send_stream(const HttpRequest* req, HttpResponse* out, const HttpBodyStream* stream) noexcept;
+
 // Lookup header by case-insensitive name. Returns value or nullptr.
 const char* http_header_get(const HttpHeader* hdrs, uint32_t n,
                             const char* name) noexcept;

@@ -1,6 +1,7 @@
 #include "bolt/net/bolt_http_client.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -425,5 +426,99 @@ TEST(BoltHttpClient, MatchingExplicitContentLengthIsSerializedExactlyOnce) {
         EXPECT_EQ(server.request.rfind("\r\nContent-Length:"), first);
         if (nonempty) EXPECT_TRUE(server.request.ends_with("\r\n\r\nz"));
     }
+}
+
+// G2ICE-381: http_send_stream.
+struct Collected {
+    int status = 0;
+    std::string body;
+    uint32_t pieces = 0, largest = 0;
+    bool refuse_head = false;
+    uint32_t refuse_after = 0;   // 0 = never
+};
+bool collect_head(void* ctx, const bn::HttpResponse* r) noexcept {
+    auto* c = static_cast<Collected*>(ctx);
+    c->status = r->status;
+    return !c->refuse_head;
+}
+bool collect_body(void* ctx, const uint8_t* d, uint32_t n) noexcept {
+    auto* c = static_cast<Collected*>(ctx);
+    c->body.append(reinterpret_cast<const char*>(d), n);
+    ++c->pieces;
+    c->largest = std::max(c->largest, n);
+    return c->refuse_after == 0 || c->pieces < c->refuse_after;
+}
+int stream_once(Pieces pieces, Collected* c, uint32_t buf_cap, uint64_t max_body, uint16_t timeout_ms = 1000) {
+    OneShotServer server;
+    if (!server.start(std::move(pieces))) return -100;
+    bn::HttpRequest req{};
+    init_request(&req, server.port);
+    req.timeout_ms = timeout_ms;
+    std::vector<uint8_t> buf(buf_cap);
+    const bn::HttpBodyStream st{&collect_head, &collect_body, c, buf.data(), buf_cap, 0, max_body};
+    bn::HttpResponse response{};
+    const int rc = bn::http_send_stream(&req, &response, &st);
+    EXPECT_EQ(response.body, nullptr);
+    return rc;
+}
+
+TEST(BoltHttpClient, StreamDeliversTheDeclaredBodyInBoundedPieces) {
+    std::string body;
+    for (int i = 0; i < 300000; ++i) body.push_back(static_cast<char>('a' + i % 26));
+    Collected c;
+    ASSERT_EQ(stream_once({"HTTP/1.1 206 Partial Content\r\nContent-Length: 300000\r\n\r\n" + body.substr(0, 1000),
+                           body.substr(1000, 150000), body.substr(151000)}, &c, 4096, body.size()), 0);
+    EXPECT_EQ(c.status, 206);
+    EXPECT_EQ(c.body, body);
+    EXPECT_LE(c.largest, 4096u);
+    EXPECT_GE(c.pieces, 300000u / 4096u);
+}
+
+TEST(BoltHttpClient, StreamDeadlineIsRenewedByProgressButBoundsAStall) {
+    Pieces pieces{"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n"};
+    for (unsigned i = 0; i < 20; ++i) pieces.emplace_back("x");   // 10 ms apart: 200 ms in all, each gap under the 60 ms bound
+    Collected c;
+    EXPECT_EQ(stream_once(std::move(pieces), &c, 64, 20, 60), 0);
+    EXPECT_EQ(c.body, std::string(20, 'x'));
+    OneShotServer server;
+    ASSERT_TRUE(server.start({"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\na"}, 1000));
+    bn::HttpRequest req{};
+    init_request(&req, server.port);
+    req.timeout_ms = 60;
+    uint8_t buf[16];
+    Collected s;
+    const bn::HttpBodyStream st{&collect_head, &collect_body, &s, buf, sizeof(buf), 0, 5};
+    bn::HttpResponse response{};
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_LT(bn::http_send_stream(&req, &response, &st), 0);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(750));
+    EXPECT_EQ(s.body, "a");
+}
+
+TEST(BoltHttpClient, StreamRefusesUnsupportedFramingAndOversizeBeforeAnyBodyByte) {
+    for (const auto* head : {"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n",
+                             "HTTP/1.1 200 OK\r\n\r\nabcde",
+                             "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabcdef"}) {
+        Collected c;
+        EXPECT_EQ(stream_once({head}, &c, 64, 5), -6) << head;
+        EXPECT_EQ(c.status, 200);
+        EXPECT_TRUE(c.body.empty());
+    }
+}
+
+TEST(BoltHttpClient, StreamCallbacksCanRefuseAndAShortBodyFails) {
+    Collected head;
+    head.refuse_head = true;
+    EXPECT_EQ(stream_once({"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 3\r\n\r\nabc"}, &head, 64, 3), -4);
+    EXPECT_EQ(head.status, 412);
+    EXPECT_TRUE(head.body.empty());
+    Collected body;
+    body.refuse_after = 1;
+    EXPECT_EQ(stream_once({"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n", std::string(100, 'x'), std::string(100, 'y')},
+                          &body, 50, 200), -4);
+    EXPECT_EQ(body.pieces, 1u);
+    Collected shortened;
+    EXPECT_LT(stream_once({"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"}, &shortened, 64, 10), 0);
+    EXPECT_EQ(shortened.body, "abc");
 }
 } // namespace

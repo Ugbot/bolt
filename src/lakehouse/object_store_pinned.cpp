@@ -166,6 +166,23 @@ int pinned_conditional(void* impl, const char* key, const ObjectVersion* expecte
     return rc;
 }
 
+// G2ICE-381: one streamed request for a whole range of a pinned object (no request_bytes cap: the sink's buffer bounds memory).
+int pinned_stream(void* impl, const char* key, const ObjectVersion* expected, uint64_t offset, uint64_t length,
+                  const ObjectRangeSink* sink, uint64_t* delivered) noexcept {
+    assert(impl != nullptr);
+    assert(sink != nullptr && delivered != nullptr);
+    auto* s = static_cast<PinnedObjectStore*>(impl);
+    const ObjectSpan outputs[]{{sink->buf, sink->buf_cap}, {delivered, sizeof(*delivered)}};
+    if (expected == nullptr || !admit(s, key, expected, outputs, 2, nullptr)) return kOsBadArg;
+    *delivered = 0;
+    const auto* pin = lookup(s, key);
+    if (pin == nullptr) return kOsNotFound;
+    if (!same_version(expected, &pin->version)) return kOsPreconditionFailed;
+    if (offset > pin->version.size || length > pin->version.size - offset) return kOsBadArg;
+    if (length == 0) return kOsOk;
+    return os_get_range_if_match_stream(&s->origin, pin->key, &pin->version, offset, length, sink, delivered);
+}
+
 int pinned_head(void* impl, const char* key, ObjectMeta* out) noexcept {
     assert(impl != nullptr);
     assert(out != nullptr);
@@ -238,7 +255,8 @@ int unsupported_delete(void* impl, const char*) noexcept {
 }
 
 const ObjectStoreVT kPinnedVT{pinned_get, unsupported_put, unsupported_list, unsupported_delete,
-                             pinned_head, unsupported_put, pinned_range, pinned_version, pinned_conditional};
+                             pinned_head, unsupported_put, pinned_range, pinned_version, pinned_conditional,
+                             nullptr, pinned_stream};
 
 bool init_admit(PinnedObjectStore* state, const ObjectStore* origin, const char* ns,
                 const PinnedObject* entries, uint32_t count,

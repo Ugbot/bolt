@@ -46,7 +46,7 @@ void shutdown_socket(TestSocket socket) {
 }
 bool send_bytes(TestSocket socket, const std::string& bytes) {
     size_t off = 0;
-    constexpr uint32_t kSendParts = kOsVersionedRangeMaxBytes / 65536u + 2u;
+    constexpr uint32_t kSendParts = (32u << 20) / 65536u + 2u;   // the streamed-range cases send up to 24 MiB
     for (uint32_t part = 0; off < bytes.size() && part < kSendParts; ++part) {
 #ifdef MSG_NOSIGNAL
         constexpr int flags = MSG_NOSIGNAL;
@@ -335,5 +335,60 @@ TEST(S3VersionedRange, DirectProviderRefusesResetWorkspaceOutputAndOverflowingAd
     uint32_t separate = 47;
     EXPECT_EQ(os_get_range_if_match(&store, "key", bad, 0, 1, &scratch, &byte, &separate), kOsBadArg);
     EXPECT_EQ(*got, 61u); EXPECT_EQ(separate, 47u);
+}
+
+// G2ICE-381: the streamed range: same request, same head rules, body through the sink in buffer-sized pieces.
+struct StreamOut { std::vector<uint8_t> bytes; uint32_t pieces = 0, largest = 0; };
+bool stream_fn(void* ctx, const uint8_t* d, uint32_t n) noexcept {
+    auto* o = static_cast<StreamOut*>(ctx);
+    o->bytes.insert(o->bytes.end(), d, d + n);
+    ++o->pieces;
+    o->largest = std::max(o->largest, n);
+    return true;
+}
+int stream_request(VersionServer& server, uint32_t buf_cap, StreamOut* out, uint64_t* delivered) {
+    if (!server.start()) { ADD_FAILURE() << "fixture start"; return kOsIoError; }
+    S3ObjectStore s3{}; ObjectStore store{};
+    if (!server.store(&s3, &store)) return kOsBadArg;
+    ObjectVersion expected{}; expected.size = server.extent; std::strcpy(expected.etag, kTag);
+    std::vector<uint8_t> buf(buf_cap);
+    const ObjectRangeSink sink{&stream_fn, out, buf.data(), buf_cap, 0};
+    const int rc = os_get_range_if_match_stream(&store, "key name.bin", &expected, server.offset, server.length, &sink, delivered);
+    server.stop(); EXPECT_TRUE(server.valid); EXPECT_EQ(server.requests, 1u);
+    return rc;
+}
+TEST(S3VersionedRange, StreamedRangeIsOneSignedRequestOfAnyLengthInBoundedPieces) {
+    for (const uint32_t length : {kLength, 1u << 20, 8u << 20, 12u << 20, 16u << 20, 17u << 20, 24u << 20}) {   // past kHttpMaxBody and the 8 MiB materialized bound
+        SCOPED_TRACE(length);
+        VersionServer server; server.length = length; server.extent = kOffset + length;
+        StreamOut out; uint64_t delivered = 0;
+        ASSERT_EQ(stream_request(server, 64u << 10, &out, &delivered), kOsOk);
+        ASSERT_EQ(delivered, length); ASSERT_EQ(out.bytes.size(), length);
+        EXPECT_LE(out.largest, 64u << 10);
+        uint32_t matched = 0;
+        while (matched < length && out.bytes[matched] == value(kOffset + matched)) ++matched;
+        ASSERT_EQ(matched, length) << "first differing byte " << matched;
+    }
+}
+TEST(S3VersionedRange, StreamedRangeChecksTheHeadBeforeAnyByteReachesTheSink) {
+    for (const Reply reply : {Reply::MissingEtag, Reply::DuplicateEtag, Reply::WeakEtag, Reply::OversizeEtag, Reply::MissingRange,
+        Reply::DuplicateRange, Reply::WrongRange, Reply::OverflowRange, Reply::WrongTotal, Reply::IgnoredRange, Reply::ShortBody,
+        Reply::MissingLength, Reply::DuplicateLength}) {
+        SCOPED_TRACE(static_cast<int>(reply));
+        VersionServer server; server.reply = reply;
+        StreamOut out; uint64_t delivered = 99;
+        EXPECT_EQ(stream_request(server, 16, &out, &delivered), kOsIoError);
+        EXPECT_EQ(delivered, 0u); EXPECT_TRUE(out.bytes.empty());
+    }
+    for (const Reply reply : {Reply::Precondition, Reply::PreconditionBody, Reply::ChangedEtag, Reply::NotFound}) {
+        VersionServer server; server.reply = reply;
+        StreamOut out; uint64_t delivered = 99;
+        EXPECT_EQ(stream_request(server, 16, &out, &delivered), reply == Reply::NotFound ? kOsNotFound : kOsPreconditionFailed);
+        EXPECT_EQ(delivered, 0u); EXPECT_TRUE(out.bytes.empty());
+    }
+    VersionServer cut; cut.reply = Reply::Truncated;   // the head is right, the body stops short: an error after the bytes it had
+    StreamOut out; uint64_t delivered = 0;
+    EXPECT_EQ(stream_request(cut, 16, &out, &delivered), kOsIoError);
+    EXPECT_EQ(delivered, kLength - 1u);
 }
 }  // namespace
