@@ -86,7 +86,7 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
             bool if_none_match, Arena* arena,
             net::HttpResponse* resp, const char* range = nullptr,
             uint16_t timeout_ms = 0, uint32_t response_limit = 0,
-            const char* if_match = nullptr) noexcept {
+            const char* if_match = nullptr, const net::HttpBodyStream* stream = nullptr) noexcept {
     assert(s3 != nullptr && method != nullptr && key != nullptr);
     assert(arena != nullptr && resp != nullptr);
     if (len > net::kHttpMaxBody) return kOsBadArg;
@@ -158,6 +158,10 @@ int s3_send(S3ObjectStore* s3, const char* method, const char* key,
     if (range != nullptr) ok = ok && net::http_request_add_header(&req, "Range", range);
     if (if_match != nullptr) ok = ok && net::http_request_add_header(&req, "If-Match", if_match);
     if (!ok) return kOsBadArg;
+    if (stream != nullptr) {   // G2ICE-381: the callbacks decide; -4 is their refusal, reported by the caller from its context
+        const int rc = net::http_send_stream(&req, resp, stream);
+        return rc == 0 ? kOsOk : rc == -4 ? kOsCancelled : kOsIoError;
+    }
     return net::http_send(arena, &req, resp) == 0 ? kOsOk : kOsIoError;
 }
 
@@ -215,7 +219,7 @@ bool response_version(const net::HttpResponse& response, ObjectVersion* out) noe
     *out = version;
     return true;
 }
-bool exact_content_range(const char* text, uint64_t off, uint32_t length, uint64_t size) noexcept {
+bool exact_content_range(const char* text, uint64_t off, uint64_t length, uint64_t size) noexcept {
     assert(text != nullptr);
     assert(length > 0 && off <= size && length <= size - off);
     std::string_view value(text);
@@ -286,6 +290,68 @@ int s3_get_range_if_match(void* impl, const char* key, const ObjectVersion* expe
     std::memcpy(dst, response.body, length);
     *out_length = length;
     return kOsOk;
+}
+
+// G2ICE-381: one streamed If-Match range. The head is held to the same rules as s3_get_range_if_match before any byte reaches
+// the sink; the verdict of a refused head is kept in the context (http_send_stream only reports the refusal).
+struct S3RangeStream {
+    const ObjectVersion*   expected;
+    uint64_t               offset, length;
+    const ObjectRangeSink* sink;
+    uint64_t*              delivered;
+    int                    verdict;
+};
+bool s3_stream_head(void* ctx, const net::HttpResponse* r) noexcept {
+    auto* s = static_cast<S3RangeStream*>(ctx);
+    assert(s != nullptr && r != nullptr);
+    s->verdict = kOsIoError;
+    if (r->status == 412) { s->verdict = kOsPreconditionFailed; return false; }
+    if (r->status == 404) { s->verdict = kOsNotFound; return false; }
+    const char* etag = nullptr;
+    const char* content_range = nullptr;
+    const char* content_length = nullptr;
+    uint64_t declared = 0;
+    if (r->status != 206 || !single_header(*r, "ETag", &etag) || !single_header(*r, "Content-Range", &content_range) ||
+        !single_header(*r, "Content-Length", &content_length) || !decimal_u64(content_length, &declared) || declared != s->length)
+        return false;
+    ObjectVersion actual{};
+    const size_t tag_size = std::strlen(etag);
+    if (tag_size >= sizeof(actual.etag)) return false;
+    std::memcpy(actual.etag, etag, tag_size + 1u);
+    if (!os_object_version_valid(&actual)) return false;
+    if (std::strcmp(actual.etag, s->expected->etag) != 0) { s->verdict = kOsPreconditionFailed; return false; }
+    if (!exact_content_range(content_range, s->offset, s->length, s->expected->size)) return false;
+    s->verdict = kOsOk;
+    return true;
+}
+bool s3_stream_body(void* ctx, const uint8_t* data, uint32_t n) noexcept {
+    auto* s = static_cast<S3RangeStream*>(ctx);
+    assert(s != nullptr && data != nullptr && n > 0);
+    if (!s->sink->fn(s->sink->ctx, data, n)) { s->verdict = kOsCancelled; return false; }
+    *s->delivered += n;
+    return true;
+}
+int s3_get_range_if_match_stream(void* impl, const char* key, const ObjectVersion* expected, uint64_t offset,
+                                 uint64_t length, const ObjectRangeSink* sink, uint64_t* delivered) noexcept {
+    assert(impl != nullptr && key != nullptr && expected != nullptr);
+    assert(sink != nullptr && delivered != nullptr);
+    *delivered = 0;
+    if (!os_object_version_valid(expected) || offset > expected->size || length > expected->size - offset ||
+        sink->buf_cap > net::kHttpMaxBody) return kOsBadArg;
+    if (length == 0) return kOsOk;
+    char range[64]{};
+    const int n = std::snprintf(range, sizeof(range), "bytes=%llu-%llu",
+        static_cast<unsigned long long>(offset), static_cast<unsigned long long>(offset + length - 1u));
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(range)) return kOsBadArg;
+    S3RangeStream st{expected, offset, length, sink, delivered, kOsIoError};
+    const net::HttpBodyStream hs{&s3_stream_head, &s3_stream_body, &st, sink->buf, sink->buf_cap, 0, length};
+    Arena scratch;
+    net::HttpResponse response{};
+    const int rc = s3_send(static_cast<S3ObjectStore*>(impl), "GET", key, "", nullptr, 0,
+        false, &scratch, &response, range, 0, 0, expected->etag, &hs);
+    if (rc == kOsCancelled) return st.verdict == kOsOk ? kOsCancelled : st.verdict;   // the head or the sink refused
+    if (rc != kOsOk) return st.verdict == kOsOk || st.verdict == kOsIoError ? kOsIoError : st.verdict;
+    return *delivered == length ? kOsOk : kOsIoError;
 }
 
 struct ContiguousSource { const uint8_t* data; };
@@ -542,7 +608,7 @@ int s3_head(void* impl, const char* key, ObjectMeta* out) noexcept {
 const ObjectStoreVT kS3VT = {
     s3_get, s3_put, s3_list, s3_delete, s3_head, s3_put_if_absent,
     s3_get_range, s3_head_versioned, s3_get_range_if_match, s3_put_if_absent_versioned,
-    s3_list_visit,
+    s3_list_visit, s3_get_range_if_match_stream,
 };
 
 constexpr uint32_t kUploadResponseBytes = 64u * 1024u;

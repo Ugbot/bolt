@@ -724,6 +724,54 @@ bool receive_response(HttpConn* c, const HttpRequest* req, Arena* arena, HttpRes
     return complete;
 }
 
+// A Content-Length the head parser already validated (decimal, no uint64 overflow); false when absent or duplicated.
+bool declared_length(const HttpResponse* out, uint64_t* n) noexcept {
+    assert(out != nullptr && n != nullptr);
+    const char* cl = nullptr;
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < out->header_count; ++i)
+        if (ieq(out->headers[i].name, "Content-Length")) { cl = out->headers[i].value; ++seen; }
+    if (seen != 1) return false;
+    *n = std::strtoull(cl, nullptr, 10);
+    return true;
+}
+
+// The head, then the declared body in pieces of at most buf_cap: the bytes read with the head first, then straight into buf.
+// Each piece renews the deadline: a stream is bounded by its progress, not by the length of the transfer.
+int stream_response(HttpConn* c, const HttpRequest* req, HttpResponse* out, const HttpBodyStream* st) noexcept {
+    assert(c != nullptr && req != nullptr && out != nullptr && st != nullptr);
+    assert(st->buf != nullptr && st->buf_cap > 0);
+    ResponseRead read{c, nullptr, out, nullptr, 0, 0, 0, 0, kMaxWireOverhead};
+    int rc = response_head(&read) ? 0 : -1;
+    const bool no_body = ieq(req->method, "HEAD") || out->status == 204 || out->status == 304 || out->status / 100 == 1;
+    uint64_t total = 0;
+    if (rc == 0 && !st->on_head(st->ctx, out)) rc = -4;          // a refused head (412, 404) is decided whatever its body
+    if (rc == 0 && !no_body && (find_header(out->headers, out->header_count, "Transfer-Encoding") != nullptr ||
+                                !declared_length(out, &total) || total > st->max_body)) rc = -6;
+    const uint32_t early = rc == 0 && !no_body ? read.size - read.head_end : 0u;
+    if (early > total) rc = -6;                                   // more bytes than declared: not one response
+    uint64_t done = 0;
+    for (uint32_t at = 0; rc == 0 && at < early;) {               // bounded by the head buffer
+        const uint32_t n = std::min(early - at, st->buf_cap);
+        std::memcpy(st->buf, read.data + read.head_end + at, n);
+        if (!st->on_body(st->ctx, st->buf, n)) rc = -4;
+        at += n;
+        done += n;
+    }
+    std::free(read.data);
+    const uint32_t timeout = req->timeout_ms ? req->timeout_ms : kDefaultTimeoutMs;
+    for (uint64_t reads = 0; rc == 0 && !no_body && done < total && reads <= total; ++reads) {   // each read moves >= 1 byte
+        c->deadline = now_ms() + timeout;
+        const uint64_t want = std::min<uint64_t>(total - done, st->buf_cap);
+        const int32_t n = conn_recv_some(c, st->buf, static_cast<uint32_t>(want));
+        if (n <= 0) { rc = -1; break; }
+        if (!st->on_body(st->ctx, st->buf, static_cast<uint32_t>(n))) rc = -4;
+        done += static_cast<uint32_t>(n);
+    }
+    assert(rc != 0 || no_body || done == total);
+    return rc;
+}
+
 } // namespace
 
 int http_send(bolt::Arena* arena, const HttpRequest* req, HttpResponse* out) noexcept {
@@ -747,6 +795,30 @@ int http_send(bolt::Arena* arena, const HttpRequest* req, HttpResponse* out) noe
     const bool complete = sent && receive_response(&connection, req, arena, out);
     conn_close(&connection);
     return complete ? 0 : -1;
+}
+
+int http_send_stream(const HttpRequest* req, HttpResponse* out, const HttpBodyStream* stream) noexcept {
+    assert(req != nullptr && out != nullptr);
+    assert(stream != nullptr);
+    out->status = 0;
+    out->header_count = 0;
+    out->body = nullptr;
+    out->body_len = 0;
+    if (stream->on_head == nullptr || stream->on_body == nullptr || stream->buf == nullptr || stream->buf_cap == 0 ||
+        stream->buf_cap > kHttpMaxBody) return -1;
+    if (!request_valid(req) || !request_framing_valid(req) || !wsa_init_once()) return -1;
+    bool https = false;
+    char host[256], path[kHttpMaxUrl], authority[sizeof(host) + 8];
+    uint16_t port = 0;
+    if (!http_url_parse(req->url, &https, host, sizeof(host), &port, path, sizeof(path)) ||
+        !http_url_authority(req->url, authority, sizeof(authority))) return -2;
+    uint32_t ipv4 = 0;
+    if (!resolve_host(host, &ipv4)) return -3;
+    HttpConn connection;
+    if (!open_connection(&connection, req, https, host, ipv4, port)) return -5;
+    const int rc = send_request_head(&connection, req, path, authority) ? stream_response(&connection, req, out, stream) : -1;
+    conn_close(&connection);
+    return rc;
 }
 
 } // namespace net

@@ -53,6 +53,14 @@ struct ObjectMeta {
 // Visitor for list_visit / os_list_visit (G2ICE-245): called once per key under the prefix, in store order. Return kOsOk to
 // continue; any other code stops the walk and is returned by the listing.
 using ObjectVisitFn = int (*)(void* ctx, const char* key, uint64_t size) noexcept;
+// The receiving end of a streamed range (G2ICE-381): fn gets consecutive pieces of at most buf_cap bytes, written in buf.
+struct ObjectRangeSink {
+    bool (*fn)(void* ctx, const uint8_t* data, uint32_t n) noexcept;
+    void*    ctx;
+    uint8_t* buf;
+    uint32_t buf_cap;
+    uint32_t _pad;
+};
 
 // The trait. `impl` carries the implementation's state (filesystem root, S3
 // config, ...). Every function pointer takes that `impl` first.
@@ -117,6 +125,12 @@ struct ObjectStoreVT {
     // the prefix holds, one pass (S3: one request per page). Same completeness contract as list_prefix: a walk that cannot
     // finish returns an error, never kOsOk over a short walk. Optional; os_list_visit falls back to os_list_all.
     int (*list_visit)(void* impl, const char* prefix, ObjectVisitFn fn, void* ctx) noexcept = nullptr;
+    // G2ICE-381: get_range_if_match as ONE streamed request of any length within the expected extent: the status, ETag,
+    // Content-Range and Content-Length are checked before any byte reaches the sink, then the body goes through the sink's
+    // buffer piece by piece. *delivered counts bytes the sink accepted; kOsOk only when all `length` were. A sink that refuses
+    // ends the request (kOsCancelled). Optional; no emulation.
+    int (*get_range_if_match_stream)(void* impl, const char* key, const ObjectVersion* expected, uint64_t offset,
+                                     uint64_t length, const ObjectRangeSink* sink, uint64_t* delivered) noexcept = nullptr;
 };
 
 struct ObjectStore {
@@ -251,6 +265,20 @@ inline int os_get_range_if_match(ObjectStore* s, const char* key, const ObjectVe
         !detail::object_io_admit(inputs, 2, outputs, 2, scratch, protected_spans, 2)) return kOsBadArg;
     if (s->vt->get_range_if_match == nullptr) { *out_length = 0; return kOsNotImplemented; }
     return s->vt->get_range_if_match(s->impl, key, expected, offset, length, scratch, dst, out_length);
+}
+inline int os_get_range_if_match_stream(ObjectStore* s, const char* key, const ObjectVersion* expected, uint64_t offset,
+                                        uint64_t length, const ObjectRangeSink* sink, uint64_t* delivered) noexcept {
+    assert(s != nullptr && s->vt != nullptr && key != nullptr);
+    assert(expected != nullptr && sink != nullptr && delivered != nullptr);
+    detail::ObjectSpan inputs[3]{{}, {expected, sizeof(*expected)}, {sink, sizeof(*sink)}};
+    const detail::ObjectSpan outputs[]{{sink->buf, sink->buf_cap}, {delivered, sizeof(*delivered)}};
+    const detail::ObjectSpan protected_spans[]{{s, sizeof(*s)}, {s->vt, sizeof(*s->vt)}};
+    if (sink->fn == nullptr || sink->buf == nullptr || sink->buf_cap == 0 ||
+        !detail::object_key_span(key, kOsMaxKey, &inputs[0]) ||
+        !detail::object_io_admit(inputs, 3, outputs, 2, nullptr, protected_spans, 2)) return kOsBadArg;
+    *delivered = 0;
+    if (s->vt->get_range_if_match_stream == nullptr) return kOsNotImplemented;
+    return s->vt->get_range_if_match_stream(s->impl, key, expected, offset, length, sink, delivered);
 }
 
 // ---------------------------------------------------------------------------
