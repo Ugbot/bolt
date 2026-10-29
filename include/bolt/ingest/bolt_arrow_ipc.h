@@ -124,6 +124,10 @@ inline constexpr std::uint16_t kIpcMaxNestDepth = 8;
 /// nullptr/0. arrow_ipc_open_nested() rejects the mismatched shape at
 /// open() (fail closed) rather than silently ignoring extra/missing
 /// children.
+/// Unit a Timestamp leaf's int64 values count in (G2ICE-309). The values
+/// are written unchanged; only the schema's TimeUnit differs.
+enum IpcTimeUnit : std::uint8_t { kIpcTimeMicro = 0, kIpcTimeNano = 1 };
+
 struct FieldSpec {
     BoltType          type;
     const char*       name;           // nullptr/"" -> a name is synthesized
@@ -134,6 +138,9 @@ struct FieldSpec {
                                        // a valid non-decimal leaf
     std::uint16_t     n_children;     // 0 (leaf), 1 (List), or N (Struct)
     const FieldSpec*  children;       // borrowed; must outlive the open() call
+    // Timestamp leaves only: one of IpcTimeUnit. Zero (a zeroed FieldSpec) is
+    // microseconds, the unit BoltType::Timestamp has always meant here.
+    std::uint8_t      time_unit;
 };
 
 /// One flattened field, as arrow_ipc_open()/arrow_ipc_open_nested() build
@@ -153,6 +160,7 @@ struct IpcFieldDesc {
                                     // meaningful iff n_children > 0
     std::uint8_t  n_children;      // 0 (leaf), 1 (List), or N (Struct)
     std::uint8_t  decimal_scale;   // Decimal128 leaves only
+    std::uint8_t  time_unit;       // Timestamp leaves only (IpcTimeUnit)
 };
 
 // Zero-initialize before the first open() (calloc or `{}`); open()
@@ -187,6 +195,15 @@ bool arrow_ipc_open(ArrowIpcWriter* w, std::FILE* f,
                     const BoltType* types, const char* const* names,
                     std::uint16_t n_cols,
                     const std::uint8_t* decimal_scales = nullptr) noexcept;
+
+/// arrow_ipc_open() plus `time_units[i]` (IpcTimeUnit) for each Timestamp
+/// column; nullptr means every Timestamp is microseconds. A unit outside
+/// IpcTimeUnit fails closed.
+bool arrow_ipc_open_units(ArrowIpcWriter* w, std::FILE* f,
+                          const BoltType* types, const char* const* names,
+                          std::uint16_t n_cols,
+                          const std::uint8_t* decimal_scales,
+                          const std::uint8_t* time_units) noexcept;
 
 /// Begin a stream whose columns may be List/Struct: like arrow_ipc_open(),
 /// but each of the `n_cols` top-level columns is a recursive `FieldSpec`
