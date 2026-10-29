@@ -457,6 +457,40 @@ TEST(NestedFlat, FlatFieldEqualsFlatPath) {
     for (int64_t i = 0; i < ra; ++i) EXPECT_EQ(render(t, t.top[top], a, i), render(t, t.top[top], b, i));
 }
 
+TEST(NestedTemporal, NanosecondsRemainExactInWholeAndRangedReads) {
+    const auto bytes = slurp(data_path("timestamp_ns.parquet")); ASSERT_FALSE(bytes.empty());
+    const int64_t expected[2][4]{{1234567891,0,0,-1},{-1,0,1700000000000000001LL,0}};
+    const bool present[2][4]{{true,false,false,true},{true,false,true,false}};
+    for (const bool ranged : {false,true}) {
+        Arena arena; auto* meta = arena.allocate_array<PqMeta>(1); PqSchemaTree tree{};
+        ASSERT_TRUE(parquet_read_meta(bytes.data(),bytes.size(),&arena,meta));
+        ASSERT_TRUE(parquet_read_schema_tree(bytes.data(),bytes.size(),&arena,&tree));
+        uint32_t footer = 0; std::memcpy(&footer,bytes.data()+bytes.size()-8u,4);
+        uint64_t capacity = footer;
+        for (uint32_t i = 0; i < meta->n_chunks; ++i) capacity = std::max(capacity,static_cast<uint64_t>(meta->chunks[i].total_compressed_size));
+        std::vector<uint8_t> scratch(static_cast<size_t>(capacity));
+        PinnedMemory memory{&bytes}; ParquetByteSource source{bytes.size(),&memory,PinnedMemory::read};
+        ParquetSourceWorkspace workspace{scratch.data(),capacity,37};
+        if (ranged) ASSERT_EQ(parquet_read_meta_source_nested(&source,&workspace,&arena,meta,&tree),ParquetSourceStatus::Ok);
+        ASSERT_EQ(meta->n_row_groups,2u); ASSERT_EQ(tree.n_top,1u);
+        for (uint32_t g = 0; g < 2; ++g) {
+            BoltColumn output{}; int64_t count = 0;
+            if (ranged) ASSERT_EQ(parquet_read_nested_column_source(&source,&workspace,meta,&tree,g,0,&arena,&output,&count,true),ParquetSourceStatus::Ok);
+            else ASSERT_TRUE(parquet_read_nested_column_tree(bytes.data(),bytes.size(),meta,&tree,g,0,&arena,&output,&count,true));
+            ASSERT_EQ(count,2); EXPECT_EQ(output.is_null(0),false); EXPECT_EQ(output.is_null(1),g == 0);
+            std::memset(scratch.data(),0xDA,scratch.size());
+            for (uint32_t c = 0; c < 2; ++c) {
+                const auto* leaf = output.child_at(c); ASSERT_NE(leaf,nullptr); EXPECT_EQ(leaf->type,BoltType::Int64);
+                for (uint32_t row = 0; row < 2; ++row) {
+                    const auto index = 2u*g+row;
+                    EXPECT_EQ(!leaf->is_null(row),present[c][index]);
+                    if (present[c][index]) EXPECT_EQ(static_cast<const int64_t*>(leaf->data)[row],expected[c][index]);
+                }
+            }
+        }
+    }
+}
+
 TEST(NestedRobust, OutOfRangeArgumentsRefuse) {
     const std::vector<uint8_t> buf = slurp(data_path("map_v2_dict.parquet"));
     ASSERT_FALSE(buf.empty());

@@ -259,7 +259,7 @@ ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* sou
 ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* w, const PqMeta* meta, const PqSchemaTree* tree,
     uint32_t row_group, uint32_t top_field, Arena* arena,
-    BoltColumn* out, int64_t* rows) noexcept {
+    BoltColumn* out, int64_t* rows, bool retain_nanoseconds) noexcept {
     assert(source != nullptr && w != nullptr && meta != nullptr);
     assert(arena != nullptr && out != nullptr && rows != nullptr);
     if (!admitted(source, w) || !nested_spans(source, w, meta, tree, arena, out, rows))
@@ -285,7 +285,7 @@ ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* s
             if (status != Status::Ok) return status;
         }
         if (!pq_decode_leaf_slots(w->bytes, length, meta, row_group, row_group + 1u,
-                                   col, arena, &leaves[i], offset)) return Status::DecodeFailed;
+                                   col, arena, &leaves[i], offset, retain_nanoseconds)) return Status::DecodeFailed;
     }
     BoltColumn staged{};
     int64_t decoded = 0;

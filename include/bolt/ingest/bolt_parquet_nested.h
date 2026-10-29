@@ -3,6 +3,8 @@
 // PqMeta keeps only LEAF columns. This header adds the GROUP tree the leaves
 // hang off, in two views, and a reader that assembles one top-level field of
 // a row group into a ColumnFormat::Nested BoltColumn tree.
+// retain_nanoseconds opts into exact Int64 ticks for nanosecond leaves. The
+// caller must retain unit/UTC metadata; the default keeps the microsecond API.
 //
 //   PqSchemaNode  one raw parquet SchemaElement, DFS order, [0] = root.
 //                 Names, repetition, ConvertedType/LogicalType, field id
@@ -134,7 +136,7 @@ bool parquet_read_nested_column_tree(const uint8_t* buf, uint64_t len,
                                      const PqSchemaTree* tree,
                                      uint32_t row_group, uint32_t top_field,
                                      Arena* arena, BoltColumn* out,
-                                     int64_t* out_rows) noexcept;
+                                     int64_t* out_rows, bool retain_nanoseconds = false) noexcept;
 
 // Same, parsing the schema tree from `buf`'s footer on each call.
 bool parquet_read_nested_column(const uint8_t* buf, uint64_t len,

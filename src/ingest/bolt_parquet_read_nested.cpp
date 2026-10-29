@@ -192,7 +192,7 @@ bool parquet_read_nested_column_tree(const uint8_t* buf, uint64_t len,
                                      const PqSchemaTree* tree,
                                      uint32_t row_group, uint32_t top_field,
                                      Arena* arena, BoltColumn* out,
-                                     int64_t* out_rows) noexcept {
+                                     int64_t* out_rows, bool retain_nanoseconds) noexcept {
     if (buf == nullptr || meta == nullptr || tree == nullptr || arena == nullptr ||
         out == nullptr || out_rows == nullptr) return false;
     if (row_group >= meta->n_row_groups || top_field >= tree->n_top) return false;
@@ -200,7 +200,8 @@ bool parquet_read_nested_column_tree(const uint8_t* buf, uint64_t len,
     if (!tree_matches(meta, tree, f)) return false;
     const int64_t rows = meta->row_groups[row_group].num_rows;
     assert(f.col_end <= meta->n_columns);
-    if (f.kind == PqFieldKind::Leaf && meta->columns[f.column].max_def <= 1u) {
+    if (f.kind == PqFieldKind::Leaf && meta->columns[f.column].max_def <= 1u &&
+        !(retain_nanoseconds && meta->columns[f.column].time_unit == 3)) {
         const uint16_t c = static_cast<uint16_t>(f.column);
         return parquet_read_row_group_cols(buf, len, meta, row_group, &c, 1,
                                            arena, out, out_rows);
@@ -210,7 +211,7 @@ bool parquet_read_nested_column_tree(const uint8_t* buf, uint64_t len,
     if (leaves == nullptr) return false;
     for (uint32_t k = 0; k < n; ++k) {
         if (!pq_decode_leaf_slots(buf, len, meta, row_group, row_group + 1u,
-                                  f.col_begin + k, arena, &leaves[k]) ||
+                                  f.col_begin + k, arena, &leaves[k],0,retain_nanoseconds) ||
             leaves[k].n_rows != rows) return false;
     }
     return pq_assemble_nested(meta, tree, row_group, top_field, leaves, n,

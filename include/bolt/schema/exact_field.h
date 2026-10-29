@@ -4,7 +4,7 @@ namespace bolt::schema {
 // Metadata only: no row inference, planner identity or allocation. Enum values
 // are codec ABI; unknown values refuse rather than falling back to strings.
 enum class Physical : uint8_t { Bool=1, Signed, Unsigned, Float, Decimal, Utf8, Binary, Temporal, Group };
-enum class Temporal : uint8_t { None, Timestamp, Duration, Date, Time };
+enum class Temporal : uint8_t { None, Timestamp, Duration, Date, Time, TimestampUtc };
 enum class Unit : uint8_t { None, Second, Millisecond, Microsecond, Nanosecond, Day };
 enum class Presence : uint8_t { Required, Nullable, Optional };
 struct ExactField {

@@ -184,3 +184,6 @@ that motivated a given design decision; treat those mentions as context for
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Retained nested schemas distinguish local/UTC timestamp meaning and opt into exact
+nanosecond ticks in ordinary Iceberg scans. [Contract and regression fixture](docs/nested-temporal-ticks.md).

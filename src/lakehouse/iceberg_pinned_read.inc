@@ -298,6 +298,7 @@ BoltType fill_bolt_type(const char* t, uint32_t* fixed, uint32_t* scale) noexcep
     unsigned p = 0, sc = 0, len = 0;
     if (std::strcmp(t, "time") == 0) return BoltType::Duration;
     if (std::strcmp(t, "timestamp") == 0 || std::strcmp(t, "timestamptz") == 0) return BoltType::Timestamp;
+    if (std::strcmp(t, "timestamp_ns") == 0 || std::strcmp(t, "timestamptz_ns") == 0) return BoltType::Int64;
     if (std::strcmp(t, "uuid") == 0) return BoltType::UUID;
     if (std::strcmp(t, "binary") == 0) return BoltType::Binary;
     if (std::sscanf(t, "decimal(%u,%u)", &p, &sc) == 2 && sc <= p && p <= 38u) {

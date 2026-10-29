@@ -80,7 +80,7 @@ inline bool validate_named_type(const NamedType& type) noexcept {
             (field.nullable && !node.nullable) ||
             field.precision > 76 || field.logical_bool > 1 ||
             (field.logical_bool && node.type != BoltType::Int64 && node.type != BoltType::Bool) ||
-            static_cast<uint8_t>(field.temporal) > static_cast<uint8_t>(schema::Temporal::Time) ||
+            static_cast<uint8_t>(field.temporal) > static_cast<uint8_t>(schema::Temporal::TimestampUtc) ||
             static_cast<uint8_t>(field.unit) > static_cast<uint8_t>(schema::Unit::Day)) return false;
         if (field.precision && (!type_detail::decimal(node.type) || field.precision < node.scale ||
             field.precision > (node.type == BoltType::Decimal64 ? 18 : node.type == BoltType::Decimal128 ? 38 : 76))) return false;

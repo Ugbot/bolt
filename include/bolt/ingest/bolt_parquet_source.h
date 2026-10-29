@@ -74,5 +74,5 @@ ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* sou
 ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* workspace, const PqMeta* meta, const PqSchemaTree* tree,
     uint32_t row_group, uint32_t top_field, Arena* output_arena,
-    BoltColumn* out, int64_t* out_rows) noexcept;
+    BoltColumn* out, int64_t* out_rows, bool retain_nanoseconds = false) noexcept;
 }  // namespace bolt::ingest::parquet

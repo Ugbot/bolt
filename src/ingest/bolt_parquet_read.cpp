@@ -2442,7 +2442,7 @@ bool leaf_levels_rows_ok(const PqMeta* meta, uint32_t g0, uint32_t g1,
 
 bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
                           uint32_t g0, uint32_t g1, uint32_t col, Arena* arena,
-                          PqLeafSlots* out, uint64_t base) noexcept {
+                          PqLeafSlots* out, uint64_t base, bool retain_nanoseconds) noexcept {
     assert(meta != nullptr && arena != nullptr && out != nullptr);
     if (buf == nullptr || g0 >= g1 || g1 > meta->n_row_groups ||
         col >= meta->n_columns || (base != 0 && g1 != g0 + 1u)) return false;
@@ -2456,6 +2456,12 @@ bool pq_decode_leaf_slots(const uint8_t* buf, uint64_t len, const PqMeta* meta,
     ColCtx cx;
     if (!init_col_ctx_any(meta, col, g0, g1, out->n_slots, arena, &elem, &cx)) {
         return false;
+    }
+    // The retained nested field tree supplies the unit. Keep nanoseconds as
+    // exact Int64 ticks instead of truncating or mislabelling them as micros.
+    if (retain_nanoseconds && pc->time_unit == 3 && (elem.type == BoltType::Timestamp || elem.type == BoltType::Duration)) {
+        cx.ts_rescale = 0; cx.type = BoltType::Int64;
+        elem.type = BoltType::Int64; elem.type_size_bytes = 8;
     }
     if (out->n_slots == 0) { out->values = elem; return true; }
     const uint64_t nb = (static_cast<uint64_t>(out->n_slots) + 7u) / 8u;

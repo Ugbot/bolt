@@ -201,9 +201,9 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
             const uint32_t top = s->source_indices[i];
             const bool ok = s->ranged
                 ? pq::parquet_read_nested_column_source(&file->source, &s->source_workspace,
-                    meta, &file->tree, row_group, top, s->scratch, &columns[i], rows) == pq::ParquetSourceStatus::Ok
+                    meta, &file->tree, row_group, top, s->scratch, &columns[i], rows, true) == pq::ParquetSourceStatus::Ok
                 : pq::parquet_read_nested_column_tree(body, length, meta, &file->tree,
-                    row_group, top, s->scratch, &columns[i], rows);
+                    row_group, top, s->scratch, &columns[i], rows, true);
             if (!ok) return false;
         }
         return true;

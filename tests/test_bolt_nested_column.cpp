@@ -190,6 +190,22 @@ TEST(NestedColumn, NamedMapsRequirePresentEntriesAndKeys) {
     EXPECT_FALSE(nr::encode_column(type,source,&output,{},&back)); EXPECT_EQ(back.length,777);
 }
 
+TEST(NestedColumn, UtcAndLocalTimestampRemainDistinctAcrossSchemaWire) {
+    Arena arena; auto local = named(fixture(arena));
+    local.fields[1].temporal = bolt::schema::Temporal::Timestamp;
+    local.fields[1].unit = bolt::schema::Unit::Nanosecond;
+    auto utc = local; utc.fields[1].temporal = bolt::schema::Temporal::TimestampUtc;
+    uint8_t first[nr::kMaxNamedTypeBytes], second[nr::kMaxNamedTypeBytes]; uint32_t n = 0, m = 0;
+    ASSERT_TRUE(nr::named_type_wire_encode(local,first,sizeof(first),&n));
+    ASSERT_TRUE(nr::named_type_wire_encode(utc,second,sizeof(second),&m));
+    ASSERT_EQ(n,m); EXPECT_NE(std::memcmp(first,second,n),0);
+    nr::NamedType decoded{}; ASSERT_TRUE(nr::named_type_wire_decode(second,m,&decoded));
+    EXPECT_EQ(decoded.fields[1].temporal,bolt::schema::Temporal::TimestampUtc);
+    EXPECT_EQ(decoded.fields[1].unit,bolt::schema::Unit::Nanosecond);
+    utc.fields[1].temporal = static_cast<bolt::schema::Temporal>(6);
+    EXPECT_FALSE(nr::validate_named_type(utc));
+}
+
 TEST(NestedColumn, RequirednessAndFixedWidthAreValidated) {
     Arena input, output; auto source = fixture(input); auto type = named(source); BoltColumn encoded{}, back{};
     ASSERT_TRUE(nr::encode_column(type,source,&output,{},&encoded));
