@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_nested_column.h"
 #include "bolt/bolt_column.h"
 #include "bolt/kernels/bolt_utf8.h"
 #include "bolt/kernels/bolt_nested_gather.h"
@@ -108,11 +109,11 @@ std::string render_leaf(const BoltColumn& c, int64_t i) {
         }
         case BoltType::UUID: return quote(raw + i * 16, 16);
         case BoltType::FixedSizeBinary: return quote(raw + i * 16, c.fixed_width);
-        case BoltType::Utf8: {
-            const StringView sv = at<StringView>(c, i);
-            const char* p = kernels::utf8::sv_bytes(
-                sv, static_cast<const char*>(c.str_overflow_base));
-            return quote(reinterpret_cast<const uint8_t*>(p), sv.length);
+        case BoltType::Utf8:
+        case BoltType::Binary: {
+            const uint8_t* bytes = nullptr; int32_t length = 0;
+            c.utf8_at(i,&bytes,&length);
+            return quote(bytes,static_cast<size_t>(length));
         }
         default: return "<type " + std::to_string(static_cast<int>(c.type)) + ">";
     }
@@ -308,6 +309,30 @@ TEST_P(NestedOracle, RowSelectionPreservesTypedValues) {
         EXPECT_FALSE(kernels::nested_gather(source,bad,1,&selected,&gathered));
         EXPECT_EQ(gathered.length,777);
     }
+}
+
+TEST_P(NestedOracle, TypedEncodedCarrierPreservesEveryNestedValue) {
+    const std::string name = GetParam(); const auto buf = slurp(data_path(name + ".parquet"));
+    ASSERT_FALSE(buf.empty()); Arena arena, encoded, decoded;
+    auto* meta = arena.allocate_array<PqMeta>(1); PqSchemaTree tree{};
+    ASSERT_TRUE(parquet_read_meta(buf.data(),buf.size(),&arena,meta));
+    ASSERT_TRUE(parquet_read_schema_tree(buf.data(),buf.size(),&arena,&tree));
+    uint32_t compared = 0;
+    for (uint32_t group = 0; group < meta->n_row_groups; ++group) for (uint32_t col = 0; col < tree.n_top; ++col) {
+        BoltColumn source{}, carrier{}, back{}; int64_t rows = 0;
+        ASSERT_TRUE(parquet_read_nested_column_tree(buf.data(),buf.size(),meta,&tree,group,col,&arena,&source,&rows));
+        if (!source.is_nested()) continue;
+        bolt::nested_row::TypeTree type{};
+        ASSERT_TRUE(bolt::nested_row::tree_from_column(source,&type));
+        for (uint32_t i = 0; i < type.n; ++i) type.nodes[i].nullable = 1;
+        ASSERT_TRUE(bolt::nested_row::encode_column(type,source,&encoded,{},&carrier));
+        ASSERT_EQ(carrier.type,source.type);
+        ASSERT_TRUE(bolt::nested_row::decode_column(type,carrier,&decoded,{},&back));
+        for (int64_t row = 0; row < rows; ++row) {
+            EXPECT_EQ(render(tree,tree.top[col],back,row),render(tree,tree.top[col],source,row)); ++compared;
+        }
+    }
+    EXPECT_GT(compared,0u);
 }
 
 TEST_P(NestedOracle, MatchesPyarrow) {

@@ -388,3 +388,16 @@ StringView spill bytes remain borrowed from the source, which must outlive the
 result. The ordinary Iceberg scanner uses it for row-delete filtering.
 Nested Parquet value fixtures, real Java-reader parity for schema evolution
 and cross-row-group position deletes, and existing reader regressions pass.
+
+`bolt_nested_type.h` / `bolt_nested_column.h` define a bounded shared carrier
+for typed encoded struct/list/map columns with a separately retained named
+schema. They reuse the existing nested-row bytes, retain the root BoltType,
+validate shapes/presence/required map keys, and stage output publication.
+Explicit row, encoded-byte and total-value budgets bound decoding (including
+children under null structs). `bolt_nested_type_wire.h` transports names, IDs,
+precision and temporal metadata as bounded pointer-free BNT1 schema bytes;
+unknown versions and malformed/trailing payloads refuse.
+The row codec now preserves decimal scale and safely sizes empty byte leaves.
+75 native checks and the 15-check owned-store nested drill pass on Clang/macOS.
+SQL catalog, operators and frontends still need to consume this contract;
+these APIs alone do not enable nested SQL or close G2ICE-400/307.

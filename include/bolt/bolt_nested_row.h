@@ -55,6 +55,7 @@ inline bool tree_add(const BoltColumn& c, TypeTree* t, uint32_t idx, uint32_t de
     nd = TypeNode{};
     nd.type = c.type;
     nd.logical = c.logical;
+    nd.scale = c.decimal_scale;
     nd.nullable = c.validity != nullptr ? 1u : 0u;
     if (!c.is_nested()) {
         nd.fixed_bytes = is_var_leaf(c) ? 0u : c.type_size_bytes;
@@ -87,7 +88,10 @@ struct Writer {
     uint8_t* p;
     size_t   cap;
     size_t   n;
+    bool failed = false;
     void put(const void* src, size_t len) noexcept {
+        if (len == 0) return;
+        if (len > SIZE_MAX - n) { failed = true; return; }
         if (n + len <= cap && p != nullptr) std::memcpy(p + n, src, len);
         n += len;                                                   // counts past `cap`: the caller sizes and retries
     }
@@ -128,7 +132,14 @@ inline bool enc(const TypeTree& t, uint32_t ni, const BoltColumn& c, int64_t i, 
     if (nd.fixed_bytes == 0u) {
         const uint8_t* bp = nullptr;
         int32_t len = 0;
-        c.utf8_at_or_empty(i, &bp, &len);
+        if (c.format == ColumnFormat::VarBinary) {
+            if (c.dict_child == nullptr || c.dict_child->data == nullptr) return false;
+            const auto* offsets = static_cast<const int32_t*>(c.dict_child->data);
+            if (offsets[i] < 0 || offsets[i+1] < offsets[i]) return false;
+            len = offsets[i+1] - offsets[i];
+            if (len && c.data == nullptr) return false;
+            if (len) bp = static_cast<const uint8_t*>(c.data) + offsets[i];
+        } else c.utf8_at_or_empty(i, &bp, &len);
         if (len < 0) return false;
         w->u32(static_cast<uint32_t>(len));
         w->put(bp, static_cast<size_t>(len));
@@ -145,7 +156,7 @@ inline bool enc(const TypeTree& t, uint32_t ni, const BoltColumn& c, int64_t i, 
 inline size_t encode_row(const TypeTree& t, const BoltColumn& c, int64_t i, uint8_t* out, size_t cap) noexcept {
     assert(t.n > 0u);
     Writer w{out, cap, 0u};
-    if (!detail::enc(t, 0u, c, i, 0u, &w)) return 0u;
+    if (!detail::enc(t, 0u, c, i, 0u, &w) || w.failed) return 0u;
     return w.n == 0u ? 1u : w.n;                                     // a value is never empty; 1 keeps 0 as the error
 }
 
@@ -282,6 +293,7 @@ inline bool build(const Decoder& d, uint32_t ni, uint32_t depth, BoltColumn* out
         out->fixed_width = nd.fixed_width;
     }
     out->logical = nd.logical;
+    out->decimal_scale = nd.scale;
     return out->format != ColumnFormat::Flat || out->data != nullptr || b.len == 0;
 }
 }  // namespace detail
