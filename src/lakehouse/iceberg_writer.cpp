@@ -27,6 +27,7 @@
 
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/writer.h"
+#include "bolt/lakehouse/iceberg/write_batch.h"
 #include "bolt/lakehouse/iceberg/metrics.h"
 #include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
@@ -389,7 +390,7 @@ const char* bolt_type_iceberg_name(BoltType t) noexcept {
 bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, BoltType* bt) noexcept {
     assert(t != nullptr && c != nullptr && bt != nullptr);
     IcebergTypeInfo info{};
-    if (!iceberg_type_parse(t, &info)) return true;                       // nested / unknown: the legacy default
+    if (!iceberg_type_parse(t, &info)) return false;
     GeoTypeInfo g{};
     if (geo_type_parse(t, static_cast<uint32_t>(std::strlen(t)), &g)) {   // G2ICE-327: WKB with the GEOMETRY / GEOGRAPHY
         *bt = BoltType::Binary;                                           // logical type; the crs points into `t`, which
@@ -400,6 +401,17 @@ bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, Bolt
         return true;
     }
     switch (info.type) {
+        case IcebergType::kBoolean:*bt=BoltType::Bool;return true;
+        case IcebergType::kInt:*bt=BoltType::Int32;return true;
+        case IcebergType::kLong:*bt=BoltType::Int64;return true;
+        case IcebergType::kFloat:*bt=BoltType::Float32;return true;
+        case IcebergType::kDouble:*bt=BoltType::Float64;return true;
+        case IcebergType::kString:*bt=BoltType::Utf8;return true;
+        case IcebergType::kDate:*bt=BoltType::Date32;return true;
+        case IcebergType::kTimestamp:case IcebergType::kTimestampTz:
+        case IcebergType::kTimestampNs:case IcebergType::kTimestampTzNs:
+            *bt=BoltType::Timestamp;c->timestamp_unit=(info.type==IcebergType::kTimestampNs || info.type==IcebergType::kTimestampTzNs)?3u:0u;
+            c->ts_local=info.type==IcebergType::kTimestamp || info.type==IcebergType::kTimestampNs;return true;
         case IcebergType::kBinary: *bt = BoltType::Binary; return true;
         case IcebergType::kUuid:   *bt = BoltType::UUID; return true;
         case IcebergType::kFixed:  *bt = BoltType::Binary; c->fixed_len = info.fixed_len; return true;
@@ -409,15 +421,17 @@ bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, Bolt
             c->precision = info.precision;
             c->scale = info.scale;
             return true;
-        default: return true;
+        default: return false;
     }
 }
+
+#include "iceberg_write_schema.inc"
 
 // Fills `po` for `sch`. A schema wider than the inline descriptor array
 // uses `wide` as its storage, so `wide` must outlive the writer open.
 bool make_pq_opts(const Schema* sch, const WriteOptions* w,
                   ingest::parquet::ParquetWriteOpts* po,
-                  std::vector<ingest::parquet::ParquetWriteColumn>* wide) noexcept {
+                  std::vector<ingest::parquet::ParquetWriteColumn>* wide,Arena* arena) noexcept {
     assert(sch != nullptr && po != nullptr);
     assert(wide != nullptr);
     *po = ingest::parquet::ParquetWriteOpts{};
@@ -428,19 +442,13 @@ bool make_pq_opts(const Schema* sch, const WriteOptions* w,
     if (cols == nullptr) return false;
     for (uint32_t i = 0; i < n; ++i) {
         std::strncpy(cols[i].name, sch->fields[i].name, sizeof(cols[i].name) - 1u);
-        // Map iceberg type string back to BoltType for the writer.
-        const char* t = sch->fields[i].type;
-        BoltType bt = BoltType::Utf8;
-        if (std::strcmp(t, "long") == 0)         bt = BoltType::Int64;
-        else if (std::strcmp(t, "int") == 0)     bt = BoltType::Int32;
-        else if (std::strcmp(t, "double") == 0)  bt = BoltType::Float64;
-        else if (std::strcmp(t, "float") == 0)   bt = BoltType::Float32;
-        else if (std::strcmp(t, "boolean") == 0) bt = BoltType::Bool;
-        else if (std::strcmp(t, "date") == 0)    bt = BoltType::Date32;
-        else if (std::strcmp(t, "timestamp") == 0) { bt = BoltType::Timestamp; cols[i].ts_local = true; }
-        else if (std::strcmp(t, "timestamptz") == 0) bt = BoltType::Timestamp;
-        else if (!pq_iceberg_type(t, &cols[i], &bt)) return false;
-        cols[i].type     = bt;
+        BoltType bt=BoltType::NA;
+        const auto& field=sch->fields[i];
+        if(!std::strcmp(field.type,"struct") || !std::strcmp(field.type,"list") || !std::strcmp(field.type,"map")) {
+            if(!nested_pq_options(field,arena,&cols[i]))return false;
+            bt=cols[i].nested[0].type;
+        } else if(!pq_iceberg_type(field.type,&cols[i],&bt))return false;
+        cols[i].type=bt;
         cols[i].nullable = !sch->fields[i].required;
         cols[i].has_field_id = true;
         cols[i].field_id = sch->fields[i].id;
@@ -1064,7 +1072,16 @@ bool append_write(AppendHandle* ah, const BoltBatch* batch) noexcept {
     assert(ah != nullptr && batch != nullptr);
     if (!write_ready(ah->th)) return false;
     if (ah->n_pending >= kMaxPendingBatch) return false;
-    ah->pending[ah->n_pending++] = batch;
+    const auto* schema=metadata_current_schema(&ah->th->meta);
+    if(!schema)return false;
+    BoltBatch* staged=nullptr;
+    const auto conformed=write_batch_conform(*schema,*batch,ah->th->arena,&staged);
+    if(conformed!=JsonValueStatus::Ok) {
+        ah->th->last_error=conformed==JsonValueStatus::Unsupported?CommitError::kUnimplemented:CommitError::kFailed;
+        std::fprintf(stderr,"[iceberg_writer] append refused: input/default does not conform (status %u); nothing was written\n",static_cast<unsigned>(conformed));
+        return false;
+    }
+    ah->pending[ah->n_pending++] = staged;
     return true;
 }
 
@@ -1118,7 +1135,7 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
     if (write_sch == nullptr) return false;
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
-    if (!make_pq_opts(write_sch, nullptr, &po, &wide)) return false;
+    if (!make_pq_opts(write_sch, nullptr, &po, &wide,th->arena)) return false;
     auto* w = data_file_begin(th, rel_out, snap_id, &po);
     if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     for (uint32_t i = 0; i < n_batches; ++i) {

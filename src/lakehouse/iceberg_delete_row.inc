@@ -44,11 +44,11 @@ bool row_delete_opts(TableHandle* th, ingest::parquet::ParquetWriteOpts* po,
                      std::vector<ingest::parquet::ParquetWriteColumn>* wide) noexcept {
     assert(th != nullptr && po != nullptr && wide != nullptr);
     Schema dsch{};
-    if (!position_delete_schema(th->arena, &dsch) || !make_pq_opts(&dsch, nullptr, po, wide)) return false;
+    if (!position_delete_schema(th->arena, &dsch) || !make_pq_opts(&dsch, nullptr, po, wide,th->arena)) return false;
     const Schema* cur = metadata_current_schema(&th->meta);
     auto* tmp = th->arena->allocate_array<ingest::parquet::ParquetWriteOpts>(1);
     std::vector<ingest::parquet::ParquetWriteColumn> wide_row;
-    if (tmp == nullptr || cur == nullptr || !make_pq_opts(cur, nullptr, tmp, &wide_row)) return false;
+    if (tmp == nullptr || cur == nullptr || !make_pq_opts(cur, nullptr, tmp, &wide_row,th->arena)) return false;
     const uint32_t n = cur->n_fields;
     auto* nodes = th->arena->allocate_array<ingest::parquet::ParquetNestedNode>(n + 1u);
     if (nodes == nullptr) return false;

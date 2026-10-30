@@ -431,3 +431,16 @@ Empty structs retain presence through construction, row decoding, named type
 validation and gather. Four focused suites (27 native cases) and 40 independent
 Iceberg-Java materialized values qualify this component. Write-default
 application, non-null geo WKT and complete manifest bounds remain pending.
+
+2026-10-30 G2ICE-314 write defaults: `iceberg/write_batch.h` binds named input
+columns with owned SwissTable lookup and fills omitted fields from write-default
+JSON, otherwise optional null. Supplied null stays null; missing required and
+unknown/duplicate names refuse transactionally. Public append uses the result.
+Writer options now derive recursive Parquet nodes and exact temporal/type
+annotations from SchemaField; preparation handles float32, decimal64 widening,
+fixed bytes and null-parent masking. Independent PyArrow reads real files;
+PyIceberg reads the same manifests/data through an explicitly documented
+annotation projection because its current model rejects ns defaults. Empty
+struct/unknown direct-write coverage, geo WKT and broader consumers remain explicit follow-ups.
+Unprojected nested delete files use identity root selection, independent of
+projected data-file indices (position-delete-with-row regression suite).

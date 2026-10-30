@@ -151,7 +151,7 @@ bool write_eq_file(TableHandle* th, int64_t snap_id, const EqKeySpec* k, const E
     ks.n_fields = k->n;
     ingest::parquet::ParquetWriteOpts* po = th->arena->allocate_array<ingest::parquet::ParquetWriteOpts>(1);
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
-    if (po == nullptr || !make_pq_opts(&ks, nullptr, po, &wide)) return false;
+    if (po == nullptr || !make_pq_opts(&ks, nullptr, po, &wide,th->arena)) return false;
     auto* w = data_file_begin(th, rel, snap_id, po);
     if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     for (uint32_t b = 0; b < g.n; ++b)                                    // bounded by the group's batches

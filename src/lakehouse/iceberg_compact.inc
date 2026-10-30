@@ -326,7 +326,7 @@ bool compact_open(CompactOut* o) noexcept {
     if (o->lineage && (sch = lineage_schema(th, sch)) == nullptr) return false;
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
-    if (!make_pq_opts(sch, nullptr, &po, &wide)) return false;
+    if (!make_pq_opts(sch, nullptr, &po, &wide,th->arena)) return false;
     o->w = data_file_begin(th, o->rel, o->snap_id, &po);
     o->file_open = o->w != nullptr;
     return o->file_open;

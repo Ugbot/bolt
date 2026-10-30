@@ -196,7 +196,7 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
         const uint32_t count = selected == 0 ? file->tree.n_top : selected;
         if (count > file->tree.n_top || count > kMaxColumns) return false;
         for (uint32_t i = 0; i < count; ++i) {
-            const uint32_t top = s->source_indices[i];
+            const uint32_t top = selected==0 ? i : s->source_indices[i];
             const bool ok = s->ranged
                 ? pq::parquet_read_nested_column_source(&file->source, &s->source_workspace,
                     meta, &file->tree, row_group, top, s->scratch, &columns[i], rows, true) == pq::ParquetSourceStatus::Ok
@@ -211,7 +211,14 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
     if (meta->n_columns == 0 || meta->n_columns > kMaxColumns) return false;
     const uint32_t count = selected==0 ? meta->n_columns : selected;
     if (count>kMaxColumns) return false;
+    const uint16_t* indices=s->source_indices;
+    if(selected==0) {
+        if(count>uint32_t{UINT16_MAX}+1u)return false;
+        auto* identity=s->scratch->allocate_array<uint16_t>(count);if(!identity)return false;
+        for(uint32_t i=0;i<count;++i)identity[i]=static_cast<uint16_t>(i);
+        indices=identity;
+    }
     return pq::parquet_read_row_group_cols_source(&file->source, &s->source_workspace,
-        meta, row_group, s->source_indices, count, s->scratch,
+        meta, row_group, indices, count, s->scratch,
         columns, rows, s->table->strict_pinned) == pq::ParquetSourceStatus::Ok;
 }

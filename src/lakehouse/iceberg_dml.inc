@@ -28,7 +28,7 @@ bool write_pos_delete_batch(TableHandle* th, int64_t snap_id, const BoltBatch* b
     if (!position_delete_schema(th->arena, &dsch)) return false;
     ingest::parquet::ParquetWriteOpts po{};
     std::vector<ingest::parquet::ParquetWriteColumn> wide;
-    if (!make_pq_opts(&dsch, nullptr, &po, &wide)) return false;
+    if (!make_pq_opts(&dsch, nullptr, &po, &wide,th->arena)) return false;
     // G2ICE-117: the spec-RESERVED field ids in the physical footer ([0]=file_path, [1]=pos).
     assert(po.n_columns == 2u && "position_delete_schema shape changed");
     po.columns[0].has_field_id = true;

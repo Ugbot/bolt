@@ -1031,6 +1031,7 @@ add_library(bolt_lakehouse STATIC
     src/lakehouse/iceberg_object_graph.cpp
     src/lakehouse/iceberg_manifest_avro.cpp
     src/lakehouse/iceberg_partition.cpp
+    src/lakehouse/iceberg_write_batch.cpp
     src/lakehouse/iceberg_json_value.cpp
     src/lakehouse/iceberg_partition_values.cpp
     src/lakehouse/iceberg_statistics.cpp

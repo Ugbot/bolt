@@ -140,6 +140,8 @@ bool table_uncertain_commit(const TableHandle* th, CommitCandidate* out) noexcep
 // Append path: open → write N batches → commit. Each commit emits one new
 // data Parquet file + a manifest + a manifest list + a new metadata.json.
 bool append_open  (AppendHandle** out, TableHandle* th) noexcept;
+// Named columns may omit fields: apply write-default (else optional null).
+// Explicit null never invokes a default. Buffers supplied by the caller stay borrowed.
 bool append_write (AppendHandle* ah, const BoltBatch* batch) noexcept;
 bool append_commit(AppendHandle* ah) noexcept;
 // As append_commit, and additionally reports the ABSOLUTE path of the data
