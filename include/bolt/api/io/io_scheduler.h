@@ -181,7 +181,10 @@ public:
         fair_queue::config fq{};
     };
 
-    explicit io_scheduler(const config& cfg = {});
+    // Not `const config& cfg = {}`: clang rejects a default argument that needs
+    // a nested struct's member initializers inside the enclosing class.
+    io_scheduler() : io_scheduler(config{}) {}
+    explicit io_scheduler(const config& cfg);
     ~io_scheduler() = default;
 
     io_scheduler(const io_scheduler&)            = delete;

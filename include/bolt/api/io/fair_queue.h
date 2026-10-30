@@ -104,7 +104,10 @@ public:
         class_id   klass_ = kInvalidClass;   // owning class while linked
     };
 
-    explicit fair_queue(config cfg = {}) noexcept : config_(cfg) {}
+    // Not `config cfg = {}`: clang rejects a default argument that needs a
+    // nested struct's member initializers inside the enclosing class.
+    fair_queue() noexcept : config_(config{}) {}
+    explicit fair_queue(config cfg) noexcept : config_(cfg) {}
 
     fair_queue(const fair_queue&)            = delete;
     fair_queue& operator=(const fair_queue&) = delete;

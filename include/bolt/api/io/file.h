@@ -176,7 +176,10 @@ public:
         uint32_t max_events = 256;   // completions drained per poll() call (Windows)
     };
 
-    static std::unique_ptr<file_io> create(const config& cfg = {});
+    // Not `const config& cfg = {}`: clang rejects a default argument that needs
+    // a nested struct's member initializers inside the enclosing class.
+    static std::unique_ptr<file_io> create() { return create(config{}); }
+    static std::unique_ptr<file_io> create(const config& cfg);
 
     ~file_io();
 
