@@ -594,3 +594,23 @@ TEST(BoltParseJsonNdjson, SaxAbortIsNotSkipped) {
         static_cast<int64_t>(src.size()),
         /*ignore_errors=*/true, &h, &st));
 }
+
+TEST(BoltParseJson, EscapeGrammarIsValidatedInTapeSaxAndSkippedSubtrees) {
+    const std::vector<std::string> bad={R"("\q")",R"("\v")",R"("\u123")",R"("\u12xz")",
+        R"("\uD800")",R"("\uDC00")",R"("\uD800\u0041")",R"("\uD800x")",
+        std::string("\"")+char(0xE2)+"\\n\""};
+    const char* paths[]={"/keep"};const int32_t lengths[]={5};
+    for(const auto& value:bad) {
+        Arena a=make_arena();StructuralIndex index{};const bolt::parse::json::SaxHandler callbacks{};
+        EXPECT_FALSE(build(a,value,&index))<<value;
+        EXPECT_FALSE(bolt::parse::json::sax_parse(reinterpret_cast<const uint8_t*>(value.data()),static_cast<int32_t>(value.size()),&callbacks))<<value;
+        PathFilter filter{};ASSERT_TRUE(bolt::parse::json::compile_paths(paths,lengths,1,&a,&filter));
+        const std::string doc="{\"skip\":"+value+",\"keep\":1}";
+        EXPECT_FALSE(bolt::parse::json::build_index_filtered(reinterpret_cast<const uint8_t*>(doc.data()),static_cast<int32_t>(doc.size()),&filter,&a,&index))<<value;
+    }
+    for(const char* value:{R"("\"\\\/\b\f\n\r\t")",R"("\u0000\u0041\u96ea")",R"("\uD83D\uDE00")"}) {
+        Arena a=make_arena();StructuralIndex index{};EXPECT_TRUE(build(a,value,&index))<<value;
+        const bolt::parse::json::SaxHandler callbacks{};
+        EXPECT_TRUE(bolt::parse::json::sax_parse(reinterpret_cast<const uint8_t*>(value),static_cast<int32_t>(std::strlen(value)),&callbacks))<<value;
+    }
+}

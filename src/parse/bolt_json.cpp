@@ -445,6 +445,31 @@ bool parse_float64_slice(const uint8_t* src, int32_t start, int32_t length,
     return bolt::kernels::float_chars::f64_from_json_chars(first, first + length, out);
 }
 
+bool scan_hex_quad(Parser* p,uint16_t* out) noexcept {
+    assert(p && out);assert(p->pos>=0 && p->pos<=p->src_len);
+    if(p->src_len-p->pos<4)return false;
+    uint16_t value=0;
+    for(uint32_t i=0;i<4;++i) {
+        const auto c=p->src[p->pos+static_cast<int32_t>(i)];
+        const int nibble=c>='0' && c<='9'?c-'0':c>='a' && c<='f'?c-'a'+10:c>='A' && c<='F'?c-'A'+10:-1;
+        if(nibble<0)return false;
+        value=static_cast<uint16_t>((value<<4)|nibble);
+    }
+    p->pos+=4;*out=value;return true;
+}
+bool scan_escape(Parser* p) noexcept {
+    assert(p);assert(p->pos<p->src_len && p->src[p->pos]=='\\');
+    if(p->src_len-p->pos<2)return false;
+    const auto c=p->src[p->pos+1];p->pos+=2;
+    if(c=='"' || c=='\\' || c=='/' || c=='b' || c=='f' || c=='n' || c=='r' || c=='t')return true;
+    uint16_t first=0;
+    if(c!='u' || !scan_hex_quad(p,&first))return false;
+    if(first<0xD800 || first>0xDFFF)return true;
+    if(first>=0xDC00 || p->src_len-p->pos<6 || p->src[p->pos]!='\\' || p->src[p->pos+1]!='u')return false;
+    p->pos+=2;uint16_t second=0;
+    return scan_hex_quad(p,&second) && second>=0xDC00 && second<=0xDFFF;
+}
+
 // Consume a JSON string starting at `*p->pos == '"'`. Sets out_start /
 // out_length to the bytes inside the quotes (exclusive of the quotes).
 // Validates UTF-8 and rejects bare control bytes < 0x20. Plain ASCII
@@ -469,12 +494,7 @@ bool scan_string(Parser* p, int32_t* out_start, int32_t* out_length) noexcept {
             return true;
         }
         if (c == '\\') {
-            // Escape consumes one extra byte. We don't validate inner forms
-            // beyond requiring at least one follower (\uXXXX is parsed
-            // lazily by the consumer).
-            if (p->pos + 1 >= p->src_len) return false;
-            p->pos += 2;
-            state = kUtf8Accept;
+            if(state!=kUtf8Accept || !scan_escape(p))return false;
             continue;
         }
         if (c < 0x20 && state == kUtf8Accept) return false;  // bare control

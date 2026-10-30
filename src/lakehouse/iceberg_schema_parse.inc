@@ -2,6 +2,19 @@
 // retain their real shape, IDs and requiredness, with a bounded recursion depth.
 bool parse_field(const bj::StructuralIndex*, bj::Iterator*, SchemaField*, Arena*, Budget*, uint32_t) noexcept;
 
+bool schema_key_eq(const bj::StructuralIndex* idx,int32_t at,const char* name) noexcept {
+    assert(idx && name);assert(at>=0 && at<idx->token_count);
+    if(tok_eq(idx,at,name))return true;
+    const auto& key=idx->tokens[at];const auto length=std::strlen(name);
+    if(key.type!=bj::TokenType::Key || key.start<1 || key.length<0 ||
+        static_cast<uint32_t>(key.length)<length || static_cast<uint32_t>(key.length)>6u*length ||
+        key.length>=idx->src_len || key.start>=idx->src_len-key.length)return false;
+    if(!std::memchr(idx->src+key.start,'\\',static_cast<size_t>(key.length)))return false;
+    char decoded[kIcebergMaxFieldName]{};
+    const kernels::json::JsonSpan span{reinterpret_cast<const char*>(idx->src+key.start-1),static_cast<uint32_t>(key.length)+2u};
+    const auto size=kernels::json::json_span_unquote(span,decoded,sizeof(decoded));
+    return size>=0 && static_cast<size_t>(size)==length && !std::memcmp(decoded,name,length);
+}
 bool schema_read_id(const bj::StructuralIndex* idx, bj::Iterator* it, int32_t* out) noexcept {
     assert(idx && it); assert(out);
     int64_t value = 0;
@@ -30,7 +43,7 @@ bool nested_type_name(const bj::StructuralIndex* idx, bj::Iterator it, char* out
     bool found = false;
     for (uint32_t g=0; bj::iter_peek(&it)==bj::TokenType::Key && g<kIterGuard; ++g) {
         const auto key=it.cursor; if (!bj::iter_advance(&it)) return false;
-        if (tok_eq(idx,key,"type")) {
+        if (schema_key_eq(idx,key,"type")) {
             if (found || !schema_type_name(idx,&it,out,cap)) return false;
             found=true;
         } else if (!skip_value(&it)) return false;
@@ -60,7 +73,7 @@ bool parse_collection_member(const bj::StructuralIndex* idx,bj::Iterator* it,Sch
     const char* names[5]={list?"element-id":"key-id",list?"element-required":"key",
                          list?"element":"value-id","value-required","value"};
     for (uint32_t i=0; i<(list?3u:5u); ++i) {
-        if (!tok_eq(idx,key,names[i])) continue;
+        if (!schema_key_eq(idx,key,names[i])) continue;
         if ((*seen & (1u<<i)) != 0u) return false;
         *seen |= 1u<<i;
         auto& child=out->children[list || i<2u?0u:1u];
@@ -94,8 +107,8 @@ bool parse_schema_type(const bj::StructuralIndex* idx,bj::Iterator* it,SchemaFie
     uint32_t seen=0;bool fields=false;
     for (uint32_t g=0; bj::iter_peek(it)==bj::TokenType::Key && g<kIterGuard; ++g) {
         const auto key=it->cursor;if (!bj::iter_advance(it)) return false;
-        if (tok_eq(idx,key,"type")) { if (!skip_value(it)) return false; }
-        else if (structure && tok_eq(idx,key,"fields")) {
+        if (schema_key_eq(idx,key,"type")) { if (!skip_value(it)) return false; }
+        else if (structure && schema_key_eq(idx,key,"fields")) {
             if (fields || !parse_struct_children(idx,it,out,arena,budget,depth)) return false;
             fields=true;
         } else if (structure) { if (!skip_value(it)) return false; }
@@ -113,17 +126,19 @@ bool parse_field(const bj::StructuralIndex* idx,bj::Iterator* it,SchemaField* ou
     for (uint32_t g=0; bj::iter_peek(it)==bj::TokenType::Key && g<kIterGuard; ++g) {
         const auto key=it->cursor;if (!bj::iter_advance(it)) return false;
         uint32_t bit=0;
-        if (tok_eq(idx,key,"id")) bit=1u;
-        else if (tok_eq(idx,key,"name")) bit=2u;
-        else if (tok_eq(idx,key,"type")) bit=4u;
-        else if (tok_eq(idx,key,"required")) bit=8u;
+        if (schema_key_eq(idx,key,"id")) bit=1u;
+        else if (schema_key_eq(idx,key,"name")) bit=2u;
+        else if (schema_key_eq(idx,key,"type")) bit=4u;
+        else if (schema_key_eq(idx,key,"required")) bit=8u;
+        else if (schema_key_eq(idx,key,"initial-default")) bit=16u;
+        else if (schema_key_eq(idx,key,"write-default")) bit=32u;
         if (bit && (seen&bit)) return false;
         seen|=bit;
         if (bit==1u) { if (!schema_read_id(idx,it,&out->id)) return false; }
         else if (bit==2u) { if (!schema_type_name(idx,it,out->name,sizeof(out->name))) return false; }
         else if (bit==4u) { if (!parse_schema_type(idx,it,out,arena,budget,depth)) return false; }
         else if (bit==8u) { if (!schema_read_bool(it,&out->required)) return false; }
-        else if (tok_eq(idx,key,"initial-default")) read_default(idx,it,out);
+        else if (bit==16u || bit==32u) {if(!read_default(idx,it,out,bit==32u,arena,budget))return false;}
         else if (!skip_value(it)) return false;
     }
     return (seen&7u)==7u && bj::iter_peek(it)==bj::TokenType::EndObject && bj::iter_advance(it);

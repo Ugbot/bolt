@@ -26,9 +26,17 @@ static constexpr uint32_t kIcebergMaxTypeName   = 32u;
 // Metadata::budget, and only table_expire_snapshots shrinks them.
 static constexpr uint32_t kIcebergMaxMetadataLog = 64u;
 
-// v3 `initial-default` of a field: kNone (absent or null), a string or another JSON scalar (text as written), or kUnsupported (an
-// object / array, or longer than kDefaultTextMax); a reader that needs an unsupported default refuses.
+// Compatibility scalar read slot: kNone (absent or null), string/scalar text,
+// or kUnsupported for forms the legacy materializer cannot fill. Complete
+// initial/write JSON lives in SchemaDefault regardless of this slot.
 enum class DefaultKind : uint8_t { kNone = 0, kString = 1, kScalar = 2, kUnsupported = 3 };
+
+// Exact JSON representation at a metadata boundary; arena-owned, never a row
+// carrier. Zero bytes means absent; an explicit null is four retained bytes.
+struct SchemaDefault {
+    const uint8_t* json = nullptr;
+    uint32_t size = 0;
+};
 
 struct SchemaField {
     int32_t     id;
@@ -38,6 +46,10 @@ struct SchemaField {
     char        name[kIcebergMaxFieldName];
     char        type[kIcebergMaxTypeName];
     char        initial_default[limits::kDefaultTextMax];
+    // Preserve all Appendix D forms and both defaults, independently of the
+    // legacy scalar reader slot above. schema_copy deep-copies these bytes.
+    SchemaDefault initial_default_value{};
+    SchemaDefault write_default_value{};
     // Arena-owned type tree. struct: named fields; list: element; map: key,value.
     // Element/key/value IDs and requiredness live on those child fields. A
     // primitive has no children. Copy with schema_copy for independent ownership.
@@ -173,7 +185,12 @@ Schema* metadata_push_schema(Metadata* m) noexcept;   // zeroed, fields empty
 bool schema_reserve(Schema* s, Arena* a, Budget* b, uint32_t n) noexcept;
 bool schema_push_field(Schema* s, Arena* a, Budget* b,
                        const SchemaField* f) noexcept;
-// Deep copy: dst gets independent fields, nested type trees and identifier IDs.
+// Validate complete JSON syntax and take arena custody, charged to the supplied
+// metadata budget. {nullptr,0} clears absence; failure preserves *out.
+bool schema_default_assign(SchemaDefault* out, const uint8_t* json, uint32_t size,
+    Arena* arena, Budget* budget = nullptr) noexcept;
+
+// Deep copy: independent fields, nested type trees, default JSON and identifier IDs.
 bool schema_copy(Schema* dst, const Schema* src, Arena* a, Budget* b) noexcept;
 // Includes struct children, list element IDs and map key/value IDs; refuses
 // malformed/cyclic trees or depth beyond kIcebergSchemaMaxDepth.

@@ -1,5 +1,6 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "lake_grow.h"
+#include "bolt/parse/bolt_json.h"
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -9,10 +10,23 @@ namespace {
 bool nested(const SchemaField& field) noexcept {
     return std::strcmp(field.type,"struct")==0 || std::strcmp(field.type,"list")==0 || std::strcmp(field.type,"map")==0;
 }
+bool default_shape(const SchemaDefault& value) noexcept {
+    assert(limits::kDefaultJsonMax<=INT32_MAX);assert(sizeof(value.size)==4);
+    if(!value.size)return value.json==nullptr;
+    if(!value.json || value.size>limits::kDefaultJsonMax)return false;
+    uint32_t first=0;
+    for(;first<value.size;++first) {
+        const auto c=value.json[first];if(c!=' ' && c!='\t' && c!='\r' && c!='\n')break;
+    }
+    if(first==value.size)return false;
+    const parse::json::SaxHandler callbacks{};
+    return parse::json::sax_parse(value.json,static_cast<int32_t>(value.size),&callbacks);
+}
 bool shape(const SchemaField& field) noexcept {
     assert(sizeof(field.id)==4); assert(sizeof(field.n_children)==4);
     if (field.id<=0 || !std::memchr(field.name,0,sizeof(field.name)) ||
-        !std::memchr(field.type,0,sizeof(field.type)) || !field.type[0]) return false;
+        !std::memchr(field.type,0,sizeof(field.type)) || !field.type[0] ||
+        !default_shape(field.initial_default_value) || !default_shape(field.write_default_value)) return false;
     if (!nested(field)) return true;
     if (field.n_children && !field.children) return false;
     if (std::strcmp(field.type,"list")==0) return field.n_children==1u;
@@ -39,6 +53,9 @@ bool copy_field(SchemaField& dst,const SchemaField& src,Arena* arena,Budget* bud
     assert(arena);assert(&dst!=&src);
     if (depth>kIcebergSchemaMaxDepth || !shape(src)) return false;
     dst=src;dst.children=nullptr;dst.n_children=0;dst.cap_children=0;
+    dst.initial_default_value={};dst.write_default_value={};
+    if(!schema_default_assign(&dst.initial_default_value,src.initial_default_value.json,src.initial_default_value.size,arena,budget) ||
+        !schema_default_assign(&dst.write_default_value,src.write_default_value.json,src.write_default_value.size,arena,budget))return false;
     if (!nested(src)) return true;
     if (!lake_grow(arena,budget,&dst.children,0u,&dst.cap_children,src.n_children)) return false;
     for (uint32_t i=0;i<src.n_children;++i)
@@ -46,6 +63,17 @@ bool copy_field(SchemaField& dst,const SchemaField& src,Arena* arena,Budget* bud
     dst.n_children=src.n_children;return true;
 }
 }  // namespace
+
+bool schema_default_assign(SchemaDefault* out,const uint8_t* json,uint32_t size,Arena* arena,Budget* budget) noexcept {
+    assert(out);assert(arena);
+    const SchemaDefault source{json,size};
+    if(!default_shape(source))return false;
+    if(!size) {*out={};return true;}
+    uint8_t* bytes=nullptr;uint32_t capacity=0;
+    if(!lake_grow(arena,budget,&bytes,0u,&capacity,size+1u))return false;
+    std::memcpy(bytes,json,size);bytes[size]=0;
+    *out={bytes,size};return true;
+}
 
 bool schema_max_field_id(const Schema* schema,int32_t* out) noexcept {
     assert(schema);assert(out);

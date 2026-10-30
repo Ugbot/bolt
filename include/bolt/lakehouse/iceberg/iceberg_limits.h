@@ -9,4 +9,5 @@ inline constexpr std::uint64_t kMaxDvObjectBytes = 256ull << 20;    // one delet
 inline constexpr std::uint32_t kMaxEqualityIds   = 16u;             // columns in one equality-delete key
 inline constexpr std::uint32_t kMaxEqualitySets  = 64u;             // distinct equality-id sets in one scan
 inline constexpr std::uint32_t kDefaultTextMax   = 128u;            // bytes of one field's initial-default JSON scalar (v3)
+inline constexpr std::uint32_t kDefaultJsonMax   = 1u << 20;         // one retained default value; charged to metadata budget
 }  // namespace bolt::lakehouse::iceberg::limits

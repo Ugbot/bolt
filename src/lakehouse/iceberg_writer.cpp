@@ -25,6 +25,7 @@
 // gets CommitError::kConflict (G2ICE-163). Bounded everything: 256 manifests/snapshot,
 // 64 snapshots, 16 refs. No exceptions, no smart pointers, ≥2 asserts/fn.
 
+#include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/writer.h"
 #include "bolt/lakehouse/iceberg/metrics.h"
 #include "bolt/lakehouse/iceberg/write_io.h"

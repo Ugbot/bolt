@@ -144,3 +144,91 @@ TEST(IcebergNestedSchema, ExternalOracle) {
     std::ofstream out(output,std::ios::binary);out<<encoded;ASSERT_TRUE(out.good());
 }
 }  // namespace
+
+namespace {
+std::string default_document(const std::string& fields) {
+    auto text=document(fields);const auto at=text.find("\"format-version\":2");
+    text.replace(at,std::strlen("\"format-version\":2"),"\"format-version\":3");return text;
+}
+std::string default_fields() {
+    const std::string long_json="\""+std::string(700,'x')+"\\u96ea\\n\"";
+    return R"([{"id":1,"name":"st","type":{"type":"struct","fields":[{"id":2,"name":"s","type":"string","initial-default":"child","write-default":"child-write"},{"id":3,"name":"ls","type":{"type":"list","element-id":4,"element-required":false,"element":"string"}}]},"initial-default":{"2":)"+long_json+R"(,"3":[null,""]},"write-default":{"2":"writer","3":[]}},
+{"id":5,"name":"mp","type":{"type":"map","key-id":6,"key":"string","value-id":7,"value-required":false,"value":"long"},"initial-default":{"keys":["a","b"],"values":[1,null]},"write-default":{"keys":[],"values":[]}},
+{"id":8,"name":"ls","type":{"type":"list","element-id":9,"element-required":false,"element":{"type":"struct","fields":[{"id":10,"name":"x","type":"int"}]}},"initial-default":[{"10":1},null,{}],"write-default":[]},
+{"id":11,"name":"explicit_null","type":"long","initial-default":null,"write-default":0},
+{"id":12,"name":"max","type":"long","initial-default":9223372036854775807}])";
+}
+std::string default_text(const bi::SchemaDefault& value) {
+    return value.size?std::string(reinterpret_cast<const char*>(value.json),value.size):std::string();
+}
+TEST(IcebergSchemaDefaults, OwnsRecursiveAndLongDefaultsWithExplicitNullAndWriteIdentity) {
+    bolt::Arena arena;auto input=default_document(default_fields());auto* metadata=parse(arena,input);ASSERT_NE(metadata,nullptr);
+    const auto& fields=metadata->schemas[0].fields;
+    ASSERT_GT(fields[0].initial_default_value.size,700u);EXPECT_EQ(fields[0].initial_default_kind,bi::DefaultKind::kUnsupported);
+    EXPECT_EQ(default_text(fields[1].initial_default_value),R"({"keys":["a","b"],"values":[1,null]})");
+    EXPECT_EQ(default_text(fields[2].write_default_value),"[]");EXPECT_EQ(default_text(fields[3].initial_default_value),"null");
+    EXPECT_EQ(default_text(fields[3].write_default_value),"0");EXPECT_EQ(fields[4].write_default_value.size,0u);
+    EXPECT_EQ(default_text(fields[0].children[0].write_default_value),"\"child-write\"");
+    const auto exact=default_text(fields[0].initial_default_value);std::fill(input.begin(),input.end(),'!');
+    EXPECT_EQ(default_text(fields[0].initial_default_value),exact);
+    auto emitted=emit(arena,*metadata);ASSERT_FALSE(emitted.empty());auto* read=parse(arena,emitted);ASSERT_NE(read,nullptr);
+    EXPECT_EQ(default_text(read->schemas[0].fields[0].initial_default_value),exact);
+    EXPECT_EQ(default_text(read->schemas[0].fields[4].initial_default_value),"9223372036854775807");
+}
+TEST(IcebergSchemaDefaults, SchemaCopyKeepsIndependentDefaultsAfterSourcePoisonAndReset) {
+    bolt::Arena source,target;auto* metadata=parse(source,default_document(default_fields()));ASSERT_NE(metadata,nullptr);
+    const auto expected=default_text(metadata->schemas[0].fields[0].initial_default_value);
+    bi::Schema copy{};ASSERT_TRUE(bi::schema_copy(&copy,&metadata->schemas[0],&target,nullptr));
+    EXPECT_NE(copy.fields[0].initial_default_value.json,metadata->schemas[0].fields[0].initial_default_value.json);
+    EXPECT_NE(copy.fields[0].children[0].write_default_value.json,metadata->schemas[0].fields[0].children[0].write_default_value.json);
+    source.reset();EXPECT_EQ(default_text(copy.fields[0].initial_default_value),expected);
+    EXPECT_EQ(default_text(copy.fields[0].children[0].write_default_value),"\"child-write\"");
+    auto* output=parse(target,default_document("[]"));ASSERT_NE(output,nullptr);output->schemas[0]=copy;
+    EXPECT_FALSE(emit(target,*output).empty());
+}
+TEST(IcebergSchemaDefaults, DuplicateDefaultsCannotChooseALastValue) {
+    for(const char* key:{"initial-default","write-default"}) {
+        const std::string fields="[{\"id\":1,\"name\":\"v\",\"type\":\"long\",\""+std::string(key)+"\":1,\""+key+"\":2}]";
+        bolt::Arena arena;EXPECT_EQ(parse(arena,default_document(fields)),nullptr);
+    }
+}
+TEST(IcebergSchemaDefaults, EscapedDefaultKeysRetainValuesAndCannotHideDuplicates) {
+    bolt::Arena arena;
+    auto* metadata=parse(arena,default_document(R"([{"id":1,"name":"v","type":"long","\u0069nitial-default":7,"\u0077rite-default":9}])"));
+    ASSERT_NE(metadata,nullptr);const auto& field=metadata->schemas[0].fields[0];
+    EXPECT_EQ(default_text(field.initial_default_value),"7");EXPECT_EQ(default_text(field.write_default_value),"9");
+    const auto text=emit(arena,*metadata);EXPECT_NE(text.find("\"write-default\":9"),std::string::npos);
+    EXPECT_EQ(parse(arena,default_document(R"([{"id":1,"name":"v","type":"long","initial-default":1,"\u0069nitial-default":2}])")),nullptr);
+}
+TEST(IcebergSchemaDefaults, AssignRefusesMalformedOversizedAndUnfundedValuesTransactionally) {
+    bolt::Arena arena;bi::SchemaDefault value{};
+    constexpr uint8_t good[]{'n','u','l','l'};ASSERT_TRUE(bi::schema_default_assign(&value,good,4,&arena));const auto before=value;
+    for(const char* bad:{" \n\t","{","[1,]","1 trailing","\"bad\\q\""}) {
+        EXPECT_FALSE(bi::schema_default_assign(&value,reinterpret_cast<const uint8_t*>(bad),static_cast<uint32_t>(std::strlen(bad)),&arena));
+        EXPECT_EQ(value.json,before.json);EXPECT_EQ(value.size,before.size);
+    }
+    EXPECT_FALSE(bi::schema_default_assign(&value,good,bi::limits::kDefaultJsonMax+1u,&arena));
+    bolt::Budget budget("default_test",1);
+    EXPECT_FALSE(bi::schema_default_assign(&value,good,4,&arena,&budget));EXPECT_EQ(budget.used(),0u);
+    EXPECT_EQ(value.json,before.json);EXPECT_EQ(default_text(value),"null");
+    EXPECT_TRUE(bi::schema_default_assign(&value,nullptr,0,&arena));EXPECT_EQ(value.json,nullptr);EXPECT_EQ(value.size,0u);
+}
+TEST(IcebergSchemaDefaults, LegacyScalarFallbackEmitsValuesAndRefusesUnsupportedLoss) {
+    bolt::Arena arena;auto* metadata=parse(arena,default_document(R"([{"id":1,"name":"v","type":"string","initial-default":"a\"b"}])"));
+    ASSERT_NE(metadata,nullptr);auto& field=metadata->schemas[0].fields[0];field.initial_default_value={};
+    auto text=emit(arena,*metadata);ASSERT_FALSE(text.empty());EXPECT_NE(text.find(R"("initial-default":"a\"b")"),std::string::npos);
+    field.initial_default_kind=bi::DefaultKind::kUnsupported;EXPECT_TRUE(emit(arena,*metadata).empty());
+}
+TEST(IcebergSchemaDefaults, ExternalCustodyOracle) {
+    const char* in=std::getenv("BOLT_DEFAULT_CUSTODY_INPUT"),*out=std::getenv("BOLT_DEFAULT_CUSTODY_OUTPUT");
+    if(!in || !out)GTEST_SKIP()<<"independent metadata fixture";
+    std::ifstream input(in);std::string text{std::istreambuf_iterator<char>(input),{}};
+    bolt::Arena source,target;auto* metadata=parse(source,text);ASSERT_NE(metadata,nullptr);
+    auto* copied=parse(target,default_document("[]"));ASSERT_NE(copied,nullptr);
+    bi::Schema schema{};ASSERT_TRUE(bi::schema_copy(&schema,&metadata->schemas[0],&target,nullptr));
+    copied->schemas[0]=schema;copied->current_schema_id=schema.schema_id;
+    std::fill(text.begin(),text.end(),'!');source.reset();
+    auto result=emit(target,*copied);ASSERT_FALSE(result.empty());
+    std::ofstream output(out);output<<result;ASSERT_TRUE(output.good());
+}
+} // namespace

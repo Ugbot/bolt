@@ -211,24 +211,31 @@ bool parse_snapshot(const bj::StructuralIndex* idx, bj::Iterator* it,
     return id_present;
 }
 
-// G2ICE-276: a field's `initial-default` (Appendix D JSON single value), kept as text for the reader to convert.
-void read_default(const bj::StructuralIndex* idx, bj::Iterator* it, SchemaField* out) noexcept {
-    assert(idx != nullptr && it != nullptr && out != nullptr);
-    const bj::TokenType t = bj::iter_peek(it);
-    out->initial_default_kind = DefaultKind::kUnsupported;
-    if (t == bj::TokenType::Null) { out->initial_default_kind = DefaultKind::kNone; bj::iter_advance(it); return; }
-    if (t == bj::TokenType::BoolTrue || t == bj::TokenType::BoolFalse) {
-        std::strcpy(out->initial_default, t == bj::TokenType::BoolTrue ? "true" : "false");
-        out->initial_default_kind = DefaultKind::kScalar;
-        bj::iter_advance(it);
-        return;
+// Retain exact source JSON before filling the compatibility scalar slot.
+bool read_default(const bj::StructuralIndex* idx,bj::Iterator* it,SchemaField* out,
+    bool write,Arena* arena,Budget* budget) noexcept {
+    assert(idx && it && out);assert(arena && it->cursor>=0 && it->cursor<idx->token_count);
+    const auto first=it->cursor;const auto& token=idx->tokens[first];
+    const bool string=token.type==bj::TokenType::String;
+    int32_t begin=token.start-(string?1:0);
+    if(!skip_value(it) || it->cursor<=first || it->cursor>idx->token_count)return false;
+    const auto& last=idx->tokens[it->cursor-1];
+    const bool close=last.type==bj::TokenType::EndObject || last.type==bj::TokenType::EndArray;
+    const int64_t end=int64_t{last.start}+(close?1:last.length)+(string?1:0);
+    if(begin<0 || end<=begin || end>idx->src_len)return false;
+    auto& value=write?out->write_default_value:out->initial_default_value;
+    if(!schema_default_assign(&value,idx->src+begin,static_cast<uint32_t>(end-begin),arena,budget))return false;
+    if(write)return true;
+    out->initial_default_kind=DefaultKind::kUnsupported;
+    if(token.type==bj::TokenType::Null) {out->initial_default_kind=DefaultKind::kNone;return true;}
+    if(token.type==bj::TokenType::BoolTrue || token.type==bj::TokenType::BoolFalse) {
+        std::strcpy(out->initial_default,token.type==bj::TokenType::BoolTrue?"true":"false");
+        out->initial_default_kind=DefaultKind::kScalar;return true;
     }
-    const bool str = t == bj::TokenType::String;
-    if (!str && t != bj::TokenType::Int64 && t != bj::TokenType::Float64) { skip_value(it); return; }
-    if (idx->tokens[it->cursor].length >= static_cast<int32_t>(limits::kDefaultTextMax)) { bj::iter_advance(it); return; }
-    copy_tok(idx, it->cursor, out->initial_default, limits::kDefaultTextMax);
-    out->initial_default_kind = str ? DefaultKind::kString : DefaultKind::kScalar;
-    bj::iter_advance(it);
+    if(!string && token.type!=bj::TokenType::Int64 && token.type!=bj::TokenType::Float64)return true;
+    if(token.length<0 || token.length>=static_cast<int32_t>(limits::kDefaultTextMax))return true;
+    copy_tok(idx,first,out->initial_default,limits::kDefaultTextMax);
+    out->initial_default_kind=string?DefaultKind::kString:DefaultKind::kScalar;return true;
 }
 
 #include "iceberg_schema_parse.inc"

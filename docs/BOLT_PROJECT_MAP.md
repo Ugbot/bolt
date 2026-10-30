@@ -413,3 +413,11 @@ old output on decoding refusal. Statistics reuse it for scalar numeric bounds,
 including exact ns timestamps. Legacy malformed/overflowed integer text is
 unknown, never a pruning value. PyIceberg conversion oracle: 201 vectors. JSON
 single-value/default and full bound-matrix qualification remain separate work.
+
+`iceberg/metadata.h::SchemaDefault` retains exact initial/write-default JSON in
+bounded, budgeted arena custody. The model parser, deep schema copy and shared
+metadata/manifest schema emitter preserve recursive values, long strings and
+explicit nulls; the legacy scalar read slot remains separate. Duplicate/escaped
+schema keys resolve consistently. Shared JSON tape/SAX/skipped-path scanners
+validate escapes and Unicode pairs. Typed recursive default materialization is
+separate pending work; retained metadata does not pretend to be row values.
