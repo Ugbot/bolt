@@ -323,9 +323,9 @@ struct BoltColumn {
                                   int64_t length, uint8_t* validity,
                                   Arena* arena) noexcept {
         BoltColumn c = make_empty();
-        if (fields == nullptr || n <= 0 || arena == nullptr) return c;
+        if (n < 0 || (n > 0 && fields == nullptr) || length < 0 || arena == nullptr) return c;
         auto* kids = static_cast<BoltColumn*>(arena->allocate(
-            static_cast<size_t>(n) * sizeof(BoltColumn), alignof(BoltColumn)));
+            static_cast<size_t>(n > 0 ? n : 1) * sizeof(BoltColumn), alignof(BoltColumn)));
         if (kids == nullptr) return c;
         for (int64_t i = 0; i < n; ++i) kids[i] = fields[i];
         c.format = ColumnFormat::Nested;

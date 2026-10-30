@@ -107,8 +107,10 @@ bool nested_absent(const SchemaField& f, int64_t rows, bool masked, Arena* arena
     assert(arena != nullptr && out != nullptr); assert(rows >= 0);
     if (depth > kIcebergSchemaMaxDepth || rows > INT32_MAX) return false;
     const bool group = !std::strcmp(f.type,"struct") || !std::strcmp(f.type,"list") || !std::strcmp(f.type,"map");
+    if (!masked && f.initial_default_value.json != nullptr)
+        return default_column(f,group ? BoltType::NA : want_bolt_type(f.type),rows,arena,out);
     if (group) {
-        if (f.initial_default_kind != DefaultKind::kNone || (f.required && !masked && rows != 0)) return false;
+        if ((!masked && f.initial_default_kind != DefaultKind::kNone) || (f.required && !masked && rows != 0)) return false;
         return nested_absent_group(f,rows,arena,depth,out);
     }
     uint32_t fixed = 0, scale = 0;

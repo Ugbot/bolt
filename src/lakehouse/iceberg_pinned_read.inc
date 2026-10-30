@@ -486,6 +486,15 @@ bool default_cell(const SchemaField& f, BoltType want, uint8_t* cell) noexcept {
 // A column of `rows` copies of the field's v3 initial-default (spec "Default values": a reader fills it for files without the field).
 bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a, BoltColumn* out) noexcept {
     assert(a != nullptr && out != nullptr);
+    if (rows < 0 || rows > INT32_MAX) return false;
+    if (f.initial_default_value.json != nullptr) {
+        BoltColumn one{}, staged{};
+        if (json_value_decode(f,f.initial_default_value.json,f.initial_default_value.size,a,&one) != JsonValueStatus::Ok ||
+            (want != BoltType::NA && one.type != want)) return false;
+        auto* selected = static_cast<uint32_t*>(a->allocate_zeroed((static_cast<size_t>(rows)+1u)*sizeof(uint32_t)));
+        if (!selected || !kernels::nested_gather(one,selected,static_cast<uint32_t>(rows),a,&staged)) return false;
+        *out = staged; return true;
+    }
     const size_t n = static_cast<size_t>(rows) + 1u;
     if ((want == BoltType::Utf8 || want == BoltType::Binary) && f.initial_default_kind == DefaultKind::kString) {
         // A string's text unescaped; binary / fixed[L > 16] defaults are hex (spec Appendix D), read as their bytes.
@@ -546,7 +555,8 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
         // Absent from this file: the column was added after the file was written. Reads its v3 initial-default, else null.
         uint32_t fixed = 0, scale = 0;
         const BoltType absent = s->want_type[j] != BoltType::NA ? s->want_type[j] : fill_bolt_type(s->map_schema->fields[j].type, &fixed, &scale);
-        if (s->map_schema->fields[j].initial_default_kind != DefaultKind::kNone) {
+        if (s->map_schema->fields[j].initial_default_value.json != nullptr ||
+            s->map_schema->fields[j].initial_default_kind != DefaultKind::kNone) {
             if (!default_column(s->map_schema->fields[j], absent, rows, s->scratch, &out[j])) return false;
             continue;
         }

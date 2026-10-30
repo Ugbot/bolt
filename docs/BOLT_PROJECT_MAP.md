@@ -421,3 +421,13 @@ explicit nulls; the legacy scalar read slot remains separate. Duplicate/escaped
 schema keys resolve consistently. Shared JSON tape/SAX/skipped-path scanners
 validate escapes and Unicode pairs. Typed recursive default materialization is
 separate pending work; retained metadata does not pretend to be row values.
+
+`iceberg/json_value.h` adds bounded Appendix D JSON-to-BoltColumn and typed-row
+JSON emission via owned nested-row/Fionn/decimal/temporal primitives. Field-ID
+structs, list/map arrays, requiredness, semantic duplicate map keys, exact ns
+and decimal values are checked before publishing. Public scans repeat retained
+initial defaults with nested_gather; null parents mask required descendants.
+Empty structs retain presence through construction, row decoding, named type
+validation and gather. Four focused suites (27 native cases) and 40 independent
+Iceberg-Java materialized values qualify this component. Write-default
+application, non-null geo WKT and complete manifest bounds remain pending.

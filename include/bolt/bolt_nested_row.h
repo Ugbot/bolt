@@ -63,7 +63,7 @@ inline bool tree_add(const BoltColumn& c, TypeTree* t, uint32_t idx, uint32_t de
         return is_var_leaf(c) || c.type_size_bytes > 0u;
     }
     const uint32_t nk = static_cast<uint32_t>(c.child_count());
-    if (nk == 0u || t->n + nk > kMaxNodes) return false;
+    if ((nk == 0u && c.type != BoltType::Struct) || nk > kMaxNodes - t->n) return false;
     nd.first_child = static_cast<uint16_t>(t->n);
     nd.n_children = static_cast<uint16_t>(nk);
     t->n += nk;
@@ -276,7 +276,7 @@ inline bool build(const Decoder& d, uint32_t ni, uint32_t depth, BoltColumn* out
     uint8_t* valid = pack_validity(b, nd.nullable != 0u, d.arena);
     if (nd.nullable != 0u && valid == nullptr) return false;
     if (nd.type == BoltType::Struct) {
-        auto* kids = static_cast<BoltColumn*>(d.arena->allocate(sizeof(BoltColumn) * nd.n_children, alignof(BoltColumn)));
+        auto* kids = static_cast<BoltColumn*>(d.arena->allocate(sizeof(BoltColumn) * (nd.n_children ? nd.n_children : 1u), alignof(BoltColumn)));
         if (kids == nullptr) return false;
         for (uint32_t k = 0; k < nd.n_children; ++k) if (!build(d, nd.first_child + k, depth + 1u, &kids[k])) return false;
         *out = BoltColumn::make_struct(kids, nd.n_children, b.len, valid, d.arena);

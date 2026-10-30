@@ -40,8 +40,8 @@ inline bool structure(const BoltColumn& src, const uint32_t* rows, uint32_t coun
     assert(arena != nullptr && out != nullptr);
     assert(depth <= kMaxDepth);
     const int64_t children = src.child_count();
-    if (children <= 0 || children > kMaxChildren || src.data == nullptr) return false;
-    auto* columns = arena->allocate_array<BoltColumn>(static_cast<size_t>(children));
+    if (children < 0 || children > kMaxChildren || src.data == nullptr) return false;
+    auto* columns = arena->allocate_array<BoltColumn>(static_cast<size_t>(children > 0 ? children : 1));
     if (columns == nullptr) return false;
     for (int64_t i = 0; i < children; ++i) {
         const auto* child = src.child_at(i);

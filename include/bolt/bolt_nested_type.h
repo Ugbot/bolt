@@ -43,8 +43,9 @@ inline bool walk(const TypeTree& tree, uint32_t index, uint32_t depth,
     const auto& node = tree.nodes[index];
     if (!is_group(node.type)) return leaf(node);
     if (node.nullable > 1 || node.fixed_bytes != 0 || node.scale != 0 || node.fixed_width != 0 ||
-        static_cast<uint8_t>(node.logical) > static_cast<uint8_t>(BoltLogical::Interval) || node.n_children == 0 ||
-        node.first_child >= tree.n || node.n_children > tree.n - node.first_child) return false;
+        static_cast<uint8_t>(node.logical) > static_cast<uint8_t>(BoltLogical::Interval)) return false;
+    if (node.n_children == 0) return node.type == BoltType::Struct && node.first_child <= tree.n;
+    if (node.first_child >= tree.n || node.n_children > tree.n - node.first_child) return false;
     if ((node.type == BoltType::List || node.type == BoltType::Map) && node.n_children != 1) return false;
     if (node.type == BoltType::Map) {
         const auto& entry = tree.nodes[node.first_child];

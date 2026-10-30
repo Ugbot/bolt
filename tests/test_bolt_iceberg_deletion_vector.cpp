@@ -306,6 +306,10 @@ TEST(IcebergSchemaBinding, RequiredColumnWithNoDataRefusesAndOptionalReadsNull) 
         const size_t at = patched.find("\"fields\":[");
         ASSERT_NE(at, std::string::npos);
         patched.insert(at + 10, std::string(
+            R"({"id":19,"name":"st_default","required":true,"type":{"type":"struct","fields":[{"id":20,"name":"n","required":true,"type":"long"},{"id":21,"name":"xs","required":false,"type":{"type":"list","element-id":22,"element-required":false,"element":"string"}}]},"initial-default":{"20":9223372036854775807,"21":[null,"","owned"]}},)"
+            R"({"id":23,"name":"map_default","required":false,"type":{"type":"map","key-id":24,"key":"string","value-id":25,"value-required":false,"value":"long"},"initial-default":{"keys":["a","b"],"values":[1,null]}},)"
+            R"({"id":26,"name":"null_parent","required":false,"type":{"type":"struct","fields":[{"id":27,"name":"n","required":true,"type":"long","initial-default":99}]}},)"
+            R"({"id":28,"name":"ns_default","required":false,"type":"timestamp_ns","initial-default":"2262-04-11T23:47:16.854775807"},)"
             "{\"id\":11,\"name\":\"tt\",\"required\":false,\"type\":\"time\",\"initial-default\":\"12:34:56.789012\"},"
             "{\"id\":12,\"name\":\"ts\",\"required\":false,\"type\":\"timestamp\",\"initial-default\":\"2024-01-02T03:04:05.000006\"},"
             "{\"id\":13,\"name\":\"d9\",\"required\":false,\"type\":\"decimal(9,2)\",\"initial-default\":\"-12.34\"},"
@@ -349,12 +353,19 @@ TEST(IcebergSchemaBinding, RequiredColumnWithNoDataRefusesAndOptionalReadsNull) 
             EXPECT_EQ(std::memcmp(static_cast<const uint8_t*>(col("uu").data) + r * 16, uuid, 16), 0);
             EXPECT_EQ(col("ff").fixed_width, 3u);
             EXPECT_EQ(std::memcmp(static_cast<const uint8_t*>(col("ff").data) + r * 16, "\x0a\x0b\x0c", 3), 0);
-            const auto* bv = static_cast<const bolt::StringView*>(col("bb").data) + r;
-            EXPECT_EQ(bv->length, 4u);
-            EXPECT_EQ(std::memcmp(bv->prefix, "\xde\xad\xbe\xef", 4), 0);
-            const auto* sv = static_cast<const bolt::StringView*>(col("ss").data) + r;
-            EXPECT_EQ(sv->length, 9u);                                   // a " b, é (2 bytes), the emoji (4)
-            EXPECT_EQ(std::memcmp(sv->prefix, "a\"b\xc3", 4), 0);
+            const uint8_t* text=nullptr;int32_t size=0;
+            col("bb").utf8_at(r,&text,&size);EXPECT_EQ(size,4);EXPECT_EQ(std::memcmp(text,"\xde\xad\xbe\xef",4),0);
+            col("ss").utf8_at(r,&text,&size);EXPECT_EQ(size,9);EXPECT_EQ(std::memcmp(text,"a\"b\xc3",4),0);
+            const auto& st=col("st_default");ASSERT_EQ(st.child_count(),2);
+            EXPECT_EQ(static_cast<const int64_t*>(st.child_at(0)->data)[r],INT64_MAX);
+            const auto* xs=st.child_at(1);ASSERT_NE(xs->list_element(),nullptr);
+            const auto begin=xs->list_offsets()[r];EXPECT_EQ(xs->list_offsets()[r+1]-begin,3);
+            EXPECT_TRUE(xs->list_element()->is_null(begin));xs->list_element()->utf8_at(begin+2,&text,&size);
+            EXPECT_EQ(size,5);EXPECT_EQ(std::memcmp(text,"owned",5),0);
+            const auto& mp=col("map_default");const auto m=mp.list_offsets()[r];
+            EXPECT_EQ(mp.list_offsets()[r+1]-m,2);EXPECT_TRUE(mp.list_element()->child_at(1)->is_null(m+1));
+            EXPECT_TRUE(col("null_parent").is_null(r));EXPECT_TRUE(col("null_parent").child_at(0)->is_null(r));
+            EXPECT_EQ(static_cast<const int64_t*>(col("ns_default").data)[r],INT64_MAX);
         }
         iceberg_scan_close(sh); iceberg_table_close(rh);
     }
