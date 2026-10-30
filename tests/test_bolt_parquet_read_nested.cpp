@@ -280,6 +280,28 @@ int64_t check_file(const std::string& name, const std::string& parquet, bool ran
 
 class NestedOracle : public ::testing::TestWithParam<const char*> {};
 
+TEST(NestedGather, PackedBytesKeepSelectionNullsAndOwnPayload) {
+    Arena source_arena, output_arena;
+    uint8_t bytes[]{'a','b',0,255,'z'}, validity[]{0x34};
+    int32_t offsets[]{0,2,2,5,5};
+    auto source = BoltColumn::make_var_binary(bytes,validity,offsets,4,BoltType::Binary,&source_arena);
+    source.validity_offset = 2; source.stats.all_valid = false;
+    const uint32_t rows[]{2,1,0,2}; BoltColumn gathered{};
+    ASSERT_TRUE(kernels::nested_gather(source,rows,4,&output_arena,&gathered));
+    EXPECT_EQ(gathered.validity_offset,0); EXPECT_EQ(gathered.stats.null_count,1);
+    std::memset(bytes,42,sizeof(bytes));
+    const std::string expected[]{std::string("\0\xffz",3),"","ab",std::string("\0\xffz",3)};
+    for (uint32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(gathered.is_null(i),i == 1);
+        const uint8_t* data = nullptr; int32_t length = 0; gathered.utf8_at(i,&data,&length);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(data),static_cast<size_t>(length)),expected[i]);
+    }
+    ASSERT_TRUE(kernels::nested_gather(source,nullptr,0,&output_arena,&gathered)); EXPECT_EQ(gathered.length,0);
+    gathered.length = 777; offsets[3] = 1;
+    const uint32_t invalid[]{2};
+    EXPECT_FALSE(kernels::nested_gather(source,invalid,1,&output_arena,&gathered)); EXPECT_EQ(gathered.length,777);
+}
+
 TEST_P(NestedOracle, PinnedRangesMatchPyarrow) {
     const std::string name = GetParam();
     const int64_t n = check_file(name, data_path(name + ".parquet"), true);

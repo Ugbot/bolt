@@ -84,6 +84,35 @@ inline bool sequence(const BoltColumn& src, const uint32_t* rows, uint32_t count
     out->dict_child = selected.dict_child;
     return true;
 }
+inline bool variable(const BoltColumn& src, const uint32_t* rows, uint32_t count,
+                     Arena* arena, BoltColumn* out) noexcept {
+    assert(arena != nullptr && out != nullptr); assert(rows != nullptr || count == 0);
+    if (!src.dict_child || src.dict_child->type != BoltType::Int32 ||
+        src.dict_child->format != ColumnFormat::Flat || src.dict_child->type_size_bytes != sizeof(int32_t) || !src.dict_child->data ||
+        src.dict_child->length < src.length+1) return false;
+    const auto* offsets = static_cast<const int32_t*>(src.dict_child->data);
+    auto* selected = arena->allocate_array<int32_t>(static_cast<size_t>(count)+1u);
+    if (!selected) return false;
+    uint64_t bytes = 0; selected[0] = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!src.is_null(rows[i])) {
+            const auto begin = offsets[rows[i]], end = offsets[rows[i]+1u];
+            if (begin < 0 || end < begin || (end != begin && !src.data)) return false;
+            bytes += static_cast<uint32_t>(end-begin);
+            if (bytes > INT32_MAX) return false;
+        }
+        selected[i+1u] = static_cast<int32_t>(bytes);
+    }
+    auto* data = arena->allocate_array<uint8_t>(bytes+1u); if (!data) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto length = selected[i+1u]-selected[i];
+        if (length) std::memcpy(data+selected[i],static_cast<const uint8_t*>(src.data)+offsets[rows[i]],static_cast<size_t>(length));
+    }
+    auto packed = BoltColumn::make_var_binary(data,out->validity,selected,count,src.type,arena);
+    if (packed.format != ColumnFormat::VarBinary) return false;
+    packed.stats = out->stats; packed.logical = src.logical; packed.decimal_scale = src.decimal_scale;
+    *out = packed; return true;
+}
 inline bool gather(const BoltColumn& src, const uint32_t* rows, uint32_t count,
                    Arena* arena, uint32_t depth, BoltColumn* out) noexcept {
     assert(arena != nullptr && out != nullptr);
@@ -96,6 +125,7 @@ inline bool gather(const BoltColumn& src, const uint32_t* rows, uint32_t count,
     out->length = count;
     out->arena = arena;
     if (!validity(src, rows, count, arena, out)) return false;
+    if (src.format == ColumnFormat::VarBinary) return variable(src,rows,count,arena,out);
     if (src.format == ColumnFormat::Nested) {
         if (src.type == BoltType::Struct) return structure(src, rows, count, arena, depth, out);
         if (src.type == BoltType::List || src.type == BoltType::Map)
@@ -116,7 +146,8 @@ inline bool gather(const BoltColumn& src, const uint32_t* rows, uint32_t count,
 }
 }  // namespace nested_gather_detail
 
-// Supports Flat leaves (including StringView/Binary) and Nested struct/list/map.
+// Supports Flat/VarBinary leaves and Nested struct/list/map. VarBinary bytes
+// are packed into arena custody; unselected payloads are never interpreted.
 // Arbitrary selection order and duplicates are preserved; zero rows is valid.
 // Output publishes only on success. Arena may consume scratch on refusal.
 // StringView spill bytes remain borrowed from src: retain its buffers until all
