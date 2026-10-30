@@ -493,3 +493,9 @@ The strict replica codec also accepts the existing native staged-part/apply
 classes 11/12. Frame capacity remains 4 MiB and the wire version/layout is
 unchanged. Ten codec cases pass; semantics remain with the storage/replication
 consumer. [Evidence](research/2026-10-30-replica-large-transactions.md).
+
+2026-10-30 Iceberg V1 schema history: modern `schemas` takes precedence over
+legacy `schema` in either JSON member order; mixed forms require a current
+member and duplicate modern arrays refuse. Five focused regressions plus
+metadata IO23/interop4 pass in the shared Clang build. See
+[qualification](research/2026-10-30-iceberg-v1-schema-history.md).

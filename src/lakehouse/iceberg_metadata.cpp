@@ -557,6 +557,7 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
     if (bj::iter_peek(&it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(&it);
     bool saw_snapshot_log = false, saw_current_snapshot = false;
+    bool saw_modern_schema = false, saw_legacy_schema = false;
     uint32_t g = 0;
     while (bj::iter_peek(&it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it.cursor;
@@ -617,6 +618,9 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
             if (bj::iter_peek(&it) != bj::TokenType::BeginArray) {
                 skip_value(&it); continue;
             }
+            if (saw_modern_schema) return false;
+            if (saw_legacy_schema) out->n_schemas = 0u;
+            saw_modern_schema = true;
             bj::iter_advance(&it);
             uint32_t g2 = 0;
             const uint32_t guard = array_guard(&idx);
@@ -630,6 +634,8 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
             bj::iter_advance(&it);
         } else if (tok_eq(&idx, key, "schema")) {
             if (bj::iter_peek(&it) == bj::TokenType::BeginObject) {
+                saw_legacy_schema = true;
+                if (saw_modern_schema) { skip_value(&it); continue; }
                 Schema* sch = metadata_push_schema(out);
                 if (sch == nullptr) return false;
                 if (!parse_schema(&idx, &it, scratch, budget, sch)) return false;
@@ -685,6 +691,14 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
     if (out->current_snapshot_id >= 0 &&
         snapshot_by_id(out, out->current_snapshot_id) == nullptr)
         return false;
+    // Modern schema history is authoritative when both v1 representations
+    // exist. It must identify the current schema rather than use legacy order.
+    if (saw_modern_schema && saw_legacy_schema) {
+        if (out->current_schema_id < 0) return false;
+        bool found = false;
+        for (uint32_t i = 0u; i < out->n_schemas; ++i) if (out->schemas[i].schema_id == out->current_schema_id) found = true;
+        if (!found) return false;
+    }
     if (out->current_schema_id < 0 && out->n_schemas > 0)
         out->current_schema_id = out->schemas[0].schema_id;
     if (out->current_spec_id < 0 && out->n_specs > 0)

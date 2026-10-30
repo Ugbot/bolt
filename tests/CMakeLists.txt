@@ -2992,3 +2992,8 @@ target_link_libraries(test_bolt_iceberg_manifest_bounds PRIVATE bolt::lakehouse 
 bolt_apply_hardening(test_bolt_iceberg_manifest_bounds)
 add_test(NAME test_bolt_iceberg_manifest_bounds COMMAND test_bolt_iceberg_manifest_bounds)
 set_tests_properties(test_bolt_iceberg_manifest_bounds PROPERTIES TIMEOUT 120)
+
+add_executable(test_bolt_iceberg_metadata_legacy test_bolt_iceberg_metadata_legacy.cpp)
+target_link_libraries(test_bolt_iceberg_metadata_legacy PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_metadata_legacy)
+add_test(NAME test_bolt_iceberg_metadata_legacy COMMAND test_bolt_iceberg_metadata_legacy)
