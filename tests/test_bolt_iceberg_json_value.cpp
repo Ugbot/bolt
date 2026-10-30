@@ -1,6 +1,8 @@
 #include "bolt/lakehouse/iceberg/json_value.h"
 #include "bolt/kernels/bolt_nested_gather.h"
 #include "bolt/bolt_nested_type.h"
+#include "bolt/kernels/bolt_wkt.h"
+#include "bolt/parse/bolt_json_writer.h"
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstdlib>
@@ -110,7 +112,7 @@ TEST(IcebergJsonValue, RefusalsAreTransactionalAndBudgeted) {
     Arena arena;BoltColumn c{};c.length=919;const auto saved=c;
     for(const auto& v:bad) {EXPECT_EQ(decode(field(v.type),v.json,arena,&c),S::Invalid)<<v.type<<v.json;EXPECT_EQ(std::memcmp(&c,&saved,sizeof(c)),0);}
     EXPECT_EQ(decode(field("long",1,true),"null",arena,&c),S::Invalid);
-    for(const char* type:{"unknown","variant","geometry","geography"}) {
+    for(const char* type:{"unknown","variant"}) {
         EXPECT_EQ(decode(field(type),"\"POINT (1 2)\"",arena,&c),S::Unsupported);
         EXPECT_EQ(decode(field(type),"null",arena,&c),S::Ok);
     }
@@ -144,5 +146,82 @@ TEST(IcebergJsonValue, ExternalTypedOracle) {
         if(count++)result<<",";result<<actual;
     }
     result<<"]";ASSERT_TRUE(result.good());EXPECT_GE(count,40u);
+}
+TEST(IcebergJsonValue, GeoFamiliesDimensionsAndNullsMaterializeOwnedWkb) {
+    const char* shapes[]{"POINT (1 -2)","LINESTRING (0 0,1 2)","POLYGON ((0 0,1 0,1 1,0 0))",
+        "MULTIPOINT ((1 2),EMPTY,(3 4))","MULTILINESTRING ((0 0,1 2),EMPTY)",
+        "MULTIPOLYGON (((0 0,1 0,1 1,0 0)),EMPTY)","GEOMETRYCOLLECTION (POINT (1 2),LINESTRING EMPTY)"};
+    for(const char* type:{"geometry","geometry(srid:3857)","geography","geography(srid:4326, karney)"}) {
+        Arena arena;const auto f=field(type);BoltColumn value{};
+        for(const auto* shape:shapes) {
+            std::string json="\""+std::string(shape)+"\"";ASSERT_EQ(decode(f,json,arena,&value),S::Ok)<<shape;
+            json.assign(json.size(),'x');EXPECT_EQ(value.type,BoltType::Binary);const auto wkb=bytes(value);
+            kernels::wkb::Bounds bounds{};EXPECT_TRUE(kernels::wkb::bounds_add(&bounds,reinterpret_cast<const uint8_t*>(wkb.data()),wkb.size()));
+            BoltColumn again{};ASSERT_EQ(decode(f,encode(f,value,arena),arena,&again),S::Ok);EXPECT_EQ(bytes(again),wkb);
+        }
+        for(const char* text:{"POINT Z (1 2 3)","POINT M (1 2 4)","POINT ZM (1 2 3 4)","POINT ZM EMPTY",
+            "GEOMETRYCOLLECTION M (POINT (1 2 3),MULTIPOINT ((4 5 6)))"}) {
+            ASSERT_EQ(decode(f,"\""+std::string(text)+"\"",arena,&value),S::Ok)<<text;
+            const auto wkb=bytes(value);BoltColumn again{};ASSERT_EQ(decode(f,encode(f,value,arena),arena,&again),S::Ok);EXPECT_EQ(bytes(again),wkb);
+        }
+        EXPECT_EQ(decode(f,"null",arena,&value),S::Ok);EXPECT_TRUE(value.is_null(0));
+    }
+}
+TEST(IcebergJsonValue, GeoMalformedAndCapacityRefuseWithoutPublishing) {
+    Arena arena;const auto f=field("geometry");BoltColumn value{};value.length=919;const auto before=value;
+    for(const char* text:{"POINT(1)","POINT(1 2 3)","POINT Z (1 2)","POINT(NaN 2)","POINT(Inf 2)","POINT(1e999 2)",
+        "POINT(+-1 2)","LINESTRING(0 0)","POLYGON((0 0,1 0,1 1,2 2))","MULTIPOINT((1 2),LINESTRING EMPTY)",
+        "GEOMETRYCOLLECTION(POINT M(1 2 3))","POINT(1 2) trailing","SRID=4326;POINT(1 2)"}) {
+        EXPECT_EQ(decode(f,"\""+std::string(text)+"\"",arena,&value),S::Invalid)<<text;
+        EXPECT_EQ(std::memcmp(&value,&before,sizeof(value)),0);
+    }
+    JsonValueLimits limits{};limits.values=1;EXPECT_EQ(decode(f,"\"POINT(1 2)\"",arena,&value,limits),S::Capacity);
+    limits={};limits.encoded_bytes=16;EXPECT_EQ(decode(f,"\"POINT(1 2)\"",arena,&value,limits),S::Capacity);
+    ASSERT_EQ(decode(f,"\"POINT(1 2)\"",arena,&value),S::Ok);
+    auto invalid=bytes(value);invalid[0]=9;
+    uint32_t length=919;EXPECT_EQ(kernels::wkt::from_wkb(reinterpret_cast<const uint8_t*>(invalid.data()),static_cast<uint32_t>(invalid.size()),nullptr,0,&length),kernels::wkt::Status::Invalid);EXPECT_EQ(length,919u);
+    uint8_t tiny[4]{};EXPECT_EQ(kernels::wkt::to_wkb("POINT(1 2)",10,tiny,sizeof(tiny),&length),kernels::wkt::Status::Capacity);EXPECT_EQ(length,919u);
+    std::string deep;
+    for(uint32_t i=0;i<66;++i)deep+="GEOMETRYCOLLECTION(";deep+="POINT EMPTY";deep.append(66,')');
+    EXPECT_EQ(decode(f,"\""+deep+"\"",arena,&value),S::Capacity);
+}
+TEST(IcebergJsonValue, ExternalGeoOracle) {
+    const char* input=std::getenv("BOLT_JSON_GEO_INPUT"),*output=std::getenv("BOLT_JSON_GEO_OUTPUT"),*type=std::getenv("BOLT_JSON_GEO_TYPE");
+    if(!input || !output || !type)GTEST_SKIP()<<"independent geometry fixture";
+    std::ifstream file(input);std::string source((std::istreambuf_iterator<char>(file)),{});ASSERT_LE(source.size(),1u<<20);
+    namespace j=bolt::parse::json;Arena arena;j::StructuralIndex index{};j::JsonValue* root=nullptr;
+    ASSERT_TRUE(j::build_index(reinterpret_cast<const uint8_t*>(source.data()),static_cast<int32_t>(source.size()),&arena,&index));
+    ASSERT_TRUE(j::value_from_index(&index,&arena,&root));ASSERT_EQ(root->kind,j::ValueKind::Array);ASSERT_LE(root->count,1000);
+    std::ofstream result(output);result<<"[";auto* node=root->head;
+    for(int32_t i=0;i<root->count;++i) {
+        ASSERT_NE(node,nullptr);const uint8_t* json=nullptr;int32_t size=0;
+        ASSERT_TRUE(j::serialize(node->value,&arena,j::EmitOptions{},&json,&size));std::string literal(reinterpret_cast<const char*>(json),static_cast<size_t>(size));
+        const auto f=field(type);BoltColumn value{};ASSERT_EQ(decode(f,literal,arena,&value),S::Ok)<<literal;literal.assign(literal.size(),'x');
+        const auto actual=encode(f,value,arena);if(i)result<<",";result<<"{\"json\":"<<actual<<",\"wkb\":\"";
+        constexpr char hex[]="0123456789abcdef";for(const char raw:bytes(value)) {const auto c=static_cast<uint8_t>(raw);result<<hex[c>>4]<<hex[c&15];}
+        result<<"\"}";node=node->next;
+    }
+    result<<"]";ASSERT_TRUE(result.good());EXPECT_EQ(node,nullptr);
+}
+TEST(IcebergJsonValue, GeoExternalWkbEndianAndNestedValues) {
+    Arena arena;const auto f=field("geometry");BoltColumn value{};
+    ASSERT_EQ(decode(f,"\"POINT (1 2)\"",arena,&value),S::Ok);auto big=bytes(value);ASSERT_EQ(big.size(),21u);
+    big[0]=0;for(uint32_t i=0;i<2;++i)std::swap(big[1+i],big[4-i]);
+    for(uint32_t begin:{5u,13u})for(uint32_t i=0;i<4;++i)std::swap(big[begin+i],big[begin+7u-i]);
+    int32_t offsets[]{0,21};auto offset_column=BoltColumn::make_flat(offsets,nullptr,2,BoltType::Int32);
+    auto external=BoltColumn::make_empty();external.format=ColumnFormat::VarBinary;external.type=BoltType::Binary;
+    external.data=big.data();external.length=1;external.dict_child=&offset_column;
+    EXPECT_EQ(encode(f,external,arena),"\"POINT (1 2)\"");
+    big[1]=static_cast<char>(0x20);const uint8_t* output=nullptr;uint32_t size=919;
+    EXPECT_EQ(json_value_encode(f,external,0,&arena,&output,&size),S::Invalid);EXPECT_EQ(output,nullptr);EXPECT_EQ(size,919u);
+    auto root=field("struct");SchemaField children[]{field("geometry",2,true),field("list",3)};auto element=field("geography",4);
+    children[1].children=&element;children[1].n_children=1;root.children=children;root.n_children=2;
+    const std::string json=R"JSON({"2":"POINT ZM (1 2 3 4)","3":[null,"MULTIPOINT ((0 0),EMPTY)"]})JSON";
+    ASSERT_EQ(decode(root,json,arena,&value),S::Ok);EXPECT_FALSE(value.child_at(0)->is_null(0));
+    EXPECT_TRUE(value.child_at(1)->list_element()->is_null(0));
+    BoltColumn again{};ASSERT_EQ(decode(root,encode(root,value,arena),arena,&again),S::Ok);
+    EXPECT_EQ(bytes(*again.child_at(0)),bytes(*value.child_at(0)));
+    root=field("map");SchemaField kv[]{field("geometry",2,true),field("long",3)};root.children=kv;root.n_children=2;
+    EXPECT_EQ(decode(root,R"JSON({"keys":["POINT(1 2)","point(+1 2.0)"],"values":[7,8]})JSON",arena,&value),S::Invalid);
 }
 } // namespace

@@ -74,7 +74,7 @@ bool scalar_parse(State& state,const SchemaField& field,const J* value,Scalar& o
     using T=IcebergType;
     if(type.type==T::kBoolean || type.type==T::kInt || type.type==T::kLong || type.type==T::kFloat || type.type==T::kDouble)
         return scalar_number(state,type,value,out);
-    if(type.type==T::kGeometry || type.type==T::kGeography)return state.unsupported();
+    if(type.type==T::kGeometry || type.type==T::kGeography)return geo_parse(state,value,&out.bytes,&out.size);
     const uint8_t* text=nullptr;uint32_t size=0;if(!raw_string(state,value,&text,&size))return false;
     if(type.type==T::kString) {out.bytes=text;out.size=size;return true;}
     if(type.type==T::kBinary || type.type==T::kFixed || type.type==T::kUuid) {

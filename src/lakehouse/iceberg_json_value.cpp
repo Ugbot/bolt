@@ -7,6 +7,7 @@
 #include "bolt/kernels/bolt_decimal.h"
 #include "bolt/kernels/bolt_temporal.h"
 #include "bolt/kernels/bolt_date.h"
+#include "bolt/kernels/bolt_wkt.h"
 #include "bolt/join/bolt_swiss.h"
 #include <algorithm>
 #include <bit>
@@ -74,6 +75,7 @@ bool hex_bytes(State& state,const uint8_t* text,uint32_t size,bool uuid,const ui
 }
 #include "iceberg_json_temporal.inc"
 #include "iceberg_json_decimal.inc"
+#include "iceberg_json_geo.inc"
 #include "iceberg_json_scalar.inc"
 #include "iceberg_json_decode.inc"
 #include "iceberg_json_encode.inc"

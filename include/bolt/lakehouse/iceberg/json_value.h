@@ -16,6 +16,8 @@ struct JsonValueLimits {
 // preserves *out; scratch may be consumed. Finite caller arenas bound allocation.
 JsonValueStatus json_value_decode(const SchemaField&,const uint8_t* json,uint32_t size,
     Arena*,BoltColumn* out,const JsonValueLimits& = {}) noexcept;
+// Geometry/geography values use WKT JSON strings and owned ISO WKB Binary
+// columns. Schema-default rules separately prohibit nonnull geo defaults.
 // Encode one typed row to arena-owned JSON (field-ID struct keys; parallel map
 // keys/values arrays). No Arrow runtime or named-field result JSON is involved.
 // Outputs publish together only on success; caller retains the source column.

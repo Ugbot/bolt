@@ -44,6 +44,18 @@ J* encoded_hex(State& state,const uint8_t* bytes,uint32_t size,bool uuid) noexce
     }
     auto* out=j::make_string(state.arena,text,static_cast<int32_t>(at));if(!out)state.capacity();return out;
 }
+bool emit_geo(State& state,const BoltColumn& column,int64_t row,J** out) noexcept {
+    assert(out);assert(row>=0 && row<column.length);
+    const uint8_t* bytes=nullptr;uint32_t size=0;if(!column_bytes(column,row,&bytes,&size))return false;
+    const auto limits=geo_limits(state);uint32_t needed=0;
+    auto status=kernels::wkt::from_wkb(bytes,size,nullptr,0,&needed,limits);
+    if(!geo_status(state,status))return false;
+    if(needed>state.limits.json_bytes)return state.capacity();
+    auto* text=state.arena->allocate_array<char>(static_cast<size_t>(needed)+1u);if(!text)return state.capacity();
+    status=kernels::wkt::from_wkb(bytes,size,text,needed,&needed,limits);
+    if(!geo_status(state,status))return false;
+    text[needed]=0;*out=j::make_string(state.arena,text,static_cast<int32_t>(needed));return *out || state.capacity();
+}
 bool emit_scalar(State& state,const SchemaField& field,const BoltColumn& column,int64_t row,J** out) noexcept {
     assert(out);assert(row>=0 && row<column.length);
     IcebergTypeInfo type{};if(!iceberg_type_parse(field.type,&type))return state.unsupported();
@@ -69,7 +81,7 @@ bool emit_scalar(State& state,const SchemaField& field,const BoltColumn& column,
         else return false;
         if(!dec::d128_column_fits_precision(&value,1,nullptr,0,type.precision))return false;
         const auto size=decimal_format(value,type.scale,text,sizeof(text));if(!size)return false;*out=text_value(state,text,size);
-    } else if(type.type==T::kGeometry || type.type==T::kGeography)return state.unsupported();
+    } else if(type.type==T::kGeometry || type.type==T::kGeography)return emit_geo(state,column,row,out);
     else if(type.type==T::kString || type.type==T::kBinary || type.type==T::kFixed || type.type==T::kUuid) {
         const uint8_t* bytes=nullptr;uint32_t size=0;if(!column_bytes(column,row,&bytes,&size))return false;
         if(type.type==T::kString) {if(column.type!=BoltType::Utf8)return false;*out=j::make_string(state.arena,reinterpret_cast<const char*>(bytes),static_cast<int32_t>(size));}

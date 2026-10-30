@@ -460,3 +460,11 @@ field names/order and JSON spelling do not alter identity. Int/float/decimal
 promotions preserve the original value; changed initial values refuse. Bounded
 arena canonicalization protects complete complex map keys and output custody.
 Ten native cases and the integrated REST/restart drill qualify this component.
+
+2026-10-30 G2ICE-314 WKT values: `kernels/bolt_wkt.h` owns bounded allocation-free
+WKT/ISO-WKB conversion for seven families and XY/Z/M/ZM, empties and collections,
+sharing WKB validation. Appendix D JSON materializes arena-owned Binary values
+and emits typed WKT, including recursive values and normalized map keys.
+264 exact independent DuckDB spatial conversions and seven integrated focused
+suites qualify this component. Nonnull geospatial schema defaults still refuse;
+full writer/consumer/bounds acceptance remains open.
