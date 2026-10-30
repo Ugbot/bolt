@@ -486,3 +486,10 @@ checks and nine corruption controls. Java reads original metadata. Strict full
 client acceptance still FAILS four PyIceberg float-infinity bindings; component
 gate explicitly permits those known limits. 3920 and G2ICE-314 remain open.
 Cached proxy gaps 384–387, R2 large-read 381 and performance 274 take priority.
+
+## G2ICE-404 strict data source classes (2026-10-30)
+
+The strict replica codec also accepts the existing native staged-part/apply
+classes 11/12. Frame capacity remains 4 MiB and the wire version/layout is
+unchanged. Ten codec cases pass; semantics remain with the storage/replication
+consumer. [Evidence](research/2026-10-30-replica-large-transactions.md).

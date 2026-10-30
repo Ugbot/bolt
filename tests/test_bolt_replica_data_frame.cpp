@@ -49,7 +49,7 @@ TEST(ReplicaDataCodec, GoldenLittleEndianMetadataAndBorrowedInnerForEverySourceK
     ASSERT_EQ(n, kFrameHeaderBytes + kReplicaDataHeaderBytes + sizeof(kPayload));
     EXPECT_EQ(std::memcmp(bytes.data() + kFrameHeaderBytes, metadata, sizeof(metadata)), 0);
     EXPECT_EQ(bytes[kOffLsn], 1); EXPECT_EQ(bytes[kOffLsn + 7], 8);
-    for (std::uint8_t kind = 1; kind <= 10; ++kind) {
+    for (std::uint8_t kind = 1; kind <= kWalTxnGroupApplyKind; ++kind) {
         auto source = source_frame(); source.kind = kind; source.frame_len = UINT32_MAX;
         ASSERT_EQ(replica_data_encode(source, source_fence(), bytes.data(), static_cast<std::uint32_t>(bytes.size())), n);
         ParsedFrame inner{}; ReplicaDataFence fence{};
@@ -128,7 +128,7 @@ TEST(ReplicaDataCodec, NestedProofHeartbeatAndUnknownSourceKindsAreRefusedBothWa
     Bytes good{}, refused{}; refused.fill(0xa5);
     const auto n = replica_data_encode(source_frame(), source_fence(), good.data(), static_cast<std::uint32_t>(good.size()));
     ASSERT_NE(n, 0u);
-    for (const std::uint8_t kind : {std::uint8_t{0}, std::uint8_t{11}, std::uint8_t{0xf0},
+    for (const std::uint8_t kind : {std::uint8_t{0}, std::uint8_t{13}, std::uint8_t{0xf0},
                                   std::uint8_t{0xf1}, std::uint8_t{0xfe}, std::uint8_t{255}}) {
         auto source = source_frame(); source.kind = kind;
         EXPECT_EQ(replica_data_encode(source, source_fence(), refused.data(), static_cast<std::uint32_t>(refused.size())), 0u);

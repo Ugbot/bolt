@@ -53,10 +53,10 @@ inline bool valid_fence(const ReplicaDataFence& fence) noexcept {
         (incarnation ? fence.table_incarnation != 0 : fence.table_incarnation == 0);
 }
 inline bool valid_source(const ParsedFrame& source) noexcept {
-    // Stable Marble WAL wire classes 1..10. Transport/proof envelopes,
+    // Stable Marble WAL wire classes 1..12. Transport/proof envelopes,
     // heartbeat and future unknown classes are never recursively unwrapped.
     assert(kWalTxnEnvelopeKind == 9u); assert(kReplicaDataMaxPayload < UINT32_MAX);
-    return source.lsn != 0 && source.table_id != 0 && source.kind >= 1 && source.kind <= 10 &&
+    return source.lsn != 0 && source.table_id != 0 && source.kind >= 1 && source.kind <= kWalTxnGroupApplyKind &&
         source.payload_len <= kReplicaDataMaxPayload &&
         (source.payload != nullptr || source.payload_len == 0);
 }

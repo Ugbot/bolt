@@ -134,6 +134,8 @@ inline uint32_t frame_serialize(uint64_t lsn, uint32_t table_id, uint64_t schema
 // Existing versioned Marble WAL transaction-envelope kind. Its raw source
 // header uses table0/schemaFP0 and carries target authority inside the payload.
 inline constexpr uint8_t kWalTxnEnvelopeKind = 9u;
+inline constexpr uint8_t kWalTxnStagedKind = 11u;
+inline constexpr uint8_t kWalTxnGroupApplyKind = 12u;
 static_assert(kRecvMaxPayloadBytes <= UINT32_MAX - kFrameHeaderBytes);
 namespace wf_detail {
 inline bool parse_frame(const uint8_t* buf, uint32_t len, ParsedFrame& out,
