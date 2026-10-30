@@ -272,8 +272,12 @@ bool table_overwrite_with(TableHandle* th, const Predicate* pred, const BoltBatc
     assert(th != nullptr);
     if (!write_ready(th)) return false;
     if (batch == nullptr) { th->last_error = CommitError::kFailed; return false; }
-    if (opts == nullptr || opts->kind == DeleteFileKind::kPosition) return dml_change(th, pred, batch, SnapshotOp::kOverwrite, opts);
-    return dml_change_eq(th, pred, batch, SnapshotOp::kOverwrite, opts);
+    const auto* schema=metadata_current_schema(&th->meta);BoltBatch* staged=nullptr;
+    if(!schema || write_batch_conform(*schema,*batch,th->arena,&staged)!=JsonValueStatus::Ok) {
+        th->last_error=CommitError::kFailed;return false;
+    }
+    if (opts == nullptr || opts->kind == DeleteFileKind::kPosition) return dml_change(th, pred, staged, SnapshotOp::kOverwrite, opts);
+    return dml_change_eq(th, pred, staged, SnapshotOp::kOverwrite, opts);
 }
 
 bool table_delete_keys(TableHandle* th, const BoltBatch* keys, const DeleteOptions* opts) noexcept {

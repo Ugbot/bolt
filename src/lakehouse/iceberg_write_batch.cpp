@@ -70,9 +70,9 @@ JsonValueStatus write_batch_conform(const Schema& schema,const BoltBatch& input,
     auto* batch=arena->allocate_array<BoltBatch>(1);if(!batch)return S::Capacity;
     BoltBatch::init_empty(batch);batch->arena=arena;
     if(!BoltBatch::alloc_columns(batch,arena,schema.n_fields))return S::Capacity;
-    batch->num_cols=schema.n_fields;batch->num_rows=input.num_rows;
+    batch->num_cols=schema.n_fields;batch->num_rows=input.num_rows;bool payload=false;
     for(uint32_t i=0;i<schema.n_fields;++i) {
-        const auto& field=schema.fields[i];BoltColumn value{};
+        const auto& field=schema.fields[i];BoltColumn value{};payload|=std::strcmp(field.type,"unknown")!=0;
         if(mapping[i]>=0) {
             value=input.col(static_cast<uint32_t>(mapping[i]));
             if(value.length!=input.num_rows)return S::Invalid;
@@ -84,6 +84,7 @@ JsonValueStatus write_batch_conform(const Schema& schema,const BoltBatch& input,
         batch->schema.fields[i].fixed_size=value.fixed_width;
         batch->columns[0][i]=value;batch->columns[1][i]=value;
     }
+    if(!payload)return S::Unsupported;
     *out=batch;return S::Ok;
 }
 } // namespace bolt::lakehouse::iceberg

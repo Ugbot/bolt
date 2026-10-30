@@ -155,7 +155,7 @@ bool write_eq_file(TableHandle* th, int64_t snap_id, const EqKeySpec* k, const E
     auto* w = data_file_begin(th, rel, snap_id, po);
     if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     for (uint32_t b = 0; b < g.n; ++b)                                    // bounded by the group's batches
-        if (!ingest::parquet::parquet_write_row_group(w, g.batches[b])) { data_file_abandon(th, w); return false; }
+        if (!physical_row_group(w,ks,*g.batches[b],th->arena)) { data_file_abandon(th, w); return false; }
     int64_t size = 0;
     if (!data_file_finish(th, rel, w, &size)) return false;
     *df = DataFileRef{};

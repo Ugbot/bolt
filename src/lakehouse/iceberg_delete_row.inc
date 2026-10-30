@@ -15,7 +15,7 @@ bool row_schema_ok(TableHandle* th) noexcept {
     if (sch == nullptr || sch->n_fields == 0u || sch->n_fields > 0xFFFEu) return false;
     for (uint32_t i = 0; i < sch->n_fields; ++i) {                        // bounded by n_fields
         IcebergTypeInfo info{};
-        if (!iceberg_type_parse(sch->fields[i].type, &info)) return false;
+        if (std::strcmp(sch->fields[i].type,"unknown") && !iceberg_type_parse(sch->fields[i].type, &info)) return false;
     }
     return true;
 }
@@ -49,7 +49,7 @@ bool row_delete_opts(TableHandle* th, ingest::parquet::ParquetWriteOpts* po,
     auto* tmp = th->arena->allocate_array<ingest::parquet::ParquetWriteOpts>(1);
     std::vector<ingest::parquet::ParquetWriteColumn> wide_row;
     if (tmp == nullptr || cur == nullptr || !make_pq_opts(cur, nullptr, tmp, &wide_row,th->arena)) return false;
-    const uint32_t n = cur->n_fields;
+    const uint32_t n = tmp->n_columns;
     auto* nodes = th->arena->allocate_array<ingest::parquet::ParquetNestedNode>(n + 1u);
     if (nodes == nullptr) return false;
     nodes[0] = ingest::parquet::ParquetNestedNode{};
@@ -120,8 +120,10 @@ bool write_row_delete_file(TableHandle* th, int64_t snap_id, const DmlPlan* p, c
         const DmlFile& f = p->files[g.files[k]];
         uint32_t off = 0;
         for (uint32_t b = 0; b < f.n_rows; ++b) {                         // bounded by the file's matched batches
-            BoltBatch rb{};
-            if (off + f.rows[b]->num_rows > f.n_pos || !row_delete_batch(th->arena, f.path, f.pos + off, f.rows[b], &rb) ||
+            BoltBatch rb{},physical{};
+            const auto* schema=metadata_current_schema(&th->meta);
+            if (off + f.rows[b]->num_rows > f.n_pos || !schema || !physical_batch(*schema,*f.rows[b],th->arena,&physical) ||
+                !row_delete_batch(th->arena, f.path, f.pos + off, &physical, &rb) ||
                 !ingest::parquet::parquet_write_row_group(w, &rb)) { data_file_abandon(th, w); return false; }
             off += static_cast<uint32_t>(f.rows[b]->num_rows);
         }

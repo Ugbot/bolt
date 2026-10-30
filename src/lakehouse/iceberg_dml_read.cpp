@@ -213,6 +213,7 @@ ReadStatus deliver(ReadCtx* rc, BoltBatch* b, const IcebergScanGroup& g) noexcep
         rb.match = sel;
     }
     b->num_cols = n_cols;
+    b->schema.num_fields = n_cols;
     return rc->visit(rc->ctx, &rb) ? ReadStatus::kOk : ReadStatus::kFailed;
 }
 

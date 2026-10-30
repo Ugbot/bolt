@@ -426,6 +426,7 @@ bool pq_iceberg_type(const char* t, ingest::parquet::ParquetWriteColumn* c, Bolt
     }
 }
 
+#include "iceberg_write_physical.inc"
 #include "iceberg_write_schema.inc"
 
 // Fills `po` for `sch`. A schema wider than the inline descriptor array
@@ -436,6 +437,8 @@ bool make_pq_opts(const Schema* sch, const WriteOptions* w,
     assert(sch != nullptr && po != nullptr);
     assert(wide != nullptr);
     *po = ingest::parquet::ParquetWriteOpts{};
+    Schema physical{};if(!physical_schema(*sch,arena,&physical))return false;
+    sch=&physical;
     const uint32_t n = sch->n_fields;
     if (n > ingest::parquet::kPwInlineColumns) wide->resize(n);
     ingest::parquet::ParquetWriteColumn* cols =
@@ -1143,7 +1146,7 @@ bool write_data_file(TableHandle* th, const BoltBatch* const* batches,
     auto* w = data_file_begin(th, rel_out, snap_id, &po);
     if (w == nullptr) { th->last_error = CommitError::kFailed; return false; }
     for (uint32_t i = 0; i < n_batches; ++i) {
-        if (!ingest::parquet::parquet_write_row_group(w, batches[i])) {
+        if (!physical_row_group(w,*write_sch,*batches[i],th->arena)) {
             data_file_abandon(th, w);
             th->last_error = CommitError::kFailed;
             return false;

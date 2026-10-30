@@ -299,7 +299,7 @@ BoltType fill_bolt_type(const char* t, uint32_t* fixed, uint32_t* scale) noexcep
     if (std::strcmp(t, "timestamp") == 0 || std::strcmp(t, "timestamptz") == 0) return BoltType::Timestamp;
     if (std::strcmp(t, "timestamp_ns") == 0 || std::strcmp(t, "timestamptz_ns") == 0) return BoltType::Int64;
     if (std::strcmp(t, "uuid") == 0) return BoltType::UUID;
-    if (std::strcmp(t, "binary") == 0) return BoltType::Binary;
+    if (std::strcmp(t, "binary") == 0 || std::strcmp(t,"unknown")==0) return BoltType::Binary;
     if (std::sscanf(t, "decimal(%u,%u)", &p, &sc) == 2 && sc <= p && p <= 38u) {
         *scale = sc;
         return p <= 18u ? BoltType::Decimal64 : BoltType::Decimal128;
@@ -549,6 +549,7 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
     for (uint32_t j=0; j<s->map_schema->n_fields; ++j) {
         const char* name=s->map_schema->fields[j].name;
         if (s->colmap[j]>=0) {
+            if(!std::strcmp(s->map_schema->fields[j].type,"unknown"))return false;
             if (!promote_column(dec[s->colmap[j]],s->want_type[j],rows,s->scratch,&out[j],name)) return false;
             continue;
         }

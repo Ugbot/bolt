@@ -127,7 +127,7 @@ bool table_overwrite(TableHandle* th, const Predicate* pred, const BoltBatch* ba
     assert(th != nullptr);
     if (!write_ready(th)) return false;
     if (batch == nullptr) { th->last_error = CommitError::kFailed; return false; }
-    return dml_change(th, pred, batch, SnapshotOp::kOverwrite, nullptr);
+    return table_overwrite_with(th,pred,batch,nullptr);
 }
 
 bool table_delete(TableHandle* th, const Predicate* pred) noexcept {

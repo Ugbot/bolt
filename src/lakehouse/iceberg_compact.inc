@@ -348,12 +348,16 @@ bool compact_visit(void* c, const dml::RowBatch* rb) noexcept {
     }
     if (rb->batch->num_rows == 0) return true;
     if (!o->file_open && !compact_open(o)) return false;
-    if (!conform_batch(o->th, rb->batch)) return false;
-    const BoltBatch* out = rb->batch;
-    if (o->lineage && (rb->lineage == nullptr || (out = with_lineage(o->th->arena, rb->batch, rb->lineage)) == nullptr)) return false;
-    if (!ingest::parquet::parquet_write_row_group(o->w, out)) return false;
+    const auto* schema=metadata_current_schema(&o->th->meta);BoltBatch* prepared=nullptr;
+    if(!schema || write_batch_conform(*schema,*rb->batch,o->th->arena,&prepared)!=JsonValueStatus::Ok)return false;
+    const BoltBatch* out=prepared;
+    if(o->lineage) {
+        if(!rb->lineage || !(out=with_lineage(o->th->arena,prepared,rb->lineage)))return false;
+        schema=lineage_schema(o->th,schema);
+    }
+    if(!schema || !physical_row_group(o->w,*schema,*out,o->th->arena))return false;
     if (!lake_grow(o->th->arena, nullptr, &o->batches, o->n_batches, &o->cap_batches, o->n_batches + 1u)) return false;
-    o->batches[o->n_batches++] = rb->batch;
+    o->batches[o->n_batches++] = prepared;
     o->rows += rb->batch->num_rows;
     return true;
 }

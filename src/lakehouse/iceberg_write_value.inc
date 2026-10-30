@@ -19,6 +19,23 @@ S write_numeric(const IcebergTypeInfo& type,Arena* arena,BoltColumn* value) noex
     assert(arena && value);assert(value->length>=0 && value->length<=INT32_MAX);
     using T=IcebergType;const auto count=static_cast<size_t>(value->length);
     if(value->format!=ColumnFormat::Flat || (count && !value->data))return S::Invalid;
+    if(type.type==T::kBoolean && value->type==BoltType::Bool) {
+        if(value->type_size_bytes!=1)return S::Invalid;
+        for(size_t i=0;i<count;++i)if(!value->is_null(static_cast<int64_t>(i)) && static_cast<const uint8_t*>(value->data)[i]>1)return S::Invalid;
+        return S::Ok;
+    }
+    if(type.type==T::kBoolean && value->type!=BoltType::Bool) {
+        const bool wide=value->type==BoltType::Int64 && value->type_size_bytes==8;
+        const bool byte=(value->type==BoltType::Int8 || value->type==BoltType::UInt8) && value->type_size_bytes==1;
+        if(!wide && !byte)return S::Invalid;
+        auto* bits=arena->allocate_array<uint8_t>(count+1u);if(!bits)return S::Capacity;
+        for(size_t i=0;i<count;++i) {
+            if(value->is_null(static_cast<int64_t>(i))) {bits[i]=0;continue;}
+            const auto number=wide?static_cast<const int64_t*>(value->data)[i]:static_cast<const uint8_t*>(value->data)[i];
+            if(number!=0 && number!=1)return S::Invalid;bits[i]=static_cast<uint8_t>(number);
+        }
+        value->data=bits;value->type=BoltType::Bool;value->type_size_bytes=1;return S::Ok;
+    }
     if(type.type==T::kFloat && value->type==BoltType::Float64 && value->type_size_bytes==8) {
         auto* floats=arena->allocate_array<float>(count+1u);if(!floats)return S::Capacity;
         for(size_t i=0;i<count;++i) {
@@ -52,12 +69,25 @@ S write_child_presence(const BoltColumn& parent,Arena* arena,BoltColumn* child) 
     child->validity=nulls?validity:nullptr;child->validity_offset=0;child->stats.all_valid=nulls==0;child->stats.null_count=nulls;
     return S::Ok;
 }
+bool write_schema_has_payload(const SchemaField& field,uint32_t depth) noexcept {
+    assert(depth<=kIcebergSchemaMaxDepth+1u);assert(field.n_children<=kMaxColumns);
+    if(depth>kIcebergSchemaMaxDepth || !std::strcmp(field.type,"unknown"))return false;
+    const bool st=!std::strcmp(field.type,"struct"),list=!std::strcmp(field.type,"list"),map=!std::strcmp(field.type,"map");
+    if(!st && !list && !map)return true;
+    if(!field.n_children || !field.children)return false;
+    bool payload=false;
+    for(uint32_t i=0;i<field.n_children;++i) {
+        const bool child=write_schema_has_payload(field.children[i],depth+1u);
+        if(!st && !child)return false;payload|=child;
+    }
+    return payload;
+}
 S write_value_prepare(const SchemaField& field,Arena* arena,BoltColumn* value,uint32_t depth) noexcept {
     assert(arena && value);assert(depth<=kIcebergSchemaMaxDepth+1u);
     if(depth>kIcebergSchemaMaxDepth || value->length<0 || value->length>INT32_MAX)return S::Invalid;
     const bool st=!std::strcmp(field.type,"struct"),list=!std::strcmp(field.type,"list"),map=!std::strcmp(field.type,"map");
     if(st || list || map) {
-        if(st && !field.n_children)return S::Unsupported;
+        if(!write_schema_has_payload(field,depth))return S::Unsupported;
         const auto type=st?BoltType::Struct:list?BoltType::List:BoltType::Map;
         if(value->type!=type || value->format!=ColumnFormat::Nested || !value->data)return S::Invalid;
         const auto count=st?field.n_children:1u;
@@ -75,6 +105,11 @@ S write_value_prepare(const SchemaField& field,Arena* arena,BoltColumn* value,ui
             children[0].data=entry;
         } else for(uint32_t i=0;i<count;++i) {const auto status=write_value_prepare(field.children[i],arena,&children[i],depth+1);if(status!=S::Ok)return status;}
         value->data=children;return S::Ok;
+    }
+    if(!std::strcmp(field.type,"unknown")) {
+        if(field.required)return S::Invalid;
+        for(int64_t r=0;r<value->length;++r)if(!value->is_null(r))return S::Invalid;
+        return S::Ok;
     }
     IcebergTypeInfo type{};if(!iceberg_type_parse(field.type,&type))return S::Unsupported;
     if(type.type==IcebergType::kFixed)return write_fixed(type,arena,value);

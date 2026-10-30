@@ -468,3 +468,13 @@ and emits typed WKT, including recursive values and normalized map keys.
 264 exact independent DuckDB spatial conversions and seven integrated focused
 suites qualify this component. Nonnull geospatial schema defaults still refuse;
 full writer/consumer/bounds acceptance remains open.
+
+2026-10-30 G2ICE-314 writer lifecycle: `iceberg_write_physical.inc` omits validated
+null unknown fields from Parquet while retaining logical IDs/fields; schemas
+without unknowns keep zero-copy dispatch. Shared write_batch_conform now covers
+overwrite and compaction, including boolean read-lane normalization. DML delivery
+trims schema width after stripping helper columns; compaction metrics consume
+normalized batches. Old scalar-only adapter removed. Eight focused suites plus
+actual live-file/unknown original-metadata/mixed-type lifecycle oracles pass,
+including stable v3 lineage. Empty/no-leaf Parquet shapes explicitly Unsupported;
+full matrix/consumer/bounds acceptance remains open.
