@@ -20,9 +20,11 @@ The legacy `read()` wrapper still spins until success.
 caller-admitted `object_store/pinned.h` directory. Manifest/list/data/delete
 reads use only copied strong versions; `object_store/s3_uri.h` maps original
 absolute URIs once against the store namespace. Signed snapshot selection is
-separate from legacy latest sentinels. Flat data and position deletes bind by
-retained Parquet field IDs; `parquet_read_meta_source_flat_strict` validates the
-exact fetched footer without extra transport calls. Full graph admission and
+separate from legacy latest sentinels. Scalar and recursive struct/list/map data
+bind by retained Parquet field IDs, including renamed/reordered children.
+`parquet_read_meta_source_nested_strict` validates raw schema members and paths
+from the exact fetched footer without extra transport calls. Position deletes
+retain the flat-strict footer contract. Full graph admission and
 durable publication remain caller responsibilities. Unsupported types/options
 are enumerated in the pinned-read public header; this is not a complete mounted
 Iceberg service or read/write cache.
@@ -36,8 +38,10 @@ without repinning. Native PyArrow-value fixtures cover V1/V2, dictionaries,
 legacy list/map shapes, late-leaf failures and poisoned scratch lifetimes.
 The ordinary Iceberg scanner now consumes this tree, maps top-level and
 child columns by stable ID, fills optional additions and applies nested row
-selection for positional deletes. The strict private pinned reader retains its
-flat-footer validation; typed SQL materialization remains unfinished.
+selection for positional deletes. The strict private pinned reader now consumes
+the recursive schema with exact type/field-ID admission, preserved ns ticks and
+terminal immutable-range failures. Missing-child defaults and promotions refuse.
+The host qualifies API/CLI nested SQL separately.
 
 `lakehouse/iceberg/metadata_io.h` loads one caller-selected immutable metadata
 object through strong conditional ranges, distinct finite retained/scratch

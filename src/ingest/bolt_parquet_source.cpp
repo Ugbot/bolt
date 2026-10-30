@@ -160,7 +160,7 @@ Status projection_extents(const ParquetByteSource& source, const ParquetSourceWo
 #include "bolt_parquet_source_nested.inc"
 }  // namespace
 
-template<bool FlatStrict>
+template<bool FlatStrict, bool NestedStrict=false>
 static ParquetSourceStatus read_meta_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* w, Arena* arena, PqMeta* out,
     PqSchemaTree* tree = nullptr) noexcept {
@@ -200,6 +200,11 @@ static ParquetSourceStatus read_meta_source(const ParquetByteSource* source,
     PqSchemaTree staged_tree{};
     if (tree != nullptr && !parquet_schema_tree_slice(w->bytes, length, arena, &staged_tree))
         return Status::DecodeFailed;
+    if constexpr (NestedStrict) {
+        const auto parsed=pq_parse_file_meta_tree_strict(w->bytes,length,staged,kPqMaxRowGroups,&staged_tree,arena);
+        if(parsed==PqMetaParseStatus::Capacity)return Status::Capacity;
+        if(parsed!=PqMetaParseStatus::Ok)return Status::DecodeFailed;
+    }
     *out = *staged;
     if (tree != nullptr) *tree = staged_tree;
     return Status::Ok;
@@ -218,7 +223,7 @@ ParquetSourceStatus parquet_read_meta_source_flat_strict(const ParquetByteSource
 ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* w, const PqMeta* meta, uint32_t row_group,
     const uint16_t* indices, uint32_t count, Arena* arena,
-    BoltColumn* out, int64_t* rows) noexcept {
+    BoltColumn* out, int64_t* rows, bool retain_nanoseconds) noexcept {
     assert(source != nullptr && w != nullptr && meta != nullptr);
     assert(arena != nullptr && out != nullptr && rows != nullptr);
     if (!admitted(source, w) || indices == nullptr || count == 0) return Status::BadArg;
@@ -241,7 +246,7 @@ ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* 
         }
         int64_t decoded = 0;
         if (!parquet_read_col_region(w->bytes, length, offset, meta, row_group, indices[i],
-                                     arena, &staged[i], &decoded) || decoded != group.num_rows)
+                                     arena, &staged[i], &decoded, retain_nanoseconds) || decoded != group.num_rows)
             return Status::DecodeFailed;
     }
     std::memcpy(out, staged, sizeof(BoltColumn) * count);
@@ -254,6 +259,13 @@ ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* sou
     assert(out != nullptr && w != nullptr);
     if (tree == nullptr) return Status::BadArg;
     return read_meta_source<false>(source, w, arena, out, tree);
+}
+
+ParquetSourceStatus parquet_read_meta_source_nested_strict(const ParquetByteSource* source,
+    ParquetSourceWorkspace* workspace,Arena* arena,PqMeta* out,PqSchemaTree* tree) noexcept {
+    assert(source != nullptr && arena != nullptr); assert(workspace != nullptr && out != nullptr);
+    if(!tree)return Status::BadArg;
+    return read_meta_source<false,true>(source,workspace,arena,out,tree);
 }
 
 ParquetSourceStatus parquet_read_nested_column_source(const ParquetByteSource* source,

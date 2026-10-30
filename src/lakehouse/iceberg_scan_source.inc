@@ -179,11 +179,9 @@ bool open_parquet(ScanHandle* s, const char* path, Arena* metadata,
     const int rc = os_head_versioned(file->store, file->key, file->io, &file->version);
     if (rc != kOsOk || !os_object_version_valid(&file->version) || file->version.size < 12) return false;
     file->source = {file->version.size, file, pinned_parquet_read};
-    if (s->table->strict_pinned)
-        return pq::parquet_read_meta_source_flat_strict(&file->source,&s->source_workspace,
-            metadata,meta)==pq::ParquetSourceStatus::Ok;
-    const bool loaded = pq::parquet_read_meta_source_nested(&file->source, &s->source_workspace,
-        metadata, meta, &file->tree) == pq::ParquetSourceStatus::Ok;
+    const bool loaded = (s->table->strict_pinned
+        ? pq::parquet_read_meta_source_nested_strict(&file->source,&s->source_workspace,metadata,meta,&file->tree)
+        : pq::parquet_read_meta_source_nested(&file->source,&s->source_workspace,metadata,meta,&file->tree)) == pq::ParquetSourceStatus::Ok;
     if (loaded) for (uint32_t i = 0; i < file->tree.n_top; ++i)
         file->nested |= file->tree.fields[file->tree.top[i]].kind != pq::PqFieldKind::Leaf;
     return loaded;
@@ -215,5 +213,5 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
     if (count>kMaxColumns) return false;
     return pq::parquet_read_row_group_cols_source(&file->source, &s->source_workspace,
         meta, row_group, s->source_indices, count, s->scratch,
-        columns, rows) == pq::ParquetSourceStatus::Ok;
+        columns, rows, s->table->strict_pinned) == pq::ParquetSourceStatus::Ok;
 }

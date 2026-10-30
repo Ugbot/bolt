@@ -3,6 +3,9 @@
 
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt_parquet_meta_internal.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
+#include "bolt/bolt_arena.h"
+#include <algorithm>
 
 namespace bolt {
 namespace ingest {
@@ -1107,6 +1110,9 @@ struct StrictSchema {
     StrictStatus status = StrictStatus::Invalid;
     uint32_t columns = 0, max_columns = 0, max_groups = 0;
     PqColumn* fields = nullptr;
+    const PqSchemaTree* tree = nullptr;
+    uint32_t* leaf_nodes = nullptr;
+    uint32_t* node_order = nullptr;
 };
 bool strict_refuse(StrictSchema& s, StrictStatus status) noexcept {
     s.status = status; return false;
@@ -1151,7 +1157,7 @@ bool strict_time_unit(TcCursor* c) noexcept {
 }
 bool strict_logical_members(TcCursor* c, int16_t member) noexcept {
     assert(c); assert(member>0);
-    if (member==1 || member==6) return strict_empty(c); // STRING / DATE
+    if (member==1 || member==2 || member==3 || member==6 || member==14) return strict_empty(c);
     uint8_t seen=0;int16_t id=0;uint8_t type=0;bool done=false;
     for (;;) {
         if (!strict_field(c,&id,&type,&done)) return false;
@@ -1174,7 +1180,8 @@ bool strict_logical(TcCursor* c, StrictSchema& s, int16_t* member) noexcept {
     assert(c && member); assert(c->p <= c->end);
     int16_t id=0;uint8_t type=0;bool done=false;
     if(!strict_field(c,&id,&type,&done) || done || type!=kTcStruct)return false;
-    if(id!=1 && id!=5 && id!=6 && id!=7 && id!=8 && id!=10)
+    if(id!=1 && id!=5 && id!=6 && id!=7 && id!=8 && id!=10 &&
+        !(s.tree && (id==2 || id==3 || id==14)))
         return strict_refuse(s,StrictStatus::Unsupported);
     *member=id;
     if(!strict_logical_members(c,id))return false;
@@ -1184,6 +1191,9 @@ bool strict_annotation_pair(const SchemaElem& e,int16_t logical) noexcept {
     const auto& c=e.col;const auto old=c.converted;
     if(old<0 || !logical)return true;
     if(logical==1)return old==0;
+    if(logical==2)return old==1;
+    if(logical==3)return old==3;
+    if(logical==14)return false; // UUID has no ConvertedType counterpart
     if(logical==5)return old==kCtDecimal;
     if(logical==6)return old==kCtDate;
     if(logical==7)return c.ts_utc && old==(c.time_unit==1?kCtTimeMillis:c.time_unit==2?kCtTimeMicros:-1);
@@ -1194,6 +1204,7 @@ bool strict_annotation_pair(const SchemaElem& e,int16_t logical) noexcept {
 }
 bool strict_type(const PqColumn& c,StrictSchema& s) noexcept {
     const auto logical=static_cast<PqLogical>(c.logical);
+    if(s.tree && logical==PqLogical::Uuid)return c.physical==PqType::FixedLenByteArray && c.type_length==16;
     if(logical==PqLogical::Int)return
         (c.int_bits==8 || c.int_bits==16 || c.int_bits==32 || c.int_bits==64) &&
         c.physical==(c.int_bits==64?PqType::Int64:PqType::Int32);
@@ -1245,8 +1256,19 @@ bool strict_element(TcCursor* c,StrictSchema& s,SchemaElem* element,bool root) n
         }
     }
     if(!(seen & (1u<<3)) || !parse_schema_element(&decoded,element) || decoded.p!=c->p)return false;
-    if(root)return !element->has_type && seen==((1u<<3)|(1u<<4)) && element->num_children>0;
-    if(element->num_children || element->repeated)return strict_refuse(s,StrictStatus::Unsupported);
+    if(root) {
+        const auto root_members=(1u<<3)|(1u<<4);
+        const bool shape=seen==root_members || (s.tree && seen==(root_members|(1u<<2)) &&
+            !element->col.optional && !element->repeated);
+        return !element->has_type && shape && element->num_children>0;
+    }
+    if(s.tree && element->num_children) {
+        if(element->has_type || !(seen & (1u<<2)) || (seen & ((1u<<1)|(1u<<6)|(1u<<7))))return false;
+        const auto converted=element->col.converted;
+        return (converted<0 || converted==1 || converted==2 || converted==3) &&
+            (!logical || logical==2 || logical==3) && strict_annotation_pair(*element,logical);
+    }
+    if(element->num_children || (element->repeated && !s.tree))return strict_refuse(s,StrictStatus::Unsupported);
     if(!element->has_type || !(seen & (1u<<2)))return false;
     const auto old=element->col.converted;
     if(old>=0 && old!=0 && old!=kCtDecimal && old!=kCtDate && (old<kCtTimeMillis || old>kCtInt64))
@@ -1261,10 +1283,12 @@ bool strict_element(TcCursor* c,StrictSchema& s,SchemaElem* element,bool root) n
     if(element->col.physical==PqType::FixedLenByteArray && !(seen & (1u<<1)))return false;
     return strict_annotation_pair(*element,logical) && strict_type(element->col,s);
 }
+#include "bolt_parquet_meta_nested_strict.inc"
 bool strict_schema_list(TcCursor* c,StrictSchema& s) noexcept {
     assert(c);assert(s.max_columns>0);
     uint8_t type=0;uint32_t count=0;
     if(!strict_list(c,&type,&count) || type!=kTcStruct || count<2)return false;
+    if(s.tree)return strict_nested_schema_list(c,s,count);
     if(count-1>s.max_columns)return strict_refuse(s,StrictStatus::Capacity);
     SchemaElem root{};if(!strict_element(c,s,&root,true))return false;
     if(static_cast<uint32_t>(root.num_children)!=count-1)return strict_refuse(s,StrictStatus::Unsupported);
@@ -1296,7 +1320,9 @@ bool strict_column_meta(TcCursor* c,StrictSchema& s,uint32_t column) noexcept {
             uint8_t element=0;uint32_t count=0;
             if(type!=kTcList || !strict_list(c,&element,&count) || element!=kTcI32 || !count)return false;
             for(uint32_t i=0;i<count;++i){int32_t encoding=0;if(!strict_i32(c,&encoding) || encoding<0)return false;}
-        } else if(id==3) {if(type!=kTcList || !strict_chunk_path(c,s.fields[column]))return false;}
+        } else if(id==3) {
+            if(type!=kTcList || !(s.tree ? strict_nested_chunk_path(c,s,column) : strict_chunk_path(c,s.fields[column])))return false;
+        }
         else if((id>=5 && id<=7) || id==9 || id==11) {
             int64_t value=0;if(type!=kTcI64 || !strict_i64(c,&value) || value<0 || ((id==9 || id==11) && value<4))return false;
         } else if(!tc_skip_impl(c,type,0,true))return false;
@@ -1364,13 +1390,20 @@ bool strict_preflight(const uint8_t* bytes,uint32_t size,StrictSchema& s) noexce
 }
 } // namespace
 
-PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* bytes,uint32_t size,
-        PqMeta* out,uint32_t max_row_groups) noexcept {
+static PqMetaParseStatus parse_meta_strict(const uint8_t* bytes,uint32_t size,
+        PqMeta* out,uint32_t max_row_groups,const PqSchemaTree* tree,Arena* arena) noexcept {
     if(!bytes || !size || !out || !out->columns || !out->columns_cap ||
         out->columns_cap>kMaxColumns || !out->chunks || !out->chunks_cap ||
         !max_row_groups || max_row_groups>kPqMaxRowGroups)return StrictStatus::Invalid;
     assert(out->columns_cap<=kMaxColumns);assert(max_row_groups<=kPqMaxRowGroups);
     StrictSchema strict{StrictStatus::Invalid,0,out->columns_cap,max_row_groups,out->columns};
+    if(tree) {
+        if(!arena || !tree->nodes || tree->n_nodes<2 || tree->n_nodes>kPqMaxSchemaElems ||
+            !tree->n_columns || tree->n_columns>out->columns_cap)return StrictStatus::Invalid;
+        strict.tree=tree; strict.leaf_nodes=arena->allocate_array<uint32_t>(tree->n_columns);
+        strict.node_order=arena->allocate_array<uint32_t>(tree->n_nodes);
+        if(!strict.leaf_nodes || !strict.node_order)return StrictStatus::Capacity;
+    }
     if(!strict_preflight(bytes,size,strict))return strict.status;
     if(!pq_parse_file_meta(bytes,size,out))return
         out->need_columns>out->columns_cap || out->need_chunks>out->chunks_cap?StrictStatus::Capacity:StrictStatus::Invalid;
@@ -1383,14 +1416,24 @@ PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* bytes,uint32_t size,
         rows+=static_cast<uint64_t>(group.num_rows);
         for(uint32_t i=0;i<group.chunk_count;++i) {
             const auto& chunk=out->chunks[group.chunk_off+i];
-            if(chunk.num_values!=group.num_rows || chunk.total_compressed_size<0 ||
+            const bool repeated=out->columns[i].max_rep!=0;
+            if((repeated ? chunk.num_values<group.num_rows : chunk.num_values!=group.num_rows) || chunk.total_compressed_size<0 ||
                 chunk.total_uncompressed_size<0)return StrictStatus::Invalid;
         }
     }
     if(rows!=static_cast<uint64_t>(out->num_rows))return StrictStatus::Invalid;
-    for(uint32_t i=0;i<out->n_columns;++i)for(uint32_t j=0;j<i;++j)
+    for(uint32_t i=0;!tree && i<out->n_columns;++i)for(uint32_t j=0;j<i;++j)
         if(std::strcmp(out->columns[i].name,out->columns[j].name)==0)return StrictStatus::Unsupported;
     return StrictStatus::Ok;
+}
+PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* bytes,uint32_t size,
+        PqMeta* out,uint32_t max_row_groups) noexcept {
+    return parse_meta_strict(bytes,size,out,max_row_groups,nullptr,nullptr);
+}
+PqMetaParseStatus pq_parse_file_meta_tree_strict(const uint8_t* bytes,uint32_t size,
+        PqMeta* out,uint32_t max_row_groups,const PqSchemaTree* tree,Arena* arena) noexcept {
+    if(!tree || !arena)return StrictStatus::Invalid;
+    return parse_meta_strict(bytes,size,out,max_row_groups,tree,arena);
 }
 
 }  // namespace parquet

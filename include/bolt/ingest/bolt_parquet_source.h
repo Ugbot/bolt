@@ -57,15 +57,20 @@ ParquetSourceStatus parquet_read_meta_source_flat_strict(const ParquetByteSource
 // malformed/unsupported pages or a failure within the existing decoder.
 // Workspace/descriptors, input metadata/indices and writable descriptors must
 // not overlap; overflowed or overlapping spans are refused before I/O.
+// retain_nanoseconds preserves Int64 ticks; callers retain unit/UTC metadata.
 ParquetSourceStatus parquet_read_row_group_cols_source(const ParquetByteSource* source,
     ParquetSourceWorkspace* workspace, const PqMeta* meta, uint32_t row_group,
     const uint16_t* col_idx, uint32_t n_idx, Arena* output_arena,
-    BoltColumn* out_cols, int64_t* out_rows) noexcept;
+    BoltColumn* out_cols, int64_t* out_rows, bool retain_nanoseconds = false) noexcept;
 // Fetch one exact footer and retain both leaf metadata and the nested schema.
 // Both outputs publish together only on success; neither borrows the workspace.
 ParquetSourceStatus parquet_read_meta_source_nested(const ParquetByteSource* source,
     ParquetSourceWorkspace* workspace, Arena* metadata_arena, PqMeta* out,
     PqSchemaTree* tree) noexcept;
+// Same exact-footer staging, plus raw logical/schema/chunk-path validation.
+// The flat-strict entry point retains its flat-only admission contract.
+ParquetSourceStatus parquet_read_meta_source_nested_strict(const ParquetByteSource*,
+    ParquetSourceWorkspace*, Arena*, PqMeta*, PqSchemaTree*) noexcept;
 
 // Assemble a top-level nested field using one compressed leaf chunk at a time.
 // Same status, immutable-source and transactional output contracts as the flat

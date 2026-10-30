@@ -2,9 +2,13 @@
 // JSON metadata/list/manifest fixtures are independent of the Iceberg writer.
 #include <gtest/gtest.h>
 #include "bolt/bolt_column.h"
+#include "bolt_iceberg_nested_json.h"
+#include <fstream>
+#include <cstdlib>
 #include "bolt/crypto/sigv4.h"
 #include "bolt/ingest/bolt_parquet_read.h"
 #include "bolt/ingest/bolt_parquet_write.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
 #include <algorithm>
 #include <array>
@@ -407,8 +411,10 @@ void exact_rows(Fixture& f) {
 void terminal_failure(Fixture& f) {
     BoltBatch batch{}; bool eof = true;
     EXPECT_FALSE(iceberg_scan_next_batch(f.scan,&batch,&eof)); EXPECT_FALSE(eof);
+    EXPECT_EQ(batch.num_rows,0); EXPECT_EQ(batch.schema.num_fields,0u);
     const uint32_t calls = f.origin.ranges;
     EXPECT_FALSE(iceberg_scan_next_batch(f.scan,&batch,&eof)); EXPECT_FALSE(eof);
+    EXPECT_EQ(batch.num_rows,0); EXPECT_EQ(batch.schema.num_fields,0u);
     EXPECT_EQ(f.origin.ranges,calls); f.no_fallback();
 }
 } // namespace
@@ -538,10 +544,9 @@ TEST(IcebergPinnedRead, MissingDuplicateNegativeUnknownAndWrongTypeParquetIdsRef
     }
 }
 
-TEST(IcebergPinnedRead, InvalidSchemaIdsAndNestedFieldsCannotMaterializeAsFlatColumns) {
+TEST(IcebergPinnedRead, InvalidSchemaIdsRefuseBeforeOriginIo) {
     for (const char* replacement : {R"({"id":0,"name":"trade_id","required":true,"type":"long"})",
-             R"({"id":11,"name":"trade_id","required":true,"type":"long"})",
-             R"({"id":7,"name":"trade_id","required":true,"type":{"type":"struct","fields":[{"id":8,"name":"child","required":true,"type":"long"}]}})"}) {
+             R"({"id":11,"name":"trade_id","required":true,"type":"long"})"}) {
         Fixture f; ASSERT_TRUE(f.prepare());
         const std::string old=R"({"id":7,"name":"trade_id","required":true,"type":"long"})";
         const auto at=f.retained.find(old); ASSERT_NE(at,std::string::npos);
@@ -550,6 +555,41 @@ TEST(IcebergPinnedRead, InvalidSchemaIdsAndNestedFieldsCannotMaterializeAsFlatCo
         if (f.open()) { EXPECT_FALSE(f.start()); EXPECT_EQ(f.scan,nullptr); }
         EXPECT_EQ(f.origin.ranges,0u); f.no_fallback();
     }
+}
+
+TEST(IcebergPinnedRead, RequiredNestedStructBindsChildrenByIdAcrossRenameAndReorder) {
+    Fixture f; ASSERT_TRUE(f.prepare()); auto& bytes=f.origin.objects[ExactData].bytes;
+    ASSERT_TRUE(rewrite_footer(&bytes));
+    const auto start=f.retained.find("\"fields\":[");
+    const auto end=f.retained.find("],\"default-spec-id\"");
+    ASSERT_NE(start,std::string::npos); ASSERT_NE(end,std::string::npos);
+    f.retained.replace(start,end-start,
+        R"("fields":[{"id":100,"name":"payload","required":true,"type":{"type":"struct","fields":[{"id":7,"name":"id","required":true,"type":"long"},{"id":11,"name":"price","required":true,"type":"double"}]}}]})");
+    f.body(MetadataSlot,f.retained);
+    f.body(ExactManifest,manifest(uri("shared/exact%25part.parquet"),-1,bytes.size()));
+    ASSERT_TRUE(f.seal()); ASSERT_TRUE(f.open()); ASSERT_TRUE(f.start());
+    uint32_t rows=0; bool finished=false;
+    for(uint32_t group=0;group<8;++group) {
+        BoltBatch batch{}; bool eof=false; ASSERT_TRUE(iceberg_scan_next_batch(f.scan,&batch,&eof));
+        if(eof) { finished=true;break; }
+        ASSERT_EQ(batch.num_cols,1u); EXPECT_STREQ(batch.schema.fields[0].name,"payload");
+        const auto& col=batch.columns[batch.read_epoch][0];
+        ASSERT_EQ(col.type,BoltType::Struct); ASSERT_EQ(col.child_count(),2u);
+        for(int64_t row=0;row<batch.num_rows;++row) {
+            ASSERT_LT(rows,3u); EXPECT_EQ(col.child_at(0)->typed_data<int64_t>()[row],41+rows);
+            EXPECT_DOUBLE_EQ(col.child_at(1)->typed_data<double>()[row],(rows+1u)*1.25); ++rows;
+        }
+    }
+    EXPECT_TRUE(finished); EXPECT_EQ(rows,3u); f.no_fallback();
+}
+
+TEST(IcebergPinnedRead, RetainedNestedDeclarationCannotAdmitAFlatPhysicalLeaf) {
+    Fixture f; ASSERT_TRUE(f.prepare());
+    const std::string old=R"({"id":7,"name":"trade_id","required":true,"type":"long"})";
+    const auto at=f.retained.find(old); ASSERT_NE(at,std::string::npos);
+    f.retained.replace(at,old.size(),R"({"id":7,"name":"trade_id","required":true,"type":{"type":"struct","fields":[{"id":8,"name":"child","required":true,"type":"long"}]}})");
+    f.body(MetadataSlot,f.retained); ASSERT_TRUE(f.seal()); ASSERT_TRUE(f.open());
+    ASSERT_TRUE(f.start()); terminal_failure(f);
 }
 
 TEST(IcebergPinnedRead, DirectoryCannotAliasTransportOrWritableReadOutputs) {
@@ -752,4 +792,61 @@ TEST(IcebergPinnedRead, MalformedLogicalAnnotationAcceptedByOrdinaryDecoderRefus
         else { EXPECT_FALSE(f.start()); EXPECT_EQ(f.scan,nullptr); }
         f.no_fallback();
     }
+}
+
+TEST(IcebergPinnedRead, ExternalNestedOracle) {
+    const char* parquet=std::getenv("BOLT_PINNED_NESTED_PARQUET");
+    const char* schema_path=std::getenv("BOLT_PINNED_NESTED_SCHEMA");
+    const char* output_path=std::getenv("BOLT_PINNED_NESTED_OUTPUT");
+    if(!parquet || !schema_path || !output_path) GTEST_SKIP() << "independent fixture probe";
+    Fixture f; ASSERT_TRUE(f.prepare());
+    std::ifstream data(parquet,std::ios::binary), schema_file(schema_path);
+    ASSERT_TRUE(data.good()); ASSERT_TRUE(schema_file.good());
+    auto& bytes=f.origin.objects[ExactData].bytes;
+    bytes.assign(std::istreambuf_iterator<char>(data),std::istreambuf_iterator<char>());
+    const std::string schema_json((std::istreambuf_iterator<char>(schema_file)),{});
+    {
+        Arena check;auto* meta=check.allocate_array<pq::PqMeta>(1);ASSERT_NE(meta,nullptr);*meta=pq::PqMeta{};
+        pq::PqSchemaTree tree{};ASSERT_TRUE(pq::parquet_read_meta(bytes.data(),bytes.size(),&check,meta));
+        ASSERT_TRUE(pq::parquet_read_schema_tree(bytes.data(),bytes.size(),&check,&tree));
+        uint64_t at=0;uint32_t size=0;ASSERT_TRUE(pq::pq_locate_footer(bytes.data(),bytes.size(),&at,&size));
+        ASSERT_EQ(pq::pq_parse_file_meta_tree_strict(bytes.data()+at,size,meta,pq::kPqMaxRowGroups,&tree,&check),pq::PqMetaParseStatus::Ok);
+    }
+
+    const auto start=f.retained.find("\"schemas\":["), end=f.retained.find(",\"default-spec-id\"");
+    ASSERT_NE(start,std::string::npos); ASSERT_NE(end,std::string::npos);
+    f.retained.replace(start,end-start,"\"schemas\":["+schema_json+"]");
+    f.body(MetadataSlot,f.retained);
+    f.body(ExactManifest,manifest(uri("shared/exact%25part.parquet"),-1,bytes.size()));
+    ASSERT_TRUE(f.seal()); ASSERT_TRUE(f.open()); ASSERT_TRUE(f.start());
+    if(const char* call=std::getenv("BOLT_PINNED_NESTED_FAIL_CALL")) {
+        f.origin.fail_slot=ExactData;f.origin.fail_call=static_cast<uint32_t>(std::strtoul(call,nullptr,10));
+        f.origin.short_success=std::getenv("BOLT_PINNED_NESTED_SHORT")!=nullptr;
+    }
+    if(std::getenv("BOLT_PINNED_NESTED_REFUSE")) {
+        terminal_failure(f);
+        if(f.origin.fail_slot==ExactData) EXPECT_EQ(f.origin.objects[ExactData].calls,f.origin.fail_call);
+        return;
+    }
+    const auto* schema=metadata_current_schema(iceberg_table_metadata(f.table)); ASSERT_NE(schema,nullptr);
+    std::string json="["; uint32_t rows=0;bool finished=false;
+    for(uint32_t group=0;group<128;++group) {
+        BoltBatch batch{}; bool eof=false;ASSERT_TRUE(iceberg_scan_next_batch(f.scan,&batch,&eof));
+        if(eof) {finished=true;break;}
+        ASSERT_EQ(batch.num_cols,schema->n_fields);
+        const auto* cols=batch.columns[batch.read_epoch];
+        for(int64_t row=0;row<batch.num_rows;++row) {
+            if(rows++)json+=",";
+            json+="{";
+            for(uint32_t c=0;c<schema->n_fields;++c) {
+                const auto& field=schema->fields[c];if(c)json+=",";
+                EXPECT_STREQ(batch.schema.fields[c].name,field.name);
+                json+=nested_oracle::quote(reinterpret_cast<const uint8_t*>(field.name),std::strlen(field.name))+":";
+                ASSERT_TRUE(nested_oracle::value(field,cols[c],row,0,&json)) << field.name;
+            }
+            json+="}";
+        }
+    }
+    EXPECT_TRUE(finished);EXPECT_EQ(rows,3u);f.no_fallback();json+="]";
+    std::ofstream output(output_path);output<<json;ASSERT_TRUE(output.good());
 }

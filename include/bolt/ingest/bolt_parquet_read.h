@@ -153,7 +153,7 @@ ParquetSourceStatus parquet_read_meta_slice(const uint8_t* metadata, uint32_t le
 // Output descriptor/row count publish only on success. Used by source reads.
 bool parquet_read_col_region(const uint8_t* buf, uint64_t length, uint64_t base,
     const PqMeta* meta, uint32_t row_group, uint16_t column, Arena* arena,
-    BoltColumn* out, int64_t* out_rows) noexcept;
+    BoltColumn* out, int64_t* out_rows, bool retain_nanoseconds = false) noexcept;
 
 // Decode ONE row group into caller-preallocated column descriptors
 // (out_cols[meta->n_columns]; the structs are descriptors only — all

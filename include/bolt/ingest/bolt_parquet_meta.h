@@ -29,6 +29,7 @@
 #include "bolt/bolt_types.h"   // kMaxColumns
 
 namespace bolt {
+class Arena;
 namespace ingest {
 namespace parquet {
 
@@ -432,6 +433,12 @@ bool pq_parse_file_meta(const uint8_t* meta, uint32_t meta_len,
 enum class PqMetaParseStatus : uint8_t { Ok, Invalid, Capacity, Unsupported };
 PqMetaParseStatus pq_parse_file_meta_strict(const uint8_t* meta, uint32_t meta_len,
     PqMeta* out, uint32_t max_row_groups) noexcept;
+struct PqSchemaTree;
+// Exact admission for a tree staged from the same footer. Checks raw logical
+// members, node/path identity and repeated chunk counts; scratch is arena-owned.
+// The existing flat-only contract above remains unchanged.
+PqMetaParseStatus pq_parse_file_meta_tree_strict(const uint8_t*, uint32_t,
+    PqMeta*, uint32_t max_row_groups, const PqSchemaTree*, Arena*) noexcept;
 
 }  // namespace parquet
 }  // namespace ingest

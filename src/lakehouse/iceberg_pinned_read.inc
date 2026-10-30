@@ -171,8 +171,7 @@ bool select_pinned_schema(ScanHandle* s) noexcept {
     if (selected==nullptr || selected->n_fields==0 || selected->n_fields>kMaxColumns) return false;
     for (uint32_t i=0; i<selected->n_fields; ++i) {
         const auto& field=selected->fields[i];
-        if (field.id<=0 || field.name[0]==0 || std::strchr(field.name,'\\')!=nullptr ||
-            std::strcmp(field.type,"struct")==0) return false;
+        if (field.id<=0 || field.name[0]==0 || std::strchr(field.name,'\\')!=nullptr) return false;
         for (uint32_t j=0; j<i; ++j)
             if (field.id==selected->fields[j].id || std::strcmp(field.name,selected->fields[j].name)==0)
                 return false;
@@ -574,6 +573,27 @@ bool conform_group(ScanHandle* s, const BoltColumn* dec, BoltColumn* out, int64_
     return true;
 }
 
+// Ordinary schema evolution permits unselected physical fields. Private exact
+// admission retains the flat reader's refusal of unknown semantic children.
+bool pinned_nested_shape(const SchemaField& field,const pq::PqSchemaTree& tree,
+    int32_t index,uint32_t depth) noexcept {
+    assert(tree.fields);assert(depth<=kIcebergSchemaMaxDepth+1u);
+    if(depth>kIcebergSchemaMaxDepth || index<0 || static_cast<uint32_t>(index)>=tree.n_fields)return false;
+    const auto& physical=tree.fields[index];
+    if(physical.kind==pq::PqFieldKind::Leaf)return field.n_children==0;
+    int32_t parent=index;
+    if(physical.kind==pq::PqFieldKind::Map) {
+        parent=physical.first_child;
+        if(parent<0 || static_cast<uint32_t>(parent)>=tree.n_fields)return false;
+    }
+    if(tree.fields[parent].n_children!=field.n_children)return false;
+    for(uint32_t i=0;i<field.n_children;++i) {
+        const auto child=pq::pq_field_find_id(&tree,parent,field.children[i].id);
+        if(!pinned_nested_shape(field.children[i],tree,child,depth+1u))return false;
+    }
+    return true;
+}
+
 bool bind_data_columns(ScanHandle* s, const pq::PqMeta* meta) noexcept {
     assert(s!=nullptr && meta!=nullptr); assert(s->table!=nullptr);
     s->output_columns=meta->n_columns;
@@ -585,6 +605,17 @@ bool bind_data_columns(ScanHandle* s, const pq::PqMeta* meta) noexcept {
     }
     const auto* schema=s->selected_schema;
     if (schema==nullptr || meta->n_columns>kMaxColumns) return false;
+    if(s->pinned.nested || schema_has_nested(schema)) {
+        if(!bind_nested_schema(s,meta,schema) || !nested_has_ids(s->pinned.tree) ||
+            s->pinned.tree.n_top!=schema->n_fields)return false;
+        for(uint32_t i=0;i<schema->n_fields;++i) {
+            const auto physical=s->colmap[i];
+            if(physical<0 || !schema_field_matches_parquet(schema->fields[i],meta,&s->pinned.tree,
+                s->pinned.tree.top[physical]) || !pinned_nested_shape(schema->fields[i],s->pinned.tree,
+                    s->pinned.tree.top[physical],0u))return false;
+        }
+        return true;
+    }
     for (uint32_t i=0; i<meta->n_columns; ++i) {
         const auto& column=meta->columns[i];
         if (!column.has_field_id || column.field_id<=0 || column.max_rep!=0 || column.max_def>1)

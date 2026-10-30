@@ -32,11 +32,14 @@ struct PinnedTableRead {
 // admitted failure can consume arena space. No ownership transfer.
 //
 // Null read options use the admitted selection. Supplied options must select the
-// same snapshot explicitly, without timestamp fallback. Flat data fields bind
-// by Iceberg/Parquet field IDs, including renamed/reordered physical columns.
-// Current typed materialization admits boolean/int/long/float/double/string/
-// binary/date and microsecond time/timestamp/timestamptz. Decimal/fixed/UUID,
-// nested fields, missing-field defaults and type promotions refuse explicitly.
+// same snapshot explicitly, without timestamp fallback. Scalar and recursive
+// struct/list/map fields bind by Iceberg/Parquet field IDs, including renamed/
+// reordered physical children. Strict raw footer/path validation runs before
+// decoding; immutable range failures are terminal, with no repin or fallback.
+// Materialization uses the shared exact leaf/type matcher and nested decoder.
+// Nanosecond timestamp ticks remain exact Int64 with retained logical metadata.
+// Missing-field defaults and type promotions refuse explicitly; supported leaf
+// encodings remain bounded by the owned Parquet decoder.
 // Position deletes use reserved field IDs; equality deletes refuse. Supplied
 // projection/predicate/include-deletes/include-partition-columns options also
 // refuse until their strict semantics are implemented. No silent option ignore.

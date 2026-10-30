@@ -2964,7 +2964,7 @@ ParquetSourceStatus parquet_read_meta_slice(const uint8_t* metadata, uint32_t le
 
 bool parquet_read_col_region(const uint8_t* buf, uint64_t length, uint64_t base,
     const PqMeta* meta, uint32_t row_group, uint16_t column, Arena* arena,
-    BoltColumn* out, int64_t* out_rows) noexcept {
+    BoltColumn* out, int64_t* out_rows, bool retain_nanoseconds) noexcept {
     assert(meta != nullptr && out != nullptr);
     assert(arena != nullptr && out_rows != nullptr);
     if (buf == nullptr || meta->n_row_groups > kPqMaxRowGroups ||
@@ -2980,6 +2980,11 @@ bool parquet_read_col_region(const uint8_t* buf, uint64_t length, uint64_t base,
     ColCtx context;
     if (!init_col_ctx(meta, column, row_group, row_group + 1u, rg.num_rows,
                       arena, &staged, &context)) return false;
+    if (retain_nanoseconds && meta->columns[column].time_unit == 3 &&
+        (staged.type == BoltType::Timestamp || staged.type == BoltType::Duration)) {
+        context.ts_rescale=0; context.type=BoltType::Int64;
+        staged.type=BoltType::Int64; staged.type_size_bytes=8;
+    }
     if (!decode_chunk(buf, length, chunk, &context, 0, rg.num_rows, arena, base)) return false;
     (void)attach_dict_hint(&context, &staged, arena);
     *out = staged;

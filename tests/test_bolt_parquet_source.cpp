@@ -1,5 +1,6 @@
 #include "bolt/ingest/bolt_parquet_source.h"
 #include "bolt/ingest/bolt_parquet_read.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
 #include "bolt/ingest/bolt_parquet_write.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -590,3 +591,31 @@ TEST_F(ParquetSource, OverflowedPointerSpansRefuseBeforeIo) {
     EXPECT_EQ(memory.calls, before);
 }
 }  // namespace
+
+TEST_F(ParquetSource, NestedStrictStagesOwnedTreeWithNoAdditionalFooterRequests) {
+    ASSERT_TRUE(integer_file(2,32,&file));bind();ASSERT_NE(meta,nullptr);
+    PqSchemaTree tree{};
+    ASSERT_EQ(parquet_read_meta_source_nested_strict(&source,&workspace,&metadata,meta,&tree),Status::Ok);
+    const auto calls=memory.calls,bytes=memory.bytes;
+    EXPECT_EQ(tree.n_top,1u);ASSERT_NE(tree.nodes,nullptr);EXPECT_STREQ(tree.nodes[1].name,"id");
+    EXPECT_FALSE(metadata.overlaps_backing(workspace.bytes,static_cast<size_t>(workspace.capacity)));
+    std::memset(workspace.bytes,0xA5,static_cast<size_t>(workspace.capacity));
+    EXPECT_STREQ(tree.nodes[1].name,"id");EXPECT_STREQ(meta->columns[0].name,"id");
+    memory.calls=0;memory.bytes=0;PqSchemaTree ordinary{};
+    ASSERT_EQ(parquet_read_meta_source_nested(&source,&workspace,&metadata,meta,&ordinary),Status::Ok);
+    EXPECT_EQ(memory.calls,calls);EXPECT_EQ(memory.bytes,bytes);
+    EXPECT_LE(memory.largest_request,workspace.request_bytes);
+}
+TEST_F(ParquetSource, NestedStrictPreservesBothOutputsOnFailureAndRejectsAliasesBeforeIo) {
+    ASSERT_TRUE(integer_file(1,16,&file));bind();ASSERT_NE(meta,nullptr);
+    meta->num_rows=-77;PqSchemaTree tree{};tree.n_top=91;
+    for(const auto failure:{Status::IoError,Status::Changed,Status::Capacity}) {
+        memory.fail_call=memory.calls+3;memory.failure=failure;
+        EXPECT_EQ(parquet_read_meta_source_nested_strict(&source,&workspace,&metadata,meta,&tree),failure);
+        EXPECT_EQ(meta->num_rows,-77);EXPECT_EQ(tree.n_top,91u);EXPECT_EQ(tree.nodes,nullptr);
+    }
+    const auto calls=memory.calls;
+    auto* alias=reinterpret_cast<PqSchemaTree*>(workspace.bytes);
+    EXPECT_EQ(parquet_read_meta_source_nested_strict(&source,&workspace,&metadata,meta,alias),Status::BadArg);
+    EXPECT_EQ(memory.calls,calls);EXPECT_EQ(meta->num_rows,-77);EXPECT_EQ(tree.n_top,91u);
+}

@@ -1,4 +1,6 @@
 #include "bolt/ingest/bolt_parquet_meta.h"
+#include "bolt/ingest/bolt_parquet_nested.h"
+#include "bolt/bolt_arena.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstddef>
@@ -67,9 +69,10 @@ void leaf(Bytes& b,Shape shape) {
     if(shape==Shape::DecimalConflict){b.number(6,5);b.number(7,3);b.number(8,18);}
     b.stop();
 }
-Bytes metadata(Shape shape) {
+Bytes metadata(Shape shape,bool explicit_root=false) {
     Bytes b;b.number(1,1);b.field(2,pq::kTcList);
     b.list(shape==Shape::Nested || shape==Shape::DuplicateName?3:2);
+    if(explicit_root)b.number(3,0);
     b.name("schema");b.number(5,shape==Shape::DuplicateName?2:1);b.stop();
     if(shape==Shape::Nested){b.number(3,0);b.name("group");b.number(5,1);b.stop();}
     leaf(b,shape);if(shape==Shape::DuplicateName)leaf(b,shape);
@@ -242,3 +245,34 @@ TEST(ParquetMetaStrict, OverflowedLengthsAndSkippedVarintsNeverWrap) {
     }
 }
 } // namespace
+
+TEST(ParquetMetaStrict, RetainedTreeAdmitsNestedMembersWithoutRelaxingFlatContract) {
+    for(const auto shape:{Shape::Plain,Shape::Dot,Shape::Timestamp,Shape::LocalTime,Shape::Nested}) {
+        const auto bytes=metadata(shape);bolt::Arena arena;pq::PqSchemaTree tree{};
+        ASSERT_TRUE(pq::parquet_schema_tree_slice(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),&arena,&tree));
+        Output nested;
+        EXPECT_EQ(pq::pq_parse_file_meta_tree_strict(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),
+            nested.meta,4,&tree,&arena),S::Ok);
+        Output flat;EXPECT_EQ(parse(bytes,flat),shape==Shape::Nested?S::Unsupported:S::Ok);
+        ++tree.nodes[1].field_id;tree.nodes[1].has_field_id=1;
+        EXPECT_NE(pq::pq_parse_file_meta_tree_strict(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),
+            nested.meta,4,&tree,&arena),S::Ok);
+    }
+}
+TEST(ParquetMetaStrict, RetainedTreeStillRejectsMalformedRawAnnotationsAndSiblingNames) {
+    for(const auto shape:{Shape::MissingUtc,Shape::MissingUnit,Shape::DuplicateUtc,Shape::Contradictory,
+        Shape::MissingRepetition,Shape::DecimalMissingScale,Shape::DecimalConflict,Shape::DuplicateName}) {
+        const auto bytes=metadata(shape);bolt::Arena arena;pq::PqSchemaTree tree{};
+        if(!pq::parquet_schema_tree_slice(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),&arena,&tree))continue;
+        Output out;EXPECT_NE(pq::pq_parse_file_meta_tree_strict(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),
+            out.meta,4,&tree,&arena),S::Ok)<<static_cast<int>(shape);
+    }
+}
+
+TEST(ParquetMetaStrict, RetainedTreeAdmitsExplicitRequiredRootFromIndependentWriters) {
+    const auto bytes=metadata(Shape::Nested,true);bolt::Arena arena;pq::PqSchemaTree tree{};
+    ASSERT_TRUE(pq::parquet_schema_tree_slice(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),&arena,&tree));
+    Output out;EXPECT_EQ(pq::pq_parse_file_meta_tree_strict(bytes.bytes.data(),static_cast<uint32_t>(bytes.bytes.size()),
+        out.meta,4,&tree,&arena),S::Ok);
+    Output flat;EXPECT_NE(parse(bytes,flat),S::Ok);
+}
