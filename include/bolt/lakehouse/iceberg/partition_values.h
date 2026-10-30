@@ -66,7 +66,9 @@ int partition_value_compare(const IcebergTypeInfo& t, const PartitionValue& a, c
 bool partition_value_equal(const PartitionValue& a, const PartitionValue& b) noexcept;
 
 // Binary single-value serialization of a non-null value of type `t` into out[0..cap), *n bytes (0 is a legal
-// length: the empty string). False on a type with no encoding, a partial value or too small a buffer.
+// length: an empty string/binary). Exact typed lanes, integer widths, time range,
+// decimal precision and UUID/fixed lengths are required. False on unsupported,
+// partial or invalid values/capacity; *n becomes zero and bytes remain unchanged.
 bool partition_value_encode(const IcebergTypeInfo& t, const PartitionValue& v, uint8_t* out, uint32_t cap,
                             uint32_t* n) noexcept;
 
@@ -78,7 +80,9 @@ bool partition_value_encode(const IcebergTypeInfo& t, const PartitionValue& v, u
 void manifest_partition_summaries(const DataFileRef* files, uint32_t n, const PartitionSpec* spec,
                                   const IcebergTypeInfo* types, ManifestListEntry* e) noexcept;
 
-// The inverse, for reading partition summary bounds. False on a length that does not fit the type.
+// The inverse, for reading partition summary bounds. Exact declared widths and
+// values are checked; failure preserves *out. Nonzero boolean bytes mean true.
+// Geometry/geography values are opaque WKB; their stats bounds use another format.
 bool partition_value_decode(const IcebergTypeInfo& t, const uint8_t* b, uint32_t len, PartitionValue* out) noexcept;
 
 // The Avro type JSON of a partition field of result type `t` (`{"type":"int","logicalType":"date"}`, a uniquely

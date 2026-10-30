@@ -13,6 +13,9 @@
 #include "bolt/lakehouse/iceberg/manifest.h"
 #include "bolt/lakehouse/iceberg/metadata.h"
 #include "bolt/lakehouse/iceberg/statistics.h"
+#include "bolt/lakehouse/iceberg/partition_values.h"
+#include <charconv>
+#include <cmath>
 
 #include <cassert>
 #include <cstdlib>
@@ -26,12 +29,11 @@ namespace {
 
 bool parse_i64(const char* s, int64_t* out) noexcept {
     assert(s != nullptr && out != nullptr);
-    if (s[0] == '\0') return false;
-    char* end = nullptr;
-    const long long v = std::strtoll(s, &end, 10);
-    if (end == s) return false;
-    *out = static_cast<int64_t>(v);
-    return true;
+    const auto length=std::strlen(s);
+    if(!length)return false;
+    int64_t value=0;const auto result=std::from_chars(s,s+length,value);
+    if(result.ec!=std::errc{} || result.ptr!=s+length)return false;
+    *out=value;return true;
 }
 
 // A text bound (JSON manifests) of `n` bytes, not NUL-terminated.
@@ -93,6 +95,8 @@ uint32_t bound_width(const char* type, bool* is_float) noexcept {
     if (std::strcmp(type, "time") == 0)        return 8u;
     if (std::strcmp(type, "timestamp") == 0)   return 8u;
     if (std::strcmp(type, "timestamptz") == 0) return 8u;
+    if (std::strcmp(type, "timestamp_ns") == 0) return 8u;
+    if (std::strcmp(type, "timestamptz_ns") == 0) return 8u;
     if (std::strcmp(type, "boolean") == 0)     return 1u;
     if (std::strcmp(type, "double") == 0) { *is_float = true; return 8u; }
     if (std::strcmp(type, "float") == 0)  { *is_float = true; return 4u; }
@@ -105,24 +109,12 @@ uint32_t bound_width(const char* type, bool* is_float) noexcept {
 bool decode_bound(const char* bytes, uint32_t len, const char* type,
                   double* out) noexcept {
     assert(bytes != nullptr && type != nullptr && out != nullptr);
-    bool is_float = false;
-    const uint32_t w = bound_width(type, &is_float);
-    if (w == 0u || len != w) return false;
-    if (is_float) {
-        if (w == 8u) { double d = 0.0; std::memcpy(&d, bytes, 8u); *out = d; }
-        else         { float  f = 0.0f; std::memcpy(&f, bytes, 4u);
-                       *out = static_cast<double>(f); }
-        return true;
-    }
-    if (w == 1u) { *out = bytes[0] != 0 ? 1.0 : 0.0; return true; }
-    if (w == 4u) {
-        int32_t v = 0; std::memcpy(&v, bytes, 4u);
-        *out = static_cast<double>(v);
-        return true;
-    }
-    int64_t v = 0; std::memcpy(&v, bytes, 8u);
-    *out = static_cast<double>(v);
-    return true;
+    IcebergTypeInfo info{};PartitionValue value{};
+    if(!iceberg_type_parse(type,&info) || !partition_value_decode(info,
+        reinterpret_cast<const uint8_t*>(bytes),len,&value))return false;
+    if(value.is_float) {if(std::isnan(value.f64))return false;*out=value.f64;return true;}
+    if(!value.is_int)return false;
+    *out=static_cast<double>(value.i64);return true;
 }
 
 // The predicate's value as a double, mirroring `pred_as_i64`'s tolerance of a
@@ -183,12 +175,12 @@ bool bounds_of_i64(const ColumnStatEntry* cs, const DataFileRef* f, const Schema
     bool is_float = false;
     const uint32_t w = bound_width(sf->type, &is_float);
     if (w == 0u || is_float) return false;
-    auto dec = [w](const char* b, uint32_t len, int64_t* out) noexcept {
-        if (len != w) return false;
-        if (w == 1u) { *out = b[0] != 0 ? 1 : 0; return true; }
-        if (w == 4u) { int32_t v = 0; std::memcpy(&v, b, 4u); *out = v; return true; }
-        std::memcpy(out, b, 8u);
-        return true;
+    IcebergTypeInfo info{};
+    if(!iceberg_type_parse(sf->type,&info))return false;
+    auto dec=[&info](const char* bytes,uint32_t length,int64_t* out) noexcept {
+        PartitionValue value{};
+        if(!partition_value_decode(info,reinterpret_cast<const uint8_t*>(bytes),length,&value) || !value.is_int)return false;
+        *out=value.i64;return true;
     };
     *have_lo = cs->has_lower && dec(cs->lower, cs->lower_len, lo);
     *have_hi = cs->has_upper && dec(cs->upper, cs->upper_len, hi);

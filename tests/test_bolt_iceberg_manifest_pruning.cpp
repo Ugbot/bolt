@@ -234,3 +234,30 @@ TEST(IcebergStatsPruning, IntegerBoundsCompareExactly) {
 }
 
 }  // namespace
+
+TEST(IcebergStatsPruning, NanosecondBoundsUseExactIntegersAndRefuseWrongWidths) {
+    for(const char* kind:{"long","timestamp_ns","timestamptz_ns"}) {
+        SchemaField field{};field.id=3;std::strcpy(field.name,"v");std::strcpy(field.type,kind);
+        Schema schema{};schema.n_fields=1;schema.fields=&field;
+        const int64_t big=INT64_C(1)<<60;
+        const uint8_t encoded[]{1,0,0,0,0,0,0,0x10}; // 2^60 + 1, not representable in double
+        ColumnStatEntry column{};column.field_id=3;column.has_lower=column.has_upper=true;
+        column.lower=column.upper=reinterpret_cast<const char*>(encoded);column.lower_len=column.upper_len=8;
+        static DataFileRef file;file=DataFileRef{};file.binary_bounds=true;file.stats.record_count=1;
+        file.stats.n_cols=file.stats.cap_cols=1;file.stats.cols=&column;
+        const auto hit=pred("v",PredicateOp::kGt,big),miss=pred("v",PredicateOp::kLe,big);
+        EXPECT_TRUE(stats_pass(&file,&schema,&hit,1));EXPECT_FALSE(stats_pass(&file,&schema,&miss,1));
+        column.lower_len=column.upper_len=4;
+        EXPECT_TRUE(stats_pass(&file,&schema,&hit,1));EXPECT_TRUE(stats_pass(&file,&schema,&miss,1));
+    }
+}
+TEST(IcebergStatsPruning, MalformedLegacyTextBoundsAreUnknownRatherThanClampedOrPartial) {
+    SchemaField field{};field.id=3;std::strcpy(field.name,"v");std::strcpy(field.type,"long");
+    Schema schema{};schema.n_fields=1;schema.fields=&field;const auto equal=pred("v",PredicateOp::kEq,0);
+    for(const char* text:{"9223372036854775808","-9223372036854775809","7trailing","7.5"}) {
+        ColumnStatEntry column{};column.field_id=3;column.has_lower=column.has_upper=true;
+        column.lower=column.upper=text;column.lower_len=column.upper_len=static_cast<uint32_t>(std::strlen(text));
+        static DataFileRef file;file=DataFileRef{};file.stats.record_count=1;file.stats.n_cols=file.stats.cap_cols=1;file.stats.cols=&column;
+        EXPECT_TRUE(stats_pass(&file,&schema,&equal,1))<<text;
+    }
+}

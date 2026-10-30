@@ -7,6 +7,9 @@
 #include "bolt/lakehouse/iceberg/metadata.h"
 
 #include <cassert>
+#include <bit>
+#include <limits>
+#include "bolt/kernels/bolt_decimal.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -375,9 +378,10 @@ int partition_value_compare(const IcebergTypeInfo& t, const PartitionValue& a, c
     }
     if (t.type == IcebergType::kUuid && uuid_signed && la == 16u && lb == 16u) {
         for (uint32_t half = 0; half < 2u; ++half) {                      // two signed longs, msb first
-            int64_t x = 0, y = 0;
-            for (uint32_t i = 0; i < 8u; ++i) { x = (x << 8) | pa[half * 8u + i]; y = (y << 8) | pb[half * 8u + i]; }
-            if (x != y) return x < y ? -1 : 1;
+            uint64_t xb=0,yb=0;
+            for(uint32_t i=0;i<8u;++i) {xb=(xb<<8)|pa[half*8u+i];yb=(yb<<8)|pb[half*8u+i];}
+            const auto x=std::bit_cast<int64_t>(xb),y=std::bit_cast<int64_t>(yb);
+            if(x!=y)return x<y ? -1 : 1;
         }
         return 0;
     }
@@ -398,41 +402,7 @@ bool partition_value_equal(const PartitionValue& a, const PartitionValue& b) noe
 
 namespace {
 
-uint32_t encode_value(const IcebergTypeInfo& t, const PartitionValue& v, uint8_t* out, uint32_t cap) noexcept {
-    assert(out != nullptr);
-    assert(!v.is_null);
-    uint32_t w = 0;
-    switch (t.type) {
-        case IcebergType::kBoolean: w = 1u; break;
-        case IcebergType::kInt: case IcebergType::kDate: w = 4u; break;
-        case IcebergType::kFloat: w = 4u; break;
-        case IcebergType::kDouble: case IcebergType::kLong: case IcebergType::kTime: case IcebergType::kTimestamp:
-        case IcebergType::kTimestampTz: case IcebergType::kTimestampNs: case IcebergType::kTimestampTzNs: w = 8u; break;
-        case IcebergType::kUnknown: return 0u;
-        default: break;
-    }
-    if (w != 0u) {
-        if (cap < w) return 0u;
-        if (t.type == IcebergType::kFloat) { const float f = static_cast<float>(v.f64); std::memcpy(out, &f, 4u); return 4u; }
-        if (t.type == IcebergType::kDouble) { std::memcpy(out, &v.f64, 8u); return 8u; }
-        for (uint32_t i = 0; i < w; ++i) out[i] = static_cast<uint8_t>((static_cast<uint64_t>(v.i64) >> (8u * i)) & 0xffu);
-        return w;
-    }
-    const uint32_t n = partition_value_bytes_len(v);
-    if (t.type == IcebergType::kDecimal) {                                // minimal big-endian unscaled bytes
-        if (n < 1u || n > 16u) return 0u;
-        int64_t hi = 0; uint64_t lo = 0;
-        decimal_from_be(reinterpret_cast<const uint8_t*>(v.str), n, &hi, &lo);
-        uint8_t m[16];
-        const uint32_t mn = decimal_min_be_bytes(hi, lo, m);
-        if (mn > cap) return 0u;
-        std::memcpy(out, m, mn);
-        return mn;
-    }
-    if (n > cap) return 0u;
-    if (n != 0u) std::memcpy(out, v.str, n);
-    return n;
-}
+#include "iceberg_single_value.inc"
 
 }  // namespace
 
@@ -440,7 +410,7 @@ bool partition_value_encode(const IcebergTypeInfo& t, const PartitionValue& v, u
                             uint32_t* n) noexcept {
     assert(out != nullptr && n != nullptr);
     *n = 0;
-    if (v.is_null || v.is_partial || t.type == IcebergType::kUnknown) return false;
+    if (!single_value_valid(t,v)) return false;
     const bool may_be_empty = (t.type == IcebergType::kString || t.type == IcebergType::kBinary) &&
                               v.is_str && partition_value_bytes_len(v) == 0u;
     *n = encode_value(t, v, out, cap);
@@ -499,29 +469,9 @@ void manifest_partition_summaries(const DataFileRef* files, uint32_t n, const Pa
 bool partition_value_decode(const IcebergTypeInfo& t, const uint8_t* b, uint32_t len, PartitionValue* out) noexcept {
     assert(b != nullptr || len == 0u);
     assert(out != nullptr);
-    std::memset(out, 0, sizeof(*out));
-    switch (t.type) {
-        case IcebergType::kBoolean: if (len != 1u) return false; out->is_int = true; out->i64 = b[0] != 0u; return true;
-        case IcebergType::kFloat: { if (len != 4u) return false; float f; std::memcpy(&f, b, 4u); out->is_float = true; out->f64 = f; return true; }
-        case IcebergType::kDouble: if (len != 8u) return false; out->is_float = true; std::memcpy(&out->f64, b, 8u); return true;
-        case IcebergType::kDecimal: {
-            if (len < 1u || len > 16u || t.fixed_len < 1u || t.fixed_len > 16u) return false;
-            int64_t hi = 0; uint64_t lo = 0;
-            decimal_from_be(b, len, &hi, &lo);
-            return put_decimal(out, hi, lo, t.fixed_len);
-        }
-        case IcebergType::kUnknown: return false;
-        default: break;
-    }
-    if (is_intlike(t.type)) {
-        if (len != 4u && len != 8u) return false;
-        if (len == 4u) { int32_t x; std::memcpy(&x, b, 4u); out->i64 = x; }
-        else std::memcpy(&out->i64, b, 8u);
-        out->is_int = true;
-        return true;
-    }
-    if (len > kMaxValue) return false;
-    put_bytes(out, b, len);
+    PartitionValue staged{};
+    if(!decode_single_value(t,b,len,&staged))return false;
+    *out=staged;
     return true;
 }
 

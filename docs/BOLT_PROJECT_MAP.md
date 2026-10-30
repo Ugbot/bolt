@@ -405,3 +405,11 @@ The row codec now preserves decimal scale and safely sizes empty byte leaves.
 75 native checks and the 15-check owned-store nested drill pass on Clang/macOS.
 SQL catalog, operators and frontends still need to consume this contract;
 these APIs alone do not enable nested SQL or close G2ICE-400/307.
+
+`iceberg/partition_values.h` provides the bounded Appendix D scalar binary codec.
+It validates exact typed lanes/widths, time ranges, decimal precision and fixed/
+UUID lengths, emits explicit LE numerics/minimal BE decimals, and preserves the
+old output on decoding refusal. Statistics reuse it for scalar numeric bounds,
+including exact ns timestamps. Legacy malformed/overflowed integer text is
+unknown, never a pruning value. PyIceberg conversion oracle: 201 vectors. JSON
+single-value/default and full bound-matrix qualification remain separate work.

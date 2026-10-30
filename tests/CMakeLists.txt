@@ -2397,6 +2397,12 @@ add_test(NAME test_bolt_iceberg_transforms COMMAND test_bolt_iceberg_transforms)
 
 # G2ICE-292 — partitioned appends, delete / overwrite / compaction per partition, spec evolution and partition
 # pruning, read back through bolt's own scan; the external verdict is scripts/iceberg_partition_interop.py.
+add_executable(test_bolt_iceberg_single_value test_bolt_iceberg_single_value.cpp)
+target_link_libraries(test_bolt_iceberg_single_value PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_single_value)
+add_test(NAME test_bolt_iceberg_single_value COMMAND test_bolt_iceberg_single_value)
+set_tests_properties(test_bolt_iceberg_single_value PROPERTIES TIMEOUT 120)
+
 add_executable(test_bolt_iceberg_partitioned test_bolt_iceberg_partitioned.cpp)
 target_link_libraries(test_bolt_iceberg_partitioned
     PRIVATE bolt::lakehouse bolt::ingest bolt::parse GTest::gtest GTest::gtest_main)
