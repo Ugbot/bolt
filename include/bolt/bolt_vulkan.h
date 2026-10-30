@@ -189,6 +189,39 @@ public:
                         const BufferHandle& scale, const BufferHandle& activation,
                         const BufferHandle& out, int32_t out_rows, int32_t cols) noexcept;
 
+    // ---- BLLM-176: on-device RMSNorm (first non-GEMV op of the resident-graph
+    // forward, BLLM-159). out[i] = x[i]/sqrt(mean(x^2)+eps)*weight[i]. All args
+    // are Vulkan-resident BufferHandles; one workgroup normalizes the whole
+    // n-wide vector. Blocks until complete (vkQueueWaitIdle). ----
+    bool create_rmsnorm_pipeline(MatmulPipeline* out) noexcept;
+    bool rmsnorm(const MatmulPipeline& pipeline, const BufferHandle& x, const BufferHandle& weight,
+                 const BufferHandle& out, int32_t n, float eps) noexcept;
+
+    // ---- BLLM-179: on-device elementwise (add/SwiGLU/GeGLU). out[i] = op(a[i],
+    // b[i]); op 0=a+b (residual/bias), 1=silu(a)*b (SwiGLU), 2=gelu(a)*b (GeGLU).
+    // One invocation per element. Blocks until complete. ----
+    bool create_elementwise_pipeline(MatmulPipeline* out) noexcept;
+    bool elementwise(const MatmulPipeline& pipeline, const BufferHandle& a, const BufferHandle& b,
+                     const BufferHandle& out, int32_t n, int32_t op) noexcept;
+
+    // ---- BLLM-177: on-device RoPE (rotate_half, matches rope_half_split).
+    // Rotates a [num_heads, head_dim] buffer in place. Blocks until complete. ----
+    bool create_rope_pipeline(MatmulPipeline* out) noexcept;
+    bool rope(const MatmulPipeline& pipeline, const BufferHandle& x, int32_t head_dim,
+              int32_t num_heads, int32_t position, float theta) noexcept;
+
+    // ---- BLLM-178: on-device decode-step causal attention with flash-style
+    // online softmax (the Vulkan twin of bolt::rocm::attention). `q` is
+    // [num_heads, head_dim]; `k_cache`/`v_cache` are [seq_len, num_kv_heads,
+    // head_dim]; `out` is [num_heads, head_dim]. GQA: query head h reads kv
+    // head h/(num_heads/num_kv_heads). One workgroup per query head; requires
+    // head_dim <= 256. Blocks until complete. ----
+    bool create_attention_pipeline(MatmulPipeline* out) noexcept;
+    bool attention(const MatmulPipeline& pipeline, const BufferHandle& q,
+                   const BufferHandle& k_cache, const BufferHandle& v_cache,
+                   const BufferHandle& out, int32_t num_heads, int32_t num_kv_heads,
+                   int32_t head_dim, int32_t seq_len, float scale) noexcept;
+
     // ---- BLLM-81: int8-ACTIVATION matmul (the real expert-FFN numerics
     // tier, distinct from matmul_dequant's float-activation tier above) ---
 

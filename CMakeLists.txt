@@ -293,7 +293,9 @@ if(BOLT_BUILD_REACTOR)
         src/api/net/event_loop.cpp
         src/api/net/io_dispatcher.cpp
         src/api/net/coro_tcp_listener.cpp
-        src/api/net/tcp_socket.cpp)
+        src/api/net/tcp_socket.cpp
+        src/api/io/file.cpp
+        src/api/io/io_scheduler.cpp)
     if(WIN32)
         list(APPEND _bolt_reactor_sources
             src/api/core/async_io_iocp.cpp
@@ -350,7 +352,15 @@ if(BOLT_BUILD_COMPUTE_IDOT)
         src/compute/idot_scalar.cpp
         src/compute/idot_avx2.cpp
         src/compute/idot_avx512vnni.cpp
-        src/compute/idot_dispatch.cpp)
+        src/compute/idot_dispatch.cpp
+        # f32/f16 float-activation SIMD GEMV (perf pass) -- same per-source-ISA
+        # + runtime-CPUID-dispatch pattern as the IDOT kernels above, so it
+        # rides in this same compiled library (compute_gemv.h is the public
+        # surface).
+        src/compute/gemv_scalar.cpp
+        src/compute/gemv_avx2.cpp
+        src/compute/gemv_avx512.cpp
+        src/compute/gemv_dispatch.cpp)
     add_library(bolt::compute_idot ALIAS bolt_compute_idot)
     # Consumers retain core's configured ISA. These dispatchable translation
     # units must not inherit it: scalar/dispatch are baseline, and each SIMD
@@ -384,11 +394,22 @@ if(BOLT_BUILD_COMPUTE_IDOT)
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+            # MSVC /arch:AVX2 enables AVX2+FMA+F16C intrinsics together;
+            # /arch:AVX512 additionally enables the 512-bit + cvtph path.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
         else()
             set_source_files_properties(src/compute/idot_avx2.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512bw;-mavx512vnni")
+            # -mf16c for the _mm256_cvtph_ps / _cvtsh_ss f16 upcasts.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mavx512f")
         endif()
     endif()
 
@@ -459,7 +480,11 @@ if(BOLT_BUILD_VULKAN)
         file(MAKE_DIRECTORY "${_bolt_vulkan_shader_gen_dir}")
         set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2
                                        matmul_dequant_int8act_int8 matmul_dequant_int8act_int4
-                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched)
+                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched
+                                       rmsnorm       # BLLM-176 on-device RMSNorm
+                                       elementwise   # BLLM-179 add/SwiGLU/GeGLU
+                                       rope          # BLLM-177 rotate_half RoPE
+                                       attention)    # BLLM-178 flash-style decode attention
         set(_bolt_vulkan_shader_headers "")
         foreach(_shader_name ${_bolt_vulkan_shader_names})
             set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")
@@ -628,6 +653,11 @@ if(BOLT_BUILD_ROCM)
                 --offload-arch=gfx1151
                 "--rocm-path=${_bolt_rocm_root}"
                 -O2 -DNDEBUG -std=c++20
+                # BLLM-189: flush f32 denormals to zero. Coarse Int4 quant can
+                # produce subnormal intermediates that hit the GPU's slow FP
+                # path (measured ~6x decode slowdown on a real Int4 model);
+                # FTZ is standard for inference kernels and never hurts.
+                -fgpu-flush-denormals-to-zero
                 -fms-runtime-lib=dll
                 -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_rocm.cpp"
@@ -653,6 +683,47 @@ if(BOLT_BUILD_ROCM)
     # consumer needs (hipMalloc/hipMemcpy/kernel-launch symbols).
     target_link_libraries(bolt_rocm INTERFACE "$ENV{HIP_PATH}/lib/amdhip64.lib")
     target_link_libraries(bolt INTERFACE bolt::rocm)
+endif()
+
+# ---------------------------------------------------------------------------
+# bolt::cuda — NVIDIA/CUDA compute backend (BLLM-182). A near-1:1 mirror of
+# bolt::rocm (CUDA and HIP are source-compatible). Unlike the ROCm block above
+# (which needs a Windows clang++-direct workaround for the enable_language(HIP)
+# /machine:x64 link gap), CUDA has first-class CMake support, so this uses the
+# standard enable_language(CUDA) + CUDAToolkit path -- compiling bolt_cuda.cpp
+# as a CUDA TU (LANGUAGE CUDA). OFF by default; requires an explicit
+# -DBOLT_BUILD_CUDA=ON AND a real nvcc / CMAKE_CUDA_COMPILER. This dev box has
+# no NVIDIA GPU / no CUDA toolkit, so it stays inert here (BLLM-182 open until
+# validated on real hardware -- see bolt_cuda.h's status note).
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_CUDA "Build bolt::cuda CUDA/NVIDIA matmul+dequant + on-device-forward kernel core (needs nvcc; unvalidated -- see bolt_cuda.h)" OFF)
+
+if(BOLT_BUILD_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(WARNING "BOLT_BUILD_CUDA requested but no CUDA compiler (nvcc) found -- skipping bolt::cuda")
+        set(BOLT_BUILD_CUDA OFF)
+    endif()
+endif()
+
+if(BOLT_BUILD_CUDA)
+    enable_language(CUDA)
+    add_library(bolt_cuda STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp")
+    # nvcc compiles bolt_cuda.cpp as CUDA (it uses <<<>>> launch syntax + __global__).
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp"
+                                PROPERTIES LANGUAGE CUDA)
+    set_target_properties(bolt_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_library(bolt::cuda ALIAS bolt_cuda)
+    target_include_directories(bolt_cuda PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    # cudart -- the CUDA runtime (cudaMalloc/cudaMemcpy/kernel-launch symbols).
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_libraries(bolt_cuda PUBLIC CUDA::cudart)
+    endif()
+    target_link_libraries(bolt INTERFACE bolt::cuda)
 endif()
 
 # ---------------------------------------------------------------------------

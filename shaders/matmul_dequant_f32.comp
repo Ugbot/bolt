@@ -1,9 +1,12 @@
 #version 450
-// BLLM-47: Vulkan matmul+dequant compute shader, F32 weight path.
-// One workgroup per output row; threads stride over `cols`, then a
-// shared-memory tree reduction combines partial sums. Numerically
-// identical to bolt_compute.h's matmul_row_dot_f32 F32 case (plain dot
-// product, no dequant).
+// BLLM-47 / BLLM-160: Vulkan matmul+dequant compute shader, F32 weight path.
+// One workgroup per output row; threads stride over `cols`. Reduction uses
+// llama.cpp's subgroupAdd approach: an in-subgroup reduction (subgroupAdd, one
+// hardware instruction on RDNA/NV) followed by a small cross-subgroup combine
+// in shared memory -- fewer barriers than the shared-memory tree it replaces.
+// Numerically identical to bolt_compute.h's matmul_row_dot_f32 (plain dot).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 256) in;
 
@@ -15,7 +18,8 @@ layout(push_constant) uniform PushConstants {
     int cols;
 } pc;
 
-shared float partial_sum[256];
+// One slot per subgroup; 256 threads / (min subgroup size 4) = 64 max.
+shared float sg_partials[64];
 
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -27,11 +31,20 @@ void main() {
     for (uint i = tid; i < cols; i += gl_WorkGroupSize.x) {
         acc += activation[i] * weight[row_offset + i];
     }
-    partial_sum[tid] = acc;
-    barrier();
-    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial_sum[tid] += partial_sum[tid + stride];
-        barrier();
+
+    // In-subgroup reduction, then the first lane of each subgroup publishes.
+    float sg_sum = subgroupAdd(acc);
+    if (subgroupElect()) {
+        sg_partials[gl_SubgroupID] = sg_sum;
     }
-    if (tid == 0u) out_data[row] = partial_sum[0];
+    barrier();
+
+    // Thread 0 combines the per-subgroup partials.
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_partials[s];
+        }
+        out_data[row] = total;
+    }
 }
