@@ -452,3 +452,11 @@ children with bounded arena custody; field-ID rebind preserves absence.
 `schema_json_parse` shares strict metadata parsing. Append/read paths use the
 selected mode; create/open validate declarations. Five dedicated native cases
 plus corrected append/delete fixtures pass integrated focused qualification.
+
+2026-10-30 G2ICE-314 immutable defaults: `initial_default_equal` and
+`schema_initial_defaults_validate` compare owned typed values over surviving
+field IDs, including child declarations under null parents. Map entry order,
+field names/order and JSON spelling do not alter identity. Int/float/decimal
+promotions preserve the original value; changed initial values refuse. Bounded
+arena canonicalization protects complete complex map keys and output custody.
+Ten native cases and the integrated REST/restart drill qualify this component.

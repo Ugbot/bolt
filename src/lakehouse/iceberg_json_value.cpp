@@ -8,6 +8,7 @@
 #include "bolt/kernels/bolt_temporal.h"
 #include "bolt/kernels/bolt_date.h"
 #include "bolt/join/bolt_swiss.h"
+#include <algorithm>
 #include <bit>
 #include <charconv>
 #include <cmath>
@@ -78,6 +79,7 @@ bool hex_bytes(State& state,const uint8_t* text,uint32_t size,bool uuid,const ui
 #include "iceberg_json_encode.inc"
 #include "iceberg_json_defaults.inc"
 #include "iceberg_json_rebind.inc"
+#include "iceberg_json_initial.inc"
 } // namespace
 
 JsonValueStatus json_value_decode(const SchemaField& field,const uint8_t* json,uint32_t size,
@@ -170,4 +172,21 @@ JsonValueStatus default_value_rebind(const SchemaField& source,const SchemaField
     *out={json,static_cast<uint32_t>(size)};return S::Ok;
 }
 
+JsonValueStatus initial_default_equal(const SchemaField& source,const SchemaField& target,
+    Arena* arena,bool* out,const JsonValueLimits& limits) noexcept {
+    assert(arena && out);assert(nr::kMaxNodes>0);
+    if(!limits_ok(limits) || source.id!=target.id)return S::Invalid;
+    State state{arena,limits};const uint8_t* before=nullptr;const uint8_t* after=nullptr;int32_t a=0,b=0;
+    if(!initial_canonical(state,source,target,false,&before,&a) || !initial_canonical(state,source,target,true,&after,&b))return state.status;
+    *out=a==b && !std::memcmp(before,after,static_cast<size_t>(a));return S::Ok;
+}
+JsonValueStatus schema_initial_defaults_validate(const Schema& source,const Schema& target,
+    Arena* arena,const JsonValueLimits& limits) noexcept {
+    assert(arena);assert(nr::kMaxDepth>=kIcebergSchemaMaxDepth);
+    auto status=schema_defaults_validate(source,arena,limits);if(status!=S::Ok)return status;
+    status=schema_defaults_validate(target,arena,limits);if(status!=S::Ok)return status;
+    State state{arena,limits};
+    if(!initial_fields(state,source.fields,source.n_fields,target.fields,target.n_fields,0))return state.status;
+    return S::Ok;
+}
 } // namespace bolt::lakehouse::iceberg
