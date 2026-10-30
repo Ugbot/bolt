@@ -443,41 +443,7 @@ bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const pq::PqM
 
 namespace {
 
-// One schema field's entry from the batches about to be written (counts, NaN count, bounds; no size: the file is not
-// written yet). False when the field is not a primitive the batches carry by name.
-bool batch_field_metrics(const BoltBatch* const* batches, uint32_t n_batches, const SchemaField& field,
-                         const MetricsModeSpec& mode, FileStats* out, Arena* a, bool* refused) noexcept {
-    assert(batches != nullptr && out != nullptr && a != nullptr && refused != nullptr);
-    ValueFold vf{};
-    if (!iceberg_type_parse(field.type, &vf.t)) return false;
-    vf.mode = mode;
-    vf.a = a;
-    int64_t values = 0, nulls = 0;
-    bool found = false;
-    for (uint32_t bi = 0; bi < n_batches; ++bi) {                        // bounded: n_batches
-        const BoltBatch* b = batches[bi];
-        for (uint32_t c = 0; c < b->num_cols; ++c) {                     // bounded: num_cols
-            if (std::strcmp(b->schema.field(static_cast<int>(c)).name, field.name) != 0) continue;
-            const BoltColumn& col = b->columns[b->read_epoch][c];
-            found = true;
-            values += b->num_rows;
-            for (int64_t r = 0; r < b->num_rows; ++r) {                  // bounded: the batch
-                if (col.is_null(r)) ++nulls; else fold_row(&vf, col, r);
-            }
-            break;
-        }
-    }
-    if (!found) return false;
-    ColumnStatEntry* e = stats_add_col(out, a, field.id);
-    if (e == nullptr) { *refused = true; return false; }
-    e->null_count = nulls;
-    e->has_value_count = true;
-    e->value_count = values;
-    const bool floats = vf.t.type == IcebergType::kFloat || vf.t.type == IcebergType::kDouble;
-    if (floats && vf.ok && !vf.refused) { e->has_nan_count = true; e->nan_count = vf.nan; }
-    if (!emit_value_bounds(vf, e, a)) *refused = true;
-    return !*refused;
-}
+#include "iceberg_batch_metrics.inc"
 
 }  // namespace
 
@@ -489,12 +455,10 @@ bool file_metrics_from_batches(const BoltBatch* const* batches, uint32_t n_batch
     out->n_split_offsets = 0;
     out->split_offsets = nullptr;
     if (mode.mode == MetricsMode::kNone) return true;
-    bool refused = false;
-    for (uint32_t f = 0; f < sch->n_fields; ++f) {                       // bounded: the schema's fields
-        (void)batch_field_metrics(batches, n_batches, sch->fields[f], mode, out, a, &refused);
-        if (refused) return false;
+    if(sch->n_fields>kMaxColumns || (sch->n_fields && !sch->fields))return false;
+    uint32_t path[kIcebergSchemaMaxDepth+1u]{},visited=0;
+    for(uint32_t i=0;i<sch->n_fields;++i) {
+        if(!batch_field_metrics(batches,n_batches,sch->fields[i].name,sch->fields[i],path,0,&visited,mode,out,a))return false;
     }
-    out->has_sort_order_id = true;                                       // the writer follows no table sort order
-    out->sort_order_id = 0;
     return true;
 }

@@ -493,3 +493,23 @@ TEST(IcebergMetricsBudget, LongBoundsSurviveManifestEncodeAndCacheCodec) {
     EXPECT_EQ(back.split_offsets[1], 1000);
     EXPECT_FALSE(ice::stats_decode(enc.data(), got - 1u, &b, &back)) << "a short encoding is refused";
 }
+
+TEST(IcebergMetrics, StructLeafBoundsMaskNullAncestorsBeforeCountingAndFolding) {
+    bolt::Arena arena;ice::SchemaField root{},leaf{};root.id=1;std::strcpy(root.name,"st");std::strcpy(root.type,"struct");
+    leaf.id=2;std::strcpy(leaf.name,"n");std::strcpy(leaf.type,"long");root.children=&leaf;root.n_children=1;
+    ice::Schema schema{};schema.fields=&root;schema.n_fields=1;
+    int64_t numbers[]{7,INT64_MAX};auto child=bolt::BoltColumn::make_flat(numbers,nullptr,2,bolt::BoltType::Int64);
+    uint8_t parent_valid[]{1};auto parent=bolt::BoltColumn::make_struct(&child,1,2,parent_valid,&arena);
+    bolt::BoltBatch batch{};bolt::BoltBatch::init_empty(&batch);ASSERT_TRUE(bolt::BoltBatch::alloc_columns(&batch,&arena,1));batch.num_rows=2;
+    ASSERT_TRUE(batch.schema.add_field("st",bolt::BoltType::Struct,true));batch.columns[0][0]=parent;
+    const bolt::BoltBatch* input=&batch;ice::FileStats stats{};
+    ASSERT_TRUE(ice::file_metrics_from_batches(&input,1,&schema,ice::MetricsModeSpec{},&arena,&stats));
+    const auto* entry=ice::stats_find(&stats,2);ASSERT_NE(entry,nullptr);EXPECT_EQ(entry->value_count,2);EXPECT_EQ(entry->null_count,1);
+    ASSERT_TRUE(entry->has_lower && entry->has_upper);ASSERT_EQ(entry->upper_len,8u);
+    int64_t lower=0,upper=0;std::memcpy(&lower,entry->lower,8);std::memcpy(&upper,entry->upper,8);EXPECT_EQ(lower,7);EXPECT_EQ(upper,7);
+    batch.columns[0][0].validity=nullptr;
+    ASSERT_TRUE(ice::file_metrics_from_batches(&input,1,&schema,ice::MetricsModeSpec{},&arena,&stats));
+    entry=ice::stats_find(&stats,2);ASSERT_NE(entry,nullptr);std::memcpy(&upper,entry->upper,8);EXPECT_EQ(upper,INT64_MAX);EXPECT_EQ(entry->null_count,0);
+    std::strcpy(root.type,"list");root.children=&leaf;root.n_children=1;
+    ASSERT_TRUE(ice::file_metrics_from_batches(&input,1,&schema,ice::MetricsModeSpec{},&arena,&stats));EXPECT_EQ(stats.n_cols,0u);
+}

@@ -63,7 +63,8 @@ bool file_metrics_from_parquet(const uint8_t* bytes, uint64_t len, const ::bolt:
                                const MetricsLeaf* leaves, uint32_t n_leaves, Arena* a, FileStats* out) noexcept;
 
 // The same metrics from the batches a writer is about to serialize as one file, for each primitive field of `sch` the batches
-// carry by name, all under `mode`: counts, NaN counts and bounds; no column_sizes or split_offsets (they belong to the file).
+// carry by name, including nonrepeated struct leaves with ancestor null masking.
+// All use `mode`: counts, NaN counts and bounds; no column_sizes or split_offsets (they belong to the file).
 bool file_metrics_from_batches(const BoltBatch* const* batches, uint32_t n_batches, const Schema* sch, const MetricsModeSpec& mode,
                                Arena* a, FileStats* out) noexcept;
 
