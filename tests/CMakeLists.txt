@@ -1155,6 +1155,10 @@ endif()
 # JSON writer: byte-faithful compact (STATION-80) + nlohmann-faithful emit
 # mode (STATION-87: indent / ensure_ascii / Grisu2 shortest-float).
 if(BOLT_BUILD_PARSE)
+    add_executable(test_bolt_json_canonical test_bolt_json_canonical.cpp)
+    target_link_libraries(test_bolt_json_canonical PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_json_canonical)
+    add_test(NAME test_bolt_json_canonical COMMAND test_bolt_json_canonical)
     add_executable(test_bolt_json_writer test_bolt_json_writer.cpp)
     target_link_libraries(test_bolt_json_writer
         PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)

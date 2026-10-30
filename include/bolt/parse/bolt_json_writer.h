@@ -201,6 +201,10 @@ struct EmitOptions {
     bool    ensure_ascii = false; // \uXXXX-escape non-ASCII (nlohmann default)
 };
 
+// Exact size and UTF-8/depth validation for the options emitter, without
+// allocation. Same INT32_MAX output bound; output unchanged on failure.
+bool measure_serialized(const JsonValue*, const EmitOptions&, uint32_t* bytes) noexcept;
+
 // Serialise `root` to arena-owned JSON text reproducing nlohmann's
 // dump(opts.indent, opts.indent_char, opts.ensure_ascii) byte-for-byte for a
 // make_*-built tree. Two passes (count, then write) like serialize(). Returns

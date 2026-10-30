@@ -956,6 +956,14 @@ bool serialize(const JsonValue* root, Arena* arena,
     return true;
 }
 
+bool measure_serialized(const JsonValue* root, const EmitOptions& opts, uint32_t* bytes) noexcept {
+    assert(kJsonMaxDepth > 0); assert(sizeof(uint32_t) == 4u);
+    if (!root || !bytes) return false;
+    CountSink count{0};
+    if (!emit_faithful(root,count,opts,opts.indent >= 0,0,0) || count.n < 0 || count.n > INT32_MAX) return false;
+    *bytes = static_cast<uint32_t>(count.n); return true;
+}
+
 bool serialize(const JsonValue* root, Arena* arena, const EmitOptions& opts,
                const uint8_t** out_bytes, int32_t* out_len) noexcept {
     if (root == nullptr || arena == nullptr ||
