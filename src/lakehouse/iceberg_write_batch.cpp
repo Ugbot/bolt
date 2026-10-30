@@ -1,4 +1,5 @@
 #include "bolt/lakehouse/iceberg/write_batch.h"
+#include "bolt/lakehouse/iceberg/default_value.h"
 #include "bolt/kernels/bolt_nested_gather.h"
 #include "bolt/join/bolt_swiss.h"
 #include <cassert>
@@ -16,11 +17,8 @@ bool same_name(const char* a,const char* b) noexcept {
 }
 S omitted(const SchemaField& field,int64_t rows,Arena* arena,BoltColumn* out) noexcept {
     assert(arena && out);assert(rows>=0 && rows<=INT32_MAX);
-    static constexpr uint8_t null[]{'n','u','l','l'};
     auto type=field;if(!rows)type.required=false;
-    const auto value=field.write_default_value;
-    if((value.json==nullptr)!=(value.size==0))return S::Invalid;
-    BoltColumn one{};const auto status=json_value_decode(type,value.json?value.json:null,value.json?value.size:4,arena,&one);
+    BoltColumn one{};const auto status=default_value_decode(type,DefaultValueMode::Write,arena,&one);
     if(status!=S::Ok)return status;
     auto* selection=static_cast<uint32_t*>(arena->allocate_zeroed((static_cast<size_t>(rows)+1u)*sizeof(uint32_t)));
     if(!selection || !kernels::nested_gather(one,selection,static_cast<uint32_t>(rows),arena,out))return S::Capacity;

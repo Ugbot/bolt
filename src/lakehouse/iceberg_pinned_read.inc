@@ -489,7 +489,7 @@ bool default_column(const SchemaField& f, BoltType want, int64_t rows, Arena* a,
     if (rows < 0 || rows > INT32_MAX) return false;
     if (f.initial_default_value.json != nullptr) {
         BoltColumn one{}, staged{};
-        if (json_value_decode(f,f.initial_default_value.json,f.initial_default_value.size,a,&one) != JsonValueStatus::Ok ||
+        if (default_value_decode(f,DefaultValueMode::Initial,a,&one) != JsonValueStatus::Ok ||
             (want != BoltType::NA && one.type != want)) return false;
         auto* selected = static_cast<uint32_t*>(a->allocate_zeroed((static_cast<size_t>(rows)+1u)*sizeof(uint32_t)));
         if (!selected || !kernels::nested_gather(one,selected,static_cast<uint32_t>(rows),a,&staged)) return false;

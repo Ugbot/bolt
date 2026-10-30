@@ -28,6 +28,7 @@
 #include "bolt/parse/bolt_json.h"
 #include "bolt/lakehouse/iceberg/writer.h"
 #include "bolt/lakehouse/iceberg/write_batch.h"
+#include "bolt/lakehouse/iceberg/default_value.h"
 #include "bolt/lakehouse/iceberg/metrics.h"
 #include "bolt/lakehouse/iceberg/write_io.h"
 #include "bolt/lakehouse/iceberg/view.h"
@@ -947,6 +948,7 @@ bool table_create_ex(TableHandle** out, Arena* arena, ObjectStore* os,
     assert(path != nullptr && schema != nullptr);
     *out = nullptr;
     if (out_uncertain != nullptr) *out_uncertain = CommitCandidate{};
+    if(schema_defaults_validate(*schema,arena)!=JsonValueStatus::Ok)return false;
     if (std::strlen(path) + 1u > kMaxPathLen) return false;
     TableHandle* h = new_table_handle(arena);
     if (h == nullptr) return false;
@@ -1042,6 +1044,8 @@ bool table_open(TableHandle** out, Arena* arena, ObjectStore* os,
     if (!metadata_parse(mb, static_cast<uint32_t>(ml), arena, &h->meta))
         return false;
     if (!metadata_version_readable(&h->meta)) return false;
+    for(uint32_t i=0;i<h->meta.n_schemas;++i)
+        if(schema_defaults_validate(h->meta.schemas[i],arena)!=JsonValueStatus::Ok)return false;
     h->prior_meta = mb;
     h->prior_meta_len = ml;
     h->file_io_configurable = true;

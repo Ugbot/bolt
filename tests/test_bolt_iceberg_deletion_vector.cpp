@@ -306,7 +306,7 @@ TEST(IcebergSchemaBinding, RequiredColumnWithNoDataRefusesAndOptionalReadsNull) 
         const size_t at = patched.find("\"fields\":[");
         ASSERT_NE(at, std::string::npos);
         patched.insert(at + 10, std::string(
-            R"({"id":19,"name":"st_default","required":true,"type":{"type":"struct","fields":[{"id":20,"name":"n","required":true,"type":"long"},{"id":21,"name":"xs","required":false,"type":{"type":"list","element-id":22,"element-required":false,"element":"string"}}]},"initial-default":{"20":9223372036854775807,"21":[null,"","owned"]}},)"
+            R"({"id":19,"name":"st_default","required":true,"type":{"type":"struct","fields":[{"id":20,"name":"n","required":true,"type":"long","initial-default":9223372036854775807},{"id":21,"name":"xs","required":false,"type":{"type":"list","element-id":22,"element-required":false,"element":"string"},"initial-default":[null,"","owned"]}]},"initial-default":{}},)"
             R"({"id":23,"name":"map_default","required":false,"type":{"type":"map","key-id":24,"key":"string","value-id":25,"value-required":false,"value":"long"},"initial-default":{"keys":["a","b"],"values":[1,null]}},)"
             R"({"id":26,"name":"null_parent","required":false,"type":{"type":"struct","fields":[{"id":27,"name":"n","required":true,"type":"long","initial-default":99}]}},)"
             R"({"id":28,"name":"ns_default","required":false,"type":"timestamp_ns","initial-default":"2262-04-11T23:47:16.854775807"},)"

@@ -265,19 +265,25 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
     if (bj::iter_peek(it) != bj::TokenType::BeginObject) return false;
     bj::iter_advance(it);
     std::memset(out, 0, sizeof(*out));
-    bool id_present=false;
+    uint32_t seen=0;
     uint32_t g = 0;
     while (bj::iter_peek(it) == bj::TokenType::Key && g++ < kIterGuard) {
         const int32_t key = it->cursor;
         bj::iter_advance(it);
-        if (tok_eq(idx, key, "schema-id")) {
+        uint32_t bit=0;
+        if(schema_key_eq(idx,key,"schema-id"))bit=1u;
+        else if(schema_key_eq(idx,key,"fields"))bit=2u;
+        else if(schema_key_eq(idx,key,"identifier-field-ids"))bit=4u;
+        else if(schema_key_eq(idx,key,"type"))bit=8u;
+        if(bit && (seen&bit))return false;
+        seen|=bit;
+        if (bit==1u) {
             int64_t v = 0;
-            if (id_present || !read_exact_integer(idx,it,&v) || v<0 || v>INT32_MAX) return false;
+            if (!read_exact_integer(idx,it,&v) || v<0 || v>INT32_MAX) return false;
             out->schema_id = static_cast<int32_t>(v);
-            id_present=true;
-        } else if (tok_eq(idx, key, "fields")) {
+        } else if (bit==2u) {
             if (bj::iter_peek(it) != bj::TokenType::BeginArray) {
-                skip_value(it); continue;
+                return false;
             }
             bj::iter_advance(it);
             uint32_t g2 = 0;
@@ -290,14 +296,13 @@ bool parse_schema(const bj::StructuralIndex* idx, bj::Iterator* it,
             }
             if (bj::iter_peek(it) != bj::TokenType::EndArray) return false;
             bj::iter_advance(it);
-        } else if (tok_eq(idx, key, "identifier-field-ids")) {
+        } else if (bit==4u) {
             if (out->n_identifier != 0u || !parse_identifier_ids(idx, it, a, b, out)) return false;
-        } else {
-            skip_value(it);
-        }
+        } else if(bit==8u) {
+            char type[16]{};if(!schema_type_name(idx,it,type,sizeof(type)) || std::strcmp(type,"struct"))return false;
+        } else if(!skip_value(it))return false;
     }
-    if (bj::iter_peek(it) == bj::TokenType::EndObject) bj::iter_advance(it);
-    return schema_validate(out, a, b);
+    return (seen&2u) && bj::iter_peek(it)==bj::TokenType::EndObject && bj::iter_advance(it) && schema_validate(out,a,b);
 }
 
 bool parse_pspec_field(const bj::StructuralIndex* idx, bj::Iterator* it,
@@ -504,6 +509,16 @@ void metadata_init(Metadata* m, Arena* arena, Budget* budget) noexcept {
 bool metadata_parse(const uint8_t* src, uint32_t len, Arena* scratch,
                     Metadata* out) noexcept {
     return metadata_parse_budget(src, len, scratch, nullptr, out);
+}
+
+bool schema_json_parse(const uint8_t* json,uint32_t size,Arena* arena,Schema* out,Budget* budget) noexcept {
+    assert(arena && out);assert(kIcebergSchemaMaxDepth>0);
+    if(!json || !size || size>(1u<<24))return false;
+    const bj::SaxHandler syntax{};bj::StructuralIndex index{};bj::Iterator it{};Schema staged{};
+    if(!bj::sax_parse(json,static_cast<int32_t>(size),&syntax) ||
+        !bj::build_index(json,static_cast<int32_t>(size),arena,&index) || !bj::iter_init(&index,&it) ||
+        !parse_schema(&index,&it,arena,budget,&staged) || bj::iter_peek(&it)!=bj::TokenType::End)return false;
+    *out=staged;return true;
 }
 
 namespace {

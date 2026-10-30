@@ -198,6 +198,10 @@ bool schema_max_field_id(const Schema* schema, int32_t* out) noexcept;
 // Shape, positive/global-unique field IDs, and bounded depth. Scratch is
 // arena/budget charged; validation never changes the schema.
 bool schema_validate(const Schema* schema, Arena* arena, Budget* budget) noexcept;
+// Parse one standalone schema JSON object with the maintained metadata parser.
+// Defaults and child trees take independent arena custody. Failure preserves
+// *out; bounded scratch/budget may be consumed. No table metadata wrapper needed.
+bool schema_json_parse(const uint8_t* json,uint32_t size,Arena*,Schema* out,Budget* budget=nullptr) noexcept;
 bool schema_leaf_matches_parquet(const SchemaField& field, const ingest::parquet::PqColumn& column) noexcept;
 // Exact field-ID/type/requiredness match of a nested Parquet field tree.
 // Names/order may differ. Materialization/evolution is a separate operation.

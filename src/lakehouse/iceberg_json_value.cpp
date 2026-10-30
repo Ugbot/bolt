@@ -1,4 +1,5 @@
 #include "bolt/lakehouse/iceberg/json_value.h"
+#include "bolt/lakehouse/iceberg/default_value.h"
 #include "bolt/lakehouse/iceberg/partition_values.h"
 #include "bolt/bolt_nested_row.h"
 #include "bolt/parse/bolt_json_writer.h"
@@ -75,6 +76,8 @@ bool hex_bytes(State& state,const uint8_t* text,uint32_t size,bool uuid,const ui
 #include "iceberg_json_scalar.inc"
 #include "iceberg_json_decode.inc"
 #include "iceberg_json_encode.inc"
+#include "iceberg_json_defaults.inc"
+#include "iceberg_json_rebind.inc"
 } // namespace
 
 JsonValueStatus json_value_decode(const SchemaField& field,const uint8_t* json,uint32_t size,
@@ -122,4 +125,49 @@ JsonValueStatus json_value_encode(const SchemaField& field,const BoltColumn& col
     if(valid!=S::Ok)return valid;
     *json=bytes;*size=static_cast<uint32_t>(length);return S::Ok;
 }
+JsonValueStatus default_value_decode(const SchemaField& field,DefaultValueMode mode,Arena* arena,
+    BoltColumn* out,const JsonValueLimits& limits) noexcept {
+    assert(arena && out);assert(kIcebergSchemaMaxDepth<=nr::kMaxDepth);
+    if(!limits_ok(limits) || (mode!=DefaultValueMode::Initial && mode!=DefaultValueMode::Write))return S::Invalid;
+    Schema schema{};schema.fields=const_cast<SchemaField*>(&field);schema.n_fields=1;
+    if(!schema_validate(&schema,arena,nullptr))return S::Invalid;
+    State state{arena,limits};
+    auto* tree=arena->allocate_array<nr::TypeTree>(1);if(!tree)return S::Capacity;
+    *tree={};tree->n=1;if(!type_tree(state,field,*tree,0,0))return state.status;
+    DefaultState defaults{state,mode};J* value=nullptr;
+    if(!effective_value(defaults,field,nullptr,true,0,&value))return state.status;
+    const uint8_t* json=nullptr;int32_t size=0;
+    if(!j::serialize(value,arena,j::EmitOptions{},&json,&size) || size<1)return S::Capacity;
+    return json_value_decode(field,json,static_cast<uint32_t>(size),arena,out,limits);
+}
+JsonValueStatus schema_defaults_validate(const Schema& schema,Arena* arena,const JsonValueLimits& limits) noexcept {
+    assert(arena);assert(kIcebergSchemaMaxDepth>0);
+    if(!limits_ok(limits) || !schema_validate(&schema,arena,nullptr))return S::Invalid;
+    State state{arena,limits};
+    for(uint32_t i=0;i<schema.n_fields;++i)if(!validate_default_fields(state,schema.fields[i],0))return state.status;
+    return S::Ok;
+}
+
+JsonValueStatus default_value_rebind(const SchemaField& source,const SchemaField& target,DefaultValueMode mode,
+    Arena* arena,SchemaDefault* out,const JsonValueLimits& limits) noexcept {
+    assert(arena && out);assert(nr::kMaxNodes>0);
+    if(!limits_ok(limits) || (mode!=DefaultValueMode::Initial && mode!=DefaultValueMode::Write))return S::Invalid;
+    State state{arena,limits};DefaultState defaults{state,mode};J* raw=nullptr;
+    if(!default_json(defaults,source,&raw))return state.status;
+    const auto declared=mode==DefaultValueMode::Initial?source.initial_default_value:source.write_default_value;
+    if(!declared.json) {*out={};return S::Ok;}
+    auto admitted=source;if(is_null(raw))admitted.required=false;
+    BoltColumn checked{};const auto valid=default_value_decode(admitted,mode,arena,&checked,limits);
+    if(valid!=S::Ok)return valid;
+    Schema schema{};schema.fields=const_cast<SchemaField*>(&target);schema.n_fields=1;
+    if(!schema_validate(&schema,arena,nullptr))return S::Invalid;
+    auto* tree=arena->allocate_array<nr::TypeTree>(1);if(!tree)return S::Capacity;
+    *tree={};tree->n=1;if(!type_tree(state,target,*tree,0,0))return state.status;
+    if(!rebind_shape(source,target,0))return S::Invalid;
+    J* rebound=nullptr;if(!rebind_value(state,source,target,raw,0,&rebound))return state.status;
+    const uint8_t* json=nullptr;int32_t size=0;
+    if(!j::serialize(rebound,arena,j::EmitOptions{},&json,&size) || size<1 || static_cast<uint32_t>(size)>limits.json_bytes)return S::Capacity;
+    *out={json,static_cast<uint32_t>(size)};return S::Ok;
+}
+
 } // namespace bolt::lakehouse::iceberg

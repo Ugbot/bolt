@@ -43,6 +43,7 @@
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
 #include "bolt/lakehouse/iceberg/json_value.h"
+#include "bolt/lakehouse/iceberg/default_value.h"
 #include "bolt/lakehouse/object_store/s3_uri.h"
 #include "bolt/lakehouse/iceberg/eq_key.h"
 

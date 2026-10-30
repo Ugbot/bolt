@@ -62,7 +62,8 @@ TEST(IcebergWriteDefaults, PublicAppendMaterializesRecursiveDefaults) {
     children[1].children=&element;children[1].n_children=1;fields[2].children=children;fields[2].n_children=2;
     SchemaField kv[]{field("key","string",8,true),field("value","int",9)};fields[3].children=kv;fields[3].n_children=2;
     defaults(a,fields[1],"\"1969-12-31T23:59:59.999999999\"","\"2262-04-11T23:47:16.854775807\"");
-    defaults(a,fields[2],R"({"4":1,"5":[]})",R"({"4":9223372036854775807,"5":[null,"","owned"]})");
+    defaults(a,fields[2],"{}","{}");
+    defaults(a,children[0],"1","9223372036854775807");defaults(a,children[1],"[]",R"([null,"","owned"])");
     defaults(a,fields[3],R"({"keys":[],"values":[]})",R"({"keys":["a","b"],"values":[1,null]})");
     defaults(a,fields[4],"\"1.00\"","\"-12345678901234567890.12\"");defaults(a,fields[5],"\"initial\"",R"("write\"雪\n")");
     defaults(a,fields[6],"1.5","0.1");defaults(a,fields[7],"\"1.00\"","\"-12.34\"");

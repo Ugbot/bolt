@@ -444,3 +444,11 @@ annotation projection because its current model rejects ns defaults. Empty
 struct/unknown direct-write coverage, geo WKT and broader consumers remain explicit follow-ups.
 Unprojected nested delete files use identity root selection, independent of
 projected data-file indices (position-delete-with-row regression suite).
+
+2026-10-30 G2ICE-314 effective defaults: `iceberg/default_value.h` separates
+schema declarations (struct null/{}, prohibited nonnull geo/variant/unknown)
+from generic JSON values. Initial/write modes recursively resolve missing
+children with bounded arena custody; field-ID rebind preserves absence.
+`schema_json_parse` shares strict metadata parsing. Append/read paths use the
+selected mode; create/open validate declarations. Five dedicated native cases
+plus corrected append/delete fixtures pass integrated focused qualification.

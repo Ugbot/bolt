@@ -2976,3 +2976,9 @@ target_link_libraries(test_bolt_iceberg_write_defaults PRIVATE bolt::lakehouse G
 bolt_apply_hardening(test_bolt_iceberg_write_defaults)
 add_test(NAME test_bolt_iceberg_write_defaults COMMAND test_bolt_iceberg_write_defaults)
 set_tests_properties(test_bolt_iceberg_write_defaults PROPERTIES TIMEOUT 120)
+
+add_executable(test_bolt_iceberg_defaults test_bolt_iceberg_defaults.cpp)
+target_link_libraries(test_bolt_iceberg_defaults PRIVATE bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_defaults)
+add_test(NAME test_bolt_iceberg_defaults COMMAND test_bolt_iceberg_defaults)
+set_tests_properties(test_bolt_iceberg_defaults PROPERTIES TIMEOUT 120)
