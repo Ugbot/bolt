@@ -110,7 +110,6 @@ public:
         if (config_.owner != nullptr) {
             config_.owner->arenas.fetch_add(1u, std::memory_order_relaxed);
         }
-        g_arena_total_owner.arenas.fetch_add(1u, std::memory_order_relaxed);
         // Explicitly sized arenas keep their eager first block; default ones
         // allocate theirs on first use (see kArenaLazyFirstBlockBytes).
         if (config_.initial_block_size != 0 && !config_.lazy_first_block) {
@@ -125,7 +124,6 @@ public:
         if (config_.owner != nullptr) {
             config_.owner->arenas.fetch_sub(1u, std::memory_order_relaxed);
         }
-        g_arena_total_owner.arenas.fetch_sub(1u, std::memory_order_relaxed);
     }
 
     Arena(const Arena&) = delete;

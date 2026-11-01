@@ -159,8 +159,7 @@ inline bool query_process_resident_bytes(std::uint64_t* out) noexcept {
 // memory gauge or a footprint test must read.
 //
 //   macOS   : task_info(TASK_VM_INFO).phys_footprint (what `footprint` shows)
-//   Linux   : /proc/self/statm (resident - shared) pages x 4 KiB, a lower bound
-//             (swapped-out private pages are not in statm)
+//   Linux   : /proc/self/status RssAnon + VmSwap (kB; no page-size guess)
 //   Windows : GetProcessMemoryInfo PagefileUsage (private commit)
 //   Other   : query fails.
 inline bool query_process_footprint_bytes(std::uint64_t* out) noexcept {
@@ -181,14 +180,22 @@ inline bool query_process_footprint_bytes(std::uint64_t* out) noexcept {
     *out = static_cast<std::uint64_t>(vi.phys_footprint);
     return *out != 0;
 #elif defined(__linux__)
-    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    // /proc/self/status reports in kB, so no page-size assumption (aarch64
+    // kernels with 16/64 KiB pages read right): anonymous resident + swapped.
+    std::FILE* f = std::fopen("/proc/self/status", "r");
     if (f == nullptr) return false;
-    unsigned long long total = 0, res = 0, shared = 0;
-    const int got = std::fscanf(f, "%llu %llu %llu", &total, &res, &shared);
+    char line[256];
+    unsigned long long anon_kb = 0, swap_kb = 0;
+    bool have_anon = false;
+    for (int i = 0; i < 128 && std::fgets(line, sizeof(line), f) != nullptr; ++i) {
+        unsigned long long v = 0;
+        if (std::sscanf(line, "RssAnon: %llu kB", &v) == 1) { anon_kb = v; have_anon = true; }
+        else if (std::sscanf(line, "VmSwap: %llu kB", &v) == 1) { swap_kb = v; }
+    }
     std::fclose(f);
-    if (got != 3 || res < shared) return false;
-    *out = static_cast<std::uint64_t>(res - shared) * 4096ull;
-    return true;
+    if (!have_anon) return false;
+    *out = static_cast<std::uint64_t>(anon_kb + swap_kb) * 1024ull;
+    return *out != 0;
 #else
     (void)out;
     return false;

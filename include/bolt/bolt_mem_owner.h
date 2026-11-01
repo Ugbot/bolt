@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "bolt/bolt_config.h"
 #include "bolt/bolt_port_limits.h"
 
 namespace bolt {
@@ -46,8 +47,13 @@ struct MemOwner {
     }
 };
 
-// Every bolt::Arena in the process, whatever its own owner.
-inline MemOwner g_arena_total_owner{};
+// Every bolt::Arena in the process, whatever its own owner. Charged on block
+// grow/free only (never on arena construction), and on its own cache line so
+// those updates do not false-share with neighbouring globals. Its `arenas`
+// field stays 0: a process-wide live-arena count would put a shared atomic on
+// every short-lived arena's construct/destroy path (R0 review).
+struct alignas(config::kCacheIsolationBytes) PaddedMemOwner : MemOwner {};
+inline PaddedMemOwner g_arena_total_owner{};
 
 inline constexpr std::uint32_t kMemOwnerRegistryCap = kBoltMemOwnerRegistryCapacity;
 
