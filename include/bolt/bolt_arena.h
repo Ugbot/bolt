@@ -45,6 +45,10 @@ struct ArenaConfig {
     // Charged for every backing block this arena holds (in addition to the
     // process-wide g_arena_total_owner). Must outlive the arena.
     MemOwner* owner           = nullptr;
+    // An explicitly sized first block, allocated on first use instead of in
+    // the constructor (an owner that creates many arenas, most never used,
+    // e.g. one per memtable zone generation). Freezing still materialises it.
+    bool      lazy_first_block = false;
 };
 
 /// Arena blocks at least this large are mapped straight from the OS on POSIX
@@ -109,7 +113,9 @@ public:
         g_arena_total_owner.arenas.fetch_add(1u, std::memory_order_relaxed);
         // Explicitly sized arenas keep their eager first block; default ones
         // allocate theirs on first use (see kArenaLazyFirstBlockBytes).
-        if (config_.initial_block_size != 0) grow(config_.initial_block_size);
+        if (config_.initial_block_size != 0 && !config_.lazy_first_block) {
+            grow(config_.initial_block_size);
+        }
     }
 
     ~Arena() noexcept {
@@ -149,6 +155,9 @@ public:
     /// had; an explicitly sized arena already allocated its first block.
     void set_growth_enabled(bool enabled) noexcept {
         assert(num_blocks_ <= kArenaMaxBlocks);
+        if (!enabled && growth_enabled_ && num_blocks_ == 0 && config_.initial_block_size != 0) {
+            (void)grow(config_.initial_block_size);   // a lazy explicit first block
+        }
         if (!enabled && growth_enabled_ && config_.initial_block_size == 0 &&
             largest_block() < kArenaLegacyFirstBlockBytes) {
             const uint32_t cur = current_idx_;

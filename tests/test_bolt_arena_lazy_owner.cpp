@@ -86,6 +86,25 @@ TEST(ArenaLazyFirstBlock, ExplicitFirstBlockStaysEager) {
     EXPECT_EQ(a.total_reserved(), 256u * 1024u);
 }
 
+TEST(ArenaLazyFirstBlock, LazyExplicitFirstBlockWaitsForFirstUse) {
+    bolt::MemOwner owner;
+    bolt::ArenaConfig cfg{};
+    cfg.initial_block_size = 256 * 1024;
+    cfg.lazy_first_block = true;
+    cfg.owner = &owner;
+    bolt::Arena a{cfg};
+    EXPECT_EQ(a.num_blocks(), 0u);
+    EXPECT_EQ(owner.reserved.load(), 0u);
+    ASSERT_NE(a.allocate(64, 64), nullptr);
+    EXPECT_EQ(a.total_reserved(), 256u * 1024u);
+    EXPECT_EQ(owner.reserved.load(), 256u * 1024u);
+
+    bolt::Arena frozen{cfg};
+    frozen.set_growth_enabled(false);
+    EXPECT_EQ(frozen.total_reserved(), 256u * 1024u);
+    EXPECT_NE(frozen.allocate(200 * 1024, 64), nullptr);
+}
+
 TEST(ArenaLazyFirstBlock, FreezingADefaultArenaKeepsTheLegacyCapacity) {
     bolt::Arena fresh;
     fresh.set_growth_enabled(false);
