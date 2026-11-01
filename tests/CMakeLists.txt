@@ -2555,6 +2555,13 @@ target_link_libraries(test_bolt_arena_os_release
 bolt_apply_hardening(test_bolt_arena_os_release)
 add_test(NAME test_bolt_arena_os_release COMMAND test_bolt_arena_os_release)
 
+# R0: lazy small first block for default arenas + MemOwner accounting.
+add_executable(test_bolt_arena_lazy_owner test_bolt_arena_lazy_owner.cpp)
+target_link_libraries(test_bolt_arena_lazy_owner
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_lazy_owner)
+add_test(NAME test_bolt_arena_lazy_owner COMMAND test_bolt_arena_lazy_owner)
+
 # TypedBatchPool / ArenaRing slot lifetime (G2CHK-148: eager per-slot Arena()
 # at pool construction, dropped by acquire's placement-new -> 4 MiB leaks).
 add_executable(test_bolt_pool_lifecycle test_bolt_pool_lifecycle.cpp)

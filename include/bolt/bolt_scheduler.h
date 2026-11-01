@@ -89,6 +89,15 @@ BOLT_FORCE_INLINE uint32_t bolt_grain_rows(uint32_t grain_bytes, size_t elem_siz
     return g;
 }
 
+// Every scheduler's per-worker arenas, process-wide: the warm query pool and
+// any per-query scheduler. Registered for /metrics on first use.
+inline MemOwner* scheduler_worker_mem_owner() noexcept {
+    static MemOwner owner;
+    static const bool registered = mem_owner_register("bolt.scheduler.worker_arenas", &owner);
+    (void)registered;
+    return &owner;
+}
+
 struct SchedulerConfig {
     TuneProfile tune           = TuneProfile::Balanced;
     uint32_t    num_workers    = 0;              // 0 -> bolt_get_hardware_concurrency()
@@ -979,6 +988,7 @@ inline bool Scheduler::init(const SchedulerConfig& in_cfg) noexcept {
         // between queries, so steady-state footprint is unchanged.
         ArenaConfig wa_cfg{};
         wa_cfg.max_block_size = 512ull * 1024 * 1024;
+        wa_cfg.owner = scheduler_worker_mem_owner();
         worker_arenas[i] = new (std::nothrow) Arena(wa_cfg);
         if (!worker_arenas[i]) {
             scheduler_free_arenas(this);

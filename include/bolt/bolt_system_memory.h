@@ -153,4 +153,46 @@ inline bool query_process_resident_bytes(std::uint64_t* out) noexcept {
 #endif
 }
 
+// Fill *out with THIS PROCESS's physical footprint: the dirty private bytes
+// the OS charges it, including pages it has compressed or swapped. This, not
+// RSS, is what grows when written-once memory goes cold, so it is the number a
+// memory gauge or a footprint test must read.
+//
+//   macOS   : task_info(TASK_VM_INFO).phys_footprint (what `footprint` shows)
+//   Linux   : /proc/self/statm (resident - shared) pages x 4 KiB, a lower bound
+//             (swapped-out private pages are not in statm)
+//   Windows : GetProcessMemoryInfo PagefileUsage (private commit)
+//   Other   : query fails.
+inline bool query_process_footprint_bytes(std::uint64_t* out) noexcept {
+    assert(out != nullptr);
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return false;
+    *out = static_cast<std::uint64_t>(pmc.PagefileUsage);
+    return *out != 0;
+#elif defined(__APPLE__)
+    task_vm_info_data_t vi{};
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&vi), &cnt) != KERN_SUCCESS) {
+        return false;
+    }
+    *out = static_cast<std::uint64_t>(vi.phys_footprint);
+    return *out != 0;
+#elif defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (f == nullptr) return false;
+    unsigned long long total = 0, res = 0, shared = 0;
+    const int got = std::fscanf(f, "%llu %llu %llu", &total, &res, &shared);
+    std::fclose(f);
+    if (got != 3 || res < shared) return false;
+    *out = static_cast<std::uint64_t>(res - shared) * 4096ull;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
 }  // namespace bolt
