@@ -34,6 +34,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_csr.h"
 #include "bolt/kernels/bolt_csr_algo.h"
+#include "bolt/kernels/bolt_csr_algo_limits.h"
 #include "bolt/kernels/bolt_radixsort.h"
 
 #include <cassert>
@@ -41,10 +42,6 @@
 
 namespace bolt {
 namespace kernels {
-
-// The hard cap on CDLP iterations (Graphalytics runs ~10; this bounds a
-// mistyped parameter, not a real workload).
-constexpr int32_t k_csr_lp_max_iterations = 1000000;
 
 constexpr uint64_t csr_label_propagation_scratch_bytes(int64_t n_nodes,
                                                        int64_t buf_cap) noexcept {
