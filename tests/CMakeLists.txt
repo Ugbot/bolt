@@ -2611,6 +2611,20 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     add_test(NAME test_bolt_coro_listener_port_clash COMMAND test_bolt_coro_listener_port_clash)
 endif()
 
+# CoroTcpListener binds its configured host (127.0.0.1 is not reachable on
+# other interfaces) and refuses an unparseable host instead of INADDR_ANY.
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_coro_listener_bind_host test_bolt_coro_listener_bind_host.cpp)
+    target_link_libraries(test_bolt_coro_listener_bind_host
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_coro_listener_bind_host)
+    add_test(NAME test_bolt_coro_listener_bind_host COMMAND test_bolt_coro_listener_bind_host)
+endif()
+
 # Listener accept retirement keeps kernel/callback ownership until completion.
 # The lifecycle controls run on every reactor backend, including IOCP.
 if(TARGET bolt_reactor)
