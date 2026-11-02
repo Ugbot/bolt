@@ -9,12 +9,13 @@
 // MISMATCH line, which the driver treats as a failure.
 //
 // Input, one case at a time:
-//   case <id> <n> <m> <want_label> <sorted> <max_hops>
+//   case <id> <n> <m> <want_label> <sorted> <max_hops> <lp_iters>
 //   <u> <v> <label> <weight>        (m lines)
 // Test-only: std::vector is fine here.
 
 #include "bolt/kernels/bolt_csr.h"
 #include "bolt/kernels/bolt_csr_bfs.h"
+#include "bolt/kernels/bolt_csr_community.h"
 #include "bolt/kernels/bolt_csr_components.h"
 #include "bolt/kernels/bolt_csr_dijkstra_indexed.h"
 #include "bolt/kernels/bolt_csr_levels.h"
@@ -36,7 +37,7 @@ namespace {
 struct Case {
     int64_t id = 0, n = 0, m = 0;
     int32_t want = -1;
-    int sorted = 0, max_hops = 0;
+    int sorted = 0, max_hops = 0, lp_iters = 0;
     std::vector<int64_t> u, v;
     std::vector<int32_t> lbl;
     std::vector<double> w;
@@ -118,6 +119,40 @@ void run_components(const G& g, std::vector<int64_t>* wcc, std::vector<int64_t>*
     bk::CsrSccScratch sc{ix.data(), lo.data(), st.data(), cn.data(), ce.data(), on.data()};
     if (bk::csr_scc(&g, &sc, scc->data() + 1, &ns) != bk::CsrAlgoStatus::Ok) ns = -1;
     (*wcc)[0] = nw; (*scc)[0] = ns;
+}
+
+// CDLP over a (and b when non-null); element 0 = iterations, or -status.
+template <typename G>
+std::vector<int64_t> label_propagation(const G* a, const G* b, int32_t iters) {
+    const size_t n = static_cast<size_t>(a->n_nodes);
+    const int64_t cap = bk::csr_lp_buf_cap(a, b);
+    std::vector<int64_t> out(n + 1), next(n), buf(static_cast<size_t>(cap) + 1),
+        tmp(buf.size());
+    bk::CsrLpScratch sc{next.data(), buf.data(), tmp.data(), cap};
+    int32_t it = 0;
+    const bk::CsrAlgoStatus st =
+        bk::csr_label_propagation(a, b, iters, &sc, out.data() + 1, &it);
+    out[0] = (st == bk::CsrAlgoStatus::Ok) ? it : -static_cast<int64_t>(st);
+    return out;
+}
+
+void run_lp(const Case& c, const Csr& f, const Csr& r) {
+    bk::CsrGraph64 g = f.g64(), gr = r.g64();
+    bk::CsrGraph32 g32 = f.g32(), gr32 = r.g32();
+    g.want_label = gr.want_label = g32.want_label = gr32.want_label = c.want;
+    const char* names[3] = {"both", "out", "in"};
+    for (int mode = 0; mode < 3; ++mode) {
+        const bk::CsrGraph64* a = (mode == 2) ? &gr : &g;
+        const bk::CsrGraph64* b = (mode == 0) ? &gr : nullptr;
+        const bk::CsrGraph32* a32 = (mode == 2) ? &gr32 : &g32;
+        const bk::CsrGraph32* b32 = (mode == 0) ? &gr32 : nullptr;
+        const auto lab = label_propagation(a, b, c.lp_iters);
+        if (lab != label_propagation(a32, b32, c.lp_iters))
+            std::printf("MISMATCH label propagation compact\n");
+        std::printf("lp %s", names[mode]);
+        for (int64_t x : lab) std::printf(" %" PRId64, x);
+        std::printf("\n");
+    }
 }
 
 template <typename G>
@@ -304,6 +339,7 @@ void run_case(const Case& c) {
         for (double x : sim) std::printf(" %.17g", x);
         std::printf("\n");
     }
+    run_lp(c, f, r);
     run_paths(c, f);
     std::printf("end\n");
 }
@@ -315,8 +351,8 @@ int main() {
     Case c;
     while (std::scanf("%15s", word) == 1) {
         if (std::strcmp(word, "case") != 0) return 2;
-        if (std::scanf("%" SCNd64 " %" SCNd64 " %" SCNd64 " %d %d %d", &c.id, &c.n,
-                       &c.m, &c.want, &c.sorted, &c.max_hops) != 6)
+        if (std::scanf("%" SCNd64 " %" SCNd64 " %" SCNd64 " %d %d %d %d", &c.id, &c.n,
+                       &c.m, &c.want, &c.sorted, &c.max_hops, &c.lp_iters) != 7)
             return 2;
         const size_t m = static_cast<size_t>(c.m);
         c.u.resize(m); c.v.resize(m); c.lbl.resize(m); c.w.resize(m);
