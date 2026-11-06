@@ -167,6 +167,37 @@ target_link_libraries(bolt INTERFACE
     bolt::core bolt::kernels bolt::join bolt::wire bolt::arrow
 )
 
+# bolt::obs — logging, metrics, tracing, crash reports and the sampling profiler.
+# Each is optional: off, its call sites compile to nothing. The switches live in
+# a generated header, so toggling one rebuilds only the sources that include it.
+option(BOLT_OBS_LOG      "Compile structured logging"   ON)
+option(BOLT_OBS_METRICS  "Compile metrics"              ON)
+option(BOLT_OBS_TRACE    "Compile tracing spans"        ON)
+option(BOLT_OBS_PROFILE  "Compile the sampling profiler" ON)
+option(BOLT_OBS_CRASH    "Compile the crash reporter"   ON)
+set(BOLT_OBS_LOG_MIN 1 CACHE STRING "Lowest compiled log level: 0 trace .. 5 fatal, 6 none")
+foreach(feature LOG METRICS TRACE PROFILE CRASH)
+    if(BOLT_OBS_${feature})
+        set(BOLT_OBS_${feature}_V 1)
+    else()
+        set(BOLT_OBS_${feature}_V 0)
+    endif()
+endforeach()
+set(BOLT_OBS_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
+configure_file(include/bolt/obs/obs_config.h.in ${BOLT_OBS_GENERATED}/bolt/obs/obs_config.h @ONLY)
+add_library(bolt_obs STATIC src/obs/log.cpp src/obs/log_format.cpp src/obs/metrics.cpp src/obs/trace.cpp
+    src/obs/crash.cpp src/obs/prof.cpp)
+add_library(bolt::obs ALIAS bolt_obs)
+set_target_properties(bolt_obs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Threads REQUIRED)
+target_link_libraries(bolt_obs PUBLIC bolt::core Threads::Threads)
+target_include_directories(bolt_obs PUBLIC
+    $<BUILD_INTERFACE:${BOLT_OBS_GENERATED}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_obs)
+target_link_libraries(bolt INTERFACE bolt::obs)
+
 # ---------------------------------------------------------------------------
 # bolt::io — compiled static library (I/O-adjacent pure-compute primitives:
 # CRC32C software fallback, varints). No actual I/O — keeps Bolt's no-IO
@@ -1313,6 +1344,7 @@ if(BOLT_INSTALL)
 # Found by chukonu, not by bolt's own consumer test, because that test only
 # touched bolt_arena.h. A partial header install is worse than none: it passes
 # every check that counts files or asks whether install succeeded.
+install(FILES ${BOLT_OBS_GENERATED}/bolt/obs/obs_config.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/bolt/obs)
 install(DIRECTORY include/bolt
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h" PATTERN "*.inc"
@@ -1331,7 +1363,7 @@ install(DIRECTORY include/bolt
 # satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
-    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt_obs bolt
     bolt_entropy bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)

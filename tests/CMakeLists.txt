@@ -6,6 +6,11 @@ bolt_apply_hardening(test_seqlock)
 add_test(NAME test_seqlock COMMAND test_seqlock)
 set_tests_properties(test_seqlock PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
 
+add_executable(test_obs test_obs.cpp)
+target_link_libraries(test_obs PRIVATE bolt::obs GTest::gtest_main)
+bolt_apply_hardening(test_obs)
+add_test(NAME test_obs COMMAND test_obs)
+
 add_executable(test_entropy test_entropy.cpp)
 target_link_libraries(test_entropy PRIVATE bolt::entropy GTest::gtest_main)
 bolt_apply_hardening(test_entropy)
