@@ -7,6 +7,14 @@
 #include <cstdio>
 #include <ctime>
 
+#if defined(__clang__)
+#define BOLT_LOG_NONLITERAL_BEGIN _Pragma("clang diagnostic push") _Pragma("clang diagnostic ignored \"-Wformat-nonliteral\"")
+#define BOLT_LOG_NONLITERAL_END _Pragma("clang diagnostic pop")
+#else
+#define BOLT_LOG_NONLITERAL_BEGIN
+#define BOLT_LOG_NONLITERAL_END
+#endif
+
 namespace bolt::log::detail {
 
 namespace {
@@ -106,13 +114,12 @@ void emit_int(Out& o, Spec& s, const int* stars, std::uint32_t n_stars, const Ar
     spec[n] = '\0';
     const std::size_t room = static_cast<std::size_t>(o.end - o.p) + 1;
     const long long sv = static_cast<long long>(v);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
+BOLT_LOG_NONLITERAL_BEGIN
     int w = 0;
     if (n_stars == 0) w = std::snprintf(o.p, room, spec, sv);
     else if (n_stars == 1) w = std::snprintf(o.p, room, spec, stars[0], sv);
     else w = std::snprintf(o.p, room, spec, stars[0], stars[1], sv);
-#pragma clang diagnostic pop
+BOLT_LOG_NONLITERAL_END
     o.advance(w);
 }
 
@@ -124,13 +131,12 @@ void emit_float(Out& o, Spec& s, const int* stars, std::uint32_t n_stars, const 
     spec[s.head_n] = s.conv;
     spec[s.head_n + 1] = '\0';
     const std::size_t room = static_cast<std::size_t>(o.end - o.p) + 1;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
+BOLT_LOG_NONLITERAL_BEGIN
     int w = 0;
     if (n_stars == 0) w = std::snprintf(o.p, room, spec, d);
     else if (n_stars == 1) w = std::snprintf(o.p, room, spec, stars[0], d);
     else w = std::snprintf(o.p, room, spec, stars[0], stars[1], d);
-#pragma clang diagnostic pop
+BOLT_LOG_NONLITERAL_END
     o.advance(w);
 }
 

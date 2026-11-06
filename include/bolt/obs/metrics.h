@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -100,7 +101,7 @@ public:
         : base_(base), shift_(shift), count_(count) {}
     void observe(std::uint64_t v) const noexcept {
         if (!enabled()) return;
-        const std::uint32_t top = 64u - static_cast<std::uint32_t>(__builtin_clzll(v | 1u));
+        const std::uint32_t top = 64u - static_cast<std::uint32_t>(std::countl_zero(v | 1u));
         std::uint32_t b = top > shift_ ? top - shift_ : 0u;
         if (v == (1ull << (top - 1)) && b != 0) --b;   // 2^k sits in the bucket it tops
         if (b > count_) b = count_;
