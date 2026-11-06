@@ -8,8 +8,17 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <arpa/inet.h>
+#include <csignal>
+#include <filesystem>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include "bolt/obs/crash.h"
+#include "bolt/obs/diag.h"
 #include "bolt/obs/log.h"
 #include "bolt/obs/metrics.h"
 #include "bolt/obs/trace.h"
@@ -163,6 +172,65 @@ TEST(ObsTrace, SampledSpansNestAndUnsampledCostNothing) {
     EXPECT_EQ(json.find("skipped"), std::string::npos);
     bolt::trace::set_rate_ppm(0);
     EXPECT_FALSE(bolt::trace::sample(77));
+}
+
+TEST(ObsCrash, ReportNamesSignalAndBacktraceThenDiesByIt) {
+    const std::string dir = temp_path("bolt_obs_crash");
+    ASSERT_EQ(::mkdir(dir.c_str(), 0700), 0);
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        bolt::crash::Config c;
+        c.dir = dir.c_str();
+        c.identity = "crash-test 1.2.3";
+        if (!bolt::crash::install(c)) ::_exit(9);
+        ::raise(SIGSEGV);
+        ::_exit(8);
+    }
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFSIGNALED(status)) << status;
+    EXPECT_EQ(WTERMSIG(status), SIGSEGV);
+    std::string report;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) report = read_all(e.path().string());
+    EXPECT_NE(report.find("fatal signal"), std::string::npos) << report;
+    EXPECT_NE(report.find("crash-test 1.2.3"), std::string::npos);
+    EXPECT_NE(report.find("--- backtrace"), std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ObsProfile, SamplesTheBusyThread) {
+    std::atomic<bool> stop{false};
+    std::thread spin([&stop] { volatile std::uint64_t x = 0; while (!stop.load()) x = x + 1; });
+    bolt::prof::Result r;
+    ASSERT_TRUE(bolt::prof::run(1, 199, &r));
+    stop.store(true);
+    spin.join();
+    EXPECT_GT(r.samples, 20u);
+    EXPECT_FALSE(r.folded.empty());
+}
+
+TEST(ObsDiag, ServesOneRequest) {
+    std::uint16_t port = 0;
+    ASSERT_TRUE(bolt::diag::start(0, false, [](void*, const char* path, std::string* body, const char**) {
+        *body = std::string("path=") + path;
+        return 200;
+    }, nullptr, &port));
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(port);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
+    const char req[] = "GET /x?y=1 HTTP/1.0\r\n\r\n";
+    ASSERT_GT(::send(fd, req, sizeof(req) - 1, 0), 0);
+    char buf[512];
+    std::string got;
+    for (ssize_t n; (n = ::recv(fd, buf, sizeof(buf), 0)) > 0;) got.append(buf, static_cast<std::size_t>(n));
+    ::close(fd);
+    bolt::diag::stop();
+    EXPECT_NE(got.find("200"), std::string::npos);
+    EXPECT_NE(got.find("path=/x"), std::string::npos);
 }
 
 }  // namespace

@@ -254,6 +254,8 @@ if(BOLT_BUILD_IO)
     bolt_apply_simd(bolt_io_file ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io_file)
 
+    add_executable(bench_obs EXCLUDE_FROM_ALL benchmarks/bench_obs.cpp)
+    target_link_libraries(bench_obs PRIVATE bolt::obs)
     add_executable(bench_mapped_ring EXCLUDE_FROM_ALL benchmarks/bench_mapped_ring.cpp)
     target_link_libraries(bench_mapped_ring PRIVATE bolt::io_file)
     bolt_apply_hardening(bench_mapped_ring)
