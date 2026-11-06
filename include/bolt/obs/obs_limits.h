@@ -38,6 +38,14 @@
     X(obs_profile_samples, kFixedAtAlloc, "samples", 16384, 256, 1u << 20, \
       "BOLT_OBS_PROFILE_SAMPLES", "GESTALT_OBS_PROFILE_SAMPLES", "samples one profiler run keeps; past it samples drop and count")
 
+namespace bolt::log {
+inline constexpr std::uint32_t kMaxModules = 256;   // kind A: Module::id and the static table
+}  // namespace bolt::log
+
+namespace bolt::crash {
+inline constexpr int kMaxFrames = 96;   // kind A: stack array in the signal handler
+}  // namespace bolt::crash
+
 namespace bolt::obs {
 BOLT_LIMITS_TABLE(obs_limits, "bolt.obs", BOLT_OBS_LIMITS)
 }  // namespace bolt::obs

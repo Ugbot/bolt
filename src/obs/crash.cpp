@@ -16,13 +16,13 @@
 
 #include "bolt/obs/context.h"
 #include "bolt/obs/log.h"
+#include "bolt/obs/obs_limits.h"
 
 namespace bolt::crash {
 
 namespace {
 
 constexpr std::size_t kAltStackBytes = 64u * 1024u;
-constexpr int kMaxFrames = 96;
 constexpr int kSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
 
 char g_dir[1024];

@@ -22,6 +22,7 @@
 #include <type_traits>
 
 #include "bolt/obs/context.h"
+#include "bolt/obs/obs_limits.h"
 
 #if defined(_MSC_VER)
 #define BOLT_LOG_COLD __declspec(noinline)
@@ -35,7 +36,6 @@ enum class Level : std::uint8_t { Trace = 0, Debug, Info, Warn, Error, Fatal, Of
 enum class Format : std::uint8_t { Text = 0, Json };
 
 inline constexpr std::uint32_t kModuleNameBytes = 24;
-inline constexpr std::uint32_t kMaxModules = 256;
 
 struct Module {
     std::atomic<std::uint8_t> level;
