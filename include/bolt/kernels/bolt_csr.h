@@ -275,6 +275,7 @@ BOLT_FORCE_INLINE void csr_block_narrow_to_dst(
 template <typename Nbr, typename Eid>
 struct CsrGraphT {
     const int64_t* off         = nullptr;   // n_win + 1 (or n_nodes + 1)
+    const int64_t* end         = nullptr;   // block ends; null = off[r + 1]
     const Nbr*     neighbors   = nullptr;   // num_edges
     const Eid*     edge_ids    = nullptr;   // num_edges
     const int32_t* edge_labels = nullptr;   // num_edges, or null
@@ -300,7 +301,7 @@ BOLT_FORCE_INLINE void csr_graph_block(const CsrGraphT<Nbr, Eid>* g,
     const uint64_t r   = static_cast<uint64_t>(node - g->node_lo);
     if (r < static_cast<uint64_t>(win)) {
         *b = g->off[r];
-        *e = g->off[r + 1];
+        *e = (g->end != nullptr) ? g->end[r] : g->off[r + 1];
     } else {
         *b = 0;
         *e = 0;
