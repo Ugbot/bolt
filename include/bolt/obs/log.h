@@ -226,7 +226,7 @@ inline void check_format(const char*, ...) noexcept {}
         if constexpr (BOLT_LOG_LEVEL_##lvl >= BOLT_OBS_LOG_MIN) {                                   \
             if (::bolt::log::enabled(bolt_log_module_, ::bolt::log::Level::lvl)) {                  \
                 ::bolt::log::detail::emit(bolt_log_module_, ::bolt::log::Level::lvl, __FILE__,      \
-                                          __LINE__, fmt __VA_OPT__(, ) __VA_ARGS__);                \
+                                          __LINE__, "" fmt __VA_OPT__(, ) __VA_ARGS__);             \
             }                                                                                       \
         }                                                                                           \
         if (false) ::bolt::log::check_format(fmt __VA_OPT__(, ) __VA_ARGS__);                       \
