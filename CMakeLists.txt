@@ -185,7 +185,7 @@ foreach(feature LOG METRICS TRACE PROFILE CRASH)
 endforeach()
 set(BOLT_OBS_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
 configure_file(include/bolt/obs/obs_config.h.in ${BOLT_OBS_GENERATED}/bolt/obs/obs_config.h @ONLY)
-add_library(bolt_obs STATIC src/obs/log.cpp src/obs/log_format.cpp src/obs/metrics.cpp src/obs/trace.cpp
+add_library(bolt_obs STATIC src/obs/log.cpp src/obs/log_format.cpp src/obs/metrics.cpp src/obs/trace.cpp src/obs/diag.cpp
     src/obs/crash.cpp src/obs/prof.cpp)
 add_library(bolt::obs ALIAS bolt_obs)
 set_target_properties(bolt_obs PROPERTIES POSITION_INDEPENDENT_CODE ON)
