@@ -49,7 +49,19 @@ int main() {
     volatile std::uint64_t sink = 0;
     row("empty loop", kIters, [&](std::uint64_t i) { sink = i; });
     row("log below level (debug at info)", kIters, [](std::uint64_t i) { BLOG_DEBUG("n=%llu", static_cast<unsigned long long>(i)); });
-    row("log enabled, ring may drop", 2000000, [](std::uint64_t i) { BLOG_INFO("n=%llu s=%s", static_cast<unsigned long long>(i), "abc"); });
+    {
+        // Bursts inside the ring: the cost a caller pays while the writer keeps up.
+        constexpr int kBurst = 128, kBursts = 2000;
+        double total = 0;
+        for (int b = 0; b < kBursts; ++b) {
+            const auto t0 = Clock::now();
+            for (int i = 0; i < kBurst; ++i) BLOG_INFO("n=%d s=%s", i, "abc");
+            total += std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::printf("log enabled, into the ring        %8.2f ns\n", total / (kBurst * kBursts));
+    }
+    row("log enabled, ring full (dropped)", 2000000, [](std::uint64_t i) { BLOG_INFO("n=%llu s=%s", static_cast<unsigned long long>(i), "abc"); });
     const auto ctr = bolt::metrics::counter("bench_total", "x");
     row("counter.inc", kIters, [&](std::uint64_t) { ctr.inc(); });
     const auto hist = bolt::metrics::histogram("bench_seconds", "x", "", bolt::metrics::kLatency);
@@ -60,13 +72,16 @@ int main() {
     row("counter.inc, run-time off", kIters, [&](std::uint64_t) { ctr.inc(); });
     row("histogram.observe, run-time off", kIters, [&](std::uint64_t i) { hist.observe(i); });
     bolt::metrics::set_enabled(true);
-    row("span unsampled", kIters, [](std::uint64_t) { bolt::trace::Span s("x"); });
+    row("span unsampled", kIters, [](std::uint64_t) {
+        bolt::trace::Span s("x");
+        asm volatile("" ::: "memory");
+    });
     (void)bolt::trace::start(nullptr, nullptr);
     bolt::trace::set_rate_ppm(1000000);
-    {
+    std::printf("span sampled %.1f ns (1 thread)\n", ns_per_op(1, 200000, [](std::uint64_t) {
         bolt::obs::ScopedTraceCtx ctx(bolt::obs::TraceCtx{1, 2, 0, 1});
-        std::printf("span sampled %.1f ns (1 thread)\n", ns_per_op(1, 1000000, [](std::uint64_t) { bolt::trace::Span s("x"); }));
-    }
+        bolt::trace::Span s("x");
+    }));
     bolt::trace::stop();
     const auto st = bolt::log::stats();
     bolt::log::stop();
