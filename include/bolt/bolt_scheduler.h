@@ -166,7 +166,59 @@ typedef void (*ColumnTaskFn)(const void* read_batch, void* write_batch,
 struct Task {
     TaskFn fn;
     void*  arg;
+    std::atomic<uint64_t>* group;   // submitter's completion count, or nullptr
 };
+
+// Per-thread completion groups (G2CHK-761). Scheduler::wait_all waits for the
+// calling thread's own tasks, whichever scheduler ran them, not for a ring-wide
+// count another borrower can satisfy. Slots are static so a task can outlive
+// its submitting thread; two threads sharing a slot only wait for each other.
+namespace sched_group {
+inline constexpr uint32_t kSlots = 4096;
+inline constexpr uint32_t kClaimProbes = 64;
+
+struct alignas(bolt::config::kCacheIsolationBytes) Slot {
+    std::atomic<uint64_t> pending{0};
+    std::atomic<uint32_t> owned{0};
+};
+
+inline Slot g_slots[kSlots];
+inline std::atomic<uint32_t> g_next{0};
+
+struct ThreadGroup {
+    Slot* slot = nullptr;
+    bool  claimed = false;
+    bool  submitted = false;   // this thread has submitted: wait_all is per-thread
+
+    Slot* get() noexcept {
+        if (slot != nullptr) return slot;
+        const uint32_t start = g_next.fetch_add(1, std::memory_order_relaxed);
+        for (uint32_t i = 0; i < kClaimProbes; ++i) {
+            Slot* s = &g_slots[(start + i) % kSlots];
+            uint32_t free_slot = 0;
+            if (s->owned.compare_exchange_strong(free_slot, 1, std::memory_order_acq_rel)) {
+                slot = s;
+                claimed = true;
+                return slot;
+            }
+        }
+        slot = &g_slots[start % kSlots];
+        return slot;
+    }
+    ~ThreadGroup() {
+        if (claimed) slot->owned.store(0, std::memory_order_release);
+    }
+};
+
+inline thread_local ThreadGroup tl_group;
+
+inline std::atomic<uint64_t>* enter() noexcept {
+    tl_group.submitted = true;
+    std::atomic<uint64_t>* c = &tl_group.get()->pending;
+    c->fetch_add(1, std::memory_order_relaxed);
+    return c;
+}
+}  // namespace sched_group
 
 // ============================================================================
 // Task Pool — Treiber stack, lock-free, zero-alloc in steady state
@@ -326,7 +378,8 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
     /// means another producer advanced; after kTaskRingReserveRetries losses
     /// this returns false and submit_wait retries, keeping each call bounded.
     template <class Sim>
-    BOLT_FORCE_INLINE bool submit_sim(TaskFn fn, void* arg) noexcept {
+    BOLT_FORCE_INLINE bool submit_sim(TaskFn fn, void* arg,
+                                      std::atomic<uint64_t>* group = nullptr) noexcept {
         uint64_t seq = reserve.load(std::memory_order_relaxed);
         Sim::point(sched_point::kSubmitEnter);
 
@@ -344,7 +397,7 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
         if (!reserved) return false;
         Sim::point(sched_point::kSubmitSpaceOk);
 
-        ring[seq & kTaskRingMask] = Task{fn, arg};
+        ring[seq & kTaskRingMask] = Task{fn, arg, group};
         Sim::point(sched_point::kSubmitSlotWritten);
 
         // Publish in reservation order. The acquire load chains each
@@ -360,14 +413,15 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
         return true;
     }
 
-    bool submit(TaskFn fn, void* arg) noexcept {
-        return submit_sim<SchedSimNoop>(fn, arg);
+    bool submit(TaskFn fn, void* arg, std::atomic<uint64_t>* group = nullptr) noexcept {
+        return submit_sim<SchedSimNoop>(fn, arg, group);
     }
 
     /// Submit with backpressure wait (spins until space available).
-    void submit_wait(TaskFn fn, void* arg, SpinPolicy policy) noexcept {
+    void submit_wait(TaskFn fn, void* arg, SpinPolicy policy,
+                     std::atomic<uint64_t>* group = nullptr) noexcept {
         uint32_t spins = 0;
-        while (!submit(fn, arg)) {
+        while (!submit(fn, arg, group)) {
             spin_wait(policy, spins, kDefaultSpinCount);
         }
     }
@@ -428,6 +482,7 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
         Sim::point(sched_point::kClaimWon);
 
         if (task.fn) task.fn(task.arg);
+        if (task.group != nullptr) task.group->fetch_sub(1, std::memory_order_release);
         // Release pairs with wait_all()'s acquire: the body's stores are
         // visible once the count covers it. Counts every claimed slot, raw
         // or trampolined, whoever executes it.
@@ -613,7 +668,7 @@ struct Scheduler {
 
     /// Fire-and-forget task. Safe from any number of threads concurrently.
     void submit(TaskFn fn, void* arg) noexcept {
-        ring.submit_wait(fn, arg, SpinPolicy::SpinYield);
+        ring.submit_wait(fn, arg, SpinPolicy::SpinYield, sched_group::enter());
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
         // Wave 18a — wake any ParkWait worker that may be sleeping on
         // `submit_seq_`. Release-order bump ensures the ring push above
@@ -631,12 +686,20 @@ struct Scheduler {
                             void* write_batch, uint32_t entity_count,
                             float delta_time, uint32_t grain_size = 512) noexcept;
 
-    /// Wait for all submitted tasks (raw, range and column) to complete.
-    /// Barrier is the ring's executed count, bumped after each task body
-    /// returns; `stats` are diagnostics only (raw submits bump
-    /// tasks_submitted but not tasks_completed) and never gate this call.
+    /// Wait for the calling thread's submitted tasks (raw, range and column)
+    /// to complete, so concurrent borrowers neither satisfy nor stretch each
+    /// other's barrier. A thread that has submitted nothing waits on the ring's
+    /// executed count instead; `stats` are diagnostics only and never gate this.
     void wait_all() noexcept {
-        ring.wait_all(SpinPolicy::SpinYield);
+        if (!sched_group::tl_group.submitted) {
+            ring.wait_all(SpinPolicy::SpinYield);
+            return;
+        }
+        const std::atomic<uint64_t>& pending = sched_group::tl_group.get()->pending;
+        uint32_t spins = 0;
+        while (pending.load(std::memory_order_acquire) != 0) {
+            spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
+        }
     }
 
     /// Get the arena for a specific worker thread.
@@ -1075,7 +1138,7 @@ inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
         p->owning_pool   = range_task_pool;
         p->owning_sched  = this;
 
-        ring.submit_wait(&scheduler_range_trampoline, p, SpinPolicy::SpinYield);
+        ring.submit_wait(&scheduler_range_trampoline, p, SpinPolicy::SpinYield, sched_group::enter());
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
         // Wave 18a — wake any ParkWait worker that may be sleeping on
         // `submit_seq_`. Release-order bump ensures the ring push above
@@ -1112,7 +1175,7 @@ inline void Scheduler::submit_column_task(ColumnTaskFn fn, const void* read_batc
         p->owning_pool   = column_task_pool;
         p->owning_sched  = this;
 
-        ring.submit_wait(&scheduler_column_trampoline, p, SpinPolicy::SpinYield);
+        ring.submit_wait(&scheduler_column_trampoline, p, SpinPolicy::SpinYield, sched_group::enter());
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
         // Wave 18a — wake any ParkWait worker that may be sleeping on
         // `submit_seq_`. Release-order bump ensures the ring push above
