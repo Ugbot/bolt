@@ -73,6 +73,44 @@ BOLT_FORCE_INLINE void l2_vertical_f32_accumulate(
     }
 }
 
+// A 64-lane PDX block, dims [d_lo, d_hi): block[d * 64 + i] is dim d of lane i.
+// 16 lanes at a time so the accumulators stay in registers across the dim walk;
+// l2_vertical_f32_accumulate reloads and stores them every dim.
+BOLT_FORCE_INLINE void l2_block64_f32_accumulate(
+    const float* BOLT_RESTRICT block, const float* BOLT_RESTRICT q,
+    uint32_t d_lo, uint32_t d_hi, float* BOLT_RESTRICT partial) noexcept {
+    assert(block != nullptr && q != nullptr && partial != nullptr);
+    for (uint32_t base = 0; base < 64u; base += 16u) {
+        float acc[16];
+        for (uint32_t i = 0; i < 16u; ++i) acc[i] = partial[base + i];
+        for (uint32_t d = d_lo; d < d_hi; ++d) {
+            const float* BOLT_RESTRICT col = block + static_cast<size_t>(d) * 64u + base;
+            const float qd = q[d];
+            for (uint32_t i = 0; i < 16u; ++i) {
+                const float t = qd - col[i];
+                acc[i] += t * t;
+            }
+        }
+        for (uint32_t i = 0; i < 16u; ++i) partial[base + i] = acc[i];
+    }
+}
+
+BOLT_FORCE_INLINE void ip_block64_f32_accumulate(
+    const float* BOLT_RESTRICT block, const float* BOLT_RESTRICT q,
+    uint32_t d_lo, uint32_t d_hi, float* BOLT_RESTRICT partial) noexcept {
+    assert(block != nullptr && q != nullptr && partial != nullptr);
+    for (uint32_t base = 0; base < 64u; base += 16u) {
+        float acc[16];
+        for (uint32_t i = 0; i < 16u; ++i) acc[i] = partial[base + i];
+        for (uint32_t d = d_lo; d < d_hi; ++d) {
+            const float* BOLT_RESTRICT col = block + static_cast<size_t>(d) * 64u + base;
+            const float qd = q[d];
+            for (uint32_t i = 0; i < 16u; ++i) acc[i] += qd * col[i];
+        }
+        for (uint32_t i = 0; i < 16u; ++i) partial[base + i] = acc[i];
+    }
+}
+
 BOLT_FORCE_INLINE void ip_vertical_f32_accumulate(
     const float* BOLT_RESTRICT dim_col, float q_broadcast,
     float* BOLT_RESTRICT dists, size_t n_vectors) noexcept {
