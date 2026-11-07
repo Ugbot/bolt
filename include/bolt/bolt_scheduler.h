@@ -635,9 +635,7 @@ struct Scheduler {
     /// Barrier is the ring's executed count, bumped after each task body
     /// returns; `stats` are diagnostics only (raw submits bump
     /// tasks_submitted but not tasks_completed) and never gate this call.
-    void wait_all() noexcept {
-        ring.wait_all(SpinPolicy::SpinYield);
-    }
+    void wait_all() noexcept;
 
     /// Get the arena for a specific worker thread.
     Arena* worker_arena(uint32_t worker_id) noexcept {
@@ -703,6 +701,7 @@ struct RangeTaskPayload {
     uint32_t      _pad0;
     TaskPool*     owning_pool;
     Scheduler*    owning_sched;
+    std::atomic<uint64_t>* pending;   // the submitting thread's count
 };
 static_assert(sizeof(RangeTaskPayload) <= 128, "RangeTaskPayload must fit pool slot");
 
@@ -717,6 +716,7 @@ struct ColumnTaskPayload {
     uint32_t      thread_id;
     TaskPool*     owning_pool;
     Scheduler*    owning_sched;
+    std::atomic<uint64_t>* pending;
 };
 static_assert(sizeof(ColumnTaskPayload) <= 128, "ColumnTaskPayload must fit pool slot");
 
@@ -732,6 +732,17 @@ static constexpr uint32_t kSchedulerPoolCapacity = config::kSchedulerPoolCapacit
 /// workers (measured: chukonu W-J5 parallel-probe pair-buffer race -> AV).
 inline thread_local uint32_t tl_worker_index = UINT32_MAX;
 
+/// Range and column tasks this thread submitted that have not returned. The
+/// ring's executed count is shared by every submitter, so with two threads
+/// submitting, wait_all() on the ring alone can return while the caller's own
+/// tasks still run (two query stages in one process lost join matches this
+/// way). wait_all() waits on this count first, which is exact for the caller.
+/// Never freed: a task may finish after its submitting thread has exited.
+inline std::atomic<uint64_t>* submit_pending_counter() noexcept {
+    thread_local std::atomic<uint64_t>* counter = new std::atomic<uint64_t>(0);
+    return counter;
+}
+
 inline void scheduler_range_trampoline(void* arg) noexcept {
     assert(arg != nullptr);
     RangeTaskPayload* p = static_cast<RangeTaskPayload*>(arg);
@@ -742,7 +753,9 @@ inline void scheduler_range_trampoline(void* arg) noexcept {
     p->fn(p->user_data, p->start, p->end, tid);
     Scheduler* sched = p->owning_sched;
     TaskPool* pool = p->owning_pool;
+    std::atomic<uint64_t>* pending = p->pending;
     pool->release(p);
+    pending->fetch_sub(1, std::memory_order_release);
     if (sched) {
         // Diagnostic only; wait_all() synchronises on TaskRing::executed.
         sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
@@ -759,7 +772,9 @@ inline void scheduler_column_trampoline(void* arg) noexcept {
     p->fn(p->read_batch, p->write_batch, p->start, p->end, p->delta_time, tid);
     Scheduler* sched = p->owning_sched;
     TaskPool* pool = p->owning_pool;
+    std::atomic<uint64_t>* pending = p->pending;
     pool->release(p);
+    pending->fetch_sub(1, std::memory_order_release);
     if (sched) {
         // Diagnostic only; wait_all() synchronises on TaskRing::executed.
         sched->stats.tasks_completed.fetch_add(1, std::memory_order_relaxed);
@@ -1051,6 +1066,15 @@ inline void Scheduler::shutdown() noexcept {
     scheduler_free_slots(this);
 }
 
+inline void Scheduler::wait_all() noexcept {
+    std::atomic<uint64_t>* mine = submit_pending_counter();
+    uint32_t spins = 0;
+    while (mine->load(std::memory_order_acquire) != 0) {
+        spin_wait(SpinPolicy::SpinYield, spins, kDefaultSpinCount);
+    }
+    ring.wait_all(SpinPolicy::SpinYield);   // raw submits are counted by the ring only
+}
+
 inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
                                     uint32_t count, uint32_t grain_size) noexcept {
     assert(fn != nullptr);
@@ -1074,6 +1098,8 @@ inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
         p->thread_id     = 0;  // Set by worker via tl_arena; not per-worker yet.
         p->owning_pool   = range_task_pool;
         p->owning_sched  = this;
+        p->pending       = submit_pending_counter();
+        p->pending->fetch_add(1, std::memory_order_relaxed);
 
         ring.submit_wait(&scheduler_range_trampoline, p, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);
@@ -1111,6 +1137,8 @@ inline void Scheduler::submit_column_task(ColumnTaskFn fn, const void* read_batc
         p->thread_id     = 0;
         p->owning_pool   = column_task_pool;
         p->owning_sched  = this;
+        p->pending       = submit_pending_counter();
+        p->pending->fetch_add(1, std::memory_order_relaxed);
 
         ring.submit_wait(&scheduler_column_trampoline, p, SpinPolicy::SpinYield);
         stats.tasks_submitted.fetch_add(1, std::memory_order_relaxed);

@@ -142,4 +142,40 @@ TEST(BoltSchedulerMultiProducer, ConcurrentSubmitRangeRunsEveryTaskOnce) {
     sched.shutdown();
 }
 
+// One submitter's wait_all must not return while its own range tasks run,
+// however many tasks other threads complete meanwhile. With the barrier on the
+// shared executed count, a second submitter's short tasks stood in for the
+// first's slow one: two query stages in one chukonu process lost join matches.
+std::atomic<std::uint32_t> g_slow_done{0};
+
+void slow_range(void*, std::uint32_t, std::uint32_t, std::uint32_t) noexcept {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    g_slow_done.store(1, std::memory_order_release);
+}
+
+void quick_range(void*, std::uint32_t, std::uint32_t, std::uint32_t) noexcept {}
+
+TEST(BoltSchedulerMultiProducer, WaitAllWaitsForTheCallersOwnTasks) {
+    static bolt::Scheduler sched;
+    ASSERT_TRUE(sched.init(kWorkers));
+    std::atomic<bool> stop{false};
+    std::thread noise([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            sched.submit_range(&quick_range, nullptr, 64, 1);
+            sched.wait_all();
+        }
+    });
+    std::uint32_t early = 0;
+    for (std::uint32_t round = 0; round < 20; ++round) {
+        g_slow_done.store(0, std::memory_order_relaxed);
+        sched.submit_range(&slow_range, nullptr, 1, 1);
+        sched.wait_all();
+        early += g_slow_done.load(std::memory_order_acquire) == 0u ? 1u : 0u;
+    }
+    stop.store(true, std::memory_order_release);
+    noise.join();
+    sched.shutdown();
+    EXPECT_EQ(early, 0u) << "wait_all returned before the caller's own task finished";
+}
+
 }  // namespace
