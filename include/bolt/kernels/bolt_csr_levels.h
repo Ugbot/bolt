@@ -49,6 +49,7 @@ inline CsrAlgoStatus csr_bfs_levels_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g
     int64_t head = 0;
     int64_t tail = 1;
     while (head < tail) {                         // each node enqueued once
+        if ((head & k_csr_stop_poll_mask) == 0 && csr_stop_requested(g)) return CsrAlgoStatus::Stopped;
         const int64_t u = queue[head++];
         const int64_t du = out_depth[u];
         if (max_depth >= 0 && du >= max_depth) continue;

@@ -152,6 +152,49 @@ bool udp_multicast_join(UdpEndpoint* ep, std::uint32_t group_ipv4,
 bool udp_multicast_leave(UdpEndpoint* ep, std::uint32_t group_ipv4,
                          std::uint32_t iface_ipv4) noexcept;
 
+// Source-specific membership: traffic for `group_ipv4` from `source_ipv4` only.
+// Preconditions: ep != nullptr, ep->sock valid, udp_is_multicast(group_ipv4).
+bool udp_multicast_join_source(UdpEndpoint* ep, std::uint32_t group_ipv4,
+                               std::uint32_t source_ipv4,
+                               std::uint32_t iface_ipv4) noexcept;
+bool udp_multicast_leave_source(UdpEndpoint* ep, std::uint32_t group_ipv4,
+                                std::uint32_t source_ipv4,
+                                std::uint32_t iface_ipv4) noexcept;
+
+// --- Feed ingress ----------------------------------------------------------
+// Request an SO_RCVBUF of `bytes`; *actual gets what the kernel granted, which
+// may be less (net.core.rmem_max) or, on Linux, doubled for bookkeeping.
+// Preconditions: ep != nullptr, ep->sock valid, actual != nullptr, bytes > 0.
+bool udp_endpoint_set_recv_buffer(UdpEndpoint* ep, std::uint32_t bytes,
+                                  std::uint32_t* actual) noexcept;
+
+// Ask the kernel to stamp each datagram at receipt. False where unsupported
+// (Windows); udp_recv_stamped then reports a user-space clock reading.
+bool udp_endpoint_enable_rx_timestamps(UdpEndpoint* ep) noexcept;
+
+enum class UdpStampSource : std::uint8_t { None, Kernel };
+struct UdpStampedResult {
+    UdpReceiveResult result;
+    std::int64_t rx_ns;      // Unix-epoch ns; 0 when source == None
+    UdpStampSource source;
+    std::uint8_t _pad[7];
+};
+static_assert(__is_trivially_copyable(UdpStampedResult), "stamped result must be POD");
+
+// udp_recv_from_checked plus the kernel receipt time. Same outcomes and
+// argument rules; rx_ns is valid only for Complete. Microsecond resolution on
+// macOS (SO_TIMESTAMP), nanosecond on Linux (SO_TIMESTAMPNS).
+UdpStampedResult udp_recv_stamped(const UdpEndpoint* ep, void* buf, std::uint32_t cap,
+                                  UdpAddr* src) noexcept;
+
+// Block up to timeout_us until any open endpoint is readable. One syscall, no
+// retry. Returns the number of readable endpoints, 0 on timeout, -1 on error.
+// timeout_us == 0 polls. Sub-millisecond waits round up to 1 ms.
+// Preconditions: endpoints != nullptr, 0 < count <= k_udp_wait_endpoints_max.
+constexpr std::uint32_t k_udp_wait_endpoints_max = 64u;
+std::int32_t udp_wait_readable(const UdpEndpoint* const* endpoints, std::uint32_t count,
+                               std::uint32_t timeout_us) noexcept;
+
 // Allow multiple sockets to bind the same multicast port (SO_REUSEADDR, and
 // SO_REUSEPORT where it exists). Call BEFORE bind; opens a fresh socket with
 // reuse set and binds it. Returns false on socket/bind error.

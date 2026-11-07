@@ -678,6 +678,12 @@ BOLT_FORCE_INLINE bool is_float_type(BoltType t) noexcept {
     return t == BoltType::Float64 || t == BoltType::Float32;
 }
 
+// Types whose aggregate cell is a d128. A UInt64 cell is {bits, 0}: the exact
+// non-negative d128, so its top half never reads as a sign.
+BOLT_FORCE_INLINE bool gb_agg_cell_is_d128(BoltType t) noexcept {
+    return t == BoltType::Decimal128 || t == BoltType::Decimal64 || t == BoltType::UInt64;
+}
+
 // Read one row of a column into a 16-byte cell. Branch-free per cell type.
 BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept {
     assert(c.data != nullptr);
@@ -695,6 +701,11 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
         }
         case BoltType::Int64:    out.a = static_cast<const int64_t*>(c.data)[r]; break;
         case BoltType::Int32:    out.a = static_cast<const int32_t*>(c.data)[r]; break;
+        case BoltType::Int16:    out.a = static_cast<const int16_t*>(c.data)[r]; break;
+        case BoltType::Int8:     out.a = static_cast<const int8_t*>(c.data)[r]; break;
+        case BoltType::UInt32:   out.a = static_cast<const uint32_t*>(c.data)[r]; break;
+        case BoltType::UInt16:   out.a = static_cast<const uint16_t*>(c.data)[r]; break;
+        case BoltType::UInt8:    out.a = static_cast<const uint8_t*>(c.data)[r]; break;
         case BoltType::Date32:   out.a = static_cast<const int32_t*>(c.data)[r]; break;
         case BoltType::Decimal64: {
             // W-DEC: widen the int64 mantissa to a full d128 cell (sign-
@@ -796,8 +807,10 @@ inline constexpr int64_t kGbNullKeyTag = static_cast<int64_t>(0x4E554C4C4B45593F
 BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
     switch (t) {
         case BoltType::Bool:
-        case BoltType::UInt64:
+        case BoltType::UInt64:    case BoltType::UInt32:
+        case BoltType::UInt16:    case BoltType::UInt8:
         case BoltType::Int64:     case BoltType::Int32:
+        case BoltType::Int16:     case BoltType::Int8:
         case BoltType::Date32:    case BoltType::Date64:
         case BoltType::Timestamp: case BoltType::Duration:
         case BoltType::Float64:   case BoltType::Float32:
@@ -846,6 +859,37 @@ BOLT_FORCE_INLINE GbCell16 read_key_cell16(const BoltColumn& c,
         return gb_null_key_cell(c.type);
     }
     return canon_key_cell(read_cell16(c, r), c.type);
+}
+
+// One group key into its output column, at the key's own width.
+BOLT_FORCE_INLINE void gb_store_key(void* buf, int64_t r, BoltType t, GbCell16 kc) noexcept {
+    switch (t) {
+        case BoltType::Bool:
+            static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
+        case BoltType::UInt64:
+            std::memcpy(&static_cast<uint64_t*>(buf)[r], &kc.a, 8); break;
+        case BoltType::Int64:
+            static_cast<int64_t*>(buf)[r] = kc.a; break;
+        case BoltType::Int32:
+        case BoltType::Date32:
+            static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
+        case BoltType::Int16:
+            static_cast<int16_t*>(buf)[r] = static_cast<int16_t>(kc.a); break;
+        case BoltType::Int8:
+            static_cast<int8_t*>(buf)[r] = static_cast<int8_t>(kc.a); break;
+        case BoltType::UInt32:
+            static_cast<uint32_t*>(buf)[r] = static_cast<uint32_t>(kc.a); break;
+        case BoltType::UInt16:
+            static_cast<uint16_t*>(buf)[r] = static_cast<uint16_t>(kc.a); break;
+        case BoltType::UInt8:
+            static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a); break;
+        case BoltType::Decimal128:
+            std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &kc, 16); break;
+        case BoltType::Utf8:
+            std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
+        default:   // Decimal64 (cell.a IS the mantissa) and the 8-byte lanes.
+            static_cast<int64_t*>(buf)[r] = kc.a; break;
+    }
 }
 
 // DISTINCT dedup keys wider than 8 bytes: Utf8 by content, Decimal128 by
@@ -956,7 +1000,7 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
 BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
     // W-DEC: Decimal64 cells are widened d128 (read_cell16), so their
     // Min/Max identities are the d128 extremes too.
-    const bool d = (t == BoltType::Decimal128 || t == BoltType::Decimal64);
+    const bool d = gb_agg_cell_is_d128(t);
     const bool s = (t == BoltType::Utf8);
     const bool f = is_float_type(t);
     // Float Min/Max identities are NaN / -infinity stored as double bits in
@@ -1005,7 +1049,7 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
     if (!valid) return;   // Sum/Min/Max/Avg ignore NULLs (SQL semantics)
     // W-DEC: Decimal64 cells arrive WIDENED to d128 (read_cell16), so the
     // Decimal128 arm is exact for them — sums grow past int64 safely.
-    if (t == BoltType::Decimal128 || t == BoltType::Decimal64) {
+    if (gb_agg_cell_is_d128(t)) {
         namespace dec = kernels::decimal;
         dec::Decimal128 s, x;
         std::memcpy(&s, slot, 16);
@@ -1184,6 +1228,10 @@ BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     // Float SUM/MIN/MAX stay double (f32 is promoted to double — SUM(real)
     // and AVG(real) widen to double, matching DuckDB/Polars semantics).
     if (is_float_type(in)) return BoltType::Float64;
+    // SUM(UInt64) leaves the 64-bit range on two rows; MIN/MAX never do.
+    if (in == BoltType::UInt64) {
+        return (k == AggKind::Sum) ? BoltType::Decimal128 : BoltType::UInt64;
+    }
     // W-DEC: SUM(Decimal64) can exceed the int64 mantissa with no plan-time
     // proof at this layer — the accumulator is the widened d128 cell and
     // the output WIDENS to Decimal128 (exact, no overflow ever). MIN/MAX
@@ -2172,27 +2220,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
             void* buf = out_keys[k].data;
             const GbCell16 kc =
                 gb_detail::gb_key_out_cell(krow[k], state->key_types[k]);
-            switch (state->key_types[k]) {
-                case BoltType::Bool:
-                    static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
-                case BoltType::UInt64:
-                    std::memcpy(&static_cast<uint64_t*>(buf)[r], &kc.a, 8); break;
-                case BoltType::Int64:
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-                case BoltType::Int32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
-                case BoltType::Date32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
-                case BoltType::Decimal128:
-                    std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
-                                &kc, 16); break;
-                case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-                case BoltType::Utf8:
-                    std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
-                default:
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-            }
+            gb_detail::gb_store_key(buf, r, state->key_types[k], kc);
         }
     }
     for (uint8_t j = 0; j < n_aggs; ++j) {
@@ -2521,27 +2549,7 @@ inline bool groupby_agg_multi_key_typed(
             void* buf = out_keys[k].data;
             const GbCell16 kc =
                 gb_detail::gb_key_out_cell(krow[k], key_types[k]);
-            switch (key_types[k]) {
-                case BoltType::Bool:
-                    static_cast<uint8_t*>(buf)[r] = static_cast<uint8_t>(kc.a != 0); break;
-                case BoltType::UInt64:
-                    std::memcpy(&static_cast<uint64_t*>(buf)[r], &kc.a, 8); break;
-                case BoltType::Int64:
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-                case BoltType::Int32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
-                case BoltType::Date32:
-                    static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(kc.a); break;
-                case BoltType::Decimal128:
-                    std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r],
-                                &kc, 16); break;
-                case BoltType::Decimal64:   // W-DEC: cell.a IS the mantissa
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-                case BoltType::Utf8:
-                    std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
-                default:
-                    static_cast<int64_t*>(buf)[r] = kc.a; break;
-            }
+            gb_detail::gb_store_key(buf, r, key_types[k], kc);
         }
     }
 

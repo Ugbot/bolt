@@ -113,6 +113,7 @@ inline CsrAlgoStatus csr_node_similarity_t(
                          buf_a == nullptr || buf_b == nullptr || buf_tmp == nullptr)))
         return CsrAlgoStatus::InvalidArgument;
     for (int64_t i = 0; i < n_pairs; ++i) {
+        if ((i & 1023) == 0 && csr_stop_requested(g)) return CsrAlgoStatus::Stopped;
         const int64_t u = us[i];
         const int64_t v = vs[i];
         if (u < 0 || u >= g->n_nodes || v < 0 || v >= g->n_nodes)
