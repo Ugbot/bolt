@@ -161,6 +161,10 @@ inline CsrAlgoStatus csr_dijkstra_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
     h.heap[h.size++] = source;
     int64_t settled = 0;
     while (h.size > 0) {                          // each node settles once
+        if ((settled & k_csr_stop_poll_mask) == 0 && csr_stop_requested(g)) {
+            *out_settled = settled;
+            return CsrAlgoStatus::Stopped;
+        }
         const int64_t u = csr_dj_pop(&h);
         ++settled;
         assert(settled <= n);

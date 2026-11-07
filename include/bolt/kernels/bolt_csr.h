@@ -284,7 +284,16 @@ struct CsrGraphT {
     int32_t        _pad        = 0;
     int64_t        node_lo     = 0;
     int64_t        n_win       = -1;
+    // Optional: a long kernel asks this between bounded steps and stops with
+    // CsrAlgoStatus::Stopped. Null = runs to the end.
+    bool         (*stop)(const void* ctx) noexcept = nullptr;
+    const void*    stop_ctx    = nullptr;
 };
+
+template <typename Nbr, typename Eid>
+BOLT_FORCE_INLINE bool csr_stop_requested(const CsrGraphT<Nbr, Eid>* g) noexcept {
+    return g->stop != nullptr && g->stop(g->stop_ctx);
+}
 
 using CsrGraph64 = CsrGraphT<int64_t, int64_t>;
 using CsrGraph32 = CsrGraphT<uint32_t, uint32_t>;
