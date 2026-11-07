@@ -48,4 +48,20 @@ TEST(BoltMoldUdp64, HeartbeatEndTrailingBytesAndSequenceOverflow) {
     ASSERT_EQ(mold::frame({bytes.data(), 23}, kLimits, p), mold::Status::Ok);
     EXPECT_EQ(p.first_sequence, UINT64_MAX);
 }
+TEST(BoltMoldUdp64, RequestGoldenBytesRoundTripAndRefusals) {
+    constexpr std::array<std::uint8_t, 20> golden{
+        'S','E','S','S','I','O','N','0','0','1', 0,0,0,0,0,0,1,2, 0,7};
+    const bolt::wire::ByteView session{golden.data(), mold::kSessionBytes};
+    std::array<std::uint8_t, 20> out{};
+    ASSERT_EQ(mold::encode_request(session, 258, 7, out.data(), 20), mold::Status::Ok);
+    EXPECT_EQ(out, golden);
+    mold::Request q{};
+    ASSERT_EQ(mold::parse_request({golden.data(), 20}, q), mold::Status::Ok);
+    EXPECT_EQ(q.first, 258u); EXPECT_EQ(q.count, 7u); EXPECT_EQ(q.session.data[9], '1');
+    EXPECT_EQ(mold::encode_request(session, 0, 7, out.data(), 20), mold::Status::Invalid);
+    EXPECT_EQ(mold::encode_request(session, 1, 0, out.data(), 20), mold::Status::Invalid);
+    EXPECT_EQ(mold::encode_request(session, 1, 0xffff, out.data(), 20), mold::Status::Invalid);
+    EXPECT_EQ(mold::encode_request(session, 1, 1, out.data(), 19), mold::Status::Capacity);
+    EXPECT_EQ(mold::parse_request({golden.data(), 19}, q), mold::Status::Truncated);
+}
 } // namespace
