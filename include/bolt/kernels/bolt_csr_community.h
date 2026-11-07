@@ -167,6 +167,7 @@ inline CsrAlgoStatus csr_label_propagation_t(
     const int64_t n = a->n_nodes;
     for (int64_t i = 0; i < n; ++i) labels[i] = i;
     for (int32_t it = 0; it < max_iter; ++it) {
+        if (csr_stop_requested(a)) return CsrAlgoStatus::Stopped;
         const int64_t changed = csr_lp_sweep(a, b, labels, sc);
         if (changed == -2) return CsrAlgoStatus::InvalidArgument;
         if (changed < 0) return CsrAlgoStatus::MalformedGraph;
