@@ -70,4 +70,36 @@ inline Status next(const Packet& p, Cursor& c, Message& out) noexcept {
     out = m;
     return Status::Ok;
 }
+inline constexpr std::uint32_t kRequestBytes = 20;
+// Request Packet, spec v1.00 p.5: session, first sequence, message count. The
+// server may return fewer messages than asked, in one downstream packet.
+inline Status encode_request(ByteView session, std::uint64_t first, std::uint16_t count,
+    std::uint8_t* out, std::uint32_t cap) noexcept {
+    if (session.data == nullptr || session.size != kSessionBytes || out == nullptr ||
+        first == 0 || count == 0 || count == UINT16_MAX) return Status::Invalid;
+    if (cap < kRequestBytes) return Status::Capacity;
+    for (std::uint32_t i = 0; i < kSessionBytes; ++i) out[i] = session.data[i];
+    for (std::uint32_t i = 0; i < 8; ++i)
+        out[kSessionBytes + i] = static_cast<std::uint8_t>(first >> (56 - 8 * i));
+    out[18] = static_cast<std::uint8_t>(count >> 8);
+    out[19] = static_cast<std::uint8_t>(count);
+    assert(out[19] == (count & 0xffu));
+    assert(cap >= kRequestBytes);
+    return Status::Ok;
+}
+struct Request { ByteView session{}; std::uint64_t first = 0; std::uint16_t count = 0; };
+inline Status parse_request(ByteView bytes, Request& out) noexcept {
+    if (bytes.data == nullptr) return Status::Invalid;
+    if (bytes.size != kRequestBytes) return Status::Truncated;
+    ByteReader r{bytes.data, bytes.size};
+    Request q{};
+    if (!read_bytes(r, kSessionBytes, q.session) ||
+        !sbe::read_scalar<sbe::ByteOrder::Big>(r, q.first) ||
+        !sbe::read_scalar<sbe::ByteOrder::Big>(r, q.count)) return Status::Truncated;
+    if (q.first == 0 || q.count == 0 || q.count == UINT16_MAX) return Status::Invalid;
+    assert(r.offset == kRequestBytes);
+    assert(q.session.size == kSessionBytes);
+    out = q;
+    return Status::Ok;
+}
 } // namespace bolt::wire::mold_udp64
