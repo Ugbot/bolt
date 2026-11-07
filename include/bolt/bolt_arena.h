@@ -355,7 +355,7 @@ private:
     }
 
     void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
-        if (!query_charge(size)) return nullptr;
+        query_charge(size);
         void* p = aligned_alloc_raw(alignment, size);
         if (p != nullptr) {
             g_arena_total_owner.charge(size);
@@ -368,18 +368,17 @@ private:
 
     // Charges the query running on this thread; the arena remembers which one,
     // so a later free credits it only while that query still runs.
-    bool query_charge(size_t size) noexcept {
+    void query_charge(size_t size) noexcept {
         QueryCtx* q = current_query_ctx();
-        if (q == nullptr) return true;
+        if (q == nullptr) return;
         const uint32_t gen = q->generation.load(std::memory_order_relaxed);
         if (q != query_ || gen != query_gen_) {
             query_ = q;
             query_gen_ = gen;
             query_charged_ = 0;
         }
-        if (!q->charge(size)) return false;
+        q->charge(size);
         query_charged_ += size;
-        return true;
     }
 
     void query_credit(size_t size) noexcept {

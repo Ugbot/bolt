@@ -14,9 +14,9 @@
 // (per morsel, per file, per I/O) use query_poll_now(), which always does.
 //
 // Memory is charged where an Arena gets or frees a block, never per
-// allocation. Crossing the limit stops the query at its next safe point and
-// lets the allocation through, so callers that do not check for nullptr keep
-// running to that safe point; a block past the hard margin is refused.
+// allocation. Crossing the limit stops the query at its next safe point. The
+// allocation still succeeds: code under a spill or a merge treats a failed
+// allocation as a bug, and a limit must end the query, not the process.
 // Slots are recycled by generation: an arena that outlives its query (worker
 // arenas do) finds the generation changed and stops crediting.
 
@@ -84,20 +84,11 @@ struct alignas(64) QueryCtx {
         }
         return false;
     }
-    // False when `bytes` is past the hard margin; nothing stays charged then.
-    bool charge(uint64_t bytes) noexcept {
+    void charge(uint64_t bytes) noexcept {
         const uint64_t used = mem_used.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-        const uint64_t lim = limits.memory_bytes;
-        if (lim != 0u && used > lim) {
-            request_stop(QueryStop::Memory);
-            if (used > lim + (lim >> 2) + (64ull << 20)) {
-                mem_used.fetch_sub(bytes, std::memory_order_relaxed);
-                return false;
-            }
-        }
+        if (limits.memory_bytes != 0u && used > limits.memory_bytes) request_stop(QueryStop::Memory);
         uint64_t p = mem_peak.load(std::memory_order_relaxed);
         while (used > p && !mem_peak.compare_exchange_weak(p, used, std::memory_order_relaxed)) {}
-        return true;
     }
     void credit(uint64_t bytes) noexcept {
         uint64_t u = mem_used.load(std::memory_order_relaxed);
