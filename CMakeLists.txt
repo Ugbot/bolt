@@ -35,7 +35,7 @@ endif()
 
 # SIMD tier for bolt::core (propagates to every consumer).
 #   NATIVE   — MSVC /arch:AVX2, GCC/Clang -march=native (best on build host)
-#   AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -msse4.2 (portable modern x86)
+#   AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -mfma -mf16c -msse4.2 (portable modern x86)
 #   SSE42    — GCC/Clang -msse4.2; MSVC no flag (baseline = SSE2, scalar path)
 #   PORTABLE — no SIMD flag; reproducible cross-machine builds (scalar on MSVC)
 # `BOLT_ENABLE_NATIVE` remains for back-compat and only affects benchmark
