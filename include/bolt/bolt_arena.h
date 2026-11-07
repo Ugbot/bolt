@@ -18,6 +18,7 @@
 
 #include "bolt/bolt_mem_owner.h"
 #include "bolt/bolt_port.h"
+#include "bolt/bolt_query_ctx.h"
 
 namespace bolt {
 
@@ -354,12 +355,43 @@ private:
     }
 
     void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
+        if (!query_charge(size)) return nullptr;
         void* p = aligned_alloc_raw(alignment, size);
         if (p != nullptr) {
             g_arena_total_owner.charge(size);
             if (config_.owner != nullptr) config_.owner->charge(size);
+        } else {
+            query_credit(size);
         }
         return p;
+    }
+
+    // Charges the query running on this thread; the arena remembers which one,
+    // so a later free credits it only while that query still runs.
+    bool query_charge(size_t size) noexcept {
+        QueryCtx* q = current_query_ctx();
+        if (q == nullptr) return true;
+        const uint32_t gen = q->generation.load(std::memory_order_relaxed);
+        if (q != query_ || gen != query_gen_) {
+            query_ = q;
+            query_gen_ = gen;
+            query_charged_ = 0;
+        }
+        if (!q->charge(size)) return false;
+        query_charged_ += size;
+        return true;
+    }
+
+    void query_credit(size_t size) noexcept {
+        if (query_ == nullptr) return;
+        if (query_->generation.load(std::memory_order_relaxed) != query_gen_) {
+            query_ = nullptr;
+            query_charged_ = 0;
+            return;
+        }
+        const uint64_t n = size < query_charged_ ? size : query_charged_;
+        query_->credit(n);
+        query_charged_ -= n;
     }
 
     void* aligned_alloc_raw(size_t alignment, size_t size) noexcept {
@@ -382,6 +414,7 @@ private:
         assert(size > 0);
         g_arena_total_owner.release(size);
         if (config_.owner != nullptr) config_.owner->release(size);
+        query_credit(size);
 #if defined(__linux__) || defined(__APPLE__)
         if (os_block(size)) {
             const int rc = ::munmap(p, size);
@@ -538,6 +571,9 @@ private:
     uintptr_t end_;
     size_t   total_allocated_;
     size_t   peak_usage_;
+    QueryCtx* query_ = nullptr;      // last query charged for a block
+    uint32_t  query_gen_ = 0;
+    uint64_t  query_charged_ = 0;
     // Bit array over blocks_ (one bit per block index, kArenaOversizeWords
     // 64-bit words): blocks consumed whole by the oversize lane THIS epoch,
     // so the normal lane's forward scan must not reuse them until the next
