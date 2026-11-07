@@ -63,6 +63,7 @@
 #pragma once
 
 #include "bolt/bolt_port.h"
+#include "bolt/bolt_query_ctx.h"
 
 #include <cassert>
 #include <cstdint>
@@ -152,6 +153,7 @@ BOLT_FORCE_INLINE void argsort_mergesort_i64(int32_t* BOLT_RESTRICT perm,
     int32_t* b = scratch;
     // Bounded outer loop: width doubles each pass, <= ceil(log2 n) passes.
     for (int64_t width = 1; width < n; width <<= 1) {
+        if (query_poll_now()) break;   // a permutation still; the query is over
         for (int64_t lo = 0; lo < n; lo += (width << 1)) {
             const int64_t mid = (lo + width < n) ? (lo + width) : n;
             const int64_t hi = (lo + (width << 1) < n) ? (lo + (width << 1)) : n;
