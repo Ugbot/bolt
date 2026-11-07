@@ -47,6 +47,7 @@
 #include "bolt/lakehouse/object_store/s3_uri.h"
 #include "bolt/lakehouse/iceberg/eq_key.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
