@@ -24,6 +24,7 @@
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/kernels/bolt_topk.h"             // argmin_f32
+#include "bolt/kernels/bolt_vector_distance.h"
 #include "bolt/kernels/bolt_vector_limits.h"
 
 #include <cassert>
@@ -286,6 +287,36 @@ BOLT_FORCE_INLINE bool kmeans_train_f32(
         }
     }
     return true;
+}
+
+// ===========================================================================
+// kmeans_assign_block_f32 — nearest centroid for up to 64 dim-major rows
+// ===========================================================================
+//
+// `rows` is a 64-lane PDX block: rows[d * 64 + i] is dim d of lane i. Each
+// centroid is one pass over the block, with no horizontal sum, and the block
+// stays cache-resident while the centroids stream past. All 64 lanes are
+// computed; only the first `lanes` of the outputs are written.
+
+BOLT_FORCE_INLINE void kmeans_assign_block_f32(
+    const float* BOLT_RESTRICT rows, uint32_t lanes, uint32_t dim,
+    const float* BOLT_RESTRICT centroids, uint32_t k,
+    uint32_t* BOLT_RESTRICT out_assign, float* BOLT_RESTRICT out_d2) noexcept {
+    assert(rows != nullptr); assert(centroids != nullptr);
+    assert(out_assign != nullptr); assert(out_d2 != nullptr);
+    assert(lanes <= 64u);
+    alignas(64) float partial[64];
+    for (uint32_t i = 0; i < lanes; ++i) { out_d2[i] = 3.0e38f; out_assign[i] = 0u; }
+    for (uint32_t c = 0; c < k; ++c) {
+        const float* BOLT_RESTRICT cv = centroids + static_cast<size_t>(c) * dim;
+        for (uint32_t i = 0; i < 64u; ++i) partial[i] = 0.0f;
+        l2_block64_f32_accumulate(rows, cv, 0u, dim, partial);
+        for (uint32_t i = 0; i < lanes; ++i) {
+            const bool better = partial[i] < out_d2[i];
+            out_d2[i]     = better ? partial[i] : out_d2[i];
+            out_assign[i] = better ? c : out_assign[i];
+        }
+    }
 }
 
 // ===========================================================================
