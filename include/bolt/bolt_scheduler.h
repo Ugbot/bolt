@@ -167,6 +167,7 @@ struct Task {
     TaskFn fn;
     void*  arg;
     std::atomic<uint64_t>* group;   // submitter's completion count, or nullptr
+    QueryCtx* query;                // submitter's running query, or nullptr
 };
 
 // Per-thread completion groups (G2CHK-761). Scheduler::wait_all waits for the
@@ -397,7 +398,7 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
         if (!reserved) return false;
         Sim::point(sched_point::kSubmitSpaceOk);
 
-        ring[seq & kTaskRingMask] = Task{fn, arg, group};
+        ring[seq & kTaskRingMask] = Task{fn, arg, group, current_query_ctx()};
         Sim::point(sched_point::kSubmitSlotWritten);
 
         // Publish in reservation order. The acquire load chains each
@@ -481,7 +482,10 @@ struct alignas(bolt::config::kCacheIsolationBytes) TaskRing {
         }
         Sim::point(sched_point::kClaimWon);
 
-        if (task.fn) task.fn(task.arg);
+        if (task.fn) {
+            QueryCtxScope query_scope(task.query);
+            task.fn(task.arg);
+        }
         if (task.group != nullptr) task.group->fetch_sub(1, std::memory_order_release);
         // Release pairs with wait_all()'s acquire: the body's stores are
         // visible once the count covers it. Counts every claimed slot, raw

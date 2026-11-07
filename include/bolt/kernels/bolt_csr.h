@@ -50,6 +50,7 @@
 
 #pragma once
 
+#include "bolt/bolt_query_ctx.h"
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_binsearch.h"
 #include "bolt/kernels/bolt_scan.h"
@@ -292,7 +293,7 @@ struct CsrGraphT {
 
 template <typename Nbr, typename Eid>
 BOLT_FORCE_INLINE bool csr_stop_requested(const CsrGraphT<Nbr, Eid>* g) noexcept {
-    return g->stop != nullptr && g->stop(g->stop_ctx);
+    return (g->stop != nullptr && g->stop(g->stop_ctx)) || query_should_stop();
 }
 
 using CsrGraph64 = CsrGraphT<int64_t, int64_t>;
