@@ -553,6 +553,8 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     const size_t size = std::strlen(host);
     if (size >= sizeof(cfg.server_name)) return false;
     std::memcpy(cfg.server_name, host, size + 1);
+    static_assert(sizeof(cfg.ca_path) == sizeof(req->ca_path));
+    std::memcpy(cfg.ca_path, req->ca_path, sizeof(cfg.ca_path));
     cfg.verify_peer = true;
     cfg.handshake_timeout_ms = static_cast<uint16_t>(remaining_ms(c->deadline));
     return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);

@@ -29,6 +29,7 @@ struct HttpRequest {
     uint32_t       body_len;
     uint16_t       timeout_ms;                    // 0 → default
     uint32_t       max_response_body;             // 0 → kHttpMaxBody; otherwise <= it
+    char           ca_path[512];                  // "" → system trust; else PEM file or hashed dir
 };
 
 struct HttpResponse {
