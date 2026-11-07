@@ -176,6 +176,7 @@ inline void parallel_merge_sort_indirect_u32(
     const uint32_t* src = perm;
     uint32_t* dst = scratch;
     for (int64_t width = 1; width < num_blocks; width <<= 1) {
+        if (query_poll_now()) break;   // a permutation still; the query is over
         const int64_t half_span = width * block_size;
         const int64_t pair_span = half_span << 1;
         const int64_t num_pairs = (num_blocks + (width << 1) - 1) / (width << 1);
@@ -188,7 +189,7 @@ inline void parallel_merge_sort_indirect_u32(
     if (src != perm) {  // result landed in scratch — copy back into perm.
         for (int64_t i = 0; i < n; ++i) perm[i] = src[i];
     }
-    assert(n <= 1 || parallel_argsort_sorted_u32(perm, n, less));
+    assert(n <= 1 || query_poll_now() || parallel_argsort_sorted_u32(perm, n, less));
 }
 
 // Arena overload: allocates the n-entry uint32 scratch from a caller-supplied
