@@ -3228,6 +3228,68 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     return true;
 }
 
+// G2CHK-66: see bolt_parquet_read.h. The OffsetIndex answers in one binary
+// search when the writer emitted it; otherwise the page headers are walked
+// (thrift header parse only, no payload touched).
+bool parquet_col_chunk_seek_row(const uint8_t* buf, uint64_t len,
+                                const PqMeta* meta, uint32_t row_group,
+                                uint16_t col, int64_t row,
+                                PqPageLocation* scratch, uint32_t scratch_cap,
+                                uint64_t* page_off,
+                                int64_t* page_first_row) noexcept {
+    assert(meta != nullptr && page_off != nullptr && page_first_row != nullptr);
+    assert(scratch != nullptr || scratch_cap == 0);
+    if (buf == nullptr || row < 0) return false;
+    if (row_group >= meta->n_row_groups || col >= meta->n_columns) return false;
+    const PqRowGroup* rg = &meta->row_groups[row_group];
+    if (row >= rg->num_rows) return false;
+    if (rg->chunk_off + col >= meta->n_chunks) return false;
+    const PqChunk* ch = &meta->chunks[rg->chunk_off + col];
+    if (meta->columns[col].max_rep != 0) return false;   // rows != values
+    if (ch->data_page_offset <= 0 || ch->total_compressed_size <= 0) return false;
+    if (scratch_cap > 0 && ch->offset_index_length > 0) {
+        PqOffsetIndex oi{scratch, scratch_cap, 0};
+        if (pq_read_offset_index(buf, len, *ch, &oi) && oi.n_pages > 0) {
+            uint32_t lo = 0, hi = oi.n_pages;            // last page with first_row <= row
+            while (hi - lo > 1u) {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                if (oi.pages[mid].first_row_index <= row) lo = mid; else hi = mid;
+            }
+            *page_off = static_cast<uint64_t>(oi.pages[lo].offset);
+            *page_first_row = oi.pages[lo].first_row_index;
+            return true;
+        }
+    }
+    const uint64_t region_start = static_cast<uint64_t>(ch->data_page_offset);
+    const uint64_t chunk_start = (ch->dictionary_page_offset > 0)
+        ? static_cast<uint64_t>(ch->dictionary_page_offset) : region_start;
+    if (chunk_start > region_start) return false;
+    const uint64_t end = chunk_start + static_cast<uint64_t>(ch->total_compressed_size);
+    if (end > len || end < region_start) return false;
+    uint64_t p = region_start;
+    int64_t first = 0;
+    for (uint32_t page = 0; page < kPqReadPageLoopBound && p < end; ++page) {
+        TcCursor c{buf + p, buf + end};
+        PageHdr h;
+        if (!parse_page_header(&c, &h)) return false;
+        const uint64_t pay = p + static_cast<uint64_t>(c.p - (buf + p));
+        if (static_cast<uint64_t>(h.cmp) > end - pay) return false;
+        if (h.type == kPageData) {
+            if (h.nvals < 0) return false;
+            if (row < first + h.nvals) {
+                *page_off = p;
+                *page_first_row = first;
+                return true;
+            }
+            first += h.nvals;
+        } else if (h.type != kPageIndex) {
+            return false;                                // dict after data, V2
+        }
+        p = pay + static_cast<uint64_t>(h.cmp);
+    }
+    return false;
+}
+
 // G2PQ-31: see the doc comment in bolt_parquet_read.h. Prune, coalesce,
 // decode -- each surviving RANGE (not page) becomes one
 // parquet_read_col_chunk_pages call, so a dictionary is re-decoded per run of
