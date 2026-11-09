@@ -320,6 +320,7 @@ struct PqChunk {
     uint32_t min_len;                 // 0 = absent
     uint32_t max_len;                 // 0 = absent
     int64_t  null_count;              // -1 = absent
+    int64_t  distinct_count;          // Statistics field 4; -1 = absent (planner NDV, no decode)
     // Page-index + bloom-filter locations (G2FEAT-23). These structures
     // live OUTSIDE the footer FileMetaData: absolute file offsets recorded
     // here, parsed on demand by bolt_parquet_pageindex.h / _bloom.h. A
