@@ -54,6 +54,9 @@ TEST(BoltTextFn, FormatJavaSubset) {
     EXPECT_EQ(fmt("%5d|%-5d|%05d", {I(42), I(42), I(-42)}), "   42|42   |-0042");
     EXPECT_EQ(fmt("%.2f %e", {D(3.14159), D(1234.5)}), "3.14 1.234500e+03");
     EXPECT_EQ(fmt("%2$s %1$s %%", {S("a"), S("b")}), "b a %");
+    EXPECT_EQ(fmt("%.1f %.1f %.0f %.2f %05.1f", {D(2.25), D(-0.05), D(0.5), D(1e-9), D(2.25)}),
+              "2.3 -0.1 1 0.00 002.3");
+    EXPECT_EQ(fmt("%.3f %f", {D(123456.0), D(0.1)}), "123456.000 0.100000");
     EXPECT_EQ(fmt("%s %d", {N(), N()}), "null null");
     EXPECT_EQ(fmt("%,d %x %S", {I(1234567), I(255), S("ab")}), "1,234,567 ff AB");
     EXPECT_EQ(fmt("%d", {S("x")}), "<-3>");

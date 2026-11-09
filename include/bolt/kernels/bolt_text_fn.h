@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "bolt/kernels/bolt_float_chars.h"
 #include "bolt/kernels/bolt_utf8_cp.h"
 
 namespace bolt {
@@ -224,6 +225,43 @@ inline int64_t emit_int(FormatOut* o, const FormatSpec& s, const FormatArg& a) n
     return emit_padded(o, s, body, bl, bl, sign) ? 0 : kTextOverflow;
 }
 
+// Java's %.Nf: the double's shortest round-trip digits, rounded HALF_UP to
+// `prec` fraction digits (java.util.Formatter), not the binary value's
+// nearest-even rounding printf applies. Returns bytes, or 0 when out is short.
+inline uint32_t fixed_half_up(double v, int32_t prec, char* out, uint32_t cap) noexcept {
+    assert(out != nullptr && prec >= 0);
+    char d[40] = {};
+    int32_t k = 0;
+    const bool neg = v < 0.0;
+    const double a = neg ? -v : v;
+    uint32_t nd = 0;
+    if (a == 0.0) { d[0] = '0'; nd = 1; k = 1; }
+    else nd = float_chars::detail::shortest_digits(a, d, &k);   // a = 0.d1..dn * 10^k
+    // digit at position p (p = 0 is the first integer digit of 10^(k-1)).
+    const int32_t int_digits = k > 0 ? k : 0;
+    const int32_t total = int_digits + prec;              // digits kept
+    char kept[kFormatMaxWidth + 400];
+    if (static_cast<uint32_t>(total) + 2u > sizeof(kept)) return 0;
+    auto digit_at = [&](int32_t i) -> int {               // i-th kept digit, i in [0, total]
+        const int32_t src = i - (int_digits - k);         // index into d[]
+        return (src >= 0 && src < static_cast<int32_t>(nd)) ? d[src] - '0' : 0;
+    };
+    for (int32_t i = 0; i < total; ++i) kept[i] = static_cast<char>('0' + digit_at(i));
+    bool carry = digit_at(total) >= 5;
+    for (int32_t i = total - 1; carry && i >= 0; --i) {
+        if (kept[i] == '9') { kept[i] = '0'; } else { ++kept[i]; carry = false; }
+    }
+    uint32_t w = 0;
+    auto put = [&](char c) { if (w < cap) out[w] = c; ++w; };
+    if (neg) put('-');
+    if (carry) put('1');
+    if (int_digits == 0 && !carry) put('0');
+    for (int32_t i = 0; i < int_digits; ++i) put(kept[i]);
+    if (prec > 0) put('.');
+    for (int32_t i = int_digits; i < total; ++i) put(kept[i]);
+    return w <= cap ? w : 0;
+}
+
 inline int64_t emit_float(FormatOut* o, const FormatSpec& s, const FormatArg& a) noexcept {
     double v = 0;
     if (a.kind == FormatKind::Float) v = a.d;
@@ -238,7 +276,20 @@ inline int64_t emit_float(FormatOut* o, const FormatSpec& s, const FormatArg& a)
     spec[k++] = (s.conv == 'e' || s.conv == 'E') ? s.conv : 'f';
     spec[k] = 0;
     char raw[kFormatMaxWidth + 400];
-    const int n = std::snprintf(raw, sizeof(raw), spec, prec, v);
+    int n = 0;
+    if (v != v) { n = 3; std::memcpy(raw, "NaN", 3); }
+    else if (v == 1.0 / 0.0 || v == -1.0 / 0.0) {
+        n = v > 0 ? 8 : 9;
+        std::memcpy(raw, v > 0 ? "Infinity" : "-Infinity", static_cast<size_t>(n));
+    } else if (s.conv == 'f') {
+        uint32_t off = 0;
+        if (s.plus && v >= 0.0) raw[off++] = '+';
+        const uint32_t w = fixed_half_up(v, prec, raw + off, sizeof(raw) - off);
+        if (w == 0) return kTextOverflow;
+        n = static_cast<int>(w + off);
+    } else {
+        n = std::snprintf(raw, sizeof(raw), spec, prec, v);
+    }
     if (n <= 0 || static_cast<uint32_t>(n) >= sizeof(raw)) return kTextOverflow;
     const uint32_t sign = (raw[0] == '-' || raw[0] == '+') ? 1u : 0u;
     return emit_padded(o, s, raw, static_cast<uint32_t>(n), static_cast<uint32_t>(n), sign) ? 0 : kTextOverflow;
