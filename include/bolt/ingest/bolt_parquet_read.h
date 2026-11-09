@@ -208,6 +208,21 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
                                   BoltColumn* out_col, int64_t* out_rows,
                                   uint64_t* next_off) noexcept;
 
+// G2CHK-66: locate the data page of flat column `col` in `row_group` that holds
+// rowgroup-relative row `row`, without decompressing anything. *page_off is the
+// page header's absolute file offset, a valid `start_off` for
+// parquet_read_col_chunk_pages; *page_first_row is that page's first row. With
+// `scratch` (cap >= the chunk's page count) and an OffsetIndex in the file this
+// is one binary search; otherwise the page headers are walked. False on a
+// repeated column, DATA_PAGE_V2, a row past the group, or any malformed shape:
+// the caller then decodes the whole chunk.
+bool parquet_col_chunk_seek_row(const uint8_t* buf, uint64_t len,
+                                const PqMeta* meta, uint32_t row_group,
+                                uint16_t col, int64_t row,
+                                PqPageLocation* scratch, uint32_t scratch_cap,
+                                uint64_t* page_off,
+                                int64_t* page_first_row) noexcept;
+
 // G2PQ-31: outcome of a pruned decode -- how much of the chunk's page index
 // was consulted and how much of it was actually decoded, so a caller (and a
 // test) can tell "skipped bytes" from "read then discarded".
