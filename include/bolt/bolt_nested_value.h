@@ -17,6 +17,14 @@
 namespace bolt {
 namespace nested_row {
 
+// A borrowed type tree: nodes[0] is the root. Lets a caller keep only the
+// nodes it uses (a plan blob) instead of a full kMaxNodes TypeTree.
+struct TreeView {
+    const TypeNode* nodes;
+    uint32_t        n;
+};
+inline TreeView view(const TypeTree& t) noexcept { return TreeView{t.nodes, t.n}; }
+
 struct Span {
     const uint8_t* p;
     uint32_t       len;
@@ -30,7 +38,7 @@ struct LeafView {
 };
 
 namespace value_detail {
-inline bool skip(const TypeTree& t, uint32_t ni, detail::Reader* r, uint32_t depth) noexcept {
+inline bool skip(TreeView t, uint32_t ni, detail::Reader* r, uint32_t depth) noexcept {
     assert(r != nullptr);
     if (depth > kMaxDepth || ni >= t.n) return false;
     const TypeNode& nd = t.nodes[ni];
@@ -66,7 +74,7 @@ inline int open(const TypeNode& nd, detail::Reader* r) noexcept {
 }  // namespace value_detail
 
 // Span of one value of node `ni` at the front of `in`.
-inline bool value_span(const TypeTree& t, uint32_t ni, const uint8_t* p, uint32_t len, Span* out) noexcept {
+inline bool value_span(TreeView t, uint32_t ni, const uint8_t* p, uint32_t len, Span* out) noexcept {
     assert(out != nullptr);
     detail::Reader r{p, p + len};
     if (!value_detail::skip(t, ni, &r, 0u)) return false;
@@ -75,7 +83,7 @@ inline bool value_span(const TypeTree& t, uint32_t ni, const uint8_t* p, uint32_
 }
 
 // A leaf of node `ni` from its standalone encoding.
-inline bool leaf_view(const TypeTree& t, uint32_t ni, Span v, LeafView* out) noexcept {
+inline bool leaf_view(TreeView t, uint32_t ni, Span v, LeafView* out) noexcept {
     assert(out != nullptr && ni < t.n);
     const TypeNode& nd = t.nodes[ni];
     if (is_group(nd.type)) return false;
@@ -94,7 +102,8 @@ inline bool leaf_view(const TypeTree& t, uint32_t ni, Span v, LeafView* out) noe
 
 // Iterates the elements of a LIST (or the entries of a MAP) value of node `ni`.
 struct ListCursor {
-    const TypeTree* t;
+    const TypeNode* nodes;
+    uint32_t        n_nodes;
     uint32_t        elem;
     detail::Reader  r;
     uint32_t        remaining;
@@ -102,11 +111,11 @@ struct ListCursor {
 };
 
 // 1: open, 0: the list is NULL, -1: malformed.
-inline int list_open(const TypeTree& t, uint32_t ni, Span v, ListCursor* c) noexcept {
+inline int list_open(TreeView t, uint32_t ni, Span v, ListCursor* c) noexcept {
     assert(c != nullptr && ni < t.n);
     const TypeNode& nd = t.nodes[ni];
     if (nd.type != BoltType::List && nd.type != BoltType::Map) return -1;
-    *c = ListCursor{&t, nd.first_child, detail::Reader{v.p, v.p + v.len}, 0u, 0u};
+    *c = ListCursor{t.nodes, t.n, nd.first_child, detail::Reader{v.p, v.p + v.len}, 0u, 0u};
     const int o = value_detail::open(nd, &c->r);
     if (o <= 0) return o;
     uint32_t cnt = 0;
@@ -120,14 +129,14 @@ inline bool list_next(ListCursor* c, Span* elem) noexcept {
     assert(c != nullptr && elem != nullptr);
     if (c->remaining == 0u) return false;
     const uint8_t* at = c->r.p;
-    if (!value_detail::skip(*c->t, c->elem, &c->r, 1u)) { c->remaining = 0; return false; }
+    if (!value_detail::skip(TreeView{c->nodes, c->n_nodes}, c->elem, &c->r, 1u)) { c->remaining = 0; return false; }
     *elem = Span{at, static_cast<uint32_t>(c->r.p - at)};
     --c->remaining;
     return true;
 }
 
 // Field k of a STRUCT value of node `ni`. 1: found, 0: the struct is NULL, -1: malformed / out of range.
-inline int struct_field(const TypeTree& t, uint32_t ni, Span v, uint32_t k, Span* out) noexcept {
+inline int struct_field(TreeView t, uint32_t ni, Span v, uint32_t k, Span* out) noexcept {
     assert(out != nullptr && ni < t.n);
     const TypeNode& nd = t.nodes[ni];
     if (nd.type != BoltType::Struct || k >= nd.n_children) return -1;

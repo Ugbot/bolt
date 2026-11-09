@@ -183,7 +183,7 @@ inline bool parse_spec(const char* f, uint32_t len, uint32_t* i, FormatSpec* s) 
 
 inline bool emit_padded(FormatOut* o, const FormatSpec& s, const char* body, uint32_t blen,
                         uint32_t chars, uint32_t sign_len) noexcept {
-    const int64_t pad = s.width > static_cast<int32_t>(chars) ? s.width - chars : 0;
+    const int64_t pad = s.width > static_cast<int32_t>(chars) ? static_cast<int64_t>(s.width) - chars : 0;
     if (s.left) return o->put(body, blen) && o->fill(' ', pad);
     if (s.zero) return o->put(body, sign_len) && o->fill('0', pad) && o->put(body + sign_len, blen - sign_len);
     return o->fill(' ', pad) && o->put(body, blen);
