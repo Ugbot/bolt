@@ -8,6 +8,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include "bolt/bolt_query_ctx.h"
 #include "bolt/net/bolt_http_client.h"
 
 #include "bolt/net/bolt_tls.h"
@@ -65,7 +66,6 @@ int64_t now_ms() noexcept {
 uint32_t remaining_ms(int64_t deadline) noexcept {
     assert(deadline > 0);
     const int64_t left = deadline - now_ms();
-    assert(kMaxTimeoutMs <= UINT16_MAX);
     return left <= 0 ? 0u : static_cast<uint32_t>(std::min<int64_t>(left, kMaxTimeoutMs));
 }
 
@@ -85,27 +85,33 @@ bool socket_pending() noexcept {
 #endif
 }
 
+constexpr uint32_t kQueryWaitSliceMs = 100;
+
 bool socket_wait(SockFd fd, bool read, int64_t deadline) noexcept {
     assert(fd != BOLT_BAD_SOCK);
     assert(deadline > 0);
 #ifndef _WIN32
     if (fd >= FD_SETSIZE) return false;
 #endif
-    const uint32_t left = remaining_ms(deadline);
-    if (left == 0) return false;
     fd_set ready;
-    FD_ZERO(&ready);
-    FD_SET(fd, &ready);
     timeval timeout{};
-    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(left / 1000);
-    timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>((left % 1000) * 1000);
 #ifdef _WIN32
     const int count = 0; // ignored by Winsock; SOCKET is not an int index
 #else
     const int count = fd + 1;
 #endif
-    return ::select(count, read ? &ready : nullptr,
-                    read ? nullptr : &ready, nullptr, &timeout) > 0;
+    // A query waiting on the network is stopped between slices.
+    for (;;) {
+        uint32_t left = remaining_ms(deadline);
+        if (left == 0 || query_poll_now()) return false;
+        if (left > kQueryWaitSliceMs) left = kQueryWaitSliceMs;
+        FD_ZERO(&ready);
+        FD_SET(fd, &ready);
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(left / 1000);
+        timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>((left % 1000) * 1000);
+        const int n = ::select(count, read ? &ready : nullptr, read ? nullptr : &ready, nullptr, &timeout);
+        if (n != 0) return n > 0;
+    }
 }
 
 bool socket_nonblocking(SockFd fd) noexcept {
@@ -544,7 +550,7 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     *c = {};
     c->https = https;
     c->fd = BOLT_BAD_SOCK;
-    c->deadline = now_ms() + (req->timeout_ms ? req->timeout_ms : kDefaultTimeoutMs);
+    c->deadline = now_ms() + query_remaining_ms(req->timeout_ms ? req->timeout_ms : kDefaultTimeoutMs);
     if (!https) {
         c->fd = tcp_connect(ipv4, port, c->deadline);
         return c->fd != BOLT_BAD_SOCK;
@@ -553,6 +559,8 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     const size_t size = std::strlen(host);
     if (size >= sizeof(cfg.server_name)) return false;
     std::memcpy(cfg.server_name, host, size + 1);
+    static_assert(sizeof(cfg.ca_path) == sizeof(req->ca_path));
+    std::memcpy(cfg.ca_path, req->ca_path, sizeof(cfg.ca_path));
     cfg.verify_peer = true;
     cfg.handshake_timeout_ms = static_cast<uint16_t>(remaining_ms(c->deadline));
     return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);

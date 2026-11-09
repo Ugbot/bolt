@@ -14,11 +14,33 @@ namespace net {
 
 namespace {
 
+// Resolves a listener host to the IPv4 address to bind. "", "0.0.0.0" and "*"
+// mean every interface; "localhost" means 127.0.0.1; anything else must be a
+// dotted IPv4 literal. Returns false (errno = EINVAL) for anything else, so a
+// host the listener cannot honour (an IPv6 literal, a typo) fails start()
+// rather than silently widening to INADDR_ANY.
+bool resolve_bind_host(const std::string& host, struct in_addr* out) {
+    assert(out != nullptr);
+    if (host.empty() || host == "0.0.0.0" || host == "*") {
+        out->s_addr = htonl(INADDR_ANY);
+        return true;
+    }
+    if (host == "localhost") {
+        out->s_addr = htonl(INADDR_LOOPBACK);
+        return true;
+    }
+    if (inet_pton(AF_INET, host.c_str(), out) == 1) {
+        return true;
+    }
+    errno = EINVAL;
+    return false;
+}
+
 // Binds the port once WITHOUT SO_REUSEPORT and releases it. SO_REUSEPORT on the
 // real sockets is for this process's per-thread accept loops; if another
 // process already holds the port with it set, our own binds would silently
 // join its kernel load-balancing group. This bind fails instead.
-int probe_port_exclusive(uint16_t port) {
+int probe_port_exclusive(const struct in_addr& host, uint16_t port) {
     assert(port != 0);
     sys::startup();
 
@@ -41,7 +63,7 @@ int probe_port_exclusive(uint16_t port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr = host;
     addr.sin_port = htons(port);
     const int rc = bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     const int saved = errno;
@@ -121,7 +143,18 @@ int CoroTcpListener::start_background() {
              config_.host.c_str(), config_.port,
              owns_resources_ ? "no" : "yes");
 
-    if (config_.port != 0 && probe_port_exclusive(config_.port) != 0) {
+    struct in_addr bind_addr;
+    if (!resolve_bind_host(config_.host, &bind_addr)) {
+        LOG_ERROR("CORO_TCP", "Cannot bind host '%s': expected an IPv4 address, "
+                  "'localhost' or '0.0.0.0'; refusing to fall back to every interface",
+                  config_.host.c_str());
+        running_.store(false);
+        accept_error_.store(EINVAL, std::memory_order_release);
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (config_.port != 0 && probe_port_exclusive(bind_addr, config_.port) != 0) {
         const int saved = errno;
         LOG_ERROR("CORO_TCP", "Port %d is already in use (%s); refusing to share it "
                   "with another listener", config_.port, strerror(saved));
@@ -461,11 +494,17 @@ int CoroTcpListener::create_listen_socket() {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;  // TODO: parse config_.host
+    if (!resolve_bind_host(config_.host, &addr.sin_addr)) {
+        LOG_ERROR("CORO_TCP", "Cannot bind host '%s'", config_.host.c_str());
+        sys::close_socket(fd);
+        errno = EINVAL;
+        return -1;
+    }
     addr.sin_port = htons(config_.port);
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("CORO_TCP", "Failed to bind to port %d: %s", config_.port, strerror(errno));
+        LOG_ERROR("CORO_TCP", "Failed to bind to %s:%d: %s", config_.host.c_str(),
+                  config_.port, strerror(errno));
         sys::close_socket(fd);
         return -1;
     }

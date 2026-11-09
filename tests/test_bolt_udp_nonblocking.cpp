@@ -231,3 +231,37 @@ TEST_F(BoltUdpChecked, LegacyReceiveRemainsUsableAlongsideCheckedReceive) {
     send(&sent, 0u);
     EXPECT_EQ(receive_legacy(&data, sizeof(data), nullptr), 0);
 }
+
+TEST(BoltUdpIngress, StampedReceiveReportsKernelTimeAndTruncation) {
+    bn::UdpEndpoint receiver{},sender{};
+    ASSERT_TRUE(bn::udp_endpoint_open(&receiver,0u,500u));
+    ASSERT_TRUE(bn::udp_endpoint_open(&sender,0u,500u));
+    std::uint32_t granted=0u;
+    ASSERT_TRUE(bn::udp_endpoint_set_recv_buffer(&receiver,1u<<16,&granted));
+    EXPECT_GT(granted,0u);
+    const bool stamped=bn::udp_endpoint_enable_rx_timestamps(&receiver);
+    const auto wall=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const char payload[16]="0123456789abcde";
+    const bn::UdpAddr to{bn::k_udp_loopback_ipv4,receiver.local_port,0u};
+    ASSERT_EQ(bn::udp_send_to(&sender,to,payload,16u),16);
+    const bn::UdpEndpoint* const set[1]={&receiver};
+    EXPECT_EQ(bn::udp_wait_readable(set,1u,200000u),1);
+    char buffer[32];bn::UdpAddr from{};
+    auto got=bn::udp_recv_stamped(&receiver,buffer,sizeof(buffer),&from);
+    ASSERT_EQ(got.result.status,bn::UdpReceiveStatus::Complete);
+    EXPECT_EQ(got.result.bytes,16u);EXPECT_EQ(std::memcmp(buffer,payload,16),0);
+    EXPECT_EQ(from.port,sender.local_port);
+    if (stamped) {
+        EXPECT_EQ(got.source,bn::UdpStampSource::Kernel);
+        EXPECT_GT(got.rx_ns,wall-5000000000LL);
+        EXPECT_LT(got.rx_ns,wall+5000000000LL);
+    }
+    ASSERT_EQ(bn::udp_send_to(&sender,to,payload,16u),16);
+    EXPECT_EQ(bn::udp_wait_readable(set,1u,200000u),1);
+    got=bn::udp_recv_stamped(&receiver,buffer,8u,&from);
+    EXPECT_EQ(got.result.status,bn::UdpReceiveStatus::Truncated);
+    EXPECT_EQ(got.result.bytes,0u);
+    EXPECT_EQ(bn::udp_wait_readable(set,1u,0u),0);
+    bn::udp_endpoint_close(&sender);bn::udp_endpoint_close(&receiver);
+}

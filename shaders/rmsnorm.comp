@@ -1,0 +1,46 @@
+#version 450
+// BLLM-176: on-device RMSNorm -- y[i] = x[i] / sqrt(mean(x^2) + eps) * w[i].
+// One workgroup for the whole vector (n = hidden_size, small enough for 256
+// threads to stride). sum(x^2) is reduced with subgroupAdd (in-subgroup) + a
+// cross-subgroup shared-memory combine, matching MoeMath.h::rmsnorm's f64->f32
+// result closely (the on-device path keeps activations resident, BLLM-159).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuf { float x[]; };
+layout(set = 0, binding = 1) readonly buffer WeightBuf { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    int n;
+    float eps;
+} pc;
+
+shared float sg_partials[64];
+shared float inv_rms;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n = uint(pc.n);
+
+    float ss = 0.0;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        ss += x[i] * x[i];
+    }
+    float sg = subgroupAdd(ss);
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg;
+    barrier();
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) total += sg_partials[s];
+        inv_rms = inversesqrt(total / float(n) + pc.eps);
+    }
+    barrier();
+
+    float r = inv_rms;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        y[i] = x[i] * r * w[i];
+    }
+}

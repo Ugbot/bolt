@@ -63,6 +63,22 @@ struct alignas(bolt::config::kCacheIsolationBytes) RetireQueue {
         return true;
     }
 
+    // MP-enqueue that never blocks: false (payload not taken) when the
+    // ring is full, so a producer on or behind the reaper's own thread can
+    // keep the object and retry instead of deadlocking.
+    BOLT_FORCE_INLINE bool try_enqueue(T&& payload, const Ebr* e) noexcept {
+        assert(e != nullptr);
+        std::atomic_thread_fence(std::memory_order_seq_cst);   // StoreLoad: see ebr_retire
+        const uint64_t ge = e->global_epoch.load(std::memory_order_acquire);
+        uint64_t seq = 0;
+        if (!ring.try_claim(&seq)) return false;
+        Entry* slot = ring.slot(seq);
+        slot->payload      = std::move(payload);
+        slot->retire_epoch = ge;
+        ring.publish(seq);
+        return true;
+    }
+
     // SC-dequeue — only the reaper thread calls this. Returns true
     // and writes into `*out` if an entry is available AND its
     // retire_epoch + 3 has been reached by the global epoch. Returns
