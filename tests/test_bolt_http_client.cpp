@@ -368,7 +368,7 @@ TEST(BoltHttpClient, InvalidRequestBudgetsAndFieldsRefuseBeforeConnecting) {
         init_request(&req, server.port);
         if (mode == 0) req.header_count = bn::kHttpMaxHeaders + 1;
         if (mode == 1) req.body_len = 1; // a nonempty borrowed body needs a pointer
-        if (mode == 2) req.timeout_ms = 60001;
+        if (mode == 2) req.timeout_ms = 3600001;
         if (mode == 3) req.max_response_body = bn::kHttpMaxBody + 1;
         bolt::Arena arena;
         bn::HttpResponse response{};

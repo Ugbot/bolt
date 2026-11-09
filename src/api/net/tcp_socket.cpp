@@ -140,6 +140,8 @@ int TcpSocket::bind(const std::string& host, uint16_t port) {
 
     if (host == "0.0.0.0" || host.empty()) {
         addr.sin_addr.s_addr = INADDR_ANY;
+    } else if (host == "localhost") {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     } else {
         if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
             errno = EINVAL;

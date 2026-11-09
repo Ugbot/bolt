@@ -269,6 +269,30 @@ TEST(BoltRetireQueue, ReaderPinnedAtRetireEpochBlocksDequeue) {
     ebr_destroy(&e);
 }
 
+// R0: a full queue refuses try_enqueue instead of blocking, so a producer on
+// the reaper's own thread (marbledb's commit loop releasing a zone) can never
+// wait on itself. Room comes back once the reaper drains.
+TEST(BoltRetireQueue, TryEnqueueRefusesWhenFullAndRecovers) {
+    Ebr e;
+    ebr_init(&e, 1);
+    auto* q = new TestRetireQueue();
+    q->init();
+    for (uint64_t i = 0; i < 16u; ++i) ASSERT_TRUE(q->try_enqueue(uint64_t{i}, &e));
+    EXPECT_FALSE(q->try_enqueue(uint64_t{100}, &e));
+    uint64_t out = 0;
+    bool got = false;
+    for (int i = 0; i < 8 && !got; ++i) {
+        (void)ebr_try_advance_and_collect(&e);
+        got = q->try_dequeue(&e, &out);
+    }
+    ASSERT_TRUE(got);
+    EXPECT_EQ(out, 0u);
+    EXPECT_TRUE(q->try_enqueue(uint64_t{100}, &e));
+    EXPECT_FALSE(q->try_enqueue(uint64_t{101}, &e));
+    delete q;
+    ebr_destroy(&e);
+}
+
 TEST(BoltRetireQueue, UnpinnedEntryDequeuesAfterThreeAdvances) {
     Ebr e;
     ebr_init(&e, 1);

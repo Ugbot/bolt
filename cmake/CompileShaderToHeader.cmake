@@ -9,8 +9,11 @@
 #   OUT       -- output .h file
 #   VAR_NAME  -- C++ identifier for the generated uint32_t array
 
+# --target-env=vulkan1.2: enables Vulkan 1.1+ features -- notably the
+# GL_KHR_shader_subgroup_* ops (subgroupAdd) the matvec/rmsnorm reduction
+# shaders use (BLLM-160/176). glslc defaults to vulkan1.0, which rejects them.
 execute_process(
-    COMMAND "${GLSLC}" -fshader-stage=compute -mfmt=c "${SRC}" -o "${OUT}.tmp"
+    COMMAND "${GLSLC}" -fshader-stage=compute --target-env=vulkan1.2 -mfmt=c "${SRC}" -o "${OUT}.tmp"
     RESULT_VARIABLE _glslc_result
     ERROR_VARIABLE _glslc_error
 )

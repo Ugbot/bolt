@@ -227,6 +227,224 @@ TEST(BoltVulkan, MatmulDequantF32MatchesHandComputedDotProduct) {
     ctx.destroy_matmul_pipeline(&pipeline);
 }
 
+// BLLM-176: on-device RMSNorm matches the CPU reference (f64-accumulated
+// sum-of-squares -> inv-rms -> scale). n=300 spans multiple subgroups, so the
+// shader's cross-subgroup reduction combine is exercised.
+TEST(BoltVulkan, RmsnormMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_rmsnorm_pipeline(&pipeline));
+
+    const int n = 300;
+    std::vector<float> x(static_cast<size_t>(n)), w(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.5f;
+        w[static_cast<size_t>(i)] = 1.0f + static_cast<float>(i % 3) * 0.25f;
+    }
+    const float eps = 1e-5f;
+
+    BufferHandle xb = make_and_fill(ctx, x.data(), x.size() * sizeof(float));
+    BufferHandle wb = make_and_fill(ctx, w.data(), w.size() * sizeof(float));
+    BufferHandle yb;
+    ASSERT_TRUE(ctx.allocate_buffer(x.size() * sizeof(float), true, &yb));
+    ASSERT_NE(xb.buffer, nullptr);
+    ASSERT_NE(wb.buffer, nullptr);
+
+    ASSERT_TRUE(ctx.rmsnorm(pipeline, xb, wb, yb, n, eps));
+
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) ss += static_cast<double>(x[static_cast<size_t>(i)]) *
+                                       static_cast<double>(x[static_cast<size_t>(i)]);
+    const float inv = static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+
+    float* y = static_cast<float*>(ctx.map_buffer(yb));
+    ASSERT_NE(y, nullptr);
+    for (int i = 0; i < n; ++i) {
+        const float want = x[static_cast<size_t>(i)] * inv * w[static_cast<size_t>(i)];
+        EXPECT_NEAR(y[i], want, 1e-4f) << "i=" << i;
+    }
+    ctx.unmap_buffer(yb);
+    ctx.free_buffer(&xb);
+    ctx.free_buffer(&wb);
+    ctx.free_buffer(&yb);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
+// BLLM-179: on-device SwiGLU (op 1) and add (op 0) match CPU references.
+TEST(BoltVulkan, ElementwiseMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_elementwise_pipeline(&pipeline));
+
+    const int n = 500;  // not a multiple of 256 -> exercises the OOB guard
+    std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        a[static_cast<size_t>(i)] = static_cast<float>((i % 11) - 5) * 0.3f;
+        b[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.7f;
+    }
+    BufferHandle ab = make_and_fill(ctx, a.data(), a.size() * sizeof(float));
+    BufferHandle bb = make_and_fill(ctx, b.data(), b.size() * sizeof(float));
+    BufferHandle ob;
+    ASSERT_TRUE(ctx.allocate_buffer(a.size() * sizeof(float), true, &ob));
+
+    // op 1: SwiGLU -> silu(a)*b.
+    ASSERT_TRUE(ctx.elementwise(pipeline, ab, bb, ob, n, /*op=*/1));
+    float* o = static_cast<float*>(ctx.map_buffer(ob));
+    ASSERT_NE(o, nullptr);
+    for (int i = 0; i < n; ++i) {
+        const float x = a[static_cast<size_t>(i)];
+        const float want = (x / (1.0f + std::exp(-x))) * b[static_cast<size_t>(i)];
+        EXPECT_NEAR(o[i], want, 1e-4f) << "swiglu i=" << i;
+    }
+    ctx.unmap_buffer(ob);
+
+    // op 0: add -> a+b.
+    ASSERT_TRUE(ctx.elementwise(pipeline, ab, bb, ob, n, /*op=*/0));
+    o = static_cast<float*>(ctx.map_buffer(ob));
+    ASSERT_NE(o, nullptr);
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(o[i], a[static_cast<size_t>(i)] + b[static_cast<size_t>(i)], 1e-5f)
+            << "add i=" << i;
+    }
+    ctx.unmap_buffer(ob);
+
+    ctx.free_buffer(&ab);
+    ctx.free_buffer(&bb);
+    ctx.free_buffer(&ob);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
+// BLLM-177: on-device RoPE matches the CPU rope_half_split reference per head.
+TEST(BoltVulkan, RopeMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_rope_pipeline(&pipeline));
+
+    const int head_dim = 64, num_heads = 4, position = 7;
+    const float theta = 10000.0f;
+    const int n = head_dim * num_heads;
+    std::vector<float> x(static_cast<size_t>(n)), ref(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        x[static_cast<size_t>(i)] = static_cast<float>((i % 13) - 6) * 0.2f;
+        ref[static_cast<size_t>(i)] = x[static_cast<size_t>(i)];
+    }
+    // CPU rope_half_split per head.
+    const int half = head_dim / 2;
+    for (int h = 0; h < num_heads; ++h) {
+        float* v = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int j = 0; j < half; ++j) {
+            const float inv = std::pow(theta, -2.0f * static_cast<float>(j) / head_dim);
+            const float ang = static_cast<float>(position) * inv;
+            const float cs = std::cos(ang), sn = std::sin(ang);
+            const float a = v[j], b = v[j + half];
+            v[j] = a * cs - b * sn;
+            v[j + half] = b * cs + a * sn;
+        }
+    }
+
+    BufferHandle xb = make_and_fill(ctx, x.data(), x.size() * sizeof(float));
+    ASSERT_TRUE(ctx.rope(pipeline, xb, head_dim, num_heads, position, theta));
+
+    float* g = static_cast<float*>(ctx.map_buffer(xb));
+    ASSERT_NE(g, nullptr);
+    for (int i = 0; i < n; ++i) {
+        EXPECT_NEAR(g[i], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.unmap_buffer(xb);
+    ctx.free_buffer(&xb);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
+// BLLM-178: on-device Vulkan decode-step attention (GQA) matches a two-pass CPU
+// softmax reference (mathematically identical to the online-softmax shader).
+TEST(BoltVulkan, AttentionMatchesCpuReference) {
+    if (!bolt::vulkan::available()) {
+        GTEST_SKIP() << "No Vulkan-capable device on this machine";
+    }
+    Context ctx;
+    ASSERT_TRUE(ctx.create());
+    MatmulPipeline pipeline;
+    ASSERT_TRUE(ctx.create_attention_pipeline(&pipeline));
+
+    const int num_heads = 4, num_kv_heads = 2, head_dim = 8, seq_len = 5;
+    const int group_size = num_heads / num_kv_heads;
+    const int q_n = num_heads * head_dim;
+    const int kv_n = seq_len * num_kv_heads * head_dim;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    std::vector<float> q(static_cast<size_t>(q_n)), kc(static_cast<size_t>(kv_n)),
+        vc(static_cast<size_t>(kv_n));
+    for (int i = 0; i < q_n; ++i) q[static_cast<size_t>(i)] = static_cast<float>((i % 9) - 4) * 0.15f;
+    for (int i = 0; i < kv_n; ++i) {
+        kc[static_cast<size_t>(i)] = static_cast<float>((i % 7) - 3) * 0.12f;
+        vc[static_cast<size_t>(i)] = static_cast<float>((i % 5) - 2) * 0.2f;
+    }
+
+    // CPU reference: per head, two-pass softmax over cached KV.
+    std::vector<float> ref(static_cast<size_t>(q_n), 0.0f);
+    for (int h = 0; h < num_heads; ++h) {
+        const int kv_head = h / group_size;
+        const float* qh = q.data() + static_cast<size_t>(h) * head_dim;
+        std::vector<float> sc(static_cast<size_t>(seq_len));
+        float mx = -1e30f;
+        for (int t = 0; t < seq_len; ++t) {
+            const float* kh =
+                kc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            float s = 0.0f;
+            for (int d = 0; d < head_dim; ++d) s += qh[d] * kh[d];
+            s *= scale;
+            sc[static_cast<size_t>(t)] = s;
+            mx = std::fmax(mx, s);
+        }
+        double denom = 0.0;
+        for (int t = 0; t < seq_len; ++t) {
+            sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
+            denom += sc[static_cast<size_t>(t)];
+        }
+        float* rh = ref.data() + static_cast<size_t>(h) * head_dim;
+        for (int t = 0; t < seq_len; ++t) {
+            const float w = static_cast<float>(sc[static_cast<size_t>(t)] / denom);
+            const float* vh =
+                vc.data() + (static_cast<size_t>(t) * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim; ++d) rh[d] += w * vh[d];
+        }
+    }
+
+    BufferHandle qb = make_and_fill(ctx, q.data(), q.size() * sizeof(float));
+    BufferHandle kb = make_and_fill(ctx, kc.data(), kc.size() * sizeof(float));
+    BufferHandle vb = make_and_fill(ctx, vc.data(), vc.size() * sizeof(float));
+    BufferHandle ob;
+    ASSERT_TRUE(ctx.allocate_buffer(q.size() * sizeof(float), true, &ob));
+    ASSERT_NE(qb.buffer, nullptr);
+
+    ASSERT_TRUE(ctx.attention(pipeline, qb, kb, vb, ob, num_heads, num_kv_heads, head_dim, seq_len,
+                              scale));
+
+    float* o = static_cast<float*>(ctx.map_buffer(ob));
+    ASSERT_NE(o, nullptr);
+    for (int i = 0; i < q_n; ++i) {
+        EXPECT_NEAR(o[i], ref[static_cast<size_t>(i)], 1e-4f) << "i=" << i;
+    }
+    ctx.unmap_buffer(ob);
+    ctx.free_buffer(&qb);
+    ctx.free_buffer(&kb);
+    ctx.free_buffer(&vb);
+    ctx.free_buffer(&ob);
+    ctx.destroy_matmul_pipeline(&pipeline);
+}
+
 TEST(BoltVulkan, MatmulDequantInt8MatchesScaledDotProduct) {
     if (!bolt::vulkan::available()) {
         GTEST_SKIP() << "No Vulkan-capable device on this machine";

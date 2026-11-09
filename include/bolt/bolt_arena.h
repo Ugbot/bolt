@@ -16,15 +16,40 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bolt/bolt_mem_owner.h"
 #include "bolt/bolt_port.h"
+#include "bolt/bolt_query_ctx.h"
 
 namespace bolt {
 
+/// First block of a default-configured arena (initial_block_size == 0). It is
+/// allocated on the first allocate(), never in the constructor, so an arena
+/// that is built and never used holds no memory, and a small owner holds a
+/// small block. Every default arena used to malloc 4 MiB up front: hundreds of
+/// per-table and per-worker arenas, most of each block never touched.
+inline constexpr size_t kArenaLazyFirstBlockBytes = 64 * 1024;
+
+/// The first block a default arena had before the lazy first block: what a
+/// default arena guarantees when it is frozen (set_growth_enabled(false)), so
+/// freezing keeps the capacity callers sized against.
+inline constexpr size_t kArenaLegacyFirstBlockBytes = 4 * 1024 * 1024;
+
 struct ArenaConfig {
-    size_t initial_block_size = 4 * 1024 * 1024;   // 4MB
+    // 0 = default: a lazy kArenaLazyFirstBlockBytes first block, doubling from
+    // there. Nonzero = an explicitly sized first block, allocated in the
+    // constructor exactly as before (callers that size an arena for its job
+    // check total_reserved() right after construction).
+    size_t initial_block_size = 0;
     size_t max_block_size     = 64 * 1024 * 1024;  // 64MB
     size_t alignment          = 64;                 // Cache-line
     bool   poison_on_reset    = false;              // Debug: 0xDE fill
+    // Charged for every backing block this arena holds (in addition to the
+    // process-wide g_arena_total_owner). Must outlive the arena.
+    MemOwner* owner           = nullptr;
+    // An explicitly sized first block, allocated on first use instead of in
+    // the constructor (an owner that creates many arenas, most never used,
+    // e.g. one per memtable zone generation). Freezing still materialises it.
+    bool      lazy_first_block = false;
 };
 
 /// Arena blocks at least this large are mapped straight from the OS on POSIX
@@ -74,18 +99,31 @@ public:
         : config_(config)
         , num_blocks_(0)
         , current_idx_(0)
-        , cursor_(0)
+        // An arena with no block has cursor_ > end_, so the fast path's
+        // bounds test fails and the first allocate() takes the slow path,
+        // which grows the first block. No extra branch on the fast path.
+        , cursor_(1)
         , end_(0)
         , total_allocated_(0)
         , peak_usage_(0) {
         memset(blocks_, 0, sizeof(blocks_));
         memset(block_sizes_, 0, sizeof(block_sizes_));
-        grow(config_.initial_block_size);
+        if (config_.owner != nullptr) {
+            config_.owner->arenas.fetch_add(1u, std::memory_order_relaxed);
+        }
+        // Explicitly sized arenas keep their eager first block; default ones
+        // allocate theirs on first use (see kArenaLazyFirstBlockBytes).
+        if (config_.initial_block_size != 0 && !config_.lazy_first_block) {
+            grow(config_.initial_block_size);
+        }
     }
 
     ~Arena() noexcept {
         for (uint32_t i = 0; i < num_blocks_; ++i) {
             aligned_free(blocks_[i], block_sizes_[i]);
+        }
+        if (config_.owner != nullptr) {
+            config_.owner->arenas.fetch_sub(1u, std::memory_order_relaxed);
         }
     }
 
@@ -111,8 +149,25 @@ public:
     /// including oversized blocks, remain reusable after reset; exhaustion
     /// returns nullptr instead of allocating another block. Default is true.
     /// Change policy only while allocation/reset/trim callers are quiescent.
+    /// Freezing a default arena first makes sure it holds a block of at least
+    /// kArenaLegacyFirstBlockBytes, the capacity a frozen default arena always
+    /// had; an explicitly sized arena already allocated its first block.
     void set_growth_enabled(bool enabled) noexcept {
         assert(num_blocks_ <= kArenaMaxBlocks);
+        if (!enabled && growth_enabled_ && num_blocks_ == 0 && config_.initial_block_size != 0) {
+            (void)grow(config_.initial_block_size);   // a lazy explicit first block
+        }
+        if (!enabled && growth_enabled_ && config_.initial_block_size == 0 &&
+            largest_block() < kArenaLegacyFirstBlockBytes) {
+            const uint32_t cur = current_idx_;
+            const uintptr_t cursor = cursor_, end = end_;
+            const uint32_t had = num_blocks_;
+            if (grow(kArenaLegacyFirstBlockBytes) && had > 0) {
+                // Keep bumping the current block; the new one is reached by
+                // the forward scan once the current block is full.
+                current_idx_ = cur; cursor_ = cursor; end_ = end;
+            }
+        }
         growth_enabled_ = enabled;
         assert(growth_enabled_ == enabled);
     }
@@ -199,8 +254,10 @@ public:
     void reset() noexcept {
         if (config_.poison_on_reset) {
             for (uint32_t i = 0; i < num_blocks_; ++i) {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(blocks_[i]);
                 size_t used = (i < current_idx_) ? block_sizes_[i]
-                    : (i == current_idx_) ? (cursor_ - reinterpret_cast<uintptr_t>(blocks_[i]))
+                    : (i == current_idx_ && cursor_ >= base && cursor_ - base <= block_sizes_[i])
+                        ? (cursor_ - base)
                     : 0;
                 if (used > 0) memset(blocks_[i], 0xDE, used);
             }
@@ -243,7 +300,6 @@ public:
     /// between-queries reset point keeps a bounded warm working set AND
     /// returns table slots. Same no-tasks-in-flight contract as reset().
     void reset_keep(size_t keep_bytes) noexcept {
-        assert(num_blocks_ >= 1);
         size_t reserved = total_reserved();
         while (num_blocks_ > 1 && reserved > keep_bytes) {
             num_blocks_--;
@@ -252,7 +308,7 @@ public:
             blocks_[num_blocks_] = nullptr;
             block_sizes_[num_blocks_] = 0;
         }
-        assert(num_blocks_ >= 1);
+        assert(num_blocks_ <= 1 || reserved <= keep_bytes);
         reset();
     }
 
@@ -274,6 +330,14 @@ public:
         return t;
     }
 
+    size_t largest_block() const noexcept {
+        size_t m = 0;
+        for (uint32_t i = 0; i < num_blocks_; ++i) {
+            if (block_sizes_[i] > m) m = block_sizes_[i];
+        }
+        return m;
+    }
+
 private:
     // Large blocks come straight from the OS on POSIX, so freeing one returns
     // its pages at once. Through malloc, macOS's large cache (and glibc's
@@ -291,6 +355,45 @@ private:
     }
 
     void* aligned_alloc_impl(size_t alignment, size_t size) noexcept {
+        query_charge(size);
+        void* p = aligned_alloc_raw(alignment, size);
+        if (p != nullptr) {
+            g_arena_total_owner.charge(size);
+            if (config_.owner != nullptr) config_.owner->charge(size);
+        } else {
+            query_credit(size);
+        }
+        return p;
+    }
+
+    // Charges the query running on this thread; the arena remembers which one,
+    // so a later free credits it only while that query still runs.
+    void query_charge(size_t size) noexcept {
+        QueryCtx* q = current_query_ctx();
+        if (q == nullptr) return;
+        const uint32_t gen = q->generation.load(std::memory_order_relaxed);
+        if (q != query_ || gen != query_gen_) {
+            query_ = q;
+            query_gen_ = gen;
+            query_charged_ = 0;
+        }
+        q->charge(size);
+        query_charged_ += size;
+    }
+
+    void query_credit(size_t size) noexcept {
+        if (query_ == nullptr) return;
+        if (query_->generation.load(std::memory_order_relaxed) != query_gen_) {
+            query_ = nullptr;
+            query_charged_ = 0;
+            return;
+        }
+        const uint64_t n = size < query_charged_ ? size : query_charged_;
+        query_->credit(n);
+        query_charged_ -= n;
+    }
+
+    void* aligned_alloc_raw(size_t alignment, size_t size) noexcept {
         assert(alignment == config_.alignment);
         assert(size > 0);
 #if defined(__linux__) || defined(__APPLE__)
@@ -308,6 +411,9 @@ private:
     void aligned_free(void* p, size_t size) noexcept {
         assert(p != nullptr);
         assert(size > 0);
+        g_arena_total_owner.release(size);
+        if (config_.owner != nullptr) config_.owner->release(size);
+        query_credit(size);
 #if defined(__linux__) || defined(__APPLE__)
         if (os_block(size)) {
             const int rc = ::munmap(p, size);
@@ -323,6 +429,10 @@ private:
         if (!growth_enabled_ || num_blocks_ >= kArenaMaxBlocks) return false;
 
         size_t sz = config_.initial_block_size;
+        if (sz == 0) {
+            sz = kArenaLazyFirstBlockBytes < config_.max_block_size
+                ? kArenaLazyFirstBlockBytes : config_.max_block_size;
+        }
         if (num_blocks_ > 0) {
             sz = block_sizes_[num_blocks_ - 1] * 2;
             if (sz > config_.max_block_size) sz = config_.max_block_size;
@@ -362,7 +472,7 @@ private:
 
     void* allocate_slow(size_t size, size_t alignment) noexcept {
         assert(alignment > 0 && (alignment & (alignment - 1)) == 0);
-        assert(size > 0);
+        assert(size > 0 || num_blocks_ == 0);   // size 0 reaches here only on the lazy first block
         // Oversize lane. A request bigger than the steady-state block size gets
         // a bespoke block WITHOUT moving the bump cursor. The old code fell
         // through to grow(), which jumps current_idx_ to the tail — a single
@@ -460,6 +570,9 @@ private:
     uintptr_t end_;
     size_t   total_allocated_;
     size_t   peak_usage_;
+    QueryCtx* query_ = nullptr;      // last query charged for a block
+    uint32_t  query_gen_ = 0;
+    uint64_t  query_charged_ = 0;
     // Bit array over blocks_ (one bit per block index, kArenaOversizeWords
     // 64-bit words): blocks consumed whole by the oversize lane THIS epoch,
     // so the normal lane's forward scan must not reuse them until the next

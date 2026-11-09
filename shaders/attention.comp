@@ -1,0 +1,65 @@
+#version 450
+// BLLM-178: on-device decode-step causal attention with flash-style online
+// softmax -- the Vulkan twin of bolt::rocm::attention (BLLM-187) and a mirror
+// of qwen2_attention_'s numerics. ONE workgroup per query head; 256 threads,
+// one per head-dim (head_dim <= 256), inactive threads (d >= head_dim)
+// contribute 0 to the QK dot and skip the final write. Streams over the cached
+// KV in a single pass keeping a running max m, denominator l, and rescaled
+// per-dim context ch. GQA: query head gl_WorkGroupID.x reads kv head
+// (workgroup / group_size). The QK dot is reduced with subgroupAdd + a
+// cross-subgroup shared combine, matching rmsnorm.comp's reduction shape.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf { float v_cache[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float outp[]; };
+
+layout(push_constant) uniform PushConstants {
+    int head_dim;
+    int num_kv_heads;
+    int group_size;
+    int seq_len;
+    float scale;
+} pc;
+
+shared float sg_partials[64];
+shared float s_score;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    int head_dim = pc.head_dim;
+    int kv_head = int(h) / pc.group_size;
+    bool lane_on = int(tid) < head_dim;
+    float qd = lane_on ? q[h * uint(head_dim) + tid] : 0.0;
+
+    float ch = 0.0;
+    float m = -1.0 / 0.0;  // -inf
+    float l = 0.0;
+    for (int t = 0; t < pc.seq_len; ++t) {
+        uint off = (uint(t) * uint(pc.num_kv_heads) + uint(kv_head)) * uint(head_dim) + tid;
+        float kd = lane_on ? k_cache[off] : 0.0;
+        float sg = subgroupAdd(qd * kd);
+        if (subgroupElect()) sg_partials[gl_SubgroupID] = sg;
+        barrier();
+        if (tid == 0u) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) tot += sg_partials[s];
+            s_score = tot * pc.scale;
+        }
+        barrier();
+        float s = s_score;
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float p = exp(s - m_new);
+        l = l * corr + p;
+        ch = ch * corr + p * (lane_on ? v_cache[off] : 0.0);
+        m = m_new;
+        barrier();  // all threads done reading s_score before next iter overwrites
+    }
+    if (lane_on) outp[h * uint(head_dim) + tid] = ch / l;
+}

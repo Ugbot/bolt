@@ -84,6 +84,7 @@ inline CsrAlgoStatus csr_pagerank_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
     const double  dn = static_cast<double>(n);
     for (int64_t i = 0; i < n; ++i) rank[i] = 1.0 / dn;
     for (int32_t it = 0; it < max_iter; ++it) {
+        if (csr_stop_requested(g)) return CsrAlgoStatus::Stopped;
         const double dangling = csr_pagerank_push(g, rank, scratch);
         if (dangling < 0.0) return CsrAlgoStatus::MalformedGraph;
         const double base = (1.0 - damping) / dn + damping * dangling / dn;

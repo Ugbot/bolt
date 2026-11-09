@@ -298,3 +298,35 @@ add_executable(bench_sbe_decode bench_sbe_decode.cpp)
 target_link_libraries(bench_sbe_decode PRIVATE bolt::core)
 bolt_apply_hardening(bench_sbe_decode)
 bolt_apply_bench_tuning(bench_sbe_decode)
+
+# perf pass: f32/f16 SIMD GEMV perf tripwire. Times the dispatched (CPUID-
+# selected) kernel vs the scalar f64 reference on real model-sized shapes and
+# asserts a GFLOPS-ratio floor when a SIMD tier is present -- the only gate that
+# catches a silent SIMD->scalar regression. Both kernels come from the
+# per-source-flagged bolt::compute_idot lib, so the bench TU's own flags don't
+# advantage either side.
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_executable(bench_compute_gemv bench_compute_gemv.cpp)
+    target_link_libraries(bench_compute_gemv PRIVATE bolt::bolt bolt::compute_idot)
+    bolt_apply_hardening(bench_compute_gemv)
+    bolt_apply_bench_tuning(bench_compute_gemv)
+    add_test(NAME bench_compute_gemv COMMAND bench_compute_gemv)
+endif()
+
+# BLLM-188/148: ROCm vs Vulkan vs CPU for the dominant decode GEMV. Needs the
+# CPU SIMD GEMV (bolt::compute_idot) plus at least one GPU backend; each backend
+# is compiled in via a BOLT_HAVE_* define and self-skips at runtime if absent.
+if(BOLT_BUILD_COMPUTE_IDOT AND (BOLT_BUILD_ROCM OR BOLT_BUILD_VULKAN))
+    add_executable(bench_gpu_backends bench_gpu_backends.cpp)
+    target_link_libraries(bench_gpu_backends PRIVATE bolt::bolt bolt::compute_idot)
+    if(BOLT_BUILD_ROCM)
+        target_link_libraries(bench_gpu_backends PRIVATE bolt::rocm)
+        target_compile_definitions(bench_gpu_backends PRIVATE BOLT_HAVE_ROCM)
+    endif()
+    if(BOLT_BUILD_VULKAN)
+        target_link_libraries(bench_gpu_backends PRIVATE bolt::vulkan)
+        target_compile_definitions(bench_gpu_backends PRIVATE BOLT_HAVE_VULKAN)
+    endif()
+    bolt_apply_hardening(bench_gpu_backends)
+    bolt_apply_bench_tuning(bench_gpu_backends)
+endif()

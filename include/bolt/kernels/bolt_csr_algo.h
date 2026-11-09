@@ -35,7 +35,11 @@ enum class CsrAlgoStatus : int32_t {
     MalformedGraph  = 2,   // a neighbour id outside [0, n_nodes)
     NotConverged    = 3,   // iteration cap hit; the output is NOT the answer
     NegativeWeight  = 4,   // Dijkstra met a negative or NaN weight
+    Stopped         = 5,   // the view's stop hook asked; the output is NOT the answer
 };
+
+// How often a kernel with a per-node loop asks the stop hook.
+inline constexpr int64_t k_csr_stop_poll_mask = (1 << 16) - 1;
 
 // Number of CSR slots a view covers (off[win] of its window).
 template <typename Nbr, typename Eid>
