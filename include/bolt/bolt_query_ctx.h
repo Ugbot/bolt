@@ -29,7 +29,35 @@
 
 #include "bolt/bolt_port.h"
 
+#if defined(BOLT_QCHARGE_TRACE)
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
 namespace bolt {
+
+#if defined(BOLT_QCHARGE_TRACE)
+// Local attribution aid (not for commit): BOLT_QCHARGE_TRACE_MB=N prints a
+// backtrace for every query charge of N MiB or more.
+[[gnu::noinline]] inline void qcharge_trace(uint64_t bytes, uint64_t used) noexcept {
+    static const uint64_t thr = [] {
+        const char* e = std::getenv("BOLT_QCHARGE_TRACE_MB");
+        return e != nullptr ? std::strtoull(e, nullptr, 10) << 20 : ~0ull;
+    }();
+    if (bytes < thr) return;
+    void* pcs[32];
+    const int n = backtrace(pcs, 32);
+    Dl_info info{};
+    dladdr(reinterpret_cast<void*>(&qcharge_trace), &info);
+    char buf[4096];
+    int off = std::snprintf(buf, sizeof buf, "[qcharge] bytes=%llu used=%llu base=%p pcs=",
+                            (unsigned long long)bytes, (unsigned long long)used, info.dli_fbase);
+    for (int i = 0; i < n && off < (int)sizeof buf - 24; ++i) off += std::snprintf(buf + off, sizeof buf - off, "%p ", pcs[i]);
+    std::fprintf(stderr, "%s\n", buf);
+}
+#endif
 
 enum class QueryStop : uint32_t {
     None      = 0,
@@ -86,6 +114,9 @@ struct alignas(64) QueryCtx {
     }
     void charge(uint64_t bytes) noexcept {
         const uint64_t used = mem_used.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+#if defined(BOLT_QCHARGE_TRACE)
+        qcharge_trace(bytes, used);
+#endif
         if (limits.memory_bytes != 0u && used > limits.memory_bytes) request_stop(QueryStop::Memory);
         uint64_t p = mem_peak.load(std::memory_order_relaxed);
         while (used > p && !mem_peak.compare_exchange_weak(p, used, std::memory_order_relaxed)) {}
