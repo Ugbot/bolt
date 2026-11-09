@@ -7,9 +7,10 @@ namespace bolt {
 constexpr bool is_valid_type(BoltType type) noexcept {
     const auto v = static_cast<std::uint8_t>(type);
     return v <= 12 || (v >= 16 && v <= 19) || (v >= 25 && v <= 26) ||
-           (v >= 30 && v <= 32) || (v >= 40 && v <= 44) || (v >= 50 && v <= 56);
+           (v >= 30 && v <= 32) || (v >= 40 && v <= 44) || (v >= 50 && v <= 57);
 }
 static_assert(is_valid_type(BoltType::Decimal64));
+static_assert(is_valid_type(BoltType::TimestampNtz));
 static_assert(!is_valid_type(static_cast<BoltType>(13)));
 static_assert(!is_valid_type(BoltType::NUM_TYPES));
 } // namespace bolt
