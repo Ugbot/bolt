@@ -767,6 +767,9 @@ struct RangeTaskPayload {
     uint32_t      start;
     uint32_t      end;
     uint32_t      thread_id;
+    uint32_t      chunk;           // grain, when stride is set
+    uint64_t      stride;          // 0 = this one chunk only
+    uint32_t      limit;           // end of the whole range, when stride is set
     uint32_t      _pad0;
     TaskPool*     owning_pool;
     Scheduler*    owning_sched;
@@ -807,6 +810,12 @@ inline void scheduler_range_trampoline(void* arg) noexcept {
     const uint32_t tid =
         (tl_worker_index != UINT32_MAX) ? tl_worker_index : p->thread_id;
     p->fn(p->user_data, p->start, p->end, tid);
+    // A query capped at k workers runs k of these, each taking every k-th chunk.
+    for (uint64_t at = uint64_t{p->start} + p->stride; p->stride != 0u && at < p->limit; at += p->stride) {
+        const uint32_t start = static_cast<uint32_t>(at);
+        const uint64_t end = at + p->chunk;
+        p->fn(p->user_data, start, end < p->limit ? static_cast<uint32_t>(end) : p->limit, tid);
+    }
     Scheduler* sched = p->owning_sched;
     TaskPool* pool = p->owning_pool;
     pool->release(p);
@@ -1126,9 +1135,16 @@ inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
 
     if (count == 0) return;
 
-    for (uint32_t start = 0; start < count; start += grain_size) {
-        uint32_t end = start + grain_size;
-        if (end > count) end = count;
+    // workers = k holds on every fan-out: k tasks, each striding over the chunks.
+    const QueryCtx* query = current_query_ctx();
+    const uint32_t cap = query != nullptr ? query->limits.workers : 0u;
+    const uint64_t chunks = (uint64_t{count} + grain_size - 1u) / grain_size;
+    const uint64_t stride = cap != 0u && chunks > cap ? uint64_t{grain_size} * cap : 0u;
+    const uint64_t first_end = stride != 0u ? stride : count;
+
+    for (uint64_t at = 0; at < first_end && at < count; at += grain_size) {
+        const uint32_t start = static_cast<uint32_t>(at);
+        uint32_t end = at + grain_size < count ? static_cast<uint32_t>(at + grain_size) : count;
 
         void* slot = range_task_pool->acquire();
         if (!slot) return;  // Pool & fallback exhausted; caller's count stats will diverge.
@@ -1139,6 +1155,9 @@ inline void Scheduler::submit_range(RangeTaskFn fn, void* user_data,
         p->start         = start;
         p->end           = end;
         p->thread_id     = 0;  // Set by worker via tl_arena; not per-worker yet.
+        p->chunk         = grain_size;
+        p->stride        = stride;
+        p->limit         = count;
         p->owning_pool   = range_task_pool;
         p->owning_sched  = this;
 
