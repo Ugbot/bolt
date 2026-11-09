@@ -49,6 +49,16 @@ bool zone_parse(const char* s, std::uint32_t len, ZoneId* out) noexcept;
 // UTC offset in seconds in effect at `utc_sec` (seconds since the epoch).
 std::int32_t offset_at(ZoneId z, std::int64_t utc_sec) noexcept;
 
+// The maximal UTC interval [lo, hi) around `utc_sec` over which the offset
+// is constant (lo / hi saturate at INT64_MIN / INT64_MAX). Column kernels
+// cache it so a run of nearby instants pays one lookup, not one per row.
+struct OffsetSpan {
+    std::int64_t lo;
+    std::int64_t hi;
+    std::int32_t off;
+};
+void offset_span(ZoneId z, std::int64_t utc_sec, OffsetSpan* out) noexcept;
+
 // The instant whose local wall clock in `z` is `local_sec` (java.time rules).
 std::int64_t local_to_utc(ZoneId z, std::int64_t local_sec) noexcept;
 

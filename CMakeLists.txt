@@ -169,7 +169,8 @@ target_link_libraries(bolt INTERFACE bolt::thread)
 add_library(bolt_datetime STATIC
     src/datetime/bolt_tz.cpp
     src/datetime/bolt_datetime_fmt.cpp
-    src/datetime/bolt_datetime_parse.cpp)
+    src/datetime/bolt_datetime_parse.cpp
+    src/datetime/bolt_datetime_kernels.cpp)
 add_library(bolt::datetime ALIAS bolt_datetime)
 set_target_properties(bolt_datetime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(bolt_datetime PUBLIC bolt::core)

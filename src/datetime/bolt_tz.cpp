@@ -258,6 +258,64 @@ std::int64_t local_to_utc(ZoneId z, std::int64_t local_sec) noexcept {
     return ub;                                         // gap: shift forward by its length
 }
 
+namespace {
+
+// The rule-governed span around `utc_sec`: between the nearest rule
+// transitions of the neighbouring years, never before `floor`.
+void rule_span(const data::RuleRec& r, std::int64_t floor, std::int64_t utc_sec,
+               OffsetSpan* out) noexcept {
+    assert(out != nullptr);
+    out->lo = floor;
+    out->hi = INT64_MAX;
+    out->off = r.std_off;
+    if (r.dst_abbr == kNoRule) return;
+    out->off = rule_in_dst(r, utc_sec) ? r.dst_off : r.std_off;
+    const std::int64_t days = floor_div(utc_sec + r.std_off, kSecPerDay);
+    const std::int32_t year = bolt::kernels::date::civil_from_days32(static_cast<std::int32_t>(days)).y;
+    for (std::int32_t y = year - 1; y <= year + 1; ++y) {
+        const std::int64_t pts[2] = {
+            rule_day(r.start, y) * kSecPerDay + r.start.secs - r.std_off,
+            rule_day(r.end, y) * kSecPerDay + r.end.secs - r.dst_off};
+        for (const std::int64_t t : pts) {
+            if (t <= utc_sec && t > out->lo) out->lo = t;
+            if (t > utc_sec && t < out->hi) out->hi = t;
+        }
+    }
+}
+
+}  // namespace
+
+void offset_span(ZoneId z, std::int64_t utc_sec, OffsetSpan* out) noexcept {
+    assert(out != nullptr);
+    out->lo = INT64_MIN;
+    out->hi = INT64_MAX;
+    out->off = 0;
+    if (zone_is_fixed(z)) { out->off = zone_fixed_offset(z); return; }
+    const data::ZoneRec* zr = named_zone(z);
+    if (zr == nullptr) return;
+    const std::int64_t* t = data::kTransUtc + zr->trans_begin;
+    const std::uint32_t n = zr->trans_count;
+    if (n == 0 && zr->rule != kNoRule) { rule_span(data::kRules[zr->rule], INT64_MIN, utc_sec, out); return; }
+    if (n == 0 || utc_sec < t[0]) {
+        out->off = data::kTypes[zr->type_begin + zr->initial].utoff;
+        out->hi = n == 0 ? INT64_MAX : t[0];
+        return;
+    }
+    if (utc_sec >= t[n - 1] && zr->rule != kNoRule) {
+        rule_span(data::kRules[zr->rule], t[n - 1], utc_sec, out);
+        return;
+    }
+    std::uint32_t lo = 0, hi = n;   // t[lo] <= utc_sec < t[hi]
+    for (std::uint32_t guard = 0; hi - lo > 1 && guard < 64; ++guard) {
+        const std::uint32_t mid = lo + (hi - lo) / 2;
+        if (t[mid] <= utc_sec) lo = mid; else hi = mid;
+    }
+    out->lo = t[lo];
+    out->hi = hi < n ? t[hi] : INT64_MAX;
+    out->off = data::kTypes[zr->type_begin + data::kTransType[zr->trans_begin + lo]].utoff;
+    assert(out->lo <= utc_sec && utc_sec < out->hi);
+}
+
 std::uint32_t zone_name(ZoneId z, char* buf, std::uint32_t cap) noexcept {
     assert(buf != nullptr || cap == 0);
     if (zone_is_fixed(z)) return write_offset(zone_fixed_offset(z), buf, cap);
