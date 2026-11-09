@@ -564,27 +564,33 @@ BOLT_FORCE_INLINE void sv_cmp_col(
     }
 }
 
-// Branch-free byte-lex MIN over two StringViews. Returns the smaller of
-// (cur, cand) under byte-lex order. Caller passes spilled bases (nullptr
-// when both views are known inline). Predicated select compiles to CMOV.
+// Does `cand` replace `cur` in a MIN (`want_min`) or MAX fold? Decided from
+// the content compare. A spilled view is only meaningful with its base: two
+// views into different buffers can be bit-identical (same length, prefix and
+// offset) while holding different bytes, so a caller must never infer the
+// winner by comparing the returned view against `cur` (G2CHK-800).
+BOLT_FORCE_INLINE bool sv_bytelex_replaces(
+        bool want_min,
+        const StringView& cur, const char* cur_base,
+        const StringView& cand, const char* cand_base) noexcept {
+    assert(cur.length  <= 12u || cur_base  != nullptr);
+    assert(cand.length <= 12u || cand_base != nullptr);
+    const int c = sv_bytelex_compare(cand, cand_base, cur, cur_base);
+    return want_min ? (c < 0) : (c > 0);
+}
+
+// Byte-lex MIN / MAX of two StringViews. The result is a view: resolve it
+// against the winner's base, which only sv_bytelex_replaces reports.
 BOLT_FORCE_INLINE StringView sv_bytelex_min(
         const StringView& cur, const char* cur_base,
         const StringView& cand, const char* cand_base) noexcept {
-    assert(cur.length  <= 12u || cur_base  != nullptr);
-    assert(cand.length <= 12u || cand_base != nullptr);
-    const int c = sv_bytelex_compare(cand, cand_base, cur, cur_base);
-    // c < 0  ⇒ cand < cur ⇒ select cand. Branch-free predicated select.
-    return (c < 0) ? cand : cur;
+    return sv_bytelex_replaces(true, cur, cur_base, cand, cand_base) ? cand : cur;
 }
 
-// Branch-free byte-lex MAX over two StringViews. Symmetric to sv_bytelex_min.
 BOLT_FORCE_INLINE StringView sv_bytelex_max(
         const StringView& cur, const char* cur_base,
         const StringView& cand, const char* cand_base) noexcept {
-    assert(cur.length  <= 12u || cur_base  != nullptr);
-    assert(cand.length <= 12u || cand_base != nullptr);
-    const int c = sv_bytelex_compare(cand, cand_base, cur, cur_base);
-    return (c > 0) ? cand : cur;
+    return sv_bytelex_replaces(false, cur, cur_base, cand, cand_base) ? cand : cur;
 }
 
 // ===========================================================================
@@ -1690,14 +1696,9 @@ inline bool gb_agg_utf8_minmax(GroupbyTypedState* state, uint32_t j,
     std::memcpy(&cand, &v,   sizeof(cand));
     const char* cur_base = (cur.length > 12u) ? state->agg_str_buf[j] : nullptr;
     assert(cur.length <= 12u || cur_base != nullptr);
-    const StringView out = (k == AggKind::Min)
-        ? sv_bytelex_min(cur, cur_base, cand, cand_base)
-        : sv_bytelex_max(cur, cur_base, cand, cand_base);
-    if (std::memcmp(&out, &cur, sizeof(out)) == 0) return true;   // cur retained
-    assert(std::memcmp(&out, &cand, sizeof(out)) == 0 &&
-           "sv_bytelex_min/max must return one of its two inputs");
-    if (out.length <= 12u) {
-        std::memcpy(slot, &out, sizeof(out));
+    if (!sv_bytelex_replaces(k == AggKind::Min, cur, cur_base, cand, cand_base)) return true;
+    if (cand.length <= 12u) {
+        std::memcpy(slot, &cand, sizeof(cand));
         return true;
     }
     const char* bytes = kernels::utf8::sv_bytes(cand, cand_base);
