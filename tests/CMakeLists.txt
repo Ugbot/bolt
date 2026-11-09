@@ -1336,6 +1336,12 @@ target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_date PRIVATE)
 add_test(NAME bolt_date COMMAND test_bolt_date)
 
+# Embedded IANA tz rules, calendar math, Spark datetime patterns.
+add_executable(test_bolt_tz test_bolt_tz.cpp)
+target_link_libraries(test_bolt_tz PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_tz PRIVATE)
+add_test(NAME bolt_tz COMMAND test_bolt_tz)
+
 # Locale-independent double <-> text (std::to_chars / from_chars semantics
 # without the availability-gated <charconv> float overloads).
 add_executable(test_bolt_float_chars test_bolt_float_chars.cpp)
