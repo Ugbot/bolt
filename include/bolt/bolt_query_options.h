@@ -13,6 +13,15 @@
 // (`LIMIT 5` has no unit; `OPTIONS (...)` needs known keys after a complete
 // statement).
 //
+// Any Limits-registry knob is also a query option (G2LAUNCH-156):
+//   SET dist_broadcast_mb = 256          -- the session
+//   ... OPTIONS (dist_skew_permille = 20) -- this statement
+//   params.options {"join_wave_mb": "64"} -- a gateway request
+// A query carries its overrides in QueryOptions::knobs; resolution is query >
+// session > process (set / env) > default. query_limit_value() reads the
+// running query's value from its QueryCtx wherever the code runs, a worker
+// included (the plan ships the overrides).
+//
 // Cold path: runs once per statement, no allocation.
 
 #pragma once
@@ -22,7 +31,101 @@
 #include <cstdio>
 #include <cstring>
 
+#include "bolt/bolt_limits.h"
+#include "bolt/bolt_query_ctx.h"
+
 namespace bolt {
+
+inline constexpr uint32_t kQueryKnobMax = 32;         // registry overrides one query carries
+inline constexpr uint32_t kQueryKnobNameBytes = 48;
+inline constexpr uint64_t kQueryKnobReset = UINT64_MAX;   // RESET name: drop the override
+
+enum class QueryKnobSource : uint8_t { Unset = 0, Session = 1, Query = 2, Optimizer = 3 };
+
+struct QueryKnob {
+    char            name[kQueryKnobNameBytes];
+    uint64_t        value;
+    QueryKnobSource source;
+    uint8_t         _pad[7];
+};
+
+struct QueryKnobs {
+    uint32_t  count = 0;
+    uint32_t  _pad = 0;
+    QueryKnob knobs[kQueryKnobMax];
+};
+
+inline int32_t query_knob_index(const QueryKnobs& k, const char* name, size_t n) noexcept {
+    for (uint32_t i = 0; i < k.count && i < kQueryKnobMax; ++i)
+        if (std::strncmp(k.knobs[i].name, name, n) == 0 && k.knobs[i].name[n] == '\0') return static_cast<int32_t>(i);
+    return -1;
+}
+
+/// The override of `name`, if this set carries one.
+inline bool query_knob_get(const QueryKnobs& k, const char* name, uint64_t* value,
+                           QueryKnobSource* source = nullptr) noexcept {
+    const int32_t i = query_knob_index(k, name, std::strlen(name));
+    if (i < 0) return false;
+    *value = k.knobs[i].value;
+    if (source != nullptr) *source = k.knobs[i].source;
+    return true;
+}
+
+/// The registry row a knob name names: a Budget or FixedAtAlloc limit, not an
+/// invariant. False for anything else.
+inline bool query_knob_limit(const char* name, size_t n, const LimitTable** t, uint32_t* i) noexcept {
+    if (n == 0 || n >= kQueryKnobNameBytes) return false;
+    char z[kQueryKnobNameBytes];
+    for (size_t j = 0; j < n; ++j) z[j] = (name[j] >= 'A' && name[j] <= 'Z') ? static_cast<char>(name[j] + 32) : name[j];
+    z[n] = '\0';
+    return limits_find(z, t, i) && (*t)->descs[*i].kind != LimitKind::kInvariant;
+}
+
+/// Set (or with kQueryKnobReset, drop) one override. False when the name is no
+/// registry knob, the value is out of the row's range, or the set is full.
+inline bool query_knob_put(QueryKnobs* k, const char* name, size_t n, uint64_t value,
+                           QueryKnobSource source) noexcept {
+    const LimitTable* t = nullptr;
+    uint32_t row = 0;
+    if (!query_knob_limit(name, n, &t, &row)) return false;
+    char z[kQueryKnobNameBytes];
+    std::snprintf(z, sizeof(z), "%s", t->descs[row].name);
+    const int32_t at = query_knob_index(*k, z, std::strlen(z));
+    if (value == kQueryKnobReset) {
+        if (at >= 0) { k->knobs[at] = k->knobs[k->count - 1u]; --k->count; }
+        return true;
+    }
+    if (!limits_in_range(t->descs[row], value)) return false;
+    QueryKnob* slot = at >= 0 ? &k->knobs[at] : (k->count < kQueryKnobMax ? &k->knobs[k->count++] : nullptr);
+    if (slot == nullptr) return false;
+    std::snprintf(slot->name, sizeof(slot->name), "%s", z);
+    slot->value = value;
+    slot->source = source;
+    return true;
+}
+
+/// `over` wins name by name; a reset entry drops the name from `base`.
+inline void query_knobs_overlay(QueryKnobs* base, const QueryKnobs& over) noexcept {
+    for (uint32_t i = 0; i < over.count && i < kQueryKnobMax; ++i) {
+        const QueryKnob& o = over.knobs[i];
+        (void)query_knob_put(base, o.name, std::strlen(o.name), o.value, o.source);
+    }
+}
+
+/// Every entry's source set to `source` (a session's overrides, a query's).
+inline void query_knobs_mark(QueryKnobs* k, QueryKnobSource source) noexcept {
+    for (uint32_t i = 0; i < k->count && i < kQueryKnobMax; ++i) k->knobs[i].source = source;
+}
+
+/// Registry row `i` of `t` for the running query: its override when the
+/// query (QueryCtx on this thread) carries one, else the process value.
+inline uint64_t query_limit_value(const LimitTable& t, uint32_t i) noexcept {
+    const QueryCtx* q = current_query_ctx();
+    uint64_t v = 0;
+    if (q != nullptr && q->knobs != nullptr && query_knob_get(*q->knobs, t.descs[i].name, &v) && v != kQueryKnobReset)
+        return v;
+    return limits_value(t, i);
+}
 
 enum class QueryDialect : uint8_t { Sql = 0, Cypher, Sparql, Promql };
 enum class QueryPriorityClass : uint8_t { Unset = 0, Low, Normal, High };
@@ -33,6 +136,7 @@ struct QueryOptions {
     enum Bit : uint32_t {
         kTimeLimit = 1u, kMemoryLimit = 2u, kRowLimit = 4u, kWorkers = 8u,
         kMorselRows = 16u, kPriority = 32u, kNodes = 64u, kCancelOnDisconnect = 128u,
+        kKnobs = 256u,
     };
     uint32_t set = 0;
     uint32_t workers = 0;
@@ -44,6 +148,7 @@ struct QueryOptions {
     QueryNodes nodes = QueryNodes::Unset;
     uint8_t  node_count = 0;        // nodes = N: candidates considered
     uint8_t  cancel_on_disconnect = 1;
+    QueryKnobs knobs;               // Limits-registry overrides (kKnobs)
 };
 
 /// Field-wise: what `over` sets wins.
@@ -57,6 +162,7 @@ inline void query_options_overlay(QueryOptions* base, const QueryOptions& over) 
     if ((s & QueryOptions::kPriority) != 0u) base->priority = over.priority;
     if ((s & QueryOptions::kNodes) != 0u) { base->nodes = over.nodes; base->node_count = over.node_count; }
     if ((s & QueryOptions::kCancelOnDisconnect) != 0u) base->cancel_on_disconnect = over.cancel_on_disconnect;
+    if ((s & QueryOptions::kKnobs) != 0u) query_knobs_overlay(&base->knobs, over.knobs);
     base->set |= s;
 }
 
@@ -146,7 +252,15 @@ inline bool parse_query_size_bytes(const char* s, size_t n, uint64_t* out) noexc
 
 enum class QueryOptionResult : uint8_t { Ok, UnknownKey, BadValue };
 
+inline bool query_option_builtin(const char* k, size_t n) noexcept;
+
 inline bool query_option_key_known(const char* k, size_t n) noexcept {
+    const LimitTable* t = nullptr;
+    uint32_t i = 0;
+    return query_option_builtin(k, n) || query_knob_limit(k, n, &t, &i);
+}
+
+inline bool query_option_builtin(const char* k, size_t n) noexcept {
     using query_options_detail::word_is;
     return word_is(k, n, "time_limit") || word_is(k, n, "statement_timeout") ||
            word_is(k, n, "memory_limit") || word_is(k, n, "row_limit") ||
@@ -165,6 +279,7 @@ inline uint32_t query_option_bit(const char* k, size_t n) noexcept {
     if (word_is(k, n, "priority")) return QueryOptions::kPriority;
     if (word_is(k, n, "nodes")) return QueryOptions::kNodes;
     if (word_is(k, n, "cancel_on_disconnect")) return QueryOptions::kCancelOnDisconnect;
+    if (!query_option_builtin(k, n)) return QueryOptions::kKnobs;
     return 0u;
 }
 
@@ -224,7 +339,13 @@ inline QueryOptionResult apply_query_option(const char* key, size_t kn, const ch
         else return QueryOptionResult::BadValue;
         o->set |= QueryOptions::kCancelOnDisconnect;
     } else {
-        return QueryOptionResult::UnknownKey;
+        const LimitTable* t = nullptr;
+        uint32_t row = 0;
+        if (!query_knob_limit(key, kn, &t, &row)) return QueryOptionResult::UnknownKey;
+        if (word_is(value, vn, "default")) n = kQueryKnobReset;
+        else if (!parse_query_uint(value, vn, &n)) return QueryOptionResult::BadValue;
+        if (!query_knob_put(&o->knobs, key, kn, n, QueryKnobSource::Query)) return QueryOptionResult::BadValue;
+        o->set |= QueryOptions::kKnobs;
     }
     return QueryOptionResult::Ok;
 }
@@ -489,6 +610,12 @@ inline QuerySetResult parse_query_set(const char* s, size_t n, QueryOptions* o, 
     while (end > i && (space(s[end - 1]) || s[end - 1] == ';')) --end;
     if (is_reset && word_is(s + kb, kn, "all") && i == end) { *reset_bits = UINT32_MAX; return QuerySetResult::Reset; }
     if (!query_option_key_known(s + kb, kn)) return QuerySetResult::NotSet;
+    if (is_reset && !query_option_builtin(s + kb, kn)) {
+        if (i != end) return QuerySetResult::NotSet;
+        (void)query_knob_put(&o->knobs, s + kb, kn, kQueryKnobReset, QueryKnobSource::Session);
+        o->set |= QueryOptions::kKnobs;
+        return QuerySetResult::Applied;
+    }
     if (is_reset) {
         if (i != end) return QuerySetResult::NotSet;
         *reset_bits = query_option_bit(s + kb, kn);
@@ -501,7 +628,7 @@ inline QuerySetResult parse_query_set(const char* s, size_t n, QueryOptions* o, 
     while (i < end && space(s[i])) ++i;
     size_t vn = end - i;
     const char* v = unquote(s + i, &vn);
-    if (word_is(v, vn, "default")) {
+    if (word_is(v, vn, "default") && query_option_builtin(s + kb, kn)) {
         *reset_bits = query_option_bit(s + kb, kn);
         return QuerySetResult::Reset;
     }
