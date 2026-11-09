@@ -2988,3 +2988,10 @@ target_link_libraries(test_bolt_iceberg_manifest_bounds PRIVATE bolt::lakehouse 
 bolt_apply_hardening(test_bolt_iceberg_manifest_bounds)
 add_test(NAME test_bolt_iceberg_manifest_bounds COMMAND test_bolt_iceberg_manifest_bounds)
 set_tests_properties(test_bolt_iceberg_manifest_bounds PROPERTIES TIMEOUT 120)
+
+# Text kernels (pad / initcap / format_string) + one-value nested navigation (G2LAUNCH-73/78).
+add_executable(test_bolt_text_fn test_bolt_text_fn.cpp)
+target_link_libraries(test_bolt_text_fn
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_fn)
+add_test(NAME test_bolt_text_fn COMMAND test_bolt_text_fn)
