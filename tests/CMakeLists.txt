@@ -3003,3 +3003,9 @@ add_executable(test_bolt_iceberg_metadata_legacy test_bolt_iceberg_metadata_lega
 target_link_libraries(test_bolt_iceberg_metadata_legacy PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_iceberg_metadata_legacy)
 add_test(NAME test_bolt_iceberg_metadata_legacy COMMAND test_bolt_iceberg_metadata_legacy)
+# Text kernels (pad / initcap / format_string) + one-value nested navigation (G2LAUNCH-73/78).
+add_executable(test_bolt_text_fn test_bolt_text_fn.cpp)
+target_link_libraries(test_bolt_text_fn
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_fn)
+add_test(NAME test_bolt_text_fn COMMAND test_bolt_text_fn)
