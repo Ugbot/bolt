@@ -153,4 +153,53 @@ inline bool query_process_resident_bytes(std::uint64_t* out) noexcept {
 #endif
 }
 
+// Fill *out with THIS PROCESS's physical footprint: the dirty private bytes
+// the OS charges it, including pages it has compressed or swapped. This, not
+// RSS, is what grows when written-once memory goes cold, so it is the number a
+// memory gauge or a footprint test must read.
+//
+//   macOS   : task_info(TASK_VM_INFO).phys_footprint (what `footprint` shows)
+//   Linux   : /proc/self/status RssAnon + VmSwap (kB; no page-size guess)
+//   Windows : GetProcessMemoryInfo PagefileUsage (private commit)
+//   Other   : query fails.
+inline bool query_process_footprint_bytes(std::uint64_t* out) noexcept {
+    assert(out != nullptr);
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return false;
+    *out = static_cast<std::uint64_t>(pmc.PagefileUsage);
+    return *out != 0;
+#elif defined(__APPLE__)
+    task_vm_info_data_t vi{};
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&vi), &cnt) != KERN_SUCCESS) {
+        return false;
+    }
+    *out = static_cast<std::uint64_t>(vi.phys_footprint);
+    return *out != 0;
+#elif defined(__linux__)
+    // /proc/self/status reports in kB, so no page-size assumption (aarch64
+    // kernels with 16/64 KiB pages read right): anonymous resident + swapped.
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (f == nullptr) return false;
+    char line[256];
+    unsigned long long anon_kb = 0, swap_kb = 0;
+    bool have_anon = false;
+    for (int i = 0; i < 128 && std::fgets(line, sizeof(line), f) != nullptr; ++i) {
+        unsigned long long v = 0;
+        if (std::sscanf(line, "RssAnon: %llu kB", &v) == 1) { anon_kb = v; have_anon = true; }
+        else if (std::sscanf(line, "VmSwap: %llu kB", &v) == 1) { swap_kb = v; }
+    }
+    std::fclose(f);
+    if (!have_anon) return false;
+    *out = static_cast<std::uint64_t>(anon_kb + swap_kb) * 1024ull;
+    return *out != 0;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
 }  // namespace bolt

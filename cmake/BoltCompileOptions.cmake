@@ -110,10 +110,10 @@ endfunction()
 #   Pin a SIMD ISA tier for `tgt`.  `mode` is one of:
 #     NATIVE   — MSVC /arch:AVX2, GCC/Clang -march=native
 #     AVX512   — MSVC /arch:AVX512, GCC/Clang
-#                -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx2 -msse4.2
+#                -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx2 -mfma -mf16c -msse4.2
 #                (stub: bolt_port.h sets BOLT_SIMD_AVX512=1 and falls through
 #                 to AVX2 wrappers; native 512-bit specialisations land later)
-#     AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -msse4.2
+#     AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -mfma -mf16c -msse4.2
 #     SSE42    — MSVC x64 baseline (no flag; MSVC has no /arch:SSE4.2 —
 #                SSE2 is baseline and SSE4.2 intrinsics compile without
 #                a flag), GCC/Clang -msse4.2
@@ -145,13 +145,13 @@ function(bolt_apply_simd tgt mode)
             _bolt_build_only_opts(${tgt} ${scope} /arch:AVX512)
         else()
             _bolt_build_only_opts(${tgt} ${scope}
-                -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx2 -msse4.2)
+                -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx2 -mfma -mf16c -msse4.2)
         endif()
     elseif(mode_up STREQUAL "AVX2")
         if(MSVC)
             _bolt_build_only_opts(${tgt} ${scope} /arch:AVX2)
         else()
-            _bolt_build_only_opts(${tgt} ${scope} -mavx2 -msse4.2)
+            _bolt_build_only_opts(${tgt} ${scope} -mavx2 -mfma -mf16c -msse4.2)
         endif()
     elseif(mode_up STREQUAL "SSE42")
         if(MSVC)

@@ -139,6 +139,19 @@ struct alignas(bolt::config::kCacheIsolationBytes) Disruptor {
         return my_end - count;
     }
 
+    // Claim one slot only if the ring has room now; false when full. For a
+    // producer that must never block (e.g. it is, or waits on, the
+    // consumer). Coexists with claim(): both move `cursor` atomically.
+    BOLT_FORCE_INLINE bool try_claim(uint64_t* seq_out) noexcept {
+        assert(seq_out != nullptr);
+        uint64_t c = cursor.load_acquire();
+        for (uint32_t spins = 0; spins < 1024u; ++spins) {   // bounded CAS retry
+            if (c + 1u - min_consumer_cursor() > Capacity) return false;
+            if (cursor.cas_weak(c, c + 1u)) { *seq_out = c; return true; }
+        }
+        return false;
+    }
+
     BOLT_FORCE_INLINE T* slot(uint64_t seq) noexcept {
         return &slots[seq & kMask];
     }

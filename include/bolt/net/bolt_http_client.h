@@ -27,8 +27,9 @@ struct HttpRequest {
     uint32_t       header_count;
     const uint8_t* body;
     uint32_t       body_len;
-    uint16_t       timeout_ms;                    // 0 → default
+    uint32_t       timeout_ms;                    // 0 → default
     uint32_t       max_response_body;             // 0 → kHttpMaxBody; otherwise <= it
+    char           ca_path[512];                  // "" → system trust; else PEM file or hashed dir
 };
 
 struct HttpResponse {
@@ -53,7 +54,7 @@ bool http_url_authority(const char* url, char* out, uint32_t cap) noexcept;
 // Send `req` and read full response. body buffer arena-owned. 0 on success,
 // negative on error; a failed response never publishes a partial body. No retry.
 // timeout_ms is a total connect/send/receive deadline after synchronous DNS;
-// accepted values are 1..60000 ms, or zero for 10000 ms. Response framing and
+// accepted values are 1..3600000 ms, or zero for 10000 ms. Response framing and
 // declared/decoded body budgets are validated, without truncating fields.
 // Response heads use kHttpResponseHeadCap (8192 bytes); wire staging is bounded
 // by the body budget plus 64 KiB of framing overhead. Unsupported transfer

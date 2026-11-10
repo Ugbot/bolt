@@ -8,6 +8,8 @@ shares no code with bolt:
 
   degree, pagerank, wcc, scc, dijkstra,
   bfs levels                             networkx (MultiDiGraph)
+  label propagation (CDLP)               the LDBC Graphalytics CDLP definition,
+                                         written over networkx's in/out edges
   jaccard / overlap                      set arithmetic on successor sets
   walk / trail / simple / reach paths    a brute-force path enumerator
 
@@ -57,8 +59,10 @@ def gen_case(seed):
         w = rng.choice([0.0, 0.5, 1.0, 2.0, 3.25, 7.0, rng.randint(0, 20) / 4])
         edges.append((u, v, lbl, w))
     want = rng.choice([-1, -1, 0, 1])
-    return {"n": n, "edges": edges, "want": want,
+    case = {"n": n, "edges": edges, "want": want,
             "sorted": rng.randint(0, 1), "max_hops": rng.randint(0, 4)}
+    case["lp_iters"] = rng.choice([0, 1, 2, 3, 5, 30])   # drawn last: older arms unchanged
+    return case
 
 
 def kept(case):
@@ -80,6 +84,29 @@ def pagerank_oracle(g, **kw):
     except ImportError:  # networkx's pure-Python power iteration
         from networkx.algorithms.link_analysis.pagerank_alg import _pagerank_python
         return _pagerank_python(g, **kw)
+
+
+def cdlp_oracle(g, n, mode, iters):
+    """LDBC Graphalytics CDLP: synchronous, the most frequent neighbour label
+    of the previous round (out- and/or in-neighbours, one per edge), ties to
+    the smallest, no neighbours keeps the label, exactly `iters` rounds."""
+    lab = list(range(n))
+    for _ in range(iters):
+        nxt = []
+        for v in range(n):
+            ls = []
+            if mode in ("both", "out"):
+                ls += [lab[w] for _, w in g.out_edges(v)]
+            if mode in ("both", "in"):
+                ls += [lab[w] for w, _ in g.in_edges(v)]
+            if not ls:
+                nxt.append(lab[v])
+                continue
+            cnt = Counter(ls)
+            top = max(cnt.values())
+            nxt.append(min(x for x, c in cnt.items() if c == top))
+        lab = nxt
+    return lab
 
 
 def comps_from_sets(n, sets):
@@ -146,6 +173,8 @@ def parse_output(text):
         elif parts[0] == "lv":
             cur["lv"][int(parts[1])] = (int(parts[2]), int(parts[3]),
                                         [int(x) for x in parts[4:]])
+        elif parts[0] == "lp":
+            cur.setdefault("lp", {})[parts[1]] = [int(x) for x in parts[2:]]
         elif parts[0] == "dj":
             cur["dj"][int(parts[1])] = (int(parts[2]), [float(x) for x in parts[3:]])
         elif parts[0] == "path":
@@ -208,6 +237,11 @@ def check(case, got):
             if not close(got["jac"][k], ej, 1e-15) or not close(got["ovl"][k], eo, 1e-15):
                 errs.append(f"similarity ({a},{b}) {got['jac'][k]} {got['ovl'][k]}")
             k += 1
+    for mode in ("both", "out", "in"):
+        res = got.get("lp", {}).get(mode)
+        want = cdlp_oracle(g, n, mode, case["lp_iters"])
+        if res is None or res[0] < 0 or res[0] > case["lp_iters"] or res[1:] != want:
+            errs.append(f"cdlp {mode} iters={case['lp_iters']}: {res} want {want}")
     for (sem, lo, hi), (st, rows) in got["paths"].items():
         want = enum_paths(case, sem, lo, hi)
         if st != 0 or rows != want:
@@ -218,7 +252,7 @@ def check(case, got):
 
 def render(cid, case):
     lines = [f"case {cid} {case['n']} {len(case['edges'])} {case['want']} "
-             f"{case['sorted']} {case['max_hops']}"]
+             f"{case['sorted']} {case['max_hops']} {case['lp_iters']}"]
     lines += [f"{u} {v} {l} {w!r}" for u, v, l, w in case["edges"]]
     return "\n".join(lines) + "\n"
 

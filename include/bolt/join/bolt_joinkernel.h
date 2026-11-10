@@ -256,12 +256,11 @@ enum class JoinKeyShape : uint8_t {
 // True iff `t` is a 64-bit-or-narrower integer key that the OneInt64 fast path
 // can represent losslessly as a raw uint64 SwissTable key.
 BOLT_FORCE_INLINE bool jk_is_int64_shape_type(BoltType t) noexcept {
-    return t == BoltType::Int64 || t == BoltType::UInt64 ||
-           t == BoltType::Int32 || t == BoltType::Date32;
+    return is_integer(t) || t == BoltType::Date32;
 }
 
 // Read one int-key cell as the raw uint64 value used by the OneInt64 path.
-// Int32/Date32 are sign-extended to 64 bits so a negative key keeps its value.
+// Signed keys sign-extend and unsigned ones zero-extend, so each keeps its value.
 BOLT_FORCE_INLINE uint64_t jk_read_int64_key(const BoltColumn& c,
                                              int64_t r) noexcept {
     assert(c.data != nullptr);
@@ -272,6 +271,15 @@ BOLT_FORCE_INLINE uint64_t jk_read_int64_key(const BoltColumn& c,
         case BoltType::Date32:
             return static_cast<uint64_t>(
                 static_cast<int64_t>(static_cast<const int32_t*>(c.data)[r]));
+        case BoltType::Int16:
+            return static_cast<uint64_t>(
+                static_cast<int64_t>(static_cast<const int16_t*>(c.data)[r]));
+        case BoltType::Int8:
+            return static_cast<uint64_t>(
+                static_cast<int64_t>(static_cast<const int8_t*>(c.data)[r]));
+        case BoltType::UInt32: return static_cast<const uint32_t*>(c.data)[r];
+        case BoltType::UInt16: return static_cast<const uint16_t*>(c.data)[r];
+        case BoltType::UInt8:  return static_cast<const uint8_t*>(c.data)[r];
         default:
             assert(false && "jk_read_int64_key on non-int key");
             return static_cast<const uint64_t*>(c.data)[r];

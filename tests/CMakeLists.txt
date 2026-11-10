@@ -6,6 +6,21 @@ bolt_apply_hardening(test_seqlock)
 add_test(NAME test_seqlock COMMAND test_seqlock)
 set_tests_properties(test_seqlock PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
 
+add_executable(test_obs test_obs.cpp)
+target_link_libraries(test_obs PRIVATE bolt::obs GTest::gtest_main)
+bolt_apply_hardening(test_obs)
+add_test(NAME test_obs COMMAND test_obs)
+# Every feature off must compile: built against its own all-off config.
+set(BOLT_OBS_LOG_V 0)
+set(BOLT_OBS_METRICS_V 0)
+set(BOLT_OBS_TRACE_V 0)
+set(BOLT_OBS_PROFILE_V 0)
+set(BOLT_OBS_CRASH_V 0)
+set(BOLT_OBS_LOG_MIN 6)
+configure_file(../include/bolt/obs/obs_config.h.in ${CMAKE_CURRENT_BINARY_DIR}/obs_off/bolt/obs/obs_config.h @ONLY)
+add_library(test_obs_off OBJECT test_obs_off.cpp)
+target_include_directories(test_obs_off BEFORE PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/obs_off ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(test_entropy test_entropy.cpp)
 target_link_libraries(test_entropy PRIVATE bolt::entropy GTest::gtest_main)
 bolt_apply_hardening(test_entropy)
@@ -1223,6 +1238,17 @@ if(BOLT_BUILD_ROCM)
         PRIVATE bolt::bolt bolt::rocm GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_rocm)
     add_test(NAME test_bolt_rocm COMMAND test_bolt_rocm)
+endif()
+
+# CUDA/NVIDIA kernel core — BLLM-182. Mirror of test_bolt_rocm; self-skips
+# (GTEST_SKIP) if bolt::cuda::available() is false. Only built when a real
+# nvcc was found (BOLT_BUILD_CUDA) -- not the case on this NVIDIA-less box.
+if(BOLT_BUILD_CUDA)
+    add_executable(test_bolt_cuda test_bolt_cuda.cpp)
+    target_link_libraries(test_bolt_cuda
+        PRIVATE bolt::bolt bolt::cuda GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_cuda)
+    add_test(NAME test_bolt_cuda COMMAND test_bolt_cuda)
 endif()
 
 # Atomic-bitmap primitives — soft-delete / live-mask substrate.
@@ -2550,6 +2576,13 @@ target_link_libraries(test_bolt_arena_os_release
 bolt_apply_hardening(test_bolt_arena_os_release)
 add_test(NAME test_bolt_arena_os_release COMMAND test_bolt_arena_os_release)
 
+# R0: lazy small first block for default arenas + MemOwner accounting.
+add_executable(test_bolt_arena_lazy_owner test_bolt_arena_lazy_owner.cpp)
+target_link_libraries(test_bolt_arena_lazy_owner
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_arena_lazy_owner)
+add_test(NAME test_bolt_arena_lazy_owner COMMAND test_bolt_arena_lazy_owner)
+
 # TypedBatchPool / ArenaRing slot lifetime (G2CHK-148: eager per-slot Arena()
 # at pool construction, dropped by acquire's placement-new -> 4 MiB leaks).
 add_executable(test_bolt_pool_lifecycle test_bolt_pool_lifecycle.cpp)
@@ -2597,6 +2630,20 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     )
     bolt_apply_hardening(test_bolt_coro_listener_port_clash)
     add_test(NAME test_bolt_coro_listener_port_clash COMMAND test_bolt_coro_listener_port_clash)
+endif()
+
+# CoroTcpListener binds its configured host (127.0.0.1 is not reachable on
+# other interfaces) and refuses an unparseable host instead of INADDR_ANY.
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_coro_listener_bind_host test_bolt_coro_listener_bind_host.cpp)
+    target_link_libraries(test_bolt_coro_listener_bind_host
+        PRIVATE
+            bolt::reactor
+            GTest::gtest
+            GTest::gtest_main
+    )
+    bolt_apply_hardening(test_bolt_coro_listener_bind_host)
+    add_test(NAME test_bolt_coro_listener_bind_host COMMAND test_bolt_coro_listener_bind_host)
 endif()
 
 # Listener accept retirement keeps kernel/callback ownership until completion.
@@ -2824,7 +2871,8 @@ add_test(NAME test_bolt_workers_kind_b COMMAND test_bolt_workers_kind_b)
 # random-graph property fuzz against networkx and a brute-force path
 # enumerator. The campaign form is `graph_algo_fuzz.py --cases 20000` under
 # the fuzz lock; exit 2 (networkx missing) reports SKIPPED, never passed.
-add_executable(test_bolt_csr_algo test_bolt_csr_algo.cpp test_bolt_csr_indexed_weights.cpp)
+add_executable(test_bolt_csr_algo test_bolt_csr_algo.cpp test_bolt_csr_community.cpp
+               test_bolt_csr_indexed_weights.cpp)
 target_link_libraries(test_bolt_csr_algo
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_csr_algo)
@@ -3009,3 +3057,16 @@ target_link_libraries(test_bolt_text_fn
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_text_fn)
 add_test(NAME test_bolt_text_fn COMMAND test_bolt_text_fn)
+
+# perf pass — f32/f16 float-activation SIMD GEMV (rides in bolt::compute_idot).
+# Every available SIMD tier (AVX2/AVX-512F) agrees with the scalar f64
+# reference to a derived tolerance (NOT bit-exact, the f32 reduction is
+# reassociated), dispatch == selected tier, f16 vs dequant-dot, determinism.
+# Self-guards on BOLT_ARCH_X86 + runtime CPUID probes (green on x86 + ARM).
+if(BOLT_BUILD_COMPUTE_IDOT)
+    add_executable(test_bolt_gemv test_bolt_gemv.cpp)
+    target_link_libraries(test_bolt_gemv
+        PRIVATE bolt::bolt bolt::compute_idot GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_gemv)
+    add_test(NAME test_bolt_gemv COMMAND test_bolt_gemv)
+endif()

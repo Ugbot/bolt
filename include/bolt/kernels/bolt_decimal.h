@@ -157,12 +157,15 @@ BOLT_FORCE_INLINE void div_u128_u64(uint64_t hi, uint64_t lo, uint64_t d,
     uint64_t qh = 0, ql = 0, r = 0;
     for (int i = 0; i < 128; ++i) {
         // Shift (r:hi:lo) left by 1 (r is the working remainder).
+        // A divisor past 2^63 can leave r >= 2^63; the bit shifted out is
+        // then part of the remainder, which is >= d.
+        const uint64_t carry = r >> 63;
         r = (r << 1) | (hi >> 63);
         hi = (hi << 1) | (lo >> 63);
         lo = (lo << 1);
         qh = (qh << 1) | (ql >> 63);
         ql = (ql << 1);
-        if (r >= d) { r -= d; ql |= 1ull; }
+        if (carry != 0 || r >= d) { r -= d; ql |= 1ull; }
     }
     *q_hi = qh; *q_lo = ql; *rem = r;
 }

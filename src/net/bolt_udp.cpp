@@ -27,6 +27,7 @@ constexpr sock_t k_bad_sock = INVALID_SOCKET;
 #  include <arpa/inet.h>
 #  include <fcntl.h>
 #  include <netinet/in.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <sys/uio.h>
@@ -186,6 +187,153 @@ bool udp_endpoint_set_nonblocking(UdpEndpoint* ep, bool enabled) noexcept {
     if (flags < 0) return false;
     const int desired = enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK;
     return ::fcntl(to_native(ep->sock), F_SETFL, desired) == 0;
+#endif
+}
+
+namespace {
+bool source_membership(UdpEndpoint* ep, std::uint32_t group, std::uint32_t source,
+                       std::uint32_t iface, int option) noexcept {
+    assert(ep != nullptr && ep->sock != k_udp_invalid_sock);
+    assert(udp_is_multicast(group));
+    ip_mreq_source mreq;
+    std::memset(&mreq, 0, sizeof(mreq));
+    mreq.imr_multiaddr.s_addr = htonl(group);
+    mreq.imr_sourceaddr.s_addr = htonl(source);
+    mreq.imr_interface.s_addr = htonl(iface);
+    return ::setsockopt(to_native(ep->sock), IPPROTO_IP, option,
+                        reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0;
+}
+}  // namespace
+
+bool udp_multicast_join_source(UdpEndpoint* ep, std::uint32_t group_ipv4,
+                               std::uint32_t source_ipv4, std::uint32_t iface_ipv4) noexcept {
+    return source_membership(ep, group_ipv4, source_ipv4, iface_ipv4,
+                             IP_ADD_SOURCE_MEMBERSHIP);
+}
+
+bool udp_multicast_leave_source(UdpEndpoint* ep, std::uint32_t group_ipv4,
+                                std::uint32_t source_ipv4, std::uint32_t iface_ipv4) noexcept {
+    return source_membership(ep, group_ipv4, source_ipv4, iface_ipv4,
+                             IP_DROP_SOURCE_MEMBERSHIP);
+}
+
+bool udp_endpoint_set_recv_buffer(UdpEndpoint* ep, std::uint32_t bytes,
+                                  std::uint32_t* actual) noexcept {
+    assert(ep != nullptr && actual != nullptr);
+    assert(bytes > 0u);
+    if (ep->sock == k_udp_invalid_sock || bytes > static_cast<std::uint32_t>(INT_MAX)) return false;
+    const int wanted = static_cast<int>(bytes);
+    if (::setsockopt(to_native(ep->sock), SOL_SOCKET, SO_RCVBUF,
+                     reinterpret_cast<const char*>(&wanted), sizeof(wanted)) != 0) return false;
+    int granted = 0;
+    socklen_t size = sizeof(granted);
+    if (::getsockopt(to_native(ep->sock), SOL_SOCKET, SO_RCVBUF,
+                     reinterpret_cast<char*>(&granted), &size) != 0 || granted <= 0) return false;
+    *actual = static_cast<std::uint32_t>(granted);
+    return true;
+}
+
+bool udp_endpoint_enable_rx_timestamps(UdpEndpoint* ep) noexcept {
+    assert(ep != nullptr);
+    assert(ep->sock != k_udp_invalid_sock);
+#if defined(_WIN32)
+    return false;
+#else
+    const int enabled = 1;
+#  if defined(SO_TIMESTAMPNS)
+    const int option = SO_TIMESTAMPNS;
+#  else
+    const int option = SO_TIMESTAMP;
+#  endif
+    return ::setsockopt(to_native(ep->sock), SOL_SOCKET, option, &enabled, sizeof(enabled)) == 0;
+#endif
+}
+
+#if !defined(_WIN32)
+namespace {
+std::int64_t control_stamp(const msghdr& message) noexcept {
+    assert(message.msg_controllen == 0 || message.msg_control != nullptr);
+    for (cmsghdr* c = CMSG_FIRSTHDR(const_cast<msghdr*>(&message)); c != nullptr;
+         c = CMSG_NXTHDR(const_cast<msghdr*>(&message), c)) {
+        if (c->cmsg_level != SOL_SOCKET) continue;
+#  if defined(SCM_TIMESTAMPNS)
+        if (c->cmsg_type == SCM_TIMESTAMPNS) {
+            timespec t;
+            std::memcpy(&t, CMSG_DATA(c), sizeof(t));
+            return std::int64_t(t.tv_sec) * 1000000000 + t.tv_nsec;
+        }
+#  endif
+        if (c->cmsg_type == SCM_TIMESTAMP) {
+            timeval t;
+            std::memcpy(&t, CMSG_DATA(c), sizeof(t));
+            return std::int64_t(t.tv_sec) * 1000000000 + std::int64_t(t.tv_usec) * 1000;
+        }
+    }
+    return 0;
+}
+}  // namespace
+#endif
+
+UdpStampedResult udp_recv_stamped(const UdpEndpoint* ep, void* buf, std::uint32_t cap,
+                                  UdpAddr* src) noexcept {
+    UdpStampedResult out{};
+#if defined(_WIN32)
+    out.result = udp_recv_from_checked(ep, buf, cap, src);
+    return out;
+#else
+    if (ep == nullptr || ep->sock == k_udp_invalid_sock || buf == nullptr || cap == 0u ||
+        cap > static_cast<std::uint32_t>(INT_MAX)) {
+        out.result = udp_recv_from_checked(ep, buf, cap, src);
+        return out;
+    }
+    iovec vector{buf, cap};
+    sockaddr_in from{};
+    alignas(cmsghdr) char control[128];
+    msghdr message{};
+    message.msg_name = &from;
+    message.msg_namelen = sizeof(from);
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    const ssize_t received = ::recvmsg(to_native(ep->sock), &message, 0);
+    if (received < 0) {
+        out.result = receive_failure(errno);
+        return out;
+    }
+    if ((message.msg_flags & MSG_TRUNC) != 0) {
+        out.result = {UdpReceiveStatus::Truncated, 0u, 0};
+        return out;
+    }
+    assert(static_cast<std::uint64_t>(received) <= cap);
+    out.result = {UdpReceiveStatus::Complete, static_cast<std::uint32_t>(received), 0};
+    out.rx_ns = control_stamp(message);
+    out.source = out.rx_ns != 0 ? UdpStampSource::Kernel : UdpStampSource::None;
+    if (src != nullptr) *src = {ntohl(from.sin_addr.s_addr), ntohs(from.sin_port), 0u};
+    return out;
+#endif
+}
+
+std::int32_t udp_wait_readable(const UdpEndpoint* const* endpoints, std::uint32_t count,
+                               std::uint32_t timeout_us) noexcept {
+    assert(endpoints != nullptr);
+    assert(count > 0u && count <= k_udp_wait_endpoints_max);
+    if (count == 0u || count > k_udp_wait_endpoints_max) return -1;
+#if defined(_WIN32)
+    WSAPOLLFD fds[k_udp_wait_endpoints_max];
+#else
+    pollfd fds[k_udp_wait_endpoints_max];
+#endif
+    for (std::uint32_t i = 0; i < count; ++i) {
+        fds[i].fd = to_native(endpoints[i]->sock);
+        fds[i].events = POLLIN;
+        fds[i].revents = 0;
+    }
+    const int timeout_ms = static_cast<int>((std::uint64_t(timeout_us) + 999u) / 1000u);
+#if defined(_WIN32)
+    return ::WSAPoll(fds, count, timeout_ms);
+#else
+    return ::poll(fds, count, timeout_ms);
 #endif
 }
 

@@ -35,7 +35,7 @@ endif()
 
 # SIMD tier for bolt::core (propagates to every consumer).
 #   NATIVE   — MSVC /arch:AVX2, GCC/Clang -march=native (best on build host)
-#   AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -msse4.2 (portable modern x86)
+#   AVX2     — MSVC /arch:AVX2, GCC/Clang -mavx2 -mfma -mf16c -msse4.2 (portable modern x86)
 #   SSE42    — GCC/Clang -msse4.2; MSVC no flag (baseline = SSE2, scalar path)
 #   PORTABLE — no SIMD flag; reproducible cross-machine builds (scalar on MSVC)
 # `BOLT_ENABLE_NATIVE` remains for back-compat and only affects benchmark
@@ -183,6 +183,37 @@ target_link_libraries(bolt INTERFACE
     bolt::core bolt::kernels bolt::join bolt::wire bolt::arrow
 )
 
+# bolt::obs — logging, metrics, tracing, crash reports and the sampling profiler.
+# Each is optional: off, its call sites compile to nothing. The switches live in
+# a generated header, so toggling one rebuilds only the sources that include it.
+option(BOLT_OBS_LOG      "Compile structured logging"   ON)
+option(BOLT_OBS_METRICS  "Compile metrics"              ON)
+option(BOLT_OBS_TRACE    "Compile tracing spans"        ON)
+option(BOLT_OBS_PROFILE  "Compile the sampling profiler" ON)
+option(BOLT_OBS_CRASH    "Compile the crash reporter"   ON)
+set(BOLT_OBS_LOG_MIN 1 CACHE STRING "Lowest compiled log level: 0 trace .. 5 fatal, 6 none")
+foreach(feature LOG METRICS TRACE PROFILE CRASH)
+    if(BOLT_OBS_${feature})
+        set(BOLT_OBS_${feature}_V 1)
+    else()
+        set(BOLT_OBS_${feature}_V 0)
+    endif()
+endforeach()
+set(BOLT_OBS_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/generated)
+configure_file(include/bolt/obs/obs_config.h.in ${BOLT_OBS_GENERATED}/bolt/obs/obs_config.h @ONLY)
+add_library(bolt_obs STATIC src/obs/log.cpp src/obs/log_format.cpp src/obs/metrics.cpp src/obs/trace.cpp src/obs/diag.cpp
+    src/obs/crash.cpp src/obs/prof.cpp)
+add_library(bolt::obs ALIAS bolt_obs)
+set_target_properties(bolt_obs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Threads REQUIRED)
+target_link_libraries(bolt_obs PUBLIC bolt::core Threads::Threads)
+target_include_directories(bolt_obs PUBLIC
+    $<BUILD_INTERFACE:${BOLT_OBS_GENERATED}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_obs)
+target_link_libraries(bolt INTERFACE bolt::obs)
+
 # ---------------------------------------------------------------------------
 # bolt::io — compiled static library (I/O-adjacent pure-compute primitives:
 # CRC32C software fallback, varints). No actual I/O — keeps Bolt's no-IO
@@ -239,6 +270,8 @@ if(BOLT_BUILD_IO)
     bolt_apply_simd(bolt_io_file ${BOLT_SIMD_TIER})
     target_link_libraries(bolt INTERFACE bolt::io_file)
 
+    add_executable(bench_obs EXCLUDE_FROM_ALL benchmarks/bench_obs.cpp)
+    target_link_libraries(bench_obs PRIVATE bolt::obs)
     add_executable(bench_mapped_ring EXCLUDE_FROM_ALL benchmarks/bench_mapped_ring.cpp)
     target_link_libraries(bench_mapped_ring PRIVATE bolt::io_file)
     bolt_apply_hardening(bench_mapped_ring)
@@ -309,7 +342,9 @@ if(BOLT_BUILD_REACTOR)
         src/api/net/event_loop.cpp
         src/api/net/io_dispatcher.cpp
         src/api/net/coro_tcp_listener.cpp
-        src/api/net/tcp_socket.cpp)
+        src/api/net/tcp_socket.cpp
+        src/api/io/file.cpp
+        src/api/io/io_scheduler.cpp)
     if(WIN32)
         list(APPEND _bolt_reactor_sources
             src/api/core/async_io_iocp.cpp
@@ -366,7 +401,15 @@ if(BOLT_BUILD_COMPUTE_IDOT)
         src/compute/idot_scalar.cpp
         src/compute/idot_avx2.cpp
         src/compute/idot_avx512vnni.cpp
-        src/compute/idot_dispatch.cpp)
+        src/compute/idot_dispatch.cpp
+        # f32/f16 float-activation SIMD GEMV (perf pass) -- same per-source-ISA
+        # + runtime-CPUID-dispatch pattern as the IDOT kernels above, so it
+        # rides in this same compiled library (compute_gemv.h is the public
+        # surface).
+        src/compute/gemv_scalar.cpp
+        src/compute/gemv_avx2.cpp
+        src/compute/gemv_avx512.cpp
+        src/compute/gemv_dispatch.cpp)
     add_library(bolt::compute_idot ALIAS bolt_compute_idot)
     # Consumers retain core's configured ISA. These dispatchable translation
     # units must not inherit it: scalar/dispatch are baseline, and each SIMD
@@ -400,11 +443,22 @@ if(BOLT_BUILD_COMPUTE_IDOT)
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+            # MSVC /arch:AVX2 enables AVX2+FMA+F16C intrinsics together;
+            # /arch:AVX512 additionally enables the 512-bit + cvtph path.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
         else()
             set_source_files_properties(src/compute/idot_avx2.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
             set_source_files_properties(src/compute/idot_avx512vnni.cpp
                 PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512bw;-mavx512vnni")
+            # -mf16c for the _mm256_cvtph_ps / _cvtsh_ss f16 upcasts.
+            set_source_files_properties(src/compute/gemv_avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+            set_source_files_properties(src/compute/gemv_avx512.cpp
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mavx512f")
         endif()
     endif()
 
@@ -475,7 +529,11 @@ if(BOLT_BUILD_VULKAN)
         file(MAKE_DIRECTORY "${_bolt_vulkan_shader_gen_dir}")
         set(_bolt_vulkan_shader_names matmul_dequant_f32 matmul_dequant_int8 matmul_dequant_int4 matmul_dequant_int2
                                        matmul_dequant_int8act_int8 matmul_dequant_int8act_int4
-                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched)
+                                       matmul_dequant_int8act_int8_batched matmul_dequant_int8act_int4_batched
+                                       rmsnorm       # BLLM-176 on-device RMSNorm
+                                       elementwise   # BLLM-179 add/SwiGLU/GeGLU
+                                       rope          # BLLM-177 rotate_half RoPE
+                                       attention)    # BLLM-178 flash-style decode attention
         set(_bolt_vulkan_shader_headers "")
         foreach(_shader_name ${_bolt_vulkan_shader_names})
             set(_src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_shader_name}.comp")
@@ -644,6 +702,11 @@ if(BOLT_BUILD_ROCM)
                 --offload-arch=gfx1151
                 "--rocm-path=${_bolt_rocm_root}"
                 -O2 -DNDEBUG -std=c++20
+                # BLLM-189: flush f32 denormals to zero. Coarse Int4 quant can
+                # produce subnormal intermediates that hit the GPU's slow FP
+                # path (measured ~6x decode slowdown on a real Int4 model);
+                # FTZ is standard for inference kernels and never hurts.
+                -fgpu-flush-denormals-to-zero
                 -fms-runtime-lib=dll
                 -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_rocm.cpp"
@@ -669,6 +732,47 @@ if(BOLT_BUILD_ROCM)
     # consumer needs (hipMalloc/hipMemcpy/kernel-launch symbols).
     target_link_libraries(bolt_rocm INTERFACE "$ENV{HIP_PATH}/lib/amdhip64.lib")
     target_link_libraries(bolt INTERFACE bolt::rocm)
+endif()
+
+# ---------------------------------------------------------------------------
+# bolt::cuda — NVIDIA/CUDA compute backend (BLLM-182). A near-1:1 mirror of
+# bolt::rocm (CUDA and HIP are source-compatible). Unlike the ROCm block above
+# (which needs a Windows clang++-direct workaround for the enable_language(HIP)
+# /machine:x64 link gap), CUDA has first-class CMake support, so this uses the
+# standard enable_language(CUDA) + CUDAToolkit path -- compiling bolt_cuda.cpp
+# as a CUDA TU (LANGUAGE CUDA). OFF by default; requires an explicit
+# -DBOLT_BUILD_CUDA=ON AND a real nvcc / CMAKE_CUDA_COMPILER. This dev box has
+# no NVIDIA GPU / no CUDA toolkit, so it stays inert here (BLLM-182 open until
+# validated on real hardware -- see bolt_cuda.h's status note).
+# ---------------------------------------------------------------------------
+option(BOLT_BUILD_CUDA "Build bolt::cuda CUDA/NVIDIA matmul+dequant + on-device-forward kernel core (needs nvcc; unvalidated -- see bolt_cuda.h)" OFF)
+
+if(BOLT_BUILD_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(WARNING "BOLT_BUILD_CUDA requested but no CUDA compiler (nvcc) found -- skipping bolt::cuda")
+        set(BOLT_BUILD_CUDA OFF)
+    endif()
+endif()
+
+if(BOLT_BUILD_CUDA)
+    enable_language(CUDA)
+    add_library(bolt_cuda STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp")
+    # nvcc compiles bolt_cuda.cpp as CUDA (it uses <<<>>> launch syntax + __global__).
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/bolt_cuda.cpp"
+                                PROPERTIES LANGUAGE CUDA)
+    set_target_properties(bolt_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_library(bolt::cuda ALIAS bolt_cuda)
+    target_include_directories(bolt_cuda PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    # cudart -- the CUDA runtime (cudaMalloc/cudaMemcpy/kernel-launch symbols).
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_libraries(bolt_cuda PUBLIC CUDA::cudart)
+    endif()
+    target_link_libraries(bolt INTERFACE bolt::cuda)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1362,7 @@ if(BOLT_INSTALL)
 # Found by chukonu, not by bolt's own consumer test, because that test only
 # touched bolt_arena.h. A partial header install is worse than none: it passes
 # every check that counts files or asks whether install succeeded.
+install(FILES ${BOLT_OBS_GENERATED}/bolt/obs/obs_config.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/bolt/obs)
 install(DIRECTORY include/bolt
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h" PATTERN "*.inc"
@@ -1276,7 +1381,7 @@ install(DIRECTORY include/bolt
 # satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
-    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt_datetime bolt
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt_datetime bolt_obs bolt
     bolt_entropy bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)

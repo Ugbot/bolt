@@ -3,7 +3,7 @@
 #pragma once
 
 // Kind C: maximum per-exchange timeout budget.
-constexpr uint32_t kMaxTimeoutMs = 60000;
+constexpr uint32_t kMaxTimeoutMs = 3600000;
 
 // Kind C: bounded wire-framing overhead byte budget.
 constexpr uint32_t kMaxWireOverhead = 64u * 1024u;
