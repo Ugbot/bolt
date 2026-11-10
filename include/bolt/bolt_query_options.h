@@ -343,7 +343,8 @@ inline QueryOptionResult apply_query_option(const char* key, size_t kn, const ch
         uint32_t row = 0;
         if (!query_knob_limit(key, kn, &t, &row)) return QueryOptionResult::UnknownKey;
         if (word_is(value, vn, "default")) n = kQueryKnobReset;
-        else if (!parse_query_uint(value, vn, &n)) return QueryOptionResult::BadValue;
+        else if (!parse_query_uint(value, vn, &n) &&
+                 !(limits_is_mode(t->descs[row]) && limits_parse_mode(value, vn, &n))) return QueryOptionResult::BadValue;
         if (!query_knob_put(&o->knobs, key, kn, n, QueryKnobSource::Query)) return QueryOptionResult::BadValue;
         o->set |= QueryOptions::kKnobs;
     }

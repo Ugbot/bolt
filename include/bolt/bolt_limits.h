@@ -123,6 +123,37 @@ inline bool limits_parse_u64(const char* s, uint64_t* out) noexcept {
     return true;
 }
 
+// A switch knob: unit kLimitUnitMode, values off (0), on (1), auto (2), which
+// read and print as those words. `auto` leaves the choice to the code that
+// reads the knob (cost, estimates, the cluster), never to a hidden default.
+inline constexpr const char* kLimitUnitMode = "off|on|auto";
+inline constexpr uint64_t kLimitModeOff = 0u, kLimitModeOn = 1u, kLimitModeAuto = 2u;
+
+inline bool limits_is_mode(const LimitDesc& d) noexcept {
+    return d.unit != nullptr && std::strcmp(d.unit, kLimitUnitMode) == 0;
+}
+
+// off / on / auto (any case) for a mode knob; false for anything else.
+inline bool limits_parse_mode(const char* s, size_t n, uint64_t* out) noexcept {
+    assert(out != nullptr);
+    static const char* const words[3] = {"off", "on", "auto"};
+    for (uint64_t w = 0; w < 3u; ++w) {
+        const size_t len = std::strlen(words[w]);
+        if (n != len) continue;
+        bool eq = true;
+        for (size_t i = 0; i < n && eq; ++i) {
+            const char c = (s[i] >= 'A' && s[i] <= 'Z') ? static_cast<char>(s[i] + 32) : s[i];
+            eq = c == words[w][i];
+        }
+        if (eq) { *out = w; return true; }
+    }
+    return false;
+}
+
+inline const char* limits_mode_name(uint64_t v) noexcept {
+    return v == kLimitModeOff ? "off" : v == kLimitModeOn ? "on" : v == kLimitModeAuto ? "auto" : "?";
+}
+
 inline bool limits_in_range(const LimitDesc& d, uint64_t v) noexcept {
     return v >= d.min && v <= d.max;
 }
@@ -149,7 +180,9 @@ inline bool limits_resolve(LimitTable* t) noexcept {
         }
         if (raw == nullptr || *raw == '\0') continue;
         uint64_t v = 0;
-        if (!limits_parse_u64(raw, &v) || !limits_in_range(d, v)) {
+        const bool parsed = limits_parse_u64(raw, &v) ||
+                            (limits_is_mode(d) && limits_parse_mode(raw, std::strlen(raw), &v));
+        if (!parsed || !limits_in_range(d, v)) {
             if (ok) {
                 std::snprintf(t->error, sizeof(t->error),
                               "%s=%s is invalid for limit %s.%s: expected an "
