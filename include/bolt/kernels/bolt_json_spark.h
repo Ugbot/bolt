@@ -69,12 +69,15 @@ struct Parser {
     uint32_t       tb, te;               // string content / number text, byte range in s
     uint8_t        quote;                // the quote char of the current string / name
     bool           esc;                  // the token contains a backslash
+    bool           ctrl_ok;              // raw control characters inside strings (get_json_object: yes; from_json: no)
+    bool           nan_ok;               // NaN / Infinity / +-INF number tokens (from_json, schema_of_json: yes)
 };
 
-inline void parser_init(Parser* p, const uint8_t* s, uint32_t n) noexcept {
+inline void parser_init(Parser* p, const uint8_t* s, uint32_t n, bool ctrl_ok = true, bool nan_ok = false) noexcept {
     assert(p != nullptr && (s != nullptr || n == 0));
     p->s = s; p->n = n; p->i = 0; p->cur = Tok::None; p->depth = 0;
     p->has_elem = false; p->in_obj = false; p->tb = p->te = 0; p->quote = 0; p->esc = false;
+    p->ctrl_ok = ctrl_ok; p->nan_ok = nan_ok;
     std::memset(p->obj_bits, 0, sizeof p->obj_bits);
     std::memset(p->elem_bits, 0, sizeof p->elem_bits);
     if (n >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF) p->i = 3;       // UTF-8 BOM (Jackson skips it)
@@ -138,6 +141,7 @@ inline bool scan_string(Parser* p) noexcept {
                 return false;
             }
         } else if (c < 0x80) {
+            if (c < 0x20 && !p->ctrl_ok) return false;
             ++i;
         } else {                                                    // multi-byte UTF-8: continuation bytes must follow
             const uint32_t len = c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : c >= 0xC2 ? 2u : 0u;
@@ -215,6 +219,18 @@ inline Tok scan_value(Parser* p, bool root) noexcept {
         case 'f': if (!scan_literal(p, "false", 5)) return fail(p); p->cur = Tok::False; return p->cur;
         case 'n': if (!scan_literal(p, "null", 4)) return fail(p); p->cur = Tok::Null; return p->cur;
         default:
+            if (p->nan_ok && (c == 'N' || c == 'I' || ((c == '-' || c == '+') && p->i + 1 < p->n && p->s[p->i + 1] == 'I') ||
+                              (c == 'N'))) {
+                static const char* const kw[] = {"NaN", "Infinity", "+Infinity", "-Infinity", "+INF", "-INF"};
+                for (const char* w : kw) {
+                    if (scan_literal(p, w, static_cast<uint32_t>(std::strlen(w)))) {
+                        p->tb = p->i - static_cast<uint32_t>(std::strlen(w)); p->te = p->i;
+                        p->cur = Tok::Float;
+                        return p->cur;
+                    }
+                }
+                return fail(p);
+            }
             if (c == '-' || is_digit(c)) {
                 const Tok t = scan_number(p);
                 if (t == Tok::Error) return t;
@@ -388,9 +404,26 @@ inline void put_unit_escaped(Out* o, uint32_t u) noexcept {
     put_utf8(o, u);
 }
 
-inline void token_json_string(const Parser& p, Out* o) noexcept {
+// `chars`: the char-based generator Spark buffers wildcard matches in (supplementary characters stay whole, a lone
+// surrogate cannot be re-encoded: *bad). Otherwise the byte generator (a surrogate becomes a \uXXXX escape).
+inline void token_json_string(const Parser& p, Out* o, bool chars = false, bool* bad = nullptr) noexcept {
     o->put('"');
-    for_each_unit(p, [&](uint32_t u) noexcept { put_unit_escaped(o, u); });
+    if (!chars) {
+        for_each_unit(p, [&](uint32_t u) noexcept { put_unit_escaped(o, u); });
+    } else {
+        uint32_t hi = 0;
+        for_each_unit(p, [&](uint32_t u) noexcept {
+            if (hi != 0) {
+                if (u >= 0xDC00 && u <= 0xDFFF) { put_utf8(o, 0x10000u + ((hi - 0xD800u) << 10) + (u - 0xDC00u)); hi = 0; return; }
+                if (bad != nullptr) *bad = true;
+                hi = 0;
+            }
+            if (u >= 0xD800 && u <= 0xDBFF) { hi = u; return; }
+            if (u >= 0xDC00 && u <= 0xDFFF) { if (bad != nullptr) *bad = true; return; }
+            put_unit_escaped(o, u);
+        });
+        if (hi != 0 && bad != nullptr) *bad = true;
+    }
     o->put('"');
 }
 
@@ -448,6 +481,19 @@ inline uint32_t java_double_chars(char* out, uint32_t cap, double v) noexcept {
     return w;
 }
 
+// The value of an Int / Float token as a double (correctly rounded; NaN / Infinity / +-INF tokens included).
+inline double token_double(const Parser& p) noexcept {
+    assert(p.cur == Tok::Int || p.cur == Tok::Float);
+    const char* t = reinterpret_cast<const char*>(p.s + p.tb);
+    const uint32_t len = p.te - p.tb;
+    if (len > 0 && (t[0] == 'N')) return std::nan("");
+    if (len > 1 && (t[0] == 'I' || t[1] == 'I')) return t[0] == '-' ? -HUGE_VAL : HUGE_VAL;
+    if (p.cur == Tok::Int && len == 2 && t[0] == '-' && t[1] == '0') return 0.0;        // an integer token has no negative zero
+    double d = 0;
+    (void)float_chars::f64_from_json_chars(t, t + len, &d);
+    return d;
+}
+
 // The number token as Jackson's copyCurrentStructure writes it: int / long / big integer text, or a double.
 inline void put_number(const Parser& p, Out* o) noexcept {
     assert(p.cur == Tok::Int || p.cur == Tok::Float);
@@ -458,8 +504,7 @@ inline void put_number(const Parser& p, Out* o) noexcept {
         o->put(t, len);
         return;
     }
-    double d = 0;
-    (void)float_chars::f64_from_json_chars(t, t + len, &d);
+    const double d = token_double(p);
     if (d != d) { o->put("\"NaN\"", 5); return; }
     if (d > 1.7976931348623157e308) { o->put("\"Infinity\"", 10); return; }
     if (d < -1.7976931348623157e308) { o->put("\"-Infinity\"", 11); return; }
@@ -471,13 +516,15 @@ inline void put_number(const Parser& p, Out* o) noexcept {
 
 struct Gen {
     Out*     o;
+    bool     chars;     // the char-based generator (see token_json_string)
+    bool     bad;       // a string it could not encode
     uint32_t depth;
     bool     first[kMaxNesting + 8];     // the container at [depth] has no element yet
     bool     after_name;
 };
 
 inline void gen_init(Gen* g, Out* o) noexcept {
-    g->o = o; g->depth = 0; g->first[0] = true; g->after_name = false;
+    g->o = o; g->chars = false; g->bad = false; g->depth = 0; g->first[0] = true; g->after_name = false;
 }
 inline bool gen_value_prefix(Gen* g) noexcept {
     if (g->after_name) { g->after_name = false; return true; }
@@ -502,7 +549,7 @@ inline bool gen_name(Gen* g, const Parser& p) noexcept {
         if (!g->first[g->depth]) g->o->put(',');
         g->first[g->depth] = false;
     }
-    token_json_string(p, g->o);
+    token_json_string(p, g->o, g->chars, &g->bad);
     g->o->put(':');
     g->after_name = true;
     return true;
@@ -528,7 +575,7 @@ inline bool copy_structure(Parser* p, Gen* g) noexcept {
             case Tok::FieldName: gen_name(g, *p); break;
             case Tok::String:
                 if (!gen_value_prefix(g)) return false;
-                token_json_string(*p, g->o);
+                token_json_string(*p, g->o, g->chars, &g->bad);
                 break;
             case Tok::Int: case Tok::Float:
                 if (!gen_value_prefix(g)) return false;
@@ -539,6 +586,7 @@ inline bool copy_structure(Parser* p, Gen* g) noexcept {
             case Tok::Null: if (!gen_raw_value(g, "null", 4)) return false; break;
             default: return false;
         }
+        if (g->bad) return false;
         if (!cont) return true;
         if ((t == Tok::EndObject || t == Tok::EndArray) && p->depth == target) return true;
         t = next(p);
@@ -700,6 +748,7 @@ inline bool eval_path(Eval* e, Gen* g, Style st, uint32_t k, bool* dirty) noexce
         Out sub{o->p, o->cap, sb, o->over};
         Gen sg;
         gen_init(&sg, &sub);
+        sg.chars = true;
         gen_start(&sg, '[');
         uint32_t matches = 0;
         for (uint64_t guard = 0; ok; ++guard) {
