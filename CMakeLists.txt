@@ -163,6 +163,22 @@ target_include_directories(bolt_thread PUBLIC
     $<INSTALL_INTERFACE:include>)
 bolt_apply_hardening(bolt_thread)
 target_link_libraries(bolt INTERFACE bolt::thread)
+
+# Calendar, IANA time-zone rules (embedded tzdb, scripts/gen_tzdb.py) and
+# Spark/java.time datetime patterns. Cold tables, no platform dependency.
+add_library(bolt_datetime STATIC
+    src/datetime/bolt_tz.cpp
+    src/datetime/bolt_datetime_fmt.cpp
+    src/datetime/bolt_datetime_parse.cpp
+    src/datetime/bolt_datetime_kernels.cpp)
+add_library(bolt::datetime ALIAS bolt_datetime)
+set_target_properties(bolt_datetime PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(bolt_datetime PUBLIC bolt::core)
+target_include_directories(bolt_datetime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+bolt_apply_hardening(bolt_datetime)
+target_link_libraries(bolt INTERFACE bolt::datetime)
 target_link_libraries(bolt INTERFACE
     bolt::core bolt::kernels bolt::join bolt::wire bolt::arrow
 )
@@ -1365,7 +1381,7 @@ install(DIRECTORY include/bolt
 # satisfy boltapi. bolt_ybolt was likewise absent — its own CMakeLists claims
 # "its install set is independent", but no such install set exists anywhere.
 set(_bolt_exportable
-    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt_obs bolt
+    bolt_core bolt_kernels bolt_join bolt_wire bolt_arrow bolt_interop bolt_thread bolt_datetime bolt_obs bolt
     bolt_entropy bolt_ribbon bolt_net bolt_crypto bolt_lakehouse
     bolt_io bolt_io_file bolt_file_read bolt_parse bolt_reactor bolt_vulkan bolt_ingest bolt_compute_idot
     bolt_ybolt)

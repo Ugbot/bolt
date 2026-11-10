@@ -1,5 +1,7 @@
 #include "bolt/ingest/bolt_arrow_ipc_reader.h"
 #include "bolt/bolt_column.h"
+#include "bolt/bolt_nested_column.h"
+#include "bolt/bolt_arena.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <atomic>
@@ -110,7 +112,7 @@ TEST(ArrowIpcReader, OrdinaryOwnedMappedFileOpenerAndClose){
     EXPECT_EQ(arrow_ipc_reader_open_file("missing-owned-arrow-reader-fixture",w.limits,w.p,w.size,w.reader),Status::IoError);
 }
 TEST(ArrowIpcReader, ExplicitUnsupportedSchemaAndCompressedBatch){
-    for(const auto* name:{"nested.arrows","dictionary.arrows","negative_scale.arrows"}){SCOPED_TRACE(name);Work w;EXPECT_EQ(w.open(load(name)),Status::Unsupported);EXPECT_EQ(w.reader.state,nullptr);}
+    for(const auto* name:{"dictionary.arrows","negative_scale.arrows"}){SCOPED_TRACE(name);Work w;EXPECT_EQ(w.open(load(name)),Status::Unsupported);EXPECT_EQ(w.reader.state,nullptr);}
     auto bytes=load("compressed.arrows");Work w;ASSERT_EQ(w.open(bytes),Status::Ok);
     const BoltBatch* out=reinterpret_cast<const BoltBatch*>(std::uintptr_t{64});EXPECT_EQ(arrow_ipc_reader_next(w.reader,out),Status::Unsupported);EXPECT_EQ(reinterpret_cast<std::uintptr_t>(out),64u);
 }
@@ -213,3 +215,92 @@ TEST(ArrowIpcReader, ReusableNextHasNoHeapAllocation){
     EXPECT_EQ(a,Status::Ok);EXPECT_EQ(b,Status::Ok);EXPECT_EQ(c,Status::Ok);EXPECT_EQ(d,Status::End);EXPECT_EQ(before,after);values(*out);
 }
 } // namespace
+namespace {
+std::string text(const BoltColumn& c,std::int64_t row){
+    const auto& v=static_cast<const StringView*>(c.data)[row];
+    if(v.length<=12)return std::string(reinterpret_cast<const char*>(v.prefix),v.length);
+    return std::string(static_cast<const char*>(c.str_overflow_base)+v.ref.offset,v.length);
+}
+std::vector<std::int32_t> spans(const BoltColumn& c){
+    const auto* o=c.list_offsets();return std::vector<std::int32_t>(o,o+c.length+1);
+}
+// Batch 0 rows 0..3; the second batch is rows 1..3 (`first` = 1).
+void nested_values(const BoltBatch& b,std::int64_t first){
+    using V=std::vector<std::int32_t>;
+    const std::int64_t rows=4-first;ASSERT_EQ(b.num_rows,rows);ASSERT_EQ(b.num_cols,5u);
+    const auto& ints=b.col(0);ASSERT_TRUE(ints.is_nested());EXPECT_EQ(ints.type,BoltType::List);
+    const auto& item=*ints.list_element();EXPECT_EQ(item.type,BoltType::Int32);
+    if(first==0){EXPECT_EQ(spans(ints),(V{0,2,2,2,4}));EXPECT_EQ(lane<std::int32_t>(item,1),2);
+        EXPECT_TRUE(ints.is_null(1));EXPECT_FALSE(ints.is_null(2));EXPECT_TRUE(item.is_null(2));EXPECT_EQ(lane<std::int32_t>(item,3),7);}
+    else{EXPECT_EQ(spans(ints),(V{0,0,0,2}));EXPECT_TRUE(ints.is_null(0));EXPECT_EQ(lane<std::int32_t>(item,1),7);}
+    const auto& names=b.col(1);const auto& name=*names.list_element();EXPECT_EQ(name.type,BoltType::Utf8);
+    if(first==0){EXPECT_EQ(text(name,0),"a");EXPECT_EQ(text(name,1),"a long string past twelve");EXPECT_TRUE(names.is_null(2));}
+    const auto& pair=b.col(2);EXPECT_EQ(pair.type,BoltType::Struct);ASSERT_EQ(pair.child_count(),2);
+    EXPECT_EQ(pair.child_at(0)->length,rows);EXPECT_EQ(text(*pair.child_at(1),rows-1),"");
+    EXPECT_TRUE(pair.is_null(1-first));EXPECT_EQ(lane<std::int64_t>(*pair.child_at(0),rows-1),-5);
+    const auto& attrs=b.col(3);EXPECT_EQ(attrs.type,BoltType::Map);
+    const auto& entry=*attrs.list_element();ASSERT_EQ(entry.type,BoltType::Struct);ASSERT_EQ(entry.child_count(),2);
+    if(first==0){EXPECT_EQ(spans(attrs),(V{0,2,2,2,3}));EXPECT_EQ(text(*entry.child_at(0),1),"j");
+        EXPECT_TRUE(entry.child_at(1)->is_null(1));EXPECT_EQ(lane<std::int64_t>(*entry.child_at(1),2),9);}
+    const auto& points=b.col(4);const auto& point=*points.list_element();ASSERT_EQ(point.type,BoltType::Struct);
+    const auto& tags=*point.child_at(1);EXPECT_EQ(tags.type,BoltType::List);EXPECT_EQ(tags.list_element()->type,BoltType::Utf8);
+    if(first==0){EXPECT_EQ(spans(points),(V{0,2,2,3,4}));EXPECT_TRUE(point.is_null(1));EXPECT_TRUE(tags.is_null(2));
+        EXPECT_EQ(text(*tags.list_element(),0),"p");EXPECT_EQ(lane<double>(*point.child_at(0),0),1.5);}
+}
+} // namespace
+TEST(ArrowIpcReader, ListStructMapReferenceValuesAndNamedTypes){
+    for(const auto* name:{"nested_ok.arrows","nested_ok.arrow"}){SCOPED_TRACE(name);const auto bytes=load(name);ASSERT_FALSE(bytes.empty());
+        Work w;ASSERT_EQ(w.open(bytes),Status::Ok);IpcReadSchema schema{};ASSERT_EQ(arrow_ipc_reader_schema(w.reader,schema),Status::Ok);
+        ASSERT_EQ(schema.field_count,5u);
+        const auto& points=schema.fields[4];ASSERT_EQ(points.child_count,1u);EXPECT_GE(points.first_child,5u);
+        const auto& point=schema.fields[points.first_child];EXPECT_EQ(point.physical_type,BoltType::Struct);ASSERT_EQ(point.child_count,2u);
+        EXPECT_EQ(std::string(schema.fields[point.first_child+1].name.data,schema.fields[point.first_child+1].name.size),"tags");
+        nested_row::NamedType types[5];
+        for(std::uint32_t i=0;i<5;++i)ASSERT_EQ(arrow_ipc_field_named_type(schema,i,types[i]),Status::Ok);
+        EXPECT_EQ(types[3].values.nodes[0].type,BoltType::Map);EXPECT_EQ(std::string(types[3].fields[2].name),"key");
+        EXPECT_EQ(types[4].values.n,5u);
+        nested_row::NamedType flat{};EXPECT_EQ(arrow_ipc_field_named_type(schema,5,flat),Status::InvalidArgument);
+        for(std::int64_t first:{0,1}){const BoltBatch* batch=nullptr;ASSERT_EQ(arrow_ipc_reader_next(w.reader,batch),Status::Ok);
+            nested_values(*batch,first);
+            Arena arena{};
+            for(std::uint32_t i=0;i<5;++i){SCOPED_TRACE(i);BoltColumn enc{};
+                ASSERT_TRUE(nested_row::encode_column(types[i],batch->col(i),&arena,nested_row::ColumnLimits{},&enc));
+                EXPECT_EQ(enc.format,ColumnFormat::VarBinary);EXPECT_EQ(enc.length,batch->num_rows);}
+        }
+        const BoltBatch* end=nullptr;EXPECT_EQ(arrow_ipc_reader_next(w.reader,end),Status::End);
+    }
+}
+TEST(ArrowIpcReader, NestedNodeBudgetCountsChildren){
+    const auto bytes=load("nested_ok.arrows");Work w;w.limits.max_fields=8;
+    std::uint64_t size=0;ASSERT_EQ(arrow_ipc_reader_workspace_size(w.limits,size),Status::Ok);
+    void* p=bolt_aligned_alloc(64,static_cast<std::size_t>(size));ArrowIpcReader r{};
+    EXPECT_EQ(arrow_ipc_reader_open(bytes.data(),bytes.size(),w.limits,p,size,r),Status::Limit);
+    arrow_ipc_reader_close(r);bolt_aligned_free(p);
+}
+TEST(ArrowIpcReader, NestedTruncationAndByteCorruptionNeverPublishPartialBatches){
+    const auto original=load("nested_ok.arrows");ASSERT_FALSE(original.empty());
+    for(std::size_t n=0;n<original.size();++n){
+        std::vector<std::uint8_t> cut(original.begin(),original.begin()+static_cast<std::ptrdiff_t>(n));
+        Work w;if(w.open(cut)!=Status::Ok)continue;const BoltBatch* b=nullptr;
+        for(int k=0;k<4&&arrow_ipc_reader_next(w.reader,b)==Status::Ok;++k)EXPECT_GT(b->num_rows,0);
+    }
+    for(std::size_t i=0;i<original.size();++i)for(std::uint8_t x:{std::uint8_t{0x01},std::uint8_t{0x80},std::uint8_t{0xff}}){
+        auto bad=original;bad[i]^=x;Work w;if(w.open(bad)!=Status::Ok)continue;const BoltBatch* b=nullptr;
+        for(int k=0;k<4&&arrow_ipc_reader_next(w.reader,b)==Status::Ok;++k){
+            for(std::uint32_t c=0;c<b->num_cols;++c){const auto& col=b->col(c);EXPECT_EQ(col.length,b->num_rows);
+                if(col.list_offsets()!=nullptr){EXPECT_EQ(col.list_offsets()[0],0);
+                    EXPECT_EQ(col.list_offsets()[col.length],col.list_element()->length);}}
+        }
+    }
+}
+TEST(ArrowIpcReader, FixedSizeAndLargeListsPublishAsLists){
+    for(const auto* name:{"nested.arrows","large_list.arrows"}){SCOPED_TRACE(name);const auto bytes=load(name);Work w;ASSERT_EQ(w.open(bytes),Status::Ok);
+        const BoltBatch* b=nullptr;ASSERT_EQ(arrow_ipc_reader_next(w.reader,b),Status::Ok);ASSERT_EQ(b->num_rows,2);
+        const auto& c=b->col(0);ASSERT_EQ(c.type,BoltType::List);EXPECT_TRUE(c.is_null(1));
+        const auto* o=c.list_offsets();EXPECT_EQ(o[0],0);EXPECT_EQ(o[1],2);
+        EXPECT_EQ(o[2],std::strcmp(name,"nested.arrows")==0?4:2);   // a null fixed-size list keeps its slots
+        EXPECT_EQ(lane<std::int32_t>(*c.list_element(),0),1);EXPECT_EQ(lane<std::int32_t>(*c.list_element(),1),2);
+        IpcReadSchema schema{};ASSERT_EQ(arrow_ipc_reader_schema(w.reader,schema),Status::Ok);
+        nested_row::NamedType t{};ASSERT_EQ(arrow_ipc_field_named_type(schema,0,t),Status::Ok);
+        Arena arena{};BoltColumn enc{};EXPECT_TRUE(nested_row::encode_column(t,c,&arena,nested_row::ColumnLimits{},&enc));}
+}

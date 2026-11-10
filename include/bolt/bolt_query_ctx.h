@@ -59,6 +59,10 @@ struct alignas(64) QueryCtx {
     std::atomic<uint32_t>            generation{0};   // odd while in use
     const std::atomic<uint32_t>*     cancel_flag = nullptr;
     QueryLimits                      limits{};
+    // Why a worker failed the query, in words, for the submitting thread
+    // (which reads it after the drivers return). First failure wins.
+    std::atomic<uint32_t>            failed{0};      // 0 none, 1 writing, 2 set
+    char                             fail_message[160] = {};
     alignas(64) std::atomic<uint64_t> mem_used{0};
     std::atomic<uint64_t>            mem_peak{0};
     std::atomic<uint64_t>            rows{0};
@@ -96,6 +100,18 @@ struct alignas(64) QueryCtx {
         mem_used.fetch_sub(n, std::memory_order_relaxed);
     }
     // Result rows produced; past row_limit the query stops. False when it has.
+    void fail(const char* message) noexcept {
+        uint32_t none = 0;
+        if (message == nullptr || !failed.compare_exchange_strong(none, 1u, std::memory_order_acq_rel)) return;
+        size_t n = 0;
+        while (n + 1 < sizeof fail_message && message[n] != '\0') { fail_message[n] = message[n]; ++n; }
+        fail_message[n] = '\0';
+        failed.store(2u, std::memory_order_release);
+    }
+    // The first failure's message, or nullptr.
+    const char* failure() const noexcept {
+        return failed.load(std::memory_order_acquire) == 2u ? fail_message : nullptr;
+    }
     bool add_rows(uint64_t n) noexcept {
         const uint64_t total = rows.fetch_add(n, std::memory_order_relaxed) + n;
         if (limits.row_limit == 0u || total <= limits.row_limit) return true;
@@ -139,6 +155,8 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->mem_used.store(0u, std::memory_order_relaxed);
         q->mem_peak.store(0u, std::memory_order_relaxed);
         q->rows.store(0u, std::memory_order_relaxed);
+        q->failed.store(0u, std::memory_order_relaxed);
+        q->fail_message[0] = '\0';
         return q;
     }
     return nullptr;

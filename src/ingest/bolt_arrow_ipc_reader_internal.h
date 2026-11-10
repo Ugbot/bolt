@@ -9,6 +9,7 @@
 #include <new>
 namespace bolt::ingest::ipc_read_detail {
 using Status = IpcReadStatus;
+inline constexpr std::uint32_t kMaxIpcDepth = 32;   // list/struct/map nesting
 inline bool range(std::uint64_t p, std::uint64_t n, std::uint64_t cap) noexcept {
     return p <= cap && n <= cap-p;
 }
@@ -82,7 +83,7 @@ inline bool indirect(Fb f, std::uint32_t p, std::uint32_t& out) noexcept {
 }
 struct Message { Fb fb{}; Table header{}; std::uint64_t body=0, next=0; std::uint32_t metadata=0;
     std::int16_t version=0; std::uint8_t kind=0; bool eos=false; };
-struct Layout { const std::uint8_t *validity=nullptr,*values=nullptr,*offsets=nullptr;
+struct Layout { const std::uint8_t *validity=nullptr,*values=nullptr,*offsets=nullptr; std::int64_t length=0;
     std::uint64_t value_bytes=0; std::int64_t nulls=0; };
 struct State {
     IpcReadLimits limits{}; const std::uint8_t* input=nullptr;
@@ -91,6 +92,7 @@ struct State {
     Fb footer{}; bool file=false;
     std::int16_t version=0;
     IpcReadSchema schema{};
+    std::uint32_t node_count=0;   // fields incl. nested children (<= max_fields)
     IpcReadField *fields=nullptr,*compare_fields=nullptr;
     IpcReadKeyValue *kv=nullptr,*compare_kv=nullptr;
     Layout* layout=nullptr; BoltField* bolt_fields=nullptr;

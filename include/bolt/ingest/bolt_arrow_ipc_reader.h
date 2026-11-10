@@ -1,11 +1,13 @@
 #pragma once
 // Owned Arrow IPC reader, format pin apache-arrow-21.0.0. No Arrow or
-// FlatBuffers runtime dependency. This is a bounded flat-type subset.
+// FlatBuffers runtime dependency. A bounded subset: flat types plus
+// List / Struct / Map.
 #include <cstddef>
 #include <cstdint>
 #include "bolt/bolt_types.h"
 #include "bolt/io/bolt_file_io.h"
 namespace bolt { struct BoltBatch; }
+namespace bolt::nested_row { struct NamedType; }
 namespace bolt::ingest {
 struct IpcReadString { const char* data = nullptr; std::uint32_t size = 0; };
 struct IpcReadKeyValue { IpcReadString key, value; };
@@ -16,7 +18,12 @@ struct IpcReadField {
     IpcReadString name, timezone;
     const IpcReadKeyValue* metadata = nullptr;
     std::uint32_t metadata_count = 0;
-    std::uint32_t first_child = 0, child_count = 0; // reserved tree shape
+    // List (12) / Struct_ (13) / FixedSizeList (16, byte_width = list size) /
+    // Map (17) / LargeList (21): children are
+    // schema.fields[first_child .. first_child + child_count), slots past
+    // field_count in the same array. A Map's child is its non-null
+    // entries struct of {key (non-null), value}.
+    std::uint32_t first_child = 0, child_count = 0;
     std::int32_t precision = 0, scale = 0, byte_width = 0;
     std::int16_t unit = 0; // Arrow DateUnit / TimeUnit according to arrow_type
     std::uint8_t arrow_type = 0;
@@ -63,6 +70,12 @@ IpcReadStatus arrow_ipc_reader_open(const void* input, std::uint64_t input_bytes
     ArrowIpcReader&) noexcept;
 IpcReadStatus arrow_ipc_reader_open_file(const char* path, const IpcReadLimits&,
     void* workspace, std::uint64_t workspace_bytes, ArrowIpcReader&) noexcept;
+// The named nested type of top-level field `field` (a List / Struct / Map),
+// the tree a batch column of that field has (bolt::nested_row encode/decode
+// take it). InvalidArgument for a flat field; Unsupported past the
+// nested_row node/name bounds. `max_fields` counts nested children too.
+IpcReadStatus arrow_ipc_field_named_type(const IpcReadSchema&, std::uint32_t field,
+                                         nested_row::NamedType& out) noexcept;
 // Returned schema borrows input+workspace; valid until close. Exact signed
 // decimal scale is retained, but this subset admits Decimal128 only with
 // precision 1..38 and scale 0..38; other widths/scales return Unsupported.
@@ -72,8 +85,12 @@ IpcReadStatus arrow_ipc_reader_schema(const ArrowIpcReader&, IpcReadSchema& out)
 // and batch cursor unchanged. On Ok: out is reader-owned, read-only, valid
 // until next successful next or close. It may be copied before then.
 // End accepts optional EOS or clean span exhaustion. Extra bytes after EOS
-// are BadInput. Nested/dictionary/compressed/view/large-offset arrays and
-// big-endian bodies are explicitly Unsupported. V4/V5 metadata admitted.
+// are BadInput. Dictionary/compressed/view/large-binary arrays, lists whose
+// offsets do not start at 0 and big-endian bodies are explicitly
+// Unsupported. List / LargeList / FixedSizeList / Struct / Map columns are
+// published as ColumnFormat::Nested trees (every list kind as a List with
+// int32 element offsets; a LargeList past INT32_MAX elements is a Limit).
+// V4/V5 metadata admitted.
 IpcReadStatus arrow_ipc_reader_next(ArrowIpcReader&, const BoltBatch*& out) noexcept;
 void arrow_ipc_reader_close(ArrowIpcReader&) noexcept;
 } // namespace bolt::ingest
