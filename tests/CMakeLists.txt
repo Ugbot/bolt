@@ -843,6 +843,17 @@ target_link_libraries(test_bolt_key_encode
 bolt_apply_hardening(test_bolt_key_encode)
 add_test(NAME test_bolt_key_encode COMMAND test_bolt_key_encode)
 
+# Partitioned writes: rows routed by key values in one pass.
+add_executable(test_bolt_partition_route test_bolt_partition_route.cpp)
+target_link_libraries(test_bolt_partition_route
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_partition_route)
+add_test(NAME test_bolt_partition_route COMMAND test_bolt_partition_route)
+
 add_executable(test_bolt_kernels test_bolt_kernels.cpp)
 
 target_link_libraries(test_bolt_kernels
@@ -1361,6 +1372,12 @@ add_executable(test_bolt_date test_bolt_date.cpp)
 target_link_libraries(test_bolt_date PRIVATE bolt::bolt GTest::gtest_main)
 bolt_apply_hardening(test_bolt_date PRIVATE)
 add_test(NAME bolt_date COMMAND test_bolt_date)
+
+# Embedded IANA tz rules, calendar math, Spark datetime patterns.
+add_executable(test_bolt_tz test_bolt_tz.cpp)
+target_link_libraries(test_bolt_tz PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_tz PRIVATE)
+add_test(NAME bolt_tz COMMAND test_bolt_tz)
 
 # Locale-independent double <-> text (std::to_chars / from_chars semantics
 # without the availability-gated <charconv> float overloads).
@@ -3045,6 +3062,12 @@ add_executable(test_bolt_iceberg_metadata_legacy test_bolt_iceberg_metadata_lega
 target_link_libraries(test_bolt_iceberg_metadata_legacy PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_iceberg_metadata_legacy)
 add_test(NAME test_bolt_iceberg_metadata_legacy COMMAND test_bolt_iceberg_metadata_legacy)
+# Text kernels (pad / initcap / format_string) + one-value nested navigation (G2LAUNCH-73/78).
+add_executable(test_bolt_text_fn test_bolt_text_fn.cpp)
+target_link_libraries(test_bolt_text_fn
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_fn)
+add_test(NAME test_bolt_text_fn COMMAND test_bolt_text_fn)
 
 # perf pass — f32/f16 float-activation SIMD GEMV (rides in bolt::compute_idot).
 # Every available SIMD tier (AVX2/AVX-512F) agrees with the scalar f64

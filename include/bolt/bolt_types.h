@@ -46,6 +46,12 @@ enum class BoltType : uint8_t {
     // slot 53 is already taken by `Symbol` — renumbering Symbol would
     // shift a wire-persisted enum byte and break old payloads.
     EmbeddingF16 = 54, EmbeddingU8 = 55, EmbeddingI8 = 56,
+    // G2LAUNCH-137: Spark TimestampNTZType / SQL TIMESTAMP WITHOUT TIME ZONE —
+    // int64 microseconds of a local wall clock, no zone. `Timestamp` is the
+    // instant (UTC micros) that date/time kernels render in a session zone.
+    // A bolt extension slot: Arrow has no distinct id for it (its tz-less
+    // timestamp[us] is exported as "tsu:").
+    TimestampNtz = 57,
     NUM_TYPES = 64,
 };
 
@@ -126,7 +132,8 @@ inline constexpr uint8_t kTypeSize[64] = {
     0, 0, 0, 0, 0,          // 45-49 reserved
     16, 4, 0, 0,             // UUID, IPv4, Embedding, Symbol
     0, 0, 0,                 // EmbeddingF16, EmbeddingU8, EmbeddingI8 (runtime stride)
-    0, 0, 0, 0, 0, 0, 0,    // 57-63 reserved
+    8,                       // TimestampNtz (int64 local micros)
+    0, 0, 0, 0, 0, 0,       // 58-63 reserved
 };
 
 inline constexpr size_t type_size(BoltType t) noexcept {
@@ -211,6 +218,7 @@ inline const char* type_name(BoltType t) noexcept {
         case BoltType::Date64:   return "date64";
         case BoltType::Timestamp:return "timestamp[us]";
         case BoltType::Duration: return "duration[us]";
+        case BoltType::TimestampNtz: return "timestamp_ntz[us]";
         case BoltType::Utf8:     return "utf8";
         case BoltType::Binary:   return "binary";
         case BoltType::List:     return "list";
@@ -252,6 +260,7 @@ inline const char* arrow_format_string(BoltType t) noexcept {
         case BoltType::Date64:   return "tdm";
         case BoltType::Timestamp:return "tsu:";   // microseconds, no tz
         case BoltType::Duration: return "tDu";
+        case BoltType::TimestampNtz: return "tsu:";   // a tz-less Arrow timestamp
         case BoltType::Utf8:     return "vu";      // utf8_view (Arrow StringView)
         case BoltType::Binary:   return "vz";      // binary_view
         case BoltType::Decimal128:return "d:38,10"; // default precision/scale

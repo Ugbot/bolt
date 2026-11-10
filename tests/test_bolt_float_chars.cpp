@@ -285,3 +285,39 @@ TEST(FloatCharsFixed, RoundTripsAndRefusesSmallCap) {
     char small[4];
     EXPECT_EQ(fc::f64_to_chars_fixed(small, sizeof(small), 12345.0), 0u);
 }
+
+// Ryu (bolt_ryu.h) against the exact free-format generator: same digits and
+// decimal point for every exponent's edge mantissas, powers of two and ten,
+// integers past 2^53, subnormals and random bit patterns.
+TEST(FloatCharsRyu, MatchesExactShortestDigits) {
+    const auto same = [](double v) {
+        char a[20], b[20];
+        int32_t ka = 0, kb = 0;
+        const uint32_t na = fc::detail::shortest_digits(v, a, &ka);
+        const uint32_t nb = fc::detail::shortest_digits_exact(v, b, &kb);
+        const bool ok = na == nb && ka == kb && std::memcmp(a, b, na) == 0;
+        EXPECT_TRUE(ok) << std::hexfloat << v << " ryu " << std::string(a, na) << "e" << ka
+                        << " exact " << std::string(b, nb) << "e" << kb;
+        return ok;
+    };
+    uint32_t bad = 0;
+    for (uint64_t e = 0; e < 2047 && bad < 8; ++e) {
+        for (uint64_t m : {uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{3}, (uint64_t{1} << 52) - 1,
+                           (uint64_t{1} << 52) - 2, uint64_t{1} << 51, uint64_t{0x5555555555555}}) {
+            const double v = from_bits((e << 52) | m);
+            if (v > 0.0 && !same(v)) ++bad;
+        }
+    }
+    for (int i = 1; i <= 22 && bad < 8; ++i) bad += same(std::pow(10.0, i)) ? 0u : 1u;
+    for (double v : {0.1, 0.2, 0.3, 2.675, 1e23, 9007199254740993.0, 5e-324, 1.7976931348623157e308,
+                     2.2250738585072014e-308, 123456789012345680.0, 1e16, 9.999999999999999e22}) {
+        bad += same(v) ? 0u : 1u;
+    }
+    for (int64_t i = 1; i < 200000 && bad < 8; i += 7) bad += same(static_cast<double>(i * 1000003)) ? 0u : 1u;
+    std::mt19937_64 rng(4021);
+    for (int i = 0; i < 2000000 && bad < 8; ++i) {
+        const double v = std::fabs(from_bits(rng()));
+        if (v > 0.0 && std::isfinite(v) && !same(v)) ++bad;
+    }
+    EXPECT_EQ(bad, 0u);
+}

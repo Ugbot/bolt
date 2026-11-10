@@ -58,9 +58,9 @@
 //   [validity, int32 offsets] then its one child's own node+buffers;
 //   Struct contributes [validity] (no data buffer of its own) then each
 //   field's own node+buffers in order.
-//   Map is NOT attempted here (ticket scope is List/Struct); a Map
-//   FieldSpec fails closed at open() the same as any other unsupported
-//   type.
+//   Map (Arrow Map, Type 17): a List-shaped column (offsets + one child)
+//   whose single child is a 2-field Struct {key, value}; the entries
+//   struct and key are written non-nullable, as Arrow requires.
 //
 // HONEST SCOPE (fail closed at open, never a misencoded stream):
 //   Leaf column types: Int64, Float64, Utf8, Bool, Date32, Timestamp
@@ -127,6 +127,9 @@ inline constexpr std::uint16_t kIpcMaxNestDepth = 8;
 /// Unit a Timestamp leaf's int64 values count in (G2ICE-309). The values
 /// are written unchanged; only the schema's TimeUnit differs.
 enum IpcTimeUnit : std::uint8_t { kIpcTimeMicro = 0, kIpcTimeNano = 1 };
+// OR'd into a time unit: the field is timestamp[unit, tz="UTC"] (an instant)
+// rather than a zone-less timestamp.
+inline constexpr std::uint8_t kIpcTimeUtc = 0x80;
 
 struct FieldSpec {
     BoltType          type;
@@ -138,8 +141,9 @@ struct FieldSpec {
                                        // a valid non-decimal leaf
     std::uint16_t     n_children;     // 0 (leaf), 1 (List), or N (Struct)
     const FieldSpec*  children;       // borrowed; must outlive the open() call
-    // Timestamp leaves only: one of IpcTimeUnit. Zero (a zeroed FieldSpec) is
-    // microseconds, the unit BoltType::Timestamp has always meant here.
+    // Timestamp leaves only: one of IpcTimeUnit, optionally | kIpcTimeUtc.
+    // Zero (a zeroed FieldSpec) is zone-less microseconds, the unit
+    // BoltType::Timestamp has always meant here.
     std::uint8_t      time_unit;
 };
 
@@ -161,6 +165,7 @@ struct IpcFieldDesc {
     std::uint8_t  n_children;      // 0 (leaf), 1 (List), or N (Struct)
     std::uint8_t  decimal_scale;   // Decimal128 leaves only
     std::uint8_t  time_unit;       // Timestamp leaves only (IpcTimeUnit)
+    std::uint8_t  non_null;        // 1: the Field is written nullable=false (map entries, key)
 };
 
 // Zero-initialize before the first open() (calloc or `{}`); open()
