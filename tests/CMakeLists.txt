@@ -1190,6 +1190,14 @@ if(BOLT_BUILD_PARSE)
     target_link_libraries(test_bolt_yaml PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_yaml)
     add_test(NAME test_bolt_yaml COMMAND test_bolt_yaml)
+    # Differential CLI + microbenchmark (not a ctest): --json FILE | --bench CORPUS.
+    # -DBOLT_BENCH_RYML=/path/rapidyaml.singlehdr.hpp adds rapidyaml to the bench.
+    add_executable(bench_bolt_yaml bench_yaml/bench_bolt_yaml.cpp)
+    target_include_directories(bench_bolt_yaml PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench_yaml)
+    target_link_libraries(bench_bolt_yaml PRIVATE bolt::bolt bolt::parse)
+    if(BOLT_BENCH_RYML)
+        target_compile_definitions(bench_bolt_yaml PRIVATE BOLT_BENCH_RYML="${BOLT_BENCH_RYML}")
+    endif()
     add_executable(test_bolt_json_writer test_bolt_json_writer.cpp)
     target_link_libraries(test_bolt_json_writer
         PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
