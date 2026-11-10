@@ -6,8 +6,9 @@
 // deployment target (the wheels) cannot call them. These kernels are the
 // owned replacement:
 //   * f64_to_chars: SHORTEST round-trip digits (the closest such, ties to
-//     even) via exact big-integer free-format generation (Steele-White /
-//     Burger-Dybvig), laid out exactly as std::to_chars(first, last, v).
+//     even) via Ryu (bolt_ryu.h), checked against exact big-integer
+//     free-format generation (Steele-White / Burger-Dybvig, kept here),
+//     laid out exactly as std::to_chars(first, last, v).
 //   * f64_from_chars (bolt_float_parse.h): the std::from_chars grammar,
 //     correctly rounded.
 //
@@ -21,6 +22,7 @@
 #include <cstring>
 
 #include "bolt/kernels/bolt_bignum_small.h"
+#include "bolt/kernels/bolt_ryu.h"
 
 namespace bolt {
 namespace kernels {
@@ -179,8 +181,17 @@ inline bool shortest_digits_u128(double v, char* digits, uint32_t* nd,
 #endif
 
 // v > 0, finite. Writes the shortest digits and k such that
-// v ~= 0.d1d2...dn * 10^k. Returns n (1..17).
+// v ~= 0.d1d2...dn * 10^k. Returns n (1..17). Ryu (bolt_ryu.h); the
+// free-format generator below is its exact reference.
 inline uint32_t shortest_digits(double v, char* digits, int32_t* k_out) noexcept {
+    assert(v > 0.0 && std::isfinite(v));
+    assert(digits != nullptr && k_out != nullptr);
+    return ryu::shortest_digits(v, digits, k_out);
+}
+
+// The same digits by exact big-integer free-format generation (Steele-White /
+// Burger-Dybvig): the reference the Ryu tables and arithmetic are tested against.
+inline uint32_t shortest_digits_exact(double v, char* digits, int32_t* k_out) noexcept {
     assert(v > 0.0 && std::isfinite(v));
     assert(digits != nullptr && k_out != nullptr);
 #if defined(__SIZEOF_INT128__)
