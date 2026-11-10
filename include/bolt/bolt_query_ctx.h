@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "bolt/bolt_port.h"
 
@@ -54,6 +55,8 @@ inline uint64_t query_steady_now_ns() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+inline constexpr uint32_t kQueryFailureBytes = 384;   // why an operator failed, in words
+
 struct alignas(64) QueryCtx {
     std::atomic<uint32_t>            stop{0};
     std::atomic<uint32_t>            generation{0};   // odd while in use
@@ -62,6 +65,26 @@ struct alignas(64) QueryCtx {
     alignas(64) std::atomic<uint64_t> mem_used{0};
     std::atomic<uint64_t>            mem_peak{0};
     std::atomic<uint64_t>            rows{0};
+    // The first operator failure's text, from whichever worker thread ran it:
+    // 0 empty, 1 being written, 2 published. Read on the submitting thread.
+    std::atomic<uint32_t>            failure_state{0};
+    char                             failure[kQueryFailureBytes] = {};
+
+    // First writer wins; later failures (usually consequences) are dropped.
+    void note_failure(const char* text) noexcept {
+        if (text == nullptr || text[0] == '\0') return;
+        uint32_t empty = 0;
+        if (!failure_state.compare_exchange_strong(empty, 1u, std::memory_order_acquire)) return;
+        size_t n = std::strlen(text);
+        if (n >= kQueryFailureBytes) n = kQueryFailureBytes - 1u;
+        std::memcpy(failure, text, n);
+        failure[n] = '\0';
+        failure_state.store(2u, std::memory_order_release);
+    }
+    // Null until a failure is published.
+    const char* failure_detail() const noexcept {
+        return failure_state.load(std::memory_order_acquire) == 2u ? failure : nullptr;
+    }
 
     // First reason wins, so the error names what actually stopped the query.
     void request_stop(QueryStop why) noexcept {
@@ -139,6 +162,8 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->mem_used.store(0u, std::memory_order_relaxed);
         q->mem_peak.store(0u, std::memory_order_relaxed);
         q->rows.store(0u, std::memory_order_relaxed);
+        q->failure[0] = '\0';
+        q->failure_state.store(0u, std::memory_order_release);
         return q;
     }
     return nullptr;
@@ -163,6 +188,13 @@ BOLT_FORCE_INLINE bool query_should_stop() noexcept {
 inline bool query_poll_now() noexcept {
     QueryCtx* q = detail::tl_query_ctx;
     return q != nullptr && q->poll_now();
+}
+
+/// Record why the running query fails (an operator's own words), from any
+/// thread that runs part of it. No-op outside a query.
+inline void query_note_failure(const char* text) noexcept {
+    QueryCtx* q = detail::tl_query_ctx;
+    if (q != nullptr) q->note_failure(text);
 }
 
 /// Time left for blocking I/O, in ms: `fallback_ms` when the query has no
