@@ -281,8 +281,11 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
     if (t == BoltType::Timestamp) {
         // bolt's Timestamp is epoch micros, no zone (timestamp[us]).
         *out_tag = kTypeTimestamp;
+        const std::uint32_t tz = (time_unit & kIpcTimeUtc) != 0 ? fb_string(b, "UTC") : 0;
+        if ((time_unit & kIpcTimeUtc) != 0 && tz == 0) return 0;
         fb_start_table(b);
-        fb_field_scalar<std::int16_t>(b, 0, time_unit == kIpcTimeNano ? kTimeUnitNano : kTimeUnitMicro);
+        fb_field_scalar<std::int16_t>(b, 0, (time_unit & 0x7F) == kIpcTimeNano ? kTimeUnitNano : kTimeUnitMicro);
+        if (tz != 0) fb_field_offset(b, 1, tz);          // timezone
         return fb_end_table(b);
     }
     if (t == BoltType::Decimal128) {
@@ -381,7 +384,7 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         fd.non_null = 0;
         fd.decimal_scale =
             (s->type == BoltType::Decimal128) ? s->decimal_scale : 0;
-        if (s->time_unit > kIpcTimeNano) return false;
+        if ((s->time_unit & 0x7F) > kIpcTimeNano) return false;
         fd.time_unit = (s->type == BoltType::Timestamp) ? s->time_unit : 0;
         fd.first_child = 0;
         if (s->n_children == 0) continue;

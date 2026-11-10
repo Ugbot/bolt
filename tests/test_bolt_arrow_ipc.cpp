@@ -891,6 +891,7 @@ TEST(ArrowIpc, NestedNarrowLeavesAndTimestampLaneRoundTrip) {
     const BoltType st[4] = {BoltType::Int8, BoltType::Int16, BoltType::Float32, BoltType::Timestamp};
     const char* sn[4] = {"a", "b", "c", "t"};
     for (int k = 0; k < 4; ++k) { sf[k].type = st[k]; sf[k].name = sn[k]; }
+    sf[3].time_unit = kIpcTimeMicro | kIpcTimeUtc;
     FieldSpec item{};
     item.type = BoltType::Int32;
     item.name = "item";
@@ -923,6 +924,8 @@ TEST(ArrowIpc, NestedNarrowLeavesAndTimestampLaneRoundTrip) {
     EXPECT_EQ(sch.fields[s.first_child + 1].physical_type, BoltType::Int16);
     EXPECT_EQ(sch.fields[s.first_child + 2].physical_type, BoltType::Float32);
     EXPECT_EQ(sch.fields[s.first_child + 3].arrow_type, 10);   // Timestamp
+    EXPECT_EQ(sch.fields[s.first_child + 3].unit, 2);          // MICROSECOND
+    EXPECT_EQ(std::string(sch.fields[s.first_child + 3].timezone.data, sch.fields[s.first_child + 3].timezone.size), "UTC");
     EXPECT_EQ(sch.fields[sch.fields[1].first_child].physical_type, BoltType::Int32);
     const BoltBatch* out = nullptr;
     ASSERT_EQ(arrow_ipc_reader_next(r, out), IpcReadStatus::Ok);

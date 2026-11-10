@@ -127,6 +127,9 @@ inline constexpr std::uint16_t kIpcMaxNestDepth = 8;
 /// Unit a Timestamp leaf's int64 values count in (G2ICE-309). The values
 /// are written unchanged; only the schema's TimeUnit differs.
 enum IpcTimeUnit : std::uint8_t { kIpcTimeMicro = 0, kIpcTimeNano = 1 };
+// OR'd into a time unit: the field is timestamp[unit, tz="UTC"] (an instant)
+// rather than a zone-less timestamp.
+inline constexpr std::uint8_t kIpcTimeUtc = 0x80;
 
 struct FieldSpec {
     BoltType          type;
@@ -138,8 +141,9 @@ struct FieldSpec {
                                        // a valid non-decimal leaf
     std::uint16_t     n_children;     // 0 (leaf), 1 (List), or N (Struct)
     const FieldSpec*  children;       // borrowed; must outlive the open() call
-    // Timestamp leaves only: one of IpcTimeUnit. Zero (a zeroed FieldSpec) is
-    // microseconds, the unit BoltType::Timestamp has always meant here.
+    // Timestamp leaves only: one of IpcTimeUnit, optionally | kIpcTimeUtc.
+    // Zero (a zeroed FieldSpec) is zone-less microseconds, the unit
+    // BoltType::Timestamp has always meant here.
     std::uint8_t      time_unit;
 };
 
