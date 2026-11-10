@@ -116,6 +116,14 @@ void test_cm4() {
     double kb = 0;
     CHK(sa::kurtosis_finalize(&mb, &kb));
     CHK(near(kb, -1.2000024000024092));
+    // A 1e8 offset must not change the moments (the first update is exactly 0).
+    CorrMoments o0{}, o1{};
+    const double sk[6] = {1, 4, 13, 28, 49, 76};
+    for (double x : sk) { sa::cm4_update(&o0, x); sa::cm4_update(&o1, x + 1e8); }
+    double a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+    CHK(sa::skewness_finalize(&o0, &a0) && sa::skewness_finalize(&o1, &a1));
+    CHK(sa::kurtosis_finalize(&o0, &b0) && sa::kurtosis_finalize(&o1, &b1));
+    CHK(near(a0, a1, 1e-9) && near(b0, b1, 1e-9));
     // Constant, single value and empty: NULL. NaN propagates.
     CorrMoments c{};
     CHK(!sa::skewness_finalize(&c, &r));

@@ -36,6 +36,10 @@ using group_stats::CorrMoments;
 BOLT_FORCE_INLINE void cm4_update(CorrMoments* BOLT_RESTRICT m, double x) noexcept {
     assert(m != nullptr);
     assert(m->n >= 0.0);
+    if (m->n == 0.0) {   // the first value: every central moment is exactly 0 (avoids FMA-contracted cancellation)
+        m->n = 1.0; m->sx = x; m->sxx = 0.0; m->sxy = 0.0; m->syy = 0.0;
+        return;
+    }
     const double n1 = m->n + 1.0;
     const double delta = x - m->sx;
     const double delta_n = delta / n1;
