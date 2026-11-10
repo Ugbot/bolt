@@ -843,6 +843,17 @@ target_link_libraries(test_bolt_key_encode
 bolt_apply_hardening(test_bolt_key_encode)
 add_test(NAME test_bolt_key_encode COMMAND test_bolt_key_encode)
 
+# Partitioned writes: rows routed by key values in one pass.
+add_executable(test_bolt_partition_route test_bolt_partition_route.cpp)
+target_link_libraries(test_bolt_partition_route
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_partition_route)
+add_test(NAME test_bolt_partition_route COMMAND test_bolt_partition_route)
+
 add_executable(test_bolt_kernels test_bolt_kernels.cpp)
 
 target_link_libraries(test_bolt_kernels
