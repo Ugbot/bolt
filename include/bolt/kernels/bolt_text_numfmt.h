@@ -484,7 +484,7 @@ inline int64_t to_number(const NumFmt& f, const char* s, uint32_t len, bool* neg
         i += u;
     }
     if (r.nruns - 1u > k) return kNumMismatch;
-    if (r.ndig == 0 && nfrac == 0 && !in_frac) return kNumMismatch;      // nothing to read
+    if (r.ndig == 0 && nfrac == 0 && (!in_frac || f.n_frac == 0)) return kNumMismatch;   // nothing to read
     if (!detail::runs_match(r, g, k, 0, 0)) return kNumMismatch;
     uint32_t w = 0;
     for (uint32_t i = 0; i < r.ndig; ++i) digs[w++] = static_cast<char>('0' + r.dig[i]);
