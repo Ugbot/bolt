@@ -707,7 +707,6 @@ bool build_from_tape(const StructuralIndex* idx, int32_t* cur,
     if (depth > kJsonMaxDepth) return false;
     if (*cur < 0 || *cur >= idx->token_count) return false;
 
-    const char* src = reinterpret_cast<const char*>(idx->src);
     const Token& t = idx->tokens[*cur];
     switch (t.type) {
         case TokenType::BeginObject: {
@@ -719,7 +718,7 @@ bool build_from_tape(const StructuralIndex* idx, int32_t* cur,
                 const Token& kt = idx->tokens[*cur];
                 if (kt.type == TokenType::EndObject) { ++*cur; break; }
                 if (kt.type != TokenType::Key) return false;
-                const char* key = src + kt.start;
+                const char* key = reinterpret_cast<const char*>(token_bytes(idx, kt));
                 const int32_t key_len = kt.length;
                 ++*cur;
                 JsonValue* val = nullptr;
@@ -745,7 +744,7 @@ bool build_from_tape(const StructuralIndex* idx, int32_t* cur,
             return true;
         }
         case TokenType::String: {
-            JsonValue* v = make_string_raw(arena, src + t.start, t.length);
+            JsonValue* v = make_string_raw(arena, reinterpret_cast<const char*>(token_bytes(idx, t)), t.length);
             if (v == nullptr) return false;
             ++*cur;
             *out = v;
@@ -758,7 +757,7 @@ bool build_from_tape(const StructuralIndex* idx, int32_t* cur,
         case TokenType::Null: {
             // Every scalar keyword/number token slices its exact source bytes
             // ("true"/"false"/"null"/the raw number) — emit them verbatim.
-            JsonValue* v = make_literal(arena, src + t.start, t.length);
+            JsonValue* v = make_literal(arena, reinterpret_cast<const char*>(token_bytes(idx, t)), t.length);
             if (v == nullptr) return false;
             ++*cur;
             *out = v;

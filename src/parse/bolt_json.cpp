@@ -133,6 +133,11 @@ bool path_is_prefix(const PathFilterImpl* impl, const char* cur, int32_t cn) noe
 
 }  // namespace
 
+bool path_filter_admits(const PathFilter* filter, const char* path, int32_t len) noexcept {
+    if (filter == nullptr || filter->impl == nullptr) return true;
+    return path_is_prefix(static_cast<const PathFilterImpl*>(filter->impl), path, len);
+}
+
 bool compile_paths(const char* const* paths, const int32_t* path_lens,
                    int32_t count, Arena* arena, PathFilter* out) noexcept {
     assert(arena != nullptr);
@@ -253,7 +258,7 @@ BOLT_FORCE_INLINE bool tape_emit(Parser* p, TokenType t, int32_t s, int32_t l) n
     if (p->token_count >= p->token_cap) return false;
     Token& tok = p->tokens[p->token_count++];
     tok.type = t;
-    tok._pad[0] = 0; tok._pad[1] = 0; tok._pad[2] = 0;
+    tok.flags = 0; tok._pad[0] = 0; tok._pad[1] = 0;
     tok.start = s;
     tok.length = l;
     return true;
@@ -802,6 +807,8 @@ static bool build_index_impl(const uint8_t* src, int32_t src_len,
         out->src_len = src_len;
         out->tokens = tokens;
         out->token_count = p.token_count;
+        out->aux = nullptr;
+        out->aux_len = 0;
         return true;
     }
     if (!parse_value(&p, &sink, /*emit_tokens=*/true)) return false;
@@ -813,6 +820,8 @@ static bool build_index_impl(const uint8_t* src, int32_t src_len,
     out->src_len = src_len;
     out->tokens = tokens;
     out->token_count = p.token_count;
+    out->aux = nullptr;
+    out->aux_len = 0;
     return true;
 }
 
@@ -1056,7 +1065,8 @@ bool iter_string(const Iterator* it, StringView* out) noexcept {
     if (it->cursor >= it->idx->token_count) return false;
     const Token& t = it->idx->tokens[it->cursor];
     if (t.type != TokenType::String && t.type != TokenType::Key) return false;
-    const char* base = reinterpret_cast<const char*>(it->idx->src);
+    const bool aux = (t.flags & kTokenAux) != 0;
+    const char* base = reinterpret_cast<const char*>(aux ? it->idx->aux : it->idx->src);
     const uint32_t len = static_cast<uint32_t>(t.length);
     memset(out, 0, sizeof(*out));
     out->length = len;
@@ -1066,7 +1076,7 @@ bool iter_string(const Iterator* it, StringView* out) noexcept {
         if (len <= 12) {
             if (len > 4) memcpy(out->inline_data, s + 4, len - 4);
         } else {
-            out->ref.buf_idx = 0;
+            out->ref.buf_idx = aux ? 1u : 0u;   // 1 = StructuralIndex::aux
             out->ref.offset = static_cast<uint32_t>(t.start);
         }
     }
@@ -1079,7 +1089,7 @@ bool iter_int64(const Iterator* it, int64_t* out) noexcept {
     if (it->cursor >= it->idx->token_count) return false;
     const Token& t = it->idx->tokens[it->cursor];
     if (t.type != TokenType::Int64 && t.type != TokenType::Float64) return false;
-    return parse_int64_slice(it->idx->src, t.start, t.length, out);
+    return parse_int64_slice((t.flags & kTokenAux) != 0 ? it->idx->aux : it->idx->src, t.start, t.length, out);
 }
 
 bool iter_float64(const Iterator* it, double* out) noexcept {
@@ -1088,7 +1098,7 @@ bool iter_float64(const Iterator* it, double* out) noexcept {
     if (it->cursor >= it->idx->token_count) return false;
     const Token& t = it->idx->tokens[it->cursor];
     if (t.type != TokenType::Int64 && t.type != TokenType::Float64) return false;
-    return parse_float64_slice(it->idx->src, t.start, t.length, out);
+    return parse_float64_slice((t.flags & kTokenAux) != 0 ? it->idx->aux : it->idx->src, t.start, t.length, out);
 }
 
 }  // namespace json
