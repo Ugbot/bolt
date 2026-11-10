@@ -183,6 +183,9 @@ inline bool utf8_replace_col(const StringView* BOLT_RESTRICT in, const char* bas
         const uint32_t L = in[i].length;
         uint32_t hits = 0;
         for (uint32_t k = 0; k + flen <= L;) {   // count, bounded by L
+            const void* hit = memchr(p + k, from[0], L - flen + 1 - k);
+            if (hit == nullptr) break;
+            k = static_cast<uint32_t>(static_cast<const char*>(hit) - p);
             if (memcmp(p + k, from, flen) == 0) { ++hits; k += flen; } else { ++k; }
         }
         if (hits == 0) {
@@ -197,14 +200,21 @@ inline bool utf8_replace_col(const StringView* BOLT_RESTRICT in, const char* bas
         char* dst = M <= 12u ? tmp : sv_sink_alloc(sink, M);
         if (dst == nullptr) return false;
         uint32_t w = 0;
-        for (uint32_t k = 0; k < L;) {
-            if (k + flen <= L && memcmp(p + k, from, flen) == 0) {
+        for (uint32_t k = 0; k < L;) {   // copy runs between matches
+            const void* hit = k + flen <= L ? memchr(p + k, from[0], L - flen + 1 - k) : nullptr;
+            uint32_t at = hit == nullptr ? L : static_cast<uint32_t>(static_cast<const char*>(hit) - p);
+            if (at < L && memcmp(p + at, from, flen) != 0) at += 1;   // a false start: copy through it
+            else if (at < L) {
+                memcpy(dst + w, p + k, at - k);
+                w += at - k;
                 if (tlen) memcpy(dst + w, to, tlen);
                 w += tlen;
-                k += flen;
-            } else {
-                dst[w++] = p[k++];
+                k = at + flen;
+                continue;
             }
+            memcpy(dst + w, p + k, at - k);
+            w += at - k;
+            k = at;
         }
         assert(w == M);
         if (M <= 12u) { out[i] = sv_make_inline(dst, M); continue; }
@@ -233,6 +243,15 @@ inline bool py_strip_col(const StringView* BOLT_RESTRICT in, const char* base, i
     }
     return true;
 }
+
+#if defined(__SIZEOF_INT128__)
+// Python round(x, n) per row, 1 <= n <= 22.
+inline void f64_round_python_col(const double* BOLT_RESTRICT in, int64_t n, int32_t digits,
+                                 double* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0 && digits >= 1 && digits <= 22);
+    for (int64_t i = 0; i < n; ++i) out[i] = f64_round_python(in[i], digits);
+}
+#endif
 
 // repr(float) per row.
 inline bool f64_python_repr_col(const double* BOLT_RESTRICT in, int64_t n, SvSink* sink,

@@ -12,6 +12,7 @@
 
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_float_chars.h"
+#include "bolt/kernels/bolt_float_parse.h"
 #include "bolt/kernels/bolt_utf8_cp.h"
 #include "bolt/kernels/bolt_utf8_pycase_tables.h"
 
@@ -118,5 +119,47 @@ BOLT_FORCE_INLINE uint32_t f64_python_repr(double v, char* out) noexcept {
     std::memcpy(out + n, d + ku, nd - ku);
     return n + nd - ku;
 }
+
+#if defined(__SIZEOF_INT128__)
+// Python's round(x, n) for 1 <= n <= 22: the exact binary value rounded to n
+// decimal places half to even (CPython double_round: dtoa mode 3), then the
+// decimal parsed back correctly rounded. NaN and infinities pass through.
+BOLT_FORCE_INLINE double f64_round_python(double x, int32_t n) noexcept {
+    assert(n >= 1 && n <= 22);
+    if (!std::isfinite(x) || x == 0.0) return x;
+    int ex = 0;
+    const double fr = std::frexp(std::fabs(x), &ex);            // |x| = fr * 2^ex, fr in [0.5, 1)
+    const uint64_t m = static_cast<uint64_t>(std::ldexp(fr, 53));   // exact
+    const int32_t e = ex - 53;                                   // |x| = m * 2^e
+    if (e >= 0) return x;                                        // an integer: nothing to round
+    const uint32_t k = static_cast<uint32_t>(-e);
+    unsigned __int128 pow10 = 1;
+    for (int32_t i = 0; i < n; ++i) pow10 *= 10u;                // <= 10^22
+    const unsigned __int128 N = static_cast<unsigned __int128>(m) * pow10;   // < 2^127
+    unsigned __int128 q = 0;
+    if (k < 128) {
+        q = N >> k;
+        const unsigned __int128 r = N - (q << k);
+        const unsigned __int128 half = static_cast<unsigned __int128>(1) << (k - 1);
+        if (r > half || (r == half && (q & 1u) != 0u)) ++q;
+    }
+    char buf[64];
+    uint32_t len = 0;
+    char dig[48];
+    uint32_t nd = 0;
+    do { dig[nd++] = static_cast<char>('0' + static_cast<unsigned>(q % 10u)); q /= 10u; } while (q != 0u);
+    if (std::signbit(x)) buf[len++] = '-';
+    while (nd > 0) buf[len++] = dig[--nd];
+    buf[len++] = 'e';
+    buf[len++] = '-';
+    if (n >= 10) buf[len++] = static_cast<char>('0' + n / 10);
+    buf[len++] = static_cast<char>('0' + n % 10);
+    double out = 0.0;
+    const auto r = float_chars::f64_from_chars(buf, buf + len, &out);
+    assert(r.status == float_chars::ParseStatus::ok);
+    (void)r;
+    return out;
+}
+#endif
 
 }  // namespace bolt::kernels::utf8
