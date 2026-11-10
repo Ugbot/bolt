@@ -66,6 +66,70 @@ Decimal128 from_i128(__int128 v) noexcept {
 // Primitive arithmetic
 // ===========================================================================
 
+// ---- overflow-checked add / sub / mul vs __int128 ---------------------------
+
+#if defined(__SIZEOF_INT128__)
+namespace {
+using i128 = __int128;
+Decimal128 to_d(i128 v) {
+    Decimal128 d;
+    d.lo = static_cast<int64_t>(static_cast<uint64_t>(v));
+    d.hi = static_cast<int64_t>(static_cast<uint64_t>(static_cast<unsigned __int128>(v) >> 64));
+    return d;
+}
+i128 from_d(Decimal128 d) {
+    return static_cast<i128>((static_cast<unsigned __int128>(static_cast<uint64_t>(d.hi)) << 64) |
+                             static_cast<uint64_t>(d.lo));
+}
+const i128 kMax = static_cast<i128>(~static_cast<unsigned __int128>(0) >> 1);
+const i128 kMin = -kMax - 1;
+}  // namespace
+
+TEST(BoltDecimalChecked, EdgesAgainstInt128) {
+    using bolt::kernels::decimal::d128_add_checked;
+    using bolt::kernels::decimal::d128_sub_checked;
+    using bolt::kernels::decimal::d128_mul_checked;
+    const i128 vals[] = {0, 1, -1, 2, -2, 10, 12345678901234567LL, -12345678901234567LL,
+                         static_cast<i128>(1) << 63, -(static_cast<i128>(1) << 63),
+                         static_cast<i128>(1) << 64, static_cast<i128>(1) << 100,
+                         -(static_cast<i128>(1) << 100), kMax, kMin, kMax - 1, kMin + 1,
+                         static_cast<i128>(1) << 126, -(static_cast<i128>(1) << 126),
+                         static_cast<i128>(10000000000000000000ULL) * 10000000000000000000ULL};
+    for (i128 a : vals) {
+        for (i128 b : vals) {
+            Decimal128 r{};
+            i128 want = 0;
+            const bool add_ok = !__builtin_add_overflow(a, b, &want);
+            EXPECT_EQ(d128_add_checked(to_d(a), to_d(b), &r), add_ok);
+            if (add_ok) EXPECT_TRUE(from_d(r) == want);
+            const bool sub_ok = !__builtin_sub_overflow(a, b, &want);
+            EXPECT_EQ(d128_sub_checked(to_d(a), to_d(b), &r), sub_ok);
+            if (sub_ok) EXPECT_TRUE(from_d(r) == want);
+            const bool mul_ok = !__builtin_mul_overflow(a, b, &want);
+            EXPECT_EQ(d128_mul_checked(to_d(a), to_d(b), &r), mul_ok);
+            if (mul_ok) EXPECT_TRUE(from_d(r) == want);
+        }
+    }
+}
+
+TEST(BoltDecimalChecked, RandomAgainstInt128) {
+    using bolt::kernels::decimal::d128_mul_checked;
+    std::mt19937_64 rng(20261110);
+    for (int i = 0; i < 200000; ++i) {
+        const int sa = static_cast<int>(rng() % 127), sb = static_cast<int>(rng() % 127);
+        i128 a = static_cast<i128>(rng() >> (rng() % 64)) << (sa > 64 ? sa - 64 : 0);
+        i128 b = static_cast<i128>(rng() >> (rng() % 64)) << (sb > 64 ? sb - 64 : 0);
+        if (rng() & 1) a = -a;
+        if (rng() & 1) b = -b;
+        Decimal128 r{};
+        i128 want = 0;
+        const bool ok = !__builtin_mul_overflow(a, b, &want);
+        ASSERT_EQ(d128_mul_checked(to_d(a), to_d(b), &r), ok);
+        if (ok) ASSERT_TRUE(from_d(r) == want);
+    }
+}
+#endif
+
 TEST(BoltDecimal, AddSimple) {
     // 1 + 2 = 3
     Decimal128 a = make_d128(0, 1);
