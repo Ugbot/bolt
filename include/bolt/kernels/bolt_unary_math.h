@@ -11,7 +11,7 @@
 
 namespace bolt::kernels {
 
-enum class UnaryF64 : uint8_t { Sqrt, Abs, Neg, Exp, Log, Log10, Log2, Floor, Ceil };
+enum class UnaryF64 : uint8_t { Sqrt, Abs, Neg, Exp, Log, Log10, Log2, Floor, Ceil, RoundEven };
 
 inline void unary_f64(UnaryF64 op, const double* BOLT_RESTRICT a, int64_t n,
                       double* BOLT_RESTRICT out) noexcept {
@@ -27,7 +27,23 @@ inline void unary_f64(UnaryF64 op, const double* BOLT_RESTRICT a, int64_t n,
         case UnaryF64::Log2:  for (int64_t i = 0; i < n; ++i) out[i] = std::log2(a[i]); break;
         case UnaryF64::Floor: for (int64_t i = 0; i < n; ++i) out[i] = std::floor(a[i]); break;
         case UnaryF64::Ceil:  for (int64_t i = 0; i < n; ++i) out[i] = std::ceil(a[i]); break;
+        case UnaryF64::RoundEven: for (int64_t i = 0; i < n; ++i) out[i] = std::nearbyint(a[i]); break;
     }
+}
+
+// IEEE a / b (a zero divisor gives +-inf / NaN).
+inline void div_f64(const double* BOLT_RESTRICT a, const double* BOLT_RESTRICT b, int64_t n,
+                    double* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0);
+    assert((a != nullptr && b != nullptr && out != nullptr) || n == 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = a[i] / b[i];
+}
+
+// int64 -> double, rounding to nearest (C++ conversion).
+inline void i64_to_f64(const int64_t* BOLT_RESTRICT a, int64_t n, double* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0);
+    assert((a != nullptr && out != nullptr) || n == 0);
+    for (int64_t i = 0; i < n; ++i) out[i] = static_cast<double>(a[i]);
 }
 
 // a / lit and a % lit truncating toward zero (C++ / SQL). lit must not be 0

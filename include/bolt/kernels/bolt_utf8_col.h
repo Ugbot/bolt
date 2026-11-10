@@ -16,6 +16,7 @@
 #include "bolt/bolt_types.h"
 #include "bolt/kernels/bolt_utf8.h"
 #include "bolt/kernels/bolt_utf8_pycase.h"
+#include "bolt/kernels/bolt_pystr.h"
 
 namespace bolt::kernels::utf8 {
 
@@ -214,6 +215,32 @@ inline bool utf8_replace_col(const StringView* BOLT_RESTRICT in, const char* bas
         r.ref.buf_idx = 0;
         r.ref.offset = static_cast<uint32_t>(dst - sink->base);
         out[i] = r;
+    }
+    return true;
+}
+
+// Python str.strip / lstrip / rstrip per row (chars == nullptr: whitespace).
+// The result is a sub-range of the input, re-anchored in the sink.
+inline bool py_strip_col(const StringView* BOLT_RESTRICT in, const char* base, int64_t n,
+                         PyStrip mode, const char* chars, uint32_t clen, SvSink* sink,
+                         StringView* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0 && sink != nullptr);
+    for (int64_t i = 0; i < n; ++i) {
+        const char* p = sv_bytes(in[i], base);
+        uint32_t lo = 0, hi = in[i].length;
+        py_strip(p, in[i].length, mode, chars, clen, &lo, &hi);
+        if (!sv_put(sink, p + lo, hi - lo, &out[i])) return false;
+    }
+    return true;
+}
+
+// repr(float) per row.
+inline bool f64_python_repr_col(const double* BOLT_RESTRICT in, int64_t n, SvSink* sink,
+                                StringView* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0 && sink != nullptr);
+    for (int64_t i = 0; i < n; ++i) {
+        char buf[40];
+        if (!sv_put(sink, buf, f64_python_repr(in[i], buf), &out[i])) return false;
     }
     return true;
 }
