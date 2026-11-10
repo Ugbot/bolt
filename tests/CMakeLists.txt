@@ -3081,3 +3081,9 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_hardening(test_bolt_gemv)
     add_test(NAME test_bolt_gemv COMMAND test_bolt_gemv)
 endif()
+
+add_executable(test_bolt_stat_agg test_bolt_stat_agg.cpp)
+target_link_libraries(test_bolt_stat_agg
+    PRIVATE bolt::bolt)
+bolt_apply_hardening(test_bolt_stat_agg)
+add_test(NAME test_bolt_stat_agg COMMAND test_bolt_stat_agg)
