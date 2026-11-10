@@ -3062,6 +3062,13 @@ add_executable(test_bolt_iceberg_metadata_legacy test_bolt_iceberg_metadata_lega
 target_link_libraries(test_bolt_iceberg_metadata_legacy PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_iceberg_metadata_legacy)
 add_test(NAME test_bolt_iceberg_metadata_legacy COMMAND test_bolt_iceberg_metadata_legacy)
+# Spark string-core kernels: trim sets, overlay, mask, translate, levenshtein, UTF-8 repair,
+# format_number, to_char / to_number, url_encode / url_decode / parse_url.
+add_executable(test_bolt_text_spark test_bolt_text_spark.cpp)
+target_link_libraries(test_bolt_text_spark
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_spark)
+add_test(NAME test_bolt_text_spark COMMAND test_bolt_text_spark)
 # Text kernels (pad / initcap / format_string) + one-value nested navigation (G2LAUNCH-73/78).
 add_executable(test_bolt_text_fn test_bolt_text_fn.cpp)
 target_link_libraries(test_bolt_text_fn
