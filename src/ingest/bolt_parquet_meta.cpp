@@ -444,6 +444,12 @@ bool parse_statistics(TcCursor* c, PqChunk* ch) noexcept {
                 ch->null_count = v;
                 break;
             }
+            case 4: {
+                int64_t v;
+                if (!tc_zigzag(c, &v)) return false;
+                ch->distinct_count = v >= 0 ? v : -1;
+                break;
+            }
             case 5: {   // max_value (new, order-aware) — preferred
                 const uint8_t* p; uint32_t n;
                 if (!tc_binary(c, &p, &n)) return false;
@@ -682,6 +688,7 @@ bool parse_column_chunk(TcCursor* c, PqChunk* ch) noexcept {
     assert(c != nullptr && ch != nullptr);
     std::memset(ch, 0, sizeof(*ch));
     ch->null_count = -1;
+    ch->distinct_count = -1;
     ch->byte_array_data_bytes = -1;
     int16_t fid = 0;
     uint8_t ft;
