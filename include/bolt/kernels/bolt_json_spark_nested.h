@@ -474,17 +474,25 @@ inline void civil(int64_t days, int64_t* y, uint32_t* m, uint32_t* d) noexcept {
     *y = yy + (*m <= 2 ? 1 : 0);
 }
 
+// A proleptic-ISO year as Spark's yyyy prints it: four digits, a leading '-' below zero, a leading '+' past 9999.
+inline uint32_t put_year(char* b, size_t cap, int64_t y) noexcept {
+    assert(b != nullptr && cap >= 24);
+    if (y >= 0 && y <= 9999) return static_cast<uint32_t>(std::snprintf(b, cap, "%04d", static_cast<int>(y)));
+    if (y > 9999) return static_cast<uint32_t>(std::snprintf(b, cap, "+%lld", static_cast<long long>(y)));
+    return static_cast<uint32_t>(std::snprintf(b, cap, "-%04lld", static_cast<long long>(-y)));
+}
+
 inline bool put_date(Out* o, int64_t days) noexcept {
     int64_t y; uint32_t m, d;
     civil(days, &y, &m, &d);
-    if (y < 0 || y > 9999) return false;
-    char b[16];
-    const int n = std::snprintf(b, sizeof b, "%04d-%02u-%02u", static_cast<int>(y), m, d);
-    o->put(b, static_cast<uint32_t>(n));
+    char b[48];
+    uint32_t n = put_year(b, sizeof b, y);
+    n += static_cast<uint32_t>(std::snprintf(b + n, sizeof b - n, "-%02u-%02u", m, d));
+    o->put(b, n);
     return true;
 }
 
-// yyyy-MM-dd'T'HH:mm:ss.SSS[XXX]
+// yyyy-MM-dd'T'HH:mm:ss.SSS[XXX]; XXX prints seconds of an offset that has them (LMT zones).
 inline bool put_timestamp(Out* o, int64_t utc_us, bolt::tz::ZoneId z, bool ntz) noexcept {
     const int64_t local = ntz ? utc_us : bolt::tz::utc_micros_to_local(z, utc_us);
     const int64_t secs = bolt::tz::floor_div(local, bolt::tz::kMicrosPerSec);
@@ -493,22 +501,24 @@ inline bool put_timestamp(Out* o, int64_t utc_us, bolt::tz::ZoneId z, bool ntz) 
     const int64_t sod = secs - days * 86400;
     int64_t y; uint32_t m, d;
     civil(days, &y, &m, &d);
-    if (y < 0 || y > 9999) return false;
-    char b[64];
-    int n = std::snprintf(b, sizeof b, "\"%04d-%02u-%02uT%02d:%02d:%02d.%03d", static_cast<int>(y), m, d,
-                          static_cast<int>(sod / 3600), static_cast<int>((sod / 60) % 60), static_cast<int>(sod % 60),
-                          static_cast<int>(frac / 1000));
+    char b[96];
+    b[0] = '"';
+    uint32_t n = 1 + put_year(b + 1, sizeof b - 1, y);
+    n += static_cast<uint32_t>(std::snprintf(b + n, sizeof b - n, "-%02u-%02uT%02d:%02d:%02d.%03d", m, d,
+                                             static_cast<int>(sod / 3600), static_cast<int>((sod / 60) % 60),
+                                             static_cast<int>(sod % 60), static_cast<int>(frac / 1000)));
     if (!ntz) {
-        const int64_t off = (local - utc_us) / bolt::tz::kMicrosPerSec;
-        if (off == 0) n += std::snprintf(b + n, sizeof b - static_cast<size_t>(n), "Z");
+        const int64_t off = bolt::tz::floor_div(local - utc_us, bolt::tz::kMicrosPerSec);
+        if (off == 0) { b[n++] = 'Z'; }
         else {
             const int64_t a = off < 0 ? -off : off;
-            n += std::snprintf(b + n, sizeof b - static_cast<size_t>(n), "%c%02d:%02d", off < 0 ? '-' : '+',
-                               static_cast<int>(a / 3600), static_cast<int>((a / 60) % 60));
+            n += static_cast<uint32_t>(std::snprintf(b + n, sizeof b - n, "%c%02d:%02d", off < 0 ? '-' : '+',
+                                                     static_cast<int>(a / 3600), static_cast<int>((a / 60) % 60)));
+            if (a % 60 != 0) n += static_cast<uint32_t>(std::snprintf(b + n, sizeof b - n, ":%02d", static_cast<int>(a % 60)));
         }
     }
     b[n++] = '"';
-    o->put(b, static_cast<uint32_t>(n));
+    o->put(b, n);
     return true;
 }
 
@@ -553,7 +563,12 @@ inline int put_leaf(const Tree& c, uint32_t ni, const nrv::LeafView& lv, Out* o)
     switch (nd.type) {
         case BoltType::Bool: o->put(lv.bytes[0] != 0 ? "true" : "false", lv.bytes[0] != 0 ? 4 : 5); return 1;
         case BoltType::Int8: case BoltType::Int16: case BoltType::Int32: case BoltType::Int64: {
-            const int n = std::snprintf(b, sizeof b, "%lld", static_cast<long long>(read_int(lv.bytes, lv.len)));
+            const int64_t iv = read_int(lv.bytes, lv.len);
+            if (nd.scale != 0) {                                     // a narrow decimal rides the integer lane with its scale
+                o->put(b, java_decimal_chars(b, sizeof b, static_cast<__int128>(iv), nd.scale));
+                return 1;
+            }
+            const int n = std::snprintf(b, sizeof b, "%lld", static_cast<long long>(iv));
             o->put(b, static_cast<uint32_t>(n));
             return 1;
         }
@@ -746,6 +761,34 @@ inline bool token_int64(const Parser& ps, int64_t* out) noexcept {
     return true;
 }
 
+// Java's Character.digit(cp, 10): the value of a Unicode decimal digit (general category Nd, Unicode 15), else -1.
+inline int unicode_decimal_digit(uint32_t cp) noexcept {
+    static const uint32_t kZero[] = {
+        0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66, 0xDE6, 0xE50, 0xED0, 0xF20,
+        0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0,
+        0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0,
+        0x11450, 0x114D0, 0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60,
+        0x16AC0, 0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E950, 0x1FBF0};
+    uint32_t lo = 0, hi = static_cast<uint32_t>(sizeof kZero / sizeof kZero[0]);
+    while (lo < hi) {                                                // the last zero <= cp
+        const uint32_t mid = (lo + hi) / 2;
+        if (kZero[mid] <= cp) lo = mid + 1; else hi = mid;
+    }
+    return lo != 0 && cp - kZero[lo - 1] < 10u ? static_cast<int>(cp - kZero[lo - 1]) : -1;
+}
+
+// The next character of valid UTF-8 text as a decimal digit: its value and byte length; -1 when it is not one.
+inline int text_digit(const char* t, uint32_t len, uint32_t i, uint32_t* width) noexcept {
+    const uint8_t c = static_cast<uint8_t>(t[i]);
+    if (c < 0x80) { *width = 1; return c >= '0' && c <= '9' ? c - '0' : -1; }
+    uint32_t w = c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : c >= 0xC0 ? 2u : 0u;
+    if (w == 0 || i + w > len) return -1;
+    uint32_t cp = c & (0xFFu >> (w + 1));
+    for (uint32_t k = 1; k < w; ++k) cp = (cp << 6) | (static_cast<uint8_t>(t[i + k]) & 0x3Fu);
+    *width = w;
+    return unicode_decimal_digit(cp);
+}
+
 // BigDecimal text -> unscaled value at `scale` (HALF_UP), within `prec` digits. false: not a number / out of range.
 inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32_t scale, __int128* out) noexcept {
     uint32_t i = 0;
@@ -755,14 +798,15 @@ inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32
     uint32_t nd = 0;
     int64_t frac = 0;
     bool any = false, dot = false;
-    for (; i < len; ++i) {
-        const char ch = t[i];
-        if (ch >= '0' && ch <= '9') {
+    for (uint32_t w = 1; i < len; i += w) {
+        const int dv = text_digit(t, len, i, &w);
+        if (dv >= 0) {
             any = true;
-            if (nd < sizeof dig) dig[nd++] = ch; else return false;
+            if (nd < sizeof dig) dig[nd++] = static_cast<char>('0' + dv); else return false;
             if (dot) ++frac;
-        } else if (ch == '.' && !dot) {
+        } else if (t[i] == '.' && !dot) {
             dot = true;
+            w = 1;
         } else break;
     }
     if (!any) return false;
@@ -772,9 +816,10 @@ inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32
         bool eneg = false;
         if (i < len && (t[i] == '+' || t[i] == '-')) { eneg = t[i] == '-'; ++i; }
         if (i >= len) return false;
-        for (; i < len; ++i) {
-            if (t[i] < '0' || t[i] > '9') return false;
-            exp10 = exp10 * 10 + (t[i] - '0');
+        for (uint32_t w = 1; i < len; i += w) {
+            const int dv = text_digit(t, len, i, &w);
+            if (dv < 0) return false;
+            exp10 = exp10 * 10 + dv;
             if (exp10 > 100000) return false;
         }
         if (eneg) exp10 = -exp10;
@@ -847,6 +892,7 @@ inline Cv leaf(const Tree& c, Parser* ps, uint32_t ni, Region* r) noexcept {
                 float f = static_cast<float>(d);
                 if (t == Tok::Int || t == Tok::Float) {
                     if (d == d && !std::isinf(d)) { char b[1100]; if (tl < sizeof b) { std::memcpy(b, tx, tl); b[tl] = 0; f = std::strtof(b, nullptr); } }
+                    if (t == Tok::Int && f == 0.0f) f = 0.0f;       // an integer token has no negative zero
                 }
                 uint8_t* p = r->take(4);
                 if (p != nullptr) std::memcpy(p, &f, 4);

@@ -30,8 +30,8 @@ namespace jsonspark {
 
 inline constexpr uint32_t kMaxNesting = 1000;       // Jackson StreamReadConstraints.maxNestingDepth
 inline constexpr uint32_t kMaxNumberChars = 1000;   // StreamReadConstraints.maxNumberLength
-inline constexpr uint32_t kMaxPathInstr = 32;       // compiled path instructions (budget json_path_instructions)
-inline constexpr uint32_t kMaxPathBytes = 512;      // bytes of names in one compiled path
+inline constexpr uint32_t kMaxPathInstr = 256;      // compiled path instructions (budget json_path_instructions)
+inline constexpr uint32_t kMaxPathBytes = 4096;     // bytes of names in one compiled path
 inline constexpr uint32_t kMaxEvalDepth = 256;      // path-evaluator recursion (flattened array nesting); past it: budget refusal
 
 enum class Tok : uint8_t {
@@ -80,7 +80,6 @@ inline void parser_init(Parser* p, const uint8_t* s, uint32_t n, bool ctrl_ok = 
     p->ctrl_ok = ctrl_ok; p->nan_ok = nan_ok;
     std::memset(p->obj_bits, 0, sizeof p->obj_bits);
     std::memset(p->elem_bits, 0, sizeof p->elem_bits);
-    if (n >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF) p->i = 3;       // UTF-8 BOM (Jackson skips it)
 }
 
 namespace detail {
