@@ -55,46 +55,84 @@ static bool utf8_values(const Layout& l,std::int64_t rows) noexcept {
     }
     assert(rows>=0);assert(l.offsets!=nullptr);return true;
 }
-static Status column(State& s,const Message& m,std::uint32_t node,std::uint32_t& buf,std::uint32_t index,
-                     std::int64_t rows,std::uint64_t& used) noexcept {
-    const auto& f=s.fields[index];auto& l=s.layout[index];l={};
-    std::int64_t length=0,nulls=0;
-    if(!m.fb.get(node,length)||!m.fb.get(node+8,nulls)||length!=rows)return Status::BadInput;
-    Buffer v{},values{},off{};auto st=buffer(s,m,buf,v);if(st!=Status::Ok)return st;buf+=16;
-    st=validity(f,v,rows,nulls,l);if(st!=Status::Ok)return st;
-    if(!reserve(used,l.validity?(static_cast<std::uint64_t>(rows)+7)/8:0,s.limits.output_bytes))return Status::Limit;
+// Pre-order walk of one field node and its children: the FieldNode and
+// buffer streams of a record batch are both depth-first.
+struct Walk { const Message* m; std::uint32_t nodes, node, buf; std::uint64_t used; };
+static Status list_offsets(Buffer b,std::int64_t rows,Layout& l,std::int64_t& children) noexcept {
+    if(b.n<(static_cast<std::uint64_t>(rows)+1)*4)return Status::BadInput;
+    std::int32_t prev=0;wire::ByteReader reader{b.p,4,0};
+    if(!wire::read_le(reader,prev))return Status::BadInput;
+    if(prev!=0)return Status::Unsupported;   // sliced lists: offsets not rebased
+    for(std::int64_t i=1;i<=rows;++i){std::int32_t n=0;
+        reader={b.p+static_cast<std::uint64_t>(i)*4,4,0};
+        if(!wire::read_le(reader,n)||n<prev)return Status::BadInput;
+        prev=n;}
+    l.offsets=b.p;children=prev;
+    assert(children>=0);assert(l.offsets!=nullptr);return Status::Ok;
+}
+static Status leaf(State& s,const Message& m,const IpcReadField& f,Layout& l,Walk& w,std::int64_t rows) noexcept {
+    Buffer values{},off{};Status st=Status::Ok;
     if(f.arrow_type==4||f.arrow_type==5){
-        st=buffer(s,m,buf,off);if(st!=Status::Ok)return st;buf+=16;
-        st=buffer(s,m,buf,values);if(st!=Status::Ok)return st;buf+=16;
+        st=buffer(s,m,w.buf,off);if(st!=Status::Ok)return st;w.buf+=16;
+        st=buffer(s,m,w.buf,values);if(st!=Status::Ok)return st;w.buf+=16;
         st=offsets(off,values,rows,l);if(st!=Status::Ok)return st;
         if(f.arrow_type==5&&!utf8_values(l,rows))return Status::BadInput;
-        if(!reserve(used,(static_cast<std::uint64_t>(rows)+1)*4,s.limits.output_bytes)||
-            !reserve(used,values.n,s.limits.output_bytes)||
-            (f.arrow_type==5&&!reserve(used,static_cast<std::uint64_t>(rows)*sizeof(StringView),s.limits.output_bytes)))return Status::Limit;
-    }else{
-        st=buffer(s,m,buf,values);if(st!=Status::Ok)return st;buf+=16;
-        const auto required=f.arrow_type==6?(static_cast<std::uint64_t>(rows)+7)/8:
-            static_cast<std::uint64_t>(rows)*static_cast<std::uint32_t>(f.byte_width);
-        if(values.n<required)return Status::BadInput;
-        l.values=values.p;l.value_bytes=required;
-        const auto width=f.arrow_type==15?16u:static_cast<std::uint32_t>(f.byte_width);
-        if(!reserve(used,static_cast<std::uint64_t>(rows)*width,s.limits.output_bytes))return Status::Limit;
+        if(!reserve(w.used,(static_cast<std::uint64_t>(rows)+1)*4,s.limits.output_bytes)||
+            !reserve(w.used,values.n,s.limits.output_bytes)||
+            (f.arrow_type==5&&!reserve(w.used,static_cast<std::uint64_t>(rows)*sizeof(StringView),s.limits.output_bytes)))return Status::Limit;
+        return Status::Ok;
     }
-    assert(used<=s.limits.output_bytes);assert(l.nulls<=rows);return Status::Ok;
+    st=buffer(s,m,w.buf,values);if(st!=Status::Ok)return st;w.buf+=16;
+    const auto required=f.arrow_type==6?(static_cast<std::uint64_t>(rows)+7)/8:
+        static_cast<std::uint64_t>(rows)*static_cast<std::uint32_t>(f.byte_width);
+    if(values.n<required)return Status::BadInput;
+    l.values=values.p;l.value_bytes=required;
+    const auto width=f.arrow_type==15?16u:static_cast<std::uint32_t>(f.byte_width);
+    if(!reserve(w.used,static_cast<std::uint64_t>(rows)*width,s.limits.output_bytes))return Status::Limit;
+    return Status::Ok;
+}
+static Status column(State& s,Walk& w,std::uint32_t index,std::int64_t rows,std::uint32_t depth) noexcept {
+    assert(index<s.node_count);assert(depth<=kMaxIpcDepth);
+    const Message& m=*w.m;const auto& f=s.fields[index];auto& l=s.layout[index];l={};
+    if(w.node>=w.nodes)return Status::BadInput;
+    std::int64_t length=0,nulls=0;const auto at=w.node;w.node+=16;
+    if(!m.fb.get(at,length)||!m.fb.get(at+8,nulls))return Status::BadInput;
+    if(length!=rows)return length>rows&&depth?Status::Unsupported:Status::BadInput;
+    Buffer v{};auto st=buffer(s,m,w.buf,v);if(st!=Status::Ok)return st;w.buf+=16;
+    st=validity(f,v,rows,nulls,l);if(st!=Status::Ok)return st;
+    l.length=rows;
+    if(!reserve(w.used,l.validity?(static_cast<std::uint64_t>(rows)+7)/8:0,s.limits.output_bytes))return Status::Limit;
+    if(f.arrow_type==13){
+        for(std::uint32_t i=0;i<f.child_count;++i){
+            st=column(s,w,f.first_child+i,rows,depth+1);if(st!=Status::Ok)return st;}
+        return Status::Ok;
+    }
+    if(f.arrow_type==12||f.arrow_type==17){
+        Buffer off{};st=buffer(s,m,w.buf,off);if(st!=Status::Ok)return st;w.buf+=16;
+        std::int64_t children=0;st=list_offsets(off,rows,l,children);if(st!=Status::Ok)return st;
+        if(!reserve(w.used,(static_cast<std::uint64_t>(rows)+1)*4,s.limits.output_bytes))return Status::Limit;
+        return column(s,w,f.first_child,children,depth+1);
+    }
+    return leaf(s,m,f,l,w,rows);
+}
+static std::uint32_t buffer_count(const IpcReadField& f) noexcept {
+    return f.arrow_type==4||f.arrow_type==5||f.arrow_type==12||f.arrow_type==17?
+        (f.arrow_type==4||f.arrow_type==5?3u:2u):f.arrow_type==13?1u:2u;
 }
 Status preflight(State& s,const Message& m,std::int64_t& rows,std::uint64_t& bytes) noexcept {
-    assert(s.schema.field_count<=s.limits.max_fields);assert(m.kind==3);
+    assert(s.schema.field_count<=s.node_count);assert(s.node_count<=s.limits.max_fields);assert(m.kind==3);
     std::uint32_t nodes=0,nn=0,buffers=0,nb=0,compression=0,variadic=0,nv=0;
     if(!m.header.scalar(0,std::int64_t{0},rows)||rows<0||!m.header.vector(1,16,nodes,nn)||
         !m.header.vector(2,16,buffers,nb)||!m.header.ref(3,compression)||!m.header.vector(4,8,variadic,nv))return Status::BadInput;
     if(compression||nv)return Status::Unsupported;
     if(static_cast<std::uint64_t>(rows)>s.limits.max_batch_rows)return Status::Limit;
-    const auto n=s.schema.field_count;std::uint32_t expected=2*n;
-    for(std::uint32_t i=0;i<n;++i)expected+=s.fields[i].arrow_type==4||s.fields[i].arrow_type==5;
-    if(nn!=n||nb!=expected)return Status::BadInput;
-    bytes=0;auto pos=buffers;
-    for(std::uint32_t i=0;i<n;++i){auto st=column(s,m,nodes+16*i,pos,i,rows,bytes);if(st!=Status::Ok)return st;}
-    assert(pos==buffers+16*nb);assert(bytes<=s.limits.output_bytes);return Status::Ok;
+    std::uint32_t expected=0;
+    for(std::uint32_t i=0;i<s.node_count;++i)expected+=buffer_count(s.fields[i]);
+    if(nn!=s.node_count||nb!=expected)return Status::BadInput;
+    Walk w{&m,nodes+16*nn,nodes,buffers,0};
+    for(std::uint32_t i=0;i<s.schema.field_count;++i){auto st=column(s,w,i,rows,0);if(st!=Status::Ok)return st;}
+    if(w.node!=w.nodes||w.buf!=buffers+16*nb)return Status::BadInput;
+    bytes=w.used;assert(bytes<=s.limits.output_bytes);return Status::Ok;
 }
 static void* take(State& s,std::uint64_t& at,std::uint64_t n) noexcept {
     at=(at+63)&~std::uint64_t{63};void* p=s.output+at;at+=n;
@@ -116,12 +154,25 @@ static void string_views(const Layout& l,std::int64_t rows,StringView* dst) noex
     }
     assert(rows>=0);assert(dst!=nullptr);
 }
-static void publish_column(State& s,std::uint32_t i,std::int64_t rows,std::uint64_t& at) noexcept {
+static void publish_column(State& s,std::uint32_t i,std::int64_t rows,std::uint64_t& at,std::uint32_t depth) noexcept {
+    assert(depth<=kMaxIpcDepth);
     const auto& f=s.fields[i];const auto& l=s.layout[i];const auto n=static_cast<std::uint64_t>(rows);
     auto* v=static_cast<std::uint8_t*>(take(s,at,l.validity?(n+7)/8:0));
     if(l.validity&&n)std::memcpy(v,l.validity,static_cast<std::size_t>((n+7)/8));
     auto& c=s.cols[i];
-    if(f.arrow_type==4||f.arrow_type==5){
+    if(f.arrow_type==12||f.arrow_type==13||f.arrow_type==17){
+        c=BoltColumn::make_empty();
+        c.format=ColumnFormat::Nested;c.type=f.physical_type;c.type_size_bytes=0;c.length=rows;
+        c.data=&s.cols[f.first_child];c.seq_offset=f.child_count;c.validity=l.validity?v:nullptr;
+        std::int64_t children=rows;
+        if(f.arrow_type!=13){
+            auto* off=static_cast<std::int32_t*>(take(s,at,(n+1)*4));
+            std::memcpy(off,l.offsets,static_cast<std::size_t>((n+1)*4));
+            children=off[n];
+            s.offset_cols[i]=BoltColumn::make_flat(off,nullptr,rows+1,BoltType::Int32);c.dict_child=&s.offset_cols[i];
+        }
+        for(std::uint32_t k=0;k<f.child_count;++k)publish_column(s,f.first_child+k,children,at,depth+1);
+    }else if(f.arrow_type==4||f.arrow_type==5){
         auto* off=static_cast<std::int32_t*>(take(s,at,(n+1)*4));
         std::memcpy(off,l.offsets,static_cast<std::size_t>((n+1)*4));
         auto* data=take(s,at,l.value_bytes);if(l.value_bytes)std::memcpy(data,l.values,static_cast<std::size_t>(l.value_bytes));
@@ -146,7 +197,7 @@ static void publish_column(State& s,std::uint32_t i,std::int64_t rows,std::uint6
 void publish(State& s,std::int64_t rows) noexcept {
     assert(rows>=0);assert(static_cast<std::uint64_t>(rows)<=s.limits.max_batch_rows);
     std::uint64_t at=0;
-    for(std::uint32_t i=0;i<s.schema.field_count;++i){publish_column(s,i,rows,at);const auto& f=s.fields[i];
+    for(std::uint32_t i=0;i<s.schema.field_count;++i){publish_column(s,i,rows,at,0);const auto& f=s.fields[i];
         auto& b=s.bolt_fields[i];b={};if(f.name.size)std::memcpy(b.name,f.name.data,f.name.size);
         b.type=f.physical_type;b.nullable=f.nullable;b.decimal_scale=static_cast<std::uint8_t>(f.scale);
         b.fixed_size=f.arrow_type==15?static_cast<std::uint32_t>(f.byte_width):0;}

@@ -48,8 +48,28 @@ for name, options in (("legacy.arrows", ipc.IpcWriteOptions(use_legacy_format=Tr
             writer.write_batch(batch)
             writer.write_batch(batch.slice(0, 0))
             writer.write_batch(batch)
+# List / struct / map, nulls at every level, two batches (the second a
+# slice, which the writer re-bases) in a stream and a file.
+point = pa.struct([pa.field("x", pa.float64()), pa.field("tags", pa.list_(pa.string()))])
+nested_cols = {
+    "ints": (pa.list_(pa.int32()), [[1, 2], None, [], [None, 7]]),
+    "names": (pa.list_(pa.string()), [["a", "a long string past twelve"], [], None, [None]]),
+    "pair": (pa.struct([pa.field("a", pa.int64()), pa.field("b", pa.string(), nullable=False)]),
+             [{"a": 1, "b": "x"}, None, {"a": None, "b": "z"}, {"a": -5, "b": ""}]),
+    "attrs": (pa.map_(pa.string(), pa.int64()), [[("k", 1), ("j", None)], None, [], [("only", 9)]]),
+    "points": (pa.list_(point), [[{"x": 1.5, "tags": ["p"]}, None], None,
+                                 [{"x": None, "tags": None}], [{"x": -0.0, "tags": []}]]),
+}
+nested_schema = pa.schema([pa.field(n, t) for n, (t, _) in nested_cols.items()])
+nested_batch = pa.record_batch([pa.array(v, type=t) for t, v in nested_cols.values()], schema=nested_schema)
+for is_file in (False, True):
+    with pa.OSFile(str(HERE / ("nested_ok.arrow" if is_file else "nested_ok.arrows")), "wb") as sink:
+        with (ipc.new_file if is_file else ipc.new_stream)(sink, nested_schema) as writer:
+            writer.write_batch(nested_batch)
+            writer.write_batch(nested_batch.slice(1, 3))
 # Each unsupported fixture independently exercises a distinct admission gate.
-for name, array in (("nested", pa.array([[1,2],None], pa.list_(pa.int32()))),
+for name, array in (("nested", pa.array([[1,2],None], pa.list_(pa.int32(), 2))),
+                    ("large_list", pa.array([[1,2],None], pa.large_list(pa.int32()))),
                     ("dictionary", pa.array(["a","b"]).dictionary_encode()),
                     ("negative_scale", pa.array([Decimal("1E2")], pa.decimal128(3,-2)))):
     b = pa.record_batch([array], names=[name])
