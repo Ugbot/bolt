@@ -88,6 +88,9 @@ def main():
     print()
     emit_map("kLower", lower)
     emit_map("kUpper", upper)
+    space = [cp for cp in range(0x110000) if not 0xD800 <= cp <= 0xDFFF and chr(cp).isspace()]
+    print("// str.strip() / split() whitespace: str.isspace()")
+    print("inline constexpr uint32_t kSpace[] = {%s};" % ", ".join("0x%04X" % c for c in space))
     emit_ranges("kSigmaIgnorable", ign)
     emit_ranges("kSigmaCased", cased)
     print()
