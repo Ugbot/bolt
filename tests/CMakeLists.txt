@@ -1185,6 +1185,11 @@ if(BOLT_BUILD_PARSE)
     target_link_libraries(test_bolt_json_canonical PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_json_canonical)
     add_test(NAME test_bolt_json_canonical COMMAND test_bolt_json_canonical)
+    # G2GRAPH-453 — YAML -> JSON kernel (frontmatter, configuration).
+    add_executable(test_bolt_yaml test_bolt_yaml.cpp)
+    target_link_libraries(test_bolt_yaml PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_yaml)
+    add_test(NAME test_bolt_yaml COMMAND test_bolt_yaml)
     add_executable(test_bolt_json_writer test_bolt_json_writer.cpp)
     target_link_libraries(test_bolt_json_writer
         PRIVATE bolt::bolt bolt::parse GTest::gtest GTest::gtest_main)
