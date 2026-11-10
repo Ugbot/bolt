@@ -51,6 +51,9 @@ TEST(BoltTz, ParsesRegionsOffsetsAndAliases) {
     char buf[64];
     EXPECT_EQ(std::string(buf, bolt::tz::zone_name(z, buf, sizeof(buf))), "America/New_York");
     EXPECT_EQ(bolt::tz::offset_at(zone("PST"), 1705276800), -8 * 3600);
+    EXPECT_EQ(bolt::tz::offset_at(zone("EST"), -2209006800), -5 * 3600);   // SHORT_IDS: fixed, no LMT
+    EXPECT_EQ(bolt::tz::offset_at(zone("MST"), -62135596800), -7 * 3600);
+    EXPECT_EQ(bolt::tz::offset_at(zone("HST"), 0), -10 * 3600);
     EXPECT_FALSE(bolt::tz::zone_parse("Mars/Olympus", 12, &z));
     EXPECT_FALSE(bolt::tz::zone_parse("+19:00", 6, &z));
     EXPECT_EQ(z, bolt::tz::kInvalidZone);
