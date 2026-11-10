@@ -306,6 +306,42 @@ inline std::uint32_t utf8_put(std::uint32_t cp, std::uint8_t* d) noexcept {
     return 4;
 }
 
+// The string Spark's UTF8String.toString yields for arbitrary bytes, re-encoded as UTF-8: every maximal
+// invalid subpart becomes one U+FFFD. dst holds 3n bytes; returns the length written.
+inline std::uint64_t utf8_repair(const std::uint8_t* s, std::uint64_t n, std::uint8_t* dst) noexcept {
+    assert(dst != nullptr && (s != nullptr || n == 0));
+    std::uint64_t i = 0, o = 0;
+    while (i < n) {
+        std::uint32_t cp, l;
+        if (utf8_next(s + i, n - i, &cp, &l)) {
+            std::memcpy(dst + o, s + i, l);
+            o += l;
+            i += l;
+            continue;
+        }
+        const std::uint32_t b0 = s[i];
+        if (b0 == 0xEDu && i + 2 < n && s[i + 1] >= 0xA0u && s[i + 1] <= 0xBFu && s[i + 2] >= 0x80u && s[i + 2] <= 0xBFu) {
+            // An encoded surrogate: the JDK decodes the 3-byte form, finds a surrogate and writes one U+FFFD.
+            dst[o++] = 0xEFu; dst[o++] = 0xBFu; dst[o++] = 0xBDu;
+            i += 3;
+            continue;
+        }
+        std::uint32_t need = 0, lo = 0x80u, hi = 0xBFu;
+        if (b0 >= 0xC2u && b0 <= 0xDFu) need = 1;
+        else if (b0 >= 0xE0u && b0 <= 0xEFu) { need = 2; if (b0 == 0xE0u) lo = 0xA0u; if (b0 == 0xEDu) hi = 0x9Fu; }
+        else if (b0 >= 0xF0u && b0 <= 0xF4u) { need = 3; if (b0 == 0xF0u) lo = 0x90u; if (b0 == 0xF4u) hi = 0x8Fu; }
+        std::uint32_t j = 1;
+        while (need != 0 && j <= need && i + j < n) {
+            const std::uint32_t b = s[i + j];
+            if (b < (j == 1 ? lo : 0x80u) || b > (j == 1 ? hi : 0xBFu)) break;
+            ++j;
+        }
+        dst[o++] = 0xEFu; dst[o++] = 0xBFu; dst[o++] = 0xBDu;
+        i += j;
+    }
+    return o;
+}
+
 inline std::uint64_t charset_encode_cap(std::uint64_t n) noexcept { return 4u * n + 4u; }
 inline std::uint64_t charset_decode_cap(std::uint64_t n) noexcept { return 3u * n + 4u; }
 
@@ -320,7 +356,7 @@ inline CodingStatus charset_encode(const std::uint8_t* s, std::uint64_t n, Chars
     if (!utf8_valid(s, n)) return CodingStatus::InvalidSource;
     std::uint64_t i = 0, o = 0;
     if (cs == Charset::Utf8) { if (n != 0) std::memcpy(dst, s, n); *out_len = n; return CodingStatus::Ok; }
-    if (cs == Charset::Utf16) { dst[o++] = 0xFEu; dst[o++] = 0xFFu; }
+    if (cs == Charset::Utf16 && n != 0) { dst[o++] = 0xFEu; dst[o++] = 0xFFu; }   // the JDK writes the BOM with the first char
     while (i < n) {
         std::uint32_t cp, l;
         (void)utf8_next(s + i, n - i, &cp, &l);
@@ -386,8 +422,11 @@ inline CodingStatus charset_decode(const std::uint8_t* s, std::uint64_t n, Chars
                                         (static_cast<std::uint32_t>(s[i + 1]) << 8) | s[i]
                                       : (static_cast<std::uint32_t>(s[i]) << 24) | (static_cast<std::uint32_t>(s[i + 1]) << 16) |
                                         (static_cast<std::uint32_t>(s[i + 2]) << 8) | s[i + 3];
-                if (cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return CodingStatus::Malformed;
-                o += utf8_put(cp, dst + o);
+                if (cp > 0x10FFFFu) return CodingStatus::Malformed;
+                // The JDK's UTF-32 decoder passes a surrogate code point through as a lone char, which
+                // Spark's String -> UTF-8 conversion then writes as '?'.
+                if (cp >= 0xD800u && cp <= 0xDFFFu) dst[o++] = static_cast<std::uint8_t>('?');
+                else o += utf8_put(cp, dst + o);
             }
             break;
         }
