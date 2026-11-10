@@ -866,3 +866,76 @@ TEST(ArrowIpc, TimestampUnitNanosRoundTrips) {
     bolt_aligned_free(batch);
     std::free(w);
 }
+
+// Narrow / single-precision leaves and an Int64 epoch lane under a Timestamp
+// field, nested, read back through the owned reader.
+TEST(ArrowIpc, NestedNarrowLeavesAndTimestampLaneRoundTrip) {
+    static std::int8_t i8[3] = {-128, 0, 127};
+    static std::int16_t i16[3] = {-32768, 1, 32767};
+    static std::int32_t i32[4] = {INT32_MIN, 7, 8, INT32_MAX};
+    static float f32[3] = {-0.5f, 1.25f, 3.0e38f};
+    static std::int64_t ts[3] = {1704164645123456LL, -1LL, 0LL};
+    static std::int32_t offs[4] = {0, 1, 1, 4};
+    bolt::Arena arena;
+    auto flat = [](void* d, std::int64_t n, BoltType t) { return BoltColumn::make_flat(d, nullptr, n, t); };
+    BoltColumn kids[4] = {flat(i8, 3, BoltType::Int8), flat(i16, 3, BoltType::Int16),
+                          flat(f32, 3, BoltType::Float32), flat(ts, 3, BoltType::Int64)};
+    const BoltColumn elem = flat(i32, 4, BoltType::Int32);
+    BoltBatch* batch = allocate_batch(&arena, 2u);
+    ASSERT_NE(batch, nullptr);
+    batch->num_rows = 3;
+    batch->num_cols = 2;
+    batch->columns[batch->read_epoch][0] = BoltColumn::make_struct(kids, 4, 3, nullptr, &arena);
+    batch->columns[batch->read_epoch][1] = BoltColumn::make_list(&elem, offs, 3, nullptr, &arena);
+    FieldSpec sf[4]{};
+    const BoltType st[4] = {BoltType::Int8, BoltType::Int16, BoltType::Float32, BoltType::Timestamp};
+    const char* sn[4] = {"a", "b", "c", "t"};
+    for (int k = 0; k < 4; ++k) { sf[k].type = st[k]; sf[k].name = sn[k]; }
+    FieldSpec item{};
+    item.type = BoltType::Int32;
+    item.name = "item";
+    FieldSpec top[2]{};
+    top[0].type = BoltType::Struct; top[0].name = "s"; top[0].n_children = 4; top[0].children = sf;
+    top[1].type = BoltType::List; top[1].name = "l"; top[1].n_children = 1; top[1].children = &item;
+    std::FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    auto* w = static_cast<ArrowIpcWriter*>(std::calloc(1, sizeof(ArrowIpcWriter)));
+    ASSERT_TRUE(arrow_ipc_open_nested(w, f, top, 2));
+    ASSERT_TRUE(arrow_ipc_write_batch(w, batch));
+    ASSERT_TRUE(arrow_ipc_close(w));
+    std::free(w);
+    const long n = std::ftell(f);
+    std::rewind(f);
+    void* buf = bolt_aligned_alloc(64, static_cast<std::size_t>(n));
+    ASSERT_EQ(std::fread(buf, 1, static_cast<std::size_t>(n), f), static_cast<std::size_t>(n));
+    std::fclose(f);
+    IpcReadLimits lim{};
+    std::uint64_t ws = 0;
+    ASSERT_EQ(arrow_ipc_reader_workspace_size(lim, ws), IpcReadStatus::Ok);
+    void* wsp = bolt_aligned_alloc(64, static_cast<std::size_t>(ws));
+    ArrowIpcReader r{};
+    ASSERT_EQ(arrow_ipc_reader_open(buf, static_cast<std::uint64_t>(n), lim, wsp, ws, r), IpcReadStatus::Ok);
+    IpcReadSchema sch{};
+    ASSERT_EQ(arrow_ipc_reader_schema(r, sch), IpcReadStatus::Ok);
+    const auto& s = sch.fields[0];
+    ASSERT_EQ(s.child_count, 4u);
+    EXPECT_EQ(sch.fields[s.first_child + 0].physical_type, BoltType::Int8);
+    EXPECT_EQ(sch.fields[s.first_child + 1].physical_type, BoltType::Int16);
+    EXPECT_EQ(sch.fields[s.first_child + 2].physical_type, BoltType::Float32);
+    EXPECT_EQ(sch.fields[s.first_child + 3].arrow_type, 10);   // Timestamp
+    EXPECT_EQ(sch.fields[sch.fields[1].first_child].physical_type, BoltType::Int32);
+    const BoltBatch* out = nullptr;
+    ASSERT_EQ(arrow_ipc_reader_next(r, out), IpcReadStatus::Ok);
+    const BoltColumn& os = out->col(0);
+    EXPECT_EQ(static_cast<const std::int8_t*>(os.child_at(0)->data)[0], -128);
+    EXPECT_EQ(static_cast<const std::int16_t*>(os.child_at(1)->data)[2], 32767);
+    EXPECT_EQ(static_cast<const float*>(os.child_at(2)->data)[1], 1.25f);
+    EXPECT_EQ(static_cast<const std::int64_t*>(os.child_at(3)->data)[0], 1704164645123456LL);
+    const BoltColumn& ol = out->col(1);
+    EXPECT_EQ(ol.list_offsets()[3], 4);
+    EXPECT_EQ(static_cast<const std::int32_t*>(ol.list_element()->data)[3], INT32_MAX);
+    arrow_ipc_reader_close(r);
+    bolt_aligned_free(wsp);
+    bolt_aligned_free(buf);
+    bolt_aligned_free(batch);
+}

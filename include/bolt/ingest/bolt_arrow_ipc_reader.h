@@ -18,7 +18,8 @@ struct IpcReadField {
     IpcReadString name, timezone;
     const IpcReadKeyValue* metadata = nullptr;
     std::uint32_t metadata_count = 0;
-    // List (12) / Struct_ (13) / Map (17): children are
+    // List (12) / Struct_ (13) / FixedSizeList (16, byte_width = list size) /
+    // Map (17) / LargeList (21): children are
     // schema.fields[first_child .. first_child + child_count), slots past
     // field_count in the same array. A Map's child is its non-null
     // entries struct of {key (non-null), value}.
@@ -84,10 +85,12 @@ IpcReadStatus arrow_ipc_reader_schema(const ArrowIpcReader&, IpcReadSchema& out)
 // and batch cursor unchanged. On Ok: out is reader-owned, read-only, valid
 // until next successful next or close. It may be copied before then.
 // End accepts optional EOS or clean span exhaustion. Extra bytes after EOS
-// are BadInput. Dictionary/compressed/view/large-offset/fixed-size-list
-// arrays, sliced lists (offsets not starting at 0) and big-endian bodies are
-// explicitly Unsupported. List / Struct / Map columns are published as
-// ColumnFormat::Nested trees. V4/V5 metadata admitted.
+// are BadInput. Dictionary/compressed/view/large-binary arrays, lists whose
+// offsets do not start at 0 and big-endian bodies are explicitly
+// Unsupported. List / LargeList / FixedSizeList / Struct / Map columns are
+// published as ColumnFormat::Nested trees (every list kind as a List with
+// int32 element offsets; a LargeList past INT32_MAX elements is a Limit).
+// V4/V5 metadata admitted.
 IpcReadStatus arrow_ipc_reader_next(ArrowIpcReader&, const BoltBatch*& out) noexcept;
 void arrow_ipc_reader_close(ArrowIpcReader&) noexcept;
 } // namespace bolt::ingest

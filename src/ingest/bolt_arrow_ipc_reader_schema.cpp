@@ -59,7 +59,10 @@ static Status field_type(Table t,IpcReadField& f) noexcept {
             if (!t.scalar(0,std::int16_t{1},f.unit) || f.unit<0 || f.unit>1) return Status::BadInput;
             f.byte_width=f.unit==0?4:8;f.physical_type=f.unit==0?BoltType::Date32:BoltType::Date64;break;
         case 9:case 10:case 18:return temporal(t,f);
-        case 12:f.physical_type=BoltType::List;break;
+        case 12:case 21:f.physical_type=BoltType::List;break;
+        case 16:
+            if(!t.scalar(0,0,f.byte_width)||f.byte_width<0)return Status::BadInput;
+            f.physical_type=BoltType::List;break;
         case 13:f.physical_type=BoltType::Struct;break;
         case 17:f.physical_type=BoltType::Map;break;
         case 15:
@@ -86,7 +89,7 @@ static bool same_field(const IpcReadField& a,const IpcReadField& b) noexcept {
 }
 struct FieldCursor { IpcReadField* dst; std::uint32_t cap, nodes; IpcReadKeyValue* kv; std::uint32_t kv_cap, kv_used; };
 static bool group(const IpcReadField& f) noexcept {
-    return f.arrow_type==12||f.arrow_type==13||f.arrow_type==17;
+    return f.arrow_type==12||f.arrow_type==13||f.arrow_type==16||f.arrow_type==17||f.arrow_type==21;
 }
 // Children of a list / struct / map take the next free slots of the same
 // field array (after every top-level field), so fields[first_child ..
