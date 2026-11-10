@@ -70,6 +70,21 @@ static Status list_offsets(Buffer b,std::int64_t rows,Layout& l,std::int64_t& ch
     l.offsets=b.p;children=prev;
     assert(children>=0);assert(l.offsets!=nullptr);return Status::Ok;
 }
+// LargeList: int64 offsets, published as int32 (past INT32_MAX elements is
+// a Limit, never a wrap).
+static Status large_offsets(Buffer b,std::int64_t rows,Layout& l,std::int64_t& children) noexcept {
+    if(b.n<(static_cast<std::uint64_t>(rows)+1)*8)return Status::BadInput;
+    std::int64_t prev=0;wire::ByteReader reader{b.p,8,0};
+    if(!wire::read_le(reader,prev))return Status::BadInput;
+    if(prev!=0)return Status::Unsupported;
+    for(std::int64_t i=1;i<=rows;++i){std::int64_t n=0;
+        reader={b.p+static_cast<std::uint64_t>(i)*8,8,0};
+        if(!wire::read_le(reader,n)||n<prev)return Status::BadInput;
+        if(n>INT32_MAX)return Status::Limit;
+        prev=n;}
+    l.offsets=b.p;children=prev;
+    assert(children>=0);assert(children<=INT32_MAX);return Status::Ok;
+}
 static Status leaf(State& s,const Message& m,const IpcReadField& f,Layout& l,Walk& w,std::int64_t rows) noexcept {
     Buffer values{},off{};Status st=Status::Ok;
     if(f.arrow_type==4||f.arrow_type==5){
@@ -107,17 +122,25 @@ static Status column(State& s,Walk& w,std::uint32_t index,std::int64_t rows,std:
             st=column(s,w,f.first_child+i,rows,depth+1);if(st!=Status::Ok)return st;}
         return Status::Ok;
     }
-    if(f.arrow_type==12||f.arrow_type==17){
+    if(f.arrow_type==16){
+        const auto width=static_cast<std::uint64_t>(f.byte_width);
+        if(width&&static_cast<std::uint64_t>(rows)>static_cast<std::uint64_t>(INT32_MAX)/width)return Status::Limit;
+        if(!reserve(w.used,(static_cast<std::uint64_t>(rows)+1)*4,s.limits.output_bytes))return Status::Limit;
+        return column(s,w,f.first_child,rows*f.byte_width,depth+1);
+    }
+    if(f.arrow_type==12||f.arrow_type==17||f.arrow_type==21){
         Buffer off{};st=buffer(s,m,w.buf,off);if(st!=Status::Ok)return st;w.buf+=16;
-        std::int64_t children=0;st=list_offsets(off,rows,l,children);if(st!=Status::Ok)return st;
+        std::int64_t children=0;
+        st=f.arrow_type==21?large_offsets(off,rows,l,children):list_offsets(off,rows,l,children);
+        if(st!=Status::Ok)return st;
         if(!reserve(w.used,(static_cast<std::uint64_t>(rows)+1)*4,s.limits.output_bytes))return Status::Limit;
         return column(s,w,f.first_child,children,depth+1);
     }
     return leaf(s,m,f,l,w,rows);
 }
 static std::uint32_t buffer_count(const IpcReadField& f) noexcept {
-    return f.arrow_type==4||f.arrow_type==5||f.arrow_type==12||f.arrow_type==17?
-        (f.arrow_type==4||f.arrow_type==5?3u:2u):f.arrow_type==13?1u:2u;
+    if(f.arrow_type==4||f.arrow_type==5)return 3u;
+    return f.arrow_type==13||f.arrow_type==16?1u:2u;
 }
 Status preflight(State& s,const Message& m,std::int64_t& rows,std::uint64_t& bytes) noexcept {
     assert(s.schema.field_count<=s.node_count);assert(s.node_count<=s.limits.max_fields);assert(m.kind==3);
@@ -160,14 +183,17 @@ static void publish_column(State& s,std::uint32_t i,std::int64_t rows,std::uint6
     auto* v=static_cast<std::uint8_t*>(take(s,at,l.validity?(n+7)/8:0));
     if(l.validity&&n)std::memcpy(v,l.validity,static_cast<std::size_t>((n+7)/8));
     auto& c=s.cols[i];
-    if(f.arrow_type==12||f.arrow_type==13||f.arrow_type==17){
+    if(f.arrow_type==12||f.arrow_type==13||f.arrow_type==16||f.arrow_type==17||f.arrow_type==21){
         c=BoltColumn::make_empty();
         c.format=ColumnFormat::Nested;c.type=f.physical_type;c.type_size_bytes=0;c.length=rows;
         c.data=&s.cols[f.first_child];c.seq_offset=f.child_count;c.validity=l.validity?v:nullptr;
         std::int64_t children=rows;
         if(f.arrow_type!=13){
             auto* off=static_cast<std::int32_t*>(take(s,at,(n+1)*4));
-            std::memcpy(off,l.offsets,static_cast<std::size_t>((n+1)*4));
+            if(f.arrow_type==16){for(std::uint64_t r=0;r<=n;++r)off[r]=static_cast<std::int32_t>(r*static_cast<std::uint64_t>(f.byte_width));}
+            else if(f.arrow_type==21){for(std::uint64_t r=0;r<=n;++r){std::int64_t v=0;
+                std::memcpy(&v,l.offsets+r*8,8);off[r]=static_cast<std::int32_t>(v);}}
+            else std::memcpy(off,l.offsets,static_cast<std::size_t>((n+1)*4));
             children=off[n];
             s.offset_cols[i]=BoltColumn::make_flat(off,nullptr,rows+1,BoltType::Int32);c.dict_child=&s.offset_cols[i];
         }

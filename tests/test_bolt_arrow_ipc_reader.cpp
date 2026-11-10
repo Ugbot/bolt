@@ -112,7 +112,7 @@ TEST(ArrowIpcReader, OrdinaryOwnedMappedFileOpenerAndClose){
     EXPECT_EQ(arrow_ipc_reader_open_file("missing-owned-arrow-reader-fixture",w.limits,w.p,w.size,w.reader),Status::IoError);
 }
 TEST(ArrowIpcReader, ExplicitUnsupportedSchemaAndCompressedBatch){
-    for(const auto* name:{"nested.arrows","large_list.arrows","dictionary.arrows","negative_scale.arrows"}){SCOPED_TRACE(name);Work w;EXPECT_EQ(w.open(load(name)),Status::Unsupported);EXPECT_EQ(w.reader.state,nullptr);}
+    for(const auto* name:{"dictionary.arrows","negative_scale.arrows"}){SCOPED_TRACE(name);Work w;EXPECT_EQ(w.open(load(name)),Status::Unsupported);EXPECT_EQ(w.reader.state,nullptr);}
     auto bytes=load("compressed.arrows");Work w;ASSERT_EQ(w.open(bytes),Status::Ok);
     const BoltBatch* out=reinterpret_cast<const BoltBatch*>(std::uintptr_t{64});EXPECT_EQ(arrow_ipc_reader_next(w.reader,out),Status::Unsupported);EXPECT_EQ(reinterpret_cast<std::uintptr_t>(out),64u);
 }
@@ -292,4 +292,15 @@ TEST(ArrowIpcReader, NestedTruncationAndByteCorruptionNeverPublishPartialBatches
                     EXPECT_EQ(col.list_offsets()[col.length],col.list_element()->length);}}
         }
     }
+}
+TEST(ArrowIpcReader, FixedSizeAndLargeListsPublishAsLists){
+    for(const auto* name:{"nested.arrows","large_list.arrows"}){SCOPED_TRACE(name);const auto bytes=load(name);Work w;ASSERT_EQ(w.open(bytes),Status::Ok);
+        const BoltBatch* b=nullptr;ASSERT_EQ(arrow_ipc_reader_next(w.reader,b),Status::Ok);ASSERT_EQ(b->num_rows,2);
+        const auto& c=b->col(0);ASSERT_EQ(c.type,BoltType::List);EXPECT_TRUE(c.is_null(1));
+        const auto* o=c.list_offsets();EXPECT_EQ(o[0],0);EXPECT_EQ(o[1],2);
+        EXPECT_EQ(o[2],std::strcmp(name,"nested.arrows")==0?4:2);   // a null fixed-size list keeps its slots
+        EXPECT_EQ(lane<std::int32_t>(*c.list_element(),0),1);EXPECT_EQ(lane<std::int32_t>(*c.list_element(),1),2);
+        IpcReadSchema schema{};ASSERT_EQ(arrow_ipc_reader_schema(w.reader,schema),Status::Ok);
+        nested_row::NamedType t{};ASSERT_EQ(arrow_ipc_field_named_type(schema,0,t),Status::Ok);
+        Arena arena{};BoltColumn enc{};EXPECT_TRUE(nested_row::encode_column(t,c,&arena,nested_row::ColumnLimits{},&enc));}
 }

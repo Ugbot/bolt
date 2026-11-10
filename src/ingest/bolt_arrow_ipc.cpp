@@ -238,6 +238,19 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
         fb_field_scalar<std::uint8_t>(b, 1, 1);         // is_signed
         return fb_end_table(b);
     }
+    if (t == BoltType::Int8 || t == BoltType::Int16 || t == BoltType::Int32) {
+        *out_tag = kTypeInt;
+        fb_start_table(b);
+        fb_field_scalar<std::int32_t>(b, 0, t == BoltType::Int8 ? 8 : t == BoltType::Int16 ? 16 : 32);
+        fb_field_scalar<std::uint8_t>(b, 1, 1);
+        return fb_end_table(b);
+    }
+    if (t == BoltType::Float32) {
+        *out_tag = kTypeFloat;
+        fb_start_table(b);
+        fb_field_scalar<std::int16_t>(b, 0, 1);          // SINGLE
+        return fb_end_table(b);
+    }
     if (t == BoltType::Float64) {
         *out_tag = kTypeFloat;
         fb_start_table(b);
@@ -647,7 +660,12 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     if (desc_idx >= w->n_desc) return false;
     if (n < 0 || col.length < n) return false;
     const IpcFieldDesc& fd = w->desc[desc_idx];
-    if (static_cast<std::uint16_t>(col.type) != fd.type) return false;
+    // A Timestamp field may carry an Int64 epoch lane (same width, the unit
+    // is the field's), the shape decoded nested-row leaves have.
+    if (static_cast<std::uint16_t>(col.type) != fd.type &&
+        !(fd.type == static_cast<std::uint16_t>(BoltType::Timestamp) && col.type == BoltType::Int64)) {
+        return false;
+    }
     if (L->n_nodes >= L->max_nodes) return false;
 
     const std::int64_t nulls = count_nulls(col.validity, n);
