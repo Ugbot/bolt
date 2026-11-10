@@ -48,6 +48,7 @@ constexpr std::uint8_t kTypeDate       = 8;
 constexpr std::uint8_t kTypeTimestamp  = 10;
 constexpr std::uint8_t kTypeList       = 12;
 constexpr std::uint8_t kTypeStruct     = 13;
+constexpr std::uint8_t kTypeMap        = 17;
 constexpr std::int16_t kPrecisionDouble = 2;  // FloatingPoint::Precision
 constexpr std::int16_t kDateUnitDay     = 0;  // DateUnit::DAY
 constexpr std::int16_t kTimeUnitMicro   = 2;  // TimeUnit::MICROSECOND
@@ -290,6 +291,11 @@ std::uint32_t build_type_table(Fb* b, BoltType t, std::uint8_t decimal_scale,
         fb_start_table(b);                               // empty table
         return fb_end_table(b);
     }
+    if (t == BoltType::Map) {
+        *out_tag = kTypeMap;
+        fb_start_table(b);                               // keysSorted = false (default)
+        return fb_end_table(b);
+    }
     return 0;                                            // unsupported
 }
 
@@ -333,9 +339,16 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
     for (std::uint16_t i = 0; i < w->n_desc; ++i) {
         const FieldSpec* s = src[i];
         const bool is_list = (s->type == BoltType::List);
+        const bool is_map = (s->type == BoltType::Map);
         const bool is_struct = (s->type == BoltType::Struct);
         if (is_list) {
             if (s->n_children != 1 || s->children == nullptr) return false;
+        } else if (is_map) {
+            // Arrow Map: one non-null struct<key, value> entries child.
+            if (s->n_children != 1 || s->children == nullptr ||
+                s->children[0].type != BoltType::Struct || s->children[0].n_children != 2) {
+                return false;
+            }
         } else if (is_struct) {
             if (s->n_children == 0 || s->n_children > kIpcMaxStructChildren ||
                 s->children == nullptr) {
@@ -352,6 +365,7 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         IpcFieldDesc& fd = w->desc[i];
         fd.type = static_cast<std::uint16_t>(s->type);
         fd.n_children = static_cast<std::uint8_t>(s->n_children);
+        fd.non_null = 0;
         fd.decimal_scale =
             (s->type == BoltType::Decimal128) ? s->decimal_scale : 0;
         if (s->time_unit > kIpcTimeNano) return false;
@@ -375,10 +389,26 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
                 std::snprintf(name_buf[ci], kIpcNameCap, "%s", child.name);
             } else if (is_list) {
                 std::snprintf(name_buf[ci], kIpcNameCap, "item");
+            } else if (is_map) {
+                std::snprintf(name_buf[ci], kIpcNameCap, "entries");
             } else {
                 std::snprintf(name_buf[ci], kIpcNameCap, "f%u",
                               static_cast<unsigned>(k));
             }
+        }
+    }
+    // Arrow requires a map's entries struct and its key to be non-null.
+    for (std::uint16_t i = 0; i < w->n_desc; ++i) {
+        if (static_cast<BoltType>(w->desc[i].type) != BoltType::Map) continue;
+        IpcFieldDesc& entries = w->desc[w->desc[i].first_child];
+        entries.non_null = 1;
+        w->desc[entries.first_child].non_null = 1;
+        const FieldSpec* es = src[w->desc[i].first_child];
+        if (es->children[0].name == nullptr || es->children[0].name[0] == '\0') {
+            std::snprintf(name_buf[entries.first_child], kIpcNameCap, "key");
+        }
+        if (es->children[1].name == nullptr || es->children[1].name[0] == '\0') {
+            std::snprintf(name_buf[entries.first_child + 1], kIpcNameCap, "value");
         }
     }
     return true;
@@ -419,7 +449,7 @@ bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
         const std::uint32_t name_pos = fb_string(b, name_buf[i]);
         fb_start_table(b);
         fb_field_offset(b, 0, name_pos);                 // name
-        fb_field_scalar<std::uint8_t>(b, 1, 1);          // nullable = true
+        fb_field_scalar<std::uint8_t>(b, 1, fd.non_null ? 0 : 1);  // nullable
         fb_field_scalar<std::uint8_t>(b, 2, tag);        // type_type
         fb_field_offset(b, 3, type_pos);                 // type
         fb_field_offset(b, 5, children_vec);              // children
@@ -647,7 +677,7 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     // out of range" pyarrow error byte-for-byte).
     if (!add_buf(nulls > 0 ? (n + 7) / 8 : 0)) return false;
 
-    if (col.type == BoltType::List) {
+    if (col.type == BoltType::List || col.type == BoltType::Map) {
         if (fd.n_children != 1 || !col.is_nested()) return false;
         if (!add_buf((n + 1) * 4)) return false;                  // offsets
         const std::int32_t* offs = col.list_offsets();
@@ -740,7 +770,7 @@ bool write_field_body(std::FILE* f, const ArrowIpcWriter* w,
         return false;
     }
 
-    if (col.type == BoltType::List) {
+    if (col.type == BoltType::List || col.type == BoltType::Map) {
         const std::int32_t* offs = col.list_offsets();
         if (offs == nullptr) return false;
         if (!write_padded(f, offs, (n + 1) * 4)) return false;
