@@ -134,6 +134,13 @@ void test_cm4() {
     CorrMoments nn{};
     sa::cm4_update(&nn, 1.0); sa::cm4_update(&nn, std::nan("")); sa::cm4_update(&nn, 3.0);
     CHK(sa::skewness_finalize(&nn, &r) && std::isnan(r));
+    // A lone NaN / +-Inf is NaN in Spark (M2 = x * (x - x)), not NULL; a lone finite value is NULL.
+    for (double lone : {std::nan(""), HUGE_VAL, -HUGE_VAL}) {
+        CorrMoments one{};
+        sa::cm4_update(&one, lone);
+        CHK(sa::skewness_finalize(&one, &r) && std::isnan(r));
+        CHK(sa::kurtosis_finalize(&one, &r) && std::isnan(r));
+    }
 }
 
 void fold(CorrMoments* m, double x, double y) {   // agg_f64::comoment_update
