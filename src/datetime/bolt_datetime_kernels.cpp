@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstring>
 
+#include "bolt/datetime/bolt_calendar_arith.h"
 #include "bolt/kernels/bolt_date.h"
 
 namespace bolt::dtk {
@@ -143,15 +144,62 @@ inline std::int64_t field_of(Field f, std::int64_t days, std::int64_t tod_us) no
         case Field::WeekDay: return cal::iso_dow(days) - 1;
         case Field::DayOfYear: return days - cal::days_from_ymd(r.y, 1, 1) + 1;   // r.doy counts from March
         case Field::Quarter: return (r.m - 1) / 3 + 1;
-        case Field::WeekOfYear:
-            return bolt::kernels::date::iso_week_from_components(
-                r.y, static_cast<std::int32_t>(days - cal::days_from_ymd(r.y, 1, 1) + 1),
-                cal::iso_dow(days));
+        case Field::WeekOfYear: {
+            std::int32_t wy = 0, wk = 0;
+            cal::iso_week_year(days, &wy, &wk);
+            return wk;
+        }
+        case Field::YearOfWeek: {
+            std::int32_t wy = 0, wk = 0;
+            cal::iso_week_year(days, &wy, &wk);
+            return wy;
+        }
+        case Field::DowIso: return cal::iso_dow(days);
+        case Field::SecondMicros: return tod_us % 60000000LL;
     }
     return 0;
 }
 
 }  // namespace
+
+bool timestamp_add_utc_us(tz::ZoneId z, cal::AddUnit u, const std::int64_t* BOLT_RESTRICT qty,
+                          const std::int64_t* BOLT_RESTRICT in, std::int64_t n,
+                          std::int64_t* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0);
+    std::uint32_t bad = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        std::int64_t r = 0;
+        bad |= static_cast<std::uint32_t>(!cal::add_zoned_us(z, u, qty[i], in[i], &r));
+        out[i] = r;
+    }
+    return bad == 0;
+}
+
+bool timestamp_add_local_us(cal::AddUnit u, const std::int64_t* BOLT_RESTRICT qty,
+                            const std::int64_t* BOLT_RESTRICT in, std::int64_t n,
+                            std::int64_t* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0);
+    std::uint32_t bad = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        std::int64_t r = 0;
+        bad |= static_cast<std::uint32_t>(!cal::add_local_us(u, qty[i], in[i], &r));
+        out[i] = r;
+    }
+    return bad == 0;
+}
+
+bool timestamp_diff_local_us(cal::AddUnit u, const std::int64_t* BOLT_RESTRICT a,
+                             const std::int64_t* BOLT_RESTRICT b, std::int64_t n,
+                             std::int64_t* BOLT_RESTRICT out) noexcept {
+    assert(n >= 0);
+    std::uint32_t bad = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        std::int64_t r = 0;
+        bad |= static_cast<std::uint32_t>(!cal::diff_local_us(u, a[i], b[i], &r));
+        out[i] = r;
+    }
+    return bad == 0;
+}
 
 void field_local_us(Field f, const std::int64_t* BOLT_RESTRICT local, std::int64_t n,
                     std::int64_t* BOLT_RESTRICT out) noexcept {

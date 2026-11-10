@@ -226,6 +226,20 @@ bool zone_parse(const char* s, std::uint32_t len, ZoneId* out) noexcept {
     return false;
 }
 
+bool zone_parse_exact(const char* s, std::uint32_t len, ZoneId* out) noexcept {
+    assert(out != nullptr);
+    if (!zone_parse(s, len, out)) return false;
+    std::uint32_t lower = 0;
+    for (std::uint32_t i = 0; i < len; ++i) lower += static_cast<std::uint32_t>(s[i] >= 'a' && s[i] <= 'z');
+    if (lower == 0) return true;
+    if (zone_is_fixed(*out)) { *out = kInvalidZone; return false; }
+    char name[kMaxZoneIdChars + 1];
+    const std::uint32_t n = zone_name(*out, name, sizeof name);
+    if (n == len && std::memcmp(name, s, len) == 0) return true;
+    *out = kInvalidZone;
+    return false;
+}
+
 std::int32_t offset_at(ZoneId z, std::int64_t utc_sec) noexcept {
     if (zone_is_fixed(z)) return zone_fixed_offset(z);
     const data::ZoneRec* zr = named_zone(z);
