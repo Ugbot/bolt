@@ -116,6 +116,11 @@ inline int64_t format_number_f64(double v, uint32_t decimals, char* out, uint32_
     if (a == 0.0) { d[0] = '0'; k = 1; }
     else nd = float_chars::detail::shortest_digits(a, d, &k);
     const int64_t drop_at = static_cast<int64_t>(decimals) + k;     // index of the first dropped digit
+    // The JVM's DecimalFormat rounds DOWN a lone shortest digit 5 sitting at the rounding position
+    // when the value is 5e-n, n >= 4 (0.0005 at 3 decimals is 0.000, 0.00005 at 4 is 0.0000), even
+    // though the double is a hair above the tie; at n <= 3 (0.005 -> 0.01) it follows the exact value.
+    // Checked against Spark 4.0.1 / JDK 21 for n = 1..15, both signs.
+    if (a != 0.0 && nd == 1 && d[0] == '5' && drop_at == 0 && k <= -3) d[0] = '4';
     if (a != 0.0 && drop_at == static_cast<int64_t>(nd) - 1 && d[nd - 1] == '5') {
         char ex[1400];                                              // an exact tie in the shortest digits
         const uint32_t en = exact_digits(a, ex, &k);

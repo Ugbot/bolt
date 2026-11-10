@@ -4,7 +4,7 @@
 //    (application/x-www-form-urlencoded, UTF-8): space <-> '+', the
 //    unreserved set is A-Z a-z 0-9 . - * _, everything else is %XX per byte,
 //    uppercase hex. A decoded run of %XX bytes is read as UTF-8 with each
-//    maximal invalid subpart replaced by one U+FFFD (new String(bytes, UTF_8)).
+//    malformed unit replaced by one U+FFFD exactly as the JDK's String(bytes, UTF_8) does.
 //    A '%' not followed by two valid characters is an error (kTextInvalid).
 //
 //  * java_uri_parse is a port of java.net.URI's parser (RFC 2396 with the JDK's
@@ -79,6 +79,60 @@ inline int pct_byte(uint8_t c1, uint8_t c2) noexcept {
 inline bool pct_negative(uint8_t c1, uint8_t c2) noexcept { return c1 == '-' && hexval(c2) > 0; }
 }  // namespace detail
 
+namespace detail {
+// java.lang.String(bytes, UTF_8) as the JDK's String.decodeUTF8 runs it with replacement: how
+// many bytes the unit at p takes, and whether they are a valid character (copied) or one U+FFFD.
+// A port of its branches, not the Unicode "maximal subpart" rule: an encoded surrogate is ONE
+// replacement for its three bytes, and a truncated sequence at the end of the input can swallow
+// all that is left.
+inline bool j_cont(uint8_t b) noexcept { return (b & 0xC0u) == 0x80u; }
+inline bool j_bad3_2(uint8_t b1, uint8_t b2) noexcept { return (b1 == 0xE0u && (b2 & 0xE0u) == 0x80u) || !j_cont(b2); }
+inline bool j_bad4_2(uint8_t b1, uint8_t b2) noexcept {
+    return (b1 == 0xF0u && (b2 < 0x90u || b2 > 0xBFu)) || (b1 == 0xF4u && (b2 & 0xF0u) != 0x80u) || !j_cont(b2);
+}
+inline uint32_t java_utf8_step(const uint8_t* s, uint32_t len, uint32_t p, bool* valid) noexcept {
+    assert(p < len);
+    const uint8_t b1 = s[p];
+    const uint32_t rem = len - p;
+    *valid = false;
+    if (b1 < 0x80u) { *valid = true; return 1; }
+    if (b1 >= 0xC2u && b1 <= 0xDFu) {
+        if (rem < 2) return rem;                                 // truncated at the end: one U+FFFD
+        if (!j_cont(s[p + 1])) return 1;
+        *valid = true;
+        return 2;
+    }
+    if (b1 >= 0xE0u && b1 <= 0xEFu) {
+        if (rem >= 3) {
+            const uint8_t b2 = s[p + 1], b3 = s[p + 2];
+            if (j_bad3_2(b1, b2) || !j_cont(b3)) return j_bad3_2(b1, b2) ? 1u : 2u;
+            if (b1 == 0xEDu && b2 >= 0xA0u) return 3;            // an encoded surrogate: one U+FFFD
+            *valid = true;
+            return 3;
+        }
+        if (rem == 2 && j_bad3_2(b1, s[p + 1])) return 1;
+        return rem;
+    }
+    if (b1 >= 0xF0u && b1 <= 0xF7u) {
+        if (rem >= 4) {
+            const uint8_t b2 = s[p + 1], b3 = s[p + 2], b4 = s[p + 3];
+            const uint32_t uc = (static_cast<uint32_t>(b1 & 7u) << 18) | (static_cast<uint32_t>(b2 & 0x3Fu) << 12) |
+                                (static_cast<uint32_t>(b3 & 0x3Fu) << 6) | (b4 & 0x3Fu);
+            if (!j_cont(b2) || !j_cont(b3) || !j_cont(b4) || uc < 0x10000u || uc > 0x10FFFFu) {
+                if (b1 > 0xF4u || j_bad4_2(b1, b2)) return 1;
+                return j_cont(b3) ? 3u : 2u;
+            }
+            *valid = true;
+            return 4;
+        }
+        if (b1 > 0xF4u || (rem > 1 && j_bad4_2(b1, s[p + 1]))) return 1;
+        if (rem > 2 && !j_cont(s[p + 2])) return 2;              // the lead and its second byte, one U+FFFD
+        return rem;
+    }
+    return 1;                                                    // 80..C1, F8..FF
+}
+}  // namespace detail
+
 // url_decode into out (cap >= len). Returns bytes, kTextInvalid for a malformed escape.
 inline int64_t url_decode(const char* s, uint32_t len, char* out, uint32_t cap) noexcept {
     assert(s != nullptr || len == 0);
@@ -106,9 +160,9 @@ inline int64_t url_decode(const char* s, uint32_t len, char* out, uint32_t cap) 
                                                            static_cast<uint8_t>(s[p + 2])));
         }
         for (uint32_t p = 0; p < rb;) {                          // bounded: rb
-            const int32_t r = text::detail::utf8_seq(raw, rb, p);
-            const uint32_t take = r > 0 ? static_cast<uint32_t>(r) : static_cast<uint32_t>(-r);
-            if (r > 0) { for (uint32_t q = 0; q < take; ++q) out[w + q] = raw[p + q]; w += take; }
+            bool valid = false;
+            const uint32_t take = detail::java_utf8_step(reinterpret_cast<const uint8_t*>(raw), rb, p, &valid);
+            if (valid) { for (uint32_t q = 0; q < take; ++q) out[w + q] = raw[p + q]; w += take; }
             else { out[w++] = static_cast<char>(0xEF); out[w++] = static_cast<char>(0xBF); out[w++] = static_cast<char>(0xBD); }
             p += take;
             assert(w <= cap - rb + p);       // output stays behind the unread staged bytes (w + 3*rb <= len)

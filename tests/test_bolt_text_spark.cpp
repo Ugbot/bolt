@@ -148,6 +148,10 @@ TEST(BoltTextSpark, LevenshteinSoundexMask) {
     EXPECT_EQ(mask("AbCd123-@$#", 'X', 'x', 'n', tx::kMaskKeep), "XxXxnnn-@$#");
     EXPECT_EQ(mask("\xF0\x9D\x90\x80", 'X', 'x', 'n', tx::kMaskKeep), "\xF0\x9D\x90\x80");
     EXPECT_EQ(mask("\xF0\x9D\x90\x80", 'X', 'x', 'n', '*'), "**");
+    // Spark classes by Character.getType (Lu / Ll / Nd), not isUpperCase / isLowerCase: U+00AA and
+    // U+2167 carry Other_Lowercase / Other_Uppercase only, so they are "other".
+    EXPECT_EQ(mask("\xC2\xAA\xE2\x85\xA7", 'X', 'x', 'n', 'o'), "oo");
+    EXPECT_EQ(mask("\xD9\xA3", 'X', 'x', 'n', 'o'), "n");
 }
 
 TEST(BoltTextSpark, Utf8Validation) {
@@ -165,6 +169,9 @@ TEST(BoltTextNumfmt, FormatNumber) {
     EXPECT_EQ(fmt_f64(1234567.891, 2), "1,234,567.89");
     EXPECT_EQ(fmt_f64(0.15, 1), "0.1");                  // the exact binary value is below the tie
     EXPECT_EQ(fmt_f64(0.125, 2), "0.12");                // an exact tie goes to even
+    EXPECT_EQ(fmt_f64(0.005, 2), "0.01");                // a lone 5 above the tie rounds up ...
+    EXPECT_EQ(fmt_f64(0.0005, 3), "0.000");              // ... except at 5e-n, n >= 4 (the JVM's DecimalFormat)
+    EXPECT_EQ(fmt_f64(-0.00005, 4), "-0.0000");
     EXPECT_EQ(fmt_f64(-0.4, 0), "-0");
     EXPECT_EQ(fmt_f64(0.0 / 0.0, 2), "NaN");
     EXPECT_EQ(fmt_f64(1.0 / 0.0, 2), "\xE2\x88\x9E");
@@ -206,6 +213,9 @@ TEST(BoltUrl, EncodeDecodeParse) {
     EXPECT_EQ(std::string(out, static_cast<size_t>(w)), "a+b%26c%3Dd%2F%C3%A9%7E*-._");
     EXPECT_EQ(url_decode("a+b%26c%3Dd%2F%C3%A9"), "a b&c=d/\xC3\xA9");
     EXPECT_EQ(url_decode("%E6%97" "a"), "\xEF\xBF\xBD" "a");
+    EXPECT_EQ(url_decode("%ED%A0%80"), "\xEF\xBF\xBD");                     // an encoded surrogate: one U+FFFD (JDK)
+    EXPECT_EQ(url_decode("%E2%82"), "\xEF\xBF\xBD");
+    EXPECT_EQ(url_decode("%C0%AF"), "\xEF\xBF\xBD\xEF\xBF\xBD");
     EXPECT_EQ(url_decode("%4"), "<err>");
     EXPECT_EQ(url_decode("%-1"), "<err>");
     const std::string u = "http://user:pw@example.com:8080/a/b?x=1&y=2#frag";

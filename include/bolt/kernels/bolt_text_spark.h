@@ -212,7 +212,7 @@ inline int64_t overlay(const char* s, uint32_t slen, const char* r, uint32_t rle
 constexpr uint64_t mask_bound(uint32_t slen) noexcept { return static_cast<uint64_t>(slen) * 8u; }
 
 // mask(s, upper, lower, digit, other): each replacement is a code point, or kMaskKeep to
-// leave that class unchanged. Classes are Java's Character.isUpperCase / isLowerCase / isDigit,
+// leave that class unchanged. Classes are Java's Character.getType UPPERCASE_LETTER / LOWERCASE_LETTER / DECIMAL_DIGIT_NUMBER,
 // applied per UTF-16 unit as Spark does: a supplementary character is two surrogate units,
 // neither of which is a letter or a digit, so it is "other" twice over; a supplementary
 // replacement character is its high surrogate alone, which encodes as '?'.
