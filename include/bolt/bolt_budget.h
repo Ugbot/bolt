@@ -39,6 +39,10 @@
     X(mem_budget_mb, kBudget, "MiB", 0, 0, (UINT64_MAX >> 20),                  \
       "BOLT_MEM_BUDGET_MB", "CHUKONU_MEM_BUDGET_MB",                            \
       "process memory budget; 0 = 40% of physical RAM clamped to [2, 64] GiB")  \
+    X(query_claim_share_pct, kBudget, "percent", 50, 1, 100,                   \
+      "BOLT_QUERY_CLAIM_SHARE_PCT", nullptr,                                    \
+      "share of a query's unclaimed memory limit one operator's buffer or "    \
+      "spill budget may claim")                                                 \
     X(max_workers, kInvariant, "threads", BOLT_MAX_WORKERS, BOLT_MAX_WORKERS,   \
       BOLT_MAX_WORKERS, nullptr, nullptr,                                       \
       "scheduler worker validation ceiling (BOLT_MAX_WORKERS at build time)")   \
