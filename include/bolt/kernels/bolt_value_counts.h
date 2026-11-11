@@ -162,7 +162,8 @@ inline bool vc_add(ValueCounts* vc, uint32_t gid, int64_t a, int64_t b, const ch
     StringView sv{};
     const char* s = nullptr;
     if (str) {
-        std::memcpy(&sv, &a, sizeof(sv));
+        std::memcpy(&sv, &a, 8);
+        std::memcpy(reinterpret_cast<char*>(&sv) + 8, &b, 8);
         s = utf8::sv_bytes(sv, base);
     }
     const uint64_t h = vc_hash(gid, a, b, s, sv.length);
