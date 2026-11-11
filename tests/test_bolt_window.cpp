@@ -22,6 +22,44 @@ using bolt::kernels::window::last_value;
 using bolt::kernels::window::ntile;
 
 // ============================================================================
+// NTH_VALUE
+// ============================================================================
+
+TEST(BoltWindow, NthValueFrameEnds) {
+    using bolt::kernels::window::nth_value;
+    using bolt::kernels::window::NthFrameEnd;
+    // Two partitions; ordered peers inside the first: {10,10},{20},{30}.
+    const int64_t pk[7] = {1, 1, 1, 1, 2, 2, 2};
+    const int64_t fk[7] = {0, 0, 1, 2, 3, 4, 5};
+    const int64_t v[7]  = {5, 6, 7, 8, 1, 2, 3};
+    const uint8_t vn[7] = {0, 0, 1, 0, 1, 0, 0};
+    int64_t out[7];
+    uint8_t on[7];
+    // Whole partition, nth=3: partition 1 -> v[2] is NULL; partition 2 -> 3.
+    nth_value<int64_t, int64_t>(v, vn, pk, nullptr, 7, 3, NthFrameEnd::kPartitionEnd, false, out, on);
+    const uint8_t e_whole[7] = {1, 1, 1, 1, 0, 0, 0};
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(on[i], e_whole[i]) << i;
+    EXPECT_EQ(out[4], 3);
+    // Rows..current, nth=2: row 1 of a partition has no 2nd row yet.
+    nth_value<int64_t, int64_t>(v, vn, pk, nullptr, 7, 2, NthFrameEnd::kCurrentRow, false, out, on);
+    const uint8_t e_cur[7] = {1, 0, 0, 0, 1, 0, 0};
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(on[i], e_cur[i]) << i;
+    EXPECT_EQ(out[1], 6);
+    EXPECT_EQ(out[6], 2);
+    // Range peers: rows 0,1 share a frame ending at row 1, so both see nth=2.
+    nth_value<int64_t, int64_t>(v, vn, pk, fk, 7, 2, NthFrameEnd::kPeerEnd, false, out, on);
+    const uint8_t e_peer[7] = {0, 0, 0, 0, 1, 0, 0};
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(on[i], e_peer[i]) << i;
+    EXPECT_EQ(out[0], 6);
+    // IGNORE NULLS, nth=3 over the whole partition: partition 1 has non-nulls
+    // 5,6,8 -> 8; partition 2 has 2,3 -> none.
+    nth_value<int64_t, int64_t>(v, vn, pk, nullptr, 7, 3, NthFrameEnd::kPartitionEnd, true, out, on);
+    const uint8_t e_ign[7] = {0, 0, 0, 0, 1, 1, 1};
+    for (int i = 0; i < 7; ++i) EXPECT_EQ(on[i], e_ign[i]) << i;
+    EXPECT_EQ(out[0], 8);
+}
+
+// ============================================================================
 // ROW_NUMBER
 // ============================================================================
 

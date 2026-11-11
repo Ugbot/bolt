@@ -46,6 +46,12 @@ constexpr std::int32_t zone_fixed_offset(ZoneId z) noexcept {
 // Returns false (and *out = kInvalidZone) on anything else.
 bool zone_parse(const char* s, std::uint32_t len, ZoneId* out) noexcept;
 
+// zone_parse with java ZoneId.of's case sensitivity (Spark's convert_timezone):
+// region ids match their canonical spelling exactly ("america/los_angeles" is
+// invalid), a SHORT_ID alias is all upper case ("PST"), and an offset form
+// carries no lower-case letters ("utc+01:00" is invalid; "Z" is).
+bool zone_parse_exact(const char* s, std::uint32_t len, ZoneId* out) noexcept;
+
 // UTC offset in seconds in effect at `utc_sec` (seconds since the epoch).
 std::int32_t offset_at(ZoneId z, std::int64_t utc_sec) noexcept;
 

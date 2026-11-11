@@ -211,7 +211,7 @@ bool parse_token(Cursor* c, const Token& t, const Pattern& pat, Parsed* p,
     }
 }
 
-bool resolve(const Parsed& p, tz::ZoneId zone, std::int64_t* utc_us) noexcept {
+bool resolve(const Parsed& p, tz::ZoneId zone, std::int64_t* utc_us, bool ignore_text_zone) noexcept {
     cal::LocalFields f{};
     const std::int32_t yoe = p.yoe == kUnset ? 1970 : p.yoe;
     f.year = p.era == 1 ? yoe : 1 - yoe;
@@ -233,7 +233,8 @@ bool resolve(const Parsed& p, tz::ZoneId zone, std::int64_t* utc_us) noexcept {
     f.micros = p.micros;
     const std::int64_t days = cal::days_from_ymd(f.year, f.month, f.day);
     if (p.dow != kUnset && cal::iso_dow(days) != p.dow) return false;
-    *utc_us = tz::local_micros_to_utc(p.has_zone ? p.zone : zone, cal::local_micros_from_fields(f));
+    *utc_us = tz::local_micros_to_utc(p.has_zone && !ignore_text_zone ? p.zone : zone,
+                                         cal::local_micros_from_fields(f));
     return true;
 }
 
@@ -246,7 +247,7 @@ std::uint16_t section_end(const Pattern& pat, std::uint16_t i) noexcept {
 }  // namespace
 
 bool parse_instant(const Pattern& pat, const char* s, std::uint32_t len, tz::ZoneId zone,
-                   std::int64_t* utc_us) noexcept {
+                   std::int64_t* utc_us, bool ignore_text_zone) noexcept {
     assert(utc_us != nullptr);
     assert(pat.n <= kMaxTokens);
     Cursor c{s, len, 0};
@@ -272,7 +273,7 @@ bool parse_instant(const Pattern& pat, const char* s, std::uint32_t len, tz::Zon
         i = end;
     }
     if (c.pos != len) return false;
-    return resolve(p, zone, utc_us);
+    return resolve(p, zone, utc_us, ignore_text_zone);
 }
 
 namespace {
@@ -352,7 +353,7 @@ bool read_time_part(Cursor* c, cal::LocalFields* f) noexcept {
 }  // namespace
 
 bool parse_timestamp_text(const char* s, std::uint32_t len, tz::ZoneId zone,
-                          std::int64_t* utc_us) noexcept {
+                          std::int64_t* utc_us, bool ignore_text_zone) noexcept {
     assert(utc_us != nullptr);
     assert(s != nullptr || len == 0);
     trim(&s, &len);
@@ -370,11 +371,13 @@ bool parse_timestamp_text(const char* s, std::uint32_t len, tz::ZoneId zone,
     if (c.pos < len) {
         std::int32_t off = 0;
         Cursor probe = c;
+        tz::ZoneId text_zone = tz::kInvalidZone;
         if (read_offset(&probe, &off) && probe.pos == len) {
-            z = tz::zone_fixed(off);
-        } else if (!tz::zone_parse(c.s + c.pos, len - c.pos, &z)) {
+            text_zone = tz::zone_fixed(off);
+        } else if (!tz::zone_parse(c.s + c.pos, len - c.pos, &text_zone)) {
             return false;
         }
+        if (!ignore_text_zone) z = text_zone;
     }
     *utc_us = tz::local_micros_to_utc(z, cal::local_micros_from_fields(f));
     return true;

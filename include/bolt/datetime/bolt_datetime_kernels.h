@@ -16,6 +16,7 @@
 
 #include "bolt/bolt_types.h"
 #include "bolt/datetime/bolt_calendar.h"
+#include "bolt/datetime/bolt_calendar_arith.h"
 #include "bolt/datetime/bolt_datetime_fmt.h"
 #include "bolt/datetime/bolt_tz.h"
 
@@ -25,6 +26,8 @@ namespace bolt::dtk {
 enum class Field : std::uint8_t {
     Year = 1, Month, Day, Hour, Minute, Second, DayOfWeek /* 1 = Sunday */,
     WeekDay /* 0 = Monday */, DayOfYear, WeekOfYear /* ISO */, Quarter,
+    YearOfWeek /* ISO week-numbering year */, DowIso /* 1 = Monday */,
+    SecondMicros /* second * 1e6 + micros: Spark's decimal(8,6) SECOND */,
 };
 
 // UTC seconds -> offset, cached over the constant-offset span.
@@ -88,6 +91,19 @@ void trunc_utc_us(tz::ZoneId z, cal::TruncUnit u, const std::int64_t* BOLT_RESTR
 void trunc_days(cal::TruncUnit u, const std::int32_t* BOLT_RESTRICT in, std::int64_t n,
                 std::int32_t* BOLT_RESTRICT out) noexcept;
 // Field of local wall-clock micros (a DATE is days * kMicrosPerDay).
+// timestampadd over columns: out[i] = in[i] + qty[i] of `u`, in zone `z` (instants) or
+// as a wall clock (_local). Return false on the first overflow (Spark: DATETIME_OVERFLOW).
+bool timestamp_add_utc_us(tz::ZoneId z, cal::AddUnit u, const std::int64_t* BOLT_RESTRICT qty,
+                          const std::int64_t* BOLT_RESTRICT in, std::int64_t n,
+                          std::int64_t* BOLT_RESTRICT out) noexcept;
+bool timestamp_add_local_us(cal::AddUnit u, const std::int64_t* BOLT_RESTRICT qty,
+                            const std::int64_t* BOLT_RESTRICT in, std::int64_t n,
+                            std::int64_t* BOLT_RESTRICT out) noexcept;
+// timestampdiff over wall-clock micros columns (java LocalDateTime.until).
+bool timestamp_diff_local_us(cal::AddUnit u, const std::int64_t* BOLT_RESTRICT a,
+                             const std::int64_t* BOLT_RESTRICT b, std::int64_t n,
+                             std::int64_t* BOLT_RESTRICT out) noexcept;
+
 void field_local_us(Field f, const std::int64_t* BOLT_RESTRICT local, std::int64_t n,
                     std::int64_t* BOLT_RESTRICT out) noexcept;
 void field_days(Field f, const std::int32_t* BOLT_RESTRICT days, std::int64_t n,

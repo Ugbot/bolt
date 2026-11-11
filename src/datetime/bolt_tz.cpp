@@ -184,6 +184,16 @@ bool prefix_ieq(const char* s, std::uint32_t len, const char* p) noexcept {
     return true;
 }
 
+// java.time.ZoneId.SHORT_IDS maps EST / MST / HST to fixed offsets, not to the
+// tzdb links of the same name (which carry local mean time before 1883).
+bool short_id_fixed(const char* s, std::int32_t* off) noexcept {
+    assert(s != nullptr && off != nullptr);
+    if (s[0] == 'E' && s[1] == 'S' && s[2] == 'T') { *off = -5 * 3600; return true; }
+    if (s[0] == 'M' && s[1] == 'S' && s[2] == 'T') { *off = -7 * 3600; return true; }
+    if (s[0] == 'H' && s[1] == 'S' && s[2] == 'T') { *off = -10 * 3600; return true; }
+    return false;
+}
+
 std::uint32_t write_offset(std::int32_t off, char* buf, std::uint32_t cap) noexcept {
     if (off == 0) {
         if (cap < 3) return 0;
@@ -221,7 +231,22 @@ bool zone_parse(const char* s, std::uint32_t len, ZoneId* out) noexcept {
         if (len == pl) { *out = kUtc; return true; }
         if (parse_offset(s + pl, len - pl, &off)) { *out = zone_fixed(off); return true; }
     }
+    if (len == 3 && short_id_fixed(s, &off)) { *out = zone_fixed(off); return true; }
     if (find_region(s, len, out)) return true;
+    *out = kInvalidZone;
+    return false;
+}
+
+bool zone_parse_exact(const char* s, std::uint32_t len, ZoneId* out) noexcept {
+    assert(out != nullptr);
+    if (!zone_parse(s, len, out)) return false;
+    std::uint32_t lower = 0;
+    for (std::uint32_t i = 0; i < len; ++i) lower += static_cast<std::uint32_t>(s[i] >= 'a' && s[i] <= 'z');
+    if (lower == 0) return true;
+    if (zone_is_fixed(*out)) { *out = kInvalidZone; return false; }
+    char name[kMaxZoneIdChars + 1];
+    const std::uint32_t n = zone_name(*out, name, sizeof name);
+    if (n == len && std::memcmp(name, s, len) == 0) return true;
     *out = kInvalidZone;
     return false;
 }
