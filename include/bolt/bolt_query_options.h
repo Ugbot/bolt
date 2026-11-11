@@ -33,12 +33,15 @@ struct QueryOptions {
     enum Bit : uint32_t {
         kTimeLimit = 1u, kMemoryLimit = 2u, kRowLimit = 4u, kWorkers = 8u,
         kMorselRows = 16u, kPriority = 32u, kNodes = 64u, kCancelOnDisconnect = 128u,
+        kScanRows = 256u, kScanBytes = 512u,
     };
     uint32_t set = 0;
     uint32_t workers = 0;
     uint64_t time_limit_ms = 0;     // 0 with the bit set: no limit (still under the cap)
     uint64_t memory_bytes = 0;
     uint64_t row_limit = 0;
+    uint64_t scan_rows = 0;         // rows the query's scans may produce
+    uint64_t scan_bytes = 0;        // decoded bytes the query's scans may produce
     int64_t  morsel_rows = 0;
     QueryPriorityClass priority = QueryPriorityClass::Unset;
     QueryNodes nodes = QueryNodes::Unset;
@@ -52,6 +55,8 @@ inline void query_options_overlay(QueryOptions* base, const QueryOptions& over) 
     if ((s & QueryOptions::kTimeLimit) != 0u) base->time_limit_ms = over.time_limit_ms;
     if ((s & QueryOptions::kMemoryLimit) != 0u) base->memory_bytes = over.memory_bytes;
     if ((s & QueryOptions::kRowLimit) != 0u) base->row_limit = over.row_limit;
+    if ((s & QueryOptions::kScanRows) != 0u) base->scan_rows = over.scan_rows;
+    if ((s & QueryOptions::kScanBytes) != 0u) base->scan_bytes = over.scan_bytes;
     if ((s & QueryOptions::kWorkers) != 0u) base->workers = over.workers;
     if ((s & QueryOptions::kMorselRows) != 0u) base->morsel_rows = over.morsel_rows;
     if ((s & QueryOptions::kPriority) != 0u) base->priority = over.priority;
@@ -150,6 +155,7 @@ inline bool query_option_key_known(const char* k, size_t n) noexcept {
     using query_options_detail::word_is;
     return word_is(k, n, "time_limit") || word_is(k, n, "statement_timeout") ||
            word_is(k, n, "memory_limit") || word_is(k, n, "row_limit") ||
+           word_is(k, n, "scan_rows") || word_is(k, n, "scan_bytes") ||
            word_is(k, n, "workers") || word_is(k, n, "morsel_rows") ||
            word_is(k, n, "priority") || word_is(k, n, "nodes") ||
            word_is(k, n, "cancel_on_disconnect");
@@ -160,6 +166,8 @@ inline uint32_t query_option_bit(const char* k, size_t n) noexcept {
     if (word_is(k, n, "time_limit") || word_is(k, n, "statement_timeout")) return QueryOptions::kTimeLimit;
     if (word_is(k, n, "memory_limit")) return QueryOptions::kMemoryLimit;
     if (word_is(k, n, "row_limit")) return QueryOptions::kRowLimit;
+    if (word_is(k, n, "scan_rows")) return QueryOptions::kScanRows;
+    if (word_is(k, n, "scan_bytes")) return QueryOptions::kScanBytes;
     if (word_is(k, n, "workers")) return QueryOptions::kWorkers;
     if (word_is(k, n, "morsel_rows")) return QueryOptions::kMorselRows;
     if (word_is(k, n, "priority")) return QueryOptions::kPriority;
@@ -194,6 +202,12 @@ inline QueryOptionResult apply_query_option(const char* key, size_t kn, const ch
     } else if (word_is(key, kn, "row_limit")) {
         if (!parse_query_uint(value, vn, &o->row_limit)) return QueryOptionResult::BadValue;
         o->set |= QueryOptions::kRowLimit;
+    } else if (word_is(key, kn, "scan_rows")) {
+        if (!parse_query_uint(value, vn, &o->scan_rows) || o->scan_rows == 0) return QueryOptionResult::BadValue;
+        o->set |= QueryOptions::kScanRows;
+    } else if (word_is(key, kn, "scan_bytes")) {
+        if (!parse_query_size_bytes(value, vn, &o->scan_bytes) || o->scan_bytes == 0) return QueryOptionResult::BadValue;
+        o->set |= QueryOptions::kScanBytes;
     } else if (word_is(key, kn, "workers")) {
         if (!parse_query_uint(value, vn, &n) || n == 0 || n > UINT32_MAX) return QueryOptionResult::BadValue;
         o->workers = static_cast<uint32_t>(n);
