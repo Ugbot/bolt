@@ -43,7 +43,7 @@ inline double f64_unary(F64Op op, double x, bool* is_null) noexcept {
         case F64Op::Asinh:
             return x == -INFINITY ? x : fd::Log::compute(x + std::sqrt(x * x + 1.0));
         case F64Op::Atan: return fd::Atan::compute(x);
-        case F64Op::Atanh: return 0.5 * fd::Log1p::compute((2.0 * x) / (1.0 - x));
+        case F64Op::Atanh: return 0.5 * (fd::Log1p::compute(x) - fd::Log1p::compute(-x));
         case F64Op::Cos: return fd::Cos::compute(x);
         case F64Op::Cosh: return fd::Cosh::compute(x);
         case F64Op::Sin: return fd::Sin::compute(x);
@@ -87,7 +87,8 @@ inline double hypot_spark(double x, double y) noexcept { return fd::Hypot::compu
 
 // BigDecimal(shortest decimal text of x).setScale(scale, HALF_EVEN).toDouble, as Spark's bround over DOUBLE.
 inline double bround_f64(double x, std::int32_t scale) noexcept {
-    if (!std::isfinite(x) || x == 0.0) return x;
+    if (x == 0.0) return 0.0;   // BigDecimal has no negative zero
+    if (!std::isfinite(x)) return x;
     char buf[40];
     const auto r = std::to_chars(buf, buf + sizeof buf, std::fabs(x), std::chars_format::scientific);
     if (r.ec != std::errc()) return x;
