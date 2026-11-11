@@ -73,6 +73,16 @@ inline bool is_fractional(const char* s, std::uint32_t n) noexcept {
     return i == n && i > frac;
 }
 
+// [+-]?(NaN|Infinity) after Java's trim (every byte <= 0x20 at either end): Double.parseDouble accepts these.
+inline bool is_nan_inf(const char* s, std::uint32_t n) noexcept {
+    std::uint32_t b = 0, e = n;
+    while (b < e && static_cast<unsigned char>(s[b]) <= 0x20u) ++b;
+    while (e > b && static_cast<unsigned char>(s[e - 1]) <= 0x20u) --e;
+    if (b < e && (s[b] == '+' || s[b] == '-')) ++b;
+    const std::uint32_t m = e - b;
+    return (m == 3 && std::memcmp(s + b, "NaN", 3) == 0) || (m == 8 && std::memcmp(s + b, "Infinity", 8) == 0);
+}
+
 inline bool has_digit(const char* s, std::uint32_t n) noexcept {
     for (std::uint32_t i = 0; i < n; ++i) if (is_digit(s[i])) return true;
     return false;
@@ -87,13 +97,12 @@ inline int csv_classify(const char* s, std::uint32_t n, CsvField* out) noexcept 
     out->precision = 0;
     if (n == 0) return kCsvOk;                                       // empty = null value = NullType -> STRING
     if (detail::ieq(s, n, "true") || detail::ieq(s, n, "false")) { out->type = CsvType::Bool; return kCsvOk; }
-    if (n == 3 && std::memcmp(s, "NaN", 3) == 0) { out->type = CsvType::Double; return kCsvOk; }
-    if ((n == 8 && std::memcmp(s, "Infinity", 8) == 0) || (n == 9 && std::memcmp(s, "-Infinity", 9) == 0)) {
-        out->type = CsvType::Double;
-        return kCsvOk;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        if (static_cast<unsigned char>(s[k]) >= 0x80u) return kCsvUnsupported;   // Java parses any Unicode decimal digit
     }
+    if (detail::is_nan_inf(s, n)) { out->type = CsvType::Double; return kCsvOk; }
     if (detail::ieq(s, n, "nan") || detail::ieq(s, n, "infinity") || detail::ieq(s, n, "+infinity") ||
-        detail::ieq(s, n, "-infinity")) return kCsvUnsupported;      // another spelling: Spark's answer depends on the parser
+        detail::ieq(s, n, "-infinity") || detail::ieq(s, n, "+nan") || detail::ieq(s, n, "-nan")) return kCsvUnsupported;
     if (!detail::has_digit(s, n)) {
         for (std::uint32_t i = 0; i < n; ++i) if (s[i] == '.' ) return kCsvUnsupported;
         return kCsvOk;                                               // text with no digit and no '.' is STRING
