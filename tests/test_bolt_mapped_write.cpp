@@ -38,6 +38,19 @@ TEST(MappedWrite, ExactExtentFlushAndExistingPathProtection) {
     EXPECT_EQ(std::memcmp(actual,literal,sizeof(literal)),0);EXPECT_EQ(std::fclose(file),0);
     EXPECT_EQ(std::remove(path.c_str()),0);
 }
+#if !defined(_WIN32)
+#include <sys/stat.h>
+// APFS can answer a contiguous F_PREALLOCATE with success and a partial
+// extent on a fragmented volume; the create must still allocate the whole
+// region (G2CHK-877: ring jobs failed with kIo on a nearly full disk).
+TEST(MappedWrite, LargeCreateAllocatesEveryByte) {
+    const auto path=unique_path();const auto bytes=std::uint64_t{64}<<20;WritableMappedFile m{};
+    ASSERT_EQ(mapped_write_create(path.c_str(),bytes,false,false,&m),FileIoStatus::kOk);
+    struct stat st{};ASSERT_EQ(::stat(path.c_str(),&st),0);
+    EXPECT_GE(static_cast<std::uint64_t>(st.st_blocks)*512u,bytes);
+    mapped_write_close(&m);EXPECT_EQ(std::remove(path.c_str()),0);
+}
+#endif
 TEST(MappedWrite, InvalidGeometryLeavesNoFileAndEphemeralCloseDeletes) {
     const auto path=unique_path();const auto unit=std::max(io_page_size(),io_map_granularity());
     WritableMappedFile m{};
