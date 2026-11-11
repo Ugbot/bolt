@@ -152,7 +152,13 @@ inline std::int64_t wrap_width(std::uint64_t v, std::uint32_t width) noexcept {
 inline std::int64_t bround_int(std::int64_t x, std::int32_t scale, std::uint32_t width, bool* overflow) noexcept {
     *overflow = false;
     if (scale >= 0) return x;
-    if (scale < -18) return 0;   // 10^19 exceeds every integer: rounds to 0 (|x| < 5e18 or exactly half is even)
+    if (scale == -19) {   // 10^19 exceeds int64: |x| > 5e18 rounds away to +-10^19 (overflow), else 0 (a half is even)
+        const std::uint64_t ax = x < 0 ? 0ull - static_cast<std::uint64_t>(x) : static_cast<std::uint64_t>(x);
+        if (width < 64 || ax <= 5000000000000000000ull) return 0;
+        *overflow = true;
+        return wrap_width(x < 0 ? 0ull - 10000000000000000000ull : 10000000000000000000ull, 64);
+    }
+    if (scale < -19) return 0;   // |x| < 5e19: rounds to 0
     std::int64_t p = 1;
     for (std::int32_t i = 0; i < -scale; ++i) p *= 10;
     std::int64_t q = x / p, r = x % p;
