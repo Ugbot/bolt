@@ -372,6 +372,58 @@ BOLT_FORCE_INLINE void nth_value(
     }
 }
 
+// ============================================================================
+// LAST_VALUE(value) IGNORE NULLS over a frame that starts at UNBOUNDED
+// PRECEDING, within partition; `frame_end` / `frame_keys` as for nth_value.
+//
+// Row r gets the last non-NULL value at or before its frame's end, or NULL
+// (out_null = 1) when the frame holds none. Linear: one forward pass per
+// partition, buffering only the current peer run's start for kPeerEnd.
+// ============================================================================
+template <typename V, typename Key>
+BOLT_FORCE_INLINE void last_value_ignore_nulls(
+    const V*       BOLT_RESTRICT values,
+    const uint8_t* BOLT_RESTRICT value_null,      // nullable: 1 = NULL value
+    const Key*     BOLT_RESTRICT partition_keys,
+    const Key*     BOLT_RESTRICT frame_keys,      // only read for kPeerEnd
+    int64_t                      n,
+    NthFrameEnd                  frame_end,
+    V*             BOLT_RESTRICT out,
+    uint8_t*       BOLT_RESTRICT out_null) noexcept
+{
+    assert(n >= 0);
+    assert(n == 0 || (values != nullptr && partition_keys != nullptr));
+    assert(n == 0 || (out != nullptr && out_null != nullptr));
+    assert(frame_end != NthFrameEnd::kPeerEnd || n == 0 || frame_keys != nullptr);
+
+    int64_t i = 0;
+    while (i < n) {
+        int64_t j = i + 1;
+        const Key k0 = partition_keys[i];
+        while (j < n && partition_keys[j] == k0) ++j;
+        int64_t last = -1;   // last non-NULL row seen so far in the partition
+        int64_t run = i;     // first row of the current peer run (kPeerEnd)
+        for (int64_t r = i; r < j; ++r) {
+            if (value_null == nullptr || value_null[r] == 0) last = r;
+            const bool run_end = r == j - 1 || frame_end != NthFrameEnd::kPeerEnd ||
+                                 frame_keys[r] != frame_keys[r + 1];
+            if (frame_end == NthFrameEnd::kPartitionEnd || !run_end) continue;
+            for (int64_t q = run; q <= r; ++q) {   // every row of the run ends at r
+                out[q] = last >= 0 ? values[last] : V{};
+                out_null[q] = static_cast<uint8_t>(last < 0);
+            }
+            run = r + 1;
+        }
+        if (frame_end == NthFrameEnd::kPartitionEnd) {
+            for (int64_t q = i; q < j; ++q) {
+                out[q] = last >= 0 ? values[last] : V{};
+                out_null[q] = static_cast<uint8_t>(last < 0);
+            }
+        }
+        i = j;
+    }
+}
+
 }  // namespace window
 }  // namespace kernels
 }  // namespace bolt

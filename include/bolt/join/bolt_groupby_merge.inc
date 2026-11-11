@@ -19,6 +19,7 @@
 //   Min/Max   : gb_detail::apply typed compare (d128 / byte-lex / bmin-bmax).
 //   Count/*   : a += a.
 //   counts[]  : += (AVG denominators).
+//   First/Last/MaxBy/MinBy : gb_pick_merge, src the later partial.
 // DISTINCT states are NOT mergeable (DistinctCell sets are not unioned in
 // v1) — asserted out; callers must gate eligibility upstream.
 // Returns false (and sets dst->oom) on dst capacity / arena overflow.
@@ -114,6 +115,11 @@ inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
         const size_t doff = static_cast<size_t>(j) * dst->cap + dslot;
         const size_t soff = static_cast<size_t>(j) * src->cap + sgid;
         const AggKind k = dst->specs[j].kind;
+        if (k == AggKind::ByOrd) continue;   // merged by its MaxBy / MinBy
+        if (gb_kind_is_pick(k)) {
+            if (!gb_pick_merge(dst, dslot, src, sgid, j)) return false;
+            continue;
+        }
         if (k == AggKind::Count || k == AggKind::CountStar) {
             // The src cell holds a partial COUNT — add the count itself
             // (apply() would add 1 per call, which is per-ROW semantics).
