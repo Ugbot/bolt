@@ -50,11 +50,20 @@ enum class TokenType : uint8_t {
     End         = 11,
 };
 
-// Compact tape entry. Points back into the caller's source buffer.
+// Compact tape entry. Points back into the caller's source buffer — or,
+// when `flags & kTokenAux`, into StructuralIndex::aux: bytes a producer had
+// to materialise (the YAML reader's escaped / folded / block scalars and
+// non-JSON number spellings, bolt_yaml.h). Either way a String / Key token's
+// bytes are JSON string inner content (escapes encoded) and a number token's
+// bytes are a JSON number. The JSON scanner never sets the flag; read token
+// bytes through token_bytes() to be correct for both.
+inline constexpr uint8_t kTokenAux = 1u;
+
 struct Token {
     TokenType type;
-    uint8_t   _pad[3];
-    int32_t   start;   // byte offset into source
+    uint8_t   flags;   // kTokenAux
+    uint8_t   _pad[2];
+    int32_t   start;   // byte offset into source (or aux)
     int32_t   length;  // byte span (string / number); 0 for structural
 };
 static_assert(sizeof(Token) == 12, "Token is 12 bytes");
@@ -65,7 +74,14 @@ struct StructuralIndex {
     int32_t        src_len;
     Token*         tokens;
     int32_t        token_count;
+    const uint8_t* aux;       // materialised token bytes (kTokenAux); may be null
+    int32_t        aux_len;
 };
+
+// The first byte of a token's payload, wherever it lives.
+inline const uint8_t* token_bytes(const StructuralIndex* idx, const Token& t) noexcept {
+    return ((t.flags & kTokenAux) != 0 ? idx->aux : idx->src) + t.start;
+}
 
 // Caps for the PathFilter perfect-hash backing store.
 static constexpr int32_t kJsonMaxPaths       = 1024;
@@ -119,6 +135,11 @@ bool build_index_filtered(const uint8_t* src, int32_t src_len,
 // arena. Returns false on cap overflow, malformed input, or arena failure.
 bool compile_paths(const char* const* paths, const int32_t* path_lens,
                    int32_t count, Arena* arena, PathFilter* out) noexcept;
+
+// True when `path` (slash-joined, as compile_paths takes) is a prefix of an
+// interest path on a '/' boundary — the test build_index_filtered applies to
+// decide whether a subtree is emitted. Shared with the YAML reader.
+bool path_filter_admits(const PathFilter* filter, const char* path, int32_t len) noexcept;
 
 // Iterator-style navigation.
 bool      iter_init(const StructuralIndex* idx, Iterator* it) noexcept;
