@@ -61,10 +61,13 @@ BOLT_FORCE_INLINE std::int64_t gk_java_sort_key(double v) noexcept {
 }
 
 // Sort the head buffer and insert it into the samples (withHeadBufferInserted).
-inline void gk_flush(GkWork* w, GkState* s, std::uint32_t h) noexcept {
+// False when the samples would pass w->cap (compression need not shrink them:
+// with 2 * rel_err * count < 1 nothing merges, so up to `count` samples stay).
+inline bool gk_flush(GkWork* w, GkState* s, std::uint32_t h) noexcept {
     assert(w != nullptr && s != nullptr);
     assert(h <= w->head_size);
-    if (h == 0) return;
+    if (h == 0) return true;
+    if (static_cast<std::uint64_t>(s->len) + h > w->cap) return false;
     for (std::uint32_t i = 0; i < h; ++i) w->key[i] = gk_java_sort_key(w->head[i]);
     if (h > 1) sort_indirect_i64_scratch(w->perm, w->key, w->tmp, h, /*ascending=*/true);
     else w->perm[0] = 0;
@@ -86,6 +89,7 @@ inline void gk_flush(GkWork* w, GkState* s, std::uint32_t h) noexcept {
     s->cur = out;
     s->len = o;
     s->count = cc;
+    return true;
 }
 
 // compressImmut: merge neighbours (back to front) while g + g' + delta' < threshold.
@@ -121,7 +125,8 @@ inline void gk_compress(GkWork* w, GkState* s) noexcept {
 }
 
 // Feed `n` values (arrival order) into a fresh summary, then compress (the
-// serialized partial). Returns false when `w` is too small.
+// serialized partial). Returns false when `w` is too small: cap must hold
+// threshold + head_size and, when compression cannot merge, every value.
 inline bool gk_build(const double* BOLT_RESTRICT vals, std::int64_t n, double rel_err,
                      GkWork* w, GkState* s) noexcept {
     assert(w != nullptr && s != nullptr);
@@ -133,12 +138,12 @@ inline bool gk_build(const double* BOLT_RESTRICT vals, std::int64_t n, double re
     for (std::int64_t i = 0; i < n; ++i) {
         w->head[h++] = vals[i];
         if (h >= w->head_size) {
-            gk_flush(w, s, h);
+            if (!gk_flush(w, s, h)) return false;
             h = 0;
             if (s->len >= w->threshold) gk_compress(w, s);
         }
     }
-    gk_flush(w, s, h);
+    if (!gk_flush(w, s, h)) return false;
     gk_compress(w, s);
     return true;
 }
