@@ -129,4 +129,58 @@ TEST(RegexBacktrack, StaleCaptureFromAFailedStartIsCleared) {
     EXPECT_EQ(mr.g_start[1], -1);
 }
 
+// java.util.regex flavor (regex_compile_java): answers checked against Spark 4.0.1 (JVM).
+bool jsearch(const char* pat, const std::string& text, MatchResult* mr) {
+    CompiledPattern cp;
+    EXPECT_TRUE(regex_compile_java(pat, static_cast<uint32_t>(std::strlen(pat)), &cp)) << pat;
+    return regex_search(&cp, text.data(), static_cast<int32_t>(text.size()), mr);
+}
+
+TEST(RegexJava, DotExcludesEveryLineTerminator) {
+    MatchResult mr;
+    EXPECT_FALSE(jsearch("a.b", "a\rb", &mr));
+    EXPECT_FALSE(jsearch("a.b", "a\xC2\x85" "b", &mr));
+    EXPECT_FALSE(jsearch("a.b", "a\xE2\x80\xA8" "b", &mr));
+    EXPECT_FALSE(jsearch("a.b", "a\xE2\x80\xA9" "b", &mr));
+    EXPECT_TRUE(jsearch("a.b", "a\xC2\xA0" "b", &mr));   // NBSP is an ordinary character
+    CompiledPattern cp;
+    ASSERT_TRUE(regex_compile("a.b", 3, &cp));             // the RE2 flavor keeps its answer
+    EXPECT_TRUE(regex_search(&cp, "a\rb", 3, &mr));
+}
+
+TEST(RegexJava, DollarMatchesBeforeAFinalTerminator) {
+    MatchResult mr;
+    EXPECT_TRUE(jsearch("b$", "ab\n", &mr));
+    EXPECT_EQ(mr.g_end[0], 2);
+    EXPECT_TRUE(jsearch("b$", "ab\r\n", &mr));
+    EXPECT_TRUE(jsearch("b$", "ab\r", &mr));
+    EXPECT_TRUE(jsearch("b$", "ab\xE2\x80\xA8", &mr));
+    EXPECT_FALSE(jsearch("b$", "ab\n\n", &mr));
+    EXPECT_FALSE(jsearch("b$", "ab\nc", &mr));
+}
+
+TEST(RegexJava, SpaceClassHasVerticalTab) {
+    MatchResult mr;
+    EXPECT_TRUE(jsearch("^\\s$", "\v", &mr));
+    EXPECT_FALSE(jsearch("^\\S$", "\v", &mr));
+}
+
+TEST(RegexJava, JavaOnlyFormsAreRefused) {
+    CompiledPattern cp;
+    for (const char* p : {"\\v", "[[a]]", "[a&&b]", "a{", "a{,2}", "x{a}"}) {
+        EXPECT_FALSE(regex_compile_java(p, static_cast<uint32_t>(std::strlen(p)), &cp)) << p;
+    }
+}
+
+TEST(RegexJava, SearchFromKeepsTheStartAnchor) {
+    CompiledPattern cp;
+    ASSERT_TRUE(regex_compile_java("^a", 2, &cp));
+    MatchResult mr;
+    EXPECT_TRUE(regex_search_from(&cp, "aa", 2, 0, &mr));
+    EXPECT_FALSE(regex_search_from(&cp, "aa", 2, 1, &mr));
+    ASSERT_TRUE(regex_compile_java("a", 1, &cp));
+    ASSERT_TRUE(regex_search_from(&cp, "aba", 3, 1, &mr));
+    EXPECT_EQ(mr.g_start[0], 2);
+}
+
 }  // namespace
