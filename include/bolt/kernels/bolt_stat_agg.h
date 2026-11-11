@@ -7,9 +7,8 @@
 //     intercept/r2 read the Welford co-moment cell the Corr/Covar aggregates
 //     already fold (agg_f64::comoment_update): no second pass, no new state.
 //   * percentile: Spark's exact percentile interpolation over a sorted slice.
-//   * Greenwald-Khanna QuantileSummaries (Spark's percentile_approx), the same
-//     insert / head-buffer / compress / query rules as Spark's
-//     QuantileSummaries, over caller-supplied scratch.
+//   * Greenwald-Khanna QuantileSummaries (Spark's percentile_approx): see
+//     bolt_gk_spark.h (included below).
 //
 // Tiger Style: noexcept, no heap (the caller supplies every buffer), bounded
 // loops, >= 2 asserts per non-trivial function, no exceptions / RTTI.
@@ -179,131 +178,8 @@ inline double percentile_spark_f64(const double* BOLT_RESTRICT vals, std::int64_
     return (static_cast<double>(hi) - position) * vlo + (position - static_cast<double>(lo)) * vhi;
 }
 
-// ---------------------------------------------------------------------------
-// Greenwald-Khanna quantile summary (Spark QuantileSummaries). One value
-// stream in arrival order -> a compressed summary -> quantile queries.
-// ---------------------------------------------------------------------------
-struct GkStat {
-    double       v;
-    std::int64_t g;
-    std::int64_t delta;
-};
-
-struct GkWork {
-    GkStat*        a;           // two sample arrays, each `cap` entries
-    GkStat*        b;
-    std::uint32_t  cap;         // >= threshold + head_size
-    std::uint32_t  head_size;   // Spark defaultHeadSize (50000)
-    std::uint32_t  threshold;   // Spark defaultCompressThreshold (10000)
-    double*        head;        // head_size values
-    std::int64_t*  key;         // head_size
-    std::int32_t*  perm;        // head_size
-    std::int32_t*  tmp;         // head_size
-};
-
-constexpr std::uint32_t k_gk_head_size = 50000;
-constexpr std::uint32_t k_gk_compress_threshold = 10000;
-
-struct GkState {
-    GkStat*        cur;
-    std::uint32_t  len;
-    std::int64_t   count;
-    double         rel_err;
-};
-
-// Sort the head buffer and insert it into the samples (insertHeadBuffer).
-inline void gk_flush(GkWork* w, GkState* s, std::uint32_t h) noexcept {
-    assert(w != nullptr && s != nullptr);
-    assert(h <= w->head_size);
-    if (h == 0) return;
-    for (std::uint32_t i = 0; i < h; ++i) w->key[i] = group_stats::f64_sortable_key(w->head[i]);
-    if (h > 1) sort_indirect_i64_scratch(w->perm, w->key, w->tmp, h, /*ascending=*/true);
-    else w->perm[0] = 0;
-    GkStat* out = (s->cur == w->a) ? w->b : w->a;
-    std::uint32_t o = 0, si = 0;
-    std::int64_t cc = s->count;
-    for (std::uint32_t oi = 0; oi < h; ++oi) {
-        const double cs = w->head[w->perm[oi]];
-        while (si < s->len && s->cur[si].v <= cs) out[o++] = s->cur[si++];
-        ++cc;
-        const bool edge = (o == 0) || (si == s->len && oi == h - 1);
-        const std::int64_t delta =
-            edge ? 0 : static_cast<std::int64_t>(std::floor(2.0 * s->rel_err * static_cast<double>(cc)));
-        out[o++] = GkStat{cs, 1, delta};
-        assert(o <= w->cap);
-    }
-    while (si < s->len) out[o++] = s->cur[si++];
-    assert(o <= w->cap);
-    s->cur = out;
-    s->len = o;
-    s->count = cc;
-}
-
-// compressImmut: merge neighbours while g + g' + delta' < mergeThreshold.
-inline void gk_compress(GkWork* w, GkState* s) noexcept {
-    assert(w != nullptr && s != nullptr);
-    if (s->len == 0) return;
-    const double merge_threshold = 2.0 * s->rel_err * static_cast<double>(s->count);
-    GkStat* out = (s->cur == w->a) ? w->b : w->a;
-    const GkStat* in = s->cur;
-    std::uint32_t o = 0;            // filled in reverse, then reversed in place
-    GkStat head = in[s->len - 1];
-    for (std::int64_t i = static_cast<std::int64_t>(s->len) - 2; i >= 1; --i) {
-        const GkStat s1 = in[i];
-        if (static_cast<double>(s1.g + head.g + head.delta) < merge_threshold) {
-            head.g += s1.g;
-        } else {
-            out[o++] = head;
-            head = s1;
-        }
-    }
-    out[o++] = head;
-    if (in[0].v <= head.v && s->len > 1) out[o++] = in[0];
-    for (std::uint32_t i = 0, j = o - 1; i < j; ++i, --j) { const GkStat t = out[i]; out[i] = out[j]; out[j] = t; }
-    s->cur = out;
-    s->len = o;
-}
-
-// Feed `n` values (arrival order). Returns false when `w` is too small.
-inline bool gk_build(const double* BOLT_RESTRICT vals, std::int64_t n, double rel_err,
-                     GkWork* w, GkState* s) noexcept {
-    assert(w != nullptr && s != nullptr);
-    assert(vals != nullptr || n == 0);
-    if (w->cap < w->threshold + w->head_size) return false;
-    s->cur = w->a; s->len = 0; s->count = 0; s->rel_err = rel_err;
-    std::uint32_t h = 0;
-    for (std::int64_t i = 0; i < n; ++i) {
-        w->head[h++] = vals[i];
-        if (h >= w->head_size) {
-            gk_flush(w, s, h);
-            h = 0;
-            if (s->len >= w->threshold) gk_compress(w, s);
-        }
-    }
-    gk_flush(w, s, h);
-    gk_compress(w, s);
-    return true;
-}
-
-// Spark QuantileSummaries.query over a built summary; len must be > 0.
-inline double gk_query(const GkState* BOLT_RESTRICT s, double q) noexcept {
-    assert(s != nullptr && s->len > 0);
-    assert(q >= 0.0 && q <= 1.0);
-    if (q <= s->rel_err) return s->cur[0].v;
-    if (q >= 1.0 - s->rel_err) return s->cur[s->len - 1].v;
-    const std::int64_t rank = static_cast<std::int64_t>(std::ceil(q * static_cast<double>(s->count)));
-    const double target = s->rel_err * static_cast<double>(s->count);
-    std::int64_t min_rank = 0;
-    for (std::uint32_t i = 0; i + 1 < s->len; ++i) {
-        min_rank += s->cur[i].g;
-        const std::int64_t max_rank = min_rank + s->cur[i].delta;
-        if (static_cast<double>(max_rank) - target <= static_cast<double>(rank) &&
-            static_cast<double>(rank) <= static_cast<double>(min_rank) + target)
-            return s->cur[i].v;
-    }
-    return s->cur[s->len - 1].v;
-}
-
 }  // namespace stat_agg
 }  // namespace kernels
 }  // namespace bolt
+
+#include "bolt/kernels/bolt_gk_spark.h"
