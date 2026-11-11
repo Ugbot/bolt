@@ -34,6 +34,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -245,4 +247,20 @@ TEST(BoltRadixSort, DirectMatchesIndirect) {
     for (int64_t i = 0; i < n; ++i)
         EXPECT_EQ(direct[static_cast<size_t>(i)],
                   in[static_cast<size_t>(perm[static_cast<size_t>(i)])]);
+}
+
+// G2CHK-883: every NaN (either sign, any payload) biases above +inf, so an
+// ascending sort puts NaN last as SQL does; a sign-bit NaN used to bias below
+// -inf.
+TEST(BoltRadixSort, NaNOfEitherSignSortsAboveInfinity) {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double qnan = std::numeric_limits<double>::quiet_NaN();
+    double neg_nan = 0.0;
+    std::uint64_t bits = 0xFFF8000000000001ull;   // sign set, non-canonical payload
+    std::memcpy(&neg_nan, &bits, sizeof bits);
+    EXPECT_GT(radix_bias_f64(qnan), radix_bias_f64(inf));
+    EXPECT_GT(radix_bias_f64(neg_nan), radix_bias_f64(inf));
+    EXPECT_EQ(radix_bias_f64(neg_nan), radix_bias_f64(qnan));
+    EXPECT_LT(radix_bias_f64(-inf), radix_bias_f64(-1.0));
+    EXPECT_LT(radix_bias_f64(-1.0), radix_bias_f64(2.5));
 }

@@ -149,12 +149,17 @@ BOLT_FORCE_INLINE int64_t radix_unbias_u64(uint64_t u) noexcept {
 // order == double-ascending order. Positive (sign bit clear): flip the sign bit.
 // Negative (sign bit set): flip ALL bits (so more-negative sorts lower). The
 // mask is sign-bit-broadcast-to-mask | signbit: negative → 0xFF..FF, positive →
-// 0x80..00. NaN maps to a deterministic extreme (SQL NaN order is impl-defined;
-// finite data is exact). Argsort-only — there is no unbias (the perm carries the
+// 0x80..00. Every NaN sorts above +inf (SQL order); finite data is exact. Argsort-only — there is no unbias (the perm carries the
 // result), so this need not be self-inverse.
 BOLT_FORCE_INLINE uint64_t radix_bias_f64(double d) noexcept {
     uint64_t bits;
     std::memcpy(&bits, &d, sizeof(bits));
+    // Every NaN (either sign, any payload) is the positive quiet NaN, so all
+    // of them sort above +inf together: SQL's order. A sign-bit NaN (fmod's)
+    // used to bias below -inf.
+    const bool nan = (bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull &&
+                     (bits & 0x000FFFFFFFFFFFFFull) != 0;
+    bits = nan ? 0x7FF8000000000000ull : bits;
     const uint64_t mask = (static_cast<uint64_t>(0) - (bits >> 63)) | kRadixSignBit;
     return bits ^ mask;
 }
