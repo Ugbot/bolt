@@ -301,6 +301,129 @@ BOLT_FORCE_INLINE void ntile(
     }
 }
 
+// ============================================================================
+// NTH_VALUE(value, nth [, ignore_nulls]) over a frame that starts at UNBOUNDED
+// PRECEDING (the partition's first row), within partition.
+//
+//   frame end  kPartitionEnd : UNBOUNDED FOLLOWING (or no ORDER BY)
+//              kCurrentRow   : ROWS .. CURRENT ROW
+//              kPeerEnd      : RANGE .. CURRENT ROW; the end is the last row
+//                              whose frame_keys equal the current row's
+//                              (frame_keys = one id per (partition, peer run))
+//
+// Row r gets the nth row (1-based; nth non-null row with ignore_nulls) of its
+// frame, or NULL (out_null = 1) when the frame holds fewer than nth rows. A
+// NULL value at that position is NULL as well. Linear: one scan per partition
+// to locate the nth position, one backward pass to bound each frame.
+// ============================================================================
+enum class NthFrameEnd : uint8_t { kPartitionEnd = 0, kCurrentRow = 1, kPeerEnd = 2 };
+
+template <typename V, typename Key>
+BOLT_FORCE_INLINE void nth_value(
+    const V*       BOLT_RESTRICT values,
+    const uint8_t* BOLT_RESTRICT value_null,      // nullable: 1 = NULL value
+    const Key*     BOLT_RESTRICT partition_keys,
+    const Key*     BOLT_RESTRICT frame_keys,      // only read for kPeerEnd
+    int64_t                      n,
+    int32_t                      nth,
+    NthFrameEnd                  frame_end,
+    bool                         ignore_nulls,
+    V*             BOLT_RESTRICT out,
+    uint8_t*       BOLT_RESTRICT out_null) noexcept
+{
+    assert(n >= 0);
+    assert(nth >= 1);
+    assert(n == 0 || (values != nullptr && partition_keys != nullptr));
+    assert(n == 0 || (out != nullptr && out_null != nullptr));
+    assert(frame_end != NthFrameEnd::kPeerEnd || n == 0 || frame_keys != nullptr);
+
+    int64_t i = 0;
+    while (i < n) {
+        int64_t j = i + 1;
+        const Key k0 = partition_keys[i];
+        while (j < n && partition_keys[j] == k0) ++j;
+        // p = the partition row that answers for every row whose frame reaches
+        // it; j (one past the partition) when the partition has no such row.
+        int64_t p = j;
+        if (!ignore_nulls) {
+            const int64_t at = i + static_cast<int64_t>(nth) - 1;
+            p = at < j ? at : j;
+        } else {
+            int64_t seen = 0;
+            for (int64_t r = i; r < j; ++r) {
+                const bool is_null = value_null != nullptr && value_null[r] != 0;
+                seen += is_null ? 0 : 1;
+                if (seen == nth) { p = r; break; }
+            }
+        }
+        const bool p_null = p < j && value_null != nullptr && value_null[p] != 0;
+        const V pv = p < j ? values[p] : V{};
+        int64_t end = j - 1;
+        for (int64_t r = j - 1; r >= i; --r) {
+            if (frame_end == NthFrameEnd::kCurrentRow) end = r;
+            else if (frame_end == NthFrameEnd::kPeerEnd) {
+                end = (r == j - 1 || frame_keys[r] != frame_keys[r + 1]) ? r : end;
+            }
+            const bool present = p <= end;
+            out[r] = present ? pv : V{};
+            out_null[r] = static_cast<uint8_t>((!present) | (present & p_null));
+        }
+        i = j;
+    }
+}
+
+// ============================================================================
+// LAST_VALUE(value) IGNORE NULLS over a frame that starts at UNBOUNDED
+// PRECEDING, within partition; `frame_end` / `frame_keys` as for nth_value.
+//
+// Row r gets the last non-NULL value at or before its frame's end, or NULL
+// (out_null = 1) when the frame holds none. Linear: one forward pass per
+// partition, buffering only the current peer run's start for kPeerEnd.
+// ============================================================================
+template <typename V, typename Key>
+BOLT_FORCE_INLINE void last_value_ignore_nulls(
+    const V*       BOLT_RESTRICT values,
+    const uint8_t* BOLT_RESTRICT value_null,      // nullable: 1 = NULL value
+    const Key*     BOLT_RESTRICT partition_keys,
+    const Key*     BOLT_RESTRICT frame_keys,      // only read for kPeerEnd
+    int64_t                      n,
+    NthFrameEnd                  frame_end,
+    V*             BOLT_RESTRICT out,
+    uint8_t*       BOLT_RESTRICT out_null) noexcept
+{
+    assert(n >= 0);
+    assert(n == 0 || (values != nullptr && partition_keys != nullptr));
+    assert(n == 0 || (out != nullptr && out_null != nullptr));
+    assert(frame_end != NthFrameEnd::kPeerEnd || n == 0 || frame_keys != nullptr);
+
+    int64_t i = 0;
+    while (i < n) {
+        int64_t j = i + 1;
+        const Key k0 = partition_keys[i];
+        while (j < n && partition_keys[j] == k0) ++j;
+        int64_t last = -1;   // last non-NULL row seen so far in the partition
+        int64_t run = i;     // first row of the current peer run (kPeerEnd)
+        for (int64_t r = i; r < j; ++r) {
+            if (value_null == nullptr || value_null[r] == 0) last = r;
+            const bool run_end = r == j - 1 || frame_end != NthFrameEnd::kPeerEnd ||
+                                 frame_keys[r] != frame_keys[r + 1];
+            if (frame_end == NthFrameEnd::kPartitionEnd || !run_end) continue;
+            for (int64_t q = run; q <= r; ++q) {   // every row of the run ends at r
+                out[q] = last >= 0 ? values[last] : V{};
+                out_null[q] = static_cast<uint8_t>(last < 0);
+            }
+            run = r + 1;
+        }
+        if (frame_end == NthFrameEnd::kPartitionEnd) {
+            for (int64_t q = i; q < j; ++q) {
+                out[q] = last >= 0 ? values[last] : V{};
+                out_null[q] = static_cast<uint8_t>(last < 0);
+            }
+        }
+        i = j;
+    }
+}
+
 }  // namespace window
 }  // namespace kernels
 }  // namespace bolt

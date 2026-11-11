@@ -972,6 +972,11 @@ inline void gb_pass2_one(GroupbyTypedState* st, uint32_t j,
         else        gb_p2_count_star<Sparse>(acc, count, gid);
         return;
     }
+    if (kind == AggKind::ByOrd) return;   // written by its MaxBy / MinBy
+    if (gb_kind_is_pick(kind)) {
+        gb_pick_pass2<Sparse>(st, j, payload, sel, start, count, gid);
+        return;
+    }
     const BoltColumn& pc = payload[st->specs[j].in_col];
     const BoltType t = st->agg_in_types[j];
     const bool hv = (pc.validity != nullptr);

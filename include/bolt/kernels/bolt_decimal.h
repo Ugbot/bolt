@@ -138,6 +138,62 @@ BOLT_FORCE_INLINE Decimal128 d128_mul(Decimal128 a, Decimal128 b) noexcept {
     return r;
 }
 
+// ---- Overflow-checked 128-bit arithmetic ------------------------------------
+// The exact result leaves [-2^127, 2^127) -> false (the value in *out is the
+// two's-complement wrap and must not be used). Spark's try_add / try_subtract /
+// try_multiply (NULL) and ANSI decimal arithmetic (an error) need the verdict;
+// the unchecked kernels above stay the hot default.
+
+BOLT_FORCE_INLINE bool d128_add_checked(Decimal128 a, Decimal128 b,
+                                        Decimal128* BOLT_RESTRICT out) noexcept {
+    assert(out != nullptr);
+    const Decimal128 r = d128_add(a, b);
+    *out = r;
+    // Overflow iff both operands share a sign and the result does not.
+    return ((a.hi ^ r.hi) & (b.hi ^ r.hi)) >= 0;
+}
+
+BOLT_FORCE_INLINE bool d128_sub_checked(Decimal128 a, Decimal128 b,
+                                        Decimal128* BOLT_RESTRICT out) noexcept {
+    assert(out != nullptr);
+    const Decimal128 r = d128_sub(a, b);
+    *out = r;
+    // Overflow iff the operands differ in sign and the result's sign is not a's.
+    return ((a.hi ^ b.hi) & (a.hi ^ r.hi)) >= 0;
+}
+
+// Signed 128x128 -> 128 with overflow detection. The magnitudes multiply as
+// unsigned 128-bit values (two non-zero high words always overflow); the
+// product must fit 2^127 - 1, or 2^127 when the result is negative.
+BOLT_FORCE_INLINE bool d128_mul_checked(Decimal128 a, Decimal128 b,
+                                        Decimal128* BOLT_RESTRICT out) noexcept {
+    assert(out != nullptr);
+    const bool neg_a = a.hi < 0;
+    const bool neg_b = b.hi < 0;
+    const Decimal128 ua = neg_a ? d128_neg(a) : a;   // |INT128_MIN| = 2^127 stays unsigned-correct
+    const Decimal128 ub = neg_b ? d128_neg(b) : b;
+    const uint64_t ahi = static_cast<uint64_t>(ua.hi), alo = static_cast<uint64_t>(ua.lo);
+    const uint64_t bhi = static_cast<uint64_t>(ub.hi), blo = static_cast<uint64_t>(ub.lo);
+    bool ok = !(ahi != 0 && bhi != 0);
+    uint64_t ll_lo, ll_hi, c_lo = 0, c_hi = 0, d_lo = 0, d_hi = 0;
+    mul_u64_u64(alo, blo, &ll_lo, &ll_hi);
+    if (bhi != 0) mul_u64_u64(alo, bhi, &c_lo, &c_hi);
+    if (ahi != 0) mul_u64_u64(ahi, blo, &d_lo, &d_hi);
+    ok = ok && c_hi == 0 && d_hi == 0;
+    const uint64_t cross = c_lo + d_lo;                 // one of the two is 0 when ok
+    const uint64_t high = ll_hi + cross;
+    ok = ok && high >= ll_hi;                           // no carry out of bit 127
+    const bool neg = neg_a != neg_b;
+    const uint64_t limit_hi = 0x7FFFFFFFFFFFFFFFull;
+    const bool is_min = neg && high == (limit_hi + 1ull) && ll_lo == 0;
+    ok = ok && (high <= limit_hi || is_min);
+    Decimal128 r;
+    r.lo = static_cast<int64_t>(ll_lo);
+    r.hi = static_cast<int64_t>(high);
+    *out = neg ? d128_neg(r) : r;
+    return ok;
+}
+
 // Unsigned 128/64 → 128 division for the div kernel.
 // Uses portable shift-subtract long division (≤128 iterations).
 // Optimised path for hi==0: single 64/64 div. This keeps Q14/Q1 style

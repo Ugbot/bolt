@@ -637,6 +637,14 @@ enum class AggKind : uint8_t {
     Min       = 3,
     Max       = 4,
     Avg       = 5,
+    // Spark first / last / max_by / min_by (bolt_groupby_pick.inc). counts[]
+    // holds the cell's set state; MaxBy / MinBy keep their ordering value in a
+    // ByOrd companion slot (AggSpec::aux), which only they write.
+    First     = 6,
+    Last      = 7,
+    MaxBy     = 8,
+    MinBy     = 9,
+    ByOrd     = 10,
 };
 
 struct AggSpec {
@@ -654,7 +662,9 @@ struct AggSpec {
     // cell stores — it stays a true Decimal128 — so lane-1 windows, lane-0
     // windows, and per-row fallback windows compose freely.
     uint8_t  lane;
-    uint8_t  _pad[4];    // explicit padding; POD, layout-stable
+    uint8_t  flags;      // First / Last: kGbPickIgnoreNulls
+    uint8_t  aux;        // MaxBy / MinBy: the ByOrd companion's agg index
+    uint8_t  _pad[2];    // explicit padding; POD, layout-stable
 };
 static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 
@@ -1030,6 +1040,9 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
             if (f) return GbCell16{kNegInfBits, 0};
             if (s) return GbCell16{0, 0};   // empty string — byte-lex min
             return d ? GbCell16{0, INT64_MIN} : GbCell16{INT64_MIN, 0};
+        case AggKind::First: case AggKind::Last:
+        case AggKind::MaxBy: case AggKind::MinBy:
+        case AggKind::ByOrd: return GbCell16{0, 0};   // unset: counts[] == 0
     }
     return GbCell16{0, 0};
 }
@@ -1052,6 +1065,8 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
     assert(slot != nullptr);
     if (k == AggKind::CountStar) { slot->a += 1; return; }
     if (k == AggKind::Count)     { slot->a += valid ? 1 : 0; return; }
+    assert(static_cast<uint8_t>(k) <= static_cast<uint8_t>(AggKind::Avg) &&
+           "pick kinds fold through bolt_groupby_pick.inc");
     if (!valid) return;   // Sum/Min/Max/Avg ignore NULLs (SQL semantics)
     // W-DEC: Decimal64 cells arrive WIDENED to d128 (read_cell16), so the
     // Decimal128 arm is exact for them — sums grow past int64 safely.
@@ -1717,6 +1732,9 @@ inline bool gb_agg_utf8_minmax(GroupbyTypedState* state, uint32_t j,
 // K-AGG-C: the two-pass specialised ingest (pass-1 gid materialisation +
 // pass-2 columnar accumulate). Kept in an .inc so this header stays
 // navigable; included only here.
+// Spark first / last / max_by / min_by cells, folded per row in input order.
+#include "bolt/join/bolt_groupby_pick.inc"
+
 #include "bolt/join/bolt_groupby_twopass.inc"
 
 // K-AGG-C fallback: the original per-row ingest loop, VERBATIM in
@@ -1792,6 +1810,12 @@ inline void gb_ingest_fallback(
             }
         }
         for (uint32_t j = 0; j < n_aggs; ++j) {
+            const AggKind kj = state->specs[j].kind;
+            if (kj == AggKind::ByOrd) continue;   // written by its MaxBy / MinBy
+            if (gb_kind_is_pick(kj)) {
+                if (!gb_pick_row(state, j, slot, payload, r)) return;
+                continue;
+            }
             GbCell16 v{0, 0};
             bool valid = true;
             const BoltColumn* pc_ptr = nullptr;
