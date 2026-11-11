@@ -100,6 +100,7 @@ struct Node {
     uint8_t    negate;                      // Class
     uint8_t    n_ranges;                     // Class
     uint8_t    lazy;                         // quantifier prefers fewest reps
+    uint8_t    java;                         // java.util.regex flavor (regex_compile_java)
     ClassRange ranges[kMaxClassRanges];      // Class
     uint16_t   min_rep;                      // quantifier lower bound
     uint16_t   max_rep;                      // quantifier upper bound (kUnbounded)
@@ -136,7 +137,8 @@ inline bool regex_class_add_perl(Node* n, char e) noexcept {
         case 'w': return regex_class_add(n, '0', '9') && regex_class_add(n, 'A', 'Z') &&
                          regex_class_add(n, '_', '_') && regex_class_add(n, 'a', 'z');
         default:  return regex_class_add(n, '\t', '\n') && regex_class_add(n, '\f', '\r') &&
-                         regex_class_add(n, ' ', ' ');
+                         regex_class_add(n, ' ', ' ') &&
+                         (n->java == 0 || regex_class_add(n, '\v', '\v'));   // Java's \s has VT
     }
 }
 
@@ -171,6 +173,8 @@ inline bool regex_class_member(const char* pat, uint32_t len, uint32_t* io,
         (pat[*io + 1] == ':' || pat[*io + 1] == '=' || pat[*io + 1] == '.')) {
         return false;
     }
+    // Java: '[' opens a nested class and '&&' is intersection; neither is a literal.
+    if (n->java != 0 && (c == '[' || (c == '&' && *io + 1 < len && pat[*io + 1] == '&'))) return false;
     if (c != '\\') {
         *out_b = static_cast<std::uint8_t>(c);
         *io += 1;
@@ -183,6 +187,7 @@ inline bool regex_class_member(const char* pat, uint32_t len, uint32_t* io,
         *out_b = 0x100u;
         return regex_class_add_perl(n, e);
     }
+    if (n->java != 0 && e == 'v') return false;   // Java \v is the vertical-space class
     const int lit = regex_escape_literal(e);
     if (lit < 0) return false;
     *out_b = static_cast<uint32_t>(lit);
@@ -319,6 +324,7 @@ inline bool regex_compile_escape(const char* pat, uint32_t len, uint32_t* io,
         n->negate = neg ? 1 : 0;
         return regex_class_add_perl(n, static_cast<char>(neg ? e + ('a' - 'A') : e));
     }
+    if (n->java != 0 && e == 'v') return false;   // Java \v is the vertical-space class
     const int lit = regex_escape_literal(e);
     if (lit < 0) return false;
     n->kind = NodeKind::Char;
@@ -351,8 +357,8 @@ inline bool regex_compile_open(const char* pat, uint32_t len, uint32_t* io,
 // treats this as a clean compile-time InvalidInput, never a silent
 // mismatch). Every byte is either understood or refused: an unknown
 // metacharacter is never read as a literal. Single bounded forward pass.
-inline bool regex_compile(const char* pat, uint32_t pat_len,
-                          CompiledPattern* out) noexcept {
+inline bool regex_compile_flavor(const char* pat, uint32_t pat_len,
+                                 CompiledPattern* out, bool java) noexcept {
     assert(pat != nullptr || pat_len == 0);
     assert(out != nullptr);
     std::memset(out, 0, sizeof(*out));
@@ -366,6 +372,7 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
         Node* n = &out->nodes[out->n_nodes];
         std::memset(n, 0, sizeof(*n));
         n->min_rep = 1; n->max_rep = 1;
+        n->java = java ? 1u : 0u;
         const char c = pat[i];
         if (atom_expected && regex_dangling_quantifier(pat, pat_len, i)) return false;
         if (c == '*' || c == '+' || c == '?') return false;
@@ -408,6 +415,7 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
         } else if (c == '\\') {
             if (!regex_compile_escape(pat, pat_len, &i, n)) return false;
         } else {
+            if (java && c == '{') return false;   // Java: "Illegal repetition", never a literal
             n->kind = NodeKind::Char;
             n->ch = static_cast<std::uint8_t>(c);
             ++i;
@@ -425,6 +433,19 @@ inline bool regex_compile(const char* pat, uint32_t pat_len,
     assert(out->n_nodes <= kMaxNodes);
     assert(out->n_groups < kMaxGroups);
     return true;
+}
+
+inline bool regex_compile(const char* pat, uint32_t pat_len,
+                          CompiledPattern* out) noexcept {
+    return regex_compile_flavor(pat, pat_len, out, false);
+}
+
+// The java.util.regex flavor: the same engine with Java's answers where RE2's differ
+// ('.' excludes every line terminator, '$' also matches before a final one, '\s' holds
+// VT) and the Java-only forms refused (nested classes, '&&', '\v', a literal '{').
+inline bool regex_compile_java(const char* pat, uint32_t pat_len,
+                               CompiledPattern* out) noexcept {
+    return regex_compile_flavor(pat, pat_len, out, true);
 }
 
 // ---------------------------------------------------------------------
@@ -455,6 +476,16 @@ inline bool regex_class_matches(const Node& n, std::uint8_t b) noexcept {
     return n.negate ? !hit : hit;
 }
 
+// A '.' in the java flavor also refuses U+0085, U+2028 and U+2029 (Java's line terminators).
+inline bool regex_is_wide_terminator(const char* t, uint32_t len, uint32_t k) noexcept {
+    assert(t != nullptr || len == 0);
+    assert(k <= len);
+    const auto u = [&](uint32_t j) { return static_cast<std::uint8_t>(t[j]); };
+    if (k + 1 < len && u(k) == 0xC2u && u(k + 1) == 0x85u) return true;
+    return k + 2 < len && u(k) == 0xE2u && u(k + 1) == 0x80u &&
+           (u(k + 2) == 0xA8u || u(k + 2) == 0xA9u);
+}
+
 inline bool regex_atom_matches(const Node& n, std::uint8_t b) noexcept {
     switch (n.kind) {
         case NodeKind::Char:  return b == n.ch;
@@ -468,7 +499,7 @@ inline bool regex_atom_matches(const Node& n, std::uint8_t b) noexcept {
         // `^https?://(?:www\.)?([^/]+)/.*$` must NOT match it because `.*`
         // cannot cross the newline to reach `$`. Both oracles leave that string
         // unchanged; chukonu rewrote it to its host and mis-grouped the row.
-        case NodeKind::Any:   return b != '\n';
+        case NodeKind::Any:   return b != '\n' && !(n.java != 0 && b == '\r');
         case NodeKind::Class: return regex_class_matches(n, b);
         default:              return false;
     }
@@ -483,6 +514,24 @@ inline bool regex_atom_matches(const Node& n, std::uint8_t b) noexcept {
 bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
                      uint16_t node_i, uint16_t outer_hi,
                      int32_t pos, int32_t* out_pos) noexcept;
+
+// Java's '$' (no MULTILINE): `pos` starts the string's final line terminator
+// (\n, \r\n, \r, U+0085, U+2028, U+2029).
+inline bool regex_before_final_terminator(const char* t, int32_t len, int32_t pos) noexcept {
+    assert(t != nullptr || len == 0);
+    assert(pos >= 0 && pos <= len);
+    const int32_t rest = len - pos;
+    if (rest == 1) {
+        if (t[pos] == '\n') return pos == 0 || t[pos - 1] != '\r';   // never between \r and \n
+        return t[pos] == '\r';
+    }
+    if (rest == 2) {
+        if (t[pos] == '\r' && t[pos + 1] == '\n') return true;
+        return static_cast<std::uint8_t>(t[pos]) == 0xC2u && static_cast<std::uint8_t>(t[pos + 1]) == 0x85u;
+    }
+    return rest == 3 && static_cast<std::uint8_t>(t[pos]) == 0xE2u && static_cast<std::uint8_t>(t[pos + 1]) == 0x80u &&
+           (static_cast<std::uint8_t>(t[pos + 2]) == 0xA8u || static_cast<std::uint8_t>(t[pos + 2]) == 0xA9u);
+}
 
 // Lazy form of regex_match_atom_rep: fewest repetitions first, adding one
 // at a time while the continuation fails.
@@ -506,7 +555,8 @@ inline bool regex_match_atom_lazy(const CompiledPattern* cp, MatchState* st,
             if (st->steps_left <= 0) return false;
         }
         if (n.max_rep != kUnbounded && reps >= n.max_rep) return false;
-        if (k >= len || !regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k]))) {
+        if (k >= len || !regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k])) ||
+            (n.java != 0 && n.kind == NodeKind::Any && regex_is_wide_terminator(st->text, len, k))) {
             return false;
         }
         k += wide ? utf8::utf8_unit_len(st->text, len, k) : 1u;
@@ -530,7 +580,8 @@ inline bool regex_match_atom_rep(const CompiledPattern* cp, MatchState* st,
     uint32_t k = static_cast<uint32_t>(pos);
     int32_t reps = 0;
     while (k < len && (n.max_rep == kUnbounded || reps < n.max_rep) &&
-           regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k]))) {
+           regex_atom_matches(n, static_cast<std::uint8_t>(st->text[k])) &&
+           !(n.java != 0 && n.kind == NodeKind::Any && regex_is_wide_terminator(st->text, len, k))) {
         k += wide ? utf8::utf8_unit_len(st->text, len, k) : 1u;
         ++reps;
     }
@@ -627,7 +678,9 @@ inline bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
             return regex_match_seq(cp, st, static_cast<uint16_t>(node_i + 1),
                                    outer_hi, pos, out_pos);
         case NodeKind::AnchorEnd:
-            if (pos != st->len) return false;
+            if (pos != st->len && !(n.java != 0 && regex_before_final_terminator(st->text, st->len, pos))) {
+                return false;
+            }
             return regex_match_seq(cp, st, static_cast<uint16_t>(node_i + 1),
                                    outer_hi, pos, out_pos);
         case NodeKind::GroupStart:
@@ -661,19 +714,20 @@ inline bool regex_match_seq(const CompiledPattern* cp, MatchState* st,
 // fast. Fills `*out` with the first (leftmost) match, or matched=false.
 // Exhausting one start's step budget stops the search with out->exhausted
 // set: a later start's match would not be the leftmost one.
-inline bool regex_search(const CompiledPattern* cp, const char* text,
-                         int32_t n, MatchResult* out) noexcept {
+inline bool regex_search_from(const CompiledPattern* cp, const char* text,
+                              int32_t n, int32_t from, MatchResult* out) noexcept {
     assert(cp != nullptr && out != nullptr);
-    assert(n >= 0);
+    assert(n >= 0 && from >= 0 && from <= n);
     std::memset(out, 0, sizeof(*out));
     for (int g = 0; g < kMaxGroups; ++g) { out->g_start[g] = -1; out->g_end[g] = -1; }
     const bool anchored = (cp->n_nodes > 0 &&
                           cp->nodes[0].kind == NodeKind::AnchorStart);
+    if (anchored && from > 0) return false;   // '^' only holds at the string's start
     const int32_t budget = kRegexMinStepBudget +
         ((n < (INT32_MAX - kRegexMinStepBudget) / kMaxStepsPerByte - 1)
              ? kMaxStepsPerByte * (n + 1)
              : INT32_MAX - kRegexMinStepBudget);
-    for (int32_t start = 0; start <= n; ++start) {
+    for (int32_t start = from; start <= n; ++start) {
         if (start > 0 && start < n &&
             utf8::utf8_is_cont(static_cast<std::uint8_t>(text[start]))) {
             continue;   // never begin a match inside a character
@@ -694,6 +748,11 @@ inline bool regex_search(const CompiledPattern* cp, const char* text,
         if (anchored) break;   // '^' can only match at position 0
     }
     return false;
+}
+
+inline bool regex_search(const CompiledPattern* cp, const char* text,
+                         int32_t n, MatchResult* out) noexcept {
+    return regex_search_from(cp, text, n, 0, out);
 }
 
 // ---------------------------------------------------------------------
