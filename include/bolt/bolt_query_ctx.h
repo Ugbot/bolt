@@ -37,6 +37,8 @@ enum class QueryStop : uint32_t {
     Deadline  = 2,
     Memory    = 3,
     Rows      = 4,
+    ScanRows  = 5,
+    ScanBytes = 6,
 };
 
 /// What a query asks of the engine. Zero means "not set" in every field.
@@ -44,6 +46,8 @@ struct QueryLimits {
     uint64_t deadline_steady_ns = 0;   // absolute steady_clock ns; 0 = none
     uint64_t memory_bytes       = 0;   // 0 = none
     uint64_t row_limit          = 0;   // result rows; 0 = none
+    uint64_t scan_rows          = 0;   // rows scan sources produce; 0 = none
+    uint64_t scan_bytes         = 0;   // decoded bytes scan sources produce; 0 = none
     int64_t  morsel_rows        = 0;   // source emit size; 0 = the mode's
     uint32_t workers            = 0;   // 0 = the pool; 1 = serial
     uint32_t _pad               = 0;
@@ -66,6 +70,8 @@ struct alignas(64) QueryCtx {
     alignas(64) std::atomic<uint64_t> mem_used{0};
     std::atomic<uint64_t>            mem_peak{0};
     std::atomic<uint64_t>            rows{0};
+    std::atomic<uint64_t>            scanned_rows{0};
+    std::atomic<uint64_t>            scanned_bytes{0};
 
     // First reason wins, so the error names what actually stopped the query.
     void request_stop(QueryStop why) noexcept {
@@ -112,6 +118,15 @@ struct alignas(64) QueryCtx {
     const char* failure() const noexcept {
         return failed.load(std::memory_order_acquire) == 2u ? fail_message : nullptr;
     }
+    // Rows and bytes the query's scan sources produced (every frontend: SQL,
+    // PromQL, DataFrame, Spark). Past a limit the query stops. False when it has.
+    bool add_scanned(uint64_t n_rows, uint64_t n_bytes) noexcept {
+        const uint64_t r = scanned_rows.fetch_add(n_rows, std::memory_order_relaxed) + n_rows;
+        const uint64_t b = scanned_bytes.fetch_add(n_bytes, std::memory_order_relaxed) + n_bytes;
+        if (limits.scan_rows != 0u && r > limits.scan_rows) { request_stop(QueryStop::ScanRows); return false; }
+        if (limits.scan_bytes != 0u && b > limits.scan_bytes) { request_stop(QueryStop::ScanBytes); return false; }
+        return true;
+    }
     bool add_rows(uint64_t n) noexcept {
         const uint64_t total = rows.fetch_add(n, std::memory_order_relaxed) + n;
         if (limits.row_limit == 0u || total <= limits.row_limit) return true;
@@ -155,6 +170,8 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->mem_used.store(0u, std::memory_order_relaxed);
         q->mem_peak.store(0u, std::memory_order_relaxed);
         q->rows.store(0u, std::memory_order_relaxed);
+        q->scanned_rows.store(0u, std::memory_order_relaxed);
+        q->scanned_bytes.store(0u, std::memory_order_relaxed);
         q->failed.store(0u, std::memory_order_relaxed);
         q->fail_message[0] = '\0';
         return q;
