@@ -3094,3 +3094,9 @@ if(BOLT_BUILD_COMPUTE_IDOT)
     bolt_apply_hardening(test_bolt_gemv)
     add_test(NAME test_bolt_gemv COMMAND test_bolt_gemv)
 endif()
+
+# G2ICE-450: Iceberg table statistics, Puffin footers, theta-sketch NDV.
+add_executable(test_bolt_iceberg_statistics test_bolt_iceberg_statistics.cpp)
+target_link_libraries(test_bolt_iceberg_statistics PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_statistics)
+add_test(NAME test_bolt_iceberg_statistics COMMAND test_bolt_iceberg_statistics)

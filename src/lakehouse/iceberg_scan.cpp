@@ -40,6 +40,7 @@
 
 #include "bolt/lakehouse/iceberg/iceberg_limits.h"
 #include "bolt/lakehouse/iceberg/scan.h"
+#include "bolt/lakehouse/iceberg/puffin.h"
 #include "bolt/lakehouse/iceberg/deletion_vector.h"
 #include "bolt/lakehouse/iceberg/pinned_read.h"
 #include "bolt/lakehouse/iceberg/json_value.h"
@@ -1594,6 +1595,8 @@ void iceberg_scan_close(ScanHandle* s) noexcept {
     s->transport_arena = nullptr;
     s->failed = true;
 }
+
+#include "iceberg_puffin_ndv.inc"
 
 }  // namespace iceberg
 }  // namespace lakehouse

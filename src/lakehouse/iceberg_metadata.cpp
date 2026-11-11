@@ -7,6 +7,7 @@
 // Tiger Style.
 
 #include "bolt/lakehouse/iceberg/metadata.h"
+#include "bolt/lakehouse/iceberg/puffin.h"
 
 #include <cassert>
 #include <algorithm>
@@ -495,6 +496,8 @@ bool parse_metadata_log(const bj::StructuralIndex* idx, bj::Iterator* it,
     return true;
 }
 
+#include "iceberg_statistics_parse.inc"
+
 }  // namespace
 
 void metadata_init(Metadata* m, Arena* arena, Budget* budget) noexcept {
@@ -665,6 +668,10 @@ bool metadata_parse_budget(const uint8_t* src, uint32_t len, Arena* scratch,
             } else {
                 skip_value(&it);
             }
+        } else if (tok_eq(&idx, key, "statistics")) {
+            if (!parse_statistics_list(&idx, &it, out, false)) return false;
+        } else if (tok_eq(&idx, key, "partition-statistics")) {
+            if (!parse_statistics_list(&idx, &it, out, true)) return false;
         } else if (tok_eq(&idx, key, "metadata-log")) {
             if (bj::iter_peek(&it) == bj::TokenType::BeginArray) {
                 if (!parse_metadata_log(&idx, &it, out)) return false;
@@ -779,6 +786,37 @@ void metadata_metadata_log_push(Metadata* m,
     dst.timestamp_ms = e->timestamp_ms;
     std::memcpy(dst.metadata_file, e->metadata_file, sizeof(dst.metadata_file));
     dst.metadata_file[sizeof(dst.metadata_file) - 1u] = '\0';
+}
+
+const StatisticsFile* metadata_statistics_for(const Metadata* m, int64_t snapshot_id) noexcept {
+    assert(m != nullptr);
+    assert(m->n_statistics == 0u || m->statistics != nullptr);
+    for (uint32_t i = 0; i < m->n_statistics; ++i)
+        if (m->statistics[i].snapshot_id == snapshot_id) return &m->statistics[i];
+    return nullptr;
+}
+
+bool puffin_footer_parse(const uint8_t* json, uint32_t len, Arena* a, BlobMetadata** out,
+                         uint32_t* n) noexcept {
+    assert(a != nullptr && out != nullptr && n != nullptr);
+    *out = nullptr; *n = 0;
+    if (json == nullptr || len == 0u) return false;
+    bj::StructuralIndex idx{};
+    if (!bj::build_index(json, len, a, &idx)) return false;
+    bj::Iterator it{};
+    if (!bj::iter_init(&idx, &it) || bj::iter_peek(&it) != bj::TokenType::BeginObject) return false;
+    bj::iter_advance(&it);
+    uint32_t cap = 0, g = 0;
+    while (bj::iter_peek(&it) == bj::TokenType::Key && g++ < kIterGuard) {
+        const int32_t key = it.cursor;
+        bj::iter_advance(&it);
+        if (tok_eq(&idx, key, "blobs")) {
+            if (!parse_blob_array(&idx, &it, a, nullptr, out, n, &cap)) return false;
+        } else {
+            skip_value(&it);
+        }
+    }
+    return bj::iter_peek(&it) == bj::TokenType::EndObject;
 }
 
 const PartitionSpec* metadata_spec(const Metadata* m, int32_t spec_id) noexcept {
