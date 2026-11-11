@@ -51,6 +51,9 @@ TEST(BoltTz, ParsesRegionsOffsetsAndAliases) {
     char buf[64];
     EXPECT_EQ(std::string(buf, bolt::tz::zone_name(z, buf, sizeof(buf))), "America/New_York");
     EXPECT_EQ(bolt::tz::offset_at(zone("PST"), 1705276800), -8 * 3600);
+    EXPECT_EQ(bolt::tz::offset_at(zone("EST"), -2209006800), -5 * 3600);   // SHORT_IDS: fixed, no LMT
+    EXPECT_EQ(bolt::tz::offset_at(zone("MST"), -62135596800), -7 * 3600);
+    EXPECT_EQ(bolt::tz::offset_at(zone("HST"), 0), -10 * 3600);
     EXPECT_FALSE(bolt::tz::zone_parse("Mars/Olympus", 12, &z));
     EXPECT_FALSE(bolt::tz::zone_parse("+19:00", 6, &z));
     EXPECT_EQ(z, bolt::tz::kInvalidZone);
@@ -269,3 +272,113 @@ TEST(BoltDtk, FixedFormatAndTextDatesMatchOracle) {
 }
 
 }  // namespace
+
+// ---- timestampadd / timestampdiff arithmetic (values frozen from Spark 4.0.1 / java.time) ----
+
+namespace {
+
+using bolt::cal::AddUnit;
+
+std::int64_t local_us(std::int64_t y, int mo, int d, int h = 0, int mi = 0, int s = 0) {
+    return bolt::cal::days_from_ymd(y, mo, d) * bolt::cal::kMicrosPerDay + ((h * 60 + mi) * 60 + s) * kUs;
+}
+
+}  // namespace
+
+TEST(BoltCalendarArith, UnitSpellings) {
+    AddUnit u{};
+    EXPECT_TRUE(bolt::cal::add_unit_parse("dayofyear", 9, &u));
+    EXPECT_EQ(u, AddUnit::Day);
+    EXPECT_TRUE(bolt::cal::add_unit_parse("Quarter", 7, &u));
+    EXPECT_EQ(u, AddUnit::Quarter);
+    EXPECT_FALSE(bolt::cal::add_unit_parse("DAYS", 4, &u));
+    EXPECT_FALSE(bolt::cal::add_unit_parse("", 0, &u));
+}
+
+TEST(BoltCalendarArith, DiffIsJavaLocalDateTimeUntil) {
+    std::int64_t r = 0;
+    // Jan 31 10:00 -> Feb 29 10:00 is 0 months: the day of month is 29 < 31.
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Month, local_us(2020, 1, 31, 10), local_us(2020, 2, 29, 10), &r));
+    EXPECT_EQ(r, 0);
+    // 2020-02-29 10:00 -> 2021-02-28 10:00 is 0 years; -> 2021-03-01 is 1.
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Year, local_us(2020, 2, 29, 10), local_us(2021, 2, 28, 10), &r));
+    EXPECT_EQ(r, 0);
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Year, local_us(2020, 2, 29, 10), local_us(2021, 3, 1, 10), &r));
+    EXPECT_EQ(r, 1);
+    // Whole days truncate toward zero from either side.
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Day, local_us(2020, 6, 20, 10, 20, 30), local_us(2020, 6, 15, 10, 20, 31), &r));
+    EXPECT_EQ(r, -4);
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Day, local_us(2020, 6, 15, 10, 20, 30), local_us(2020, 6, 20, 10, 20, 29), &r));
+    EXPECT_EQ(r, 4);
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Quarter, local_us(2020, 1, 15, 10), local_us(2020, 11, 14, 10), &r));
+    EXPECT_EQ(r, 3);
+    ASSERT_TRUE(bolt::cal::diff_local_us(AddUnit::Microsecond, local_us(1, 1, 1), local_us(9999, 12, 31, 23, 59, 59), &r));
+    EXPECT_EQ(r, 315537897599000000LL);
+    EXPECT_FALSE(bolt::cal::diff_local_us(AddUnit::Microsecond, INT64_MIN, INT64_MAX, &r));
+}
+
+TEST(BoltCalendarArith, AddZonedKeepsOffsetInOverlapAndShiftsThroughGap) {
+    const ZoneId la = zone("America/Los_Angeles");
+    std::int64_t r = 0;
+    // 2021-12-07 01:30 PST minus one month lands in the 2021-11-07 01:30 overlap: java keeps PST (the later offset).
+    const std::int64_t start = bolt::tz::local_micros_to_utc(la, local_us(2021, 12, 7, 1, 30));
+    ASSERT_TRUE(bolt::cal::add_zoned_us(la, AddUnit::Month, -1, start, &r));
+    EXPECT_EQ(r, 1636277400LL * kUs);
+    // 2021-03-13 02:30 + 1 day is the spring-forward gap: shifted to 03:30 PDT.
+    const std::int64_t s2 = bolt::tz::local_micros_to_utc(la, local_us(2021, 3, 13, 2, 30));
+    ASSERT_TRUE(bolt::cal::add_zoned_us(la, AddUnit::Day, 1, s2, &r));
+    EXPECT_EQ(r, 1615717800LL * kUs);
+    // Clock units are absolute: +24 h across the gap is 24 elapsed hours.
+    const std::int64_t s3 = bolt::tz::local_micros_to_utc(la, local_us(2021, 3, 13, 12));
+    ASSERT_TRUE(bolt::cal::add_zoned_us(la, AddUnit::Hour, 24, s3, &r));
+    EXPECT_EQ(r, s3 + 24 * 3600 * kUs);
+}
+
+TEST(BoltCalendarArith, AddOverflowIsReportedNotWrapped) {
+    std::int64_t r = 0;
+    EXPECT_FALSE(bolt::cal::add_local_us(AddUnit::Year, 2147483647, local_us(2020, 6, 15), &r));
+    EXPECT_FALSE(bolt::cal::add_local_us(AddUnit::Day, INT32_MAX, local_us(2020, 6, 15), &r));
+    EXPECT_FALSE(bolt::cal::add_local_us(AddUnit::Second, INT64_MAX, local_us(2020, 6, 15), &r));
+    EXPECT_TRUE(bolt::cal::add_local_us(AddUnit::Hour, 2147483647, local_us(2020, 6, 15, 10, 20, 30), &r));
+    EXPECT_EQ(r, 7732533345630000000LL);
+}
+
+TEST(BoltCalendarArith, IsoWeekYearAndNames) {
+    std::int32_t y = 0, w = 0;
+    bolt::cal::iso_week_year(bolt::cal::days_from_ymd(2021, 1, 3), &y, &w);
+    EXPECT_EQ(y, 2020);
+    EXPECT_EQ(w, 53);
+    bolt::cal::iso_week_year(bolt::cal::days_from_ymd(2024, 12, 30), &y, &w);
+    EXPECT_EQ(y, 2025);
+    EXPECT_EQ(w, 1);
+    bolt::cal::iso_week_year(bolt::cal::days_from_ymd(-1, 1, 1), &y, &w);   // proleptic year -1 (Spark: -2, week 53)
+    EXPECT_EQ(y, -2);
+    EXPECT_EQ(w, 53);
+    EXPECT_STREQ(bolt::cal::short_day_name(bolt::cal::iso_dow(bolt::cal::days_from_ymd(2020, 6, 15))), "Mon");
+    EXPECT_STREQ(bolt::cal::short_month_name(12), "Dec");
+}
+
+TEST(BoltTz, ZoneParseExactIsCaseSensitive) {
+    ZoneId z = 0;
+    auto p = [&](const char* s) { return bolt::tz::zone_parse_exact(s, static_cast<std::uint32_t>(std::strlen(s)), &z); };
+    EXPECT_TRUE(p("America/Los_Angeles"));
+    EXPECT_FALSE(p("america/los_angeles"));
+    EXPECT_TRUE(p("PST"));
+    EXPECT_TRUE(p("UTC"));
+    EXPECT_TRUE(p("Z"));
+    EXPECT_FALSE(p("z"));
+    EXPECT_FALSE(p("utc"));
+    EXPECT_TRUE(p("+05:30"));
+    EXPECT_TRUE(p("GMT+3"));
+    EXPECT_FALSE(p("utc+01:00"));
+    EXPECT_FALSE(p(""));
+}
+
+TEST(BoltDtfmt, NtzParseDropsTheTextZone) {
+    std::int64_t us = 0;
+    const char* t = "2020-06-15 10:20:30+05:00";
+    ASSERT_TRUE(bolt::dtfmt::parse_timestamp_text(t, static_cast<std::uint32_t>(std::strlen(t)), bolt::tz::kUtc, &us, true));
+    EXPECT_EQ(us, 1592216430LL * kUs);
+    ASSERT_TRUE(bolt::dtfmt::parse_timestamp_text(t, static_cast<std::uint32_t>(std::strlen(t)), bolt::tz::kUtc, &us, false));
+    EXPECT_EQ(us, 1592198430LL * kUs);
+}

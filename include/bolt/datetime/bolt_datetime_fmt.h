@@ -49,18 +49,21 @@ const char* compile_status_text(CompileStatus st) noexcept;
 std::uint32_t format_instant(const Pattern& p, std::int64_t utc_us, tz::ZoneId zone,
                              char* buf, std::uint32_t cap) noexcept;
 
-// Parse `s` with pattern `p`. A zone/offset in the text wins over `zone`.
+// Parse `s` with pattern `p`. A zone/offset in the text wins over `zone`, unless
+// `ignore_text_zone` (TIMESTAMP_NTZ: the zone is read and dropped, the result is
+// the wall clock as epoch micros when `zone` is UTC).
 // Missing fields default as Spark does (1970-01-01 00:00:00).
 bool parse_instant(const Pattern& p, const char* s, std::uint32_t len, tz::ZoneId zone,
-                   std::int64_t* utc_us) noexcept;
+                   std::int64_t* utc_us, bool ignore_text_zone = false) noexcept;
 
 // Spark CAST(string AS DATE): "[+-]yyyy[-[m]m[-[d]d[( |T)...]]]", trimmed.
 bool parse_date_text(const char* s, std::uint32_t len, std::int64_t* days) noexcept;
 
 // Spark CAST(string AS TIMESTAMP): date part as above, then optional
 // "( |T)[h]h[:[m]m[:[s]s[.fraction]]]" and an optional zone id / offset.
+// `ignore_text_zone` as parse_instant (CAST(string AS TIMESTAMP_NTZ)).
 bool parse_timestamp_text(const char* s, std::uint32_t len, tz::ZoneId zone,
-                          std::int64_t* utc_us) noexcept;
+                          std::int64_t* utc_us, bool ignore_text_zone = false) noexcept;
 
 // "yyyy-MM-dd" / "yyyy-MM-dd HH:mm:ss[.ffffff]" (Spark's default rendering).
 std::uint32_t format_date_default(std::int64_t days, char* buf, std::uint32_t cap) noexcept;
