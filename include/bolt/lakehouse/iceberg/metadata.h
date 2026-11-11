@@ -84,6 +84,37 @@ struct MetadataLogEntry {
     char    metadata_file[kIcebergMaxManifestPath];
 };
 
+// G2ICE-450: table statistics (spec "Table Statistics" / Puffin "Blob
+// metadata"). One record shape for a `statistics[].blob-metadata[]` entry of
+// table metadata and a Puffin footer's `blobs[]` entry; `offset` / `length` /
+// `codec` are footer-only (-1 / "" in table metadata). `ndv` is the `ndv`
+// property (-1 when absent). Arrays are arena-owned.
+struct BlobMetadata {
+    char     type[64];
+    int64_t  snapshot_id;
+    int64_t  sequence_number;
+    int64_t  offset;
+    int64_t  length;
+    int64_t  ndv;
+    int32_t* fields;
+    uint32_t n_fields;
+    char     codec[16];
+};
+struct StatisticsFile {
+    int64_t       snapshot_id;
+    int64_t       file_size;
+    int64_t       footer_size;
+    char          path[kIcebergMaxManifestPath];
+    BlobMetadata* blobs;
+    uint32_t      n_blobs;
+    uint32_t      cap_blobs;
+};
+struct PartitionStatisticsFile {
+    int64_t snapshot_id;
+    int64_t file_size;
+    char    path[kIcebergMaxManifestPath];
+};
+
 struct Metadata {
     int32_t   format_version;
     int32_t   current_schema_id;
@@ -142,7 +173,17 @@ struct Metadata {
     bool        has_next_row_id;
     bool        has_encryption_keys;   // v3 `encryption-keys` lists at least one key (the table's files may be encrypted)
     uint8_t     _pad_nr[6];
+    // G2ICE-450: `statistics` and `partition-statistics`, arena-grown.
+    StatisticsFile*          statistics;
+    uint32_t                 n_statistics;
+    uint32_t                 cap_statistics;
+    PartitionStatisticsFile* partition_statistics;
+    uint32_t                 n_partition_statistics;
+    uint32_t                 cap_partition_statistics;
 };
+
+// The statistics file of `snapshot_id`, or nullptr.
+const StatisticsFile* metadata_statistics_for(const Metadata* m, int64_t snapshot_id) noexcept;
 
 // One field of a name mapping: the Iceberg field id and its file-name aliases.
 static constexpr uint32_t kNameMapMaxNames = limits::kNameMapMaxNames;

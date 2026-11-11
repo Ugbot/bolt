@@ -3238,3 +3238,8 @@ add_executable(test_bolt_json_column test_bolt_json_column.cpp)
 target_link_libraries(test_bolt_json_column PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_json_column)
 add_test(NAME test_bolt_json_column COMMAND test_bolt_json_column)
+# G2ICE-450: Iceberg table statistics, Puffin footers, theta-sketch NDV.
+add_executable(test_bolt_iceberg_statistics test_bolt_iceberg_statistics.cpp)
+target_link_libraries(test_bolt_iceberg_statistics PRIVATE bolt::bolt bolt::lakehouse GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_iceberg_statistics)
+add_test(NAME test_bolt_iceberg_statistics COMMAND test_bolt_iceberg_statistics)
