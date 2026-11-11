@@ -977,6 +977,10 @@ inline void gb_pass2_one(GroupbyTypedState* st, uint32_t j,
         gb_pick_pass2<Sparse>(st, j, payload, sel, start, count, gid);
         return;
     }
+    if (gb_kind_is_fold(kind)) {
+        gb_fold_pass2<Sparse>(st, j, payload, sel, start, count, gid);
+        return;
+    }
     const BoltColumn& pc = payload[st->specs[j].in_col];
     const BoltType t = st->agg_in_types[j];
     const bool hv = (pc.validity != nullptr);

@@ -120,6 +120,10 @@ inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
             if (!gb_pick_merge(dst, dslot, src, sgid, j)) return false;
             continue;
         }
+        if (gb_kind_is_fold(k)) {
+            gb_fold_merge(dst, dslot, src, sgid, j);
+            continue;
+        }
         if (k == AggKind::Count || k == AggKind::CountStar) {
             // The src cell holds a partial COUNT — add the count itself
             // (apply() would add 1 per call, which is per-ROW semantics).
