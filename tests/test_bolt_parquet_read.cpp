@@ -291,7 +291,7 @@ TEST(BoltParquetRead, TypeMapRejectsOutsideSubset) {
 //   flag       BOOLEAN PLAIN          == (i % 3 == 0)      -> Int64 0/1
 //   flag_null  BOOLEAN PLAIN, nulls   == null if i%5==0 else (i%2==0)
 //   u16        INT32 (UINT_16)        == i                 -> Int32
-//   u64        INT64 (UINT_64)        == (1<<63) + i (bit pattern)
+//   u64        INT64 (UINT_64)        == (1<<63) + i       -> UInt64
 //   dur        INT64 (duration[ns])   == i * 1000000007
 //   s_dict     BYTE_ARRAY dict        == "SYM%d" % (i % 5) -> Utf8
 // golden_taq_types_rlebool.parquet: flag/flag_null written with
@@ -347,7 +347,7 @@ TEST(BoltParquetRead, TaqTypesFloatBoolWidening) {
     ASSERT_EQ(cols[3].type, bolt::BoltType::Int64);     // flag 0/1
     ASSERT_EQ(cols[4].type, bolt::BoltType::Int64);     // flag_null 0/1
     ASSERT_EQ(cols[5].type, bolt::BoltType::Int32);     // u16
-    ASSERT_EQ(cols[6].type, bolt::BoltType::Int64);     // u64 bit pattern
+    ASSERT_EQ(cols[6].type, bolt::BoltType::UInt64);    // u64 exact (G2CHK-947)
     ASSERT_EQ(cols[7].type, bolt::BoltType::Int64);     // duration[ns]
     ASSERT_EQ(cols[8].type, bolt::BoltType::Utf8);      // dict string
     const auto* f32p = static_cast<const double*>(cols[0].data);
@@ -356,7 +356,7 @@ TEST(BoltParquetRead, TaqTypesFloatBoolWidening) {
     const auto* flag  = static_cast<const int64_t*>(cols[3].data);
     const auto* flagn = static_cast<const int64_t*>(cols[4].data);
     const auto* u16  = static_cast<const int32_t*>(cols[5].data);
-    const auto* u64c = static_cast<const int64_t*>(cols[6].data);
+    const auto* u64c = static_cast<const uint64_t*>(cols[6].data);
     const auto* dur  = static_cast<const int64_t*>(cols[7].data);
     const auto* sd   = static_cast<const bolt::StringView*>(cols[8].data);
     ASSERT_NE(cols[2].validity, nullptr);
@@ -377,9 +377,7 @@ TEST(BoltParquetRead, TaqTypesFloatBoolWidening) {
             ASSERT_EQ(flagn[i], (i % 2 == 0) ? 1 : 0) << "row " << i;
         }
         ASSERT_EQ(u16[i], static_cast<int32_t>(i));
-        ASSERT_EQ(u64c[i],
-                  static_cast<int64_t>((uint64_t{1} << 63) +
-                                       static_cast<uint64_t>(i)));
+        ASSERT_EQ(u64c[i], (uint64_t{1} << 63) + static_cast<uint64_t>(i));
         ASSERT_EQ(dur[i], i * 1000000007);
         char want[16];
         std::snprintf(want, sizeof(want), "SYM%lld", (long long)(i % 5));
@@ -665,8 +663,7 @@ TEST(BoltParquetPageRange, DictChunkResumesAndMatchesWholeChunk) {
 //   u8_c       INT32 (UINT_8)             == i % 251          -> Int32
 //   u16_c      INT32 (UINT_16)            == (i*37) % 65521   -> Int32
 //   i32_c      INT32 signed               == (-1)^i * i*1000  -> Int32
-//   u64_c      INT64 (UINT_64)            == 2^64-1 - i       -> Int64 (bit
-//                                            pattern; see the u64 note below)
+//   u64_c      INT64 (UINT_64)            == 2^64-1 - i       -> UInt64
 // with BIG = [0, 1, 2147483647, 2147483648, 3000000000, 4000000000,
 //             4294967295].
 //
@@ -694,14 +691,8 @@ TEST(BoltParquetPageRange, DictChunkResumesAndMatchesWholeChunk) {
 //                  data_page_version="1.0", use_dictionary=["u32_dict"],
 //                  write_statistics=True)
 //
-// u64 SCOPE NOTE (deliberately NOT asserted as a value): INT64-physical
-// UINT_64 has no wider signed lane to widen into, so bolt keeps it on Int64
-// and a u64 above 2^63-1 stays a raw bit pattern. That is the same class of
-// gap G2FEAT-111 fixes for u32, but it is not fixable by widening — it needs
-// a real BoltType::UInt64 lane and a downstream kernel audit (see the
-// UNSIGNED WIDTHS note in test_bolt_parquet_types.cpp). golden_taq_types'
-// u64 column already pins the bit-pattern behaviour; u64_c is here only so
-// this fixture proves the fix did not disturb it.
+// u64: INT64-physical UINT_64 lands on the exact UInt64 lane (G2CHK-947);
+// u64_c pins values at the top of the unsigned range.
 TEST(BoltParquetRead, Uint32AboveSignedRange) {
     const auto buf = slurp(data_path("golden_uint32.parquet").c_str());
     ASSERT_FALSE(buf.empty());
@@ -722,7 +713,7 @@ TEST(BoltParquetRead, Uint32AboveSignedRange) {
     EXPECT_EQ(cols[4].type, bolt::BoltType::Int32) << "u8_c";
     EXPECT_EQ(cols[5].type, bolt::BoltType::Int32) << "u16_c";
     EXPECT_EQ(cols[6].type, bolt::BoltType::Int32) << "i32_c";
-    EXPECT_EQ(cols[7].type, bolt::BoltType::Int64) << "u64_c";
+    EXPECT_EQ(cols[7].type, bolt::BoltType::UInt64) << "u64_c";   // G2CHK-947
     ASSERT_EQ(cols[0].type_size_bytes, 8u);
     ASSERT_EQ(cols[1].type_size_bytes, 8u);
     ASSERT_EQ(cols[2].type_size_bytes, 8u);
