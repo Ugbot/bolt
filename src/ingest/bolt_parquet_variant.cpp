@@ -492,23 +492,47 @@ bool pq_variant_group_shredded(const PqSchemaTree* tree, int32_t f) noexcept {
     return pq_variant_group_ok(tree, f) && child_named(tree, f, "typed_value", &pos) >= 0;
 }
 
+bool pq_variant_in_field(const PqSchemaTree* tree, uint32_t top_field, bool force_top) noexcept {
+    if (tree == nullptr || top_field >= tree->n_top) return false;
+    const int32_t f = tree->top[top_field];
+    return (force_top && pq_variant_group_ok(tree, f)) || has_variant_group(tree, f, 0u);
+}
+
+bool pq_variant_read_meta(const PqMeta* meta, const PqSchemaTree* tree, uint32_t top_field, bool force_top, Arena* arena,
+                          PqMeta* out) noexcept {
+    if (meta == nullptr || tree == nullptr || arena == nullptr || out == nullptr || top_field >= tree->n_top) return false;
+    const int32_t f = tree->top[top_field];
+    if (force_top && !pq_variant_group_ok(tree, f)) return false;
+    if (!raw_time_meta(meta, tree, f, arena, out)) return false;
+    if (!force_top) return true;
+    // The top-level group is taken by its shape alone (a writer may leave the VARIANT annotation off it).
+    for (uint32_t c = tree->fields[f].col_begin; c < tree->fields[f].col_end; ++c) {   // bounded: the group's leaves
+        if (out->columns[c].time_unit == 1) return false;
+        if (out->columns[c].time_unit == 3) out->columns[c].time_unit = 0;
+    }
+    return true;
+}
+
+bool pq_variant_fold(const PqSchemaTree* tree, const PqMeta* meta, uint32_t top_field, bool force_top, BoltColumn* col,
+                     Arena* arena) noexcept {
+    if (tree == nullptr || meta == nullptr || col == nullptr || arena == nullptr || top_field >= tree->n_top) return false;
+    const int32_t f = tree->top[top_field];
+    if (force_top) return pq_variant_group_ok(tree, f) && unshred_group(tree, meta, f, *col, arena, col);
+    return unshred_tree(tree, meta, f, col, arena, 0u);
+}
+
 bool parquet_read_variant_column(const uint8_t* buf, uint64_t len, const PqMeta* meta, const PqSchemaTree* tree,
                                  uint32_t row_group, uint32_t top_field, Arena* arena, BoltColumn* out,
                                  int64_t* out_rows) noexcept {
     if (buf == nullptr || meta == nullptr || tree == nullptr || arena == nullptr || out == nullptr || out_rows == nullptr) return false;
     if (top_field >= tree->n_top || !pq_variant_group_ok(tree, tree->top[top_field])) return false;
-    const int32_t gf = tree->top[top_field];
     PqMeta raw{};
     BoltColumn gc;
     int64_t rows = 0;
-    // The top-level group is taken by its shape alone (a writer may leave the VARIANT annotation off it).
-    if (!raw_time_meta(meta, tree, gf, arena, &raw)) return false;
-    for (uint32_t c = tree->fields[gf].col_begin; c < tree->fields[gf].col_end; ++c) {   // bounded: the group's leaves
-        if (raw.columns[c].time_unit == 1) return false;
-        if (raw.columns[c].time_unit == 3) raw.columns[c].time_unit = 0;
-    }
+    if (!pq_variant_read_meta(meta, tree, top_field, true, arena, &raw)) return false;
     if (!parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, &gc, &rows)) return false;
-    if (!unshred_group(tree, meta, gf, gc, arena, out)) return false;
+    if (!pq_variant_fold(tree, meta, top_field, true, &gc, arena)) return false;
+    *out = gc;
     *out_rows = rows;
     return true;
 }

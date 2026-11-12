@@ -36,6 +36,16 @@ bool pq_variant_group_ok(const PqSchemaTree* tree, int32_t f) noexcept;
 // Is that group shredded (has a typed_value child)?
 bool pq_variant_group_shredded(const PqSchemaTree* tree, int32_t f) noexcept;
 
+// A reader that assembles fields itself (a ranged source, a scan) folds VARIANT groups in two steps: read top field `top_field` with
+// the footer pq_variant_read_meta writes to `out` (NANOS leaves under a variant group left raw), then pq_variant_fold the assembled
+// column with the ORIGINAL footer. `force_top` takes the top-level field as a VARIANT group by its shape alone (a table schema says
+// it is a variant); otherwise only VARIANT-annotated groups inside the field are folded. pq_variant_in_field: is there one to fold?
+bool pq_variant_in_field(const PqSchemaTree* tree, uint32_t top_field, bool force_top) noexcept;
+bool pq_variant_read_meta(const PqMeta* meta, const PqSchemaTree* tree, uint32_t top_field, bool force_top, Arena* arena,
+                          PqMeta* out) noexcept;
+bool pq_variant_fold(const PqSchemaTree* tree, const PqMeta* meta, uint32_t top_field, bool force_top, BoltColumn* col,
+                     Arena* arena) noexcept;
+
 // Top-level field `top_field` of `row_group` as BoltColumn::make_variant({metadata, value}) with the group's nullability,
 // typed_value folded back into `value`. False on a shape outside the spec, a typed_value type the variant encoding has no
 // primitive for, a residual value that is not an object beside an object typed_value, a key absent from the row's

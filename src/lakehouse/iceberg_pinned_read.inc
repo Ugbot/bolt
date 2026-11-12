@@ -591,6 +591,7 @@ bool pinned_nested_shape(const SchemaField& field,const pq::PqSchemaTree& tree,
     assert(tree.fields);assert(depth<=kIcebergSchemaMaxDepth+1u);
     if(depth>kIcebergSchemaMaxDepth || index<0 || static_cast<uint32_t>(index)>=tree.n_fields)return false;
     const auto& physical=tree.fields[index];
+    if(!std::strcmp(field.type,"variant"))return pq::pq_variant_group_ok(&tree,index);
     if(physical.kind==pq::PqFieldKind::Leaf)return field.n_children==0;
     int32_t parent=index;
     if(physical.kind==pq::PqFieldKind::Map) {

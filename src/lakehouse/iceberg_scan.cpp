@@ -59,6 +59,7 @@
 #include "bolt/kernels/bolt_nested_gather.h"
 #include "bolt/ingest/bolt_parquet_meta.h"
 #include "bolt/ingest/bolt_parquet_nested.h"
+#include "bolt/ingest/bolt_parquet_variant.h"
 #include "bolt/ingest/bolt_parquet_read.h"
 #include "bolt/ingest/bolt_parquet_source.h"
 #include "bolt/lakehouse/iceberg/delete_file.h"

@@ -56,18 +56,19 @@ inline void put_escaped(jsonspark::Out* o, const uint8_t* s, uint32_t n) noexcep
 
 // unscaled (two's complement, `n` bytes) at `scale`, stripTrailingZeros().toPlainString().
 inline void put_decimal(jsonspark::Out* o, const uint8_t* p, uint32_t n, uint32_t scale) noexcept {
-    unsigned __int128 u = 0;
-    for (uint32_t i = 0; i < n; ++i) u |= static_cast<unsigned __int128>(p[i]) << (8u * i);
-    const bool neg = (p[n - 1] & 0x80u) != 0;
-    if (neg) {
-        if (n < 16) u |= ~static_cast<unsigned __int128>(0) << (8u * n);   // sign-extend
-        u = ~u + 1u;
+    bool neg = false;
+    u128::U128 u = u128::from_le_signed(p, n, &neg);
+    uint64_t rem = 0;
+    while (scale > 0 && !u128::is_zero(u)) {
+        const u128::U128 q = u128::div_small(u, 10u, &rem);
+        if (rem != 0) break;
+        u = q;
+        --scale;
     }
-    while (scale > 0 && u != 0 && u % 10u == 0) { u /= 10u; --scale; }
-    if (u == 0) scale = 0;
+    if (u128::is_zero(u)) scale = 0;
     char dig[48];
     uint32_t nd = 0;
-    do { dig[nd++] = static_cast<char>('0' + static_cast<int>(u % 10u)); u /= 10u; } while (u != 0 && nd < 40);
+    do { u = u128::div_small(u, 10u, &rem); dig[nd++] = static_cast<char>('0' + static_cast<int>(rem)); } while (!u128::is_zero(u) && nd < 40);
     if (neg) o->put('-');
     if (scale >= nd) {
         o->put("0.", 2);
