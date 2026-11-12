@@ -115,6 +115,17 @@ inline bool value(detail::Enc* e, const jsonspark::Tree& c, uint32_t ni, nrv::Sp
     if (depth > nrv::kMaxDepth + 1u) { e->st = Status::Malformed; return false; }
     const nrv::TypeNode& nd = c.t.nodes[ni];
     if (jsonspark::tojd::is_null(nd, v)) return null_value(e, id);
+    if (nd.type == BoltType::Struct && nd.logical == BoltLogical::Variant) {   // an embedded variant (G2CHK-984)
+        nrv::Span ms{}, vs{};
+        nrv::LeafView ml{}, vl{};
+        if (nd.n_children != 2 || nrv::struct_field(c.t, ni, v, 0, &ms) != 1 || nrv::struct_field(c.t, ni, v, 1, &vs) != 1 ||
+            !nrv::leaf_view(c.t, nd.first_child, ms, &ml) || !nrv::leaf_view(c.t, nd.first_child + 1u, vs, &vl) ||
+            ml.is_null || vl.is_null) {
+            e->st = Status::Malformed;
+            return false;
+        }
+        return detail::append_variant(e, ml.bytes, ml.len, vl.bytes, vl.len, id, 0);
+    }
     if (nd.type == BoltType::Struct || nd.type == BoltType::List || nd.type == BoltType::Map) {
         const bool obj = nd.type != BoltType::List;
         if (!detail::open_container(e, obj, id)) return false;

@@ -440,10 +440,14 @@ inline int schema_of_json(const uint8_t* json, uint32_t len, InferPool* pool, Ou
 
 // ---- to_json ----------------------------------------------------------------------------------------------------------
 
+// Renders one variant {metadata, value} as JSON (variantspark::nested_variant_json): 1 ok, -1 budget, -2 unsupported.
+using VariantJsonFn = int (*)(const uint8_t* metadata, uint32_t mn, const uint8_t* value, uint32_t vn, Out* o, tz::ZoneId zone);
+
 struct Tree {
     nrv::TreeView     t;
     const NodeMeta*   meta;     // per node (BNT1 names / decimal precision)
     bolt::tz::ZoneId  tz;       // session time zone (TIMESTAMP rendering)
+    VariantJsonFn     variant_json = nullptr;   // a Variant-annotated {metadata, value} node; null refuses it (-2)
 };
 
 namespace tojd {
@@ -677,10 +681,23 @@ inline int put_map(const Tree& c, uint32_t ni, nrv::Span v, Out* o, uint32_t dep
     return 1;
 }
 
+// A Variant-annotated {metadata, value} struct node (G2CHK-984): the variant's own JSON.
+inline int put_variant(const Tree& c, uint32_t ni, nrv::Span v, Out* o) noexcept {
+    const nrv::TypeNode& nd = c.t.nodes[ni];
+    if (c.variant_json == nullptr || nd.n_children != 2) return -2;
+    nrv::Span ms{}, vs{};
+    nrv::LeafView ml{}, vl{};
+    if (nrv::struct_field(c.t, ni, v, 0, &ms) != 1 || nrv::struct_field(c.t, ni, v, 1, &vs) != 1 ||
+        !nrv::leaf_view(c.t, nd.first_child, ms, &ml) || !nrv::leaf_view(c.t, nd.first_child + 1u, vs, &vl) ||
+        ml.is_null || vl.is_null) return -2;
+    return c.variant_json(ml.bytes, ml.len, vl.bytes, vl.len, o, c.tz);
+}
+
 inline int value(const Tree& c, uint32_t ni, nrv::Span v, Out* o, uint32_t depth) noexcept {
     assert(ni < c.t.n);
     if (depth > nrv::kMaxDepth + 1u) return -2;
     const nrv::TypeNode& nd = c.t.nodes[ni];
+    if (nd.type == BoltType::Struct && nd.logical == BoltLogical::Variant) return put_variant(c, ni, v, o);
     if (nd.type == BoltType::Struct) return put_struct(c, ni, v, o, depth);
     if (nd.type == BoltType::List) return put_list(c, ni, v, o, depth);
     if (nd.type == BoltType::Map) return put_map(c, ni, v, o, depth);

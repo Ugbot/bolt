@@ -2,6 +2,7 @@
 // (tests/data/spark_variant_vectors.tsv: value and metadata bytes from parse_json, text from to_json).
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -291,4 +292,56 @@ TEST(BoltVariantSpark, PortableU128) {
     const u::U128 n = u::negate(u::U128{0, 1});
     EXPECT_EQ(n.hi, ~0ull);
     EXPECT_EQ(n.lo, ~0ull);
+}
+
+// G2CHK-984: variants embedded in an outer container (VariantBuilder.appendVariant) are re-keyed into the outer dictionary
+// in each object's (sorted) field order. Expected bytes: Spark 4.0.4
+// to_variant_object(array(parse_json('{"b":1,"a":2}'), parse_json('{"c":3,"a":4}'))). A malformed embedded value refuses.
+namespace {
+bool embed_all(const std::string* val, const std::string* meta, int n, Bufs* b, vs::Encoded* out, vs::Workspace* w) {
+    std::fill(b->table.begin(), b->table.end(), 0u);   // a fresh dictionary, as to_variant_object starts
+    *w = b->ws();
+    *out = vs::Encoded{b->value.data(), static_cast<uint32_t>(b->value.size()), 0, b->meta.data(), static_cast<uint32_t>(b->meta.size()), 0};
+    vs::detail::Enc enc{w, out, 0, 0, 0, 0, vs::Status::Ok};
+    if (!vs::detail::open_container(&enc, false, 0)) return false;
+    for (int i = 0; i < n; ++i) {
+        if (!vs::detail::append_variant(&enc, reinterpret_cast<const uint8_t*>(meta[i].data()), static_cast<uint32_t>(meta[i].size()),
+                                        reinterpret_cast<const uint8_t*>(val[i].data()), static_cast<uint32_t>(val[i].size()), 0, 0))
+            return false;
+    }
+    return vs::detail::finish_container(&enc) && vs::detail::write_metadata(&enc);
+}
+void encode_parts(const std::string* parts, int n, std::string* val, std::string* meta) {
+    for (int i = 0; i < n; ++i) {
+        Bufs b;
+        vs::Encoded e{};
+        ASSERT_EQ(parse(&b, parts[i], &e), vs::Status::Ok);
+        val[i].assign(reinterpret_cast<const char*>(e.value), e.value_n);
+        meta[i].assign(reinterpret_cast<const char*>(e.metadata), e.metadata_n);
+    }
+}
+}  // namespace
+
+TEST(BoltVariantSpark, AppendVariantRekeysIntoOuterDictionary) {
+    const std::string parts[2] = {"{\"b\":1,\"a\":2}", "{\"c\":3,\"a\":4}"};
+    std::string val[2], meta[2];
+    encode_parts(parts, 2, val, meta);
+    Bufs b;
+    vs::Workspace w{};
+    vs::Encoded out{};
+    ASSERT_TRUE(embed_all(val, meta, 2, &b, &out, &w));
+    EXPECT_EQ(hex(out.value, out.value_n), "0302000b16020200010002040c020c01020200020002040c040c03");
+    EXPECT_EQ(hex(out.metadata, out.metadata_n), "010300010203616263");
+
+    const std::string deep[2] = {"[1,\"s\",null,1.5,true]", "{\"c\":3,\"a\":{\"z\":[1,{\"y\":\"long string past sixty-four bytes, so a long-string header is used here\"}]}}"};
+    encode_parts(deep, 2, val, meta);
+    ASSERT_TRUE(embed_all(val, meta, 2, &b, &out, &w));
+    std::vector<char> text(1 << 12);
+    js::Out o{text.data(), static_cast<uint32_t>(text.size()), 0, false};
+    ASSERT_EQ(vs::to_json(out.value, out.value_n, out.metadata, out.metadata_n, &o), vs::JsonStatus::Ok);
+    EXPECT_EQ(std::string(text.data(), o.n), "[[1,\"s\",null,1.5,true],{\"a\":{\"z\":[1,{\"y\":\"long string past sixty-four bytes, "
+                                             "so a long-string header is used here\"}]},\"c\":3}]");
+
+    val[1].pop_back();
+    EXPECT_FALSE(embed_all(val, meta, 2, &b, &out, &w));
 }

@@ -292,6 +292,14 @@ inline JsonStatus to_json(const uint8_t* value, uint32_t vn, const uint8_t* meta
     return s;
 }
 
+// jsonspark::Tree::variant_json: a variant nested in a struct / array / map rendered by to_json (G2CHK-984).
+inline int nested_variant_json(const uint8_t* metadata, uint32_t mn, const uint8_t* value, uint32_t vn, jsonspark::Out* o,
+                               tz::ZoneId zone) noexcept {
+    const JsonStatus s = to_json(value, vn, metadata, mn, o, zone);
+    // A measuring pass (cap 0) runs past its buffer by design: the caller sizes the output from o->n.
+    return s == JsonStatus::Ok || (s == JsonStatus::Budget && o->over) ? 1 : -2;
+}
+
 }  // namespace variantspark
 }  // namespace kernels
 }  // namespace bolt
