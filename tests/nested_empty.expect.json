@@ -1,0 +1,1 @@
+{"file":"nested_empty.parquet","row_groups":1,"sort_leaf":-1,"rows":[],"field_ids":{"m":40,"m.key":41,"m.value":42,"m.value.p":43,"m.value.q":44,"m.value.q.element":45},"leaves":[{"path":"m.key_value.key","max_def":2,"max_rep":1},{"path":"m.key_value.value.p","max_def":4,"max_rep":1},{"path":"m.key_value.value.q.list.element","max_def":5,"max_rep":2}]}
