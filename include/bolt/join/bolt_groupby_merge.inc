@@ -40,7 +40,7 @@ inline bool gb_merge_keys_equal(const GroupbyTypedState* dst, uint32_t dgid,
     const GbCell16* drow = dst->keys_flat + static_cast<size_t>(dgid) * n_keys;
     const GbCell16* srow = src->keys_flat + static_cast<size_t>(sgid) * n_keys;
     for (uint32_t k = 0; k < n_keys; ++k) {
-        if (dst->key_types[k] == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(dst->key_types[k])) {
             StringView dsv, ssv;
             std::memcpy(&dsv, &drow[k], 16);
             std::memcpy(&ssv, &srow[k], 16);
@@ -76,7 +76,7 @@ inline bool gb_merge_insert_group(GroupbyTypedState* dst,
     const GbCell16* srow = src->keys_flat + static_cast<size_t>(sgid) * n_keys;
     for (uint32_t k = 0; k < n_keys; ++k) {
         drow[k] = srow[k];
-        if (dst->key_types[k] == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(dst->key_types[k])) {
             StringView* sv = reinterpret_cast<StringView*>(&drow[k]);
             if (gb_detail::gb_sv_key_spilled(*sv)) {
                 const char* sb = kernels::utf8::sv_bytes(*sv,
@@ -124,7 +124,7 @@ inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
             // The src cell holds a partial COUNT — add the count itself
             // (apply() would add 1 per call, which is per-ROW semantics).
             dst->accums[doff].a += src->accums[soff].a;
-        } else if (dst->agg_in_types[j] == BoltType::Utf8 &&
+        } else if (::bolt::gb_detail::gb_bytes(dst->agg_in_types[j]) &&
                    (k == AggKind::Min || k == AggKind::Max)) {
             // G2FEAT-283: src's cell (if spilled) is owned by SRC's OWN
             // agg_str_buf — resolve it there (never a transient producing
@@ -134,9 +134,10 @@ inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
             std::memcpy(&ssv, &src->accums[soff], sizeof(ssv));
             const char* cand_base =
                 (ssv.length > 12u) ? src->agg_str_buf[j] : nullptr;
+            // An empty src partial holds only the identity; skip it (G2CHK-944).
             if (!gb_agg_utf8_minmax(dst, j, k, &dst->accums[doff],
-                                    src->accums[soff], /*valid=*/true,
-                                    cand_base)) {
+                                    src->accums[soff], src->counts[soff] > 0,
+                                    cand_base, dst->counts[doff] == 0)) {
                 return false;   // dst->oom already set
             }
         } else {
