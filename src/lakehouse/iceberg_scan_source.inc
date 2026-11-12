@@ -210,10 +210,13 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
             const bool force = top_is_variant(s, top);
             const bool variant = pq::pq_variant_in_field(&file->tree, top, force);
             const pq::PqMeta* read_meta = meta;
-            pq::PqMeta raw{};
             if (variant) {
-                if (!pq::pq_variant_read_meta(meta, &file->tree, top, force, s->scratch, &raw)) return false;
-                read_meta = &raw;
+                // PqMeta is ~500 KB (inline row-group array): never a stack local,
+                // or a reader on a worker thread overflows its stack.
+                auto* raw = s->scratch->allocate_array<pq::PqMeta>(1);
+                if (raw == nullptr) return false;
+                if (!pq::pq_variant_read_meta(meta, &file->tree, top, force, s->scratch, raw)) return false;
+                read_meta = raw;
             }
             const bool ok = s->ranged
                 ? pq::parquet_read_nested_column_source(&file->source, &s->source_workspace,
