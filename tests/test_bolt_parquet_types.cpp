@@ -155,7 +155,7 @@ TEST(BoltParquetTypes, NonDecimalFlbaAcceptedAsFixedSizeBinary) {
     // Over one storage slot (G2ICE-291, an Iceberg fixed[L]): a byte-string lane, one L-byte value per row.
     PqColumn wide = mk(PqType::FixedLenByteArray, PqLogical::None, 0, 0, 1, 0, 0, 17);
     ASSERT_TRUE(parquet_map_type(&wide, &t, &s));
-    EXPECT_EQ(t, bolt::BoltType::Utf8);
+    EXPECT_EQ(t, bolt::BoltType::Binary);   // G2CHK-948: opaque bytes, not text
 }
 
 // End-to-end: writer emits INT64 + ConvertedType TIMESTAMP_MICROS; the reader
@@ -227,3 +227,16 @@ TEST(BoltParquetTypes, TimestampWriteReadRoundtrip) {
 }
 
 }  // namespace
+
+// G2CHK-948: BYTE_ARRAY is text only when annotated (STRING / ENUM / JSON or
+// the legacy UTF8 ConvertedType); unannotated and BSON bytes are Binary.
+TEST(BoltParquetTypes, ByteArrayIsTextOnlyWhenAnnotated) {
+    EXPECT_EQ(map_ok(mk(PqType::ByteArray, PqLogical::None, 0, 0, 0, 0, 0, 0)), bolt::BoltType::Binary);
+    EXPECT_EQ(map_ok(mk(PqType::ByteArray, PqLogical::Bson, 0, 0, 0, 0, 0, 0)), bolt::BoltType::Binary);
+    EXPECT_EQ(map_ok(mk(PqType::ByteArray, PqLogical::String, 0, 0, 0, 0, 0, 0)), bolt::BoltType::Utf8);
+    EXPECT_EQ(map_ok(mk(PqType::ByteArray, PqLogical::Enum, 0, 0, 0, 0, 0, 0)), bolt::BoltType::Utf8);
+    EXPECT_EQ(map_ok(mk(PqType::ByteArray, PqLogical::Json, 0, 0, 0, 0, 0, 0)), bolt::BoltType::Utf8);
+    PqColumn legacy = mk(PqType::ByteArray, PqLogical::None, 0, 0, 0, 0, 0, 0);
+    legacy.converted = 0;   // ConvertedType UTF8
+    EXPECT_EQ(map_ok(legacy), bolt::BoltType::Utf8);
+}
