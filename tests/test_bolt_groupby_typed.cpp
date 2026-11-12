@@ -1463,6 +1463,30 @@ TEST(BoltDecimalDivG2chk977, AvgPast38DigitsOverflows) {
     EXPECT_TRUE(dec::d128_add_wrapped(r, pow10_times(9, 37), &r));
 }
 
+TEST(BoltDecimalDivG2chk977, ExactAddSubMul) {
+    dec::Decimal128 r{};
+    ASSERT_EQ(dec::d128_addsub_exact(dec::d128_from_i64(125), 2, dec::d128_from_i64(-3), 0, false, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, -175);   // 1.25 + -3 = -1.75
+    ASSERT_EQ(dec::d128_addsub_exact(dec::d128_from_i64(125), 2, dec::d128_from_i64(-3), 0, true, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, 425);
+    EXPECT_EQ(dec::d128_addsub_exact(pow10_times(6, 37), 0, pow10_times(6, 37), 0, false, &r),
+              dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_addsub_exact(pow10_times(6, 37), 0, pow10_times(6, 37), 0, true, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, 0);
+    // 10^20 at scale 0 aligned to scale 18 is 10^38.
+    EXPECT_EQ(dec::d128_addsub_exact(dec::d128_pow10(20), 0, dec::d128_from_i64(0), 18, false, &r),
+              dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_mul_exact(dec::d128_from_i64(-12), pow10_times(3, 30), &r), dec::DivStatus::Ok);
+    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-36, 30)), 0);
+    EXPECT_EQ(dec::d128_mul_exact(dec::d128_pow10(19), dec::d128_pow10(19), &r), dec::DivStatus::Overflow);
+    EXPECT_EQ(dec::d128_mul_exact(pow10_times(9, 37), pow10_times(9, 37), &r), dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_mul_exact(pow10_times(9, 18), pow10_times(-11, 18), &r), dec::DivStatus::Ok);
+    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-99, 36)), 0);
+}
+
 // Group 0: 6e37 + 6e37 = 1.2e38 (past 38 digits, inside 128 bits).
 // Group 1: 1 + 2 (fine). Rows interleave so every ingest path sees both.
 struct Fixture {

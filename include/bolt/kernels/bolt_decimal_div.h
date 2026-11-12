@@ -177,6 +177,67 @@ inline bool d128_within_38_digits(Decimal128 v) noexcept {
     return m.hi >= 0 && d128_cmp(m, d128_pow10(38)) < 0;
 }
 
+// a ± b at scale max(sa, sb), exact; Overflow past 38 digits.
+inline DivStatus d128_addsub_exact(Decimal128 a, int sa, Decimal128 b, int sb, bool sub,
+                                   Decimal128* out) noexcept {
+    using namespace div_detail;
+    assert(out != nullptr);
+    assert(sa >= 0 && sb >= 0 && sa <= 38 && sb <= 38);
+    const int t = sa > sb ? sa : sb;
+    const bool na = a.hi < 0, nb = (b.hi < 0) != sub;
+    U256 x = u256_from(abs128(a));
+    U256 y = u256_from(abs128(b));
+    if (!u256_mul_pow10(&x, t - sa) || !u256_mul_pow10(&y, t - sb)) return DivStatus::Overflow;
+    U256 r{};
+    bool neg = na;
+    if (na == nb) {
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t s1 = x.w[i] + y.w[i];
+            const uint64_t s2 = s1 + carry;
+            carry = (s1 < x.w[i] ? 1u : 0u) + (s2 < s1 ? 1u : 0u);
+            r.w[i] = s2;
+        }
+        if (carry != 0) return DivStatus::Overflow;
+    } else if (u256_cmp(x, y) >= 0) {
+        r = x; u256_sub(&r, y);
+    } else {
+        r = y; u256_sub(&r, x); neg = nb;
+    }
+    Decimal128 v{};
+    if (!to_d128(r, neg, &v) || !d128_within_38_digits(v)) return DivStatus::Overflow;
+    *out = v;
+    return DivStatus::Ok;
+}
+
+// a * b at scale sa + sb, exact; Overflow past 38 digits.
+inline DivStatus d128_mul_exact(Decimal128 a, Decimal128 b, Decimal128* out) noexcept {
+    using namespace div_detail;
+    assert(out != nullptr);
+    const U256 x = u256_from(abs128(a)), y = u256_from(abs128(b));
+    U256 r{};
+    for (int i = 0; i < 2; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 2; ++j) {
+            uint64_t lo = 0, hi = 0;
+            mul_u64_u64(x.w[i], y.w[j], &lo, &hi);
+            const uint64_t s1 = r.w[i + j] + lo;
+            hi += s1 < lo ? 1u : 0u;
+            const uint64_t s2 = s1 + carry;
+            hi += s2 < s1 ? 1u : 0u;
+            r.w[i + j] = s2;
+            carry = hi;
+        }
+        r.w[i + 2] += carry;
+    }
+    Decimal128 v{};
+    if (!to_d128(r, (a.hi < 0) != (b.hi < 0), &v) || !d128_within_38_digits(v))
+        return DivStatus::Overflow;
+    *out = v;
+    return DivStatus::Ok;
+}
+
+
 // a + b in two's complement; true when the signed 128-bit word wrapped.
 BOLT_FORCE_INLINE bool d128_add_wrapped(Decimal128 a, Decimal128 b, Decimal128* out) noexcept {
     const uint64_t lo = static_cast<uint64_t>(a.lo) + static_cast<uint64_t>(b.lo);
