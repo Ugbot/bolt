@@ -268,3 +268,27 @@ TEST(BoltVariantSpark, NarrowestWidthsMatchSpark) {
     EXPECT_EQ(vs::decimal_value_digits(-1, ~0ull), 1u);            // -1
     EXPECT_EQ(vs::decimal_value_digits(0, 0), 1u);
 }
+
+// Portable 128-bit helpers behind the variant decimal paths (MSVC has no __int128).
+TEST(BoltVariantSpark, PortableU128) {
+    namespace u = bolt::kernels::u128;
+    u::U128 x{};
+    for (const char c : std::string("99999999999999999999999999999999999999")) ASSERT_TRUE(u::mul10_add(&x, static_cast<uint32_t>(c - '0')));
+    EXPECT_EQ(x.hi, 0x4B3B4CA85A86C47Aull);                          // 10^38 - 1
+    EXPECT_EQ(x.lo, 0x098A223FFFFFFFFFull);
+    u::U128 big{~0ull, ~0ull};
+    EXPECT_FALSE(u::mul10_add(&big, 0));
+    const uint8_t minus_two[3] = {0xFE, 0xFF, 0xFF};
+    bool neg = false;
+    const u::U128 m = u::from_le_signed(minus_two, 3, &neg);
+    EXPECT_TRUE(neg);
+    EXPECT_EQ(m.hi, 0u);
+    EXPECT_EQ(m.lo, 2u);
+    uint64_t rem = 0;
+    const u::U128 q = u::div_small(x, 10u, &rem);
+    EXPECT_EQ(rem, 9u);
+    EXPECT_FALSE(u::is_zero(q));
+    const u::U128 n = u::negate(u::U128{0, 1});
+    EXPECT_EQ(n.hi, ~0ull);
+    EXPECT_EQ(n.lo, ~0ull);
+}

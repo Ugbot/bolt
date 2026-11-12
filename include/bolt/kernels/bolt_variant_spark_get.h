@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "bolt/kernels/bolt_decimal.h"
+#include "bolt/kernels/bolt_u128.h"
 
 namespace bolt {
 namespace kernels {
@@ -212,13 +213,13 @@ inline CastStatus to_long(const uint8_t* v, uint32_t n, int64_t* out) noexcept {
         case kDecimal4: case kDecimal8: case kDecimal16: {
             const uint32_t k = h == kDecimal4 ? 4u : h == kDecimal8 ? 8u : 16u;
             if (n < 2u + k) return CastStatus::Malformed;
-            unsigned __int128 u = 0;
-            for (uint32_t i = 0; i < k; ++i) u |= static_cast<unsigned __int128>(v[2 + i]) << (8u * i);
-            if (k < 16 && (v[1 + k] & 0x80u) != 0) u |= ~static_cast<unsigned __int128>(0) << (8u * k);
-            __int128 x = static_cast<__int128>(u);
-            for (uint32_t sc = 0; sc < v[1]; ++sc) x /= 10;              // truncate toward zero
-            if (x > INT64_MAX || x < INT64_MIN) return CastStatus::Invalid;
-            *out = static_cast<int64_t>(x);
+            bool neg = false;
+            u128::U128 x = u128::from_le_signed(v + 2, k, &neg);           // the magnitude: truncation toward zero
+            uint64_t rem = 0;
+            for (uint32_t sc = 0; sc < v[1] && !u128::is_zero(x); ++sc) x = u128::div_small(x, 10u, &rem);
+            const uint64_t lim = neg ? (uint64_t{1} << 63) : static_cast<uint64_t>(INT64_MAX);
+            if (x.hi != 0 || x.lo > lim) return CastStatus::Invalid;
+            *out = neg ? static_cast<int64_t>(0u - x.lo) : static_cast<int64_t>(x.lo);
             return CastStatus::Ok;
         }
         default: return CastStatus::Invalid;

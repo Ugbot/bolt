@@ -25,6 +25,7 @@
 
 #include "bolt/bolt_hash.h"
 #include "bolt/kernels/bolt_json_spark.h"
+#include "bolt/kernels/bolt_u128.h"
 
 namespace bolt {
 namespace kernels {
@@ -163,7 +164,7 @@ inline bool parse_decimal(const char* t, uint32_t len, bool* neg, uint64_t* hi, 
     uint32_t i = 0;
     *neg = t[0] == '-';
     if (*neg) ++i;
-    unsigned __int128 u = 0;
+    u128::U128 u{};
     uint32_t digits = 0, frac = 0;
     bool dot = false, lead = true;
     for (; i < len; ++i) {
@@ -174,27 +175,27 @@ inline bool parse_decimal(const char* t, uint32_t len, bool* neg, uint64_t* hi, 
         if (lead && c == '0') continue;
         lead = false;
         if (++digits > 38) return false;
-        u = u * 10u + static_cast<unsigned>(c - '0');
+        if (!u128::mul10_add(&u, static_cast<uint32_t>(c - '0'))) return false;
     }
     *scale = frac;
     *prec = digits == 0 ? 1u : digits;
     if (*scale > 38) return false;
-    *hi = static_cast<uint64_t>(u >> 64);
-    *lo = static_cast<uint64_t>(u);
+    *hi = u.hi;
+    *lo = u.lo;
     return true;
 }
 
 inline bool append_decimal(Enc* e, bool neg, uint64_t hi, uint64_t lo, uint32_t scale, uint32_t prec) noexcept {
-    unsigned __int128 u = (static_cast<unsigned __int128>(hi) << 64) | lo;
-    if (neg) u = ~u + 1u;                                            // two's complement of the unscaled value
+    u128::U128 u{hi, lo};
+    if (neg) u = u128::negate(u);                                    // two's complement of the unscaled value
     uint8_t b[18];
     uint32_t n = 16;
     if (scale <= 9 && prec <= 9) { b[0] = prim(kDecimal4); n = 4; }
     else if (scale <= 18 && prec <= 18) { b[0] = prim(kDecimal8); n = 8; }
     else { b[0] = prim(kDecimal16); n = 16; }
     b[1] = static_cast<uint8_t>(scale);
-    put_le(b + 2, static_cast<uint64_t>(u), n < 8 ? n : 8);
-    if (n == 16) put_le(b + 10, static_cast<uint64_t>(u >> 64), 8);
+    put_le(b + 2, u.lo, n < 8 ? n : 8);
+    if (n == 16) put_le(b + 10, u.hi, 8);
     return put_bytes(e, b, n + 2);
 }
 
