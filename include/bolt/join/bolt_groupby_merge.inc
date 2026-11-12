@@ -182,6 +182,7 @@ inline bool groupby_agg_multi_key_typed_merge_class(
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
     dst->dec_sum_wrapped |= src->dec_sum_wrapped;
+    dst->dec_bound_units = gb_dec_bound_add(dst->dec_bound_units, src->dec_bound_units);
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
 #ifndef NDEBUG
@@ -249,6 +250,7 @@ inline bool groupby_agg_multi_key_typed_merge_list(
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
     dst->dec_sum_wrapped |= src->dec_sum_wrapped;
+    dst->dec_bound_units = gb_dec_bound_add(dst->dec_bound_units, src->dec_bound_units);
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     for (uint32_t i = 0; i < n; ++i) {
@@ -312,6 +314,7 @@ inline bool groupby_typed_merge_dense_range(
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
     dst->dec_sum_wrapped |= src->dec_sum_wrapped;
+    dst->dec_bound_units = gb_dec_bound_add(dst->dec_bound_units, src->dec_bound_units);
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     const int64_t src_lo = src->dense_min;
