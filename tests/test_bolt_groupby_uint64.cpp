@@ -86,6 +86,25 @@ TEST(BoltGroupbyNarrow, KeysReadAtTheirOwnWidth) {
     constexpr int8_t i8[4]={-128,1,-128,1}; check_narrow_keys(BoltType::Int8,i8);
     constexpr int16_t i16[4]={-32768,1,-32768,1}; check_narrow_keys(BoltType::Int16,i16);
 }
+TEST(BoltGroupbyNarrow, Float32KeysKeepTheirValueAndWidth) {
+    // G2CHK-945: read_cell16 promotes a Float32 key to double bits; storing
+    // those 8 bytes into the 4-byte key column wrote garbage past each row.
+    Arena arena; float data[6]={-28.125f,1.5f,-28.125f,3.0f,1.5f,-28.125f};
+    auto key=BoltColumn::make_flat(data,nullptr,6,BoltType::Float32);
+    AggSpec spec{}; spec.kind=AggKind::CountStar; BoltColumn out[1]{},counts[1]{}; uint32_t n=0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key,1,nullptr,0,&spec,1,6,out,counts,&n,&arena,6));
+    ASSERT_EQ(n,3u); ASSERT_EQ(out[0].type,BoltType::Float32); ASSERT_EQ(out[0].type_size_bytes,4);
+    int64_t seen=0;
+    for(uint32_t i=0;i<n;++i) {
+        const float k=static_cast<const float*>(out[0].data)[i];
+        const int64_t c=static_cast<const int64_t*>(counts[0].data)[i];
+        if(k==-28.125f) { EXPECT_EQ(c,3); seen|=1; }
+        else if(k==1.5f) { EXPECT_EQ(c,2); seen|=2; }
+        else if(k==3.0f) { EXPECT_EQ(c,1); seen|=4; }
+        else ADD_FAILURE()<<"unexpected key "<<k;
+    }
+    EXPECT_EQ(seen,7);
+}
 TEST(BoltGroupbyNarrow, PayloadWidensExactly) {
     Arena arena; int64_t keys[3]={1,1,1}; uint32_t values[3]={UINT32_MAX,UINT32_MAX,0};
     auto key=BoltColumn::make_flat(keys,nullptr,3,BoltType::Int64);
