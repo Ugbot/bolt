@@ -302,13 +302,14 @@ TEST(BoltParquetFlbaLogical, WrongWidthIntervalIsRefused) {
     EXPECT_FALSE(parquet_map_type(&c, &t, &scale));
 }
 
-// G2ICE-291: a raw FLBA wider than one slot (an Iceberg fixed[L], L > 16) reads as a byte-string lane, like a BYTE_ARRAY.
-TEST(BoltParquetFlbaLogical, RawFlbaOverSixteenBytesReadsAsByteStrings) {
+// G2ICE-291: a raw FLBA wider than one slot (an Iceberg fixed[L], L > 16) reads as a byte-string lane.
+// G2CHK-948: that lane is Binary, as an unannotated BYTE_ARRAY is; the bytes are not text.
+TEST(BoltParquetFlbaLogical, RawFlbaOverSixteenBytesReadsAsBinary) {
     PqColumn c = make_col(PqType::FixedLenByteArray, 17, -1, PqLogical::None);
     bolt::BoltType t;
     std::uint8_t scale = 0;
     ASSERT_TRUE(parquet_map_type(&c, &t, &scale));
-    EXPECT_EQ(t, bolt::BoltType::Utf8);
+    EXPECT_EQ(t, bolt::BoltType::Binary);
 }
 
 TEST(BoltParquetFlbaLogical, RawFlbaSixteenBytesIsAccepted) {
