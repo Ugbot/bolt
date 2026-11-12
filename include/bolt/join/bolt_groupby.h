@@ -28,6 +28,7 @@
 #include "bolt/kernels/bolt_utf8.h"
 #include "bolt/kernels/numeric_key.h"
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -686,6 +687,12 @@ inline constexpr uint32_t kGbIngestWindow = BOLT_GROUPBY_INGEST_WINDOW;
 // K-AGG-C: bank-split accumulation. 4 banks of up to 1024 groups; a window
 // is bank-eligible when entry_count <= kGbBankGroups and the window is big
 // enough that zeroing the bank slices amortises (see gb_pass2_one).
+inline constexpr uint64_t kGbDecBoundLimit     = uint64_t{1} << 62;   // 2^125 in 2^63 units
+inline constexpr uint64_t kGbDecBoundSaturated = ~uint64_t{0};
+inline constexpr uint64_t gb_dec_bound_add(uint64_t a, uint64_t b) noexcept {
+    return (a >= kGbDecBoundLimit || b >= kGbDecBoundLimit || b >= kGbDecBoundLimit - a)
+        ? kGbDecBoundSaturated : a + b;
+}
 inline constexpr uint32_t kGbBankCount  = 4u;
 inline constexpr uint32_t kGbBankGroups = 1024u;
 
@@ -1407,6 +1414,9 @@ struct GroupbyTypedState {
     // A decimal Sum/Avg partial left the signed 128-bit word: some group's
     // total is past 38 digits, though no row can say which. Merges carry it.
     bool            dec_sum_wrapped;
+    // Bound on any decimal Sum/Avg accumulator's magnitude, in units of 2^63
+    // (gb_d128_window_units); kGbDecBoundSaturated once it may reach 2^125.
+    uint64_t        dec_bound_units;
     bool            any_distinct;
     // W-P / G2FEAT-362: set true iff a group MAY have been inserted while
     // dense is enabled WITHOUT publishing its slot into dense_gid — an
@@ -1578,6 +1588,7 @@ inline bool gb_begin_with_scratch(
         ? kGbEntryCap : static_cast<uint32_t>(grow_cap);
     state->oom              = false;
     state->dec_sum_wrapped  = false;
+    state->dec_bound_units  = 0;
     state->null_key         = false;              // G2COV-30
     for (uint8_t k = 0; k < n_keys; ++k) {        // Card S: spilled-key buffers
         state->key_str_buf[k]  = nullptr;

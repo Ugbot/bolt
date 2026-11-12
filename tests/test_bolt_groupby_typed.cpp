@@ -1586,4 +1586,41 @@ TEST(BoltGroupbyTypedG2chk977, WrapPast128BitsIsFlagged) {
     EXPECT_TRUE(a.dec_sum_wrapped);
 }
 
+TEST(BoltGroupbyTypedG2chk977, LargeValuesTakeTheCheckedPathExactly) {
+    // |v| = 2^103: a window's bound saturates, so the fast pass is undone and
+    // rerun checked. Few groups take the banked loop, many the plain one.
+    for (const uint32_t groups : {2u, 2000u}) {
+        SCOPED_TRACE(::testing::Message() << "groups=" << groups);
+        const uint32_t n = groups * 3;
+        std::vector<int64_t> keys(n);
+        std::vector<dec::Decimal128> vals(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            keys[i] = i % groups;
+            vals[i] = dec::Decimal128{0, (i & 1u) ? -(int64_t{1} << 39) : (int64_t{1} << 39)};
+        }
+        Arena arena;
+        BoltColumn key = BoltColumn::make_flat(keys.data(), nullptr, n, BoltType::Int64);
+        BoltColumn val = BoltColumn::make_flat(vals.data(), nullptr, n, BoltType::Decimal128);
+        AggSpec spec = make_spec(AggKind::Sum, 0);
+        GroupbyTypedState st{};
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &arena, &key, 1, &val, 1, &spec, 1, 4096));
+        groupby_agg_multi_key_typed_ingest(&st, &key, &val, nullptr, 0, n);
+        EXPECT_FALSE(st.dec_sum_wrapped);
+        BoltColumn ok[1], oa[1]; uint32_t ng = 0;
+        ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+        ASSERT_EQ(ng, groups);
+        const auto* ks = static_cast<const int64_t*>(ok[0].data);
+        const auto* sums = static_cast<const dec::Decimal128*>(oa[0].data);
+        for (uint32_t r = 0; r < ng; ++r) {
+            // Group g holds rows g, g + groups, g + 2 * groups.
+            int64_t net = 0;
+            for (uint32_t k = 0; k < 3; ++k) net += ((ks[r] + k * groups) & 1u) ? -1 : 1;
+            const dec::Decimal128 want = dec::d128_mul(dec::d128_from_i64(net),
+                                                       dec::Decimal128{0, int64_t{1} << 39});
+            EXPECT_EQ(dec::d128_cmp(sums[r], want), 0) << "group " << ks[r];
+            EXPECT_FALSE(groupby_typed_dec_overflow(&st, 0, r));
+        }
+    }
+}
+
 }  // namespace g2chk977
