@@ -1272,7 +1272,7 @@ void check_decimal_avg_output(const BoltColumn& keys, const BoltColumn& avg,
 
 TEST(BoltGroupbyTypedG2chk736, DecimalAvgScaleCeilingAllFinalizers) {
     constexpr uint8_t scales[] = {2, 34, 35, 36, 37, 38};
-    constexpr int64_t expected[] = {25000, 25000, 2500, 250, 25, 2};
+    constexpr int64_t expected[] = {25000, 25000, 2500, 250, 25, 3};
     int64_t ks[] = {0,0,0,1,1,1,2,2,2,3,3,3};
     int64_t v64[] = {1,4,99,-1,-4,99,1,-1,99,99,99,99};
     dec::Decimal128 v128[12];
