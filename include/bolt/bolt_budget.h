@@ -35,6 +35,12 @@
 // ---------------------------------------------------------------------------
 // bolt's own Limits table.
 // ---------------------------------------------------------------------------
+// G2CHK-1006: the largest stack frame one bolt library function may use. The
+// build reads this line (cmake/BoltCompileOptions.cmake) and compiles every
+// library target with -Werror=frame-larger-than at it, so a large struct on
+// the stack fails the build rather than a 512 KiB thread at run time.
+#define BOLT_FRAME_BUDGET_BYTES 262144
+
 #define BOLT_LIMITS(X)                                                          \
     X(mem_budget_mb, kBudget, "MiB", 0, 0, (UINT64_MAX >> 20),                  \
       "BOLT_MEM_BUDGET_MB", "CHUKONU_MEM_BUDGET_MB",                            \
@@ -48,6 +54,9 @@
       "backing blocks per bolt::Arena")                                         \
     X(stack_array_lint_bytes, kInvariant, "bytes", 16384, 16384, 16384,         \
       nullptr, nullptr, "largest function-scope array the stack lint allows")    \
+    X(frame_budget_bytes, kInvariant, "bytes", BOLT_FRAME_BUDGET_BYTES,         \
+      BOLT_FRAME_BUDGET_BYTES, BOLT_FRAME_BUDGET_BYTES, nullptr, nullptr,        \
+      "largest stack frame of a bolt library function (a build error past it)") \
     X(lake_metadata_budget_mb, kBudget, "MiB", 1024, 1, (UINT64_MAX >> 20),     \
       "BOLT_LAKE_METADATA_BUDGET_MB", nullptr,                                  \
       "Iceberg/Delta metadata held by one table handle or one scan")          \

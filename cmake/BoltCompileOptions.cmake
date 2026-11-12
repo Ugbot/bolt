@@ -45,6 +45,27 @@ function(_bolt_build_only_opts tgt scope)
     endif()
 endfunction()
 
+# G2CHK-1006: library code is compiled with a stack-frame budget read from
+# include/bolt/bolt_budget.h (BOLT_FRAME_BUDGET_BYTES); a frame past it is a
+# build error. Executables (tests, benches, tools) are not budgeted.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../include/bolt/bolt_budget.h" _bolt_frame_line
+     REGEX "^#define BOLT_FRAME_BUDGET_BYTES [0-9]+")
+string(REGEX MATCH "[0-9]+$" BOLT_FRAME_BUDGET_BYTES "${_bolt_frame_line}")
+if(NOT BOLT_FRAME_BUDGET_BYTES)
+    message(FATAL_ERROR "bolt: BOLT_FRAME_BUDGET_BYTES not found in bolt_budget.h")
+endif()
+function(bolt_apply_frame_budget tgt scope)
+    get_target_property(_type ${tgt} TYPE)
+    if(_type STREQUAL "EXECUTABLE" OR MSVC)
+        return()
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(${tgt} ${scope}
+            $<$<COMPILE_LANGUAGE:CXX,C>:-Wframe-larger-than=${BOLT_FRAME_BUDGET_BYTES}>
+            $<$<COMPILE_LANGUAGE:CXX,C>:-Werror=frame-larger-than>)
+    endif()
+endfunction()
+
 function(bolt_apply_hardening tgt)
     get_target_property(type ${tgt} TYPE)
     if(type STREQUAL "INTERFACE_LIBRARY")
@@ -103,6 +124,9 @@ function(bolt_apply_hardening tgt)
         if(BOLT_WARNINGS_AS_ERRORS)
             _bolt_build_only_opts(${tgt} ${scope} -Werror)
         endif()
+    endif()
+    if(NOT scope STREQUAL "INTERFACE")
+        bolt_apply_frame_budget(${tgt} PRIVATE)
     endif()
 endfunction()
 
