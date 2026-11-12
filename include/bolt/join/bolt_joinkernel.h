@@ -151,7 +151,7 @@ BOLT_FORCE_INLINE uint64_t hash_keys_typed(const BoltColumn* keys,
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (uint8_t k = 0; k < n_keys; ++k) {
         const BoltColumn& c = keys[k];
-        if (c.type == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(c.type)) {
             const StringView& sv = static_cast<const StringView*>(c.data)[r];
             const char* base =
                 static_cast<const char*>(c.str_overflow_base);
@@ -183,7 +183,7 @@ BOLT_FORCE_INLINE bool keys_equal_typed(const BoltColumn* keys, uint8_t n_keys,
     assert(keys_flat != nullptr);
     const GbCell16* row = keys_flat + static_cast<size_t>(slot) * n_keys;
     for (uint8_t k = 0; k < n_keys; ++k) {
-        if (key_types[k] == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(key_types[k])) {
             const StringView& pv = static_cast<const StringView*>(keys[k].data)[r];
             StringView bv;
             std::memcpy(&bv, &row[k], sizeof(bv));

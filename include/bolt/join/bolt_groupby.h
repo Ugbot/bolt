@@ -685,6 +685,13 @@ inline constexpr uint32_t kGbBankGroups = 1024u;
 
 namespace gb_detail {
 
+// Byte-valued keys and aggregates: Utf8 and Binary share the StringView
+// layout and compare / hash by bytes (G2CHK-944).
+BOLT_FORCE_INLINE constexpr bool gb_bytes(BoltType t) noexcept {
+    return t == BoltType::Utf8 || t == BoltType::Binary;
+}
+
+
 // True for the IEEE-754 floating column types. Float aggregation accumulates
 // in `double` (the cell's `.a` lane holds the running double's bit pattern),
 // so identity / apply / out_type / finalize all key off this predicate.
@@ -739,7 +746,8 @@ BOLT_FORCE_INLINE GbCell16 read_cell16(const BoltColumn& c, int64_t r) noexcept 
             std::memcpy(&out.a, &d, 8);
             break;
         }
-        case BoltType::Utf8:     std::memcpy(&out, &static_cast<const StringView*>(c.data)[r], 16); break;
+        case BoltType::Utf8:
+        case BoltType::Binary:   std::memcpy(&out, &static_cast<const StringView*>(c.data)[r], 16); break;
         default:                 out.a = static_cast<const int64_t*>(c.data)[r]; break;
     }
     return out;
@@ -831,7 +839,7 @@ BOLT_FORCE_INLINE bool gb_key_type_can_tag_null(BoltType t) noexcept {
         case BoltType::Timestamp: case BoltType::Duration:
         case BoltType::Float64:   case BoltType::Float32:
         case BoltType::Decimal64: case BoltType::Decimal128:
-        case BoltType::Utf8:
+        case BoltType::Utf8:      case BoltType::Binary:
             return true;
         default:
             return false;
@@ -849,7 +857,7 @@ BOLT_FORCE_INLINE bool gb_sv_key_spilled(const StringView& sv) noexcept {
 
 BOLT_FORCE_INLINE GbCell16 gb_null_key_cell(BoltType t) noexcept {
     GbCell16 out{0, kGbNullKeyTag};
-    if (t == BoltType::Utf8) {
+    if (::bolt::gb_detail::gb_bytes(t)) {
         StringView sv;
         std::memset(&sv, 0, sizeof(sv));
         sv.length = kGbNullUtf8Len;
@@ -902,6 +910,7 @@ BOLT_FORCE_INLINE void gb_store_key(void* buf, int64_t r, BoltType t, GbCell16 k
         case BoltType::Decimal128:
             std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &kc, 16); break;
         case BoltType::Utf8:
+        case BoltType::Binary:
             std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
         case BoltType::Float32: {   // read_cell16 promoted it to double bits
             double d = 0.0;
@@ -917,7 +926,7 @@ BOLT_FORCE_INLINE void gb_store_key(void* buf, int64_t r, BoltType t, GbCell16 k
 // DISTINCT dedup keys wider than 8 bytes: Utf8 by content, Decimal128 by
 // its full 16 bytes (the 8-byte cell would keep only the low word).
 BOLT_FORCE_INLINE bool distinct_is_16(BoltType t) noexcept {
-    return t == BoltType::Utf8 || t == BoltType::Decimal128;
+    return ::bolt::gb_detail::gb_bytes(t) || t == BoltType::Decimal128;
 }
 
 BOLT_FORCE_INLINE int distinct16_insert(DistinctCell16* cell,
@@ -925,7 +934,7 @@ BOLT_FORCE_INLINE int distinct16_insert(DistinctCell16* cell,
                                         Arena* arena) noexcept {
     assert(cell != nullptr && arena != nullptr);
     assert(distinct_is_16(c.type));
-    if (c.type == BoltType::Utf8) {
+    if (::bolt::gb_detail::gb_bytes(c.type)) {
         StringView sv;
         std::memcpy(&sv, &v, sizeof(sv));
         return cell->insert_sv(
@@ -939,7 +948,7 @@ BOLT_FORCE_INLINE int distinct16_insert(DistinctCell16* cell,
 // Is the stored group cell for a key column of type `t` the NULL group?
 BOLT_FORCE_INLINE bool gb_cell_is_null_key(const GbCell16& c,
                                            BoltType t) noexcept {
-    if (t == BoltType::Utf8) {
+    if (::bolt::gb_detail::gb_bytes(t)) {
         StringView sv;
         std::memcpy(&sv, &c, 16);
         return gb_sv_is_null_key(sv);
@@ -960,7 +969,7 @@ BOLT_FORCE_INLINE uint64_t hash_keys(const BoltColumn* keys, uint32_t n_keys,
     assert(keys != nullptr || n_keys == 0);
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (uint32_t k = 0; k < n_keys; ++k) {
-        if (keys[k].type == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(keys[k].type)) {
             const GbCell16 kc = read_key_cell16(keys[k], r);
             StringView sv;
             std::memcpy(&sv, &kc, 16);
@@ -987,7 +996,7 @@ BOLT_FORCE_INLINE bool keys_equal(const BoltColumn* keys, uint32_t n_keys,
     assert(keys_flat != nullptr);
     const GbCell16* row = keys_flat + static_cast<size_t>(gid) * n_keys;
     for (uint32_t k = 0; k < n_keys; ++k) {
-        if (keys[k].type == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(keys[k].type)) {
             const GbCell16 kc = read_key_cell16(keys[k], r);
             StringView in_sv;
             std::memcpy(&in_sv, &kc, 16);
@@ -1023,7 +1032,7 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
     // W-DEC: Decimal64 cells are widened d128 (read_cell16), so their
     // Min/Max identities are the d128 extremes too.
     const bool d = gb_agg_cell_is_d128(t);
-    const bool s = (t == BoltType::Utf8);
+    const bool s = (::bolt::gb_detail::gb_bytes(t));
     const bool f = is_float_type(t);
     // Float Min/Max identities are NaN / -infinity stored as double bits in
     // the `.a` lane (the cell holds a double for float aggregation). Sum/Avg
@@ -1091,7 +1100,7 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         if (take) std::memcpy(slot, &v, 16);
         return;
     }
-    if (t == BoltType::Utf8 && (k == AggKind::Min || k == AggKind::Max)) {
+    if (::bolt::gb_detail::gb_bytes(t) && (k == AggKind::Min || k == AggKind::Max)) {
         // Inline-only invariant: the typed kernel does not yet resolve
         // spilled keys (>12 byte content), so the cell carries the full
         // 16-byte StringView for inline strings. Asserts in
@@ -1268,7 +1277,7 @@ BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     }
     // SUM / MIN / MAX: preserve input type for Decimal128/Utf8/Date32; SUM/MIN/MAX
     // of narrow ints emit Int64.
-    if (in == BoltType::Decimal128 || in == BoltType::Utf8 || in == BoltType::Date32) {
+    if (in == BoltType::Decimal128 || ::bolt::gb_detail::gb_bytes(in) || in == BoltType::Date32) {
         return in;
     }
     return BoltType::Int64;
@@ -1706,18 +1715,24 @@ BOLT_FORCE_INLINE bool gb_agg_str_append(GroupbyTypedState* state, uint32_t j,
 // retained winner survives past the source's lifetime. Returns false (and
 // sets `state->oom`) only on arena exhaustion; a no-op / cur-retained compare
 // always succeeds.
+//
+// G2CHK-944: `first` = the group has no value yet, so the candidate is taken
+// outright. The MIN identity (12 x 0xFF) is not a byte maximum -- a longer
+// 0xFF run, any Binary value, sorts above it -- so it must never be compared.
 inline bool gb_agg_utf8_minmax(GroupbyTypedState* state, uint32_t j,
                                AggKind k, GbCell16* slot, GbCell16 v,
-                               bool valid, const char* cand_base) noexcept {
+                               bool valid, const char* cand_base,
+                               bool first) noexcept {
     assert(state != nullptr && slot != nullptr);
     assert(k == AggKind::Min || k == AggKind::Max);
     if (!valid) return true;   // Min/Max ignore NULLs, same as gb_detail::apply
     StringView cur, cand;
     std::memcpy(&cur,  slot, sizeof(cur));
     std::memcpy(&cand, &v,   sizeof(cand));
-    const char* cur_base = (cur.length > 12u) ? state->agg_str_buf[j] : nullptr;
-    assert(cur.length <= 12u || cur_base != nullptr);
-    if (!sv_bytelex_replaces(k == AggKind::Min, cur, cur_base, cand, cand_base)) return true;
+    const char* cur_base = (!first && cur.length > 12u) ? state->agg_str_buf[j] : nullptr;
+    assert(first || cur.length <= 12u || cur_base != nullptr);
+    if (!first &&
+        !sv_bytelex_replaces(k == AggKind::Min, cur, cur_base, cand, cand_base)) return true;
     if (cand.length <= 12u) {
         std::memcpy(slot, &cand, sizeof(cand));
         return true;
@@ -1787,7 +1802,7 @@ inline void gb_ingest_fallback(
                 // group representative owns its bytes — the input overflow
                 // buffer is freed after this morsel. hash/equal + finalize then
                 // resolve via the groupby's own per-key buffer.
-                if (keys[k].type == BoltType::Utf8) {
+                if (::bolt::gb_detail::gb_bytes(keys[k].type)) {
                     StringView* sv = reinterpret_cast<StringView*>(&krow[k]);
                     if (gb_detail::gb_sv_is_null_key(*sv)) {
                         // stored as the fixed null identity; nothing to own
@@ -1855,7 +1870,7 @@ inline void gb_ingest_fallback(
             // gb_detail::apply — it hard-codes nullptr spilled-string bases,
             // which segfaults the moment a real (>12-byte) string is compared.
             // Resolve + deep-copy-on-win via the dedicated helper instead.
-            if (state->agg_in_types[j] == BoltType::Utf8 &&
+            if (::bolt::gb_detail::gb_bytes(state->agg_in_types[j]) &&
                 (state->specs[j].kind == AggKind::Min ||
                  state->specs[j].kind == AggKind::Max)) {
                 const char* cand_base = (pc_ptr != nullptr)
@@ -1863,7 +1878,7 @@ inline void gb_ingest_fallback(
                     : nullptr;
                 if (!gb_agg_utf8_minmax(state, j, state->specs[j].kind,
                                         &state->accums[off], v, valid,
-                                        cand_base)) {
+                                        cand_base, state->counts[off] == 0)) {
                     return;   // state->oom already set
                 }
             } else {
@@ -1899,7 +1914,7 @@ inline uint64_t gb_merge_hash_stored(const GroupbyTypedState* s,
     const GbCell16* row = s->keys_flat + static_cast<size_t>(gid) * n_keys;
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (uint32_t k = 0; k < n_keys; ++k) {
-        if (s->key_types[k] == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(s->key_types[k])) {
             StringView sv;
             std::memcpy(&sv, &row[k], 16);
             h = swiss_mix_wyhash3(
@@ -2003,7 +2018,7 @@ inline void gb_route_hash_rows(const GroupbyTypedState* st,
     for (uint32_t k = 0; k < n_keys; ++k) {
         assert(st->key_types[k] == keys[k].type &&
                "route hash requires the _begin descriptor types");
-        if (keys[k].type == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(keys[k].type)) {
             gb_detail::gb_route_fold_utf8(keys[k], sel, start, count, out);
         } else {
             gb_detail::gb_route_fold_cells(keys[k], sel, start, count, out);
@@ -2206,7 +2221,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
         // G2FEAT-283: spilled Utf8 MIN/MAX winners point into our own per-agg
         // deep-copy buffer (agg_str_buf); hand the base to the output column
         // so the sink/sort/next-op resolves them, exactly like out_keys above.
-        if (ot == BoltType::Utf8) {
+        if (::bolt::gb_detail::gb_bytes(ot)) {
             out_aggs[j].str_overflow_base = state->agg_str_buf[j];
         }
         if (out_n > 0 && out_aggs[j].data == nullptr) return false;
@@ -2301,7 +2316,7 @@ inline bool groupby_agg_multi_key_typed_finalize(
             }
             if (ot == BoltType::Decimal128) {
                 std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &acc, 16);
-            } else if (ot == BoltType::Utf8) {
+            } else if (::bolt::gb_detail::gb_bytes(ot)) {
                 std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);
             } else if (ot == BoltType::Date32) {
                 static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(acc.a);
@@ -2596,7 +2611,7 @@ inline bool groupby_agg_multi_key_typed(
     // are self-contained and never dangle (mirrors the stateful finalize's
     // Card S treatment and the spilled MIN/MAX-winner deep-copy).
     for (uint32_t k = 0; k < n_keys; ++k) {
-        if (key_types[k] != BoltType::Utf8) continue;
+        if (!::bolt::gb_detail::gb_bytes(key_types[k])) continue;
         StringView* osv = static_cast<StringView*>(out_keys[k].data);
         size_t total = 0;
         for (int64_t r = 0; r < out_n; ++r) {
@@ -2657,7 +2672,7 @@ inline bool groupby_agg_multi_key_typed(
             // SUM / MIN / MAX — write 16-byte cell or 8-byte int.
             if (ot == BoltType::Decimal128) {
                 std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &acc, 16);
-            } else if (ot == BoltType::Utf8) {
+            } else if (::bolt::gb_detail::gb_bytes(ot)) {
                 std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);
             } else if (ot == BoltType::Date32) {
                 static_cast<int32_t*>(buf)[r] = static_cast<int32_t>(acc.a);

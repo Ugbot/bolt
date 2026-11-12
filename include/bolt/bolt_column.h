@@ -399,6 +399,9 @@ struct BoltColumn {
                                       Arena* arena) noexcept {
         BoltColumn c = make_empty();
         size_t tsz = bolt::type_size(type);
+        // A flat Binary column is a StringView column, as flat Utf8 is
+        // (G2CHK-944); packed VarBinary is built on the offsets path.
+        if (type == BoltType::Binary) tsz = 16u;
         if (tsz == 0) return c;  // Variable-width needs different path
         c.data = arena->allocate(length * tsz);
         if (!c.data) return c;
