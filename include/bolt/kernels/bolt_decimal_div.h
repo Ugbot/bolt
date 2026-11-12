@@ -18,6 +18,14 @@ namespace bolt::kernels::decimal {
 
 enum class DivStatus : uint8_t { Ok, DivZero, Overflow };
 
+// How a quotient drops the digits past its scale.
+enum class DecRound : uint8_t { HalfUp, TowardZero };
+
+// The rounding of a decimal AVG at its result scale, for every finalizer
+// (bolt's grouped ones, chukonu's global one). HalfUp is Spark's and
+// Postgres'; TowardZero was the G2CHK-736 contract.
+inline constexpr DecRound k_decimal_avg_round = DecRound::HalfUp;
+
 namespace div_detail {
 
 struct U256 { uint64_t w[4]; };   // little-endian limbs
@@ -127,9 +135,9 @@ inline bool to_d128(const U256& x, bool neg, Decimal128* out) noexcept {
 
 }  // namespace div_detail
 
-// round_half_up((a / 10^sa) / (b / 10^sb)) as a mantissa at scale `s`.
-inline DivStatus d128_div_round(Decimal128 a, int sa, Decimal128 b, int sb, int s,
-                                Decimal128* out) noexcept {
+// (a / 10^sa) / (b / 10^sb) as a mantissa at scale `s`, rounded by `mode`.
+inline DivStatus d128_div_scaled(Decimal128 a, int sa, Decimal128 b, int sb, int s,
+                                 DecRound mode, Decimal128* out) noexcept {
     using namespace div_detail;
     assert(out != nullptr);
     assert(sa >= 0 && sb >= 0 && s >= 0 && sa <= 76 && sb <= 76 && s <= 76);
@@ -151,10 +159,50 @@ inline DivStatus d128_div_round(Decimal128 a, int sa, Decimal128 b, int sb, int 
     // HALF_UP: up when the remainder is at least half the divisor (2r >= d).
     U256 r2 = r;
     const bool r2_fits = u256_mul_small(&r2, 2);
-    if (!r2_fits || u256_cmp(r2, d) >= 0) {
+    if (mode == DecRound::HalfUp && (!r2_fits || u256_cmp(r2, d) >= 0)) {
         for (int i = 0; i < 4 && ++q.w[i] == 0; ++i) {}
     }
     return to_d128(q, neg, out) ? DivStatus::Ok : DivStatus::Overflow;
+}
+
+// round_half_up((a / 10^sa) / (b / 10^sb)) as a mantissa at scale `s`.
+inline DivStatus d128_div_round(Decimal128 a, int sa, Decimal128 b, int sb, int s,
+                                Decimal128* out) noexcept {
+    return d128_div_scaled(a, sa, b, sb, s, DecRound::HalfUp, out);
+}
+
+// |v| < 10^38: v is a DECIMAL(38) mantissa.
+inline bool d128_within_38_digits(Decimal128 v) noexcept {
+    const Decimal128 m = div_detail::abs128(v);
+    return m.hi >= 0 && d128_cmp(m, d128_pow10(38)) < 0;
+}
+
+// a + b in two's complement; true when the signed 128-bit word wrapped.
+BOLT_FORCE_INLINE bool d128_add_wrapped(Decimal128 a, Decimal128 b, Decimal128* out) noexcept {
+    const uint64_t lo = static_cast<uint64_t>(a.lo) + static_cast<uint64_t>(b.lo);
+    const uint64_t hi = static_cast<uint64_t>(a.hi) + static_cast<uint64_t>(b.hi) +
+                        (lo < static_cast<uint64_t>(a.lo) ? 1u : 0u);
+    out->lo = static_cast<int64_t>(lo);
+    out->hi = static_cast<int64_t>(hi);
+    return ((static_cast<uint64_t>(a.hi) ^ hi) & (static_cast<uint64_t>(b.hi) ^ hi)) >> 63 != 0;
+}
+
+// The AVG of `count` >= 1 values summing to `sum` (scale in_s), at scale
+// out_s, rounded by k_decimal_avg_round. Overflow when the sum or the result
+// needs more than 38 digits.
+inline DivStatus d128_avg(Decimal128 sum, int in_s, int64_t count, int out_s,
+                          Decimal128* out) noexcept {
+    assert(count > 0 && out != nullptr);
+    assert(in_s >= 0 && out_s >= in_s && out_s <= 38);
+    *out = Decimal128{0, 0};
+    if (!d128_within_38_digits(sum)) return DivStatus::Overflow;
+    Decimal128 q{};
+    const DivStatus ds = d128_div_scaled(sum, in_s, d128_from_i64(count), 0, out_s,
+                                         k_decimal_avg_round, &q);
+    if (ds != DivStatus::Ok) return ds;
+    if (!d128_within_38_digits(q)) return DivStatus::Overflow;
+    *out = q;
+    return DivStatus::Ok;
 }
 
 // a % b with the dividend's sign, at scale max(sa, sb).
