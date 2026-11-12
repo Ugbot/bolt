@@ -53,7 +53,22 @@ constexpr int32_t kEncPlain = 0, kEncPlainDict = 2, kEncRle = 3,
                   kEncRleDict = 8, kEncByteStreamSplit = 9,
                   kEncDeltaBinaryPacked = 5, kEncDeltaLenByteArray = 6,
                   kEncDeltaByteArray = 7;
-constexpr int32_t kConvDecimal = 5, kConvDate = 6;
+constexpr int32_t kConvUtf8 = 0, kConvDecimal = 5, kConvDate = 6;
+
+// A decoded column's per-row slot width. Binary has no fixed bolt width (it
+// may be VarBinary elsewhere); decoded here it is a StringView per row, as
+// Utf8 is (G2CHK-948).
+inline uint32_t pq_slot_bytes(BoltType t) noexcept {
+    return t == BoltType::Binary ? static_cast<uint32_t>(sizeof(StringView))
+                                 : static_cast<uint32_t>(bolt::type_size(t));
+}
+
+inline BoltColumn pq_alloc_col(int64_t rows, BoltType t, Arena* arena) noexcept {
+    if (t != BoltType::Binary) return BoltColumn::make_flat_alloc(rows, t, arena);
+    BoltColumn c = BoltColumn::make_flat_alloc(rows, BoltType::Utf8, arena);
+    if (c.format == ColumnFormat::Flat) c.type = BoltType::Binary;
+    return c;
+}
 
 // True iff an FLBA column is DECIMAL-annotated (either encoding) -- the only
 // FLBA shape whose bytes get NUMERIC (big-endian two's-complement) decode.
@@ -1223,7 +1238,7 @@ bool decode_dict_page(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::FixedLenByteArray:
             ok = flba_is_decimal(cx->pc)
                      ? plain_flba(&tmp, v, vlen, nullptr, 0, n, n)
-                     : cx->type == BoltType::Utf8 ? plain_flba_binary(&tmp, v, vlen, nullptr, 0, n, n)
+                     : (cx->type == BoltType::Utf8 || cx->type == BoltType::Binary) ? plain_flba_binary(&tmp, v, vlen, nullptr, 0, n, n)
                      : plain_flba_raw(&tmp, v, vlen, nullptr, 0, n, n);
             break;
         case PqType::ByteArray:
@@ -1515,7 +1530,7 @@ bool decode_plain_values(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         case PqType::FixedLenByteArray:
             return flba_is_decimal(cx->pc)
                        ? plain_flba(cx, v, vlen, def, row0, nvals, nvalid)
-                       : cx->type == BoltType::Utf8 ? plain_flba_binary(cx, v, vlen, def, row0, nvals, nvalid)
+                       : (cx->type == BoltType::Utf8 || cx->type == BoltType::Binary) ? plain_flba_binary(cx, v, vlen, def, row0, nvals, nvalid)
                        : plain_flba_raw(cx, v, vlen, def, row0, nvals, nvalid);
         case PqType::ByteArray:
             return plain_utf8(cx, v, vlen, def, row0, nvals, nvalid);
@@ -2082,14 +2097,14 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     BoltType t;
     uint8_t scale = 0;
     if (!parquet_map_type(pc, &t, &scale)) return false;
-    *col = BoltColumn::make_flat_alloc(rows, t, arena);
+    *col = pq_alloc_col(rows, t, arena);
     col->logical = parquet_map_logical(pc);
     if (col->data == nullptr && rows > 0) return false;
     if (rows == 0) {       // typed empty column (make_flat_alloc bails at 0)
         *col = BoltColumn::make_empty();
         col->format = ColumnFormat::Flat;
         col->type = t;
-        col->type_size_bytes = static_cast<uint16_t>(bolt::type_size(t));
+        col->type_size_bytes = static_cast<uint16_t>(pq_slot_bytes(t));
     }
     col->decimal_scale = scale;
     // G2PQ-16: FixedSizeBinary always allocates a full 16-byte slot
@@ -2104,7 +2119,8 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     for (uint32_t g = g0; g < g1; ++g) {       // bounded: n_row_groups
         const PqChunk* ch = &m->chunks[m->row_groups[g].chunk_off + c];
         if (pc->optional != 0 && ch->null_count != 0) needs_validity = true;
-        if ((pc->physical == PqType::ByteArray || (pc->physical == PqType::FixedLenByteArray && t == BoltType::Utf8)) &&
+        if ((pc->physical == PqType::ByteArray ||
+             (pc->physical == PqType::FixedLenByteArray && (t == BoltType::Utf8 || t == BoltType::Binary))) &&
             ch->total_uncompressed_size > 0) {
             ovf += static_cast<uint64_t>(ch->total_uncompressed_size);
         }
@@ -2125,7 +2141,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     // 88 bytes over 100M rows), and it bounds the extra memory to 4 B/row on one
     // column rather than every column. MUST come after the memset above, which
     // zeroes the whole context.
-    if (t == BoltType::Utf8 && rows > 0) {
+    if ((t == BoltType::Utf8 || t == BoltType::Binary) && rows > 0) {
         auto* cb = static_cast<int32_t*>(
             arena->allocate(static_cast<uint64_t>(rows) * 4u, 4));
         if (cb != nullptr) {               // best-effort: no buffer => no hint
@@ -2133,7 +2149,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
             cx->codes_ok = 1;
         }
     }
-    cx->elem = static_cast<uint32_t>(bolt::type_size(t));
+    cx->elem = pq_slot_bytes(t);
     cx->out = static_cast<uint8_t*>(col->data);
     cx->validity = col->validity;
     // Type-conformance decode controls (G2FEAT-46). Default: source width ==
@@ -2175,7 +2191,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     }
     cx->arena = arena;
     cx->ovf_base = &col->str_overflow_base;
-    if (t == BoltType::Utf8 && ovf > 0 && rows > 0) {
+    if ((t == BoltType::Utf8 || t == BoltType::Binary) && ovf > 0 && rows > 0) {
         char* ob = static_cast<char*>(arena->allocate(ovf, 1));
         if (ob == nullptr) return false;
         cx->overflow = ob;
@@ -2764,9 +2780,20 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
         case PqType::Boolean:                 // 0/1
             *out_type = BoltType::Int64;
             return true;
-        case PqType::ByteArray:
-            *out_type = BoltType::Utf8;
+        case PqType::ByteArray: {
+            // G2CHK-948: only a text annotation (STRING / ENUM / JSON, or the
+            // legacy UTF8 ConvertedType) makes BYTE_ARRAY text. Unannotated
+            // bytes are Binary, as the spec and DuckDB read them; a caller that
+            // knows its writer stored text there opts in explicitly
+            // (chukonu's parquet_binary_as_string), never by default.
+            const bool text =
+                col->logical == static_cast<int32_t>(PqLogical::String) ||
+                col->logical == static_cast<int32_t>(PqLogical::Enum) ||
+                col->logical == static_cast<int32_t>(PqLogical::Json) ||
+                col->converted == kConvUtf8;
+            *out_type = text ? BoltType::Utf8 : BoltType::Binary;
             return true;
+        }
         case PqType::FixedLenByteArray:
             if (is_dec) {
                 if (col->type_length <= 0 || col->type_length > 16) return false;
@@ -2801,9 +2828,9 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                 return false;                                // malformed writer
             }
             if (col->type_length <= 0) return false;
-            // A raw FLBA wider than one 16-byte slot (an Iceberg fixed[L], L > 16) reads like a BYTE_ARRAY (a Utf8 lane of
-            // byte strings, as every BYTE_ARRAY does): one L-byte value per row.
-            *out_type = col->type_length > 16 ? BoltType::Utf8 : BoltType::FixedSizeBinary;
+            // A raw FLBA wider than one 16-byte slot (an Iceberg fixed[L], L > 16) reads like an unannotated
+            // BYTE_ARRAY: Binary, one L-byte value per row (G2CHK-948).
+            *out_type = col->type_length > 16 ? BoltType::Binary : BoltType::FixedSizeBinary;
             return true;
         default:
             return false;
@@ -3143,7 +3170,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     BoltType t;
     uint8_t scale = 0;
     if (!parquet_map_type(pc, &t, &scale)) return false;
-    *out_col = BoltColumn::make_flat_alloc(rows_sum, t, arena);
+    *out_col = pq_alloc_col(rows_sum, t, arena);
     if (out_col->data == nullptr) return false;
     out_col->decimal_scale = scale;
     if (t == BoltType::FixedSizeBinary) {   // G2PQ-16, see init_col_ctx_any
@@ -3153,7 +3180,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     std::memset(&cx, 0, sizeof(cx));
     cx.pc = pc;
     cx.type = t;
-    cx.elem = static_cast<uint32_t>(bolt::type_size(t));
+    cx.elem = pq_slot_bytes(t);
     cx.out = static_cast<uint8_t*>(out_col->data);
     if (pc->optional != 0 && ch->null_count != 0) {
         const uint64_t nb = (static_cast<uint64_t>(rows_sum) + 7u) / 8u;
@@ -3166,7 +3193,7 @@ bool parquet_read_col_chunk_pages(const uint8_t* buf, uint64_t len,
     }
     cx.arena = arena;
     cx.ovf_base = &out_col->str_overflow_base;
-    if (t == BoltType::Utf8 && unc_sum > 0) {
+    if ((t == BoltType::Utf8 || t == BoltType::Binary) && unc_sum > 0) {
         char* ob = static_cast<char*>(arena->allocate(unc_sum, 1));
         if (ob == nullptr) return false;
         cx.overflow = ob;
@@ -3382,7 +3409,7 @@ bool parquet_read_col_chunk_pruned_i64(const uint8_t* buf, uint64_t len,
         if (i == 0) {
             elem_type = rc.type;
             elem_bytes = rc.type_size_bytes;
-            *out_col = BoltColumn::make_flat_alloc(total_rows, elem_type, arena);
+            *out_col = pq_alloc_col(total_rows, elem_type, arena);
             if (out_col->data == nullptr) return false;
             out_col->decimal_scale = rc.decimal_scale;
         } else if (rc.type != elem_type || rc.type_size_bytes != elem_bytes) {
