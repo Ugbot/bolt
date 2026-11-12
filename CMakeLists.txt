@@ -120,6 +120,11 @@ target_link_libraries(bolt_core INTERFACE Threads::Threads)
 bolt_apply_hardening(bolt_core)
 bolt_apply_simd(bolt_core ${BOLT_SIMD_TIER})
 bolt_apply_feature_toggles(bolt_core)
+# Build-time Limits defaults: -DBOLT_LIMIT_<NAME>=<value> (cmake/BoltLimits.cmake).
+include(BoltLimits)
+set(BOLT_LIMITS_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BoltLimits.cmake"
+    CACHE INTERNAL "bolt_limits_build_overrides() for every repo's Limits table")
+bolt_limits_build_overrides(bolt_core BOLT bolt_limits_build.h BOLT_LIMITS_BUILD)
 
 # Placeholder sibling modules. Populated as phases land.
 foreach(mod IN ITEMS kernels join wire arrow)

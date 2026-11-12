@@ -87,9 +87,18 @@
       BOLT_WIRE_IO_ALIGN, BOLT_WIRE_IO_ALIGN, nullptr, nullptr,                \
       "writer I/O unit this build records (informational)")
 
+#if defined(__has_include)
+#if __has_include(<bolt_limits_build.h>)
+#include <bolt_limits_build.h>
+#endif
+#endif
+#ifndef BOLT_LIMITS_BUILD
+#define BOLT_LIMITS_BUILD ""
+#endif
+
 namespace bolt {
 
-BOLT_LIMITS_TABLE(bolt_limits, "bolt", BOLT_LIMITS)
+BOLT_LIMITS_TABLE_BUILD(bolt_limits, "bolt", BOLT_LIMITS, BOLT_LIMITS_BUILD)
 
 static_assert(kArenaMaxBlocks == 256, "update BOLT_LIMITS arena_max_blocks");
 static_assert(kMaxVectorDim == 65535u, "update BOLT_LIMITS max_vector_dim");

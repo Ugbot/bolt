@@ -7,6 +7,12 @@
 //                    workers, caches). Settable before first use.
 //   C kBudget      — a budget that data-sized structures grow under. Settable.
 //
+// Precedence, lowest first: source default < build (-D<REPO>_LIMIT_<NAME>) <
+// file (the host's config file) < env < set (CLI / admin API). A host applies
+// its file with limits_set_from(..., kFile) only where the source is not
+// already env; one name scheme: id "<owner>.<name>", env <OWNER>_<NAME>,
+// CMake <OWNER>_LIMIT_<NAME>, file key [limits.<owner>] <name>.
+//
 // Each repo declares ONE X-macro table and instantiates it with
 // BOLT_LIMITS_TABLE. The table resolves its environment overrides once, on
 // first access, and registers itself here so a host (gestaltd) can report
@@ -18,6 +24,15 @@
 //       "MYREPO_MAX_WIDGETS", nullptr, "widgets per pool")
 //   BOLT_LIMITS_TABLE(myrepo_limits, "myrepo", MYREPO_LIMITS)
 //   ... myrepo_limits_value(myrepo_limits_id::max_widgets)
+//
+// Build-time defaults: every non-invariant limit can also be set when the
+// stack is configured, with -D<REPO>_LIMIT_<NAME>=<value> (for example
+// -DMARBLEDB_LIMIT_SEAL_ROWS=131072). The repo's CMake (cmake/BoltLimits.cmake)
+// gathers those into one "name=value;..." string that the repo hands to
+// BOLT_LIMITS_TABLE_BUILD. A name the table lacks, an invariant, junk or a
+// value outside [min, max] fails the compile. At run time the build value
+// replaces the source default (source "build"); the environment and
+// limits_set still override it.
 //
 // RULES: No exceptions, no allocation. Environment parsing happens once per
 // table, at first access (never on a hot path).
@@ -45,6 +60,8 @@ enum class LimitSource : uint8_t {
     kEnv     = 1,
     kSet     = 2,   // programmatic / CLI / config file
     kInvalid = 3,   // env override rejected; value is the default, table->error says why
+    kBuild   = 4,   // -D<REPO>_LIMIT_<NAME> at configure time
+    kFile    = 5,   // the host's config file (gestalt.toml [limits])
 };
 
 inline const char* limit_kind_name(LimitKind k) noexcept {
@@ -62,6 +79,8 @@ inline const char* limit_source_name(LimitSource s) noexcept {
         case LimitSource::kEnv:     return "env";
         case LimitSource::kSet:     return "set";
         case LimitSource::kInvalid: return "invalid";
+        case LimitSource::kBuild:   return "build";
+        case LimitSource::kFile:    return "file";
     }
     return "?";
 }
@@ -87,6 +106,7 @@ struct LimitTable {
     std::atomic<uint64_t>* values;
     std::atomic<uint8_t>*  sources;
     char                   error[kLimitsErrorBytes];   // first resolve error
+    const char*            build = nullptr;   // "name=value;..." build overrides
 };
 
 // Registry capacity: one table per repo, generous headroom.
@@ -127,6 +147,65 @@ inline bool limits_in_range(const LimitDesc& d, uint64_t v) noexcept {
     return v >= d.min && v <= d.max;
 }
 
+// ---------------------------------------------------------------------------
+// Build-time overrides: "name=value;name=value". Parsed at compile time (the
+// static_assert in BOLT_LIMITS_TABLE_BUILD) and again once at resolve.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kLimitsBuildMaxEntries = 4096;
+
+// Value of `name` in a build string. 1 found, 0 absent, -1 malformed string
+// (empty name, missing '=', non-decimal or overflowing value).
+constexpr int limits_build_find(const char* s, const char* name,
+                                uint64_t* out) noexcept {
+    assert(name != nullptr && name[0] != '\0');
+    assert(out != nullptr);
+    if (s == nullptr) return 0;
+    uint32_t i = 0;
+    for (uint32_t e = 0; e < kLimitsBuildMaxEntries && s[i] != '\0'; ++e) {
+        const uint32_t key = i;
+        while (s[i] != '\0' && s[i] != '=' && s[i] != ';') ++i;
+        if (s[i] != '=' || i == key) return -1;
+        const uint32_t key_end = i++;
+        uint64_t v = 0;
+        uint32_t digits = 0;
+        for (; s[i] >= '0' && s[i] <= '9'; ++i, ++digits) {
+            const uint64_t d = static_cast<uint64_t>(s[i] - '0');
+            if (digits >= 20 || v > (UINT64_MAX - d) / 10u) return -1;
+            v = v * 10u + d;
+        }
+        if (digits == 0 || (s[i] != ';' && s[i] != '\0')) return -1;
+        uint32_t k = 0;
+        while (key + k < key_end && name[k] != '\0' && name[k] == s[key + k]) ++k;
+        if (key + k == key_end && name[k] == '\0') { *out = v; return 1; }
+        if (s[i] == ';') ++i;
+    }
+    return s[i] == '\0' ? 0 : -1;
+}
+
+// True when every entry of a build string names a settable limit of `descs`
+// with an in-range value, and no name repeats.
+constexpr bool limits_build_valid(const LimitDesc* descs, uint32_t n,
+                                  const char* s) noexcept {
+    assert(descs != nullptr || n == 0);
+    assert(n < kLimitsBuildMaxEntries);
+    if (s == nullptr || s[0] == '\0') return true;
+    uint32_t matched = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t v = 0;
+        const int r = limits_build_find(s, descs[i].name, &v);
+        if (r < 0) return false;
+        if (r == 0) continue;
+        if (descs[i].kind == LimitKind::kInvariant) return false;
+        if (v < descs[i].min || v > descs[i].max) return false;
+        ++matched;
+    }
+    uint32_t entries = 0;
+    for (uint32_t i = 0; s[i] != '\0' && i < (1u << 20); ++i) {
+        if (s[i] == '=') ++entries;
+    }
+    return entries == matched;
+}
+
 // Resolve a table's environment overrides. Records the first error in
 // table->error and keeps that entry at its default. Returns false on error.
 inline bool limits_resolve(LimitTable* t) noexcept {
@@ -140,6 +219,23 @@ inline bool limits_resolve(LimitTable* t) noexcept {
         t->sources[i].store(static_cast<uint8_t>(LimitSource::kDefault),
                             std::memory_order_relaxed);
         if (d.kind == LimitKind::kInvariant) continue;
+        uint64_t bv = 0;
+        if (limits_build_find(t->build, d.name, &bv) == 1) {
+            if (limits_in_range(d, bv)) {
+                t->values[i].store(bv, std::memory_order_relaxed);
+                t->sources[i].store(static_cast<uint8_t>(LimitSource::kBuild),
+                                    std::memory_order_relaxed);
+            } else if (ok) {
+                std::snprintf(t->error, sizeof(t->error),
+                              "build override %s=%llu is outside [%llu, %llu] "
+                              "for limit %s.%s (%s)", d.name,
+                              static_cast<unsigned long long>(bv),
+                              static_cast<unsigned long long>(d.min),
+                              static_cast<unsigned long long>(d.max), t->owner,
+                              d.name, d.unit);
+                ok = false;
+            }
+        }
         // An empty variable counts as unset.
         const char* var = d.env;
         const char* raw = d.env != nullptr ? std::getenv(d.env) : nullptr;
@@ -234,10 +330,37 @@ inline bool limits_find(const char* name, const LimitTable** out_t,
     return false;
 }
 
+// Find "<owner>.<name>" (the qualified id; owners may contain dots, e.g.
+// "bolt.obs.obs_trace_sample_ppm").
+inline bool limits_find_qualified(const char* id, const LimitTable** out_t,
+                                  uint32_t* out_i) noexcept {
+    assert(id != nullptr && out_t != nullptr && out_i != nullptr);
+    const uint32_t n = limits_table_count();
+    for (uint32_t k = 0; k < n; ++k) {
+        const LimitTable* t = limits_table_at(k);
+        if (t == nullptr) continue;
+        const size_t ol = std::strlen(t->owner);
+        if (std::strncmp(id, t->owner, ol) != 0 || id[ol] != '.') continue;
+        const int32_t i = limits_index(*t, id + ol + 1);
+        if (i >= 0) { *out_t = t; *out_i = static_cast<uint32_t>(i); return true; }
+    }
+    return false;
+}
+
+inline bool limits_set_from(LimitTable* t, uint32_t i, uint64_t v, LimitSource src,
+                            char* err, size_t err_cap) noexcept;
+
 // Programmatic override (CLI/config). Invariants cannot be set; the value
 // must be in range. Writes a reason into err on failure.
 inline bool limits_set(LimitTable* t, uint32_t i, uint64_t v,
                        char* err, size_t err_cap) noexcept {
+    return limits_set_from(t, i, v, LimitSource::kSet, err, err_cap);
+}
+
+// limits_set, recording where the value came from (kSet or kFile).
+inline bool limits_set_from(LimitTable* t, uint32_t i, uint64_t v, LimitSource src,
+                            char* err, size_t err_cap) noexcept {
+    assert(src == LimitSource::kSet || src == LimitSource::kFile);
     assert(t != nullptr && i < t->n);
     assert(err == nullptr || err_cap > 0);
     const LimitDesc& d = t->descs[i];
@@ -254,8 +377,7 @@ inline bool limits_set(LimitTable* t, uint32_t i, uint64_t v,
         return false;
     }
     t->values[i].store(v, std::memory_order_relaxed);
-    t->sources[i].store(static_cast<uint8_t>(LimitSource::kSet),
-                        std::memory_order_relaxed);
+    t->sources[i].store(static_cast<uint8_t>(src), std::memory_order_relaxed);
     return true;
 }
 
@@ -287,17 +409,26 @@ inline const char* limits_env_for(const char* name) noexcept {
 
 // Defines `enum class <fn>_id`, `bolt::LimitTable& <fn>()` (resolves and
 // registers on first call) and `uint64_t <fn>_value(<fn>_id)`.
-#define BOLT_LIMITS_TABLE(fn, owner_str, LIST)                                  \
+// BOLT_LIMITS_TABLE_BUILD also takes the build-override string (see top).
+#define BOLT_LIMITS_TABLE(fn, owner_str, LIST) \
+    BOLT_LIMITS_TABLE_BUILD(fn, owner_str, LIST, "")
+
+#define BOLT_LIMITS_TABLE_BUILD(fn, owner_str, LIST, BUILD)                    \
     enum class fn##_id : uint32_t { LIST(BOLT_LIMITS_X_ENUM) kCount };          \
     inline ::bolt::LimitTable& fn() noexcept {                                  \
-        static const ::bolt::LimitDesc descs[] = {LIST(BOLT_LIMITS_X_DESC)};    \
+        static constexpr ::bolt::LimitDesc descs[] = {LIST(BOLT_LIMITS_X_DESC)}; \
         static_assert(sizeof(descs) / sizeof(descs[0]) ==                       \
                       static_cast<size_t>(fn##_id::kCount));                    \
+        static_assert(::bolt::limits_build_valid(                               \
+                          descs, static_cast<uint32_t>(fn##_id::kCount), BUILD), \
+                      "a -D<REPO>_LIMIT_<NAME> build override names no limit "  \
+                      "of this table, sets an invariant, repeats, is not a "    \
+                      "decimal integer or is outside the limit's [min, max]");  \
         static std::atomic<uint64_t> values[static_cast<size_t>(fn##_id::kCount)]; \
         static std::atomic<uint8_t> sources[static_cast<size_t>(fn##_id::kCount)]; \
         static ::bolt::LimitTable table{                                        \
             owner_str, descs, static_cast<uint32_t>(fn##_id::kCount), values,   \
-            sources, {}};                                                        \
+            sources, {}, BUILD};                                                \
         static const bool once = [] {                                           \
             (void)::bolt::limits_resolve(&table);                               \
             return ::bolt::limits_register(&table);                             \

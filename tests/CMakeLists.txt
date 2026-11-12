@@ -2806,6 +2806,16 @@ target_link_libraries(test_bolt_limits_primitives
 bolt_apply_hardening(test_bolt_limits_primitives)
 add_test(NAME test_bolt_limits_primitives COMMAND test_bolt_limits_primitives)
 
+# Build-time Limits defaults: bolt's own table compiled with a build override,
+# as -DBOLT_LIMIT_LAKE_METADATA_BUDGET_MB=4096 would produce.
+add_executable(test_bolt_limits_build_override test_bolt_limits_build_override.cpp)
+target_compile_definitions(test_bolt_limits_build_override
+    PRIVATE BOLT_LIMITS_BUILD="lake_metadata_budget_mb=4096")
+target_link_libraries(test_bolt_limits_build_override
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_limits_build_override)
+add_test(NAME test_bolt_limits_build_override COMMAND test_bolt_limits_build_override)
+
 # G2CHK-330 (limits L2): stack-array lint (no function-scope array > 16 KiB)
 # and the literal-cap ratchet (no new capacity literal outside *limits.h).
 # Both compare against scripts/limits_lint_baseline/, which may only shrink.
