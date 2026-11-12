@@ -25,6 +25,7 @@
 #include "bolt/join/bolt_groupby_distinct.h"
 #include "bolt/join/bolt_swiss.h"
 #include "bolt/kernels/bolt_decimal.h"
+#include "bolt/kernels/bolt_decimal_div.h"
 #include "bolt/kernels/bolt_utf8.h"
 #include "bolt/kernels/numeric_key.h"
 
@@ -2319,10 +2320,14 @@ inline bool groupby_agg_multi_key_typed_finalize(
                     dec::Decimal128 s; std::memcpy(&s, &acc, 16);
                     const uint8_t in_s  = state->agg_in_scales[j];
                     const uint8_t out_s = out_aggs[j].decimal_scale;
-                    const dec::Decimal128 num = dec::d128_rescale(s, in_s, out_s);
-                    const dec::Decimal128 q   = (cnt > 0)
-                        ? dec::d128_div(num, dec::d128_from_i64(cnt))
-                        : dec::Decimal128{0, 0};
+                    dec::Decimal128 q{0, 0};
+                    if (cnt > 0) {
+                        // HALF_UP at the result scale, as the global finalizer.
+                        const dec::DivStatus ds = dec::d128_div_round(
+                            s, in_s, dec::d128_from_i64(cnt), 0, out_s, &q);
+                        assert(ds == dec::DivStatus::Ok);
+                        (void)ds;
+                    }
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: the accumulator holds a double bit pattern;
@@ -2674,10 +2679,14 @@ inline bool groupby_agg_multi_key_typed(
                     dec::Decimal128 s; std::memcpy(&s, &acc, 16);
                     const uint8_t in_s  = agg_in_scales[j];
                     const uint8_t out_s = out_aggs[j].decimal_scale;
-                    const dec::Decimal128 num = dec::d128_rescale(s, in_s, out_s);
-                    const dec::Decimal128 q   = (cnt > 0)
-                        ? dec::d128_div(num, dec::d128_from_i64(cnt))
-                        : dec::Decimal128{0, 0};
+                    dec::Decimal128 q{0, 0};
+                    if (cnt > 0) {
+                        // HALF_UP at the result scale, as the global finalizer.
+                        const dec::DivStatus ds = dec::d128_div_round(
+                            s, in_s, dec::d128_from_i64(cnt), 0, out_s, &q);
+                        assert(ds == dec::DivStatus::Ok);
+                        (void)ds;
+                    }
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: accumulator holds a double bit pattern;
