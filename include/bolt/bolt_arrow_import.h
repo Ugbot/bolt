@@ -21,6 +21,10 @@ struct ImportField {
     std::uint8_t precision=0, unit=0; // unit: 1=s,2=ms,3=us,4=ns; no rescaling
     std::uint8_t temporal_kind=0; // 1=timestamp,2=duration; non-us physical Int64
     bool large_offsets=false;
+    // G2CHK-966: fixed_size_binary ("w:N") imports as Binary of N-byte values;
+    // the arrow.uuid extension over w:16 as canonical UUID text (Utf8).
+    std::uint32_t fixed_width=0;
+    bool uuid=false;
 };
 struct ImportChunk;
 // Both arenas must have default_alignment() <= 64; larger alignments refuse
