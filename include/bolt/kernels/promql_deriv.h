@@ -18,9 +18,8 @@
 //                  then returns slope*predict_seconds + intercept, i.e. the
 //                  value predicted `predict_seconds` after eval_ts_ms.
 //
-// The four sums are Kahan-compensated as Prometheus does; the multiply-adds
-// follow BOLT_PROMQL_FUSED_MULADD (promql_over_time.h) so the last bits match
-// the Prometheus built for this target (G2LAUNCH-219).
+// The four sums are Kahan-compensated as Prometheus does (G2LAUNCH-219);
+// PromqlNumerics::fused_muladd reproduces an arm64 Go build's last bits.
 //
 // Tiger Style: noexcept, >= 2 asserts/fn, fixed-bound loops, no allocation,
 // explicit integer sizes, functions <= 70 lines.
@@ -52,7 +51,8 @@ inline bool promql_linear_regression(const int64_t* BOLT_RESTRICT ts,
                                      int64_t n,
                                      int64_t intercept_time_ms,
                                      double* BOLT_RESTRICT slope_out,
-                                     double* BOLT_RESTRICT intercept_out) noexcept {
+                                     double* BOLT_RESTRICT intercept_out,
+                                     const PromqlNumerics& num = {}) noexcept {
     assert(slope_out != nullptr);
     assert(intercept_out != nullptr);
     assert(ts != nullptr || n == 0);
@@ -73,8 +73,8 @@ inline bool promql_linear_regression(const int64_t* BOLT_RESTRICT ts,
         const double x = static_cast<double>(ts[i] - intercept_time_ms) / 1000.0;
         promql_kahan_inc(x, &sum_x, &c_x);
         promql_kahan_inc(y, &sum_y, &c_y);
-        promql_kahan_inc_mul(x, y, &sum_xy, &c_xy);
-        promql_kahan_inc_mul(x, x, &sum_x2, &c_x2);
+        promql_kahan_inc_mul(x, y, &sum_xy, &c_xy, num);
+        promql_kahan_inc_mul(x, x, &sum_x2, &c_x2, num);
     }
     if (const_y) {
         if (std::isinf(init_y)) return true;   // slope/intercept stay NaN
@@ -100,7 +100,8 @@ inline bool promql_linear_regression(const int64_t* BOLT_RESTRICT ts,
 // (fewer than two samples, or a +/-Inf-only constant series).
 inline double promql_deriv(const int64_t* BOLT_RESTRICT ts,
                            const double* BOLT_RESTRICT val,
-                           int64_t n) noexcept {
+                           int64_t n,
+                           const PromqlNumerics& num = {}) noexcept {
     assert(ts != nullptr || n == 0);
     assert(n >= 0);
     double slope = 0.0, intercept = 0.0;
@@ -108,7 +109,7 @@ inline double promql_deriv(const int64_t* BOLT_RESTRICT ts,
     // The regression is only reported undefined for fewer than two samples,
     // which is ABSENCE. An Inf-only constant series returns true with a NaN
     // slope, which is a NaN VALUE and flows through unchanged.
-    if (!promql_linear_regression(ts, val, n, itime, &slope, &intercept)) {
+    if (!promql_linear_regression(ts, val, n, itime, &slope, &intercept, num)) {
         return promql_no_sample();
     }
     return slope;
@@ -121,14 +122,15 @@ inline double promql_predict_linear(const int64_t* BOLT_RESTRICT ts,
                                     const double* BOLT_RESTRICT val,
                                     int64_t n,
                                     int64_t eval_ts_ms,
-                                    double predict_seconds) noexcept {
+                                    double predict_seconds,
+                                    const PromqlNumerics& num = {}) noexcept {
     assert(ts != nullptr || n == 0);
     assert(n >= 0);
     double slope = 0.0, intercept = 0.0;
-    if (!promql_linear_regression(ts, val, n, eval_ts_ms, &slope, &intercept)) {
+    if (!promql_linear_regression(ts, val, n, eval_ts_ms, &slope, &intercept, num)) {
         return promql_no_sample();
     }
-    return promql_mul_add(slope, predict_seconds, intercept);
+    return promql_mul_add(slope, predict_seconds, intercept, num);
 }
 
 }  // namespace promql
