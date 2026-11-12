@@ -30,6 +30,34 @@ BOLT_LIMITS_TABLE(test_limits_ok, "test_ok", TEST_LIMITS_OK)
       nullptr, "sprockets")
 BOLT_LIMITS_TABLE(test_limits_bad, "test_bad", TEST_LIMITS_BAD)
 
+// Build-time defaults (-D<REPO>_LIMIT_<NAME>): "build" beats the source
+// default, the environment beats "build".
+#define TEST_LIMITS_BUILD(X)                                                  \
+    X(cogs, kBudget, "count", 10, 1, 100, "BOLT_TEST_COGS", nullptr, "cogs")  \
+    X(gears, kFixedAtAlloc, "count", 3, 1, 9, "BOLT_TEST_GEARS", nullptr,    \
+      "gears")                                                               \
+    X(pins, kBudget, "count", 7, 0, 99, "BOLT_TEST_PINS", nullptr, "pins")    \
+    X(ring_bytes, kInvariant, "bytes", 64, 64, 64, nullptr, nullptr, "wire")
+BOLT_LIMITS_TABLE_BUILD(test_limits_build, "test_build", TEST_LIMITS_BUILD,
+                        "cogs=42;gears=9")
+
+namespace build_checks {
+constexpr bolt::LimitDesc kDescs[] = {TEST_LIMITS_BUILD(BOLT_LIMITS_X_DESC)};
+constexpr uint32_t kN = sizeof(kDescs) / sizeof(kDescs[0]);
+static_assert(bolt::limits_build_valid(kDescs, kN, ""));
+static_assert(bolt::limits_build_valid(kDescs, kN, "cogs=1"));
+static_assert(bolt::limits_build_valid(kDescs, kN, "pins=0;cogs=100"));
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cog=5"));          // no such limit
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs=101"));       // past max
+static_assert(!bolt::limits_build_valid(kDescs, kN, "gears=0"));        // under min
+static_assert(!bolt::limits_build_valid(kDescs, kN, "ring_bytes=64")); // invariant
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs=4x"));        // junk
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs="));          // no value
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs"));           // no '='
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs=5;cogs=6"));  // repeat
+static_assert(!bolt::limits_build_valid(kDescs, kN, "cogs=99999999999999999999999"));
+}  // namespace build_checks
+
 namespace {
 
 void set_env(const char* k, const char* v) {
@@ -243,6 +271,29 @@ TEST(LimitsRegistry, OutOfRangeEnvIsAStartupErrorAndKeepsDefault) {
     const char* first = bolt::limits_first_error();
     ASSERT_NE(first, nullptr);
     EXPECT_NE(std::string(first).find("sprockets"), std::string::npos);
+}
+
+TEST(LimitsRegistry, BuildOverrideReplacesDefaultAndEnvStillWins) {
+    set_env("BOLT_TEST_GEARS", "2");
+    bolt::LimitTable& t = test_limits_build();
+    EXPECT_EQ(bolt::limits_value(t, 0), 42u);
+    EXPECT_EQ(bolt::limits_source(t, 0), bolt::LimitSource::kBuild);
+    EXPECT_STREQ(bolt::limit_source_name(bolt::limits_source(t, 0)), "build");
+    EXPECT_EQ(t.descs[0].def, 10u);   // the source default is still reported
+    EXPECT_EQ(bolt::limits_value(t, 1), 2u);
+    EXPECT_EQ(bolt::limits_source(t, 1), bolt::LimitSource::kEnv);
+    EXPECT_EQ(bolt::limits_value(t, 2), 7u);
+    EXPECT_EQ(bolt::limits_source(t, 2), bolt::LimitSource::kDefault);
+    EXPECT_EQ(t.error[0], '\0');
+}
+
+TEST(LimitsRegistry, BuildFindParsesEntries) {
+    uint64_t v = 0;
+    EXPECT_EQ(bolt::limits_build_find("a=1;bb=22;c=3", "bb", &v), 1);
+    EXPECT_EQ(v, 22u);
+    EXPECT_EQ(bolt::limits_build_find("a=1;bb=22", "b", &v), 0);
+    EXPECT_EQ(bolt::limits_build_find(nullptr, "a", &v), 0);
+    EXPECT_EQ(bolt::limits_build_find("a=1;;", "z", &v), -1);
 }
 
 TEST(LimitsRegistry, ParseRejectsJunkAndOverflow) {
