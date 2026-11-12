@@ -41,6 +41,11 @@ BOLT_LIMITS_TABLE(test_limits_bad, "test_bad", TEST_LIMITS_BAD)
 BOLT_LIMITS_TABLE_BUILD(test_limits_build, "test_build", TEST_LIMITS_BUILD,
                         "cogs=42;gears=9")
 
+#define TEST_LIMITS_FILE(X)                                                  \
+    X(gears, kFixedAtAlloc, "count", 3, 1, 9, nullptr, nullptr, "gears")      \
+    X(pins, kBudget, "count", 7, 0, 99, nullptr, nullptr, "pins")
+BOLT_LIMITS_TABLE(test_limits_file, "test.file", TEST_LIMITS_FILE)
+
 namespace build_checks {
 constexpr bolt::LimitDesc kDescs[] = {TEST_LIMITS_BUILD(BOLT_LIMITS_X_DESC)};
 constexpr uint32_t kN = sizeof(kDescs) / sizeof(kDescs[0]);
@@ -285,6 +290,24 @@ TEST(LimitsRegistry, BuildOverrideReplacesDefaultAndEnvStillWins) {
     EXPECT_EQ(bolt::limits_value(t, 2), 7u);
     EXPECT_EQ(bolt::limits_source(t, 2), bolt::LimitSource::kDefault);
     EXPECT_EQ(t.error[0], '\0');
+}
+
+TEST(LimitsRegistry, FileSourceAndQualifiedLookup) {
+    bolt::LimitTable& t = test_limits_file();   // owner with a dot, like "bolt.obs"
+    const bolt::LimitTable* ft = nullptr;
+    uint32_t fi = 0;
+    ASSERT_TRUE(bolt::limits_find_qualified("test.file.pins", &ft, &fi));
+    EXPECT_EQ(ft, &t);
+    EXPECT_EQ(fi, 1u);
+    EXPECT_FALSE(bolt::limits_find_qualified("test.file.nope", &ft, &fi));
+    EXPECT_FALSE(bolt::limits_find_qualified("test.fil.pins", &ft, &fi));
+    EXPECT_FALSE(bolt::limits_find_qualified("pins", &ft, &fi));
+    char err[256] = {};
+    ASSERT_TRUE(bolt::limits_set_from(&t, 1, 8, bolt::LimitSource::kFile, err, sizeof(err)));
+    EXPECT_EQ(bolt::limits_value(t, 1), 8u);
+    EXPECT_STREQ(bolt::limit_source_name(bolt::limits_source(t, 1)), "file");
+    EXPECT_FALSE(bolt::limits_set_from(&t, 1, 100, bolt::LimitSource::kFile, err, sizeof(err)));
+    EXPECT_EQ(bolt::limits_value(t, 1), 8u);
 }
 
 TEST(LimitsRegistry, BuildFindParsesEntries) {

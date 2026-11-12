@@ -7,6 +7,12 @@
 //                    workers, caches). Settable before first use.
 //   C kBudget      — a budget that data-sized structures grow under. Settable.
 //
+// Precedence, lowest first: source default < build (-D<REPO>_LIMIT_<NAME>) <
+// file (the host's config file) < env < set (CLI / admin API). A host applies
+// its file with limits_set_from(..., kFile) only where the source is not
+// already env; one name scheme: id "<owner>.<name>", env <OWNER>_<NAME>,
+// CMake <OWNER>_LIMIT_<NAME>, file key [limits.<owner>] <name>.
+//
 // Each repo declares ONE X-macro table and instantiates it with
 // BOLT_LIMITS_TABLE. The table resolves its environment overrides once, on
 // first access, and registers itself here so a host (gestaltd) can report
@@ -55,6 +61,7 @@ enum class LimitSource : uint8_t {
     kSet     = 2,   // programmatic / CLI / config file
     kInvalid = 3,   // env override rejected; value is the default, table->error says why
     kBuild   = 4,   // -D<REPO>_LIMIT_<NAME> at configure time
+    kFile    = 5,   // the host's config file (gestalt.toml [limits])
 };
 
 inline const char* limit_kind_name(LimitKind k) noexcept {
@@ -73,6 +80,7 @@ inline const char* limit_source_name(LimitSource s) noexcept {
         case LimitSource::kSet:     return "set";
         case LimitSource::kInvalid: return "invalid";
         case LimitSource::kBuild:   return "build";
+        case LimitSource::kFile:    return "file";
     }
     return "?";
 }
@@ -322,10 +330,37 @@ inline bool limits_find(const char* name, const LimitTable** out_t,
     return false;
 }
 
+// Find "<owner>.<name>" (the qualified id; owners may contain dots, e.g.
+// "bolt.obs.obs_trace_sample_ppm").
+inline bool limits_find_qualified(const char* id, const LimitTable** out_t,
+                                  uint32_t* out_i) noexcept {
+    assert(id != nullptr && out_t != nullptr && out_i != nullptr);
+    const uint32_t n = limits_table_count();
+    for (uint32_t k = 0; k < n; ++k) {
+        const LimitTable* t = limits_table_at(k);
+        if (t == nullptr) continue;
+        const size_t ol = std::strlen(t->owner);
+        if (std::strncmp(id, t->owner, ol) != 0 || id[ol] != '.') continue;
+        const int32_t i = limits_index(*t, id + ol + 1);
+        if (i >= 0) { *out_t = t; *out_i = static_cast<uint32_t>(i); return true; }
+    }
+    return false;
+}
+
+inline bool limits_set_from(LimitTable* t, uint32_t i, uint64_t v, LimitSource src,
+                            char* err, size_t err_cap) noexcept;
+
 // Programmatic override (CLI/config). Invariants cannot be set; the value
 // must be in range. Writes a reason into err on failure.
 inline bool limits_set(LimitTable* t, uint32_t i, uint64_t v,
                        char* err, size_t err_cap) noexcept {
+    return limits_set_from(t, i, v, LimitSource::kSet, err, err_cap);
+}
+
+// limits_set, recording where the value came from (kSet or kFile).
+inline bool limits_set_from(LimitTable* t, uint32_t i, uint64_t v, LimitSource src,
+                            char* err, size_t err_cap) noexcept {
+    assert(src == LimitSource::kSet || src == LimitSource::kFile);
     assert(t != nullptr && i < t->n);
     assert(err == nullptr || err_cap > 0);
     const LimitDesc& d = t->descs[i];
@@ -342,8 +377,7 @@ inline bool limits_set(LimitTable* t, uint32_t i, uint64_t v,
         return false;
     }
     t->values[i].store(v, std::memory_order_relaxed);
-    t->sources[i].store(static_cast<uint8_t>(LimitSource::kSet),
-                        std::memory_order_relaxed);
+    t->sources[i].store(static_cast<uint8_t>(src), std::memory_order_relaxed);
     return true;
 }
 
