@@ -5,6 +5,7 @@
 // (bolt_utf8_pycase_tables.h).
 #pragma once
 
+#include "bolt/kernels/bolt_u128.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -133,21 +134,26 @@ BOLT_FORCE_INLINE double f64_round_python(double x, int32_t n) noexcept {
     const int32_t e = ex - 53;                                   // |x| = m * 2^e
     if (e >= 0) return x;                                        // an integer: nothing to round
     const uint32_t k = static_cast<uint32_t>(-e);
-    unsigned __int128 pow10 = 1;
-    for (int32_t i = 0; i < n; ++i) pow10 *= 10u;                // <= 10^22
-    const unsigned __int128 N = static_cast<unsigned __int128>(m) * pow10;   // < 2^127
-    unsigned __int128 q = 0;
+    u128::U128 N{};                                              // m * 10^n < 2^127 (10^n <= 10^22)
+    const bool fits = u128::mul_small(u128::pow10(static_cast<uint32_t>(n)), m, &N);
+    assert(fits);
+    (void)fits;
+    u128::U128 q{};
     if (k < 128) {
-        q = N >> k;
-        const unsigned __int128 r = N - (q << k);
-        const unsigned __int128 half = static_cast<unsigned __int128>(1) << (k - 1);
-        if (r > half || (r == half && (q & 1u) != 0u)) ++q;
+        q = u128::shr(N, k);
+        const u128::U128 r = u128::sub(N, u128::shl(q, k));
+        const u128::U128 half = u128::bit(k - 1);
+        if (u128::less(half, r) || (u128::equal(r, half) && (q.lo & 1u) != 0u)) (void)u128::add_small(&q, 1u);
     }
     char buf[64];
     uint32_t len = 0;
     char dig[48];
     uint32_t nd = 0;
-    do { dig[nd++] = static_cast<char>('0' + static_cast<unsigned>(q % 10u)); q /= 10u; } while (q != 0u);
+    do {
+        uint64_t rem = 0;
+        q = u128::div_small(q, 10u, &rem);
+        dig[nd++] = static_cast<char>('0' + static_cast<unsigned>(rem));
+    } while (!u128::is_zero(q));
     if (std::signbit(x)) buf[len++] = '-';
     while (nd > 0) buf[len++] = dig[--nd];
     buf[len++] = 'e';

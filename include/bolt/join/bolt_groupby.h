@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "bolt/kernels/bolt_u128.h"   // gb_fold: portable 128-bit decimal cells
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_branchless.h"
 #include "bolt/bolt_column.h"

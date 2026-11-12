@@ -23,25 +23,20 @@ BOLT_FORCE_INLINE bool gb_kind_is_fold(AggKind k) noexcept {
 
 namespace gb_fold {
 
-using i128 = __int128;
+namespace u = ::bolt::kernels::u128;   // portable 128-bit (MSVC has no __int128)
 
-inline constexpr i128 kD38Max = static_cast<i128>(10000000000000000000ULL) * 10000000000000000000ULL - 1;
+// 10^38 - 1: the largest DECIMAL(38) magnitude.
+inline u::U128 d38_max() noexcept { return u::sub(u::pow10(38), u::U128{0, 1}); }
 
-BOLT_FORCE_INLINE i128 cell_i128(GbCell16 c) noexcept {
-    return static_cast<i128>((static_cast<unsigned __int128>(static_cast<uint64_t>(c.b)) << 64) |
-                             static_cast<uint64_t>(c.a));
+// A cell's two's-complement value as sign and magnitude, and back.
+BOLT_FORCE_INLINE u::U128 cell_mag(GbCell16 c, bool* neg) noexcept {
+    const u::U128 v{static_cast<uint64_t>(c.b), static_cast<uint64_t>(c.a)};
+    *neg = (v.hi >> 63) != 0;
+    return *neg ? u::negate(v) : v;
 }
-
-BOLT_FORCE_INLINE GbCell16 i128_cell(i128 v) noexcept {
-    const auto u = static_cast<unsigned __int128>(v);
-    return GbCell16{static_cast<int64_t>(static_cast<uint64_t>(u)), static_cast<int64_t>(static_cast<uint64_t>(u >> 64))};
-}
-
-BOLT_FORCE_INLINE i128 pow10_i128(uint32_t k) noexcept {
-    assert(k <= 38);
-    i128 p = 1;
-    for (uint32_t i = 0; i < k; ++i) p *= 10;
-    return p;
+BOLT_FORCE_INLINE GbCell16 mag_cell(u::U128 m, bool neg) noexcept {
+    const u::U128 v = neg ? u::negate(m) : m;
+    return GbCell16{static_cast<int64_t>(v.lo), static_cast<int64_t>(v.hi)};
 }
 
 }  // namespace gb_fold
@@ -51,20 +46,20 @@ BOLT_FORCE_INLINE i128 pow10_i128(uint32_t k) noexcept {
 inline bool gb_fold_d128_avg(GbCell16 sum, int64_t count, uint8_t in_s, uint8_t out_s, GbCell16* out) noexcept {
     assert(count > 0 && out != nullptr);
     assert(out_s >= in_s && out_s <= 38);
-    using gb_fold::i128;
-    const i128 s = gb_fold::cell_i128(sum);
-    const bool neg = s < 0;
-    const i128 m = neg ? -s : s;
-    const i128 c = count;
-    const uint32_t k = static_cast<uint32_t>(out_s - in_s);
-    const i128 p = gb_fold::pow10_i128(k);
-    i128 whole = 0;
-    if (__builtin_mul_overflow(m / c, p, &whole)) return false;
-    const i128 frac = (m % c) * p;              // < 2^63 * 10^4: exact
-    i128 q = whole + frac / c;
-    if (2 * (frac % c) >= c) q += 1;            // HALF_UP: away from zero at .5
-    if (q > gb_fold::kD38Max) return false;
-    *out = gb_fold::i128_cell(neg ? -q : q);
+    namespace u = gb_fold::u;
+    bool neg = false;
+    const u::U128 m = gb_fold::cell_mag(sum, &neg);
+    const uint64_t c = static_cast<uint64_t>(count);
+    uint64_t rem = 0;
+    const u::U128 p = u::pow10(static_cast<uint32_t>(out_s - in_s));
+    u::U128 whole{}, frac{};
+    if (!u::mul(u::div_small(m, c, &rem), p, &whole)) return false;
+    if (!u::mul(u::U128{0, rem}, p, &frac)) return false;
+    uint64_t frem = 0;
+    u::U128 q = u::add(whole, u::div_small(frac, c, &frem));
+    if (frem >= c - frem) q = u::add(q, u::U128{0, 1});   // HALF_UP: away from zero at .5 (2 * frem >= c)
+    if (u::less(gb_fold::d38_max(), q)) return false;
+    *out = gb_fold::mag_cell(q, neg);
     return true;
 }
 
@@ -85,9 +80,13 @@ inline void gb_fold_combine(AggKind k, BoltType t, GbCell16* d, int64_t* dc, GbC
         return;
     }
     if (gb_detail::gb_agg_cell_is_d128(t)) {
-        const gb_fold::i128 r = gb_fold::cell_i128(*d) + gb_fold::cell_i128(s);
-        if (r > gb_fold::kD38Max || r < -gb_fold::kD38Max) { *dc = kGbFoldOverflow; return; }
-        *d = gb_fold::i128_cell(r);
+        namespace u = gb_fold::u;   // both within +-(10^38 - 1): the 128-bit sum cannot wrap
+        const u::U128 r = u::add(u::U128{static_cast<uint64_t>(d->b), static_cast<uint64_t>(d->a)},
+                                 u::U128{static_cast<uint64_t>(s.b), static_cast<uint64_t>(s.a)});
+        bool neg = false;
+        const u::U128 mag = gb_fold::cell_mag(GbCell16{static_cast<int64_t>(r.lo), static_cast<int64_t>(r.hi)}, &neg);
+        if (u::less(gb_fold::d38_max(), mag)) { *dc = kGbFoldOverflow; return; }
+        *d = GbCell16{static_cast<int64_t>(r.lo), static_cast<int64_t>(r.hi)};
         *dc += sc;
         return;
     }

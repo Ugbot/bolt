@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "bolt/kernels/bolt_u128.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -146,13 +147,16 @@ inline int64_t format_number_dec(int64_t hi, uint64_t lo, uint32_t scale, uint32
                                  char* out, uint32_t cap) noexcept {
     assert(out != nullptr);
     assert(scale <= 38u);
-    using u128 = unsigned __int128;
     const bool neg = hi < 0;
-    u128 m = (static_cast<u128>(static_cast<uint64_t>(hi)) << 64) | lo;
-    if (neg) m = ~m + 1u;
+    u128::U128 m{static_cast<uint64_t>(hi), lo};
+    if (neg) m = u128::negate(m);
     char rev[48], d[48];
     uint32_t nd = 0;
-    do { rev[nd++] = static_cast<char>('0' + static_cast<uint32_t>(m % 10u)); m /= 10u; } while (m != 0 && nd < 40u);
+    do {
+        uint64_t r = 0;
+        m = u128::div_small(m, 10u, &r);
+        rev[nd++] = static_cast<char>('0' + static_cast<uint32_t>(r));
+    } while (!u128::is_zero(m) && nd < 40u);
     for (uint32_t i = 0; i < nd; ++i) d[i] = rev[nd - 1 - i];
     return format_number_digits(neg, d, nd, static_cast<int32_t>(nd) - static_cast<int32_t>(scale),
                                 decimals, out, cap);

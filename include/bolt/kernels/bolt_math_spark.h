@@ -7,6 +7,7 @@
 // Column kernels are branchless loops the compiler vectorises where the scalar kernel is; none allocates.
 #pragma once
 
+#include "bolt/kernels/bolt_u128.h"
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -165,11 +166,15 @@ inline std::int64_t bround_int(std::int64_t x, std::int32_t scale, std::uint32_t
     const std::int64_t ar = r < 0 ? -r : r;
     const std::int64_t twice = ar * 2;   // |r| < 10^18: no overflow
     if (twice > p || (twice == p && (q & 1) != 0)) q += x < 0 ? -1 : 1;
-    const __int128 big = static_cast<__int128>(q) * p;
-    const std::int64_t lo = width >= 64 ? INT64_MIN : -(std::int64_t{1} << (width - 1));
-    const std::int64_t hi = width >= 64 ? INT64_MAX : (std::int64_t{1} << (width - 1)) - 1;
-    if (big < lo || big > hi) *overflow = true;
-    return wrap_width(static_cast<std::uint64_t>(static_cast<unsigned __int128>(big)), width);
+    // q * p exactly as sign and 128-bit magnitude (portable: no __int128).
+    const bool neg = (q < 0) != (p < 0) && q != 0 && p != 0;
+    const std::uint64_t aq = q < 0 ? 0u - static_cast<std::uint64_t>(q) : static_cast<std::uint64_t>(q);
+    const std::uint64_t ap = p < 0 ? 0u - static_cast<std::uint64_t>(p) : static_cast<std::uint64_t>(p);
+    const u128::U128 mag = u128::mul_u64(aq, ap);
+    const std::uint64_t lim = width >= 64 ? (neg ? std::uint64_t{1} << 63 : (std::uint64_t{1} << 63) - 1u)
+                                          : (neg ? std::uint64_t{1} << (width - 1) : (std::uint64_t{1} << (width - 1)) - 1u);
+    if (mag.hi != 0 || mag.lo > lim) *overflow = true;
+    return wrap_width(neg ? 0u - mag.lo : mag.lo, width);
 }
 
 // ---- integer / bit functions -----------------------------------------------------------------

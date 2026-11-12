@@ -86,6 +86,65 @@ inline void to_le_signed(U128 mag, bool neg, uint8_t* out16) noexcept {
     }
 }
 
+// a * b, exact.
+inline U128 mul_u64(uint64_t a, uint64_t b) noexcept {
+    const uint64_t al = a & 0xFFFFFFFFu, ah = a >> 32, bl = b & 0xFFFFFFFFu, bh = b >> 32;
+    const uint64_t ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    const uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFu) + (hl & 0xFFFFFFFFu);
+    return U128{hh + (lh >> 32) + (hl >> 32) + (mid >> 32), (mid << 32) | (ll & 0xFFFFFFFFu)};
+}
+
+// x * m; false when the result passes 128 bits.
+inline bool mul_small(U128 x, uint64_t m, U128* out) noexcept {
+    assert(out != nullptr);
+    const U128 lo = mul_u64(x.lo, m);
+    const U128 hi = mul_u64(x.hi, m);
+    if (hi.hi != 0) return false;
+    const uint64_t h = hi.lo + lo.hi;
+    if (h < lo.hi) return false;
+    *out = U128{h, lo.lo};
+    return true;
+}
+
+// x >> k, x << k and 2^k for k < 128.
+inline U128 shr(U128 x, uint32_t k) noexcept {
+    assert(k < 128u);
+    if (k == 0) return x;
+    if (k >= 64u) return U128{0, x.hi >> (k - 64u)};
+    return U128{x.hi >> k, (x.lo >> k) | (x.hi << (64u - k))};
+}
+inline U128 shl(U128 x, uint32_t k) noexcept {
+    assert(k < 128u);
+    if (k == 0) return x;
+    if (k >= 64u) return U128{x.lo << (k - 64u), 0};
+    return U128{(x.hi << k) | (x.lo >> (64u - k)), x.lo << k};
+}
+inline U128 bit(uint32_t k) noexcept { return shl(U128{0, 1}, k); }
+
+// a - b (wraps at 128 bits).
+inline U128 sub(U128 a, U128 b) noexcept {
+    U128 r{a.hi - b.hi, a.lo - b.lo};
+    if (a.lo < b.lo) --r.hi;
+    return r;
+}
+
+inline bool equal(U128 a, U128 b) noexcept { return a.hi == b.hi && a.lo == b.lo; }
+
+// a + b (wraps at 128 bits).
+inline U128 add(U128 a, U128 b) noexcept {
+    U128 r{a.hi + b.hi, a.lo + b.lo};
+    if (r.lo < a.lo) ++r.hi;
+    return r;
+}
+
+// a * b; false when the result passes 128 bits.
+inline bool mul(U128 a, U128 b, U128* out) noexcept {
+    assert(out != nullptr);
+    if (a.hi != 0 && b.hi != 0) return false;
+    if (a.hi != 0) return mul_small(a, b.lo, out);
+    return mul_small(b, a.lo, out);
+}
+
 // x / d, the remainder in *rem.
 inline U128 div_small(U128 x, uint64_t d, uint64_t* rem) noexcept {
     assert(d != 0 && rem != nullptr);
