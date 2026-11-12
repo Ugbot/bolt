@@ -177,6 +177,21 @@ inline bool d128_within_38_digits(Decimal128 v) noexcept {
     return m.hi >= 0 && d128_cmp(m, d128_pow10(38)) < 0;
 }
 
+// max |v[i]| over n values (0 for n == 0). With the exact add / mul below it
+// proves a whole column's arithmetic stays within 38 digits.
+inline Decimal128 d128_col_max_abs(const Decimal128* v, int64_t n) noexcept {
+    assert(n == 0 || v != nullptr);
+    uint64_t mhi = 0, mlo = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const Decimal128 a = div_detail::abs128(v[i]);
+        const uint64_t hi = static_cast<uint64_t>(a.hi), lo = static_cast<uint64_t>(a.lo);
+        const bool gt = hi > mhi || (hi == mhi && lo > mlo);
+        mhi = gt ? hi : mhi;
+        mlo = gt ? lo : mlo;
+    }
+    return Decimal128{static_cast<int64_t>(mlo), static_cast<int64_t>(mhi)};
+}
+
 // a ± b at scale max(sa, sb), exact; Overflow past 38 digits.
 inline DivStatus d128_addsub_exact(Decimal128 a, int sa, Decimal128 b, int sb, bool sub,
                                    Decimal128* out) noexcept {
