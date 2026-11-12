@@ -15,6 +15,7 @@
 #include "bolt/parse/bolt_ascii.h"
 #include "bolt/kernels/bolt_date.h"
 #include "bolt/kernels/bolt_decimal.h"
+#include "bolt/kernels/bolt_float_parse.h"
 
 #include <cassert>
 #include <cstdint>
@@ -409,7 +410,8 @@ static bool alloc_columns(const CsvSchema& schema, int64_t row_count,
         const BoltType t = csv_type(schema, c);
         if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8 &&
             t != BoltType::Date32 && t != BoltType::Decimal128 &&
-            t != BoltType::Decimal64 && t != BoltType::Timestamp) {
+            t != BoltType::Decimal64 && t != BoltType::Timestamp &&
+            t != BoltType::Float64) {
             return false;
         }
         if (row_count == 0) {
@@ -460,6 +462,18 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
         int64_t v = 0;
         if (flen != 0 && !field_to_timestamp_us(f_start, flen, &v)) return false;
         static_cast<int64_t*>(cols[c].data)[row] = v;
+    } else if (t == BoltType::Float64) {
+        // G2CHK-979: correctly rounded text -> double; an empty field is the
+        // caller's NULL. A leading '+' is accepted, as DuckDB reads it.
+        double v = 0.0;
+        if (flen != 0) {
+            const char* b = f_start;
+            const char* e = f_start + flen;
+            if (*b == '+') ++b;
+            const auto r = bolt::kernels::float_chars::f64_from_chars(b, e, &v);
+            if (r.status != bolt::kernels::float_chars::ParseStatus::ok || r.ptr != e) return false;
+        }
+        static_cast<double*>(cols[c].data)[row] = v;
     } else if (t == BoltType::Decimal128) {
         Decimal128 v{0, 0};
         if (!field_to_decimal128(f_start, flen,

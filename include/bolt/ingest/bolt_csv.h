@@ -63,10 +63,11 @@ inline bool csv_schema_width_ok(const CsvSchema& s) noexcept {
 //   - unsupported BoltType in schema
 // Supported types: Int32 (int10ths interpretation), Int64, Date32,
 // Timestamp (ISO text -> epoch microseconds, G2CHK-976)
-// (ISO YYYY-MM-DD), Decimal128 (per-column scale), Utf8.
+// (ISO YYYY-MM-DD), Decimal128 (per-column scale), Float64 (correctly
+// rounded, G2CHK-979), Utf8.
 //
 // Inner loop uses bolt_swar_find_byte_u64 for delimiter / line scanning
-// and bolt::parse::parse_int10th for numeric fields. No floats.
+// and bolt::parse::parse_int10th for numeric fields.
 bool parse_csv(const char* BOLT_RESTRICT buf, size_t buf_len,
                const CsvSchema& schema,
                Arena*           arena,
