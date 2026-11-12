@@ -16,6 +16,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -182,6 +185,53 @@ TEST(BoltParquetVariant, ShreddedGroupRebuildsTheVariantEncoding) {
     EXPECT_TRUE(out.is_null(3));
     EXPECT_EQ(value_at(*out.variant_metadata(), 1), dict("abc"));
 }
+
+// The variant reads keep their PqMeta copy off the stack: a ~500 KB frame
+// overflowed a 512 KB worker-thread stack (macOS std::thread default) in
+// Gestalt2's remote-binding reader. Read on a 256 KB stack.
+#if !defined(_WIN32)
+struct SmallStackRead {
+    const Bytes* file;
+    const PqMeta* meta;
+    const PqSchemaTree* tree;
+    bolt::Arena* a;
+    std::int64_t rows = -1;
+    bool ok = false;
+    bool ok_nested = false;
+};
+
+void* small_stack_read(void* p) {
+    auto* r = static_cast<SmallStackRead*>(p);
+    BoltColumn out;
+    r->ok = parquet_read_variant_column(r->file->data(), r->file->size(), r->meta, r->tree, 0, 0, r->a, &out,
+                                        &r->rows);
+    std::int64_t rows2 = 0;
+    r->ok_nested = parquet_read_nested_column_variants(r->file->data(), r->file->size(), r->meta, r->tree, 0, 0,
+                                                       r->a, &out, &rows2) && rows2 == r->rows;
+    return nullptr;
+}
+
+TEST(BoltParquetVariant, ReadsFitASmallThreadStack) {
+    bolt::Arena a;
+    const Bytes file = write_file(&a);
+    ASSERT_FALSE(file.empty());
+    PqMeta meta{};
+    ASSERT_TRUE(parquet_read_meta(file.data(), file.size(), &a, &meta));
+    PqSchemaTree tree{};
+    ASSERT_TRUE(parquet_read_schema_tree(file.data(), file.size(), &a, &tree));
+    SmallStackRead r{&file, &meta, &tree, &a};
+    pthread_attr_t attr;
+    ASSERT_EQ(pthread_attr_init(&attr), 0);
+    ASSERT_EQ(pthread_attr_setstacksize(&attr, 256u * 1024u), 0);
+    pthread_t t;
+    ASSERT_EQ(pthread_create(&t, &attr, small_stack_read, &r), 0);
+    ASSERT_EQ(pthread_join(t, nullptr), 0);
+    pthread_attr_destroy(&attr);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.rows, kRows);
+    EXPECT_TRUE(r.ok_nested);
+}
+#endif
 
 TEST(BoltParquetVariant, UnshreddedGroupIsTakenAsIs) {
     bolt::Arena a;

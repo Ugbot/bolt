@@ -526,11 +526,13 @@ bool parquet_read_variant_column(const uint8_t* buf, uint64_t len, const PqMeta*
                                  int64_t* out_rows) noexcept {
     if (buf == nullptr || meta == nullptr || tree == nullptr || arena == nullptr || out == nullptr || out_rows == nullptr) return false;
     if (top_field >= tree->n_top || !pq_variant_group_ok(tree, tree->top[top_field])) return false;
-    PqMeta raw{};
+    // PqMeta is ~500 KB (inline row-group array): never a stack local.
+    PqMeta* raw = arena->allocate_array<PqMeta>(1);
+    if (raw == nullptr) return false;
     BoltColumn gc;
     int64_t rows = 0;
-    if (!pq_variant_read_meta(meta, tree, top_field, true, arena, &raw)) return false;
-    if (!parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, &gc, &rows)) return false;
+    if (!pq_variant_read_meta(meta, tree, top_field, true, arena, raw)) return false;
+    if (!parquet_read_nested_column_tree(buf, len, raw, tree, row_group, top_field, arena, &gc, &rows)) return false;
     if (!pq_variant_fold(tree, meta, top_field, true, &gc, arena)) return false;
     *out = gc;
     *out_rows = rows;
@@ -544,9 +546,9 @@ bool parquet_read_nested_column_variants(const uint8_t* buf, uint64_t len, const
     if (top_field >= tree->n_top) return false;
     const int32_t f = tree->top[top_field];
     if (!has_variant_group(tree, f, 0u)) return parquet_read_nested_column_tree(buf, len, meta, tree, row_group, top_field, arena, out, out_rows);
-    PqMeta raw{};
-    if (!raw_time_meta(meta, tree, f, arena, &raw) ||
-        !parquet_read_nested_column_tree(buf, len, &raw, tree, row_group, top_field, arena, out, out_rows)) return false;
+    PqMeta* raw = arena->allocate_array<PqMeta>(1);   // ~500 KB: never a stack local
+    if (raw == nullptr || !raw_time_meta(meta, tree, f, arena, raw) ||
+        !parquet_read_nested_column_tree(buf, len, raw, tree, row_group, top_field, arena, out, out_rows)) return false;
     return unshred_tree(tree, meta, f, out, arena, 0u);
 }
 
