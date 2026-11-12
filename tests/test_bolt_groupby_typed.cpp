@@ -1484,7 +1484,10 @@ TEST(BoltDecimalDivG2chk977, ExactAddSubMul) {
     EXPECT_EQ(dec::d128_mul_exact(dec::d128_pow10(19), dec::d128_pow10(19), &r), dec::DivStatus::Overflow);
     EXPECT_EQ(dec::d128_mul_exact(pow10_times(9, 37), pow10_times(9, 37), &r), dec::DivStatus::Overflow);
     ASSERT_EQ(dec::d128_mul_exact(pow10_times(9, 18), pow10_times(-11, 18), &r), dec::DivStatus::Ok);
-    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-99, 36)), 0);
+    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-99, 36)), 0);    const dec::Decimal128 col[4] = {dec::d128_from_i64(3), pow10_times(-7, 30), dec::d128_from_i64(-1),
+                                    pow10_times(6, 30)};
+    EXPECT_EQ(dec::d128_cmp(dec::d128_col_max_abs(col, 4), pow10_times(7, 30)), 0);
+    EXPECT_EQ(dec::d128_cmp(dec::d128_col_max_abs(col, 0), dec::d128_from_i64(0)), 0);
 }
 
 // Group 0: 6e37 + 6e37 = 1.2e38 (past 38 digits, inside 128 bits).
