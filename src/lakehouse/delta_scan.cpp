@@ -235,9 +235,10 @@ bool gather_column_for_dv(const BoltColumn& src, const int32_t* sel,
     assert(arena != nullptr && out != nullptr);
     assert(sel != nullptr || sel_n == 0);
     if (src.format != ColumnFormat::Flat) return false;
-    const size_t tsz = bolt::type_size(src.type);
+    const size_t tsz = src.type == BoltType::Binary ? sizeof(StringView) : bolt::type_size(src.type);
     if (tsz == 0) return false;
-    BoltColumn c = BoltColumn::make_flat_alloc(sel_n, src.type, arena);
+    BoltColumn c = BoltColumn::make_flat_alloc(sel_n, src.type == BoltType::Binary ? BoltType::Utf8 : src.type, arena);
+    if (src.type == BoltType::Binary && c.format == ColumnFormat::Flat) c.type = BoltType::Binary;   // G2CHK-948: StringView slots
     if (sel_n > 0 && c.data == nullptr) return false;
     if (sel_n > 0 &&
         !gather_pod_dispatch(src.data, sel, sel_n, c.data,
@@ -259,7 +260,7 @@ bool gather_column_for_dv(const BoltColumn& src, const int32_t* sel,
         c.stats.null_count = static_cast<uint32_t>(null_count);
         c.stats.all_valid = (null_count == 0);
     }
-    if (src.type == BoltType::Utf8) c.str_overflow_base = src.str_overflow_base;
+    if (src.type == BoltType::Utf8 || src.type == BoltType::Binary) c.str_overflow_base = src.str_overflow_base;
     c.decimal_scale = src.decimal_scale;
     *out = c;
     return true;
