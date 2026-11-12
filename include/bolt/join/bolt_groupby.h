@@ -674,7 +674,7 @@ struct AggSpec {
 static_assert(sizeof(AggSpec) == 8, "AggSpec must be 8 bytes");
 
 inline constexpr uint32_t kGbMaxKeys  = 8;   // was 4; TPC-H Q10 GROUP BYs 7 cols
-inline constexpr uint32_t kGbMaxAggs  = 16;
+inline constexpr uint32_t kGbMaxAggs  = 128;  // G2CHK-971: = chukonu k_max_aggs_per_node (was 16: a 17th typed aggregate aborted)
 inline constexpr uint32_t kGbEntryCap = 1u << 24;   // 16M groups hard cap
 // K-AGG-C: ingest processes rows in windows of this size; the gid
 // scratch (one int32 per window row) is allocated once in _begin.
