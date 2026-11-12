@@ -334,6 +334,30 @@ TEST(BoltCsv, ParseInt64FullRange) {
     }
 }
 
+// G2CHK-979: Float64 fields are correctly rounded (the nearest double to the
+// decimal text), so 0.1 is the literal 0.1; malformed text fails the parse.
+TEST(BoltCsv, ParseFloat64CorrectlyRounded) {
+    const char* input = "0.1\n-2.5\n+3\n1e-3\n9007199254740993\n0.30000000000000004\n\n";
+    CsvSchema schema{};
+    schema.col_types[0] = BoltType::Float64;
+    schema.num_cols = 1; schema.delimiter = ','; schema.has_header = false;
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 7);
+    const auto* v = static_cast<const double*>(batch.col(0).data);
+    EXPECT_EQ(v[0], 0.1);
+    EXPECT_EQ(v[1], -2.5);
+    EXPECT_EQ(v[2], 3.0);
+    EXPECT_EQ(v[3], 1e-3);
+    EXPECT_EQ(v[4], 9007199254740992.0);   // ties to even
+    EXPECT_EQ(v[5], 0.30000000000000004);
+    EXPECT_EQ(v[6], 0.0);                  // empty: the caller marks it NULL
+    for (const char* bad : {"1.5x\n", "--1\n", ".\n", "1e400\n"}) {
+        Arena a2; BoltBatch b2;
+        EXPECT_FALSE(parse_csv(bad, std::strlen(bad), schema, &a2, &b2)) << bad;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decimal128 round-trip at multiple scales.
 // ---------------------------------------------------------------------------
