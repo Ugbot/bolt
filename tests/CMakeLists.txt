@@ -3114,3 +3114,11 @@ target_link_libraries(test_bolt_hash_encode
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_hash_encode)
 add_test(NAME test_bolt_hash_encode COMMAND test_bolt_hash_encode)
+# G2CHK-963: Spark parse_json / to_json over the variant encoding, against Spark 4.0.4 vectors.
+add_executable(test_bolt_variant_spark test_bolt_variant_spark.cpp)
+target_link_libraries(test_bolt_variant_spark
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_bolt_variant_spark PRIVATE
+    BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+bolt_apply_hardening(test_bolt_variant_spark)
+add_test(NAME test_bolt_variant_spark COMMAND test_bolt_variant_spark)
