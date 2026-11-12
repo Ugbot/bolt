@@ -908,6 +908,12 @@ BOLT_FORCE_INLINE void gb_store_key(void* buf, int64_t r, BoltType t, GbCell16 k
             std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &kc, 16); break;
         case BoltType::Utf8:
             std::memcpy(&static_cast<StringView*>(buf)[r], &kc, 16); break;
+        case BoltType::Float32: {   // read_cell16 promoted it to double bits
+            double d = 0.0;
+            std::memcpy(&d, &kc.a, 8);
+            static_cast<float*>(buf)[r] = static_cast<float>(d);
+            break;
+        }
         default:   // Decimal64 (cell.a IS the mantissa) and the 8-byte lanes.
             static_cast<int64_t*>(buf)[r] = kc.a; break;
     }

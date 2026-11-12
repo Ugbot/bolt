@@ -2690,16 +2690,16 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
             }
             if (is_ts)   { *out_type = BoltType::Timestamp; return true; }
             if (is_time) { *out_type = BoltType::Duration;  return true; }
-            // INTEGER WIDTH: deliberately NOT narrowed to exact unsigned types.
-            // G2FEAT-46 originally mapped unsigned IntType to UInt8/16/32/64.
-            // That is more type-faithful, but it would change the BoltType of
-            // real production columns (e.g. the TAQ rowgroup u16/u64 columns)
-            // and downstream lane support for exact unsigned is thin -- 4
-            // BoltType::UInt16/UInt32 references in all of chukonu/src, 14 in
-            // marbledb/src. Flipping it needs a downstream kernel audit, not a
-            // reader change. Until then keep the signed lane, which every
-            // kernel handles, and which is what main already produced.
-            // Tracked as a follow-up; see the note in tests/test_bolt_parquet_types.cpp.
+            // UINT_64 takes the exact UInt64 lane (G2CHK-947). It used to stay
+            // on Int64 as a raw bit pattern, so every value above 2^63-1 read
+            // back negative through every operator. The engine now carries
+            // UInt64 through sort, top-N, aggregates, windows and egress
+            // (chukonu G2CHK-937/945), which is the audit this waited on.
+            // Narrower unsigned widths still widen to the next signed lane.
+            if (is_int && col->int_signed == 0 && col->int_bits == 64) {
+                *out_type = BoltType::UInt64;
+                return true;
+            }
             *out_type = BoltType::Int64;
             return true;
         case PqType::Int32:
@@ -2731,11 +2731,6 @@ bool parquet_map_type(const PqColumn* col, BoltType* out_type,
                 // ZERO-extends it at decode (src_signed = 0) -- sign-extending
                 // would reintroduce the same negatives one layer down.
                 //
-                // u64 has no wider signed lane and stays a raw Int64 bit
-                // pattern above 2^63-1; fixing that needs a real UInt64 lane
-                // plus the downstream kernel audit the Int64 note describes,
-                // not a widening. golden_taq_types.parquet pins the current
-                // bit-pattern behaviour.
                 if (col->int_signed) {
                     switch (col->int_bits) {
                         case 8:  *out_type = BoltType::Int8;  return true;
