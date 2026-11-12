@@ -645,6 +645,11 @@ enum class AggKind : uint8_t {
     MaxBy     = 8,
     MinBy     = 9,
     ByOrd     = 10,
+    // Spark product / try_sum / try_avg (bolt_groupby_fold.inc). counts[] holds
+    // the folded value count, or kGbFoldOverflow once the sum left its range.
+    Product   = 11,
+    TrySum    = 12,
+    TryAvg    = 13,
 };
 
 struct AggSpec {
@@ -1058,6 +1063,8 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
         case AggKind::First: case AggKind::Last:
         case AggKind::MaxBy: case AggKind::MinBy:
         case AggKind::ByOrd: return GbCell16{0, 0};   // unset: counts[] == 0
+        case AggKind::Product: case AggKind::TrySum:
+        case AggKind::TryAvg: return GbCell16{0, 0};  // nothing folded: counts[] == 0
     }
     return GbCell16{0, 0};
 }
@@ -1254,6 +1261,9 @@ inline bool window_has_null_key(const BoltColumn* keys, uint32_t n_keys,
 // Decide output BoltType for one agg given its input type.
 BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     if (k == AggKind::CountStar || k == AggKind::Count) return BoltType::Int64;
+    if (k == AggKind::Product) return BoltType::Float64;
+    if (k == AggKind::TrySum || k == AggKind::TryAvg)
+        return (k == AggKind::TryAvg || gb_agg_cell_is_d128(in)) ? BoltType::Decimal128 : BoltType::Int64;
     if (k == AggKind::Avg) {
         // W-DEC: Avg(Decimal64) accumulates in the widened d128 cell and
         // finalizes through the SAME d128 rescale(+4)/div path, so the
@@ -1755,6 +1765,8 @@ inline bool gb_agg_utf8_minmax(GroupbyTypedState* state, uint32_t j,
 // navigable; included only here.
 // Spark first / last / max_by / min_by cells, folded per row in input order.
 #include "bolt/join/bolt_groupby_pick.inc"
+// Spark product / try_sum / try_avg cells (overflow-to-NULL sums).
+#include "bolt/join/bolt_groupby_fold.inc"
 
 #include "bolt/join/bolt_groupby_twopass.inc"
 
@@ -1835,6 +1847,10 @@ inline void gb_ingest_fallback(
             if (kj == AggKind::ByOrd) continue;   // written by its MaxBy / MinBy
             if (gb_kind_is_pick(kj)) {
                 if (!gb_pick_row(state, j, slot, payload, r)) return;
+                continue;
+            }
+            if (gb_kind_is_fold(kj)) {
+                gb_fold_row(state, j, slot, payload, r);
                 continue;
             }
             GbCell16 v{0, 0};
@@ -2214,7 +2230,8 @@ inline bool groupby_agg_multi_key_typed_finalize(
                                                 state->agg_in_types[j]);
         out_aggs[j] = BoltColumn::make_flat_alloc(out_n, ot, arena);
         if (ot == BoltType::Decimal128 || ot == BoltType::Decimal64) {
-            out_aggs[j].decimal_scale = (state->specs[j].kind == AggKind::Avg)
+            out_aggs[j].decimal_scale = (state->specs[j].kind == AggKind::Avg ||
+                                         state->specs[j].kind == AggKind::TryAvg)
                 ? decimal_avg_scale(state->agg_in_scales[j])
                 : state->agg_in_scales[j];
         }
@@ -2288,6 +2305,11 @@ inline bool groupby_agg_multi_key_typed_finalize(
             if (state->specs[j].kind == AggKind::CountStar ||
                 state->specs[j].kind == AggKind::Count) {
                 static_cast<int64_t*>(buf)[r] = acc.a;
+                continue;
+            }
+            if (gb_kind_is_fold(state->specs[j].kind)) {
+                gb_fold_emit(state->specs[j].kind, ot, state->agg_in_scales[j], out_aggs[j].decimal_scale, acc,
+                             &state->counts[off], buf, r);
                 continue;
             }
             if (state->specs[j].kind == AggKind::Avg) {

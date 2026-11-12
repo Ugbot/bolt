@@ -285,4 +285,42 @@ BOLT_FORCE_INLINE void hll_add_u64(HllPp<P>* sketch, uint64_t key) noexcept {
                     ::bolt::swiss_mix_murmur3(::bolt::swiss_mix(key)));
 }
 
+// ---------------------------------------------------------------------------
+// Runtime-precision form of the same sketch: one byte per register over a
+// caller-owned array of m = 2^p bytes, the same index / rank convention as
+// hll_add_hash (idx = top p bits, rank = clz((h << p) | 2^(p-1)) + 1) and the
+// same register-max merge. Spark's HLL++ picks p per query (bolt_hll_spark.h).
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t k_hll_rt_min_p = 4;
+inline constexpr uint32_t k_hll_rt_max_p = 26;
+
+BOLT_FORCE_INLINE void hll_rt_add_hash(uint8_t* regs, uint32_t p, uint64_t hash) noexcept {
+    assert(regs != nullptr);
+    assert(p >= k_hll_rt_min_p && p <= k_hll_rt_max_p);
+    const uint32_t idx = static_cast<uint32_t>(hash >> (64u - p));
+    const uint64_t w   = (hash << p) | (1ull << (p - 1u));
+    const uint8_t  rho = static_cast<uint8_t>(::bolt_clz64(w) + 1);
+    const uint8_t  old = regs[idx];
+    regs[idx]          = (rho > old) ? rho : old;
+}
+
+// Fold n hashes; a row whose bit is clear in `valid` (Arrow order, nullptr =
+// all valid) is skipped.
+inline void hll_rt_add_hashes(uint8_t* BOLT_RESTRICT regs, uint32_t p, const uint64_t* BOLT_RESTRICT hashes,
+                              const uint8_t* BOLT_RESTRICT valid, int64_t n) noexcept {
+    assert(regs != nullptr && (hashes != nullptr || n == 0));
+    assert(p >= k_hll_rt_min_p && p <= k_hll_rt_max_p && n >= 0);
+    for (int64_t i = 0; i < n; ++i) {
+        if (valid != nullptr && ((valid[i >> 3] >> (i & 7)) & 1u) == 0u) continue;
+        hll_rt_add_hash(regs, p, hashes[i]);
+    }
+}
+
+// dst[i] = max(dst[i], src[i]) over m registers; ranges disjoint.
+inline void hll_rt_merge(uint8_t* BOLT_RESTRICT dst, const uint8_t* BOLT_RESTRICT src, uint32_t m) noexcept {
+    assert(dst != nullptr && src != nullptr);
+    assert(m >= (1u << k_hll_rt_min_p) && (m & (m - 1u)) == 0u);
+    for (uint32_t i = 0; i < m; ++i) dst[i] = dst[i] > src[i] ? dst[i] : src[i];
+}
+
 }  // namespace bolt::kernels::hll
