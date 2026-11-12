@@ -145,6 +145,12 @@ struct FieldSpec {
     // Zero (a zeroed FieldSpec) is zone-less microseconds, the unit
     // BoltType::Timestamp has always meant here.
     std::uint8_t      time_unit;
+    // 1: the Field is written nullable=false (e.g. a Spark variant's value / metadata).
+    std::uint8_t      non_null;
+    // One custom_metadata entry on the Field (both or neither), e.g. {"variant": "true"} on a Spark
+    // variant's `metadata` child; borrowed, must outlive the open() call.
+    const char*       meta_key;
+    const char*       meta_value;
 };
 
 /// One flattened field, as arrow_ipc_open()/arrow_ipc_open_nested() build
@@ -166,6 +172,8 @@ struct IpcFieldDesc {
     std::uint8_t  decimal_scale;   // Decimal128 leaves only
     std::uint8_t  time_unit;       // Timestamp leaves only (IpcTimeUnit)
     std::uint8_t  non_null;        // 1: the Field is written nullable=false (map entries, key)
+    const char*   meta_key;        // custom_metadata {meta_key: meta_value}, or nullptr
+    const char*   meta_value;
 };
 
 // Zero-initialize before the first open() (calloc or `{}`); open()
