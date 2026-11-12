@@ -304,11 +304,82 @@ TEST(PromqlOverTime, StdvarStddevQuantileMad) {
     double mad[7] = {4, 6, 2, 1, 999, 1, 2};
     EXPECT_NEAR(bolt::promql::promql_mad(mad, 7), 1.0, 1e-12);
 
-    double nanv[3] = {1, std::numeric_limits<double>::quiet_NaN(), 4};
-    EXPECT_TRUE(std::isnan(bolt::promql::promql_mad(nanv, 3)));
     EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(two, 0, 0.5)));
     double qn[2] = {0, 1};
     EXPECT_EQ(bolt::promql::promql_quantile(qn, 2, -1.0), -kInf);
     double qp[2] = {0, 1};
     EXPECT_EQ(bolt::promql::promql_quantile(qp, 2, 2.0), kInf);
+}
+
+// Captured from Prometheus 3.5.0 (G2LAUNCH-218): quantile of one sample is
+// v*(1-w) + v*w, so a lone +/-Inf or NaN gives NaN.
+TEST(PromqlOverTime, QuantileOfOneSampleInterpolatesLikePrometheus) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    double ninf[1] = {-kInf};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(ninf, 1, 0.5)));
+    double ninf3[1] = {-kInf};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(ninf3, 1, 0.3)));
+    double pinf[1] = {kInf};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(pinf, 1, 0.5)));
+    double one_nan[1] = {nan};
+    EXPECT_TRUE(std::isnan(bolt::promql::promql_quantile(one_nan, 1, 0.5)));
+    double one[1] = {5.25};
+    EXPECT_EQ(bolt::promql::promql_quantile(one, 1, 0.5), 5.25);
+}
+
+// Captured from Prometheus 3.5.0 (G2LAUNCH-218): mad_over_time does not
+// short-circuit on NaN; NaN sorts first, then two medians.
+TEST(PromqlOverTime, MadWithNanSamplesLikePrometheus) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    double a[5] = {1, nan, 4, 10, 2};
+    EXPECT_EQ(bolt::promql::promql_mad(a, 5), 1.0);
+    double b[6] = {nan, nan, 3, -7.5, 1e16, 2};
+    EXPECT_EQ(bolt::promql::promql_mad(b, 6), 4.75);
+    double q[5] = {1, nan, 4, 10, 2};
+    EXPECT_EQ(bolt::promql::promql_quantile(q, 5, 0.5), 2.0);
+}
+
+// Captured from Prometheus 3.5.0 darwin-arm64 (G2LAUNCH-219): Kahan-summed
+// regression, with Go's arm64 multiply-add fusion. The x86-64 values are
+// Go's unfused arithmetic (GOAMD64=v1), modelled in IEEE doubles.
+namespace {
+constexpr int64_t kCpuStart = 1700000006782;
+const double kCpu[39] = {
+    -1.5, -2.151, -4.0, -7.887186647, -9.427347275, -9.688403464, -11.649,
+    -13.2, -11.2, -7.394935556, -6.456, -6.3, -4.048700879, -1.733552262, 1.7,
+    4.626469011, 4.7, 1.2, 3.039595549, -0.740582915, 0.263816894, 0.8, 1.2,
+    -1.023303916, 1.5, 5.037, 4.3, 3.0, 2.7, 3.057827419, 3.616, 4.607, 8.167,
+    7.337, 7.047, 10.2, 10.7, 13.0, 13.0};
+constexpr int64_t kUserStart = 1700000010831;
+const double kUser[10] = {6.200414165, 4.0, 4.5, 3.192447998, 3.799, 3.976,
+                          9.0, 9.0, 8.842, 6.678};
+constexpr int64_t kEval = 1700000580000;
+}  // namespace
+
+TEST(PromqlDeriv, KahanRegressionLikePrometheus) {
+    int64_t ts[39];
+    mk_ts(ts, kCpuStart, 15000, 39);
+    int64_t tu[10];
+    mk_ts(tu, kUserStart, 60000, 10);
+    if (bolt::promql::kPromqlFusedMulAdd) {
+        EXPECT_EQ(promql_deriv(ts, kCpu, 39), 0.0341426831725371);
+        EXPECT_EQ(promql_deriv(tu, kUser, 10), 0.007908275608181822);
+    } else {
+        EXPECT_EQ(promql_deriv(ts, kCpu, 39), 0.03414268317253712);
+        EXPECT_EQ(promql_deriv(tu, kUser, 10), 0.00790827560818181);
+    }
+}
+
+TEST(PromqlPredictLinear, KahanRegressionLikePrometheus) {
+    int64_t ts[39];
+    mk_ts(ts, kCpuStart, 15000, 39);
+    int64_t tu[10];
+    mk_ts(tu, kUserStart, 60000, 10);
+    if (bolt::promql::kPromqlFusedMulAdd) {
+        EXPECT_EQ(promql_predict_linear(ts, kCpu, 39, kEval, 3600.0), 133.17467466331996);
+        EXPECT_EQ(promql_predict_linear(tu, kUser, 10, kEval, 3600.0), 36.75448931117871);
+    } else {
+        EXPECT_EQ(promql_predict_linear(ts, kCpu, 39, kEval, 3600.0), 133.17467466332);
+        EXPECT_EQ(promql_predict_linear(tu, kUser, 10, kEval, 3600.0), 36.75448931117869);
+    }
 }

@@ -20,7 +20,8 @@
 namespace bolt {
 namespace promql {
 
-// Insertion-sort `vals[0..n)` ascending. NaN sorts to the end (Prometheus).
+// Insertion-sort `vals[0..n)` ascending. NaN sorts first, as Prometheus's
+// vectorByValueHeap.Less does.
 inline void promql_sort_values(double* BOLT_RESTRICT vals, int64_t n) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
@@ -49,7 +50,6 @@ inline double promql_quantile(double* BOLT_RESTRICT vals, int64_t n,
     if (q < 0.0) return -std::numeric_limits<double>::infinity();
     if (q > 1.0) return  std::numeric_limits<double>::infinity();
     promql_sort_values(vals, n);
-    if (n == 1) return vals[0];
     const double rank = q * static_cast<double>(n - 1);
     const double lo_d = std::floor(rank);
     const int64_t lo = static_cast<int64_t>(lo_d);
@@ -58,6 +58,18 @@ inline double promql_quantile(double* BOLT_RESTRICT vals, int64_t n,
     const double weight = rank - lo_d;
     return vals[lo] * (1.0 - weight) + vals[hi] * weight;
 }
+
+// Go fuses a*b+c into one multiply-add on arm64 and not on x86-64
+// (GOAMD64=v1), so Prometheus's last bits depend on its build target. Match
+// the Prometheus built for this target; -DBOLT_PROMQL_FUSED_MULADD=0/1 overrides.
+#ifndef BOLT_PROMQL_FUSED_MULADD
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define BOLT_PROMQL_FUSED_MULADD 1
+#else
+#define BOLT_PROMQL_FUSED_MULADD 0
+#endif
+#endif
+inline constexpr bool kPromqlFusedMulAdd = BOLT_PROMQL_FUSED_MULADD != 0;
 
 // Prometheus kahanSumInc: Neumaier-compensated sum + inc.
 inline void promql_kahan_inc(double inc, double* sum, double* c) noexcept {
@@ -71,6 +83,33 @@ inline void promql_kahan_inc(double inc, double* sum, double* c) noexcept {
         *c += (inc - t) + *sum;
     }
     *sum = t;
+}
+
+// promql_kahan_inc(a * b, ...) as Go compiles it: on arm64 the product feeds
+// the sum and the compensation as fused multiply-adds.
+inline void promql_kahan_inc_mul(double a, double b, double* sum, double* c) noexcept {
+    assert(sum != nullptr && c != nullptr);
+    if constexpr (!kPromqlFusedMulAdd) {
+        promql_kahan_inc(a * b, sum, c);
+        return;
+    }
+    const double inc = a * b;
+    const double t = std::fma(a, b, *sum);
+    if (std::isinf(t)) {
+        *c = 0.0;
+    } else if (std::fabs(*sum) >= std::fabs(inc)) {
+        *c += std::fma(a, b, *sum - t);
+    } else {
+        *c += std::fma(a, b, -t) + *sum;
+    }
+    *sum = t;
+}
+
+// a * b + c, fused where Go fuses it.
+inline double promql_mul_add(double a, double b, double c) noexcept {
+    if constexpr (kPromqlFusedMulAdd) return std::fma(a, b, c);
+    const double p = a * b;
+    return p + c;
 }
 
 // Population variance exactly as Prometheus varianceOverTime: Welford with
@@ -95,13 +134,11 @@ inline double promql_stddev(const double* BOLT_RESTRICT vals, int64_t n) noexcep
     return std::isnan(v) ? v : std::sqrt(v);
 }
 
-// Median of |x - median(x)|. Any NaN => NaN. Mutates vals.
+// Median of |x - median(x)|, NaN ordered first as Prometheus does. Mutates vals.
 inline double promql_mad(double* BOLT_RESTRICT vals, int64_t n) noexcept {
     assert(vals != nullptr || n == 0);
     assert(n >= 0);
     if (n <= 0) return promql_no_sample();
-    for (int64_t i = 0; i < n; ++i)
-        if (std::isnan(vals[i])) return promql_nan();  // a NaN VALUE, emitted
     const double med = promql_quantile(vals, n, 0.5);
     for (int64_t i = 0; i < n; ++i)
         vals[i] = std::fabs(vals[i] - med);
