@@ -32,22 +32,11 @@ using namespace bolt::ingest::parquet;
 // this test was authored against an older header layout.)
 using bolt::BoltType;
 
-// UNSIGNED WIDTHS -- a deliberate, recorded deviation from this test's
-// original (2026-07-19) intent, made when it was rebased onto main.
-//
-// As authored, G2FEAT-46 mapped unsigned parquet IntType to exact UInt8/16/32/64.
-// That is the more type-faithful answer. It is NOT landed, because it would
-// change the BoltType of real production columns (the NYSE TAQ rowgroup u16/u64
-// columns that TPC-H/TAQ/ClickBench are validated against) and downstream lane
-// support for exact unsigned is thin: 4 BoltType::UInt16/UInt32 references in
-// all of chukonu/src, 14 in marbledb/src. A reader change cannot safely widen
-// the type surface the whole engine consumes; that needs a downstream kernel
-// audit first.
-//
-// So integer mapping reproduces main exactly (signed lanes, lossless), and
-// every OTHER part of G2FEAT-46 -- LogicalType(field 10) resolution, timestamp
-// milli/micro/NANO units, TIME, INT96 legacy timestamps, INT32-backed DECIMAL --
-// is landed and covered below. Revisit the unsigned question with the audit.
+// UNSIGNED WIDTHS. u8/u16 take Int32 and u32 takes Int64 (the next wider
+// signed lane, G2FEAT-111); u64 has no wider signed lane and takes the exact
+// UInt64 lane (G2CHK-947), now that the engine carries UInt64 through every
+// operator. The 2026-07-19 note that held u64 on Int64 as a raw bit pattern
+// waited on exactly that downstream audit.
 
 // Build a normalized leaf-column descriptor as the meta parser would produce.
 PqColumn mk(PqType physical, PqLogical logical, int32_t time_unit,
@@ -109,10 +98,8 @@ TEST(BoltParquetTypes, Int32DecimalMapsToDecimal64) {
 // Unsigned widths take the NEXT WIDER SIGNED lane, per width (G2FEAT-111) --
 // the narrowest lane that holds every value that width can carry. u8/u16 fit
 // Int32; u32 does NOT (2^31..2^32-1 read back negative) so it widens to
-// Int64. u64 is the one genuinely lossy case left and is documented as such
-// in parquet_map_type -- it has no wider signed lane, so closing it needs a
-// real UInt64 lane plus the downstream kernel audit the UNSIGNED WIDTHS note
-// above describes, not a mapping change.
+// Int64. u64 has no wider signed lane, so it takes the exact UInt64 lane
+// (G2CHK-947) now that the engine carries UInt64 end to end.
 TEST(BoltParquetTypes, UnsignedIntsMapToNextWiderSignedLane) {
     EXPECT_EQ(map_ok(mk(PqType::Int32, PqLogical::Int, 0, 8, 0, 0, 0, 0)),
               bolt::BoltType::Int32);   // u8  -> fits signed 32
@@ -121,7 +108,7 @@ TEST(BoltParquetTypes, UnsignedIntsMapToNextWiderSignedLane) {
     EXPECT_EQ(map_ok(mk(PqType::Int32, PqLogical::Int, 0, 32, 0, 0, 0, 0)),
               bolt::BoltType::Int64);   // u32 -> needs signed 64 (G2FEAT-111)
     EXPECT_EQ(map_ok(mk(PqType::Int64, PqLogical::Int, 0, 64, 0, 0, 0, 0)),
-              bolt::BoltType::Int64);   // u64 -> lossy above 2^63-1, tracked
+              bolt::BoltType::UInt64);  // u64 -> exact UInt64 (G2CHK-947)
 }
 
 TEST(BoltParquetTypes, SignedSubwordIntsMapToNarrowInts) {
