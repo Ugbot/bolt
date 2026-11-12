@@ -31,3 +31,16 @@
 #include "bolt/kernels/promql_native_histogram.h"
 #include "bolt/kernels/promql_nh_rate.h"
 #include "bolt/kernels/promql_over_time.h"
+
+// Contraction is chosen by PromqlNumerics::fused_muladd, never by the compiler:
+// an implicit fma would make answers depend on the CPU (MSVC never contracts
+// under /fp:precise).
+#if defined(__clang__)
+#pragma float_control(push)
+#pragma clang fp contract(off)
+#endif
+
+
+#if defined(__clang__)
+#pragma float_control(pop)
+#endif

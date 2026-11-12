@@ -17,6 +17,14 @@
 #include <cmath>
 #include <limits>
 
+// Contraction is chosen by PromqlNumerics::fused_muladd, never by the compiler:
+// an implicit fma would make answers depend on the CPU (MSVC never contracts
+// under /fp:precise).
+#if defined(__clang__)
+#pragma float_control(push)
+#pragma clang fp contract(off)
+#endif
+
 namespace bolt {
 namespace promql {
 
@@ -162,3 +170,7 @@ inline double promql_mad(double* BOLT_RESTRICT vals, int64_t n,
 
 }  // namespace promql
 }  // namespace bolt
+
+#if defined(__clang__)
+#pragma float_control(pop)
+#endif

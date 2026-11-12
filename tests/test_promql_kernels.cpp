@@ -10,7 +10,9 @@
 #include <gtest/gtest.h>
 
 #include "bolt/kernels/promql.h"
+#include "bolt/kernels/promql_smoothing.h"
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -406,4 +408,35 @@ TEST(PromqlPredictLinear, KahanRegressionLikePrometheus) {
     EXPECT_EQ(promql_predict_linear(tu, kUser, 10, kEval, 3600.0), 36.75448931117869);
     EXPECT_EQ(promql_predict_linear(ts, kCpu, 39, kEval, 3600.0, kFused), 133.17467466331996);
     EXPECT_EQ(promql_predict_linear(tu, kUser, 10, kEval, 3600.0, kFused), 36.75448931117871);
+}
+
+// The kernels' answers must not depend on the CPU or the includer's
+// -ffp-contract: a*b+c rounds twice unless PromqlNumerics::fused_muladd asks
+// for one fma. Reference values round every product explicitly.
+namespace {
+double round_mul(double a, double b) { volatile double p = a * b; return p; }
+
+double des_trend_unfused(double tf, double s0, double s1, double b) {
+    const double x = round_mul(tf, s1 - s0);
+    const double y = round_mul(1.0 - tf, b);
+    return x + y;
+}
+}  // namespace
+
+TEST(PromqlDeterminism, DesTrendIsNotContracted) {
+    std::uint64_t st = 0x9E3779B97F4A7C15ull;
+    auto next = [&st]() {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        return static_cast<double>(st >> 11) * 0x1.0p-53;
+    };
+    int differs_from_fma = 0;
+    for (int i = 0; i < 4096; ++i) {
+        const double tf = 0.05 + 0.9 * next();
+        const double s0 = 1e3 * next(), s1 = 1e3 * next(), b = 1e2 * (next() - 0.5);
+        const double want = des_trend_unfused(tf, s0, s1, b);
+        const double got = bolt::promql::promql_des_trend(1, tf, s0, s1, b);
+        ASSERT_EQ(want, got) << "case " << i;
+        if (std::fma(tf, s1 - s0, round_mul(1.0 - tf, b)) != want) ++differs_from_fma;
+    }
+    EXPECT_GT(differs_from_fma, 0);
 }
