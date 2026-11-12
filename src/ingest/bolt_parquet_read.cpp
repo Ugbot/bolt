@@ -504,6 +504,7 @@ struct ColCtx {
                                 //      signed ints); 0 => zero-extend (uints)
     uint8_t  int_convert;       // 1 => src_width != elem integer conversion
     uint8_t  is_int96;          // 1 => INT96 legacy timestamp -> Timestamp[us]
+    uint8_t  int96_floor;       // 1 => INT96 sub-microsecond digits floor away (G2CHK-975)
     int32_t  ts_rescale;        // 0 none / 1 millis*1000 / 2 nanos/1000 -> us
     // Utf8 spill growth (delta byte-array encodings only -- see
     // ensure_overflow_room). `ovf_base` points at the COLUMN's
@@ -845,6 +846,15 @@ bool plain_int96(ColCtx* cx, const uint8_t* v, uint64_t vlen,
         // check in decode_chunk). Refuse rather than silently round away a
         // real sub-microsecond digit; a file whose nanos happen to already
         // be exact microseconds keeps reading byte-identically.
+        // G2CHK-975: with PqMeta::nanos_lane the reader drops the
+        // sub-microsecond digits as DuckDB and Spark read INT96 (a
+        // microsecond TIMESTAMP; nanos_of_day >= 0, so this floors).
+        if (cx->int96_floor != 0 && nanos_of_day < 86400000000000ull) {
+            const int64_t days = static_cast<int64_t>(julian) - 2440588;
+            dst[i] = days * 86400000000LL + static_cast<int64_t>(nanos_of_day / 1000ull);
+            ++src;
+            continue;
+        }
         if ((nanos_of_day % 1000ull) != 0ull) {
             std::fprintf(stderr,
                 "bolt parquet: column '%s' is legacy INT96 TIMESTAMP and "
@@ -2097,6 +2107,9 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
     BoltType t;
     uint8_t scale = 0;
     if (!parquet_map_type(pc, &t, &scale)) return false;
+    // G2CHK-975: nanoseconds stay exact on an Int64 lane when asked.
+    const bool ns_lane = m->nanos_lane != 0 && parquet_column_is_nanos(m, c);
+    if (ns_lane) t = BoltType::Int64;
     *col = pq_alloc_col(rows, t, arena);
     col->logical = parquet_map_logical(pc);
     if (col->data == nullptr && rows > 0) return false;
@@ -2171,6 +2184,7 @@ bool init_col_ctx_any(const PqMeta* m, uint32_t c, uint32_t g0, uint32_t g1,
         (out_unsigned || src_unsigned_int) ? uint8_t{0} : uint8_t{1};
     if (pc->physical == PqType::Int96) {
         cx->is_int96 = 1;                 // 12-byte legacy timestamp -> us
+        cx->int96_floor = m->nanos_lane;  // as DuckDB / Spark (G2CHK-975)
         cx->src_width = 12;
     } else if (pc->physical == PqType::Int32) {
         cx->src_width = 4;
@@ -3493,7 +3507,8 @@ void parfile_decode_task(void* user, uint32_t lo, uint32_t hi,
 }
 
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
-                       BoltBatch* out_batch, Scheduler* decode_pool) noexcept {
+                       BoltBatch* out_batch, Scheduler* decode_pool,
+                       bool nanos_lane) noexcept {
     assert(arena != nullptr);
     assert(out_batch != nullptr);
     if (buf == nullptr || len == 0) return false;
@@ -3504,6 +3519,7 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     std::memset(meta, 0, sizeof(*meta));
     if (!parquet_read_meta(buf, len, arena, meta)) return false;
     if (meta->num_rows < 0) return false;
+    meta->nanos_lane = nanos_lane ? 1u : 0u;
     BoltBatch::init_empty(out_batch);
     // G2FEAT-47: right-size columns[2] before dereferencing columns[read_epoch].
     if (!BoltBatch::alloc_columns(out_batch, arena, meta->n_columns)) return false;
@@ -3597,6 +3613,16 @@ bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
     return true;
 }
 
+bool parquet_column_is_nanos(const PqMeta* meta, uint32_t c) noexcept {
+    assert(meta != nullptr);
+    if (c >= meta->n_columns) return false;
+    const PqColumn* pc = &meta->columns[c];
+    BoltType t; uint8_t scale = 0;
+    if (pc->physical == PqType::Int96 || !parquet_map_type(pc, &t, &scale)) return false;
+    return t == BoltType::Timestamp && pc->time_unit == 3;
+}
+
 }  // namespace parquet
 }  // namespace ingest
+
 }  // namespace bolt

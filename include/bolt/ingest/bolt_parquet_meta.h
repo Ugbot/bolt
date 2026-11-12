@@ -409,7 +409,19 @@ struct PqMeta {
     // every pair present overflowed the cap (see kPqMaxFileKv* above).
     PqFileKeyValue file_kv[kPqMaxFileKv];
     uint32_t       n_file_kv;
+    // G2CHK-975: caller opt-in, set after parquet_read_meta. A
+    // TIMESTAMP(NANOS) column then decodes onto an Int64 lane of exact
+    // nanoseconds instead of the microsecond Timestamp lane (which refuses a
+    // sub-microsecond digit); the caller keeps the unit, and
+    // parquet_column_is_nanos says which columns took the lane. A legacy
+    // INT96 column stays a microsecond TIMESTAMP and drops sub-microsecond
+    // digits (floor), as DuckDB and Spark read it.
+    uint8_t        nanos_lane = 0;
 };
+
+// G2CHK-975: does column `c` decode as exact nanoseconds when
+// meta->nanos_lane is set (TIMESTAMP NANOS)?
+bool parquet_column_is_nanos(const PqMeta* meta, uint32_t c) noexcept;
 
 // Locate + verify the footer in a whole-file buffer. On success *meta_off /
 // *meta_len bound the thrift FileMetaData slice. Rejects truncated files,

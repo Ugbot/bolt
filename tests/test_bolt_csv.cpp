@@ -289,6 +289,51 @@ TEST(BoltCsv, ParseDate32Reject) {
     }
 }
 
+// G2CHK-976: ISO timestamps -> epoch microseconds; past the sixth fraction
+// digit truncates (as DuckDB casts); a bare date is midnight.
+TEST(BoltCsv, ParseTimestampMicros) {
+    const char* input = "2013-07-15 12:40:00.123456789\n1950-07-30T16:56:12.3784729\n"
+                        "2020-01-01\n1970-01-01 00:00:00\n\n";
+    CsvSchema schema{};
+    schema.col_types[0] = BoltType::Timestamp;
+    schema.num_cols = 1; schema.delimiter = ','; schema.has_header = false;
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    ASSERT_EQ(batch.num_rows, 5);
+    const auto* t = static_cast<const int64_t*>(batch.col(0).data);
+    EXPECT_EQ(t[0], 1373892000123456LL);
+    EXPECT_EQ(t[1], -612947027621528LL);   // 16:56:12.378472
+    EXPECT_EQ(t[2], bolt::kernels::date::days_from_civil(2020, 1, 1) * 86400000000LL);
+    EXPECT_EQ(t[3], 0);
+    EXPECT_EQ(t[4], 0);                     // empty: the caller marks it NULL
+    for (const char* bad : {"2013-07-15 25:00:00\n", "2013-07-15 12:40\n", "2013-07-15 12:40:00.\n",
+                            "2013-07-15 12:40:00+02\n"}) {
+        Arena a2; BoltBatch b2;
+        EXPECT_FALSE(parse_csv(bad, std::strlen(bad), schema, &a2, &b2)) << bad;
+    }
+}
+
+// G2CHK-976: the whole int64 range; a signed 18-digit or any 19-digit value
+// was read as 0, and an out-of-range value now fails the parse.
+TEST(BoltCsv, ParseInt64FullRange) {
+    const char* input = "9223372036854775807\n-9223372036854775808\n-123456789012345678\n+42\n-7\n";
+    CsvSchema schema{};
+    schema.col_types[0] = BoltType::Int64;
+    schema.num_cols = 1; schema.delimiter = ','; schema.has_header = false;
+    Arena arena; BoltBatch batch;
+    ASSERT_TRUE(parse_csv(input, std::strlen(input), schema, &arena, &batch));
+    const auto* v = static_cast<const int64_t*>(batch.col(0).data);
+    EXPECT_EQ(v[0], INT64_MAX);
+    EXPECT_EQ(v[1], INT64_MIN);
+    EXPECT_EQ(v[2], -123456789012345678LL);
+    EXPECT_EQ(v[3], 42);
+    EXPECT_EQ(v[4], -7);
+    for (const char* bad : {"9223372036854775808\n", "12345678901234567890\n", "-\n", "1x\n"}) {
+        Arena a2; BoltBatch b2;
+        EXPECT_FALSE(parse_csv(bad, std::strlen(bad), schema, &a2, &b2)) << bad;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decimal128 round-trip at multiple scales.
 // ---------------------------------------------------------------------------

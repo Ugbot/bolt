@@ -96,7 +96,7 @@ TEST(ArrowImport, BooleanFloatDecimalAndTemporalMetadata) {
 }
 TEST(ArrowImport, UnsupportedAndMalformedShapesPreserveOutput) {
     std::int64_t value=1;Fixture f{"l",&value,1};
-    for (const char* format:{"+l","tsu:UTC","d:0,0","d:39,0","d:3,-1","d:3,4","d:3,1,256","vu","w:0","w:","w:4x"}) {
+    for (const char* format:{"+l","tsx:UTC","d:0,0","d:39,0","d:3,-1","d:3,4","d:3,1,256","vu","w:0","w:","w:4x"}) {
         f.leaf.format=format;bolt::Arena scratch;ar::ImportState state{};
         EXPECT_EQ(ar::import_begin(&f.schema,{},&scratch,state),ar::ImportError::Unsupported);
     }
@@ -185,4 +185,25 @@ TEST(ArrowImport, FixedSizeBinaryAndUuidExtension) {
     std::memcpy(meta+32,"arrow.json",10);   // any other extension stays refused
     bolt::Arena scratch;ar::ImportState state{};
     EXPECT_EQ(ar::import_begin(&u.schema,{},&scratch,state),ar::ImportError::Unsupported);
+}
+
+// G2CHK-974: a zoned Arrow timestamp ("tsu:UTC", "tsn:Europe/Paris") imports
+// on the same lane as the naive one -- the values are UTC instants.
+TEST(ArrowImport, ZonedTimestampsImportAsTheirInstants) {
+    const std::int64_t micros[]{1373892000123456, -5};
+    for (const char* format:{"tsu:UTC","tsu:Europe/Paris"}) {
+        Fixture f{format,micros,2};bolt::Arena scratch,destination;ar::ImportState state{};
+        ASSERT_EQ(ar::import_begin(&f.schema,{},&scratch,state),ar::ImportError::Ok);
+        ASSERT_EQ(ar::import_append(state,&f.array),ar::ImportError::Ok);
+        bolt::BoltBatch batch{};ASSERT_EQ(ar::import_finish(state,&destination,batch),ar::ImportError::Ok);
+        ASSERT_EQ(batch.col(0).type,bolt::BoltType::Timestamp);
+        EXPECT_EQ(std::memcmp(batch.col(0).data,micros,sizeof(micros)),0);
+    }
+    const std::int64_t nanos[]{1373892000123456789};
+    Fixture n{"tsn:UTC",nanos,1};bolt::Arena scratch,destination;ar::ImportState state{};
+    ASSERT_EQ(ar::import_begin(&n.schema,{},&scratch,state),ar::ImportError::Ok);
+    ASSERT_EQ(ar::import_append(state,&n.array),ar::ImportError::Ok);
+    bolt::BoltBatch batch{};ASSERT_EQ(ar::import_finish(state,&destination,batch),ar::ImportError::Ok);
+    EXPECT_EQ(batch.col(0).type,bolt::BoltType::Int64);
+    EXPECT_EQ(static_cast<const std::int64_t*>(batch.col(0).data)[0],nanos[0]);
 }

@@ -61,7 +61,8 @@ inline bool csv_schema_width_ok(const CsvSchema& s) noexcept {
 //   - schema mismatch (mid-row column count != schema.num_cols)
 //   - arena OOM
 //   - unsupported BoltType in schema
-// Supported types: Int32 (int10ths interpretation), Int64, Date32
+// Supported types: Int32 (int10ths interpretation), Int64, Date32,
+// Timestamp (ISO text -> epoch microseconds, G2CHK-976)
 // (ISO YYYY-MM-DD), Decimal128 (per-column scale), Utf8.
 //
 // Inner loop uses bolt_swar_find_byte_u64 for delimiter / line scanning

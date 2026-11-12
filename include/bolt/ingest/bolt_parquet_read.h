@@ -331,9 +331,13 @@ bool parquet_read_list_column(const uint8_t* buf, uint64_t len,
 // parallel fan-out (v1 scope; they are independent per column too, but
 // narrower and rarer in real files -- a natural follow-up, not required
 // for this ticket's target workloads).
+// nanos_lane (G2CHK-975): TIMESTAMP(NANOS) decodes onto exact Int64
+// nanoseconds and INT96 floors to microseconds (see PqMeta::nanos_lane)
+// instead of refusing sub-microsecond digits.
 bool parquet_read_file(const uint8_t* buf, uint64_t len, Arena* arena,
                        BoltBatch* out_batch,
-                       Scheduler* decode_pool = nullptr) noexcept;
+                       Scheduler* decode_pool = nullptr,
+                       bool nanos_lane = false) noexcept;
 
 }  // namespace parquet
 }  // namespace ingest
