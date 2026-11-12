@@ -163,12 +163,29 @@ static int32_t field_to_int32(const char* p, int len) noexcept {
     return bolt::parse::parse_int10th(p, len);
 }
 
-// parse_int requires len in [1..18]. Empty fields return 0.
-static int64_t field_to_int64(const char* p, int len) noexcept {
-    assert(len >= 0);
+// Optional sign then 1..19 digits, exact over the whole int64 range. An empty
+// field is 0 (the caller marks it NULL); anything else that is not an int64
+// fails the parse. G2CHK-976: parse_int's 18-character fast path read a
+// signed 18-digit or any 19-digit value as 0, and a non-digit unchecked.
+static bool field_to_int64(const char* p, int len, int64_t* out) noexcept {
+    assert(len >= 0 && out != nullptr);
     assert(p != nullptr || len == 0);
-    if (len < 1 || len > 18) return 0;
-    return bolt::parse::parse_int(p, len);
+    *out = 0;
+    if (len == 0) return true;
+    int i = 0;
+    const bool neg = p[0] == '-';
+    if (p[0] == '-' || p[0] == '+') i = 1;
+    if (i == len || len - i > 19) return false;
+    uint64_t v = 0;
+    for (; i < len; ++i) {
+        const uint32_t d = static_cast<uint8_t>(p[i]) - '0';
+        if (d > 9u) return false;
+        v = v * 10u + d;   // <= 19 digits: no uint64 wrap
+    }
+    const uint64_t lim = neg ? (uint64_t{1} << 63) : (uint64_t{1} << 63) - 1u;
+    if (v > lim) return false;
+    *out = neg ? static_cast<int64_t>(0u - v) : static_cast<int64_t>(v);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +234,38 @@ static bool field_to_date32(const char* p, size_t flen, int32_t* out) noexcept {
     int64_t z = bolt::kernels::date::days_from_civil(y, m, d);
     if (z < INT32_MIN || z > INT32_MAX) return false;
     *out = static_cast<int32_t>(z);
+    return true;
+}
+
+// G2CHK-976: Timestamp field — "YYYY-MM-DD[( |T)HH:MM:SS[.f{1,9}]]" with no
+// zone -> epoch microseconds. Digits past the sixth are dropped, as DuckDB
+// casts them; a bare date is its midnight.
+static bool field_to_timestamp_us(const char* p, size_t flen, int64_t* out) noexcept {
+    assert(out != nullptr);
+    assert(p != nullptr || flen == 0);
+    int32_t days = 0;
+    if (flen < 10 || !field_to_date32(p, 10, &days)) return false;
+    int64_t sec = 0;
+    int64_t us = 0;
+    if (flen > 10) {
+        if (flen < 19 || flen > 29 || (p[10] != ' ' && p[10] != 'T') || p[13] != ':' ||
+            p[16] != ':') return false;
+        uint32_t hh = 0, mi = 0, ss = 0;
+        if (!fold_two(p + 11, &hh) || !fold_two(p + 14, &mi) || !fold_two(p + 17, &ss)) return false;
+        if (hh > 23u || mi > 59u || ss > 59u) return false;
+        sec = static_cast<int64_t>(hh) * 3600 + static_cast<int64_t>(mi) * 60 + ss;
+        if (flen > 19) {
+            if (p[19] != '.' || flen == 20) return false;
+            uint32_t scale = 100000u;
+            for (size_t i = 20; i < flen; ++i) {
+                const uint32_t dg = static_cast<uint8_t>(p[i]) - '0';
+                if (dg > 9u) return false;
+                us += static_cast<int64_t>(dg) * scale;
+                scale /= 10u;
+            }
+        }
+    }
+    *out = (static_cast<int64_t>(days) * 86400 + sec) * 1000000 + us;
     return true;
 }
 
@@ -360,7 +409,7 @@ static bool alloc_columns(const CsvSchema& schema, int64_t row_count,
         const BoltType t = csv_type(schema, c);
         if (t != BoltType::Int32 && t != BoltType::Int64 && t != BoltType::Utf8 &&
             t != BoltType::Date32 && t != BoltType::Decimal128 &&
-            t != BoltType::Decimal64) {
+            t != BoltType::Decimal64 && t != BoltType::Timestamp) {
             return false;
         }
         if (row_count == 0) {
@@ -400,12 +449,17 @@ static bool write_field(const CsvSchema& schema, uint32_t c, int64_t row,
         int32_t v = field_to_int32(f_start, static_cast<int>(flen));
         static_cast<int32_t*>(cols[c].data)[row] = v;
     } else if (t == BoltType::Int64) {
-        int64_t v = field_to_int64(f_start, static_cast<int>(flen));
+        int64_t v = 0;
+        if (!field_to_int64(f_start, static_cast<int>(flen), &v)) return false;
         static_cast<int64_t*>(cols[c].data)[row] = v;
     } else if (t == BoltType::Date32) {
         int32_t v = 0;
         if (flen != 0 && !field_to_date32(f_start, flen, &v)) return false;
         static_cast<int32_t*>(cols[c].data)[row] = v;
+    } else if (t == BoltType::Timestamp) {
+        int64_t v = 0;
+        if (flen != 0 && !field_to_timestamp_us(f_start, flen, &v)) return false;
+        static_cast<int64_t*>(cols[c].data)[row] = v;
     } else if (t == BoltType::Decimal128) {
         Decimal128 v{0, 0};
         if (!field_to_decimal128(f_start, flen,
