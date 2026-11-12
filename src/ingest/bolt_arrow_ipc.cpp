@@ -381,7 +381,9 @@ bool flatten_fields(ArrowIpcWriter* w, const FieldSpec* top,
         IpcFieldDesc& fd = w->desc[i];
         fd.type = static_cast<std::uint16_t>(s->type);
         fd.n_children = static_cast<std::uint8_t>(s->n_children);
-        fd.non_null = 0;
+        fd.non_null = s->non_null != 0 ? 1 : 0;
+        fd.meta_key = (s->meta_key != nullptr && s->meta_value != nullptr) ? s->meta_key : nullptr;
+        fd.meta_value = fd.meta_key != nullptr ? s->meta_value : nullptr;
         fd.decimal_scale =
             (s->type == BoltType::Decimal128) ? s->decimal_scale : 0;
         if ((s->time_unit & 0x7F) > kIpcTimeNano) return false;
@@ -463,12 +465,26 @@ bool build_all_fields(Fb* b, const ArrowIpcWriter* w,
             b, static_cast<BoltType>(fd.type), fd.decimal_scale, fd.time_unit, &tag);
         if (type_pos == 0) return false;
         const std::uint32_t name_pos = fb_string(b, name_buf[i]);
+        std::uint32_t meta_vec = 0;
+        if (fd.meta_key != nullptr) {                    // custom_metadata: [KeyValue{key, value}]
+            const std::uint32_t k = fb_string(b, fd.meta_key);
+            const std::uint32_t v = fb_string(b, fd.meta_value);
+            if (k == 0 || v == 0) return false;
+            fb_start_table(b);
+            fb_field_offset(b, 0, k);
+            fb_field_offset(b, 1, v);
+            const std::uint32_t kv = fb_end_table(b);
+            if (kv == 0) return false;
+            meta_vec = fb_offset_vector(b, &kv, 1);
+            if (meta_vec == 0) return false;
+        }
         fb_start_table(b);
         fb_field_offset(b, 0, name_pos);                 // name
         fb_field_scalar<std::uint8_t>(b, 1, fd.non_null ? 0 : 1);  // nullable
         fb_field_scalar<std::uint8_t>(b, 2, tag);        // type_type
         fb_field_offset(b, 3, type_pos);                 // type
         fb_field_offset(b, 5, children_vec);              // children
+        if (meta_vec != 0) fb_field_offset(b, 6, meta_vec);   // custom_metadata
         field_pos[i] = fb_end_table(b);
         if (field_pos[i] == 0) return false;
     }
@@ -664,9 +680,11 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     if (n < 0 || col.length < n) return false;
     const IpcFieldDesc& fd = w->desc[desc_idx];
     // A Timestamp field may carry an Int64 epoch lane (same width, the unit
-    // is the field's), the shape decoded nested-row leaves have.
+    // is the field's), the shape decoded nested-row leaves have, or a
+    // TimestampNtz lane (a zone-less field: the same epoch micros).
     if (static_cast<std::uint16_t>(col.type) != fd.type &&
-        !(fd.type == static_cast<std::uint16_t>(BoltType::Timestamp) && col.type == BoltType::Int64)) {
+        !(fd.type == static_cast<std::uint16_t>(BoltType::Timestamp) &&
+          (col.type == BoltType::Int64 || col.type == BoltType::TimestampNtz))) {
         return false;
     }
     if (L->n_nodes >= L->max_nodes) return false;
@@ -987,6 +1005,7 @@ bool arrow_ipc_open_units(ArrowIpcWriter* w, std::FILE* f,
         std::malloc(sizeof(FieldSpec) * n_cols));
     if (specs == nullptr) return false;
     for (std::uint16_t c = 0; c < n_cols; ++c) {
+        std::memset(static_cast<void*>(&specs[c]), 0, sizeof(FieldSpec));   // non_null / meta_key / meta_value too
         specs[c].type = types[c];
         specs[c].name = (names != nullptr) ? names[c] : nullptr;
         specs[c].decimal_scale =

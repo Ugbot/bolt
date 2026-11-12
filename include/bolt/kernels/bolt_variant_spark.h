@@ -25,6 +25,7 @@
 
 #include "bolt/bolt_hash.h"
 #include "bolt/kernels/bolt_json_spark.h"
+#include "bolt/kernels/bolt_u128.h"
 
 namespace bolt {
 namespace kernels {
@@ -163,7 +164,7 @@ inline bool parse_decimal(const char* t, uint32_t len, bool* neg, uint64_t* hi, 
     uint32_t i = 0;
     *neg = t[0] == '-';
     if (*neg) ++i;
-    unsigned __int128 u = 0;
+    u128::U128 u{};
     uint32_t digits = 0, frac = 0;
     bool dot = false, lead = true;
     for (; i < len; ++i) {
@@ -174,27 +175,27 @@ inline bool parse_decimal(const char* t, uint32_t len, bool* neg, uint64_t* hi, 
         if (lead && c == '0') continue;
         lead = false;
         if (++digits > 38) return false;
-        u = u * 10u + static_cast<unsigned>(c - '0');
+        if (!u128::mul10_add(&u, static_cast<uint32_t>(c - '0'))) return false;
     }
     *scale = frac;
     *prec = digits == 0 ? 1u : digits;
     if (*scale > 38) return false;
-    *hi = static_cast<uint64_t>(u >> 64);
-    *lo = static_cast<uint64_t>(u);
+    *hi = u.hi;
+    *lo = u.lo;
     return true;
 }
 
 inline bool append_decimal(Enc* e, bool neg, uint64_t hi, uint64_t lo, uint32_t scale, uint32_t prec) noexcept {
-    unsigned __int128 u = (static_cast<unsigned __int128>(hi) << 64) | lo;
-    if (neg) u = ~u + 1u;                                            // two's complement of the unscaled value
+    u128::U128 u{hi, lo};
+    if (neg) u = u128::negate(u);                                    // two's complement of the unscaled value
     uint8_t b[18];
     uint32_t n = 16;
     if (scale <= 9 && prec <= 9) { b[0] = prim(kDecimal4); n = 4; }
     else if (scale <= 18 && prec <= 18) { b[0] = prim(kDecimal8); n = 8; }
     else { b[0] = prim(kDecimal16); n = 16; }
     b[1] = static_cast<uint8_t>(scale);
-    put_le(b + 2, static_cast<uint64_t>(u), n < 8 ? n : 8);
-    if (n == 16) put_le(b + 10, static_cast<uint64_t>(u >> 64), 8);
+    put_le(b + 2, u.lo, n < 8 ? n : 8);
+    if (n == 16) put_le(b + 10, u.hi, 8);
     return put_bytes(e, b, n + 2);
 }
 
@@ -318,6 +319,69 @@ inline bool open_container(Enc* e, bool obj, uint32_t id) noexcept {
     e->w->frame_obj[e->nframe] = obj ? 1 : 0;
     ++e->nframe;
     return true;
+}
+
+// Byte size of the variant value at v[0..n), or 0 when it is not one whole value (G2CHK-984).
+inline uint32_t value_size(const uint8_t* v, uint32_t n) noexcept {
+    if (n == 0) return 0;
+    const uint8_t h = v[0], basic = h & 3u, t = h >> 2;
+    uint64_t sz = 0;
+    if (basic == kShortString) {
+        sz = 1u + t;
+    } else if (basic == kPrimitive) {
+        static constexpr uint8_t kFixed[21] = {1, 1, 1, 2, 3, 5, 9, 9, 6, 10, 18, 5, 9, 9, 5, 0, 0, 9, 9, 9, 17};
+        if (t > kUuid) return 0;
+        if (t == kBinary || t == kLongString) sz = n < 5u ? ~0ull : 5u + get_le(v + 1, 4);
+        else sz = kFixed[t];
+    } else {
+        const bool obj = basic == kObject;
+        const uint32_t osize = (t & 3u) + 1u, idsize = obj ? ((t >> 2) & 3u) + 1u : 0u;
+        const uint32_t nsize = (t >> (obj ? 4 : 2)) & 1u ? 4u : 1u;
+        if (n < 1u + nsize) return 0;
+        const uint64_t cnt = get_le(v + 1, nsize);
+        const uint64_t hdr = 1u + nsize + cnt * idsize + (cnt + 1u) * osize;
+        if (hdr > n) return 0;
+        sz = hdr + get_le(v + 1 + nsize + cnt * idsize + cnt * osize, osize);
+    }
+    return sz <= n ? static_cast<uint32_t>(sz) : 0u;
+}
+
+// Spark VariantBuilder.appendVariant: the variant {metadata m, value v} as entry `id` of the innermost container, its
+// object keys re-keyed into this encoder's dictionary (G2CHK-984). Malformed when the bytes are not one variant.
+inline bool append_variant(Enc* e, const uint8_t* m, uint32_t mn, const uint8_t* v, uint32_t vn, uint32_t id,
+                           uint32_t depth) noexcept {
+    const uint32_t sz = value_size(v, vn);
+    if (sz == 0 || depth > 1024u || mn < 1u || (m[0] & 0x0Fu) != 1u) { e->st = Status::Malformed; return false; }
+    const uint8_t basic = v[0] & 3u, t = v[0] >> 2;
+    if (basic != kObject && basic != kArray) return add_entry(e, id) && put_bytes(e, v, sz);
+    const bool obj = basic == kObject;
+    const uint32_t osize = (t & 3u) + 1u, idsize = obj ? ((t >> 2) & 3u) + 1u : 0u;
+    const uint32_t nsize = (t >> (obj ? 4 : 2)) & 1u ? 4u : 1u;
+    const uint32_t cnt = static_cast<uint32_t>(get_le(v + 1, nsize));
+    const uint8_t* ids = v + 1 + nsize;
+    const uint8_t* offs = ids + uint64_t{cnt} * idsize;
+    const uint8_t* data = offs + uint64_t{cnt + 1u} * osize;
+    const uint32_t data_n = sz - static_cast<uint32_t>(data - v);
+    const uint32_t ksize = ((m[0] >> 6) & 3u) + 1u;
+    const uint64_t nkeys = mn >= 1u + ksize ? get_le(m + 1, ksize) : 0u;
+    const uint8_t* koff = m + 1 + ksize;
+    const uint64_t kbase = 1u + uint64_t{ksize} * (nkeys + 2u);
+    if (kbase > mn) { e->st = Status::Malformed; return false; }
+    if (!open_container(e, obj, id)) return false;
+    for (uint32_t i = 0; i < cnt; ++i) {                              // bounded by the container's element count
+        const uint64_t off = get_le(offs + uint64_t{i} * osize, osize);
+        if (off >= data_n) { e->st = Status::Malformed; return false; }
+        uint32_t cid = 0;
+        if (obj) {
+            const uint64_t k = get_le(ids + uint64_t{i} * idsize, idsize);
+            if (k >= nkeys) { e->st = Status::Malformed; return false; }
+            const uint64_t a = get_le(koff + k * ksize, ksize), b = get_le(koff + (k + 1u) * ksize, ksize);
+            if (a > b || kbase + b > mn) { e->st = Status::Malformed; return false; }
+            if (!key_id(e, m + kbase + a, static_cast<uint32_t>(b - a), &cid)) return false;
+        }
+        if (!append_variant(e, m, mn, data + off, data_n - static_cast<uint32_t>(off), cid, depth + 1u)) return false;
+    }
+    return finish_container(e);
 }
 
 inline bool write_metadata(Enc* e) noexcept {

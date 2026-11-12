@@ -2,6 +2,7 @@
 // (tests/data/spark_variant_vectors.tsv: value and metadata bytes from parse_json, text from to_json).
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include "bolt/datetime/bolt_tz.h"
 #include "bolt/kernels/bolt_variant_spark.h"
+#include "bolt/kernels/bolt_variant_spark_schema.h"
 
 namespace vs = bolt::kernels::variantspark;
 namespace js = bolt::kernels::jsonspark;
@@ -213,4 +215,133 @@ TEST(BoltVariantSpark, GetPathAndCastsMatchSpark) {
     js::Out o{out, sizeof out, 0, false};
     ASSERT_EQ(vs::to_json(v, n, e.metadata, e.metadata_n, &o), vs::JsonStatus::Ok);
     EXPECT_EQ(std::string(out, o.n), "[1,2]");
+}
+
+// schema_of_variant: expected text from real Spark 4.0.4 (schema_of_variant(parse_json(j)), probe c_sov.py).
+TEST(BoltVariantSpark, SchemaOfMatchesSpark) {
+    const std::pair<const char*, const char*> cases[] = {
+        {R"({"a":1,"b":[1,2]})", "OBJECT<a: BIGINT, b: ARRAY<BIGINT>>"},
+        {R"([1,"a",null,true,[2,{"x":1}]])", "ARRAY<VARIANT>"},
+        {"1.5", "DECIMAL(2,1)"}, {"null", "VOID"}, {R"("x")", "STRING"},
+        {R"({"z":{"y":{"x":"deep"}},"a":null})", "OBJECT<a: VOID, z: OBJECT<y: OBJECT<x: STRING>>>"},
+        {"[]", "ARRAY<VOID>"}, {"{}", "OBJECT<>"}, {"[1, 2.5]", "ARRAY<DECIMAL(21,1)>"}, {"[1, 1e20]", "ARRAY<DOUBLE>"},
+        {"[1.5, 1e300]", "ARRAY<DOUBLE>"}, {R"([1, "s"])", "ARRAY<VARIANT>"},
+        {R"([{"a":1},{"b":"x"}])", "ARRAY<OBJECT<a: BIGINT, b: STRING>>"}, {R"([{"a":1},{"a":2.25}])", "ARRAY<OBJECT<a: DECIMAL(22,2)>>"},
+        {R"([{"a":1},{"a":"s"}])", "ARRAY<OBJECT<a: VARIANT>>"}, {"[[1],[2.5]]", "ARRAY<ARRAY<DECIMAL(21,1)>>"},
+        {"[null, null]", "ARRAY<VOID>"}, {"[true, 1]", "ARRAY<VARIANT>"}, {R"({"A":1,"a":2})", "OBJECT<A: BIGINT, a: BIGINT>"},
+        {R"({"a b":1,"c`d":2,"_e":3,"1f":4})", "OBJECT<`1f`: BIGINT, _e: BIGINT, `a b`: BIGINT, `c``d`: BIGINT>"},
+        {"0.001", "DECIMAL(3,3)"}, {"123456789012345678901234567890", "DECIMAL(30,0)"}, {"-0.0", "DECIMAL(1,0)"},
+        {"1e-5", "DOUBLE"}, {"[0.5, 0.25]", "ARRAY<DECIMAL(2,2)>"}, {"9223372036854775807", "BIGINT"},
+        {R"([{"a":[1]},{"a":[null]},{"a":[2.5]}])", "ARRAY<OBJECT<a: ARRAY<DECIMAL(21,1)>>>"}, {"[[], [1]]", "ARRAY<ARRAY<BIGINT>>"},
+        {R"([{}, {"a":1}])", "ARRAY<OBJECT<a: BIGINT>>"}, {"[1, 0.1234567890123456789012345678]", "ARRAY<DOUBLE>"},
+        {"[[1],{\"a\":1}]", "ARRAY<VARIANT>"},
+    };
+    Bufs b;
+    std::vector<vs::SchemaNode> nodes(4096);
+    char out[512];
+    for (const auto& [json, want] : cases) {
+        vs::Encoded e{};
+        ASSERT_EQ(parse(&b, json, &e), vs::Status::Ok) << json;
+        vs::SchemaPool pool{nodes.data(), static_cast<uint32_t>(nodes.size()), 0};
+        js::Out o{out, sizeof out, 0, false};
+        ASSERT_EQ(vs::schema_of(e.value, e.value_n, e.metadata, e.metadata_n, &pool, &o), vs::SchemaStatus::Ok) << json;
+        EXPECT_EQ(std::string(out, o.n), want) << json;
+    }
+    vs::Encoded e{};
+    ASSERT_EQ(parse(&b, R"([{"a":1,"b":2},{"c":3}])", &e), vs::Status::Ok);
+    vs::SchemaPool tiny{nodes.data(), 3, 0};
+    js::Out o{out, sizeof out, 0, false};
+    EXPECT_EQ(vs::schema_of(e.value, e.value_n, e.metadata, e.metadata_n, &tiny, &o), vs::SchemaStatus::Budget);
+}
+
+// CAST(x AS VARIANT) widths as Spark's VariantBuilder writes them (probe c_tvw.py bytes).
+TEST(BoltVariantSpark, NarrowestWidthsMatchSpark) {
+    uint8_t b[24];
+    EXPECT_EQ(hex(b, vs::encode_int(b, sizeof b, 5, vs::long_width(5))), "0c05");
+    EXPECT_EQ(hex(b, vs::encode_int(b, sizeof b, 300, vs::long_width(300))), "102c01");
+    EXPECT_EQ(vs::long_width(70000), 4u);
+    EXPECT_EQ(vs::long_width(5000000000LL), 8u);
+    EXPECT_EQ(vs::long_width(-129), 2u);
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 125, vs::decimal_value_digits(0, 125), 2)), "20027d000000");
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 1, vs::decimal_value_digits(0, 1), 0)), "200001000000");
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 12345678901ull, vs::decimal_value_digits(0, 12345678901ull), 0)),
+              "2400351cdcdf02000000");
+    EXPECT_EQ(vs::decimal_value_digits(-1, ~0ull), 1u);            // -1
+    EXPECT_EQ(vs::decimal_value_digits(0, 0), 1u);
+}
+
+// Portable 128-bit helpers behind the variant decimal paths (MSVC has no __int128).
+TEST(BoltVariantSpark, PortableU128) {
+    namespace u = bolt::kernels::u128;
+    u::U128 x{};
+    for (const char c : std::string("99999999999999999999999999999999999999")) ASSERT_TRUE(u::mul10_add(&x, static_cast<uint32_t>(c - '0')));
+    EXPECT_EQ(x.hi, 0x4B3B4CA85A86C47Aull);                          // 10^38 - 1
+    EXPECT_EQ(x.lo, 0x098A223FFFFFFFFFull);
+    u::U128 big{~0ull, ~0ull};
+    EXPECT_FALSE(u::mul10_add(&big, 0));
+    const uint8_t minus_two[3] = {0xFE, 0xFF, 0xFF};
+    bool neg = false;
+    const u::U128 m = u::from_le_signed(minus_two, 3, &neg);
+    EXPECT_TRUE(neg);
+    EXPECT_EQ(m.hi, 0u);
+    EXPECT_EQ(m.lo, 2u);
+    uint64_t rem = 0;
+    const u::U128 q = u::div_small(x, 10u, &rem);
+    EXPECT_EQ(rem, 9u);
+    EXPECT_FALSE(u::is_zero(q));
+    const u::U128 n = u::negate(u::U128{0, 1});
+    EXPECT_EQ(n.hi, ~0ull);
+    EXPECT_EQ(n.lo, ~0ull);
+}
+
+// G2CHK-984: variants embedded in an outer container (VariantBuilder.appendVariant) are re-keyed into the outer dictionary
+// in each object's (sorted) field order. Expected bytes: Spark 4.0.4
+// to_variant_object(array(parse_json('{"b":1,"a":2}'), parse_json('{"c":3,"a":4}'))). A malformed embedded value refuses.
+namespace {
+bool embed_all(const std::string* val, const std::string* meta, int n, Bufs* b, vs::Encoded* out, vs::Workspace* w) {
+    std::fill(b->table.begin(), b->table.end(), 0u);   // a fresh dictionary, as to_variant_object starts
+    *w = b->ws();
+    *out = vs::Encoded{b->value.data(), static_cast<uint32_t>(b->value.size()), 0, b->meta.data(), static_cast<uint32_t>(b->meta.size()), 0};
+    vs::detail::Enc enc{w, out, 0, 0, 0, 0, vs::Status::Ok};
+    if (!vs::detail::open_container(&enc, false, 0)) return false;
+    for (int i = 0; i < n; ++i) {
+        if (!vs::detail::append_variant(&enc, reinterpret_cast<const uint8_t*>(meta[i].data()), static_cast<uint32_t>(meta[i].size()),
+                                        reinterpret_cast<const uint8_t*>(val[i].data()), static_cast<uint32_t>(val[i].size()), 0, 0))
+            return false;
+    }
+    return vs::detail::finish_container(&enc) && vs::detail::write_metadata(&enc);
+}
+void encode_parts(const std::string* parts, int n, std::string* val, std::string* meta) {
+    for (int i = 0; i < n; ++i) {
+        Bufs b;
+        vs::Encoded e{};
+        ASSERT_EQ(parse(&b, parts[i], &e), vs::Status::Ok);
+        val[i].assign(reinterpret_cast<const char*>(e.value), e.value_n);
+        meta[i].assign(reinterpret_cast<const char*>(e.metadata), e.metadata_n);
+    }
+}
+}  // namespace
+
+TEST(BoltVariantSpark, AppendVariantRekeysIntoOuterDictionary) {
+    const std::string parts[2] = {"{\"b\":1,\"a\":2}", "{\"c\":3,\"a\":4}"};
+    std::string val[2], meta[2];
+    encode_parts(parts, 2, val, meta);
+    Bufs b;
+    vs::Workspace w{};
+    vs::Encoded out{};
+    ASSERT_TRUE(embed_all(val, meta, 2, &b, &out, &w));
+    EXPECT_EQ(hex(out.value, out.value_n), "0302000b16020200010002040c020c01020200020002040c040c03");
+    EXPECT_EQ(hex(out.metadata, out.metadata_n), "010300010203616263");
+
+    const std::string deep[2] = {"[1,\"s\",null,1.5,true]", "{\"c\":3,\"a\":{\"z\":[1,{\"y\":\"long string past sixty-four bytes, so a long-string header is used here\"}]}}"};
+    encode_parts(deep, 2, val, meta);
+    ASSERT_TRUE(embed_all(val, meta, 2, &b, &out, &w));
+    std::vector<char> text(1 << 12);
+    js::Out o{text.data(), static_cast<uint32_t>(text.size()), 0, false};
+    ASSERT_EQ(vs::to_json(out.value, out.value_n, out.metadata, out.metadata_n, &o), vs::JsonStatus::Ok);
+    EXPECT_EQ(std::string(text.data(), o.n), "[[1,\"s\",null,1.5,true],{\"a\":{\"z\":[1,{\"y\":\"long string past sixty-four bytes, "
+                                             "so a long-string header is used here\"}]},\"c\":3}]");
+
+    val[1].pop_back();
+    EXPECT_FALSE(embed_all(val, meta, 2, &b, &out, &w));
 }

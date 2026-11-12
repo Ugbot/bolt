@@ -17,6 +17,7 @@
 #include "bolt/bolt_nested_value.h"
 #include "bolt/datetime/bolt_tz.h"
 #include "bolt/kernels/bolt_json_spark.h"
+#include "bolt/kernels/bolt_u128.h"
 
 namespace bolt {
 namespace kernels {
@@ -104,16 +105,18 @@ inline uint32_t java_float_chars(char* out, uint32_t cap, float v) noexcept {
     return w;
 }
 
-// java.math.BigDecimal.toString of unscaled * 10^-scale (scale >= 0).
-inline uint32_t java_decimal_chars(char* out, uint32_t cap, __int128 unscaled, uint32_t scale) noexcept {
+// java.math.BigDecimal.toString of (neg ? -mag : mag) * 10^-scale (scale >= 0). Portable 128-bit (G2CHK-990).
+inline uint32_t java_decimal_chars(char* out, uint32_t cap, bool neg, u128::U128 mag, uint32_t scale) noexcept {
     assert(out != nullptr && cap >= 64 && scale <= 38);
     uint32_t w = 0;
-    unsigned __int128 u = unscaled < 0 ? static_cast<unsigned __int128>(0) - static_cast<unsigned __int128>(unscaled)
-                                       : static_cast<unsigned __int128>(unscaled);
-    if (unscaled < 0) out[w++] = '-';
+    if (neg) out[w++] = '-';
     char d[48];
     uint32_t nd = 0;
-    do { d[nd++] = static_cast<char>('0' + static_cast<int>(u % 10u)); u /= 10u; } while (u != 0 && nd < sizeof d);
+    do {
+        uint64_t r = 0;
+        mag = u128::div_small(mag, 10u, &r);
+        d[nd++] = static_cast<char>('0' + static_cast<int>(r));
+    } while (!u128::is_zero(mag) && nd < sizeof d);
     for (uint32_t a = 0, b = nd - 1; a < b; ++a, --b) { const char t = d[a]; d[a] = d[b]; d[b] = t; }
     if (scale == 0) { std::memcpy(out + w, d, nd); return w + nd; }
     const int32_t adjusted = static_cast<int32_t>(nd) - 1 - static_cast<int32_t>(scale);
@@ -440,10 +443,14 @@ inline int schema_of_json(const uint8_t* json, uint32_t len, InferPool* pool, Ou
 
 // ---- to_json ----------------------------------------------------------------------------------------------------------
 
+// Renders one variant {metadata, value} as JSON (variantspark::nested_variant_json): 1 ok, -1 budget, -2 unsupported.
+using VariantJsonFn = int (*)(const uint8_t* metadata, uint32_t mn, const uint8_t* value, uint32_t vn, Out* o, tz::ZoneId zone);
+
 struct Tree {
     nrv::TreeView     t;
     const NodeMeta*   meta;     // per node (BNT1 names / decimal precision)
     bolt::tz::ZoneId  tz;       // session time zone (TIMESTAMP rendering)
+    VariantJsonFn     variant_json = nullptr;   // a Variant-annotated {metadata, value} node; null refuses it (-2)
 };
 
 namespace tojd {
@@ -565,7 +572,8 @@ inline int put_leaf(const Tree& c, uint32_t ni, const nrv::LeafView& lv, Out* o)
         case BoltType::Int8: case BoltType::Int16: case BoltType::Int32: case BoltType::Int64: {
             const int64_t iv = read_int(lv.bytes, lv.len);
             if (nd.scale != 0) {                                     // a narrow decimal rides the integer lane with its scale
-                o->put(b, java_decimal_chars(b, sizeof b, static_cast<__int128>(iv), nd.scale));
+                const uint64_t mag = iv < 0 ? uint64_t{0} - static_cast<uint64_t>(iv) : static_cast<uint64_t>(iv);
+                o->put(b, java_decimal_chars(b, sizeof b, iv < 0, u128::U128{0, mag}, nd.scale));
                 return 1;
             }
             const int n = std::snprintf(b, sizeof b, "%lld", static_cast<long long>(iv));
@@ -580,8 +588,9 @@ inline int put_leaf(const Tree& c, uint32_t ni, const nrv::LeafView& lv, Out* o)
             return 1;
         }
         case BoltType::Decimal128: {
-            __int128 u; std::memcpy(&u, lv.bytes, 16);
-            o->put(b, java_decimal_chars(b, sizeof b, u, nd.scale));
+            bool neg = false;
+            const u128::U128 mag = u128::from_le_signed(lv.bytes, 16, &neg);
+            o->put(b, java_decimal_chars(b, sizeof b, neg, mag, nd.scale));
             return 1;
         }
         case BoltType::Date32: { int32_t d; std::memcpy(&d, lv.bytes, 4); o->put('"'); const bool ok = put_date(o, d); o->put('"'); return ok ? 1 : -2; }
@@ -677,10 +686,23 @@ inline int put_map(const Tree& c, uint32_t ni, nrv::Span v, Out* o, uint32_t dep
     return 1;
 }
 
+// A Variant-annotated {metadata, value} struct node (G2CHK-984): the variant's own JSON.
+inline int put_variant(const Tree& c, uint32_t ni, nrv::Span v, Out* o) noexcept {
+    const nrv::TypeNode& nd = c.t.nodes[ni];
+    if (c.variant_json == nullptr || nd.n_children != 2) return -2;
+    nrv::Span ms{}, vs{};
+    nrv::LeafView ml{}, vl{};
+    if (nrv::struct_field(c.t, ni, v, 0, &ms) != 1 || nrv::struct_field(c.t, ni, v, 1, &vs) != 1 ||
+        !nrv::leaf_view(c.t, nd.first_child, ms, &ml) || !nrv::leaf_view(c.t, nd.first_child + 1u, vs, &vl) ||
+        ml.is_null || vl.is_null) return -2;
+    return c.variant_json(ml.bytes, ml.len, vl.bytes, vl.len, o, c.tz);
+}
+
 inline int value(const Tree& c, uint32_t ni, nrv::Span v, Out* o, uint32_t depth) noexcept {
     assert(ni < c.t.n);
     if (depth > nrv::kMaxDepth + 1u) return -2;
     const nrv::TypeNode& nd = c.t.nodes[ni];
+    if (nd.type == BoltType::Struct && nd.logical == BoltLogical::Variant) return put_variant(c, ni, v, o);
     if (nd.type == BoltType::Struct) return put_struct(c, ni, v, o, depth);
     if (nd.type == BoltType::List) return put_list(c, ni, v, o, depth);
     if (nd.type == BoltType::Map) return put_map(c, ni, v, o, depth);
@@ -789,8 +811,9 @@ inline int text_digit(const char* t, uint32_t len, uint32_t i, uint32_t* width) 
     return unicode_decimal_digit(cp);
 }
 
-// BigDecimal text -> unscaled value at `scale` (HALF_UP), within `prec` digits. false: not a number / out of range.
-inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32_t scale, __int128* out) noexcept {
+// BigDecimal text -> unscaled value at `scale` (HALF_UP), within `prec` digits, as 16 little-endian two's complement
+// bytes. false: not a number / out of range.
+inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32_t scale, uint8_t* out16) noexcept {
     uint32_t i = 0;
     bool neg = false;
     if (i < len && (t[i] == '+' || t[i] == '-')) { neg = t[i] == '-'; ++i; }
@@ -827,29 +850,28 @@ inline bool decimal_from_text(const char* t, uint32_t len, uint32_t prec, uint32
     if (i != len) return false;
     uint32_t lead = 0;
     while (lead < nd && dig[lead] == '0') ++lead;
-    unsigned __int128 u = 0;
+    u128::U128 u{};
     if (lead < nd) {
         const uint32_t L = nd - lead;
         const int64_t shift = exp10 - frac + static_cast<int64_t>(scale);   // unscaled = D * 10^shift
         if (shift >= 0) {
             if (static_cast<int64_t>(L) + shift > 38) return false;
-            for (uint32_t k = 0; k < L; ++k) u = u * 10u + static_cast<unsigned>(dig[lead + k] - '0');
-            for (int64_t k = 0; k < shift; ++k) u *= 10u;
+            for (uint32_t k = 0; k < L; ++k) (void)u128::mul10_add(&u, static_cast<uint32_t>(dig[lead + k] - '0'));
+            for (int64_t k = 0; k < shift; ++k) (void)u128::mul10_add(&u, 0);   // <= 38 digits: no overflow
         } else {
             const int64_t keep = static_cast<int64_t>(L) + shift;
             if (keep > 38) return false;
             if (keep > 0) {
-                for (int64_t k = 0; k < keep; ++k) u = u * 10u + static_cast<unsigned>(dig[lead + static_cast<uint32_t>(k)] - '0');
-                if (dig[lead + static_cast<uint32_t>(keep)] >= '5') ++u;
+                for (int64_t k = 0; k < keep; ++k)
+                    (void)u128::mul10_add(&u, static_cast<uint32_t>(dig[lead + static_cast<uint32_t>(k)] - '0'));
+                if (dig[lead + static_cast<uint32_t>(keep)] >= '5') (void)u128::add_small(&u, 1u);
             } else if (keep == 0 && dig[lead] >= '5') {
-                u = 1;
+                u = u128::U128{0, 1};
             }
         }
     }
-    unsigned __int128 lim = 1;
-    for (uint32_t k = 0; k < prec; ++k) lim *= 10u;
-    if (u >= lim) return false;
-    *out = neg ? -static_cast<__int128>(u) : static_cast<__int128>(u);
+    if (!u128::less(u, u128::pow10(prec < 38u ? prec : 38u))) return false;
+    u128::to_le_signed(u, neg, out16);
     return true;
 }
 
@@ -903,15 +925,15 @@ inline Cv leaf(const Tree& c, Parser* ps, uint32_t ni, Region* r) noexcept {
             break;
         }
         case BoltType::Decimal128: {
-            __int128 u = 0;
+            uint8_t u[16] = {};
             const uint32_t prec = c.meta[ni].precision != 0 ? c.meta[ni].precision : 38u;
             if (t == Tok::Int || (t == Tok::Float && (tx[0] != 'N' && tx[0] != 'I' && tx[1] != 'I'))) {
-                if (!decimal_from_text(tx, tl, prec, nd.scale, &u)) return Cv::Fail;
+                if (!decimal_from_text(tx, tl, prec, nd.scale, u)) return Cv::Fail;
             } else if (t == Tok::String && !ps->esc && tl >= 1) {
-                if (!decimal_from_text(tx, tl, prec, nd.scale, &u)) return Cv::Fail;
+                if (!decimal_from_text(tx, tl, prec, nd.scale, u)) return Cv::Fail;
             } else return Cv::Fail;
             uint8_t* p = r->take(16);
-            if (p != nullptr) std::memcpy(p, &u, 16);
+            if (p != nullptr) std::memcpy(p, u, 16);
             break;
         }
         case BoltType::Utf8: {

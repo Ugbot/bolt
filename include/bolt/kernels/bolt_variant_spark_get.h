@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bolt/kernels/bolt_decimal.h"
+#include "bolt/kernels/bolt_u128.h"
+
 namespace bolt {
 namespace kernels {
 namespace variantspark {
@@ -210,13 +213,13 @@ inline CastStatus to_long(const uint8_t* v, uint32_t n, int64_t* out) noexcept {
         case kDecimal4: case kDecimal8: case kDecimal16: {
             const uint32_t k = h == kDecimal4 ? 4u : h == kDecimal8 ? 8u : 16u;
             if (n < 2u + k) return CastStatus::Malformed;
-            unsigned __int128 u = 0;
-            for (uint32_t i = 0; i < k; ++i) u |= static_cast<unsigned __int128>(v[2 + i]) << (8u * i);
-            if (k < 16 && (v[1 + k] & 0x80u) != 0) u |= ~static_cast<unsigned __int128>(0) << (8u * k);
-            __int128 x = static_cast<__int128>(u);
-            for (uint32_t sc = 0; sc < v[1]; ++sc) x /= 10;              // truncate toward zero
-            if (x > INT64_MAX || x < INT64_MIN) return CastStatus::Invalid;
-            *out = static_cast<int64_t>(x);
+            bool neg = false;
+            u128::U128 x = u128::from_le_signed(v + 2, k, &neg);           // the magnitude: truncation toward zero
+            uint64_t rem = 0;
+            for (uint32_t sc = 0; sc < v[1] && !u128::is_zero(x); ++sc) x = u128::div_small(x, 10u, &rem);
+            const uint64_t lim = neg ? (uint64_t{1} << 63) : static_cast<uint64_t>(INT64_MAX);
+            if (x.hi != 0 || x.lo > lim) return CastStatus::Invalid;
+            *out = neg ? static_cast<int64_t>(0u - x.lo) : static_cast<int64_t>(x.lo);
             return CastStatus::Ok;
         }
         default: return CastStatus::Invalid;
@@ -320,6 +323,31 @@ inline CastStatus to_bool(const uint8_t* v, uint32_t n, bool* out) noexcept {
 // Each writes the value bytes into out[0..cap) and returns their length (0 when cap is too small). The width
 // follows the source type, as Spark's cast does: a TINYINT is int8, an INT is int32 whatever its value.
 inline constexpr uint8_t kEmptyMetadata[3] = {1, 0, 0};
+
+// Spark VariantBuilder.appendLong: the narrowest integer width (bytes) that holds `v`.
+inline uint32_t long_width(int64_t v) noexcept {
+    return v == static_cast<int8_t>(v) ? 1u : v == static_cast<int16_t>(v) ? 2u : v == static_cast<int32_t>(v) ? 4u : 8u;
+}
+
+// Decimal digits of the two's-complement unscaled value (hi, lo), at least 1: VariantBuilder.appendDecimal sizes a decimal
+// (4 / 8 / 16 bytes) by this, the value's own precision, not its declared type's.
+inline uint32_t decimal_value_digits(int64_t hi, uint64_t lo) noexcept {
+    uint64_t h = static_cast<uint64_t>(hi), l = lo;
+    if (hi < 0) {
+        h = ~h;
+        l = ~l;
+        if (++l == 0) ++h;
+    }
+    uint32_t d = 0;
+    uint64_t qh = 0, ql = 0, r = 0;
+    for (uint32_t k = 0; k < 40u && (h != 0 || l != 0); ++k) {     // bounded: 39 digits in 128 bits
+        decimal::div_u128_u64(h, l, 10u, &qh, &ql, &r);
+        h = qh;
+        l = ql;
+        ++d;
+    }
+    return d == 0 ? 1u : d;
+}
 
 inline uint32_t encode_int(uint8_t* out, uint32_t cap, int64_t v, uint32_t width_bytes) noexcept {
     assert(width_bytes == 1 || width_bytes == 2 || width_bytes == 4 || width_bytes == 8);

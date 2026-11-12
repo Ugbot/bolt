@@ -4,7 +4,7 @@ bool schema_has_nested(const Schema* schema) noexcept {
     if (schema == nullptr) return false;
     for (uint32_t i = 0; i < schema->n_fields; ++i) {
         const auto* t = schema->fields[i].type;
-        if (!std::strcmp(t,"struct") || !std::strcmp(t,"list") || !std::strcmp(t,"map")) return true;
+        if (!std::strcmp(t,"struct") || !std::strcmp(t,"list") || !std::strcmp(t,"map") || !std::strcmp(t,"variant")) return true;
     }
     return false;
 }
@@ -106,6 +106,19 @@ bool nested_absent(const SchemaField& f, int64_t rows, bool masked, Arena* arena
                    uint32_t depth, BoltColumn* out) noexcept {
     assert(arena != nullptr && out != nullptr); assert(rows >= 0);
     if (depth > kIcebergSchemaMaxDepth || rows > INT32_MAX) return false;
+    if (!std::strcmp(f.type,"variant")) {                 // G2ICE-382: null (a variant takes no default)
+        if (f.required && !masked && rows != 0) return false;
+        auto* offsets = arena->allocate_array<int32_t>(static_cast<size_t>(rows)+1u);
+        auto* valid = static_cast<uint8_t*>(arena->allocate_zeroed((static_cast<uint64_t>(rows)+7u)/8u+1u));
+        auto* empty = static_cast<uint8_t*>(arena->allocate(1,8));
+        if (offsets == nullptr || valid == nullptr || empty == nullptr) return false;
+        std::memset(offsets,0,(static_cast<size_t>(rows)+1u)*sizeof(int32_t));
+        const BoltColumn bytes = BoltColumn::make_var_binary(empty,nullptr,offsets,rows,BoltType::Binary,arena);
+        *out = BoltColumn::make_variant(&bytes,&bytes,rows,valid,arena);
+        if (out->data == nullptr) return false;
+        out->stats.all_valid = rows == 0; out->stats.null_count = static_cast<uint32_t>(rows);
+        return true;
+    }
     const bool group = !std::strcmp(f.type,"struct") || !std::strcmp(f.type,"list") || !std::strcmp(f.type,"map");
     if (!masked && f.initial_default_value.json != nullptr)
         return default_column(f,group ? BoltType::NA : want_bolt_type(f.type),rows,arena,out);
@@ -178,6 +191,11 @@ bool nested_conform(ScanHandle* s, const SchemaField& field, int32_t index,
             if (!schema_leaf_matches_parquet(old,column)) return false;
         }
         return promote_column(src,want_bolt_type(field.type),src.length,s->scratch,out,field.name);
+    }
+    if (!std::strcmp(field.type,"variant")) {            // G2ICE-382: folded by read_parquet_group / unshred
+        if (!src.is_variant() || !pq::pq_variant_group_ok(&tree,index)) return false;
+        *out = src;
+        return true;
     }
     const auto kind = physical.kind;
     const char* type = kind == pq::PqFieldKind::Struct ? "struct" : kind == pq::PqFieldKind::List ? "list" : "map";

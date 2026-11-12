@@ -3129,3 +3129,10 @@ target_compile_definitions(test_bolt_variant_spark PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 bolt_apply_hardening(test_bolt_variant_spark)
 add_test(NAME test_bolt_variant_spark COMMAND test_bolt_variant_spark)
+
+# G2CHK-990: portable 128-bit helpers and the kernels ported onto them.
+add_executable(test_bolt_u128 test_bolt_u128.cpp)
+target_link_libraries(test_bolt_u128
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_u128)
+add_test(NAME test_bolt_u128 COMMAND test_bolt_u128)

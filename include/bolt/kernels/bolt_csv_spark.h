@@ -51,10 +51,10 @@ inline int classify_integer(const char* s, std::uint32_t n, CsvField* out) noexc
     const std::uint32_t digits = n - i;
     if (digits <= 9) { out->type = CsvType::Int; return kCsvOk; }
     if (digits <= 19) {
-        unsigned __int128 v = 0;
+        std::uint64_t v = 0;   // <= 19 digits: below 10^19 < 2^64
         for (std::uint32_t k = i; k < n; ++k) v = v * 10u + static_cast<unsigned>(s[k] - '0');
-        const unsigned __int128 imax = neg ? 2147483648u : 2147483647u;
-        const unsigned __int128 lmax = neg ? (static_cast<unsigned __int128>(1) << 63) : (static_cast<unsigned __int128>(1) << 63) - 1u;
+        const std::uint64_t imax = neg ? 2147483648u : 2147483647u;
+        const std::uint64_t lmax = neg ? (std::uint64_t{1} << 63) : (std::uint64_t{1} << 63) - 1u;
         if (v <= imax) { out->type = CsvType::Int; return kCsvOk; }
         if (v <= lmax) { out->type = CsvType::Long; return kCsvOk; }
     }
