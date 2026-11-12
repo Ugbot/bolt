@@ -1003,6 +1003,7 @@ bool arrow_ipc_open_units(ArrowIpcWriter* w, std::FILE* f,
         std::malloc(sizeof(FieldSpec) * n_cols));
     if (specs == nullptr) return false;
     for (std::uint16_t c = 0; c < n_cols; ++c) {
+        std::memset(static_cast<void*>(&specs[c]), 0, sizeof(FieldSpec));   // non_null / meta_key / meta_value too
         specs[c].type = types[c];
         specs[c].name = (names != nullptr) ? names[c] : nullptr;
         specs[c].decimal_scale =
