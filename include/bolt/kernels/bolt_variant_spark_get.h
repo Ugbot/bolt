@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bolt/kernels/bolt_decimal.h"
+
 namespace bolt {
 namespace kernels {
 namespace variantspark {
@@ -320,6 +322,31 @@ inline CastStatus to_bool(const uint8_t* v, uint32_t n, bool* out) noexcept {
 // Each writes the value bytes into out[0..cap) and returns their length (0 when cap is too small). The width
 // follows the source type, as Spark's cast does: a TINYINT is int8, an INT is int32 whatever its value.
 inline constexpr uint8_t kEmptyMetadata[3] = {1, 0, 0};
+
+// Spark VariantBuilder.appendLong: the narrowest integer width (bytes) that holds `v`.
+inline uint32_t long_width(int64_t v) noexcept {
+    return v == static_cast<int8_t>(v) ? 1u : v == static_cast<int16_t>(v) ? 2u : v == static_cast<int32_t>(v) ? 4u : 8u;
+}
+
+// Decimal digits of the two's-complement unscaled value (hi, lo), at least 1: VariantBuilder.appendDecimal sizes a decimal
+// (4 / 8 / 16 bytes) by this, the value's own precision, not its declared type's.
+inline uint32_t decimal_value_digits(int64_t hi, uint64_t lo) noexcept {
+    uint64_t h = static_cast<uint64_t>(hi), l = lo;
+    if (hi < 0) {
+        h = ~h;
+        l = ~l;
+        if (++l == 0) ++h;
+    }
+    uint32_t d = 0;
+    uint64_t qh = 0, ql = 0, r = 0;
+    for (uint32_t k = 0; k < 40u && (h != 0 || l != 0); ++k) {     // bounded: 39 digits in 128 bits
+        decimal::div_u128_u64(h, l, 10u, &qh, &ql, &r);
+        h = qh;
+        l = ql;
+        ++d;
+    }
+    return d == 0 ? 1u : d;
+}
 
 inline uint32_t encode_int(uint8_t* out, uint32_t cap, int64_t v, uint32_t width_bytes) noexcept {
     assert(width_bytes == 1 || width_bytes == 2 || width_bytes == 4 || width_bytes == 8);

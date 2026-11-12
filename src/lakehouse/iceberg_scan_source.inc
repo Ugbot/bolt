@@ -187,6 +187,15 @@ bool open_parquet(ScanHandle* s, const char* path, Arena* metadata,
     return loaded;
 }
 
+// Is decoded top field `top` the table schema's `variant` column (G2ICE-382)?
+bool top_is_variant(const ScanHandle* s, uint32_t top) noexcept {
+    assert(s != nullptr);
+    if (!s->use_map || s->map_schema == nullptr || s->colmap == nullptr) return false;
+    for (uint32_t j = 0; j < s->map_schema->n_fields; ++j)              // bounded by the schema
+        if (s->colmap[j] == static_cast<int32_t>(top)) return std::strcmp(s->map_schema->fields[j].type, "variant") == 0;
+    return false;
+}
+
 bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
     uint64_t length, const pq::PqMeta* meta, uint32_t row_group,
     BoltColumn* columns, int64_t* rows, uint32_t selected=0) noexcept {
@@ -197,12 +206,22 @@ bool read_parquet_group(ScanHandle* s, PinnedParquet* file, const uint8_t* body,
         if (count > file->tree.n_top || count > kMaxColumns) return false;
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t top = selected==0 ? i : s->source_indices[i];
+            // G2ICE-382: VARIANT groups (shredded or not) read with their NANOS leaves raw, then fold to make_variant.
+            const bool force = top_is_variant(s, top);
+            const bool variant = pq::pq_variant_in_field(&file->tree, top, force);
+            const pq::PqMeta* read_meta = meta;
+            pq::PqMeta raw{};
+            if (variant) {
+                if (!pq::pq_variant_read_meta(meta, &file->tree, top, force, s->scratch, &raw)) return false;
+                read_meta = &raw;
+            }
             const bool ok = s->ranged
                 ? pq::parquet_read_nested_column_source(&file->source, &s->source_workspace,
-                    meta, &file->tree, row_group, top, s->scratch, &columns[i], rows, true) == pq::ParquetSourceStatus::Ok
-                : pq::parquet_read_nested_column_tree(body, length, meta, &file->tree,
+                    read_meta, &file->tree, row_group, top, s->scratch, &columns[i], rows, true) == pq::ParquetSourceStatus::Ok
+                : pq::parquet_read_nested_column_tree(body, length, read_meta, &file->tree,
                     row_group, top, s->scratch, &columns[i], rows, true);
             if (!ok) return false;
+            if (variant && !pq::pq_variant_fold(&file->tree, meta, top, force, &columns[i], s->scratch)) return false;
         }
         return true;
     }

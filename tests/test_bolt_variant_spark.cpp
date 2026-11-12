@@ -11,6 +11,7 @@
 
 #include "bolt/datetime/bolt_tz.h"
 #include "bolt/kernels/bolt_variant_spark.h"
+#include "bolt/kernels/bolt_variant_spark_schema.h"
 
 namespace vs = bolt::kernels::variantspark;
 namespace js = bolt::kernels::jsonspark;
@@ -213,4 +214,57 @@ TEST(BoltVariantSpark, GetPathAndCastsMatchSpark) {
     js::Out o{out, sizeof out, 0, false};
     ASSERT_EQ(vs::to_json(v, n, e.metadata, e.metadata_n, &o), vs::JsonStatus::Ok);
     EXPECT_EQ(std::string(out, o.n), "[1,2]");
+}
+
+// schema_of_variant: expected text from real Spark 4.0.4 (schema_of_variant(parse_json(j)), probe c_sov.py).
+TEST(BoltVariantSpark, SchemaOfMatchesSpark) {
+    const std::pair<const char*, const char*> cases[] = {
+        {R"({"a":1,"b":[1,2]})", "OBJECT<a: BIGINT, b: ARRAY<BIGINT>>"},
+        {R"([1,"a",null,true,[2,{"x":1}]])", "ARRAY<VARIANT>"},
+        {"1.5", "DECIMAL(2,1)"}, {"null", "VOID"}, {R"("x")", "STRING"},
+        {R"({"z":{"y":{"x":"deep"}},"a":null})", "OBJECT<a: VOID, z: OBJECT<y: OBJECT<x: STRING>>>"},
+        {"[]", "ARRAY<VOID>"}, {"{}", "OBJECT<>"}, {"[1, 2.5]", "ARRAY<DECIMAL(21,1)>"}, {"[1, 1e20]", "ARRAY<DOUBLE>"},
+        {"[1.5, 1e300]", "ARRAY<DOUBLE>"}, {R"([1, "s"])", "ARRAY<VARIANT>"},
+        {R"([{"a":1},{"b":"x"}])", "ARRAY<OBJECT<a: BIGINT, b: STRING>>"}, {R"([{"a":1},{"a":2.25}])", "ARRAY<OBJECT<a: DECIMAL(22,2)>>"},
+        {R"([{"a":1},{"a":"s"}])", "ARRAY<OBJECT<a: VARIANT>>"}, {"[[1],[2.5]]", "ARRAY<ARRAY<DECIMAL(21,1)>>"},
+        {"[null, null]", "ARRAY<VOID>"}, {"[true, 1]", "ARRAY<VARIANT>"}, {R"({"A":1,"a":2})", "OBJECT<A: BIGINT, a: BIGINT>"},
+        {R"({"a b":1,"c`d":2,"_e":3,"1f":4})", "OBJECT<`1f`: BIGINT, _e: BIGINT, `a b`: BIGINT, `c``d`: BIGINT>"},
+        {"0.001", "DECIMAL(3,3)"}, {"123456789012345678901234567890", "DECIMAL(30,0)"}, {"-0.0", "DECIMAL(1,0)"},
+        {"1e-5", "DOUBLE"}, {"[0.5, 0.25]", "ARRAY<DECIMAL(2,2)>"}, {"9223372036854775807", "BIGINT"},
+        {R"([{"a":[1]},{"a":[null]},{"a":[2.5]}])", "ARRAY<OBJECT<a: ARRAY<DECIMAL(21,1)>>>"}, {"[[], [1]]", "ARRAY<ARRAY<BIGINT>>"},
+        {R"([{}, {"a":1}])", "ARRAY<OBJECT<a: BIGINT>>"}, {"[1, 0.1234567890123456789012345678]", "ARRAY<DOUBLE>"},
+        {"[[1],{\"a\":1}]", "ARRAY<VARIANT>"},
+    };
+    Bufs b;
+    std::vector<vs::SchemaNode> nodes(4096);
+    char out[512];
+    for (const auto& [json, want] : cases) {
+        vs::Encoded e{};
+        ASSERT_EQ(parse(&b, json, &e), vs::Status::Ok) << json;
+        vs::SchemaPool pool{nodes.data(), static_cast<uint32_t>(nodes.size()), 0};
+        js::Out o{out, sizeof out, 0, false};
+        ASSERT_EQ(vs::schema_of(e.value, e.value_n, e.metadata, e.metadata_n, &pool, &o), vs::SchemaStatus::Ok) << json;
+        EXPECT_EQ(std::string(out, o.n), want) << json;
+    }
+    vs::Encoded e{};
+    ASSERT_EQ(parse(&b, R"([{"a":1,"b":2},{"c":3}])", &e), vs::Status::Ok);
+    vs::SchemaPool tiny{nodes.data(), 3, 0};
+    js::Out o{out, sizeof out, 0, false};
+    EXPECT_EQ(vs::schema_of(e.value, e.value_n, e.metadata, e.metadata_n, &tiny, &o), vs::SchemaStatus::Budget);
+}
+
+// CAST(x AS VARIANT) widths as Spark's VariantBuilder writes them (probe c_tvw.py bytes).
+TEST(BoltVariantSpark, NarrowestWidthsMatchSpark) {
+    uint8_t b[24];
+    EXPECT_EQ(hex(b, vs::encode_int(b, sizeof b, 5, vs::long_width(5))), "0c05");
+    EXPECT_EQ(hex(b, vs::encode_int(b, sizeof b, 300, vs::long_width(300))), "102c01");
+    EXPECT_EQ(vs::long_width(70000), 4u);
+    EXPECT_EQ(vs::long_width(5000000000LL), 8u);
+    EXPECT_EQ(vs::long_width(-129), 2u);
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 125, vs::decimal_value_digits(0, 125), 2)), "20027d000000");
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 1, vs::decimal_value_digits(0, 1), 0)), "200001000000");
+    EXPECT_EQ(hex(b, vs::encode_decimal(b, sizeof b, 0, 12345678901ull, vs::decimal_value_digits(0, 12345678901ull), 0)),
+              "2400351cdcdf02000000");
+    EXPECT_EQ(vs::decimal_value_digits(-1, ~0ull), 1u);            // -1
+    EXPECT_EQ(vs::decimal_value_digits(0, 0), 1u);
 }
