@@ -680,9 +680,11 @@ bool layout_field(const ArrowIpcWriter* w, std::uint16_t desc_idx,
     if (n < 0 || col.length < n) return false;
     const IpcFieldDesc& fd = w->desc[desc_idx];
     // A Timestamp field may carry an Int64 epoch lane (same width, the unit
-    // is the field's), the shape decoded nested-row leaves have.
+    // is the field's), the shape decoded nested-row leaves have, or a
+    // TimestampNtz lane (a zone-less field: the same epoch micros).
     if (static_cast<std::uint16_t>(col.type) != fd.type &&
-        !(fd.type == static_cast<std::uint16_t>(BoltType::Timestamp) && col.type == BoltType::Int64)) {
+        !(fd.type == static_cast<std::uint16_t>(BoltType::Timestamp) &&
+          (col.type == BoltType::Int64 || col.type == BoltType::TimestampNtz))) {
         return false;
     }
     if (L->n_nodes >= L->max_nodes) return false;
