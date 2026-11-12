@@ -401,3 +401,4 @@ inline Status parse_json(const uint8_t* json, uint32_t len, Workspace* w, Encode
 }  // namespace bolt
 
 #include "bolt/kernels/bolt_variant_spark_json.h"
+#include "bolt/kernels/bolt_variant_spark_get.h"

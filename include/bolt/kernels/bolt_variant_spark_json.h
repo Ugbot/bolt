@@ -2,13 +2,17 @@
 // Included by bolt_variant_spark.h. Objects print their fields in key order (the encoding's field-id order),
 // strings and keys with Jackson's escaping, decimals as stripTrailingZeros().toPlainString(), doubles as
 // Java's Double.toString with a non-finite value quoted, dates as quoted yyyy-MM-dd, binary as quoted base64,
-// uuid as quoted text. Timestamps / times / floats print in Spark's session-zone forms and are refused here
-// (Status::Unsupported) until a caller needs them.
+// uuid as quoted text, floats as Java's Float.toString, a timestamp as quoted "yyyy-MM-dd HH:mm:ss[.ffffff]+HH:MM"
+// in the session zone and a timestamp_ntz without the offset (fraction trailing zeros trimmed). TIME and the
+// nanosecond timestamps (Spark 4.1 types) are refused (JsonStatus::Unsupported).
 #pragma once
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+
+#include "bolt/datetime/bolt_tz.h"
+#include "bolt/kernels/bolt_json_spark_nested.h"
 
 namespace bolt {
 namespace kernels {
@@ -24,6 +28,7 @@ struct Dec {
     uint32_t       osize;  // metadata offset size
     uint32_t       nkeys;
     jsonspark::Out* o;
+    tz::ZoneId     zone;   // session zone of TIMESTAMP values
 };
 
 inline void put_escaped(jsonspark::Out* o, const uint8_t* s, uint32_t n) noexcept {
@@ -107,6 +112,40 @@ inline void put_date(jsonspark::Out* o, int32_t days) noexcept {
     o->put(b, static_cast<uint32_t>(w));
 }
 
+// A TIMESTAMP (UTC micros) in `zone` with its offset, or a TIMESTAMP_NTZ (wall micros) without one.
+inline void put_timestamp(jsonspark::Out* o, int64_t micros, bool ntz, tz::ZoneId zone) noexcept {
+    int64_t sec = micros >= 0 ? micros / 1000000 : -((-micros + 999999) / 1000000);
+    int64_t frac = micros - sec * 1000000;
+    int32_t off = 0;
+    if (!ntz) {
+        tz::OffsetSpan sp{};
+        tz::offset_span(zone, sec, &sp);
+        off = sp.off;
+    }
+    const int64_t local = sec + off;
+    const int64_t days = local >= 0 ? local / 86400 : -((-local + 86399) / 86400);
+    const int64_t tod = local - days * 86400;
+    char date[32];
+    jsonspark::Out tmp{date, sizeof date, 0, false};
+    put_date(&tmp, static_cast<int32_t>(days));                      // "yyyy-MM-dd" with quotes
+    o->put(date, tmp.n - 1);                                         // keep the opening quote, drop the closing one
+    char b[64];
+    int w = std::snprintf(b, sizeof b, " %02lld:%02lld:%02lld", static_cast<long long>(tod / 3600),
+                          static_cast<long long>((tod / 60) % 60), static_cast<long long>(tod % 60));
+    o->put(b, static_cast<uint32_t>(w));
+    if (frac != 0) {
+        w = std::snprintf(b, sizeof b, ".%06lld", static_cast<long long>(frac));
+        while (w > 1 && b[w - 1] == '0') --w;
+        o->put(b, static_cast<uint32_t>(w));
+    }
+    if (!ntz) {
+        const int32_t a = off < 0 ? -off : off;
+        w = std::snprintf(b, sizeof b, "%c%02d:%02d", off < 0 ? '-' : '+', a / 3600, (a / 60) % 60);
+        o->put(b, static_cast<uint32_t>(w));
+    }
+    o->put('"');
+}
+
 inline JsonStatus value_json(const Dec& d, const uint8_t* v, uint32_t n, uint32_t depth) noexcept;
 
 inline JsonStatus container_json(const Dec& d, const uint8_t* v, uint32_t n, uint32_t depth, bool obj) noexcept {
@@ -188,6 +227,23 @@ inline JsonStatus value_json(const Dec& d, const uint8_t* v, uint32_t n, uint32_
             put_decimal(d.o, v + 2, k, v[1]);
             return JsonStatus::Ok;
         }
+        case kFloat: {
+            if (!need(4)) return JsonStatus::Malformed;
+            const uint32_t bits = static_cast<uint32_t>(get_le(v + 1, 4));
+            float x = 0;
+            std::memcpy(&x, &bits, 4);
+            const uint32_t w = jsonspark::java_float_chars(b, sizeof b, x);
+            const bool finite = x == x && x != HUGE_VALF && x != -HUGE_VALF;
+            if (!finite) d.o->put('"');
+            d.o->put(b, w);
+            if (!finite) d.o->put('"');
+            return JsonStatus::Ok;
+        }
+        case kTimestamp: case kTimestampNtz: {
+            if (!need(8)) return JsonStatus::Malformed;
+            put_timestamp(d.o, static_cast<int64_t>(get_le(v + 1, 8)), h == kTimestampNtz, d.zone);
+            return JsonStatus::Ok;
+        }
         case kDate: {
             if (!need(4)) return JsonStatus::Malformed;
             put_date(d.o, static_cast<int32_t>(static_cast<uint32_t>(get_le(v + 1, 4))));
@@ -214,7 +270,7 @@ inline JsonStatus value_json(const Dec& d, const uint8_t* v, uint32_t n, uint32_
             return JsonStatus::Ok;
         }
         default:
-            return JsonStatus::Unsupported;                           // timestamps, times, float
+            return JsonStatus::Unsupported;                           // TIME, nanosecond timestamps (Spark 4.1)
     }
 }
 
@@ -222,11 +278,11 @@ inline JsonStatus value_json(const Dec& d, const uint8_t* v, uint32_t n, uint32_
 
 // Spark to_json(variant) of {value, metadata} into `o`.
 inline JsonStatus to_json(const uint8_t* value, uint32_t vn, const uint8_t* metadata, uint32_t mn,
-                          jsonspark::Out* o) noexcept {
+                          jsonspark::Out* o, tz::ZoneId zone = 0) noexcept {
     assert(o != nullptr);
     assert(value != nullptr || vn == 0);
     if (mn < 1 || metadata == nullptr || (metadata[0] & 0x0Fu) != 1u) return JsonStatus::Malformed;
-    detail::Dec d{metadata, mn, ((metadata[0] >> 6) & 3u) + 1u, 0, o};
+    detail::Dec d{metadata, mn, ((metadata[0] >> 6) & 3u) + 1u, 0, o, zone};
     if (mn < 1u + d.osize * 2u) return JsonStatus::Malformed;
     d.nkeys = static_cast<uint32_t>(detail::get_le(metadata + 1, d.osize));
     if (1u + uint64_t{d.osize} * (d.nkeys + 2u) > mn) return JsonStatus::Malformed;
