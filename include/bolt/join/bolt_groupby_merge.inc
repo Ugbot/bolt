@@ -150,7 +150,8 @@ inline bool gb_merge_combine(GroupbyTypedState* dst, uint32_t dslot,
             // i128). Min/Max: typed compare against the src partial — a
             // src identity cell (zero valid rows) can never win.
             gb_detail::apply(k, dst->agg_in_types[j], &dst->accums[doff],
-                             src->accums[soff], /*valid=*/true);
+                             src->accums[soff], /*valid=*/true,
+                             &dst->dec_sum_wrapped);
         }
         dst->counts[doff] += src->counts[soff];
     }
@@ -180,6 +181,7 @@ inline bool groupby_agg_multi_key_typed_merge_class(
     // never be merged INTO a clean destination, and must poison one it is
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
+    dst->dec_sum_wrapped |= src->dec_sum_wrapped;
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
 #ifndef NDEBUG
@@ -246,6 +248,7 @@ inline bool groupby_agg_multi_key_typed_merge_list(
     // never be merged INTO a clean destination, and must poison one it is
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
+    dst->dec_sum_wrapped |= src->dec_sum_wrapped;
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     for (uint32_t i = 0; i < n; ++i) {
@@ -308,6 +311,7 @@ inline bool groupby_typed_merge_dense_range(
     // never be merged INTO a clean destination, and must poison one it is
     // merged into, or the refusal is lost at the merge boundary.
     if (src->null_key) { dst->null_key = true; return false; }
+    dst->dec_sum_wrapped |= src->dec_sum_wrapped;
     if (dst->null_key) return false;
     if (dst->any_distinct || src->any_distinct) return false;
     const int64_t src_lo = src->dense_min;

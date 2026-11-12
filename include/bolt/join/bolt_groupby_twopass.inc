@@ -492,33 +492,42 @@ BOLT_FORCE_INLINE int64_t gb_p2_row(const uint32_t* sel, int64_t start,
 // structs through stack temps even under __forceinline, which turns the
 // by-value d128_add into a store-forwarding chain (~3ns/row measured);
 // writing the lanes directly keeps everything in registers.
-BOLT_FORCE_INLINE void gb_d128_acc(
+// Returns 1 when the signed 128-bit word wrapped (the sum left 38 digits).
+BOLT_FORCE_INLINE uint64_t gb_d128_acc(
         kernels::decimal::Decimal128* BOLT_RESTRICT dst,
         const kernels::decimal::Decimal128& src) noexcept {
     const uint64_t alo = static_cast<uint64_t>(dst->lo);
+    const uint64_t ahi = static_cast<uint64_t>(dst->hi);
+    const uint64_t shi = static_cast<uint64_t>(src.hi);
     const uint64_t lo  = alo + static_cast<uint64_t>(src.lo);
+    const uint64_t hi  = ahi + shi + ((lo < alo) ? 1u : 0u);
     dst->lo = static_cast<int64_t>(lo);
-    dst->hi = dst->hi + src.hi + static_cast<int64_t>((lo < alo) ? 1 : 0);
+    dst->hi = static_cast<int64_t>(hi);
+    return ((ahi ^ hi) & (shi ^ hi)) >> 63;
 }
 
 template <bool Sparse, bool HasValid>
-inline void gb_p2_sum_d128(GbCell16* BOLT_RESTRICT acc,
+inline void gb_p2_sum_d128(GroupbyTypedState* st,
+                           GbCell16* BOLT_RESTRICT acc,
                            int64_t* BOLT_RESTRICT cnt,
                            const BoltColumn& pc, const uint32_t* sel,
                            int64_t start, int64_t count,
-                           const int32_t* BOLT_RESTRICT gid) noexcept {
-    assert(acc != nullptr && cnt != nullptr && gid != nullptr);
+                           const int32_t* BOLT_RESTRICT gid,
+                           uint32_t /*ec*/, const int64_t* /*win*/) noexcept {
+    assert(st != nullptr && acc != nullptr && cnt != nullptr && gid != nullptr);
     static_assert(sizeof(GbCell16) == sizeof(kernels::decimal::Decimal128),
                   "GbCell16 must alias Decimal128");
     const auto* p = static_cast<const kernels::decimal::Decimal128*>(pc.data);
     auto* a = reinterpret_cast<kernels::decimal::Decimal128*>(acc);
+    uint64_t wrapped = 0;
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
         const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
         const int32_t g = gid[i];
-        if (valid) gb_d128_acc(&a[g], p[r]);
+        if (valid) wrapped |= gb_d128_acc(&a[g], p[r]);
         cnt[g] += valid ? 1 : 0;
     }
+    st->dec_sum_wrapped |= wrapped != 0;
 }
 
 // W-DEC: Decimal64 payload — int64 mantissas accumulated into the FULL
@@ -663,26 +672,28 @@ inline void gb_p2_sum_d128_bank(GroupbyTypedState* st,
     auto* bk = reinterpret_cast<dec::Decimal128*>(st->bank_acc);
     int64_t* bc = st->bank_cnt;
     const auto* p = static_cast<const dec::Decimal128*>(pc.data);
+    uint64_t wrapped = 0;
     for (int64_t i = 0; i < count; ++i) {
         const int64_t r = gb_p2_row<Sparse>(sel, start, i);
         const bool valid = gb_p2_valid<Sparse, HasValid>(pc, r);
         const size_t o = static_cast<size_t>(i & (kGbBankCount - 1)) *
                          kGbBankGroups + static_cast<uint32_t>(gid[i]);
-        if (valid) gb_d128_acc(&bk[o], p[r]);
+        if (valid) wrapped |= gb_d128_acc(&bk[o], p[r]);
         if (HasValid) bc[o] += valid ? 1 : 0;
     }
     auto* a = reinterpret_cast<dec::Decimal128*>(acc);
     for (uint32_t g = 0; g < ec; ++g) {
         dec::Decimal128 s = bk[g];
         for (uint32_t b = 1; b < kGbBankCount; ++b)
-            gb_d128_acc(&s, bk[static_cast<size_t>(b) * kGbBankGroups + g]);
-        gb_d128_acc(&a[g], s);
+            wrapped |= gb_d128_acc(&s, bk[static_cast<size_t>(b) * kGbBankGroups + g]);
+        wrapped |= gb_d128_acc(&a[g], s);
         if (!HasValid) { cnt[g] += win[g]; continue; }
         int64_t c = bc[g];
         for (uint32_t b = 1; b < kGbBankCount; ++b)
             c += bc[static_cast<size_t>(b) * kGbBankGroups + g];
         cnt[g] += c;
     }
+    st->dec_sum_wrapped |= wrapped != 0;
 }
 
 template <bool Sparse, bool HasValid, typename SrcT>
@@ -760,7 +771,7 @@ inline void gb_p2_sum_dec64_lane_bank(GroupbyTypedState* st,
         int64_t s = bk[g].a;
         for (uint32_t b = 1; b < kGbBankCount; ++b)
             s += bk[static_cast<size_t>(b) * kGbBankGroups + g].a;
-        gb_d128_acc(&a[g], kernels::decimal::d128_from_i64(s));
+        (void)gb_d128_acc(&a[g], kernels::decimal::d128_from_i64(s));
         if (!HasValid) { cnt[g] += win[g]; continue; }
         int64_t c = bc[g];
         for (uint32_t b = 1; b < kGbBankCount; ++b)
@@ -876,7 +887,7 @@ inline void gb_p2_generic(GroupbyTypedState* st, uint32_t j,
                           // ingest checks state->oom right after this call
             }
         } else {
-            gb_detail::apply(kind, t, &acc[g], v, valid);
+            gb_detail::apply(kind, t, &acc[g], v, valid, &st->dec_sum_wrapped);
         }
         cnt[g] += valid ? 1 : 0;
     }
@@ -911,7 +922,7 @@ inline bool gb_pass2_sum_like(GroupbyTypedState* st, GbCell16* acc,
         if (banked) {
             BOLT_GB_P2B(gb_p2_sum_d128_bank);
         } else {
-            BOLT_GB_P2(gb_p2_sum_d128);
+            BOLT_GB_P2B(gb_p2_sum_d128);
         }
         return true;
     }
