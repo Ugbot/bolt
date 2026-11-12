@@ -1888,6 +1888,13 @@ target_compile_definitions(test_bolt_parquet_flba_logical PRIVATE
 bolt_apply_hardening(test_bolt_parquet_flba_logical)
 add_test(NAME test_bolt_parquet_flba_logical COMMAND test_bolt_parquet_flba_logical)
 
+# G2CHK-975: PqMeta::nanos_lane over embedded pyarrow NANOS / INT96 fixtures.
+add_executable(test_bolt_parquet_nanos test_bolt_parquet_nanos.cpp)
+target_link_libraries(test_bolt_parquet_nanos
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_parquet_nanos)
+add_test(NAME test_bolt_parquet_nanos COMMAND test_bolt_parquet_nanos)
+
 # Self-contained LZ4 block codec. bolt could not OPEN an LZ4_RAW parquet file
 # on a default build (bolt_lz4.h is behind find_package(lz4)), so this closes
 # a read gap as well as a write one. Checked against a naive reference decoder
