@@ -34,6 +34,20 @@ namespace {
 using namespace bolt;
 namespace dec = bolt::kernels::decimal;
 
+// AVG of a scale-2 sum at scale 6, HALF_UP (away from zero on a half), in
+// plain 128-bit integers rather than the decimal kernels under test.
+dec::Decimal128 avg_s2_to_s6_half_up(int64_t sum, int64_t n) {
+    const __int128 num = static_cast<__int128>(sum) * 10000;
+    __int128 q = num / n;
+    const __int128 r = num % n;
+    const __int128 ar = r < 0 ? -r : r;
+    if (2 * ar >= n) q += (num < 0) ? -1 : 1;
+    dec::Decimal128 out;
+    out.lo = static_cast<int64_t>(static_cast<uint64_t>(q));
+    out.hi = static_cast<int64_t>(q >> 64);
+    return out;
+}
+
 inline AggSpec make_spec(AggKind k, uint8_t in_col,
                          uint8_t distinct = 0) noexcept {
     AggSpec s{};
@@ -314,10 +328,7 @@ TEST(BoltGroupbyTwopass, Q1ShapeMatchesScalarOracle) {
         EXPECT_EQ(dec::d128_cmp(s1[i], dec::d128_from_i64(acc.s1)), 0) << key;
         EXPECT_EQ(dec::d128_cmp(s2[i], dec::d128_from_i64(acc.s2)), 0) << key;
         EXPECT_EQ(cs[i], acc.n) << key;
-        // AVG replicates finalize's formula: rescale(+4) then divide.
-        const dec::Decimal128 num =
-            dec::d128_rescale(dec::d128_from_i64(acc.s2), 2, 6);
-        const dec::Decimal128 q = dec::d128_div(num, dec::d128_from_i64(acc.n));
+        const dec::Decimal128 q = avg_s2_to_s6_half_up(acc.s2, acc.n);
         EXPECT_EQ(dec::d128_cmp(av[i], q), 0) << key;
     }
 }
@@ -510,10 +521,7 @@ TEST(BoltGroupbyTwopass, BankedAvgAndSumsAreExact) {
         const auto* ia = static_cast<const double*>(oa[3].data);
         const auto* ic = static_cast<const int64_t*>(oa[4].data);
         EXPECT_EQ(dec::d128_cmp(ds[i], dec::d128_from_i64(dsum[g])), 0);
-        const dec::Decimal128 num =
-            dec::d128_rescale(dec::d128_from_i64(dsum[g]), 2, 6);
-        const dec::Decimal128 q =
-            dec::d128_div(num, dec::d128_from_i64(n_g[g]));
+        const dec::Decimal128 q = avg_s2_to_s6_half_up(dsum[g], n_g[g]);
         EXPECT_EQ(dec::d128_cmp(da[i], q), 0);
         EXPECT_EQ(is[i], isum[g]);
         EXPECT_DOUBLE_EQ(ia[i], static_cast<double>(isum[g]) /
