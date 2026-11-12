@@ -56,6 +56,36 @@ inline bool mul10_add(U128* x, uint32_t d) noexcept {
     return true;
 }
 
+// x + d; false when the result passes 128 bits.
+inline bool add_small(U128* x, uint64_t d) noexcept {
+    assert(x != nullptr);
+    x->lo += d;
+    if (x->lo >= d) return true;
+    if (x->hi == ~uint64_t{0}) return false;
+    ++x->hi;
+    return true;
+}
+
+inline bool less(U128 a, U128 b) noexcept { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+
+// 10^n for n <= 38.
+inline U128 pow10(uint32_t n) noexcept {
+    assert(n <= 38u);
+    U128 r{0, 1};
+    for (uint32_t k = 0; k < n; ++k) (void)mul10_add(&r, 0);   // 10^38 < 2^127
+    return r;
+}
+
+// The 16-byte little-endian two's complement of (neg ? -mag : mag).
+inline void to_le_signed(U128 mag, bool neg, uint8_t* out16) noexcept {
+    assert(out16 != nullptr);
+    const U128 v = neg ? negate(mag) : mag;
+    for (uint32_t i = 0; i < 8u; ++i) {
+        out16[i] = static_cast<uint8_t>(v.lo >> (8u * i));
+        out16[8u + i] = static_cast<uint8_t>(v.hi >> (8u * i));
+    }
+}
+
 // x / d, the remainder in *rem.
 inline U128 div_small(U128 x, uint64_t d, uint64_t* rem) noexcept {
     assert(d != 0 && rem != nullptr);
