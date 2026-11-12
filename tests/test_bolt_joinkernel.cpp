@@ -595,3 +595,33 @@ TEST(BoltJoinKernel, CompositeUtf8PlusInt) {
 }
 
 }  // namespace
+
+// G2CHK-944: Binary keys share the StringView layout and join by bytes, inline
+// and spilled, exactly as Utf8 does (they hashed as raw view bits before).
+TEST(BoltJoinKernel, BinaryKeysJoinByBytes) {
+    Arena a;
+    char build_pool[256] = {0};
+    char probe_pool[256] = {0};
+    uint32_t bc = 0, pc = 0;
+    StringView bv[] = {
+        spill_view(build_pool, &bc, "\xff\xfe binary key 01"),
+        StringView::from_cstr("\xff\x01"),
+    };
+    StringView pv[] = {
+        spill_view(probe_pool, &pc, "ZZ"),
+        StringView::from_cstr("\xff\x01"),
+        spill_view(probe_pool, &pc, "\xff\xfe binary key 01"),
+    };
+    BoltColumn b = make_utf8_col(bv, 2, build_pool);
+    BoltColumn p = make_utf8_col(pv, 3, probe_pool);
+    b.type = BoltType::Binary;
+    p.type = BoltType::Binary;
+    JoinBuildTyped jb{};
+    ASSERT_TRUE(join_build_typed(&b, 1, 2, &a, &jb));
+    int32_t ob[16], op[16];
+    const size_t n = join_probe_typed(&jb, &p, 3, ob, op, 16);
+    ASSERT_EQ(n, 2u);
+    for (size_t i = 0; i < n; ++i) {
+        EXPECT_EQ(0, kernels::utf8::sv_compare(bv[ob[i]], build_pool, pv[op[i]], probe_pool));
+    }
+}

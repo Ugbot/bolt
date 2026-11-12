@@ -980,7 +980,8 @@ TEST(BoltGroupbyTyped, NullDecimalGroupKeyIsItsOwnGroup) {
 // _key` no longer scans a type the kernel can now ANSWER, so over an Int64 key
 // it correctly returns false everywhere and this sweep would assert NOTHING
 // while still printing green. G2CHK-311 answers Decimal64 too, so the sweep
-// uses Binary, a type the kernel still refuses; only the type tag moves.
+// uses FixedSizeBinary, a type the kernel still refuses (G2CHK-944 answers
+// Binary); only the type tag moves.
 TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
     constexpr int64_t kN = 40;                 // 5 bytes of bitmap
     int64_t ks[kN];
@@ -990,7 +991,7 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
         for (int b = 0; b < 8; ++b) bits[b] = 0xFF;
         bits[null_row >> 3] = static_cast<uint8_t>(
             bits[null_row >> 3] & ~(1u << (null_row & 7)));
-        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::Binary);
+        BoltColumn key = BoltColumn::make_flat(ks, bits, kN, BoltType::FixedSizeBinary);
         for (int64_t start = 0; start < kN; ++start) {
             for (int64_t count = 0; start + count <= kN; ++count) {
                 const bool want = (null_row >= start && null_row < start + count);
@@ -1008,9 +1009,9 @@ TEST(BoltGroupbyTyped, WindowHasNullKeyCoversEveryBitPosition) {
 TEST(BoltGroupbyTyped, WindowHasNullKeyHonoursSelection) {
     int64_t ks[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t bits[1] = {0b11110111};            // row 3 is NULL
-    // Binary for the same reason as the sweep above: an answered key type
+    // FixedSizeBinary for the same reason as the sweep above: an answered key type
     // is no longer scanned, so this would pass vacuously.
-    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::Binary);
+    BoltColumn key = BoltColumn::make_flat(ks, bits, 8, BoltType::FixedSizeBinary);
     const uint32_t skips[4] = {0, 1, 2, 4};
     const uint32_t hits[4]  = {0, 3, 5, 7};
     EXPECT_FALSE(gb_detail::window_has_null_key(&key, 1, skips, 0, 4));
@@ -1333,5 +1334,90 @@ TEST(BoltGroupbyTypedG2chk736, DecimalAvgEmptyGrouped) {
         EXPECT_EQ(ng,0u);
         EXPECT_EQ(oa[0].type,BoltType::Decimal128);
         EXPECT_EQ(oa[0].decimal_scale,38);
+    }
+}
+
+// G2CHK-944: Binary group keys and MIN/MAX over Binary are bytewise, like Utf8.
+TEST(BoltGroupbyTyped, BinaryKeysAndMinMaxAreBytewise) {
+    Arena a;
+    StringView keys[6] = {sv_inline("\xff\x00", 2), sv_inline("ab", 2), sv_inline("\xff\x00", 2),
+                          sv_inline("ab", 2), sv_inline("\xff\x00", 2), sv_inline("", 0)};
+    StringView vals[6] = {sv_inline("\x10", 1), sv_inline("\xff", 1), sv_inline("\x02\x03", 2),
+                          sv_inline("a", 1), sv_inline("\xfe\xff", 2), sv_inline("z", 1)};
+    BoltColumn key = BoltColumn::make_flat(keys, nullptr, 6, BoltType::Binary);
+    BoltColumn val = BoltColumn::make_flat(vals, nullptr, 6, BoltType::Binary);
+    AggSpec specs[3];
+    specs[0] = make_spec(AggKind::Min, 0);
+    specs[1] = make_spec(AggKind::Max, 0);
+    specs[2] = make_spec(AggKind::CountStar, 0);
+    BoltColumn ok[1], oa[3];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed(&key, 1, &val, 1, specs, 3, 6, ok, oa, &ng, &a, 4));
+    ASSERT_EQ(ng, 3u);
+    EXPECT_EQ(ok[0].type, BoltType::Binary);
+    EXPECT_EQ(oa[0].type, BoltType::Binary);
+    EXPECT_EQ(oa[1].type, BoltType::Binary);
+    const auto* k = static_cast<const StringView*>(ok[0].data);
+    const auto* mn = static_cast<const StringView*>(oa[0].data);
+    const auto* mx = static_cast<const StringView*>(oa[1].data);
+    const auto* cnt = static_cast<const int64_t*>(oa[2].data);
+    auto bytes = [](const StringView& v) { return std::string(v.prefix, v.prefix + v.length); };
+    int seen = 0;
+    for (uint32_t i = 0; i < ng; ++i) {
+        const std::string g = bytes(k[i]);
+        if (g == std::string("\xff\x00", 2)) {
+            EXPECT_EQ(cnt[i], 3);
+            EXPECT_EQ(bytes(mn[i]), std::string("\x02\x03", 2));
+            EXPECT_EQ(bytes(mx[i]), std::string("\xfe\xff", 2));
+            seen |= 1;
+        } else if (g == "ab") {
+            EXPECT_EQ(cnt[i], 2);
+            EXPECT_EQ(bytes(mn[i]), "a");
+            EXPECT_EQ(bytes(mx[i]), "\xff");
+            seen |= 2;
+        } else if (g.empty()) {
+            EXPECT_EQ(cnt[i], 1);
+            seen |= 4;
+        }
+    }
+    EXPECT_EQ(seen, 7);
+}
+
+// G2CHK-944: a group whose only value sorts above the 12 x 0xFF MIN identity
+// (a longer 0xFF run, spilled) answers that value, not the identity.
+TEST(BoltGroupbyTyped, ByteMinAboveTheIdentityIsTheValue) {
+    Arena a;
+    char pool[32];
+    std::memset(pool, 0xFF, sizeof(pool));
+    StringView big{};
+    big.length = 13;
+    std::memset(big.prefix, 0xFF, 4);
+    big.ref.buf_idx = 0;
+    big.ref.offset = 0;
+    int64_t ks[2] = {7, 7};
+    StringView vs[2] = {big, sv_inline("", 0)};
+    uint8_t valid[1] = {0b01};   // row 1 is NULL
+    BoltColumn key = BoltColumn::make_flat(ks, nullptr, 2, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vs, valid, 2, BoltType::Binary);
+    val.str_overflow_base = pool;
+    val.stats.all_valid = false;
+    AggSpec specs[2];
+    specs[0] = make_spec(AggKind::Min, 0);
+    specs[1] = make_spec(AggKind::Max, 0);
+    // The one-shot entry is inline-only for byte MIN/MAX; the state API (what
+    // chukonu drives) resolves spilled values.
+    GroupbyTypedState st{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &a, &key, 1, &val, 1, specs, 2, 4));
+    groupby_agg_multi_key_typed_ingest(&st, &key, &val, nullptr, 0, 2);
+    ASSERT_FALSE(st.oom);
+    BoltColumn ok[1], oa[2];
+    uint32_t ng = 0;
+    ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+    ASSERT_EQ(ng, 1u);
+    for (int s = 0; s < 2; ++s) {
+        const StringView out = static_cast<const StringView*>(oa[s].data)[0];
+        ASSERT_EQ(out.length, 13u) << "agg " << s;
+        const char* bytes = kernels::utf8::sv_bytes(out, static_cast<const char*>(oa[s].str_overflow_base));
+        EXPECT_EQ(std::string(bytes, 13), std::string(13, '\xff')) << "agg " << s;
     }
 }

@@ -69,7 +69,7 @@ inline bool gb_pick_bytes_append(GbPickBytes s, const char* p, uint32_t len, uin
 // *dst = v, owning a spilled Utf8 tail (resolved through `base`) in `s`.
 inline bool gb_pick_take(BoltType t, GbCell16* dst, GbCell16 v, const char* base, GbPickBytes s) noexcept {
     assert(dst != nullptr);
-    if (t != BoltType::Utf8) { *dst = v; return true; }
+    if (!::bolt::gb_detail::gb_bytes(t)) { *dst = v; return true; }
     StringView sv;
     std::memcpy(&sv, &v, sizeof(sv));
     if (sv.length <= 12u) { *dst = v; return true; }
@@ -85,7 +85,7 @@ inline bool gb_pick_take(BoltType t, GbCell16* dst, GbCell16 v, const char* base
 
 // Spark's ordering of two cells of type `t`: <0, 0, >0.
 inline int gb_pick_ord_cmp(BoltType t, GbCell16 a, const char* abase, GbCell16 b, const char* bbase) noexcept {
-    if (t == BoltType::Utf8) {
+    if (::bolt::gb_detail::gb_bytes(t)) {
         StringView x, y;
         std::memcpy(&x, &a, sizeof(x));
         std::memcpy(&y, &b, sizeof(y));

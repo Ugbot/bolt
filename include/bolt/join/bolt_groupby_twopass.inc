@@ -109,7 +109,7 @@ inline GbShape gb_classify(const GroupbyTypedState* st,
         if (keys[k].validity != nullptr) return GbShape::Fallback;
         if (t != BoltType::Int64 && t != BoltType::Int32 &&
             t != BoltType::Date32) all_int = false;
-        if (t != BoltType::Utf8) all_sv = false;
+        if (!::bolt::gb_detail::gb_bytes(t)) all_sv = false;
     }
     if (all_int) return GbShape::IntKeys;
     if (!all_sv) return GbShape::Fallback;
@@ -861,7 +861,7 @@ inline void gb_p2_generic(GroupbyTypedState* st, uint32_t j,
     // — it hard-codes nullptr spilled-string bases, which segfaults the
     // moment a real (>12-byte) string is compared. Resolve + deep-copy-on-win
     // via the dedicated helper instead (same fix as gb_ingest_fallback).
-    const bool is_utf8_minmax = (t == BoltType::Utf8) &&
+    const bool is_utf8_minmax = (::bolt::gb_detail::gb_bytes(t)) &&
         (kind == AggKind::Min || kind == AggKind::Max);
     const char* cand_base = is_utf8_minmax
         ? static_cast<const char*>(pc.str_overflow_base) : nullptr;
@@ -871,7 +871,7 @@ inline void gb_p2_generic(GroupbyTypedState* st, uint32_t j,
         const int32_t g = gid[i];
         const GbCell16 v = gb_detail::read_cell16(pc, r);
         if (is_utf8_minmax) {
-            if (!gb_agg_utf8_minmax(st, j, kind, &acc[g], v, valid, cand_base)) {
+            if (!gb_agg_utf8_minmax(st, j, kind, &acc[g], v, valid, cand_base, cnt[g] == 0)) {
                 return;   // st->oom already set; groupby_agg_multi_key_typed_
                           // ingest checks state->oom right after this call
             }
