@@ -2,6 +2,7 @@
 #include "bolt/bolt_column.h"
 #include <gtest/gtest.h>
 #include <cstring>
+#include <string>
 #include <limits>
 namespace {
 namespace ar=bolt::arrow;
@@ -95,7 +96,7 @@ TEST(ArrowImport, BooleanFloatDecimalAndTemporalMetadata) {
 }
 TEST(ArrowImport, UnsupportedAndMalformedShapesPreserveOutput) {
     std::int64_t value=1;Fixture f{"l",&value,1};
-    for (const char* format:{"+l","tsu:UTC","d:0,0","d:39,0","d:3,-1","d:3,4","d:3,1,256","vu","w:16"}) {
+    for (const char* format:{"+l","tsu:UTC","d:0,0","d:39,0","d:3,-1","d:3,4","d:3,1,256","vu","w:0","w:","w:4x"}) {
         f.leaf.format=format;bolt::Arena scratch;ar::ImportState state{};
         EXPECT_EQ(ar::import_begin(&f.schema,{},&scratch,state),ar::ImportError::Unsupported);
     }
@@ -152,3 +153,36 @@ TEST(ArrowImport, UnsupportedArenaAlignmentRefusesBeforeBudgetedAllocations) {
     EXPECT_FALSE(state.finished);
 }
 } // namespace
+
+// G2CHK-966: fixed_size_binary imports as Binary values of its width, nulls
+// kept; the arrow.uuid extension over w:16 as canonical UUID text.
+TEST(ArrowImport, FixedSizeBinaryAndUuidExtension) {
+    const std::uint8_t data[]{0,1,2,3, 9,9,9,9, 0xff,0xfe,0xfd,0xfc};std::uint8_t valid[]{0b101};
+    Fixture f{"w:4",data,3};f.buffers[0]=valid;f.column.null_count=1;
+    {
+        bolt::Arena scratch,destination;ar::ImportState state{};
+        ASSERT_EQ(ar::import_begin(&f.schema,{},&scratch,state),ar::ImportError::Ok);
+        ASSERT_EQ(ar::import_append(state,&f.array),ar::ImportError::Ok);
+        bolt::BoltBatch batch{};ASSERT_EQ(ar::import_finish(state,&destination,batch),ar::ImportError::Ok);
+        ASSERT_EQ(batch.col(0).type,bolt::BoltType::Binary);EXPECT_TRUE(batch.col(0).is_null(1));
+        const std::uint8_t* bytes=nullptr;std::int32_t n=0;
+        batch.col(0).utf8_at(0,&bytes,&n);ASSERT_EQ(n,4);EXPECT_EQ(std::memcmp(bytes,data,4),0);
+        batch.col(0).utf8_at(2,&bytes,&n);ASSERT_EQ(n,4);EXPECT_EQ(std::memcmp(bytes,data+8,4),0);
+    }
+    const std::uint8_t id[16]{0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef};
+    char meta[4+4+20+4+10];std::int32_t v=1;std::memcpy(meta,&v,4);v=20;std::memcpy(meta+4,&v,4);
+    std::memcpy(meta+8,"ARROW:extension:name",20);v=10;std::memcpy(meta+28,&v,4);std::memcpy(meta+32,"arrow.uuid",10);
+    Fixture u{"w:16",id,1};u.leaf.metadata=meta;
+    {
+        bolt::Arena scratch,destination;ar::ImportState state{};
+        ASSERT_EQ(ar::import_begin(&u.schema,{},&scratch,state),ar::ImportError::Ok);
+        ASSERT_EQ(ar::import_append(state,&u.array),ar::ImportError::Ok);
+        bolt::BoltBatch batch{};ASSERT_EQ(ar::import_finish(state,&destination,batch),ar::ImportError::Ok);
+        ASSERT_EQ(batch.col(0).type,bolt::BoltType::Utf8);
+        const std::uint8_t* bytes=nullptr;std::int32_t n=0;batch.col(0).utf8_at(0,&bytes,&n);
+        ASSERT_EQ(n,36);EXPECT_EQ(std::string(reinterpret_cast<const char*>(bytes),36),"12345678-9abc-def0-0123-456789abcdef");
+    }
+    std::memcpy(meta+32,"arrow.json",10);   // any other extension stays refused
+    bolt::Arena scratch;ar::ImportState state{};
+    EXPECT_EQ(ar::import_begin(&u.schema,{},&scratch,state),ar::ImportError::Unsupported);
+}

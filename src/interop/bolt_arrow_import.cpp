@@ -41,6 +41,15 @@ Error field_type(const char* fmt,ImportField& f) noexcept {
         }
         return Error::Ok;
     }
+    if (n>2 && fmt[0]=='w' && fmt[1]==':') {   // fixed_size_binary (G2CHK-966)
+        std::uint32_t w=0;
+        for (std::uint32_t i=2;i<n;++i) {
+            if (fmt[i]<'0' || fmt[i]>'9' || w>(INT32_MAX-9)/10) return Error::Unsupported;
+            w=w*10+static_cast<std::uint32_t>(fmt[i]-'0');
+        }
+        if (w==0) return Error::Unsupported;
+        f.field.type=BoltType::Binary;f.fixed_width=w;return Error::Ok;
+    }
     if (std::strcmp(fmt,"tdD")==0) { f.field.type=BoltType::Date32;return Error::Ok; }
     if (std::strcmp(fmt,"tdm")==0) { f.field.type=BoltType::Date64;return Error::Ok; }
     const bool timestamp=n==4 && fmt[0]=='t' && fmt[1]=='s' && fmt[3]==':';
@@ -62,15 +71,39 @@ Error field_type(const char* fmt,ImportField& f) noexcept {
     f.field.type=BoltType::Decimal128; f.precision=static_cast<std::uint8_t>(values[0]);
     f.field.decimal_scale=static_cast<std::uint8_t>(values[1]);return Error::Ok;
 }
+// Field metadata is accepted only as a canonical extension type: the keys
+// ARROW:extension:name = arrow.uuid and an optional ARROW:extension:metadata.
+// Anything else stays refused, as before (G2CHK-966).
+bool extension_uuid(const char* m,bool& uuid) noexcept {
+    assert(m!=nullptr);
+    auto i32=[](const char* p) noexcept { std::int32_t v=0;std::memcpy(&v,p,4);return v; };
+    const std::int32_t pairs=i32(m);
+    if (pairs<1 || pairs>2) return false;
+    const char* p=m+4;
+    for (std::int32_t k=0;k<pairs;++k) {
+        const std::int32_t kl=i32(p); if (kl<0 || kl>64) return false; const char* key=p+4; p+=4+kl;
+        const std::int32_t vl=i32(p); if (vl<0 || vl>64) return false; const char* val=p+4; p+=4+vl;
+        const auto is=[](const char* s,std::int32_t l,const char* want) noexcept {
+            return static_cast<std::size_t>(l)==std::strlen(want) && std::memcmp(s,want,static_cast<std::size_t>(l))==0; };
+        if (is(key,kl,"ARROW:extension:name")) { if (!is(val,vl,"arrow.uuid")) return false; uuid=true; }
+        else if (!is(key,kl,"ARROW:extension:metadata")) return false;
+    }
+    return uuid;
+}
 Error schema_field(const ArrowSchema* s,ImportField& f) noexcept {
     assert(f.field.type==BoltType::NA); assert(sizeof(f.field.name)==64);
     if (!s || !s->format || !s->release) return Error::Invalid;
-    if (s->dictionary || s->n_children!=0 || s->metadata) return Error::Unsupported;
+    if (s->dictionary || s->n_children!=0) return Error::Unsupported;
+    bool uuid=false;
+    if (s->metadata && !extension_uuid(s->metadata,uuid)) return Error::Unsupported;
     std::uint32_t n=0;
     if (s->name && !text_size(s->name,64,n)) return Error::Unsupported;
     if (n) std::memcpy(f.field.name,s->name,n);
     f.field.nullable=(s->flags&2)!=0;
-    return field_type(s->format,f);
+    const auto e=field_type(s->format,f);
+    if (e!=Error::Ok || !uuid) return e;
+    if (f.fixed_width!=16) return Error::Unsupported;   // arrow.uuid is w:16
+    f.uuid=true;f.field.type=BoltType::Utf8;return Error::Ok;
 }
 bool variable(const ImportField& f) noexcept { return f.field.type==BoltType::Binary || f.field.type==BoltType::Utf8; }
 bool valid_bit(const ArrowArray& a,std::uint64_t bit) noexcept {
@@ -91,7 +124,8 @@ Error plan_column(const ImportField& f,const ArrowArray* a,std::uint64_t parent,
     if (parent>static_cast<std::uint64_t>(a->length) || rows>static_cast<std::uint64_t>(a->length)-parent ||
         static_cast<std::uint64_t>(a->offset)>static_cast<std::uint64_t>(INT64_MAX)-parent-rows) return Error::Invalid;
     p.start=static_cast<std::uint64_t>(a->offset)+parent;
-    if (a->n_buffers!=(variable(f)?3:2) || !a->buffers) return Error::Invalid;
+    const bool fixed=f.fixed_width!=0;
+    if (a->n_buffers!=(variable(f) && !fixed?3:2) || !a->buffers) return Error::Invalid;
     if (!a->buffers[0] && a->null_count>0) return Error::Invalid;
     if (a->buffers[0] && !span(a->buffers[0],(p.start+rows+7)/8)) return Error::Invalid;
     for (std::uint64_t i=0;i<rows;++i) p.nulls+=valid_bit(*a,p.start+i)?0u:1u;
@@ -103,6 +137,17 @@ Error plan_column(const ImportField& f,const ArrowArray* a,std::uint64_t parent,
         if ((width && p.start+rows>SIZE_MAX/width) || (rows && !span(a->buffers[1],input_bytes))) return Error::Invalid;
         p.bytes=rows*width;
         return charge(charge_bytes,p.bytes,2)?Error::Ok:Error::Limit;
+    }
+    if (fixed) {   // fixed_size_binary: N bytes per slot; UUID text is 36 per value
+        const std::uint64_t w=f.fixed_width;
+        if (p.start+rows>SIZE_MAX/w || (rows && !span(a->buffers[1],(p.start+rows)*w))) return Error::Invalid;
+        const std::uint64_t per=f.uuid?36u:w;
+        if (rows-p.nulls>(INT32_MAX/per)) return Error::Limit;
+        p.bytes=(rows-p.nulls)*per;
+        if (!charge(charge_bytes,p.bytes,2) || !charge(charge_bytes,(rows+1)*4,2) ||
+            !charge(charge_bytes,sizeof(BoltColumn),2)) return Error::Limit;
+        if (f.field.type==BoltType::Utf8 && !charge(charge_bytes,rows*sizeof(StringView),2)) return Error::Limit;
+        return Error::Ok;
     }
     const auto width=f.large_offsets?8u:4u;
     if (p.start+rows+1>SIZE_MAX/width || !span(a->buffers[1],(p.start+rows+1)*width)) return Error::Invalid;
@@ -118,6 +163,16 @@ Error plan_column(const ImportField& f,const ArrowArray* a,std::uint64_t parent,
         !charge(charge_bytes,sizeof(BoltColumn),2)) return Error::Limit;
     if (f.field.type==BoltType::Utf8 && !charge(charge_bytes,rows*sizeof(StringView),2)) return Error::Limit;
     return Error::Ok;
+}
+// Canonical lowercase 8-4-4-4-12 text of 16 UUID bytes.
+void uuid_text(const std::uint8_t* b,std::uint8_t* out) noexcept {
+    static constexpr char k_hex[]="0123456789abcdef";
+    std::uint32_t w=0;
+    for (std::uint32_t i=0;i<16;++i) {
+        if (i==4 || i==6 || i==8 || i==10) out[w++]='-';
+        out[w++]=static_cast<std::uint8_t>(k_hex[b[i]>>4]);out[w++]=static_cast<std::uint8_t>(k_hex[b[i]&15]);
+    }
+    assert(w==36);
 }
 Error copy_column(const ImportField& f,const ArrowArray& a,const ColumnPlan& p,
                   std::uint64_t rows,Arena& arena,BoltColumn& out) noexcept {
@@ -140,7 +195,15 @@ Error copy_column(const ImportField& f,const ArrowArray& a,const ColumnPlan& p,
         auto* offsets=arena.allocate_array<std::int32_t>(static_cast<std::size_t>(rows+1));
         if (!data || !offsets) return Error::Allocation;
         std::uint64_t used=0;offsets[0]=0;
-        for (std::uint64_t i=0;i<rows;++i) {
+        for (std::uint64_t i=0;i<rows && f.fixed_width!=0;++i) {
+            if (valid_bit(a,p.start+i)) {
+                const auto* src=static_cast<const std::uint8_t*>(a.buffers[1])+(p.start+i)*f.fixed_width;
+                if (f.uuid) { uuid_text(src,data+used);used+=36; }
+                else { std::memcpy(data+used,src,f.fixed_width);used+=f.fixed_width; }
+            }
+            offsets[i+1]=static_cast<std::int32_t>(used);
+        }
+        for (std::uint64_t i=0;i<rows && f.fixed_width==0;++i) {
             const auto b=offset_at(a,f.large_offsets,p.start+i),e=offset_at(a,f.large_offsets,p.start+i+1);
             if (valid_bit(a,p.start+i) && e>b) { std::memcpy(data+used,static_cast<const std::uint8_t*>(a.buffers[2])+b,static_cast<std::size_t>(e-b));used+=static_cast<std::uint64_t>(e-b); }
             offsets[i+1]=static_cast<std::int32_t>(used);
