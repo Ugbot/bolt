@@ -52,7 +52,10 @@ Error field_type(const char* fmt,ImportField& f) noexcept {
     }
     if (std::strcmp(fmt,"tdD")==0) { f.field.type=BoltType::Date32;return Error::Ok; }
     if (std::strcmp(fmt,"tdm")==0) { f.field.type=BoltType::Date64;return Error::Ok; }
-    const bool timestamp=n==4 && fmt[0]=='t' && fmt[1]=='s' && fmt[3]==':';
+    // "ts<unit>:" (naive) or "ts<unit>:<zone>": a zoned timestamp is the same
+    // UTC instant on the same lane; the zone only changes how it is shown
+    // (G2CHK-971).
+    const bool timestamp=n>=4 && fmt[0]=='t' && fmt[1]=='s' && fmt[3]==':';
     const bool duration=n==3 && fmt[0]=='t' && fmt[1]=='D';
     if (timestamp || duration) {
         switch (fmt[2]) { case 's':f.unit=1;break; case 'm':f.unit=2;break;
