@@ -470,10 +470,7 @@ TEST(BoltAvroDatum, NestedNullableLeaf) {
 // row after it.
 TEST(BoltAvroDatum, UnrepresentableTypesFailClosed) {
     const char* cases[] = {
-        // enum: an int index on the wire, not a string.
-        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
-        "{\"name\":\"s\",\"type\":{\"type\":\"enum\",\"name\":\"S\","
-        "\"symbols\":[\"A\",\"B\"]}}]}",
+        // (enum is modelled: AvroType::kEnum + AvroEnumTable; see LogicalTypesEnumsAndEncodeRoundtrip.)
         // (fixed is modelled since G2ICE-292: AvroField::fixed_size; see BoltAvro.FixedRoundTrip.)
         // A named-type REFERENCE needs a definition table to resolve.
         "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
@@ -1460,11 +1457,101 @@ TEST(BoltAvro, FixedWithoutSizeFailsClosed) {
 // item_type byte cannot say "record, N fields wide"). AvroField is multiplied
 // by kAvroMaxFields inside AvroHeader, so the cost is pinned here rather than
 // left to drift: 132 -> 134 bytes per field, 33,816 -> 34,328 per header;
-// `fixed_size` (G2ICE-292) 134 -> 136, 34,328 -> 34,840.
+// `fixed_size` (G2ICE-292) 134 -> 136, 34,328 -> 34,840; logical type +
+// precision + scale (G2CHK registry Avro) 136 -> 140, 34,840 -> 35,864.
 TEST(BoltAvro, AbiSizesPinned) {
-    static_assert(sizeof(AvroField) == 136, "AvroField ABI changed");
-    static_assert(sizeof(AvroHeader) == 34840, "AvroHeader ABI changed");
+    static_assert(sizeof(AvroField) == 140, "AvroField ABI changed");
+    static_assert(sizeof(AvroHeader) == 35864, "AvroHeader ABI changed");
     std::printf("sizeof(AvroField)=%zu sizeof(AvroHeader)=%zu\n",
                 sizeof(AvroField), sizeof(AvroHeader));
     EXPECT_EQ(offsetof(AvroField, elem_fields), 132u);
+}
+
+// Registry schemas carry logical types and enums; both must survive the parse,
+// and a datum encoded from the parsed table must decode back to the same values.
+TEST(BoltAvroDatum, LogicalTypesEnumsAndEncodeRoundtrip) {
+    const char* js =
+        "{\"type\":\"record\",\"name\":\"t\",\"fields\":["
+        "{\"name\":\"px\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":18,\"scale\":4}},"
+        "{\"name\":\"ts\",\"type\":{\"logicalType\":\"timestamp-micros\",\"type\":\"long\"}},"
+        "{\"name\":\"d\",\"type\":[\"null\",{\"type\":\"int\",\"logicalType\":\"date\"}],\"default\":null},"
+        "{\"name\":\"side\",\"type\":{\"type\":\"enum\",\"name\":\"Side\",\"symbols\":[\"BUY\",\"SELL\"]}},"
+        "{\"name\":\"venue\",\"type\":[\"null\",{\"symbols\":[\"A\",\"B\",\"C\"],\"type\":\"enum\",\"name\":\"V\"}]},"
+        "{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"F\",\"size\":16,\"logicalType\":\"decimal\",\"precision\":38,\"scale\":10}},"
+        "{\"name\":\"bad\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":4,\"scale\":9}},"
+        "{\"name\":\"other\",\"type\":{\"type\":\"string\",\"logicalType\":\"made-up\"}}]}";
+    AvroField f[16];
+    std::memset(f, 0, sizeof(f));
+    static AvroEnumTable enums;
+    uint32_t n = 0;
+    ASSERT_TRUE(avro_parse_schema_ex(reinterpret_cast<const uint8_t*>(js),
+                                     static_cast<uint32_t>(std::strlen(js)), f, 16, &n, &enums));
+    ASSERT_EQ(n, 8u);
+    EXPECT_EQ(f[0].type, AvroType::kBytes);
+    EXPECT_EQ(f[0].logical, AvroLogical::kDecimal);
+    EXPECT_EQ(f[0].precision, 18u);
+    EXPECT_EQ(f[0].scale, 4u);
+    EXPECT_EQ(f[1].logical, AvroLogical::kTimestampMicros);
+    EXPECT_TRUE(f[2].nullable);
+    EXPECT_EQ(f[2].logical, AvroLogical::kDate);
+    EXPECT_EQ(f[3].type, AvroType::kEnum);
+    EXPECT_EQ(f[4].type, AvroType::kEnum);
+    EXPECT_TRUE(f[4].nullable);
+    EXPECT_EQ(f[5].type, AvroType::kFixed);
+    EXPECT_EQ(f[5].logical, AvroLogical::kDecimal);
+    EXPECT_EQ(f[5].precision, 38u);
+    EXPECT_EQ(f[6].logical, AvroLogical::kNone);   // scale > precision: plain bytes
+    EXPECT_EQ(f[7].logical, AvroLogical::kNone);
+    const char* sym = nullptr;
+    uint32_t sl = 0;
+    ASSERT_TRUE(avro_enum_symbol(&enums, 3, 1, &sym, &sl));
+    EXPECT_EQ(std::string(sym, sl), "SELL");
+    ASSERT_TRUE(avro_enum_symbol(&enums, 4, 2, &sym, &sl));
+    EXPECT_EQ(std::string(sym, sl), "C");
+    EXPECT_FALSE(avro_enum_symbol(&enums, 4, 3, &sym, &sl));
+    EXPECT_FALSE(avro_enum_symbol(&enums, 0, 0, &sym, &sl));
+
+    AvroValue v[8];
+    std::memset(v, 0, sizeof(v));
+    const uint8_t px[3] = {0x01, 0xE2, 0x40};      // 123456 big-endian
+    uint8_t fx[16];
+    std::memset(fx, 0xFF, sizeof(fx));             // -1
+    v[0].bytes = px; v[0].bytes_len = 3;
+    v[1].num.i64 = 1700000000123456;
+    v[2].is_null = true;
+    v[3].num.i64 = 1;
+    v[4].num.i64 = 2;
+    v[5].bytes = fx; v[5].bytes_len = 16;
+    v[6].bytes = px; v[6].bytes_len = 3;
+    v[7].bytes = reinterpret_cast<const uint8_t*>("x"); v[7].bytes_len = 1;
+    uint8_t buf[128];
+    uint64_t len = sizeof(buf);
+    ASSERT_TRUE(avro_encode_datum(f, n, v, buf, &len));
+    AvroValue out[8];
+    uint64_t used = 0;
+    ASSERT_TRUE(avro_decode_datum(buf, len, f, n, out, &used));
+    EXPECT_EQ(used, len);
+    EXPECT_EQ(out[0].bytes_len, 3u);
+    EXPECT_EQ(std::memcmp(out[0].bytes, px, 3), 0);
+    EXPECT_EQ(out[1].num.i64, 1700000000123456);
+    EXPECT_TRUE(out[2].is_null);
+    EXPECT_EQ(out[3].num.i64, 1);
+    EXPECT_EQ(out[4].num.i64, 2);
+    EXPECT_FALSE(out[4].is_null);
+    EXPECT_EQ(std::memcmp(out[5].bytes, fx, 16), 0);
+    uint64_t small = 4;
+    EXPECT_FALSE(avro_encode_datum(f, n, v, buf, &small));
+}
+
+TEST(BoltAvroDatum, EnumSymbolOverflowFailsClosed) {
+    std::string js = "{\"type\":\"record\",\"name\":\"t\",\"fields\":[{\"name\":\"e\",\"type\":{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[";
+    for (uint32_t i = 0; i < kAvroMaxEnumSymbols + 1u; ++i) js += (i ? ",\"s" : "\"s") + std::to_string(i) + "\"";
+    js += "]}}]}";
+    AvroField f[4];
+    static AvroEnumTable enums;
+    uint32_t n = 0;
+    EXPECT_FALSE(avro_parse_schema_ex(reinterpret_cast<const uint8_t*>(js.data()), static_cast<uint32_t>(js.size()), f, 4, &n, &enums));
+    // Without a table the field still parses: the symbols are not reported.
+    EXPECT_TRUE(avro_parse_schema(reinterpret_cast<const uint8_t*>(js.data()), static_cast<uint32_t>(js.size()), f, 4, &n));
+    EXPECT_EQ(f[0].type, AvroType::kEnum);
 }

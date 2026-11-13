@@ -39,6 +39,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_types.h"
+#include "bolt/ingest/bolt_avro_limits.h"
 
 namespace bolt {
 namespace ingest {
@@ -63,7 +64,23 @@ enum class AvroType : uint8_t {
     // uuid, fixed[L] and decimal). A record field or a union branch only; an
     // array/map element of this type fails the schema parse closed.
     kFixed = 10,
+    // `enum`: an int symbol index on the wire. The symbols are reported by
+    // avro_parse_schema_ex through an AvroEnumTable.
+    kEnum = 11,
 };
+
+// Avro logical type carried on a primitive / fixed (spec 1.11 "Logical Types").
+// Zero is "none", so a zeroed AvroField keeps its plain physical meaning.
+enum class AvroLogical : uint8_t {
+    kNone = 0, kDecimal = 1, kDate = 2, kTimeMillis = 3, kTimeMicros = 4,
+    kTimestampMillis = 5, kTimestampMicros = 6, kLocalTimestampMillis = 7,
+    kLocalTimestampMicros = 8, kUuid = 9, kTimestampNanos = 10,
+    kLocalTimestampNanos = 11,
+};
+
+// Enum symbol tables reported by avro_parse_schema_ex are bounded by
+// bolt_avro_limits.h. Overflow FAILS the parse: a truncated symbol list would
+// map an index to the wrong name.
 
 // AvroField::item_type when the element of an array/map is not a primitive
 // and not a modelled record (a union, or another container). Such a block can
@@ -135,7 +152,35 @@ struct AvroField {
     uint16_t elem_fields;
     // kFixed only: the declared "size" (1..65535). Zero for every other type.
     uint16_t fixed_size;
+    // Logical type of the field's (non-null) branch; kNone when absent or not
+    // understood. Decimal carries precision (1..76) and scale (0..precision).
+    AvroLogical logical;
+    uint8_t     precision;
+    uint8_t     scale;
 };
+
+struct AvroEnumDesc {
+    uint16_t field;        // index into the parsed field table
+    uint16_t first;        // first symbol in AvroEnumTable::sym_off/sym_len
+    uint16_t count;
+    uint16_t _pad;
+};
+
+struct AvroEnumTable {
+    uint32_t     n;
+    uint32_t     n_syms;
+    uint32_t     pool_used;
+    uint32_t     _pad;
+    AvroEnumDesc e[kAvroMaxEnums];
+    uint16_t     sym_off[kAvroMaxEnumSymbols];
+    uint16_t     sym_len[kAvroMaxEnumSymbols];
+    char         pool[kAvroEnumPoolBytes];
+};
+
+// Symbol `index` of the enum at field `field`, or false when the field is not
+// an enum in `t` or the index is out of range (a corrupt or newer datum).
+bool avro_enum_symbol(const AvroEnumTable* t, uint32_t field, int64_t index,
+                      const char** out, uint32_t* out_len) noexcept;
 
 // Parsed OCF header: schema fields + codec + sync marker.
 struct AvroHeader {
@@ -230,6 +275,12 @@ bool avro_parse_schema(const uint8_t* json, uint32_t json_len,
                        AvroField* out_fields, uint32_t max_fields,
                        uint32_t* out_n) noexcept;
 
+// As avro_parse_schema, plus the symbols of every enum field into `enums`
+// (may be null: enum fields then decode to their index only).
+bool avro_parse_schema_ex(const uint8_t* json, uint32_t json_len,
+                          AvroField* out_fields, uint32_t max_fields,
+                          uint32_t* out_n, AvroEnumTable* enums) noexcept;
+
 // Decode ONE bare datum: `n_fields` values written to out_vals[0..n_fields).
 // *out_consumed (optional) receives the bytes read, so a caller can walk a
 // buffer holding several datums back-to-back.
@@ -245,6 +296,14 @@ bool avro_parse_schema(const uint8_t* json, uint32_t json_len,
 bool avro_decode_datum(const uint8_t* src, uint64_t src_len,
                        const AvroField* fields, uint32_t n_fields,
                        AvroValue* out_vals, uint64_t* out_consumed) noexcept;
+
+// Encode ONE bare datum (no OCF framing): the inverse of avro_decode_datum,
+// same per-field rules as the OCF writer's rows. On entry *dst_len is the
+// capacity; on success the bytes written. False on overflow or a value the
+// field cannot carry; dst is then unspecified.
+bool avro_encode_datum(const AvroField* fields, uint32_t n_fields,
+                       const AvroValue* vals, uint8_t* dst,
+                       uint64_t* dst_len) noexcept;
 
 // ---------------------------------------------------------------------------
 // Writer — encode rows into a single-block OCF (codec = null) into a caller
