@@ -39,6 +39,7 @@
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_types.h"
+#include "bolt/ingest/bolt_avro_limits.h"
 
 namespace bolt {
 namespace ingest {
@@ -77,11 +78,9 @@ enum class AvroLogical : uint8_t {
     kLocalTimestampNanos = 11,
 };
 
-// Enum symbol tables reported by avro_parse_schema_ex. Overflow FAILS the
-// parse: a truncated symbol list would map an index to the wrong name.
-static constexpr uint32_t kAvroMaxEnums        = 32u;
-static constexpr uint32_t kAvroMaxEnumSymbols  = 1024u;
-static constexpr uint32_t kAvroEnumPoolBytes   = 16384u;
+// Enum symbol tables reported by avro_parse_schema_ex are bounded by
+// bolt_avro_limits.h. Overflow FAILS the parse: a truncated symbol list would
+// map an index to the wrong name.
 
 // AvroField::item_type when the element of an array/map is not a primitive
 // and not a modelled record (a union, or another container). Such a block can
