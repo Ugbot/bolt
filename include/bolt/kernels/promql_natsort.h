@@ -37,6 +37,14 @@
 #include <cstdint>
 #include <cstring>
 
+// Contraction is chosen by PromqlNumerics::fused_muladd, never by the compiler:
+// an implicit fma would make answers depend on the CPU (MSVC never contracts
+// under /fp:precise).
+#if defined(__clang__)
+#pragma float_control(push)
+#pragma clang fp contract(off)
+#endif
+
 namespace bolt::promql {
 
 // A maximal run of digits, or a maximal run of non-digits. `chunkify`'s
@@ -131,3 +139,7 @@ inline bool promql_natsort_less(const char* a, const char* b) noexcept {
 }  // namespace bolt::promql
 
 #endif  // BOLT_KERNELS_PROMQL_NATSORT_H
+
+#if defined(__clang__)
+#pragma float_control(pop)
+#endif

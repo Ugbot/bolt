@@ -78,6 +78,14 @@
 
 #include "bolt/ingest/bolt_parquet_bloom.h"
 
+// Contraction is chosen by PromqlNumerics::fused_muladd, never by the compiler:
+// an implicit fma would make answers depend on the CPU (MSVC never contracts
+// under /fp:precise).
+#if defined(__clang__)
+#pragma float_control(push)
+#pragma clang fp contract(off)
+#endif
+
 namespace bolt::promql {
 
 // One (name, value) label pair, borrowed. Value "" means the label is absent.
@@ -172,3 +180,7 @@ inline bool ratio_sample_keep(double r, double sample_offset) noexcept {
 }  // namespace bolt::promql
 
 #endif  // BOLT_KERNELS_PROMQL_LABELHASH_H
+
+#if defined(__clang__)
+#pragma float_control(pop)
+#endif
