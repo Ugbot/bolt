@@ -198,6 +198,7 @@ include/bolt/net/bolt_http_client.h::kHttpMaxBody
 include/bolt/net/bolt_http_client.h::kHttpMaxHeader
 include/bolt/net/bolt_http_client.h::kHttpMaxHeaders
 include/bolt/net/bolt_http_client.h::kHttpMaxUrl
+include/bolt/net/bolt_tls.h::k_tls_error_max
 include/bolt/net/wal_frame.h::kRecvMaxPayloadBytes
 include/bolt/net/wal_frame.h::kWalMaxFrameBytes
 include/bolt/parse/bolt_jinja_ast.h::kMaxArgs
