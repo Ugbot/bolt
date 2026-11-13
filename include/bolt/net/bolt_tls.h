@@ -36,9 +36,11 @@ namespace bolt::net {
 //                         the handshake proceed against self-signed certs.
 // `handshake_timeout_ms`— wall-clock deadline for the connect+handshake
 //                         loop. 0 = library default (5000 ms).
-// `recv_timeout_ms`     — reserved configuration; legacy send/recv currently
-//                         use their library default (5000 ms). For explicit
-//                         per-call bounds use the timeout APIs below.
+// `recv_timeout_ms`     — how long tls_send_all / tls_recv_all /
+//                         tls_recv_some wait without progress (a throttled
+//                         Kafka broker holds a response for seconds). 0 = the
+//                         library default (5000 ms). The *_timeout APIs below
+//                         take an explicit per-call bound instead.
 struct TlsConfig {
     char           server_name[256];
     char           ca_path[512];
@@ -48,6 +50,22 @@ struct TlsConfig {
     bool           insecure_skip_verify;
     std::uint16_t  handshake_timeout_ms;
     std::uint16_t  recv_timeout_ms;
+    // Fields below default to zero, which keeps the behaviour above.
+    // allow_tls12          — accept TLS 1.2 as the floor (database servers:
+    //                        MySQL, PostgreSQL < 12 builds). false = 1.3 only.
+    // skip_hostname_check  — verify the chain but not the name (PG verify-ca,
+    //                        MySQL VERIFY_CA). Ignored unless verify_peer.
+    // *_pem / *_pem_len    — PEM bytes in memory, used instead of the path
+    //                        twin when non-null. Read during connect only.
+    bool           allow_tls12;
+    bool           skip_hostname_check;
+    std::uint8_t   _pad0[2];
+    std::uint32_t  ca_pem_len;
+    const char*    ca_pem;
+    const char*    cert_pem;
+    const char*    key_pem;
+    std::uint32_t  cert_pem_len;
+    std::uint32_t  key_pem_len;
 };
 
 // Live connection handle. Owned by caller; pass by pointer to all funcs.
@@ -55,11 +73,19 @@ struct TlsConfig {
 // `fd` is the underlying TCP socket (SOCKET on Windows, int on POSIX —
 // stored as int either way; cast at the call site in the .cpp).
 // `handshake_done` flips to true after a successful tls_client_connect.
+constexpr std::uint32_t k_tls_error_max = 192u;
+
 struct TlsSocket {
     void*  ssl_ctx;
     void*  ssl;
     int    fd;
     bool   handshake_done;
+    // Wait without progress tls_send_all / tls_recv_all / tls_recv_some allow,
+    // from TlsConfig::recv_timeout_ms; 0 = the library default (5000 ms).
+    std::uint16_t recv_timeout_ms;
+    // Why the last connect/start failed: verify result, OpenSSL reason,
+    // timeout. Empty on success. Never holds key material.
+    char   error[k_tls_error_max];
 };
 
 // Connect a fresh TCP socket to (ipv4, port), then drive an OpenSSL 3.x
@@ -71,6 +97,18 @@ bool tls_client_connect(TlsSocket*       out,
                         const TlsConfig* cfg,
                         std::uint32_t    ipv4,
                         std::uint16_t    port) noexcept;
+
+// Upgrade an already connected TCP socket to TLS (PostgreSQL SSLRequest,
+// MySQL CLIENT_SSL, SMTP/LDAP STARTTLS). The socket is switched to
+// non-blocking. On success `out` owns `fd` and tls_close closes it. On
+// failure `fd` stays the caller's (still open) and out->error says why.
+bool tls_client_start(TlsSocket*       out,
+                      const TlsConfig* cfg,
+                      int              fd) noexcept;
+
+// Decrypted bytes already buffered inside the session. A readiness wait on
+// the socket must not block while this is non-zero.
+std::uint32_t tls_pending(const TlsSocket* s) noexcept;
 
 // Write `len` bytes. Returns `len` on success, -1 on error.
 // Uses the library's default per-call deadline; cfg is not retained by socket.
