@@ -214,6 +214,8 @@ TEST(BoltTls, PeerResetDoesNotRaiseSigpipe) {
 // Reuses the in-process certificate/server setup; never contacts public hosts.
 #include <atomic>
 #include <poll.h>
+#include <fcntl.h>
+#include <openssl/pem.h>
 namespace {
 struct SilentTlsPeer {
     SelfSigned certificate{};
@@ -293,6 +295,59 @@ TEST(BoltTls, ExplicitSendDeadlineBoundsNonReadingPeer) {
     std::fprintf(stdout,"explicit TLS send timeout: budget_ms=40 elapsed_ms=%lld\n",
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
     bolt::net::tls_close(&client); peer.stop=true;
+}
+
+// G2CHK-1096: STARTTLS on an already connected socket, and a named reason on
+// every refusal (database connectors negotiate TLS inside their protocol).
+namespace {
+int plain_connect(std::uint16_t port) {
+    const int fd=::socket(AF_INET,SOCK_STREAM,0); if (fd<0) return -1;
+    sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if (::connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof(a))!=0) { ::close(fd); return -1; }
+    return fd;
+}
+bool pem_of(X509* x, char* out, std::size_t cap, std::uint32_t* len) {
+    BIO* b=BIO_new(BIO_s_mem()); if (b==nullptr) return false;
+    const bool ok=PEM_write_bio_X509(b,x)==1;
+    const int n=ok ? BIO_read(b,out,static_cast<int>(cap)) : -1;
+    BIO_free(b); if (n<=0) return false; *len=static_cast<std::uint32_t>(n); return true;
+}
+}
+TEST(BoltTls, StartUpgradesConnectedSocket) {
+    SilentTlsPeer peer; ASSERT_NE(peer.port,0);
+    const int fd=plain_connect(peer.port); ASSERT_GE(fd,0);
+    bolt::net::TlsConfig cfg{}; fill_default(&cfg,"localhost");
+    cfg.verify_peer=false; cfg.insecure_skip_verify=true; cfg.allow_tls12=true;
+    bolt::net::TlsSocket s{};
+    ASSERT_TRUE(bolt::net::tls_client_start(&s,&cfg,fd)) << s.error;
+    EXPECT_TRUE(s.handshake_done); EXPECT_EQ(s.fd,fd); EXPECT_EQ(s.error[0],'\0');
+    EXPECT_EQ(bolt::net::tls_pending(&s),0u);
+    bolt::net::tls_close(&s); peer.stop=true;
+}
+TEST(BoltTls, StartNamesTheRefusal) {
+    bolt::net::TlsConfig cfg{}; fill_default(&cfg,"localhost");
+    bolt::net::TlsSocket s{};
+    EXPECT_FALSE(bolt::net::tls_client_start(&s,&cfg,-1));
+    EXPECT_NE(std::strstr(s.error,"not open"),nullptr) << s.error;
+
+    SilentTlsPeer peer; ASSERT_NE(peer.port,0);
+    int fd=plain_connect(peer.port); ASSERT_GE(fd,0);
+    static const char garbage[]="-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n";
+    cfg.ca_pem=garbage; cfg.ca_pem_len=sizeof(garbage)-1;
+    EXPECT_FALSE(bolt::net::tls_client_start(&s,&cfg,fd));
+    EXPECT_NE(std::strstr(s.error,"cannot load CA certificates"),nullptr) << s.error;
+    EXPECT_NE(::fcntl(fd,F_GETFD),-1);   // the caller still owns the socket
+    ::close(fd); peer.stop=true;
+
+    SilentTlsPeer peer2; ASSERT_NE(peer2.port,0);
+    SelfSigned other{}; ASSERT_TRUE(make_self_signed(&other));
+    char pem[4096]; std::uint32_t n=0; ASSERT_TRUE(pem_of(other.cert,pem,sizeof(pem),&n));
+    fd=plain_connect(peer2.port); ASSERT_GE(fd,0);
+    cfg.ca_pem=pem; cfg.ca_pem_len=n;
+    EXPECT_FALSE(bolt::net::tls_client_start(&s,&cfg,fd));
+    EXPECT_NE(std::strstr(s.error,"certificate verify failed"),nullptr) << s.error;
+    ::close(fd); peer2.stop=true;
+    X509_free(other.cert); EVP_PKEY_free(other.key);
 }
 
 #endif  // BOLT_WITH_TLS && !_WIN32
