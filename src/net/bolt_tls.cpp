@@ -34,7 +34,11 @@
 #  include <openssl/ssl.h>
 #  include <openssl/err.h>
 #  include <openssl/x509v3.h>
+#  include <openssl/pem.h>
 #endif
+
+#include <cstdarg>
+#include <cstdio>
 
 #include <chrono>
 
@@ -199,9 +203,21 @@ static sock_t tcp_connect(std::uint32_t ipv4_host, std::uint16_t port,
 
 bool tls_client_connect(TlsSocket* out, const TlsConfig*, std::uint32_t,
                         std::uint16_t) noexcept {
-    if (out) std::memset(out, 0, sizeof(*out));
+    if (out) {
+        std::memset(out, 0, sizeof(*out));
+        std::snprintf(out->error, sizeof(out->error), "%s", "bolt built without TLS (BOLT_WITH_TLS=OFF)");
+    }
     return false;
 }
+bool tls_client_start(TlsSocket* out, const TlsConfig*, int) noexcept {
+    if (out) {
+        std::memset(out, 0, sizeof(*out));
+        out->fd = -1;
+        std::snprintf(out->error, sizeof(out->error), "%s", "bolt built without TLS (BOLT_WITH_TLS=OFF)");
+    }
+    return false;
+}
+std::uint32_t tls_pending(const TlsSocket*) noexcept { return 0; }
 std::int64_t tls_send_all(const TlsSocket*, const void*, std::uint32_t) noexcept { return -1; }
 bool         tls_recv_all(const TlsSocket*, void*, std::uint32_t) noexcept       { return false; }
 std::int32_t tls_recv_some(const TlsSocket*, void*, std::uint32_t) noexcept      { return -1; }
@@ -219,17 +235,150 @@ namespace {
 static constexpr std::uint16_t kDefaultHandshakeMs = 5000;
 static constexpr std::uint16_t kDefaultRecvMs      = 5000;
 
-// Configure an SSL_CTX from the caller's TlsConfig. Returns nullptr on
-// failure (e.g. cert/key load error).
-static SSL_CTX* make_ctx(const TlsConfig* cfg) noexcept {
-    assert(cfg != nullptr && "make_ctx: null cfg");
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) return nullptr;
+static void set_error(char* err, const char* fmt, ...) noexcept {
+    assert(err != nullptr && fmt != nullptr);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(err, k_tls_error_max, fmt, ap);
+    va_end(ap);
+    assert(err[k_tls_error_max - 1] == '\0' || std::strlen(err) < k_tls_error_max);
+}
 
-    // TLS 1.3 only. Fail-fast on anything less.
-    if (!SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) ||
+// The newest OpenSSL error-queue reason, then the queue is cleared.
+static void openssl_reason(char* out, std::size_t cap) noexcept {
+    assert(out != nullptr && cap > 0);
+    out[0] = '\0';
+    unsigned long last = 0;
+    for (int i = 0; i < 64; ++i) {
+        const unsigned long e = ERR_get_error();
+        if (e == 0) break;
+        last = e;
+    }
+    if (last != 0) ERR_error_string_n(last, out, cap);
+    else std::snprintf(out, cap, "%s", "no OpenSSL reason");
+}
+
+static bool load_ca_pem(SSL_CTX* ctx, const char* pem, std::uint32_t len) noexcept {
+    assert(ctx != nullptr && pem != nullptr);
+    if (len == 0 || len > INT32_MAX) return false;
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (bio == nullptr) return false;
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    std::uint32_t added = 0;
+    for (std::uint32_t i = 0; i < 1024; ++i) {
+        X509* x = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+        if (x == nullptr) break;
+        const int ok = X509_STORE_add_cert(store, x);
+        X509_free(x);
+        if (ok != 1) { BIO_free(bio); return false; }
+        ++added;
+    }
+    ERR_clear_error();  // the read past the last certificate leaves a PEM "no start line"
+    BIO_free(bio);
+    return added > 0;
+}
+
+static bool load_cert_pem(SSL_CTX* ctx, const char* pem, std::uint32_t len) noexcept {
+    assert(ctx != nullptr && pem != nullptr);
+    if (len == 0 || len > INT32_MAX) return false;
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (bio == nullptr) return false;
+    X509* leaf = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    bool ok = leaf != nullptr && SSL_CTX_use_certificate(ctx, leaf) == 1;
+    if (leaf != nullptr) X509_free(leaf);
+    for (std::uint32_t i = 0; ok && i < 64; ++i) {
+        X509* x = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+        if (x == nullptr) break;
+        if (SSL_CTX_add_extra_chain_cert(ctx, x) != 1) { X509_free(x); ok = false; }
+    }
+    if (ok) ERR_clear_error();
+    BIO_free(bio);
+    return ok;
+}
+
+static bool load_key_pem(SSL_CTX* ctx, const char* pem, std::uint32_t len) noexcept {
+    assert(ctx != nullptr && pem != nullptr);
+    if (len == 0 || len > INT32_MAX) return false;
+    BIO* bio = BIO_new_mem_buf(pem, static_cast<int>(len));
+    if (bio == nullptr) return false;
+    EVP_PKEY* k = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    const bool ok = k != nullptr && SSL_CTX_use_PrivateKey(ctx, k) == 1;
+    if (k != nullptr) EVP_PKEY_free(k);
+    BIO_free(bio);
+    return ok;
+}
+
+static bool configure_trust(SSL_CTX* ctx, const TlsConfig* cfg, char* err) noexcept {
+    assert(ctx != nullptr && cfg != nullptr && err != nullptr);
+    char why[128];
+    if (cfg->ca_pem != nullptr) {
+        if (!load_ca_pem(ctx, cfg->ca_pem, cfg->ca_pem_len)) {
+            openssl_reason(why, sizeof(why));
+            set_error(err, "cannot load CA certificates from PEM (%u bytes): %s",
+                      cfg->ca_pem_len, why);
+            return false;
+        }
+        return true;
+    }
+    if (cfg->ca_path[0] != '\0') {
+        if (SSL_CTX_load_verify_locations(ctx, cfg->ca_path, nullptr) != 1) {
+            openssl_reason(why, sizeof(why));
+            set_error(err, "cannot load CA file '%s': %s", cfg->ca_path, why);
+            return false;
+        }
+        return true;
+    }
+    // System defaults: the OS / OpenSSL configured root store.
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        openssl_reason(why, sizeof(why));
+        set_error(err, "cannot load the system trust store: %s", why);
+        return false;
+    }
+    return true;
+}
+
+static bool configure_client_cert(SSL_CTX* ctx, const TlsConfig* cfg, char* err) noexcept {
+    assert(ctx != nullptr && cfg != nullptr && err != nullptr);
+    const bool have_cert = cfg->cert_pem != nullptr || cfg->client_cert_path[0] != '\0';
+    const bool have_key  = cfg->key_pem  != nullptr || cfg->client_key_path[0]  != '\0';
+    if (!have_cert && !have_key) return true;
+    if (have_cert != have_key) {
+        set_error(err, "%s", "client certificate and client key must be given together");
+        return false;
+    }
+    char why[128];
+    const bool cert_ok = cfg->cert_pem != nullptr
+        ? load_cert_pem(ctx, cfg->cert_pem, cfg->cert_pem_len)
+        : SSL_CTX_use_certificate_chain_file(ctx, cfg->client_cert_path) == 1;
+    if (!cert_ok) {
+        openssl_reason(why, sizeof(why));
+        set_error(err, "cannot load client certificate: %s", why);
+        return false;
+    }
+    const bool key_ok = cfg->key_pem != nullptr
+        ? load_key_pem(ctx, cfg->key_pem, cfg->key_pem_len)
+        : SSL_CTX_use_PrivateKey_file(ctx, cfg->client_key_path, SSL_FILETYPE_PEM) == 1;
+    if (!key_ok || SSL_CTX_check_private_key(ctx) != 1) {
+        openssl_reason(why, sizeof(why));
+        set_error(err, "cannot load client key (or it does not match the certificate): %s", why);
+        return false;
+    }
+    return true;
+}
+
+// Configure an SSL_CTX from the caller's TlsConfig. Returns nullptr and
+// fills `err` on failure (e.g. cert/key load error).
+static SSL_CTX* make_ctx(const TlsConfig* cfg, char* err) noexcept {
+    assert(cfg != nullptr && "make_ctx: null cfg");
+    assert(err != nullptr && "make_ctx: null err");
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { set_error(err, "%s", "SSL_CTX_new failed"); return nullptr; }
+
+    const int floor = cfg->allow_tls12 ? TLS1_2_VERSION : TLS1_3_VERSION;
+    if (!SSL_CTX_set_min_proto_version(ctx, floor) ||
         !SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION)) {
         SSL_CTX_free(ctx);
+        set_error(err, "%s", "cannot set the TLS protocol range");
         return nullptr;
     }
 
@@ -242,31 +391,9 @@ static SSL_CTX* make_ctx(const TlsConfig* cfg) noexcept {
                                                      : SSL_VERIFY_PEER,
                            nullptr);
     }
-
-    // Trust store: explicit ca_path overrides; empty string → system store.
-    if (cfg->ca_path[0] != '\0') {
-        if (SSL_CTX_load_verify_locations(ctx, cfg->ca_path, nullptr) != 1) {
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
-    } else {
-        // System defaults: on Windows OpenSSL 3.x picks up the user's
-        // configured root store; on POSIX it walks /etc/ssl/certs and
-        // friends. Both are fine for client TLS.
-        if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
-    }
-
-    // mTLS: load client cert + key when both paths are set.
-    if (cfg->client_cert_path[0] != '\0' && cfg->client_key_path[0] != '\0') {
-        if (SSL_CTX_use_certificate_chain_file(ctx, cfg->client_cert_path) != 1 ||
-            SSL_CTX_use_PrivateKey_file(ctx, cfg->client_key_path, SSL_FILETYPE_PEM) != 1 ||
-            SSL_CTX_check_private_key(ctx) != 1) {
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
+    if (!configure_trust(ctx, cfg, err) || !configure_client_cert(ctx, cfg, err)) {
+        SSL_CTX_free(ctx);
+        return nullptr;
     }
     return ctx;
 }
@@ -382,6 +509,84 @@ static int handshake_step(SSL* ssl, sock_t fd, std::int64_t deadline_ms) noexcep
     return -1;
 }
 
+// The handshake failed: say why, most specific first.
+static void handshake_reason(SSL* ssl, const TlsConfig* cfg, bool timed_out,
+                             char* err) noexcept {
+    assert(ssl != nullptr && cfg != nullptr && err != nullptr);
+    const long vr = SSL_get_verify_result(ssl);
+    char why[128];
+    openssl_reason(why, sizeof(why));
+    if (vr != X509_V_OK) {
+        set_error(err, "certificate verify failed for '%s': %s",
+                  cfg->server_name, X509_verify_cert_error_string(vr));
+        return;
+    }
+    if (timed_out) {
+        set_error(err, "TLS handshake timed out after %u ms",
+                  unsigned(cfg->handshake_timeout_ms ? cfg->handshake_timeout_ms
+                                                     : kDefaultHandshakeMs));
+        return;
+    }
+    set_error(err, "TLS handshake failed: %s", why);
+}
+
+// Drive SSL_connect on a connected socket. On success the socket owns
+// ctx/ssl/fd; on failure ctx/ssl are freed and fd is left open.
+static bool start_on_fd(TlsSocket* out, const TlsConfig* cfg, sock_t fd,
+                        std::int64_t hs_deadline) noexcept {
+    assert(out != nullptr && cfg != nullptr);
+    assert(fd != kInvalidSock);
+    SSL_CTX* ctx = make_ctx(cfg, out->error);
+    if (!ctx) return false;
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); set_error(out->error, "%s", "SSL_new failed"); return false; }
+    if (!attach_fd(ssl, fd)) {
+        SSL_free(ssl); SSL_CTX_free(ctx);
+        set_error(out->error, "%s", "cannot attach the socket to the TLS session");
+        return false;
+    }
+    if (cfg->server_name[0] != '\0') {
+        // SNI. An IP literal is not a valid SNI name, but servers ignore it.
+        SSL_set_tlsext_host_name(ssl, cfg->server_name);
+        if (cfg->verify_peer && !cfg->skip_hostname_check) {
+            X509_VERIFY_PARAM* p = SSL_get0_param(ssl);
+            X509_VERIFY_PARAM_set_hostflags(p, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+            // An IP literal is checked against the IP SAN, a name against DNS SANs.
+            const bool is_ip = X509_VERIFY_PARAM_set1_ip_asc(p, cfg->server_name) == 1;
+            ERR_clear_error();
+            if (!is_ip && X509_VERIFY_PARAM_set1_host(p, cfg->server_name, 0) != 1) {
+                SSL_free(ssl); SSL_CTX_free(ctx);
+                set_error(out->error, "invalid server name '%s'", cfg->server_name);
+                return false;
+            }
+        }
+    } else if (cfg->verify_peer && !cfg->skip_hostname_check) {
+        SSL_free(ssl); SSL_CTX_free(ctx);
+        set_error(out->error, "%s", "hostname verification needs a server name");
+        return false;
+    }
+    bool timed_out = false;
+    for (int spins = 0; spins < 256; ++spins) {
+        const int st = handshake_step(ssl, fd, hs_deadline);
+        if (st == 1) {
+            out->ssl_ctx        = ctx;
+            out->ssl            = ssl;
+            out->fd             = static_cast<int>(fd);
+            out->handshake_done = true;
+            out->recv_timeout_ms = cfg->recv_timeout_ms;
+            out->error[0]       = '\0';
+            return true;
+        }
+        if (st < 0) {
+            timed_out = io_deadline_expired(hs_deadline);
+            break;
+        }
+    }
+    handshake_reason(ssl, cfg, timed_out, out->error);
+    SSL_free(ssl); SSL_CTX_free(ctx);
+    return false;
+}
+
 }  // namespace
 
 bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
@@ -396,44 +601,44 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
         deadline_from(cfg->handshake_timeout_ms, kDefaultHandshakeMs);
 
     sock_t fd = tcp_connect(ipv4, port, hs_deadline);
-    if (fd == kInvalidSock) return false;
-
-    SSL_CTX* ctx = make_ctx(cfg);
-    if (!ctx) { BOLT_TLS_CLOSESOCK(fd); return false; }
-
-    SSL* ssl = SSL_new(ctx);
-    if (!ssl) { SSL_CTX_free(ctx); BOLT_TLS_CLOSESOCK(fd); return false; }
-
-    if (!attach_fd(ssl, fd)) {
-        SSL_free(ssl); SSL_CTX_free(ctx); BOLT_TLS_CLOSESOCK(fd); return false;
+    if (fd == kInvalidSock) {
+        set_error(out->error, "TCP connect to port %u failed", unsigned(port));
+        return false;
     }
-    // SNI — required by all modern HTTPS endpoints.
-    if (cfg->server_name[0] != '\0') {
-        SSL_set_tlsext_host_name(ssl, cfg->server_name);
-        // Hostname verification (RFC 6125) at the X509 layer.
-        if (cfg->verify_peer) {
-            X509_VERIFY_PARAM* p = SSL_get0_param(ssl);
-            X509_VERIFY_PARAM_set_hostflags(p, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-            X509_VERIFY_PARAM_set1_host(p, cfg->server_name, 0);
-        }
+    if (!start_on_fd(out, cfg, fd, hs_deadline)) {
+        BOLT_TLS_CLOSESOCK(fd);
+        out->fd = static_cast<int>(kInvalidSock);
+        return false;
     }
+    return true;
+}
 
-    // Bounded handshake loop. Each spin either WANTs r/w (and we select)
-    // or finishes / fails.
-    for (int spins = 0; spins < 256; ++spins) {
-        const int s = handshake_step(ssl, fd, hs_deadline);
-        if (s == 1) {
-            out->ssl_ctx        = ctx;
-            out->ssl            = ssl;
-            out->fd             = static_cast<int>(fd);
-            out->handshake_done = true;
-            out->recv_timeout_ms = cfg->recv_timeout_ms;
-            return true;
-        }
-        if (s < 0) break;  // timeout / hard error
+bool tls_client_start(TlsSocket* out, const TlsConfig* cfg, int fd_in) noexcept {
+    assert(out != nullptr && "tls_client_start: null out");
+    assert(cfg != nullptr && "tls_client_start: null cfg");
+    std::memset(out, 0, sizeof(*out));
+    out->fd = static_cast<int>(kInvalidSock);
+    const sock_t fd = static_cast<sock_t>(fd_in);
+    if (fd_in < 0 || fd == kInvalidSock) {
+        set_error(out->error, "%s", "tls_client_start: socket is not open");
+        return false;
     }
-    SSL_free(ssl); SSL_CTX_free(ctx); BOLT_TLS_CLOSESOCK(fd);
-    return false;
+    if (!set_nonblocking(fd)) {
+        set_error(out->error, "%s", "tls_client_start: cannot make the socket non-blocking");
+        return false;
+    }
+    const std::int64_t hs_deadline =
+        deadline_from(cfg->handshake_timeout_ms, kDefaultHandshakeMs);
+    const bool ok = start_on_fd(out, cfg, fd, hs_deadline);
+    assert(ok == out->handshake_done);
+    return ok;
+}
+
+std::uint32_t tls_pending(const TlsSocket* s) noexcept {
+    assert(s != nullptr && "tls_pending: null s");
+    if (!s->handshake_done || s->ssl == nullptr) return 0;
+    const int n = SSL_pending(static_cast<SSL*>(s->ssl));
+    return n > 0 ? static_cast<std::uint32_t>(n) : 0u;
 }
 
 std::int64_t tls_send_all(const TlsSocket* s, const void* data,
