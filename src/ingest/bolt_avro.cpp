@@ -104,7 +104,8 @@ enum : uint8_t {
 };
 
 enum : uint8_t {
-    kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyItems, kKeyValues, kKeySize, kKeyOther
+    kKeyNone = 0, kKeyType, kKeyName, kKeyFields, kKeyItems, kKeyValues, kKeySize,
+    kKeyLogical, kKeyPrecision, kKeyScale, kKeySymbols, kKeyOther
 };
 
 // A type object's container flavour.
@@ -137,6 +138,17 @@ struct SFrame {
     bool     is_fixed;        // this object declared "type":"fixed"
     uint16_t fixed_size;      // ...and its "size"
     uint16_t union_fixed_size;  // kFrUnion: the size of its fixed branch
+    // Logical type annotation of this type object ("logicalType" / "precision"
+    // / "scale"), applied to the leaf it produces at the object's end.
+    AvroLogical logical;
+    uint8_t  precision;
+    uint8_t  scale;
+    bool     is_enum;         // this object declared "type":"enum"
+    int32_t  leaf_idx;        // field index this object committed, or -1
+    // kFrUnion: the logical annotation of its typed branch.
+    AvroLogical union_logical;
+    uint8_t  union_precision;
+    uint8_t  union_scale;
     char     name[kAvroMaxName];
 };
 
@@ -163,6 +175,12 @@ struct SchemaCtx {
     char       capture_prefix[kAvroMaxName];    // ...and its bytes
     AvroField  elem_buf[kAvroMaxElemFields];
     uint32_t   elem_n;
+    // Enum symbols (null = not reported). sym_sp is the "symbols" array frame
+    // being read; symbols past committed_syms belong to the enum not yet closed.
+    AvroEnumTable* enums;
+    uint32_t   sym_sp;
+    uint32_t   committed_syms;
+    uint32_t   committed_pool;
     bool       ok;
 };
 
@@ -199,6 +217,7 @@ void sx_push(SchemaCtx* s, uint8_t kind) noexcept {
     // key order: {"items":"long","type":"array"} is as legal as the reverse,
     // so the "array"/"map" type string must NOT reset what "items" recorded.
     f->item_type      = kAvroItemOpaque;
+    f->leaf_idx       = -1;
 }
 
 void sx_pop(SchemaCtx* s) noexcept {
@@ -338,8 +357,77 @@ bool sx_key(void* c, const char* b, int32_t len) noexcept {
     else if (k("items"))  f->last_key = kKeyItems;    // array element type
     else if (k("values")) f->last_key = kKeyValues;   // map value type
     else if (k("size"))   f->last_key = kKeySize;     // fixed width
+    else if (k("logicalType")) f->last_key = kKeyLogical;
+    else if (k("precision"))   f->last_key = kKeyPrecision;
+    else if (k("scale"))       f->last_key = kKeyScale;
+    else if (k("symbols"))     f->last_key = kKeySymbols;
     else                  f->last_key = kKeyOther;
     return true;
+}
+
+AvroLogical logical_from_str(const char* b, uint32_t ln) noexcept {
+    assert(b != nullptr || ln == 0u);
+    const auto eq = [&](const char* k) noexcept {
+        return std::strlen(k) == ln && std::memcmp(b, k, ln) == 0;
+    };
+    if (eq("decimal"))                return AvroLogical::kDecimal;
+    if (eq("date"))                   return AvroLogical::kDate;
+    if (eq("time-millis"))            return AvroLogical::kTimeMillis;
+    if (eq("time-micros"))            return AvroLogical::kTimeMicros;
+    if (eq("timestamp-millis"))       return AvroLogical::kTimestampMillis;
+    if (eq("timestamp-micros"))       return AvroLogical::kTimestampMicros;
+    if (eq("timestamp-nanos"))        return AvroLogical::kTimestampNanos;
+    if (eq("local-timestamp-millis")) return AvroLogical::kLocalTimestampMillis;
+    if (eq("local-timestamp-micros")) return AvroLogical::kLocalTimestampMicros;
+    if (eq("local-timestamp-nanos"))  return AvroLogical::kLocalTimestampNanos;
+    if (eq("uuid"))                   return AvroLogical::kUuid;
+    return AvroLogical::kNone;        // the spec: unknown logical types are ignored
+}
+
+// Stamp a logical annotation on a committed leaf. An invalid decimal (no or
+// bad precision/scale) is, per the spec, its underlying type.
+void sx_apply_logical(AvroField* f, AvroLogical lg, uint8_t precision,
+                      uint8_t scale) noexcept {
+    assert(f != nullptr);
+    assert(scale <= 0xFFu);
+    if (lg == AvroLogical::kDecimal) {
+        const bool phys = f->type == AvroType::kBytes || f->type == AvroType::kFixed;
+        if (!phys || precision == 0u || precision > 76u || scale > precision) return;
+    }
+    f->logical   = lg;
+    f->precision = (lg == AvroLogical::kDecimal) ? precision : 0u;
+    f->scale     = (lg == AvroLogical::kDecimal) ? scale : 0u;
+}
+
+// Close the pending symbol run as the enum of `field`.
+void sx_enum_attach(SchemaCtx* s, uint32_t field) noexcept {
+    assert(s != nullptr);
+    assert(field < s->max_fields);
+    if (s->enums == nullptr) return;
+    AvroEnumTable* t = s->enums;
+    if (t->n >= kAvroMaxEnums) { s->ok = false; return; }
+    AvroEnumDesc* d = &t->e[t->n++];
+    d->field = static_cast<uint16_t>(field);
+    d->first = static_cast<uint16_t>(s->committed_syms);
+    d->count = static_cast<uint16_t>(t->n_syms - s->committed_syms);
+    s->committed_syms = t->n_syms;
+    s->committed_pool = t->pool_used;
+}
+
+void sx_enum_symbol(SchemaCtx* s, const char* b, uint32_t ln) noexcept {
+    assert(s != nullptr);
+    assert(b != nullptr || ln == 0u);
+    if (s->enums == nullptr) return;
+    AvroEnumTable* t = s->enums;
+    if (t->n_syms >= kAvroMaxEnumSymbols || t->pool_used + ln > kAvroEnumPoolBytes) {
+        s->ok = false;
+        return;
+    }
+    t->sym_off[t->n_syms] = static_cast<uint16_t>(t->pool_used);
+    t->sym_len[t->n_syms] = static_cast<uint16_t>(ln);
+    if (ln != 0u) std::memcpy(t->pool + t->pool_used, b, ln);
+    t->pool_used += ln;
+    ++t->n_syms;
 }
 
 // The value of a "type" key: a record splices at "fields", a container/fixed resolves at its object's end, a
@@ -360,6 +448,11 @@ bool sx_type_string(SchemaCtx* s, SFrame* f, const char* b, uint32_t ln) noexcep
     }
     if (ln == 3u && std::memcmp(b, "map", 3) == 0) {
         f->complex_kind = kCplxMap;
+        return true;
+    }
+    if (ln == 4u && std::memcmp(b, "enum", 4) == 0) {
+        if (f->kind != kFrObj) { s->ok = false; return true; }
+        f->is_enum = true;          // committed at the object's end
         return true;
     }
     if (ln == 5u && std::memcmp(b, "fixed", 5) == 0) {
@@ -388,8 +481,10 @@ bool sx_type_string(SchemaCtx* s, SFrame* f, const char* b, uint32_t ln) noexcep
     bool crossed_union = false;
     const int32_t fi = sx_enclosing_field(s, &crossed_union);
     if (fi < 0) return true;         // a "type" outside any field
+    const uint32_t before = s->n;
     sx_commit_leaf(s, fi, t, /*nullable=*/false, /*null_branch=*/0u,
                    /*item_type=*/0u);
+    if (!sx_capturing(s) && s->n == before + 1u) f->leaf_idx = static_cast<int32_t>(before);
     return true;
 }
 
@@ -398,6 +493,13 @@ bool sx_string(void* c, const char* b, int32_t len) noexcept {
     SFrame* f = sx_top(s);
     const uint32_t ln = static_cast<uint32_t>(len);
     if (sx_suppressed(s)) { f->last_key = kKeyNone; return true; }
+
+    if (s->sym_sp != 0u && s->sp == s->sym_sp) { sx_enum_symbol(s, b, ln); return true; }
+    if (f->last_key == kKeyLogical) {
+        f->last_key = kKeyNone;
+        f->logical  = logical_from_str(b, ln);
+        return true;
+    }
 
     // The element type of a container. A primitive element can be skipped
     // item-by-item; anything else is opaque and needs the byte-size form.
@@ -476,6 +578,8 @@ void sx_end_fixed(SchemaCtx* s, const SFrame* f) noexcept {
     assert(s != nullptr && f != nullptr && f->is_fixed);
     assert(s->sp > 0u);
     const uint16_t size = f->fixed_size;
+    const AvroLogical lg = f->logical;
+    const uint8_t prec = f->precision, scale = f->scale;
     sx_pop(s);
     if (size == 0u) { s->ok = false; return; }
     SFrame* p = sx_top(s);
@@ -484,6 +588,9 @@ void sx_end_fixed(SchemaCtx* s, const SFrame* f) noexcept {
         p->union_type       = AvroType::kFixed;
         p->union_have_type  = true;
         p->union_fixed_size = size;
+        p->union_logical    = lg;
+        p->union_precision  = prec;
+        p->union_scale      = scale;
         if (p->union_n < 0xFEu) ++p->union_n;
         return;
     }
@@ -491,7 +598,30 @@ void sx_end_fixed(SchemaCtx* s, const SFrame* f) noexcept {
     const int32_t fi = sx_enclosing_field(s, &crossed_union);
     const uint32_t before = s->n;
     sx_commit_leaf(s, fi, AvroType::kFixed, /*nullable=*/false, /*null_branch=*/0u, /*item_type=*/0u);
-    if (s->n == before + 1u) s->fields[before].fixed_size = size;
+    if (s->n == before + 1u && !sx_capturing(s)) {
+        s->fields[before].fixed_size = size;
+        sx_apply_logical(&s->fields[before], lg, prec, scale);
+    }
+}
+
+// An `enum` type object closes: an int index on the wire, symbols attached.
+void sx_end_enum(SchemaCtx* s) noexcept {
+    assert(s != nullptr);
+    assert(s->sp > 0u);
+    sx_pop(s);
+    SFrame* p = sx_top(s);
+    if (p->kind == kFrUnion) {
+        if (p->union_have_type || p->union_have_cont) { s->ok = false; return; }
+        p->union_type      = AvroType::kEnum;
+        p->union_have_type = true;
+        if (p->union_n < 0xFEu) ++p->union_n;
+        return;
+    }
+    bool crossed_union = false;
+    const int32_t fi = sx_enclosing_field(s, &crossed_union);
+    const uint32_t before = s->n;
+    sx_commit_leaf(s, fi, AvroType::kEnum, /*nullable=*/false, /*null_branch=*/0u, /*item_type=*/0u);
+    if (s->n == before + 1u && !sx_capturing(s)) sx_enum_attach(s, before);
 }
 
 bool sx_int64(void* c, int64_t v, const char* /*b*/, int32_t /*len*/) noexcept {
@@ -501,6 +631,10 @@ bool sx_int64(void* c, int64_t v, const char* /*b*/, int32_t /*len*/) noexcept {
         if (v <= 0 || v > 0xFFFF) s->ok = false;
         else f->fixed_size = static_cast<uint16_t>(v);
     }
+    // Out-of-range precision/scale leave 0 / an invalid pair, which
+    // sx_apply_logical treats as "not a decimal", as the spec says.
+    if (f->last_key == kKeyPrecision) f->precision = (v > 0 && v <= 76) ? static_cast<uint8_t>(v) : 0u;
+    if (f->last_key == kKeyScale)     f->scale = (v >= 0 && v <= 76) ? static_cast<uint8_t>(v) : 0xFFu;
     f->last_key = kKeyNone;
     return true;
 }
@@ -528,6 +662,17 @@ bool sx_end_obj(void* c) noexcept {
     }
     if (sx_suppressed(s)) { sx_pop(s); return true; }
     if (f->is_fixed) { sx_end_fixed(s, f); return true; }
+    if (f->is_enum) { sx_end_enum(s); return true; }
+    if (f->logical != AvroLogical::kNone) {
+        SFrame* p = (s->sp > 0u) ? &s->st[s->sp - 1u] : nullptr;
+        if (f->kind == kFrObj && p != nullptr && p->kind == kFrUnion) {
+            p->union_logical   = f->logical;       // a typed union branch
+            p->union_precision = f->precision;
+            p->union_scale     = f->scale;
+        } else if (f->leaf_idx >= 0 && static_cast<uint32_t>(f->leaf_idx) < s->n) {
+            sx_apply_logical(&s->fields[f->leaf_idx], f->logical, f->precision, f->scale);
+        }
+    }
     if (f->complex_kind != kCplxNone) {             // an array/map type object
         const AvroType ct = (f->complex_kind == kCplxArray) ? AvroType::kArray
                                                             : AvroType::kMap;
@@ -577,11 +722,20 @@ bool sx_begin_arr(void* c) noexcept {
     const bool elem = (p->last_key == kKeyItems || p->last_key == kKeyValues);
     if (p->last_key == kKeyFields)   kind = kFrFieldsArr;
     else if (p->last_key == kKeyType) kind = kFrUnion;
+    const bool symbols = (p->last_key == kKeySymbols);
     if (elem) p->item_type = kAvroItemOpaque;   // a union/array element
     p->last_key = kKeyNone;
     sx_push(s, kind);
     if (elem && s->suppress_sp == 0u) s->suppress_sp = s->sp;
     if (sx_suppressed(s)) return true;
+    if (symbols) {                               // a fresh enum's symbol run
+        s->sym_sp = s->sp;
+        if (s->enums != nullptr) {
+            s->enums->n_syms    = s->committed_syms;
+            s->enums->pool_used = s->committed_pool;
+        }
+        return true;
+    }
     if (kind != kFrFieldsArr) return true;
 
     // A "fields" array belongs to a record. If that record is the VALUE of an
@@ -614,8 +768,11 @@ bool sx_end_arr(void* c) noexcept {
         return true;
     }
     if (sx_suppressed(s)) { sx_pop(s); return true; }
+    if (s->sym_sp != 0u && s->sp == s->sym_sp) { s->sym_sp = 0u; sx_pop(s); return true; }
     if (f->kind == kFrUnion) {
         const bool nullable = (f->union_null_idx != kNoNullBranch);
+        const AvroLogical ulg = f->union_logical;
+        const uint8_t uprec = f->union_precision, uscale = f->union_scale;
         const AvroType t = f->union_have_type ? f->union_type : AvroType::kNull;
         const uint8_t nb = nullable ? f->union_null_idx : 0u;
         const bool     have_cont = f->union_have_cont;
@@ -635,7 +792,11 @@ bool sx_end_arr(void* c) noexcept {
         }
         const uint32_t before = s->n;
         sx_commit_leaf(s, fi, t, nullable, nb, /*item_type=*/0u);
-        if (t == AvroType::kFixed && s->n == before + 1u) s->fields[before].fixed_size = union_fixed;
+        if (s->n == before + 1u && !sx_capturing(s)) {
+            if (t == AvroType::kFixed) s->fields[before].fixed_size = union_fixed;
+            sx_apply_logical(&s->fields[before], ulg, uprec, uscale);
+            if (t == AvroType::kEnum) sx_enum_attach(s, before);
+        }
         return true;
     }
     if (f->kind == kFrFieldsArr && f->pushed_prefix) {
@@ -648,11 +809,14 @@ bool sx_end_arr(void* c) noexcept {
 // Parse the schema JSON; fill fields[] (bounded by max_fields). Returns the
 // field count, 0 on failure.
 uint32_t parse_schema(const uint8_t* json, uint32_t json_len,
-                      AvroField* fields, uint32_t max_fields) noexcept {
+                      AvroField* fields, uint32_t max_fields,
+                      AvroEnumTable* enums = nullptr) noexcept {
     assert(json != nullptr);
     assert(fields != nullptr);
     SchemaCtx s;
     std::memset(&s, 0, sizeof(s));
+    s.enums      = enums;
+    if (enums != nullptr) std::memset(enums, 0, sizeof(*enums));
     s.fields     = fields;
     s.max_fields = max_fields;
     s.ok         = true;
@@ -757,7 +921,8 @@ bool skip_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
             ++(*off);
             return true;
         case AvroType::kInt:
-        case AvroType::kLong: {
+        case AvroType::kLong:
+        case AvroType::kEnum: {
             int64_t tmp = 0;
             return read_long(p, len, off, &tmp);
         }
@@ -797,6 +962,7 @@ bool read_primitive(const uint8_t* p, uint64_t len, uint64_t* off,
             return true;
         case AvroType::kInt:
         case AvroType::kLong:
+        case AvroType::kEnum:
             return read_long(p, len, off, &v->num.i64);
         case AvroType::kFloat: {
             if (*off + 4u > len) return false;
@@ -1054,6 +1220,7 @@ bool decode_row(const uint8_t* p, uint64_t len, uint64_t* off,
             case AvroType::kBoolean:
             case AvroType::kInt:
             case AvroType::kLong:
+            case AvroType::kEnum:
             case AvroType::kFloat:
             case AvroType::kDouble:
             case AvroType::kBytes:
@@ -1208,6 +1375,35 @@ bool avro_parse_schema(const uint8_t* json, uint32_t json_len,
     return n != 0u;
 }
 
+bool avro_parse_schema_ex(const uint8_t* json, uint32_t json_len,
+                          AvroField* out_fields, uint32_t max_fields,
+                          uint32_t* out_n, AvroEnumTable* enums) noexcept {
+    assert(out_fields != nullptr || max_fields == 0);
+    assert(out_n != nullptr);
+    if (json == nullptr || out_fields == nullptr || out_n == nullptr) return false;
+    if (json_len == 0u || max_fields == 0u) return false;
+    const uint32_t n = parse_schema(json, json_len, out_fields, max_fields, enums);
+    *out_n = n;
+    return n != 0u;
+}
+
+bool avro_enum_symbol(const AvroEnumTable* t, uint32_t field, int64_t index,
+                      const char** out, uint32_t* out_len) noexcept {
+    assert(out != nullptr && out_len != nullptr);
+    assert(t == nullptr || t->n <= kAvroMaxEnums);
+    if (t == nullptr || index < 0) return false;
+    for (uint32_t i = 0; i < t->n; ++i) {            // bounded: kAvroMaxEnums
+        const AvroEnumDesc& d = t->e[i];
+        if (d.field != field) continue;
+        if (index >= static_cast<int64_t>(d.count)) return false;
+        const uint32_t k = d.first + static_cast<uint32_t>(index);
+        *out     = t->pool + t->sym_off[k];
+        *out_len = t->sym_len[k];
+        return true;
+    }
+    return false;
+}
+
 bool avro_decode_datum(const uint8_t* src, uint64_t src_len,
                        const AvroField* fields, uint32_t n_fields,
                        AvroValue* out_vals, uint64_t* out_consumed) noexcept {
@@ -1234,6 +1430,85 @@ uint32_t enc_bytes(uint8_t* dst, const uint8_t* b, uint32_t len) noexcept {
     uint32_t n = write_long(static_cast<int64_t>(len), dst);
     if (len > 0) std::memcpy(dst + n, b, len);
     return n + len;
+}
+
+// Encode one row's fields at dst[*pos..cap). The single per-field encoder: the
+// OCF writer and the bare-datum writer both call it.
+bool encode_row(const AvroField* fields, uint32_t n_fields, const AvroValue* row,
+                uint8_t* dst, uint64_t cap, uint64_t* pos) noexcept {
+    assert(fields != nullptr || n_fields == 0u);
+    assert(dst != nullptr && pos != nullptr);
+    uint64_t b = *pos;
+    for (uint32_t f = 0; f < n_fields; ++f) {    // bounded
+        const AvroValue* v = &row[f];
+        const AvroField* fd = &fields[f];
+        if (fd->nullable) {
+            if (b + 10u > cap) return false;
+            // Honour the declared null branch. Both orderings occur:
+            // ["null",T] puts null at 0, ["T","null"] at 1, and the READER
+            // already reads `null_branch` -- writing a literal 0/1 here
+            // disagreed with it for any schema that is not null-first.
+            const int64_t null_br = static_cast<int64_t>(fd->null_branch);
+            b += write_long(v->is_null ? null_br : (1 - null_br), dst + b);
+            if (v->is_null) continue;
+        }
+        switch (fd->type) {
+            // A container has no per-field scalar in this flat model, so a
+            // non-null container value is carried as PRE-ENCODED Avro bytes
+            // in v->bytes[0..v->bytes_len) -- the caller hand-assembles the
+            // block-count-prefixed element sequence (and its own zero-count
+            // terminator block) using the same primitives this file uses
+            // (write_long / enc_bytes), then hands it here to be spliced in
+            // verbatim after the union branch already written above. This
+            // is what G2ICE-135 needed: Iceberg's per-file column stats
+            // (null_value_counts, lower_bounds, upper_bounds) are
+            // array<record<key,value>>, which is exactly this shape
+            // (see iceberg_manifest_writer.cpp's encode_stat_map). A null
+            // `bytes` pointer (caller forgot to build the payload) still
+            // fails the write rather than silently truncating.
+            case AvroType::kArray:
+            case AvroType::kMap:
+                if (v->bytes == nullptr) return false;
+                if (b + v->bytes_len > cap) return false;
+                if (v->bytes_len > 0) {
+                    std::memcpy(dst + b, v->bytes, v->bytes_len);
+                }
+                b += v->bytes_len;
+                break;
+            case AvroType::kNull: break;
+            case AvroType::kBoolean:
+                if (b + 1u > cap) return false;
+                dst[b++] = v->num.i64 != 0 ? 1u : 0u; break;
+            case AvroType::kInt:
+            case AvroType::kLong:
+            case AvroType::kEnum:
+                if (b + 10u > cap) return false;
+                b += write_long(v->num.i64, dst + b); break;
+            case AvroType::kFloat: {
+                if (b + 4u > cap) return false;
+                float fv = static_cast<float>(v->num.f64);
+                std::memcpy(dst + b, &fv, 4); b += 4u; break;
+            }
+            case AvroType::kDouble: {
+                if (b + 8u > cap) return false;
+                double dv = v->num.f64;
+                std::memcpy(dst + b, &dv, 8); b += 8u; break;
+            }
+            case AvroType::kBytes:
+            case AvroType::kString: {
+                if (b + 10u + v->bytes_len > cap) return false;
+                b += enc_bytes(dst + b, v->bytes, v->bytes_len); break;
+            }
+            case AvroType::kFixed:               // exactly fixed_size raw bytes
+                if (v->bytes == nullptr || fd->fixed_size == 0u || v->bytes_len != fd->fixed_size) return false;
+                if (b + v->bytes_len > cap) return false;
+                std::memcpy(dst + b, v->bytes, v->bytes_len);
+                b += v->bytes_len;
+                break;
+        }
+    }
+    *pos = b;
+    return true;
 }
 
 // Build the JSON schema "{\"type\":\"record\",\"name\":\"r\",\"fields\":[...]}".
@@ -1366,73 +1641,7 @@ bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
     uint64_t b = body_start_guess;
     for (int64_t r = 0; r < n_rows; ++r) {           // bounded by n_rows
         const AvroValue* row = rows + static_cast<uint64_t>(r) * n_fields;
-        for (uint32_t f = 0; f < n_fields; ++f) {    // bounded
-            const AvroValue* v = &row[f];
-            const AvroField* fd = &fields[f];
-            if (fd->nullable) {
-                if (!room(b - o + 10u)) return false;
-                // Honour the declared null branch. Both orderings occur:
-                // ["null",T] puts null at 0, ["T","null"] at 1, and the READER
-                // already reads `null_branch` -- writing a literal 0/1 here
-                // disagreed with it for any schema that is not null-first.
-                const int64_t null_br = static_cast<int64_t>(fd->null_branch);
-                b += write_long(v->is_null ? null_br : (1 - null_br), dst + b);
-                if (v->is_null) continue;
-            }
-            switch (fd->type) {
-                // A container has no per-field scalar in this flat model, so a
-                // non-null container value is carried as PRE-ENCODED Avro bytes
-                // in v->bytes[0..v->bytes_len) -- the caller hand-assembles the
-                // block-count-prefixed element sequence (and its own zero-count
-                // terminator block) using the same primitives this file uses
-                // (write_long / enc_bytes), then hands it here to be spliced in
-                // verbatim after the union branch already written above. This
-                // is what G2ICE-135 needed: Iceberg's per-file column stats
-                // (null_value_counts, lower_bounds, upper_bounds) are
-                // array<record<key,value>>, which is exactly this shape
-                // (see iceberg_manifest_writer.cpp's encode_stat_map). A null
-                // `bytes` pointer (caller forgot to build the payload) still
-                // fails the write rather than silently truncating.
-                case AvroType::kArray:
-                case AvroType::kMap:
-                    if (v->bytes == nullptr) return false;
-                    if (b + v->bytes_len > cap) return false;
-                    if (v->bytes_len > 0) {
-                        std::memcpy(dst + b, v->bytes, v->bytes_len);
-                    }
-                    b += v->bytes_len;
-                    break;
-                case AvroType::kNull: break;
-                case AvroType::kBoolean:
-                    if (b + 1u > cap) return false;
-                    dst[b++] = v->num.i64 != 0 ? 1u : 0u; break;
-                case AvroType::kInt:
-                case AvroType::kLong:
-                    if (b + 10u > cap) return false;
-                    b += write_long(v->num.i64, dst + b); break;
-                case AvroType::kFloat: {
-                    if (b + 4u > cap) return false;
-                    float fv = static_cast<float>(v->num.f64);
-                    std::memcpy(dst + b, &fv, 4); b += 4u; break;
-                }
-                case AvroType::kDouble: {
-                    if (b + 8u > cap) return false;
-                    double dv = v->num.f64;
-                    std::memcpy(dst + b, &dv, 8); b += 8u; break;
-                }
-                case AvroType::kBytes:
-                case AvroType::kString: {
-                    if (b + 10u + v->bytes_len > cap) return false;
-                    b += enc_bytes(dst + b, v->bytes, v->bytes_len); break;
-                }
-                case AvroType::kFixed:               // exactly fixed_size raw bytes
-                    if (v->bytes == nullptr || fd->fixed_size == 0u || v->bytes_len != fd->fixed_size) return false;
-                    if (b + v->bytes_len > cap) return false;
-                    std::memcpy(dst + b, v->bytes, v->bytes_len);
-                    b += v->bytes_len;
-                    break;
-            }
-        }
+        if (!encode_row(fields, n_fields, row, dst, cap, &b)) return false;
     }
     const uint64_t body_len = b - body_start_guess;
 
@@ -1449,6 +1658,19 @@ bool avro_write_ex(const AvroField* fields, uint32_t n_fields,
     std::memcpy(dst + o, sync, kAvroSyncLen); o += kAvroSyncLen;
 
     *dst_len = o;
+    return true;
+}
+
+bool avro_encode_datum(const AvroField* fields, uint32_t n_fields,
+                       const AvroValue* vals, uint8_t* dst,
+                       uint64_t* dst_len) noexcept {
+    assert(dst_len != nullptr);
+    assert(fields != nullptr || n_fields == 0u);
+    if (fields == nullptr || vals == nullptr || dst == nullptr || n_fields == 0u) return false;
+    uint64_t pos = 0;
+    if (!encode_row(fields, n_fields, vals, dst, *dst_len, &pos)) return false;
+    assert(pos <= *dst_len);
+    *dst_len = pos;
     return true;
 }
 
