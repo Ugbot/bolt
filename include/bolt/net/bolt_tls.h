@@ -36,9 +36,11 @@ namespace bolt::net {
 //                         the handshake proceed against self-signed certs.
 // `handshake_timeout_ms`— wall-clock deadline for the connect+handshake
 //                         loop. 0 = library default (5000 ms).
-// `recv_timeout_ms`     — reserved configuration; legacy send/recv currently
-//                         use their library default (5000 ms). For explicit
-//                         per-call bounds use the timeout APIs below.
+// `recv_timeout_ms`     — how long tls_send_all / tls_recv_all /
+//                         tls_recv_some wait without progress (a throttled
+//                         Kafka broker holds a response for seconds). 0 = the
+//                         library default (5000 ms). The *_timeout APIs below
+//                         take an explicit per-call bound instead.
 struct TlsConfig {
     char           server_name[256];
     char           ca_path[512];
@@ -60,6 +62,9 @@ struct TlsSocket {
     void*  ssl;
     int    fd;
     bool   handshake_done;
+    // Wait without progress tls_send_all / tls_recv_all / tls_recv_some allow,
+    // from TlsConfig::recv_timeout_ms; 0 = the library default (5000 ms).
+    std::uint16_t recv_timeout_ms;
 };
 
 // Connect a fresh TCP socket to (ipv4, port), then drive an OpenSSL 3.x

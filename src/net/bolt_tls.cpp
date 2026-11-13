@@ -427,6 +427,7 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
             out->ssl            = ssl;
             out->fd             = static_cast<int>(fd);
             out->handshake_done = true;
+            out->recv_timeout_ms = cfg->recv_timeout_ms;
             return true;
         }
         if (s < 0) break;  // timeout / hard error
@@ -437,7 +438,7 @@ bool tls_client_connect(TlsSocket* out, const TlsConfig* cfg,
 
 std::int64_t tls_send_all(const TlsSocket* s, const void* data,
                           std::uint32_t len) noexcept {
-    return tls_send_all_timeout(s, data, len, kDefaultRecvMs);
+    return tls_send_all_timeout(s, data, len, s->recv_timeout_ms != 0 ? s->recv_timeout_ms : kDefaultRecvMs);
 }
 
 std::int64_t tls_send_all_timeout(const TlsSocket* s, const void* data,
@@ -475,13 +476,19 @@ bool tls_recv_all(const TlsSocket* s, void* data, std::uint32_t len) noexcept {
     if (!s->handshake_done || !s->ssl) return false;
     SSL* ssl = static_cast<SSL*>(s->ssl);
     const sock_t fd = static_cast<sock_t>(s->fd);
-    const std::int64_t deadline = deadline_from(0, kDefaultRecvMs);
+    // A deadline without progress: a large body over a slow or throttled link
+    // keeps reading while bytes arrive.
+    std::int64_t deadline = deadline_from(s->recv_timeout_ms, kDefaultRecvMs);
 
     std::uint32_t off = 0;
     while (off < len) {
         const int rc = SSL_read(ssl, static_cast<char*>(data) + off,
                                 static_cast<int>(len - off));
-        if (rc > 0) { off += static_cast<std::uint32_t>(rc); continue; }
+        if (rc > 0) {
+            off += static_cast<std::uint32_t>(rc);
+            deadline = deadline_from(s->recv_timeout_ms, kDefaultRecvMs);
+            continue;
+        }
         const int err = SSL_get_error(ssl, rc);
         if (err == SSL_ERROR_WANT_READ) {
             if (!sock_wait(fd, true, false, deadline)) return false;
@@ -496,7 +503,7 @@ bool tls_recv_all(const TlsSocket* s, void* data, std::uint32_t len) noexcept {
 
 std::int32_t tls_recv_some(const TlsSocket* s, void* data,
                            std::uint32_t cap) noexcept {
-    return tls_recv_some_timeout(s, data, cap, kDefaultRecvMs);
+    return tls_recv_some_timeout(s, data, cap, s->recv_timeout_ms != 0 ? s->recv_timeout_ms : kDefaultRecvMs);
 }
 
 std::int32_t tls_recv_some_timeout(const TlsSocket* s, void* data,
