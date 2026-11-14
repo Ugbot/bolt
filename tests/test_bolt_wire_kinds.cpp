@@ -256,6 +256,11 @@ void build_all_kinds(Kit* k) {
     for (int64_t r = 0; r < n; ++r) static_cast<StringView*>(js.data)[r] = k->str("{}", pool, &used);
     js.logical = BoltLogical::Json;
     k->add("json", js);
+    // G2CHK-1140: u32 symbol codes carry their logical tag across the wire.
+    BoltColumn sc = BoltColumn::make_flat_alloc(n, BoltType::UInt32, &a);
+    for (int64_t r = 0; r < n; ++r) static_cast<uint32_t*>(sc.data)[r] = static_cast<uint32_t>(4096 + r % 7);
+    sc.logical = BoltLogical::SymbolCode;
+    k->add("symcode", sc);
 }
 
 void expect_same(const BoltBatch& src, const BoltBatch& dst) {

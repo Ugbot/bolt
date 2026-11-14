@@ -242,7 +242,8 @@ option(BOLT_BUILD_IO "Build bolt::io compiled library" ON)
 # bolt::file_read — B6 file reads (pread, mmap, batched reads, range_coalesce).
 # Core-only and always built: bolt::lakehouse needs it even where a consumer
 # turns BOLT_BUILD_IO off (boltapi's vendored build does).
-add_library(bolt_file_read STATIC src/io/bolt_file_io.cpp src/io/bolt_read_batch.cpp)
+add_library(bolt_file_read STATIC src/io/bolt_file_io.cpp src/io/bolt_read_batch.cpp
+    src/io/bolt_vmem.cpp)
 add_library(bolt::file_read ALIAS bolt_file_read)
 target_link_libraries(bolt_file_read PUBLIC bolt::core)
 target_include_directories(bolt_file_read PUBLIC

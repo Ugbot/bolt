@@ -106,6 +106,12 @@ enum class BoltLogical : uint8_t {
     // bytes plus this annotation is the whole representation. Sort order
     // is spec-UNDEFINED; never used for pruning.
     Interval = 7,
+    // G2CHK-1140: UInt32 storage, one code of a symbol domain (an interned
+    // string, MarbleDB symbol_domain.h). The code is stable for the life of
+    // the domain and never reused; the domain resolves it to its bytes. Equal
+    // codes of one domain are equal strings, so `=`, IN, GROUP BY and joins
+    // may run on the codes; order and egress need the domain.
+    SymbolCode = 8,
 };
 
 inline constexpr uint8_t kTypeSize[64] = {
