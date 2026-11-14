@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 using bolt::promql::HistBucket;
@@ -439,4 +440,18 @@ TEST(PromqlDeterminism, DesTrendIsNotContracted) {
         if (std::fma(tf, s1 - s0, round_mul(1.0 - tf, b)) != want) ++differs_from_fma;
     }
     EXPECT_GT(differs_from_fma, 0);
+}
+
+// The stale marker is one exact NaN payload; a real NaN sample is not one.
+TEST(PromqlStaleMarker, OnlyPayloadTwo) {
+    double stale = 0.0, other = 0.0;
+    const std::uint64_t sb = 0x7ff0000000000002ULL, ob = 0x7ff0000000000003ULL;
+    std::memcpy(&stale, &sb, sizeof(stale));
+    std::memcpy(&other, &ob, sizeof(other));
+    EXPECT_TRUE(bolt::promql::promql_is_stale_marker(stale));
+    EXPECT_TRUE(bolt::promql::promql_is_stale_marker_bits(sb));
+    EXPECT_FALSE(bolt::promql::promql_is_stale_marker(other));
+    EXPECT_FALSE(bolt::promql::promql_is_stale_marker(std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(bolt::promql::promql_is_stale_marker(0.0));
+    EXPECT_FALSE(bolt::promql::promql_is_stale_marker(-0.0));
 }
