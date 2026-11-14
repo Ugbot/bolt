@@ -505,7 +505,8 @@ TEST(BoltGroupbyTyped, Utf8AggIdentityIsValidInlineStringView) {
     StringView v = sv_inline("apple", 5);
     GbCell16 vc{};
     std::memcpy(&vc, &v, sizeof(v));
-    gb_detail::apply(AggKind::Min, BoltType::Utf8, &slot, vc, /*valid=*/true);
+    bool wrapped = false;
+    gb_detail::apply(AggKind::Min, BoltType::Utf8, &slot, vc, /*valid=*/true, &wrapped);
     StringView out{};
     std::memcpy(&out, &slot, sizeof(out));
     EXPECT_EQ(out.length, 5u);
@@ -1421,3 +1422,205 @@ TEST(BoltGroupbyTyped, ByteMinAboveTheIdentityIsTheValue) {
         EXPECT_EQ(std::string(bytes, 13), std::string(13, '\xff')) << "agg " << s;
     }
 }
+
+namespace g2chk977 {
+
+using namespace bolt;
+namespace dec = bolt::kernels::decimal;
+
+dec::Decimal128 pow10_times(int64_t m, int e) { return dec::d128_mul(dec::d128_from_i64(m), dec::d128_pow10(e)); }
+
+TEST(BoltDecimalDivG2chk977, RoundingModeIsOneSwitch) {
+    dec::Decimal128 q{};
+    ASSERT_EQ(dec::d128_div_scaled(dec::d128_from_i64(5), 0, dec::d128_from_i64(2), 0, 0,
+                                   dec::DecRound::HalfUp, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(q.lo, 3);
+    ASSERT_EQ(dec::d128_div_scaled(dec::d128_from_i64(-5), 0, dec::d128_from_i64(2), 0, 0,
+                                   dec::DecRound::HalfUp, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(q.lo, -3);
+    ASSERT_EQ(dec::d128_div_scaled(dec::d128_from_i64(5), 0, dec::d128_from_i64(2), 0, 0,
+                                   dec::DecRound::TowardZero, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(q.lo, 2);
+    ASSERT_EQ(dec::d128_div_scaled(dec::d128_from_i64(-5), 0, dec::d128_from_i64(2), 0, 0,
+                                   dec::DecRound::TowardZero, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(q.lo, -2);
+    ASSERT_EQ(dec::d128_avg(dec::d128_from_i64(5), 38, 2, 38, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(q.lo, dec::k_decimal_avg_round == dec::DecRound::HalfUp ? 3 : 2);
+}
+
+TEST(BoltDecimalDivG2chk977, AvgPast38DigitsOverflows) {
+    dec::Decimal128 q{};
+    // AVG of one 10^35 at scale 0 is 10^39 at scale 4.
+    EXPECT_EQ(dec::d128_avg(dec::d128_pow10(35), 0, 1, 4, &q), dec::DivStatus::Overflow);
+    EXPECT_EQ(q.lo, 0);
+    EXPECT_EQ(q.hi, 0);
+    EXPECT_EQ(dec::d128_avg(dec::d128_pow10(33), 0, 1, 4, &q), dec::DivStatus::Ok);
+    EXPECT_EQ(dec::d128_avg(dec::d128_pow10(38), 0, 1, 0, &q), dec::DivStatus::Overflow);
+    dec::Decimal128 r{};
+    EXPECT_FALSE(dec::d128_add_wrapped(pow10_times(9, 37), pow10_times(-9, 37), &r));
+    EXPECT_FALSE(dec::d128_add_wrapped(pow10_times(9, 37), pow10_times(8, 37), &r));
+    EXPECT_FALSE(dec::d128_within_38_digits(r));
+    EXPECT_TRUE(dec::d128_add_wrapped(r, pow10_times(9, 37), &r));
+}
+
+TEST(BoltDecimalDivG2chk977, ExactAddSubMul) {
+    dec::Decimal128 r{};
+    ASSERT_EQ(dec::d128_addsub_exact(dec::d128_from_i64(125), 2, dec::d128_from_i64(-3), 0, false, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, -175);   // 1.25 + -3 = -1.75
+    ASSERT_EQ(dec::d128_addsub_exact(dec::d128_from_i64(125), 2, dec::d128_from_i64(-3), 0, true, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, 425);
+    EXPECT_EQ(dec::d128_addsub_exact(pow10_times(6, 37), 0, pow10_times(6, 37), 0, false, &r),
+              dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_addsub_exact(pow10_times(6, 37), 0, pow10_times(6, 37), 0, true, &r),
+              dec::DivStatus::Ok);
+    EXPECT_EQ(r.lo, 0);
+    // 10^20 at scale 0 aligned to scale 18 is 10^38.
+    EXPECT_EQ(dec::d128_addsub_exact(dec::d128_pow10(20), 0, dec::d128_from_i64(0), 18, false, &r),
+              dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_mul_exact(dec::d128_from_i64(-12), pow10_times(3, 30), &r), dec::DivStatus::Ok);
+    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-36, 30)), 0);
+    EXPECT_EQ(dec::d128_mul_exact(dec::d128_pow10(19), dec::d128_pow10(19), &r), dec::DivStatus::Overflow);
+    EXPECT_EQ(dec::d128_mul_exact(pow10_times(9, 37), pow10_times(9, 37), &r), dec::DivStatus::Overflow);
+    ASSERT_EQ(dec::d128_mul_exact(pow10_times(9, 18), pow10_times(-11, 18), &r), dec::DivStatus::Ok);
+    EXPECT_EQ(dec::d128_cmp(r, pow10_times(-99, 36)), 0);    const dec::Decimal128 col[4] = {dec::d128_from_i64(3), pow10_times(-7, 30), dec::d128_from_i64(-1),
+                                    pow10_times(6, 30)};
+    EXPECT_EQ(dec::d128_cmp(dec::d128_col_max_abs(col, 4), pow10_times(7, 30)), 0);
+    EXPECT_EQ(dec::d128_cmp(dec::d128_col_max_abs(col, 0), dec::d128_from_i64(0)), 0);
+}
+
+// Group 0: 6e37 + 6e37 = 1.2e38 (past 38 digits, inside 128 bits).
+// Group 1: 1 + 2 (fine). Rows interleave so every ingest path sees both.
+struct Fixture {
+    int64_t keys[4] = {0, 1, 0, 1};
+    dec::Decimal128 vals[4];
+    Fixture() {
+        vals[0] = pow10_times(6, 37); vals[1] = dec::d128_from_i64(1);
+        vals[2] = pow10_times(6, 37); vals[3] = dec::d128_from_i64(2);
+    }
+};
+
+void check_rows(const GroupbyTypedState& st, const BoltColumn& keys, uint32_t ng, uint32_t j) {
+    ASSERT_EQ(ng, 2u);
+    const auto* ks = static_cast<const int64_t*>(keys.data);
+    for (uint32_t r = 0; r < ng; ++r)
+        EXPECT_EQ(groupby_typed_dec_overflow(&st, j, r), ks[r] == 0) << "row " << r;
+}
+
+TEST(BoltGroupbyTypedG2chk977, SumAndAvgPast38DigitsReportedPerGroup) {
+    for (uint32_t path = 0; path < 2; ++path) {
+        SCOPED_TRACE(::testing::Message() << "path=" << path);
+        Fixture f;
+        Arena arena;
+        BoltColumn key = BoltColumn::make_flat(f.keys, nullptr, 4, BoltType::Int64);
+        BoltColumn val = BoltColumn::make_flat(f.vals, nullptr, 4, BoltType::Decimal128);
+        val.decimal_scale = 0;
+        BoltColumn payload[2] = {val, val};
+        AggSpec specs[2] = {make_spec(AggKind::Sum, 0), make_spec(AggKind::Avg, 1)};
+        GroupbyTypedState dst{}, src{};
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&dst, &arena, &key, 1, payload, 2, specs, 2, 8));
+        uint32_t first[] = {0, 1}, second[] = {2, 3};
+        groupby_agg_multi_key_typed_ingest(&dst, &key, payload, first, 2, 4);
+        if (path == 0) {
+            groupby_agg_multi_key_typed_ingest(&dst, &key, payload, second, 2, 4);
+        } else {
+            ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&src, &arena, &key, 1, payload, 2, specs, 2, 8));
+            groupby_agg_multi_key_typed_ingest(&src, &key, payload, second, 2, 4);
+            ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&dst, &src));
+        }
+        EXPECT_FALSE(dst.dec_sum_wrapped);
+        BoltColumn ok[1], oa[2]; uint32_t ng = 0;
+        ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&dst, ok, oa, &ng));
+        check_rows(dst, ok[0], ng, 0);
+        check_rows(dst, ok[0], ng, 1);
+    }
+    Fixture f;
+    Arena arena;
+    BoltColumn key = BoltColumn::make_flat(f.keys, nullptr, 4, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(f.vals, nullptr, 4, BoltType::Decimal128);
+    AggSpec spec = make_spec(AggKind::Sum, 0);
+    BoltColumn ok[1], oa[1]; uint32_t ng = 0;
+    EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, &spec, 1, 4, ok, oa, &ng, &arena, 8));
+}
+
+TEST(BoltGroupbyTypedG2chk977, WrapPast128BitsIsFlagged) {
+    // Three 9e37 in one group: the running sum leaves the signed 128-bit
+    // word, so its final bits say nothing; the state flag does. Row counts
+    // cover the one-row fallback, the plain and the banked loops.
+    for (const uint32_t n : {3u, 64u, 5000u}) {
+        SCOPED_TRACE(::testing::Message() << "rows=" << n);
+        std::vector<int64_t> keys(n, 7);
+        std::vector<dec::Decimal128> vals(n, pow10_times(9, 37));
+        Arena arena;
+        BoltColumn key = BoltColumn::make_flat(keys.data(), nullptr, n, BoltType::Int64);
+        BoltColumn val = BoltColumn::make_flat(vals.data(), nullptr, n, BoltType::Decimal128);
+        AggSpec spec = make_spec(AggKind::Sum, 0);
+        GroupbyTypedState st{};
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &arena, &key, 1, &val, 1, &spec, 1, 8));
+        groupby_agg_multi_key_typed_ingest(&st, &key, &val, nullptr, 0, n);
+        EXPECT_TRUE(st.dec_sum_wrapped);
+        GroupbyTypedState other{};
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&other, &arena, &key, 1, &val, 1, &spec, 1, 8));
+        ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&other, &st));
+        EXPECT_TRUE(other.dec_sum_wrapped);
+        BoltColumn ok[1], oa[1]; uint32_t ng = 0;
+        EXPECT_FALSE(groupby_agg_multi_key_typed(&key, 1, &val, 1, &spec, 1, n, ok, oa, &ng, &arena, 8));
+    }
+    // Two partials of 9e37 each fit; their merge wraps.
+    int64_t keys[2] = {1, 1};
+    dec::Decimal128 vals[2] = {pow10_times(9, 37), pow10_times(9, 37)};
+    Arena arena;
+    BoltColumn key = BoltColumn::make_flat(keys, nullptr, 2, BoltType::Int64);
+    BoltColumn val = BoltColumn::make_flat(vals, nullptr, 2, BoltType::Decimal128);
+    AggSpec spec = make_spec(AggKind::Sum, 0);
+    GroupbyTypedState a{}, b{};
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&a, &arena, &key, 1, &val, 1, &spec, 1, 8));
+    ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&b, &arena, &key, 1, &val, 1, &spec, 1, 8));
+    uint32_t r0[] = {0}, r1[] = {1};
+    groupby_agg_multi_key_typed_ingest(&a, &key, &val, r0, 1, 2);
+    groupby_agg_multi_key_typed_ingest(&b, &key, &val, r1, 1, 2);
+    EXPECT_FALSE(a.dec_sum_wrapped);
+    EXPECT_FALSE(b.dec_sum_wrapped);
+    ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&a, &b));
+    EXPECT_TRUE(a.dec_sum_wrapped);
+}
+
+TEST(BoltGroupbyTypedG2chk977, LargeValuesTakeTheCheckedPathExactly) {
+    // |v| = 2^103: a window's bound saturates, so the fast pass is undone and
+    // rerun checked. Few groups take the banked loop, many the plain one.
+    for (const uint32_t groups : {2u, 2000u}) {
+        SCOPED_TRACE(::testing::Message() << "groups=" << groups);
+        const uint32_t n = groups * 3;
+        std::vector<int64_t> keys(n);
+        std::vector<dec::Decimal128> vals(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            keys[i] = i % groups;
+            vals[i] = dec::Decimal128{0, (i & 1u) ? -(int64_t{1} << 39) : (int64_t{1} << 39)};
+        }
+        Arena arena;
+        BoltColumn key = BoltColumn::make_flat(keys.data(), nullptr, n, BoltType::Int64);
+        BoltColumn val = BoltColumn::make_flat(vals.data(), nullptr, n, BoltType::Decimal128);
+        AggSpec spec = make_spec(AggKind::Sum, 0);
+        GroupbyTypedState st{};
+        ASSERT_TRUE(groupby_agg_multi_key_typed_begin(&st, &arena, &key, 1, &val, 1, &spec, 1, 4096));
+        groupby_agg_multi_key_typed_ingest(&st, &key, &val, nullptr, 0, n);
+        EXPECT_FALSE(st.dec_sum_wrapped);
+        BoltColumn ok[1], oa[1]; uint32_t ng = 0;
+        ASSERT_TRUE(groupby_agg_multi_key_typed_finalize(&st, ok, oa, &ng));
+        ASSERT_EQ(ng, groups);
+        const auto* ks = static_cast<const int64_t*>(ok[0].data);
+        const auto* sums = static_cast<const dec::Decimal128*>(oa[0].data);
+        for (uint32_t r = 0; r < ng; ++r) {
+            // Group g holds rows g, g + groups, g + 2 * groups.
+            int64_t net = 0;
+            for (uint32_t k = 0; k < 3; ++k) net += ((ks[r] + k * groups) & 1u) ? -1 : 1;
+            const dec::Decimal128 want = dec::d128_mul(dec::d128_from_i64(net),
+                                                       dec::Decimal128{0, int64_t{1} << 39});
+            EXPECT_EQ(dec::d128_cmp(sums[r], want), 0) << "group " << ks[r];
+            EXPECT_FALSE(groupby_typed_dec_overflow(&st, 0, r));
+        }
+    }
+}
+
+}  // namespace g2chk977

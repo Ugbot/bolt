@@ -29,6 +29,7 @@
 #include "bolt/kernels/bolt_utf8.h"
 #include "bolt/kernels/numeric_key.h"
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -687,6 +688,12 @@ inline constexpr uint32_t kGbIngestWindow = BOLT_GROUPBY_INGEST_WINDOW;
 // K-AGG-C: bank-split accumulation. 4 banks of up to 1024 groups; a window
 // is bank-eligible when entry_count <= kGbBankGroups and the window is big
 // enough that zeroing the bank slices amortises (see gb_pass2_one).
+inline constexpr uint64_t kGbDecBoundLimit     = uint64_t{1} << 62;   // 2^125 in 2^63 units
+inline constexpr uint64_t kGbDecBoundSaturated = ~uint64_t{0};
+inline constexpr uint64_t gb_dec_bound_add(uint64_t a, uint64_t b) noexcept {
+    return (a >= kGbDecBoundLimit || b >= kGbDecBoundLimit || b >= kGbDecBoundLimit - a)
+        ? kGbDecBoundSaturated : a + b;
+}
 inline constexpr uint32_t kGbBankCount  = 4u;
 inline constexpr uint32_t kGbBankGroups = 1024u;
 
@@ -1084,9 +1091,12 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
 // surface (no asserts fire, no extra branches in the hot path because
 // the per-call `valid` is hoisted into a constant by the wrapper for
 // columns lacking a validity bitmap).
+// `wrapped` turns true when a decimal Sum/Avg partial leaves the signed
+// 128-bit word (past 38 digits, so the aggregate has overflowed).
 BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
-                             GbCell16* slot, GbCell16 v, bool valid) noexcept {
-    assert(slot != nullptr);
+                             GbCell16* slot, GbCell16 v, bool valid,
+                             bool* wrapped) noexcept {
+    assert(slot != nullptr && wrapped != nullptr);
     if (k == AggKind::CountStar) { slot->a += 1; return; }
     if (k == AggKind::Count)     { slot->a += valid ? 1 : 0; return; }
     assert(static_cast<uint8_t>(k) <= static_cast<uint8_t>(AggKind::Avg) &&
@@ -1100,7 +1110,8 @@ BOLT_FORCE_INLINE void apply(AggKind k, BoltType t,
         std::memcpy(&s, slot, 16);
         std::memcpy(&x, &v,   16);
         if (k == AggKind::Sum || k == AggKind::Avg) {
-            const dec::Decimal128 r = dec::d128_add(s, x);
+            dec::Decimal128 r;
+            *wrapped |= dec::d128_add_wrapped(s, x, &r);
             std::memcpy(slot, &r, 16);
             return;
         }
@@ -1401,6 +1412,12 @@ struct GroupbyTypedState {
     uint8_t         n_keys;
     uint8_t         n_aggs;
     bool            oom;                // set true if any _ingest hit cap
+    // A decimal Sum/Avg partial left the signed 128-bit word: some group's
+    // total is past 38 digits, though no row can say which. Merges carry it.
+    bool            dec_sum_wrapped;
+    // Bound on any decimal Sum/Avg accumulator's magnitude, in units of 2^63
+    // (gb_d128_window_units); kGbDecBoundSaturated once it may reach 2^125.
+    uint64_t        dec_bound_units;
     bool            any_distinct;
     // W-P / G2FEAT-362: set true iff a group MAY have been inserted while
     // dense is enabled WITHOUT publishing its slot into dense_gid — an
@@ -1571,6 +1588,8 @@ inline bool gb_begin_with_scratch(
     state->grow_cap         = (grow_cap > kGbEntryCap)
         ? kGbEntryCap : static_cast<uint32_t>(grow_cap);
     state->oom              = false;
+    state->dec_sum_wrapped  = false;
+    state->dec_bound_units  = 0;
     state->null_key         = false;              // G2COV-30
     for (uint8_t k = 0; k < n_keys; ++k) {        // Card S: spilled-key buffers
         state->key_str_buf[k]  = nullptr;
@@ -1901,7 +1920,8 @@ inline void gb_ingest_fallback(
                 }
             } else {
                 gb_detail::apply(state->specs[j].kind, state->agg_in_types[j],
-                                 &state->accums[off], v, valid);
+                                 &state->accums[off], v, valid,
+                                 &state->dec_sum_wrapped);
             }
             state->counts[off] += (valid ? 1 : 0);
         }
@@ -2320,14 +2340,10 @@ inline bool groupby_agg_multi_key_typed_finalize(
                     dec::Decimal128 s; std::memcpy(&s, &acc, 16);
                     const uint8_t in_s  = state->agg_in_scales[j];
                     const uint8_t out_s = out_aggs[j].decimal_scale;
+                    // Past 38 digits the cell holds 0; the caller reads the
+                    // row as overflowed through groupby_typed_dec_overflow.
                     dec::Decimal128 q{0, 0};
-                    if (cnt > 0) {
-                        // HALF_UP at the result scale, as the global finalizer.
-                        const dec::DivStatus ds = dec::d128_div_round(
-                            s, in_s, dec::d128_from_i64(cnt), 0, out_s, &q);
-                        assert(ds == dec::DivStatus::Ok);
-                        (void)ds;
-                    }
+                    if (cnt > 0) (void)dec::d128_avg(s, in_s, cnt, out_s, &q);
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: the accumulator holds a double bit pattern;
@@ -2368,6 +2384,30 @@ inline bool groupby_agg_multi_key_typed_finalize(
     return true;
 }
 
+// After finalize: true when output row r of aggregate j, a decimal Sum or
+// Avg, has no value within 38 digits (its sum, or its average at the output
+// scale). The output cell holds 0 for such a row; the caller chooses NULL or
+// a failed query. A wrap (dec_sum_wrapped) is reported by no row.
+inline bool groupby_typed_dec_overflow(const GroupbyTypedState* state, uint32_t j,
+                                       uint32_t r) noexcept {
+    namespace dec = kernels::decimal;
+    assert(state != nullptr && j < state->n_aggs && r < state->cap);
+    const AggKind k = state->specs[j].kind;
+    if (k != AggKind::Sum && k != AggKind::Avg) return false;
+    if (gb_detail::out_type(k, state->agg_in_types[j]) != BoltType::Decimal128) return false;
+    const size_t off = static_cast<size_t>(j) * state->cap + r;
+    dec::Decimal128 s; std::memcpy(&s, &state->accums[off], 16);
+    if (!dec::d128_within_38_digits(s)) return true;
+    const int64_t cnt = state->counts[off];
+    if (k == AggKind::Sum || cnt <= 0) return false;
+    const uint8_t in_s = state->agg_in_scales[j];
+    const uint8_t out_s = decimal_avg_scale(in_s);
+    const dec::Decimal128 m = s.hi < 0 ? dec::d128_neg(s) : s;
+    if (dec::d128_cmp(m, dec::d128_pow10(38 - (out_s - in_s))) < 0) return false;
+    dec::Decimal128 q{};
+    return dec::d128_avg(s, in_s, cnt, out_s, &q) != dec::DivStatus::Ok;
+}
+
 // Partial-state merge kernels (W4 serial fold + W-J5 class/list merges) —
 // split out for file size. Single inclusion point, inside namespace bolt.
 #include "bolt_groupby_merge.inc"
@@ -2390,6 +2430,7 @@ inline bool groupby_agg_multi_key_typed(
     if (n_keys == 0 || n_keys > kGbMaxKeys) return false;
     if (n_aggs == 0 || n_aggs > kGbMaxAggs) return false;
     if (n_rows < 0) return false;
+    bool wrapped = false;   // a decimal Sum/Avg partial left 128 bits
     assert(keys != nullptr);
     assert(aggs != nullptr);
     (void)n_payload;
@@ -2558,12 +2599,15 @@ inline bool groupby_agg_multi_key_typed(
                 }
             }
             const size_t off = static_cast<size_t>(j) * cap + slot;
-            gb_detail::apply(aggs[j].kind, agg_in_types[j], &accums[off], v, valid);
+            gb_detail::apply(aggs[j].kind, agg_in_types[j], &accums[off], v, valid,
+                             &wrapped);
             // Avg's row-per-group counter must also skip NULLs (denominator
             // is "rows with non-NULL value", not raw arrival count).
             counts[off] += (valid ? 1 : 0);
         }
     }
+
+    if (wrapped) return false;   // a decimal SUM/AVG past 38 digits
 
     // ---- Emit output columns ----
     const int64_t out_n = static_cast<int64_t>(entry_count);
@@ -2680,13 +2724,8 @@ inline bool groupby_agg_multi_key_typed(
                     const uint8_t in_s  = agg_in_scales[j];
                     const uint8_t out_s = out_aggs[j].decimal_scale;
                     dec::Decimal128 q{0, 0};
-                    if (cnt > 0) {
-                        // HALF_UP at the result scale, as the global finalizer.
-                        const dec::DivStatus ds = dec::d128_div_round(
-                            s, in_s, dec::d128_from_i64(cnt), 0, out_s, &q);
-                        assert(ds == dec::DivStatus::Ok);
-                        (void)ds;
-                    }
+                    if (cnt > 0 && dec::d128_avg(s, in_s, cnt, out_s, &q) != dec::DivStatus::Ok)
+                        return false;   // past 38 digits: no value to emit
                     std::memcpy(&static_cast<dec::Decimal128*>(buf)[r], &q, 16);
                 } else {
                     // Float AVG: accumulator holds a double bit pattern;
@@ -2703,6 +2742,10 @@ inline bool groupby_agg_multi_key_typed(
             }
             // SUM / MIN / MAX — write 16-byte cell or 8-byte int.
             if (ot == BoltType::Decimal128) {
+                kernels::decimal::Decimal128 v; std::memcpy(&v, &acc, 16);
+                if (aggs[j].kind == AggKind::Sum &&
+                    !kernels::decimal::d128_within_38_digits(v))
+                    return false;   // a decimal SUM past 38 digits
                 std::memcpy(&static_cast<kernels::decimal::Decimal128*>(buf)[r], &acc, 16);
             } else if (::bolt::gb_detail::gb_bytes(ot)) {
                 std::memcpy(&static_cast<StringView*>(buf)[r], &acc, 16);

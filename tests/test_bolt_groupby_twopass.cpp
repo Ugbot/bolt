@@ -633,6 +633,7 @@ TEST(BoltGroupbyTwopass, MinMaxAndFloat64ThroughTwopass) {
         mn[i] = INT64_MAX; mx[i] = INT64_MIN;
         frep[i] = gb_detail::agg_identity(AggKind::Sum, BoltType::Float64);
     }
+    bool unused_wrap = false;
     for (int64_t i = 0; i < N; ++i) {
         ks[i] = static_cast<int32_t>(18000 + (i % 4));   // Date32-style keys
         v64[i] = (i * 37) % 5000 - 2500;
@@ -643,7 +644,7 @@ TEST(BoltGroupbyTwopass, MinMaxAndFloat64ThroughTwopass) {
         if (v64[i] > mx[g]) mx[g] = v64[i];
         GbCell16 v{};
         std::memcpy(&v.a, &vf[i], 8);
-        gb_detail::apply(AggKind::Sum, BoltType::Float64, &frep[g], v, true);
+        gb_detail::apply(AggKind::Sum, BoltType::Float64, &frep[g], v, true, &unused_wrap);
     }
     Arena a;
     BoltColumn kd = BoltColumn::make_flat(ks, nullptr, 0, BoltType::Date32);
