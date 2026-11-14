@@ -105,6 +105,18 @@ BOLT_FORCE_INLINE bool promql_is_no_sample(double v) noexcept {
     return bits == k_promql_no_sample_bits;
 }
 
+// Prometheus's stale marker: exactly the NaN with payload 2. Any other NaN,
+// including a real NaN sample, is not one. Takes the value or its raw bits.
+BOLT_FORCE_INLINE bool promql_is_stale_marker_bits(uint64_t bits) noexcept {
+    return bits == k_promql_stale_bits;
+}
+
+BOLT_FORCE_INLINE bool promql_is_stale_marker(double v) noexcept {
+    uint64_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return promql_is_stale_marker_bits(bits);
+}
+
 // ---------------------------------------------------------------------------
 // extrapolatedRate — the shared core of rate/increase/delta.
 //
