@@ -497,6 +497,19 @@ bolt_apply_hardening(test_promql_kernels)
 
 add_test(NAME test_promql_kernels COMMAND test_promql_kernels)
 
+add_executable(test_promql_time_fn test_promql_time_fn.cpp)
+
+target_link_libraries(test_promql_time_fn
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_promql_time_fn)
+
+add_test(NAME test_promql_time_fn COMMAND test_promql_time_fn)
+
 add_executable(test_promql_native_histogram test_promql_native_histogram.cpp)
 
 target_link_libraries(test_promql_native_histogram

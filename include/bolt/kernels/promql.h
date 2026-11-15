@@ -31,6 +31,7 @@
 #include "bolt/kernels/promql_native_histogram.h"
 #include "bolt/kernels/promql_nh_rate.h"
 #include "bolt/kernels/promql_over_time.h"
+#include "bolt/kernels/promql_time_fn.h"
 
 // Contraction is chosen by PromqlNumerics::fused_muladd, never by the compiler:
 // an implicit fma would make answers depend on the CPU (MSVC never contracts
