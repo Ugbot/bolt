@@ -129,6 +129,13 @@ inline void bounds_time(const std::int64_t* BOLT_RESTRICT ts, std::uint32_t n, c
 
 }  // namespace detail
 
+// First row of ts[0, n) not below the lower bound of the frame of time t (the row a frame starting at t reads
+// first): the rows below it can leave the buffer. One binary search.
+inline std::uint32_t frame_first_row(const std::int64_t* ts, std::uint32_t n, const FrameSpec& s, std::int64_t t) noexcept {
+    assert(ts != nullptr || n == 0);
+    return detail::search_lo(ts, n, s, frame_bound(s, t));
+}
+
 // Points t_i = start + (g0 + i) * step (wrapping unsigned arithmetic), i in [0, m).
 inline void frame_bounds_time_grid(const std::int64_t* ts, std::uint32_t n, const FrameSpec& s, std::int64_t start,
                                    std::int64_t step, std::int64_t g0, std::uint32_t m, std::uint32_t* lo,

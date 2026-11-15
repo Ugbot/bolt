@@ -178,6 +178,7 @@ TEST(FrameBounds, TimeAgainstNaive) {
             ASSERT_EQ(lo[i], w.lo) << "round " << round << " point " << i;
             ASSERT_EQ(hi[i], w.hi) << "round " << round << " point " << i;
         }
+        for (std::uint32_t i = 0; i < m; ++i) ASSERT_EQ(frame::frame_first_row(ts.data(), n, s, pts[i]), lo[i]) << "first_row round " << round;
         const std::int64_t step = 1 + static_cast<std::int64_t>(g() % 6), start = static_cast<std::int64_t>(g() % 20) - 10;
         const std::int64_t g0 = static_cast<std::int64_t>(g() % 4);
         frame::frame_bounds_time_grid(ts.data(), n, s, start, step, g0, m, lo.data(), hi.data());
