@@ -103,10 +103,14 @@ inline double quantile_f64(const double* BOLT_RESTRICT vals, std::int64_t n,
 // rank = phi * (n - 1), result = values[lower] * (1 - w) + values[upper] * w with lower = floor(rank),
 // upper = min(n - 1, lower + 1), w = rank - lower; so an infinite neighbour times a zero weight is NaN, as
 // upstream. phi NaN is NaN, phi < 0 is -Inf, phi > 1 is +Inf, n <= 0 is NaN. Scratch as quantile_f64.
+// Numerics (bolt::promql::PromqlNumerics): `zero_weight_exact` (a release after Prometheus 3.5) answers the lower
+// value itself when the rank is whole, so an infinite upper neighbour is not turned into NaN; `fused` computes
+// vhi * w + lower * (1 - w) as one fma, as an arm64 Go build does.
 inline double quantile_prom_f64(const double* BOLT_RESTRICT vals, std::int64_t n, double phi,
                                 std::int64_t* BOLT_RESTRICT key_scratch,
                                 std::int32_t* BOLT_RESTRICT perm,
-                                std::int32_t* BOLT_RESTRICT sort_scratch) noexcept {
+                                std::int32_t* BOLT_RESTRICT sort_scratch,
+                                bool zero_weight_exact = false, bool fused = false) noexcept {
     assert(vals != nullptr || n <= 0);
     assert(n <= 0x7FFFFFFF && "quantile group too large for int32 argsort perm");
     constexpr double k_nan = std::numeric_limits<double>::quiet_NaN();
@@ -128,7 +132,11 @@ inline double quantile_prom_f64(const double* BOLT_RESTRICT vals, std::int64_t n
     // position p of the NaN-first order: the first nan_count are NaN, then the sorted rest
     const double vlo = lo < nan_count ? k_nan : vals[perm[lo - nan_count]];
     const double vhi = hi < nan_count ? k_nan : vals[perm[hi - nan_count]];
-    return vlo * (1.0 - w) + vhi * w;
+    if (w == 0.0 && zero_weight_exact) return vlo;
+    const double low_part = vlo * (1.0 - w);
+    if (fused) return std::fma(vhi, w, low_part);
+    const double hi_part = vhi * w;
+    return hi_part + low_part;   // separate statements: no contraction unless asked for
 }
 
 // MEDIAN == quantile 0.5.

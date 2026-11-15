@@ -523,6 +523,19 @@ bolt_apply_hardening(test_promql_time_fn)
 
 add_test(NAME test_promql_time_fn COMMAND test_promql_time_fn)
 
+add_executable(test_counter_rate test_counter_rate.cpp)
+
+target_link_libraries(test_counter_rate
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_counter_rate)
+
+add_test(NAME test_counter_rate COMMAND test_counter_rate)
+
 add_executable(test_promql_native_histogram test_promql_native_histogram.cpp)
 
 target_link_libraries(test_promql_native_histogram

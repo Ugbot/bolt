@@ -43,6 +43,19 @@ TEST(GroupStats, PromQuantileInterpolatesAsUpstream) {
     EXPECT_EQ(prom(one, 1, 0.9), 7.0);
 }
 
+// Numerics (G2CHK-1173): a whole rank answers the lower value after Prometheus 3.5; fused mode is one fma.
+TEST(GroupStats, PromQuantileNumerics) {
+    const double inf[] = {1.0, INFINITY};
+    EXPECT_TRUE(std::isnan(quantile_prom_f64(inf, 2, 0.0, g_keys, g_perm, g_sort, false, false)));   // 3.5: Inf * 0
+    EXPECT_EQ(quantile_prom_f64(inf, 2, 0.0, g_keys, g_perm, g_sort, true, false), 1.0);            // later releases
+    const double v[] = {0.1, 0.7, 0.3};
+    const double phi = 0.3, rank = phi * 2.0, w = rank - 0.0;   // sorted 0.1 0.3 0.7: lo = 0, hi = 1
+    const double plain = 0.3 * w + 0.1 * (1.0 - w);
+    const double fused = std::fma(0.3, w, 0.1 * (1.0 - w));
+    EXPECT_EQ(quantile_prom_f64(v, 3, phi, g_keys, g_perm, g_sort, false, false), plain);
+    EXPECT_EQ(quantile_prom_f64(v, 3, phi, g_keys, g_perm, g_sort, false, true), fused);
+}
+
 TEST(GroupStats, PromQuantileEdges) {
     const double v[] = {3.0, 1.0, 2.0};
     EXPECT_EQ(prom(v, 3, -0.1), -INFINITY);
