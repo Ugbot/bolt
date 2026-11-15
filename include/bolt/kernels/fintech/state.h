@@ -159,7 +159,7 @@ struct WelfordAccumulator {
     //   delta2 = x - mean              (post-update mean)
     //   m2    <- m2 + delta * delta2
     inline void update(double x) noexcept {
-        assert(!(x != x) || x == x);      // tolerate NaN propagation explicitly
+        // NaN propagates into mean and m2 by design; no assert on x.
         assert(count < 0xFFFFFFFFFFFFFFFFull);
         ++count;
         const double delta  = x - mean;
