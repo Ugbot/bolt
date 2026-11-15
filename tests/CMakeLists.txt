@@ -69,6 +69,10 @@ target_link_libraries(test_bolt_nested_column PRIVATE bolt::core GTest::gtest_ma
 bolt_apply_hardening(test_bolt_nested_column)
 add_test(NAME test_bolt_nested_column COMMAND test_bolt_nested_column)
 
+add_executable(test_bolt_groupby_pick_duck test_bolt_groupby_pick_duck.cpp)
+target_link_libraries(test_bolt_groupby_pick_duck PRIVATE bolt::core GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_pick_duck)
+add_test(NAME test_bolt_groupby_pick_duck COMMAND test_bolt_groupby_pick_duck)
 add_executable(test_bolt_groupby_bool test_bolt_groupby_bool.cpp)
 target_link_libraries(test_bolt_groupby_bool PRIVATE bolt::core GTest::gtest_main)
 bolt_apply_hardening(test_bolt_groupby_bool)

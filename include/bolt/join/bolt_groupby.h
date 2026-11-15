@@ -670,7 +670,7 @@ struct AggSpec {
     // cell stores — it stays a true Decimal128 — so lane-1 windows, lane-0
     // windows, and per-row fallback windows compose freely.
     uint8_t  lane;
-    uint8_t  flags;      // First / Last: kGbPickIgnoreNulls
+    uint8_t  flags;      // pick: kGbPickIgnoreNulls (First/Last); kGbPickDuckBy (MaxBy/MinBy)
     uint8_t  aux;        // MaxBy / MinBy: the ByOrd companion's agg index
     uint8_t  _pad[2];    // explicit padding; POD, layout-stable
 };
