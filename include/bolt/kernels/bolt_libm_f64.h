@@ -90,4 +90,7 @@ inline double libm_f64(LibmOp op, double x) noexcept {
     }
 }
 
+// atan2(y, x) with C library semantics (Prometheus's atan2 operator), not fdlibm's.
+inline double atan2_f64(double y, double x) noexcept { return std::atan2(y, x); }
+
 }  // namespace bolt::kernels::libm_f64
