@@ -1328,6 +1328,9 @@ BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
 //     flag `state->oom = true`; caller checks after _ingest.
 // ---------------------------------------------------------------------------
 struct GroupbyTypedState {
+    // MaxBy / MinBy with kGbPickFirstOfTies: the position of ingested row 0 in the caller's input order. A tie keeps
+    // the smaller position, so the answer does not depend on which partial holds a row or the order they merge in.
+    uint64_t        pick_pos_base;
     SwissTable*     table;
     GbCell16*       keys_flat;          // [cap * n_keys]
     GbCell16*       accums;             // [n_aggs * cap]

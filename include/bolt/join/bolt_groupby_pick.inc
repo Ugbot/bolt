@@ -16,6 +16,8 @@
 //           strings by unsigned bytes, NaN equal to NaN and above every double,
 //           -0.0 equal to 0.0. The ordering lives in a ByOrd companion slot
 //           (AggSpec::aux) that only its MaxBy / MinBy writes.
+//   With kGbPickFirstOfTies the ByOrd companion's counts[] entry also carries the row's input position
+//           (kGbPickValue | pos << kGbPickPosShift): a tie keeps the smaller position, whatever the fold or merge order.
 // Spilled (>12-byte) Utf8 values and orderings are deep-copied into the slot's
 // own byte buffer, as Utf8 MIN / MAX winners are (G2FEAT-283).
 
@@ -24,6 +26,7 @@ inline constexpr uint8_t kGbPickIgnoreNulls = 1u;   // AggSpec::flags
 // FIRST of tied orderings is kept (a row replaces the cell only when strictly better; a merge keeps the earlier partial).
 inline constexpr uint8_t kGbPickSkipNullValue = 2u;
 inline constexpr uint8_t kGbPickFirstOfTies   = 4u;
+inline constexpr int kGbPickPosShift = 3;
 inline constexpr uint8_t kGbPickDuckBy = kGbPickSkipNullValue | kGbPickFirstOfTies;
 inline constexpr int64_t kGbPickUnset = 0;           // counts[]: nothing folded
 inline constexpr int64_t kGbPickValue = 1;           //   holds a value
@@ -146,7 +149,7 @@ struct GbPickBy {
 
 // Fold one candidate (value v, ordering o) into a MaxBy / MinBy cell.
 inline bool gb_pick_fold_by(AggKind k, const GbPickBy& c, GbCell16 v, bool v_valid, const char* vbase,
-                            GbCell16 o, bool o_valid, const char* obase, uint8_t flags = 0) noexcept {
+                            GbCell16 o, bool o_valid, const char* obase, uint8_t flags = 0, uint64_t pos = 0) noexcept {
     assert(gb_kind_is_by(k));
     assert(c.val != nullptr && c.ord != nullptr && c.vstate != nullptr && c.ostate != nullptr);
     if (!o_valid) return true;
@@ -154,11 +157,18 @@ inline bool gb_pick_fold_by(AggKind k, const GbPickBy& c, GbCell16 v, bool v_val
     if (*c.ostate != kGbPickUnset) {
         const int kept = gb_pick_ord_cmp(c.ot, *c.ord, *c.obytes.buf, o, obase);
         const bool first_of_ties = (flags & kGbPickFirstOfTies) != 0;
-        if (k == AggKind::MaxBy ? (first_of_ties ? kept >= 0 : kept > 0) : (first_of_ties ? kept <= 0 : kept < 0))
+        if (first_of_ties) {
+            const bool strictly = k == AggKind::MaxBy ? kept < 0 : kept > 0;
+            const bool earlier = kept == 0 && pos < (static_cast<uint64_t>(*c.ostate) >> kGbPickPosShift);
+            if (!strictly && !earlier) return true;
+        } else if (k == AggKind::MaxBy ? kept > 0 : kept < 0) {
             return true;
+        }
     }
     if (!gb_pick_take(c.ot, c.ord, o, obase, c.obytes)) return false;
-    *c.ostate = kGbPickValue;
+    *c.ostate = (flags & kGbPickFirstOfTies) != 0
+                    ? static_cast<int64_t>(static_cast<uint64_t>(kGbPickValue) | (pos << kGbPickPosShift))
+                    : kGbPickValue;
     if (!v_valid) {
         *c.val = GbCell16{0, 0};
         *c.vstate = kGbPickNull;
@@ -201,7 +211,8 @@ inline bool gb_pick_row(GroupbyTypedState* st, uint32_t j, uint32_t slot, const 
         const bool o_valid = gb_detail::cell_valid(oc, r);
         const GbCell16 o = o_valid ? gb_detail::read_cell16(oc, r) : GbCell16{0, 0};
         ok = gb_pick_fold_by(sp.kind, gb_pick_by_cell(st, j, slot), v, valid, vbase, o, o_valid,
-                             static_cast<const char*>(oc.str_overflow_base), sp.flags);
+                             static_cast<const char*>(oc.str_overflow_base), sp.flags,
+                             st->pick_pos_base + static_cast<uint64_t>(r));
     }
     if (!ok) st->oom = true;
     return ok;
@@ -240,7 +251,8 @@ inline bool gb_pick_merge(GroupbyTypedState* dst, uint32_t dslot, const GroupbyT
         const size_t sord = static_cast<size_t>(sp.aux) * src->cap + sgid;
         if (src->counts[sord] == kGbPickUnset) return true;
         ok = gb_pick_fold_by(sp.kind, gb_pick_by_cell(dst, j, dslot), v, v_valid, src->agg_str_buf[j],
-                             src->accums[sord], true, src->agg_str_buf[sp.aux], sp.flags);
+                             src->accums[sord], true, src->agg_str_buf[sp.aux], sp.flags,
+                             static_cast<uint64_t>(src->counts[sord]) >> kGbPickPosShift);
     }
     if (!ok) dst->oom = true;
     return ok;

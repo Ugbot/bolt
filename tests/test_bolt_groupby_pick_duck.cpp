@@ -80,6 +80,7 @@ bool begin(GroupbyTypedState* st, Arena* a, BoltType vt, BoltType ot, AggKind k,
 }
 
 bool ingest(GroupbyTypedState* st, Arena* a, const Col& v, const Col& o, Z from, Z n) {
+    st->pick_pos_base = from;
     BoltColumn key = BoltColumn::make_flat_alloc(static_cast<std::int64_t>(n), BoltType::Int64, a);
     for (Z r = 0; r < n; ++r) static_cast<std::int64_t*>(key.data)[r] = static_cast<std::int64_t>((from + r) % kGroups);
     const BoltColumn pay[2] = {build(a, v, from, n), build(a, o, from, n)};
@@ -138,6 +139,35 @@ TEST_P(Duck, MatchesReferenceOnePartitionAndMergedPartials) {
         const std::string want = reference(v, o, g, max);
         EXPECT_EQ(cell(&one, static_cast<std::int64_t>(g), v), want) << "one state, group " << g;
         EXPECT_EQ(cell(&merged, static_cast<std::int64_t>(g), v), want) << "merged partials, group " << g;
+    }
+}
+
+// Rows dealt to four partials by 4096-row windows (as the partition driver claims them), merged in reverse and in
+// window order: the first of tied orderings is the row with the smallest input position either way.
+TEST_P(Duck, InterleavedPartialsMergeInAnyOrder) {
+    const BoltType ts[3] = {BoltType::Int64, BoltType::Float64, BoltType::Utf8};
+    const BoltType vt = ts[std::get<0>(GetParam())], ot = ts[std::get<1>(GetParam())];
+    const bool max = std::get<2>(GetParam());
+    const AggKind k = max ? AggKind::MaxBy : AggKind::MinBy;
+    const Col v = make_col(vt, 11, 40), o = make_col(ot, 29, 9);
+    Arena a{};
+    GroupbyTypedState part[4]{};
+    for (Z p = 0; p < 4; ++p) ASSERT_TRUE(begin(&part[p], &a, vt, ot, k, kGbPickDuckBy));
+    for (Z from = 0, w = 0; from < kRows; from += 750, ++w) {
+        const Z n = from + 750 <= kRows ? 750 : kRows - from;
+        ASSERT_TRUE(ingest(&part[(w * 3 + 1) % 4], &a, v, o, from, n));
+    }
+    GroupbyTypedState fwd{}, rev{};
+    ASSERT_TRUE(begin(&fwd, &a, vt, ot, k, kGbPickDuckBy));
+    ASSERT_TRUE(begin(&rev, &a, vt, ot, k, kGbPickDuckBy));
+    for (Z p = 0; p < 4; ++p) {
+        ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&fwd, &part[p]));
+        ASSERT_TRUE(groupby_agg_multi_key_typed_merge(&rev, &part[3 - p]));
+    }
+    for (Z g = 0; g < kGroups; ++g) {
+        const std::string want = reference(v, o, g, max);
+        EXPECT_EQ(cell(&fwd, static_cast<std::int64_t>(g), v), want) << "forward, group " << g;
+        EXPECT_EQ(cell(&rev, static_cast<std::int64_t>(g), v), want) << "reverse, group " << g;
     }
 }
 
