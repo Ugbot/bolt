@@ -22,6 +22,7 @@
 #include <cstring>
 
 #include "bolt/kernels/bolt_bignum_small.h"
+#include "bolt/kernels/bolt_float_chars_limits.h"
 #include "bolt/kernels/bolt_ryu.h"
 
 namespace bolt {
@@ -364,9 +365,6 @@ inline uint32_t f64_to_chars_fixed(char* out, uint32_t cap, double v) noexcept {
     assert(n <= 400);
     return n <= cap ? n : 0;
 }
-
-// Longest f64_to_chars_prom output: sign + 17 digits + '.' + "e-324".
-inline constexpr uint32_t k_f64_prom_max_chars = 32;
 
 // A sample value as Prometheus writes it (jsonutil.MarshalFloat): Go
 // FormatFloat(v, 'f', -1, 64) while 1e-6 <= |v| < 1e21, 'e' form outside
