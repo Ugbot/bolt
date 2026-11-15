@@ -497,6 +497,19 @@ bolt_apply_hardening(test_promql_kernels)
 
 add_test(NAME test_promql_kernels COMMAND test_promql_kernels)
 
+add_executable(test_bolt_fintech_step test_bolt_fintech_step.cpp)
+
+target_link_libraries(test_bolt_fintech_step
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_fintech_step)
+
+add_test(NAME test_bolt_fintech_step COMMAND test_bolt_fintech_step)
+
 add_executable(test_promql_time_fn test_promql_time_fn.cpp)
 
 target_link_libraries(test_promql_time_fn
