@@ -26,6 +26,48 @@ double quantile(const double* v, std::int64_t n, double q) {
     return quantile_f64(v, n, q, g_keys, g_perm, g_sort);
 }
 
+double prom(const double* v, std::int64_t n, double phi) {
+    return quantile_prom_f64(v, n, phi, g_keys, g_perm, g_sort);
+}
+
+// Prometheus quantile: rank = phi * (n - 1), lower * (1 - w) + upper * w, NaN sorts first, phi outside [0,1] is +-Inf.
+TEST(GroupStats, PromQuantileInterpolatesAsUpstream) {
+    const double v[] = {5.0, 1.0, 3.0, 2.0, 4.0};   // sorted 1..5
+    EXPECT_EQ(prom(v, 5, 0.0), 1.0);
+    EXPECT_EQ(prom(v, 5, 1.0), 5.0);
+    EXPECT_EQ(prom(v, 5, 0.5), 3.0);
+    const double w = 0.3 * 4.0 - 1.0;               // the weight, computed as the kernel does
+    EXPECT_EQ(prom(v, 5, 0.3), 2.0 * (1.0 - w) + 3.0 * w);
+    EXPECT_EQ(prom(v, 5, 0.25), 2.0);               // rank 1.0 exactly
+    const double one[] = {7.0};
+    EXPECT_EQ(prom(one, 1, 0.9), 7.0);
+}
+
+TEST(GroupStats, PromQuantileEdges) {
+    const double v[] = {3.0, 1.0, 2.0};
+    EXPECT_EQ(prom(v, 3, -0.1), -INFINITY);
+    EXPECT_EQ(prom(v, 3, 1.1), INFINITY);
+    EXPECT_TRUE(std::isnan(prom(v, 3, NAN)));
+    EXPECT_TRUE(std::isnan(prom(v, 0, 0.5)));
+    // NaN sorts first: {NaN, 1, 2, 3}; rank at phi 1 is the last (3), at phi 0 the NaN
+    const double n[] = {2.0, NAN, 3.0, 1.0};
+    EXPECT_TRUE(std::isnan(prom(n, 4, 0.0)));
+    EXPECT_EQ(prom(n, 4, 1.0), 3.0);
+    EXPECT_EQ(prom(n, 4, 2.0 / 3.0), 2.0);          // rank 2.0
+    EXPECT_TRUE(std::isnan(prom(n, 4, 0.2)));       // rank 0.6 interpolates the NaN with 1
+    // Inf neighbour with a zero weight is NaN (Inf * 0), as upstream's formula
+    const double inf[] = {1.0, INFINITY};
+    EXPECT_TRUE(std::isnan(prom(inf, 2, 0.0)));
+}
+
+// The mixed-sign sort, -Inf and +Inf included.
+TEST(GroupStats, PromQuantileMixedSignsAndInfinities) {
+    const double v[] = {-INFINITY, 2.0, -3.0, INFINITY, 0.5};   // sorted -Inf,-3,0.5,2,Inf
+    EXPECT_EQ(prom(v, 5, 0.25), -3.0);
+    EXPECT_EQ(prom(v, 5, 0.5), 0.5);
+    EXPECT_TRUE(std::isnan(prom(v, 5, 0.75)));    // rank 3.0: 2 * 1 + Inf * 0
+}
+
 TEST(GroupStats, MedianOddCount) {
     const double v[] = {5.0, 1.0, 3.0, 2.0, 4.0};   // sorted: 1,2,3,4,5
     EXPECT_DOUBLE_EQ(median(v, 5), 3.0);
