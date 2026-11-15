@@ -11,14 +11,22 @@
 //   TrySum  : an int64 sum (integral input) leaving int64 range, or a d128 sum
 //             (decimal input) leaving 38 digits, overflows. Two in-range d128
 //             values never wrap the 128-bit cell (|x| < 10^38 < 2^126).
+//   SumComp : a float64 sum with a Neumaier compensation (.a the sum, .b the compensation, both double bits):
+//             a row adds x and a partial adds its sum and its compensation, so any split of the input over
+//             partials and any merge order give the answer one fold over the rows does (-1e300, -2.25, 1e300
+//             sum to -2.25, never 0). An infinite sum answers itself (neumaier_result).
+//   AvgComp : the SumComp state divided by the folded count at the end; a sum that left double range answers
+//             +-Inf (Prometheus's incremental mean can recover there; a partial merge cannot).
 //   TryAvg  : the TrySum d128 state; the result is Spark's decimal average,
 //             sum / count rounded HALF_UP to the output scale, NULL past 38
 //             digits (DecimalDivideWithOverflowCheck with nullOnOverflow).
 
 inline constexpr int64_t kGbFoldOverflow = -1;   // counts[]: the sum overflowed
 
+BOLT_FORCE_INLINE bool gb_kind_is_comp(AggKind k) noexcept { return k == AggKind::SumComp || k == AggKind::AvgComp; }
+
 BOLT_FORCE_INLINE bool gb_kind_is_fold(AggKind k) noexcept {
-    return k == AggKind::Product || k == AggKind::TrySum || k == AggKind::TryAvg;
+    return k == AggKind::Product || k == AggKind::TrySum || k == AggKind::TryAvg || gb_kind_is_comp(k);
 }
 
 namespace gb_fold {
@@ -63,6 +71,72 @@ inline bool gb_fold_d128_avg(GbCell16 sum, int64_t count, uint8_t in_s, uint8_t 
     return true;
 }
 
+
+// AvgComp cell: while the compensated sum is finite it is (.a sum, .b compensation) and the answer is sum / n. Once a
+// partial sum leaves double range the cell turns into Prometheus's incremental mean (.a mean, .b its compensation,
+// flagged in counts[]): the mean of finite values is finite, so the answer survives where the sum cannot.
+inline constexpr int64_t kGbAvgMeanFlag = int64_t{1} << 62;
+
+namespace gb_avg {
+
+namespace gs = ::bolt::kernels::group_stats;
+
+BOLT_FORCE_INLINE int64_t n_of(int64_t c) noexcept { return c & ~kGbAvgMeanFlag; }
+BOLT_FORCE_INLINE bool is_mean(int64_t c) noexcept { return (c & kGbAvgMeanFlag) != 0; }
+
+// A finite-sum cell as the mean state of the same values.
+BOLT_FORCE_INLINE void to_mean(GbCell16* c, int64_t* cnt) noexcept {
+    double a, b;
+    std::memcpy(&a, &c->a, 8); std::memcpy(&b, &c->b, 8);
+    const double n = static_cast<double>(n_of(*cnt));
+    const double m = a / n, mc = b / n;
+    std::memcpy(&c->a, &m, 8); std::memcpy(&c->b, &mc, 8);
+    *cnt |= kGbAvgMeanFlag;
+}
+
+}  // namespace gb_avg
+
+inline void gb_avg_comp_combine(GbCell16* d, int64_t* dc, GbCell16 s, int64_t sc) noexcept {
+    namespace gs = gb_avg::gs;
+    assert(d != nullptr && dc != nullptr && sc > 0);
+    if (*dc == 0) { *d = s; *dc = sc; return; }
+    int64_t sn = sc;
+    GbCell16 sv = s;
+    const int64_t dn = gb_avg::n_of(*dc);
+    if (!gb_avg::is_mean(*dc) && !gb_avg::is_mean(sc)) {   // both sums: add, unless the total leaves double range
+        double da, db, sa, sb;
+        std::memcpy(&da, &d->a, 8); std::memcpy(&db, &d->b, 8);
+        std::memcpy(&sa, &s.a, 8);  std::memcpy(&sb, &s.b, 8);
+        double ta = da, tb = db;
+        gs::neumaier_add(&ta, &tb, sa);
+        tb += sb;
+        if (gs::gs_is_finite(ta) && gs::gs_is_finite(tb)) {
+            std::memcpy(&d->a, &ta, 8); std::memcpy(&d->b, &tb, 8);
+            *dc = dn + gb_avg::n_of(sc);
+            return;
+        }
+    }
+    if (!gb_avg::is_mean(*dc)) gb_avg::to_mean(d, dc);
+    if (!gb_avg::is_mean(sn)) gb_avg::to_mean(&sv, &sn);
+    double dm, dmc, sm, smc;
+    std::memcpy(&dm, &d->a, 8); std::memcpy(&dmc, &d->b, 8);
+    std::memcpy(&sm, &sv.a, 8); std::memcpy(&smc, &sv.b, 8);
+    const double n1 = static_cast<double>(dn), n2 = static_cast<double>(gb_avg::n_of(sn));
+    double m, mc;
+    if (n2 == 1.0 && smc == 0.0) {
+        mc = dmc;   // one more value: the incremental update itself
+        m = gs::promql_mean_update(dm, &mc, n1 + 1.0, sm);
+    } else if (!gs::gs_is_finite(dm) || !gs::gs_is_finite(sm)) {
+        m = dm + sm; mc = 0.0;   // an infinite or NaN mean absorbs the other as a sum does
+    } else {
+        const double w1 = n1 / (n1 + n2), w2 = n2 / (n1 + n2);
+        m = dm * w1; mc = dmc * w1 + smc * w2;
+        gs::neumaier_add(&m, &mc, sm * w2);
+    }
+    std::memcpy(&d->a, &m, 8); std::memcpy(&d->b, &mc, 8);
+    *dc = (dn + gb_avg::n_of(sn)) | kGbAvgMeanFlag;
+}
+
 // Fold one non-NULL value (sc == 1) or one partial (cell s, count sc) into a
 // fold cell. Allocation-free; never fails.
 inline void gb_fold_combine(AggKind k, BoltType t, GbCell16* d, int64_t* dc, GbCell16 s, int64_t sc) noexcept {
@@ -70,6 +144,23 @@ inline void gb_fold_combine(AggKind k, BoltType t, GbCell16* d, int64_t* dc, GbC
     assert(d != nullptr && dc != nullptr && *dc >= kGbFoldOverflow && sc >= kGbFoldOverflow);
     if (sc == 0 || *dc == kGbFoldOverflow) return;
     if (sc == kGbFoldOverflow) { *dc = kGbFoldOverflow; return; }
+    if (k == AggKind::SumComp) {
+        assert(t == BoltType::Float64);
+        if (*dc == 0) { *d = s; *dc = sc; return; }   // the first value is the sum: -0.0 stays -0.0
+        double ds, dcomp, ss, scomp;
+        std::memcpy(&ds, &d->a, 8); std::memcpy(&dcomp, &d->b, 8);
+        std::memcpy(&ss, &s.a, 8);  std::memcpy(&scomp, &s.b, 8);
+        kernels::group_stats::neumaier_add(&ds, &dcomp, ss);
+        dcomp += scomp;
+        std::memcpy(&d->a, &ds, 8); std::memcpy(&d->b, &dcomp, 8);
+        *dc += sc;
+        return;
+    }
+    if (k == AggKind::AvgComp) {
+        assert(t == BoltType::Float64);
+        gb_avg_comp_combine(d, dc, s, sc);
+        return;
+    }
     if (k == AggKind::Product) {
         double x, acc;
         std::memcpy(&x, &s.a, 8);
@@ -133,7 +224,7 @@ inline void gb_fold_merge(GroupbyTypedState* dst, uint32_t dslot, const GroupbyT
 
 BOLT_FORCE_INLINE BoltType gb_fold_out_type(AggKind k, BoltType in) noexcept {
     assert(gb_kind_is_fold(k));
-    if (k == AggKind::Product) return BoltType::Float64;
+    if (k == AggKind::Product || gb_kind_is_comp(k)) return BoltType::Float64;
     if (k == AggKind::TryAvg || gb_detail::gb_agg_cell_is_d128(in)) return BoltType::Decimal128;
     return BoltType::Int64;
 }
@@ -146,6 +237,16 @@ inline void gb_fold_emit(AggKind k, BoltType ot, uint8_t in_s, uint8_t out_s, Gb
     assert(gb_kind_is_fold(k) && cnt != nullptr && buf != nullptr);
     assert(r >= 0);
     GbCell16 v = *cnt > 0 ? acc : GbCell16{0, 0};
+    if (gb_kind_is_comp(k) && *cnt > 0) {
+        double sum, comp;
+        std::memcpy(&sum, &acc.a, 8); std::memcpy(&comp, &acc.b, 8);
+        double r = kernels::group_stats::neumaier_result(sum, comp);
+        if (k == AggKind::AvgComp) {
+            r = gb_avg::is_mean(*cnt) ? (kernels::group_stats::gs_is_finite(sum) ? sum + comp : sum)
+                                      : r / static_cast<double>(gb_avg::n_of(*cnt));
+        }
+        std::memcpy(&v.a, &r, 8);
+    }
     if (k == AggKind::TryAvg && *cnt > 0 && !gb_fold_d128_avg(acc, *cnt, in_s, out_s, &v)) {
         *cnt = kGbFoldOverflow;
         v = GbCell16{0, 0};
