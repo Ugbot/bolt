@@ -145,3 +145,22 @@ TEST(BoltBitmap, FillNonByteAligned) {
         EXPECT_TRUE(get_bit(bm.data(), i)) << "bit " << i;
     }
 }
+
+TEST(BoltBitmap, ToSelectionI32MatchesBitScan) {
+    uint32_t seed = 12345u;
+    auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (int it = 0; it < 500; ++it) {
+        const size_t n = next() % 700u;
+        std::array<uint8_t, 96> bm{};
+        for (auto& b : bm) b = (next() % 3u == 0u) ? 0u : static_cast<uint8_t>(next());
+        std::array<int32_t, 700> out{};
+        std::array<int32_t, 700> ref{};
+        size_t want = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (get_bit(bm.data(), i)) ref[want++] = static_cast<int32_t>(i);
+        const size_t got = bolt::bitmap_to_selection_i32(bm.data(), n, out.data());
+        ASSERT_EQ(got, want) << "n " << n;
+        for (size_t i = 0; i < got; ++i) ASSERT_EQ(out[i], ref[i]) << "n " << n << " at " << i;
+    }
+    EXPECT_EQ(bolt::bitmap_to_selection_i32(nullptr, 0, nullptr), 0u);
+}
