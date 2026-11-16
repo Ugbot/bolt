@@ -223,3 +223,12 @@ first Match ends the scan; `re2_full_match` is the same loop, `search=false`),
 behind a required-literal prefilter (`regex_required_literal`: none with a
 top-level `|` or `(?`). All filters take and return selection vectors.
 **Not done:** SIMD for the case-insensitive path; Unicode word characters.
+
+### Decision: Int64 column % literal array kernel (G2CHK-1198, 2026-11-16)
+`mod_lit_nz_i64(a, n, d, out)` in bolt_numeric.h: `x % d` with the sign of the dividend, false for d = 0 and d = -1 (the
+caller's scalar rules). The ns-scale minute / hour / day widths join the unrolled `div_lit_i64` divisors. Why in Bolt: the
+vectorized Compute lane has no Mod arm of its own, and time_bucket lowers to `ts - ts % W`. Not done: the columnar JSON-path
+extraction kernel (item 2 of the lane). Stream pruning removed JSON from the declared-field queries, and a column kernel needs
+the Compute lane to emit a validity bitmap for a vectorized root, which it does not yet (every vectorized root is null-free by
+precondition); the scalar `json_path_lookup` still validates the whole document and then re-walks it (27% jp_skip_value in
+G1's profile).
