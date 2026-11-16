@@ -1,13 +1,14 @@
 // bench_column_codec.cpp — column codec chains over a real text / NDJSON file:
 // bytes per row, ratio, encode and decode MB/s, every chunk round-trip checked.
 //
-//   bench_column_codec <file> [--rows N] [--chunk R] [--reps K]
+//   bench_column_codec <file> [--rows N] [--chunk R] [--reps K] [--threads T] [--col NAME]
 //                      [--str "chain;chain"] [--int "chain;chain"]
 //
 // Every line is one row of column `line`. If the lines are flat JSON objects,
 // each key also becomes a column (a canonical integer value -> int64, else
 // string). The column is cut into chunks of R rows (default 65536); each chunk
-// is encoded on its own. 1 thread. MB/s is raw column bytes over the best rep.
+// is encoded on its own, T chunks at a time (default 1, inline); decode is 1
+// thread. MB/s is raw column bytes over the best rep.
 
 #include <algorithm>
 #include <chrono>
@@ -21,7 +22,8 @@
 #include <vector>
 
 #include "bolt/bolt_arena.h"
-#include "bolt/codec/bolt_column_codec.h"
+#include "bolt/bolt_scheduler.h"
+#include "bolt/codec/bolt_codec_parallel.h"
 
 namespace {
 
@@ -100,39 +102,44 @@ std::vector<std::string> split(const std::string& s) {
 
 struct Result { uint64_t enc_bytes = 0; double enc_s = 1e30, dec_s = 1e30; bool ok = true; };
 
-Result run(const Column& c, const C::Chain& chain, uint64_t chunk, int reps) {
+Result run(const Column& c, const C::Chain& chain, uint64_t chunk, int reps, bolt::Scheduler* sched,
+           bolt::Arena** scratch) {
     Result best;
     const uint64_t n = c.is_int ? c.ints.size() : c.offs.size() - 1;
-    std::vector<uint32_t> local;
-    std::vector<std::vector<uint8_t>> enc;
+    const uint64_t nchunks = (n + chunk - 1) / chunk;
+    std::vector<std::vector<uint32_t>> local(nchunks);
+    std::vector<std::vector<uint8_t>> dst(nchunks);
+    std::vector<C::ChunkJob> jobs(nchunks);
+    for (uint64_t j = 0; j < nchunks; ++j) {
+        const uint64_t at = j * chunk, m = std::min(chunk, n - at);
+        if (c.is_int) jobs[j].in = C::ints_stream(c.ints.data() + at, m);
+        else {
+            local[j].resize(m + 1);
+            for (uint64_t i = 0; i <= m; ++i) local[j][i] = c.offs[at + i] - c.offs[at];
+            jobs[j].in = C::strs_stream(local[j].data(), c.bytes.data() + c.offs[at], m);
+        }
+        dst[j].resize(C::encode_bound(jobs[j].in));
+        jobs[j].dst = dst[j].data(); jobs[j].cap = dst[j].size();
+    }
     bolt::Arena a;
     for (int rep = 0; rep < reps; ++rep) {
-        enc.clear(); uint64_t total = 0; double es = 0, ds = 0;
-        for (uint64_t at = 0; at < n; at += chunk) {
-            const uint64_t m = std::min(chunk, n - at);
-            C::Stream in;
-            if (c.is_int) in = C::ints_stream(c.ints.data() + at, m);
-            else {
-                local.resize(m + 1);
-                for (uint64_t i = 0; i <= m; ++i) local[i] = c.offs[at + i] - c.offs[at];
-                in = C::strs_stream(local.data(), c.bytes.data() + c.offs[at], m);
-            }
-            a.reset();
-            C::Buf out; out.a = &a;
-            const auto t0 = Clock::now();
-            const bool eok = C::encode_column(in, chain, a, &out);
-            es += std::chrono::duration<double>(Clock::now() - t0).count();
-            if (!eok) { best.ok = false; return best; }
-            enc.emplace_back(out.p, out.p + out.n); total += out.n;
+        const auto t0 = Clock::now();
+        const bool eok = C::encode_chunks(sched, jobs.data(), static_cast<uint32_t>(nchunks), chain, scratch);
+        const double es = std::chrono::duration<double>(Clock::now() - t0).count();
+        if (!eok) { best.ok = false; return best; }
+        uint64_t total = 0; double ds = 0;
+        for (uint64_t j = 0; j < nchunks; ++j) {
+            const C::Stream& in = jobs[j].in;
+            total += jobs[j].len;
             a.reset();
             C::Stream back;
             const auto t1 = Clock::now();
-            const bool dok = C::decode_column(enc.back().data(), enc.back().size(), a, &back);
+            const bool dok = C::decode_column(jobs[j].dst, jobs[j].len, a, &back);
             ds += std::chrono::duration<double>(Clock::now() - t1).count();
-            bool same = dok && back.n == m;
-            if (same && c.is_int) same = std::memcmp(back.ints, in.ints, m * 8) == 0;
+            bool same = dok && back.n == in.n;
+            if (same && c.is_int) same = std::memcmp(back.ints, in.ints, in.n * 8) == 0;
             if (same && !c.is_int)
-                same = std::memcmp(back.offs, in.offs, (m + 1) * 4) == 0 &&
+                same = std::memcmp(back.offs, in.offs, (in.n + 1) * 4) == 0 &&
                        std::memcmp(back.bytes, in.bytes, in.nbytes) == 0;
             if (!same) { best.ok = false; return best; }
         }
@@ -145,7 +152,7 @@ Result run(const Column& c, const C::Chain& chain, uint64_t chunk, int reps) {
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: bench_column_codec <file> [--rows N] [--chunk R] [--reps K] [--str chains] [--int chains]\n"); return 2; }
-    uint64_t max_rows = ~0ull, chunk = 65536; int reps = 3;
+    uint64_t max_rows = ~0ull, chunk = 65536; int reps = 3; uint32_t threads = 1; std::string only;
     std::string str_chains = "none;lz4;zstd;zstd(9);zstdself;dict,for,zstd;front,for,zstd;template,dict,for;"
                              "template,dict,for,lz4;template,dict,for,zstd;template(2),dict,for,zstd;"
                              "template(1),dict,for,zstd;template,dict,front,delta,for,zstd";
@@ -155,11 +162,13 @@ int main(int argc, char** argv) {
         if (k == "--rows") max_rows = std::strtoull(argv[i + 1], nullptr, 10);
         else if (k == "--chunk") chunk = std::strtoull(argv[i + 1], nullptr, 10);
         else if (k == "--reps") reps = std::atoi(argv[i + 1]);
+        else if (k == "--threads") threads = static_cast<uint32_t>(std::atoi(argv[i + 1]));
+        else if (k == "--col") only = argv[i + 1];
         else if (k == "--str") str_chains = argv[i + 1];
         else if (k == "--int") int_chains = argv[i + 1];
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
-    if (chunk == 0 || chunk > C::kMaxRows || reps < 1) { std::fprintf(stderr, "bad --chunk / --reps\n"); return 2; }
+    if (chunk == 0 || chunk > C::kMaxRows || reps < 1 || threads < 1 || threads > 256) { std::fprintf(stderr, "bad --chunk / --reps\n"); return 2; }
 
     std::ifstream f(argv[1]);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
@@ -187,16 +196,22 @@ int main(int argc, char** argv) {
     cols[0].is_int = false;
     for (size_t i = 0; i < cols.size(); ++i) { if (i) cols[i].is_int = true; settle(cols[i]); }
 
-    std::printf("file %s: %llu rows, %.1f raw bytes/row, chunk %llu rows, libzstd %s\n\n", argv[1],
+    bolt::Scheduler sched;
+    if (threads > 1 && !sched.init(threads)) { std::fprintf(stderr, "scheduler init failed\n"); return 1; }
+    std::vector<bolt::Arena> arenas(threads);
+    std::vector<bolt::Arena*> scratch;
+    for (auto& ar : arenas) scratch.push_back(&ar);
+    std::printf("file %s: %llu rows, %.1f raw bytes/row, chunk %llu rows, %u encode thread(s), decode 1 thread, libzstd %s\n\n", argv[1],
                 static_cast<unsigned long long>(rows), rows ? double(raw_bytes) / double(rows) : 0.0,
-                static_cast<unsigned long long>(chunk), bolt::ingest::zstd_available() ? "yes" : "no (zstd = bolt's own encoder)");
+                static_cast<unsigned long long>(chunk), threads, bolt::ingest::zstd_available() ? "yes" : "no (zstd = bolt's own encoder)");
     std::printf("| column | chain | bytes/row | ratio | enc MB/s | dec MB/s |\n|---|---|---|---|---|---|\n");
     for (const auto& c : cols) {
+        if (!only.empty() && c.name != only) continue;
         const double col_bytes = c.is_int ? double(c.ints.size()) * 8 : double(c.bytes.size());
         for (const auto& text : split(c.is_int ? int_chains : str_chains)) {
             C::Chain chain;
             if (!C::chain_parse(text.c_str(), &chain)) { std::fprintf(stderr, "bad chain %s\n", text.c_str()); return 2; }
-            const Result r = run(c, chain, chunk, reps);
+            const Result r = run(c, chain, chunk, reps, threads > 1 ? &sched : nullptr, scratch.data());
             if (!r.ok) { std::fprintf(stderr, "ROUND TRIP FAILED: %s %s\n", c.name.c_str(), text.c_str()); return 1; }
             std::printf("| %s (%s, %.1f B/row raw) | %s | %.2f | %.1fx | %.0f | %.0f |\n", c.name.c_str(),
                         c.is_int ? "int64" : "string", rows ? col_bytes / double(rows) : 0.0, text.c_str(),
@@ -204,5 +219,6 @@ int main(int argc, char** argv) {
                         col_bytes / 1e6 / r.enc_s, col_bytes / 1e6 / r.dec_s);
         }
     }
+    if (threads > 1) sched.shutdown();
     return 0;
 }

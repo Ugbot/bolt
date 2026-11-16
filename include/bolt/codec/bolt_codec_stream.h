@@ -7,11 +7,13 @@
 
 #pragma once
 
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 
 #include "bolt/bolt_arena.h"
+#include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_fastlanes.h"
 
 namespace bolt {
@@ -184,15 +186,48 @@ inline bool for_decode(Rd& r, uint64_t n, int64_t* out) noexcept {
     return true;
 }
 
-// Run lengths. vals / lens hold at most n entries; returns the run count.
-inline uint64_t rle_encode(const int64_t* v, uint64_t n, int64_t* vals, int64_t* lens) noexcept {
+// Run lengths, no branch on the data. vals holds n entries, lens n + 1;
+// returns the run count.
+inline uint64_t rle_encode(const int64_t* BOLT_RESTRICT v, uint64_t n, int64_t* BOLT_RESTRICT vals,
+                           int64_t* BOLT_RESTRICT lens) noexcept {
     assert(v != nullptr || n == 0);
+    assert(vals != nullptr && lens != nullptr);
     uint64_t runs = 0;
     for (uint64_t i = 0; i < n; ++i) {
-        if (runs && vals[runs - 1] == v[i]) { ++lens[runs - 1]; continue; }
-        vals[runs] = v[i]; lens[runs] = 1; ++runs;
+        vals[runs] = v[i]; lens[runs] = static_cast<int64_t>(i);
+        runs += (i + 1 == n) | (v[i] != v[i + 1 < n ? i + 1 : i]);
     }
+    // lens[k] holds the last row of run k; turn it into a length.
+    int64_t prev = -1;
+    for (uint64_t k = 0; k < runs; ++k) { const int64_t last = lens[k]; lens[k] = last - prev; prev = last; }
     return runs;
+}
+
+// Bytes a and b share from the front, eight at a time (little-endian hosts).
+inline uint32_t common_prefix(const uint8_t* BOLT_RESTRICT a, const uint8_t* BOLT_RESTRICT b, uint32_t n) noexcept {
+    assert((a != nullptr && b != nullptr) || n == 0);
+    uint32_t k = 0;
+    for (; k + 8 <= n; k += 8) {
+        uint64_t x, y; std::memcpy(&x, a + k, 8); std::memcpy(&y, b + k, 8);
+        if (x != y) return k + (static_cast<uint32_t>(std::countr_zero(x ^ y)) >> 3);
+    }
+    while (k < n && a[k] == b[k]) ++k;
+    return k;
+}
+
+// Offset of the first byte below `limit` (1..128) in [p, end), else end - p.
+// SWAR: the lowest flagged byte is exact.
+inline uint64_t find_below(const uint8_t* p, const uint8_t* end, uint8_t limit) noexcept {
+    assert(p <= end && limit >= 1 && limit <= 128);
+    const uint8_t* q = p;
+    const uint64_t ones = 0x0101010101010101ull, lim = ones * limit;
+    for (; q + 8 <= end; q += 8) {
+        uint64_t x; std::memcpy(&x, q, 8);
+        const uint64_t hit = (x - lim) & ~x & (ones << 7);
+        if (hit) return static_cast<uint64_t>(q - p) + (static_cast<uint32_t>(std::countr_zero(hit)) >> 3);
+    }
+    while (q < end && *q >= limit) ++q;
+    return static_cast<uint64_t>(q - p);
 }
 
 }  // namespace codec

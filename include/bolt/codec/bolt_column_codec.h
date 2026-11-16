@@ -27,11 +27,13 @@
 
 #include <algorithm>
 
+#include "bolt/bolt_hash.h"
 #include "bolt/codec/bolt_codec_stream.h"
 #include "bolt/ingest/bolt_lz4_raw.h"
 #include "bolt/ingest/bolt_zstd.h"
 #include "bolt/ingest/bolt_zstd_dec.h"
 #include "bolt/ingest/bolt_zstd_enc.h"
+#include "bolt/join/bolt_swiss.h"
 
 namespace bolt {
 namespace codec {
@@ -127,32 +129,47 @@ inline bool strout_ok(const StrOut& s) noexcept {
     return s.bytes.ok && s.offs.ok && s.bytes.n < kMaxChunkBytes;
 }
 
+// Byte classes of the template split: delimiter, digit, needs an escape.
+inline constexpr uint8_t kClsDelim = 1, kClsDigit = 2, kClsEsc = 4;
+struct TplClass { uint8_t c[256]; };
+inline void tpl_class_init(TplClass& t, uint32_t param) noexcept {
+    for (uint32_t b = 0; b < 256; ++b) {
+        const uint8_t ch = static_cast<uint8_t>(b);
+        t.c[b] = static_cast<uint8_t>((tpl_delim(ch, param) ? kClsDelim : 0) | (ch >= '0' && ch <= '9' ? kClsDigit : 0) |
+                                      (ch >= kTplEsc && ch <= kTplStr ? kClsEsc : 0));
+    }
+}
+
 inline void tpl_split(const Stream& in, uint32_t param, StrOut& tpl, Buf& ivars, StrOut& svars) noexcept {
     assert(in.kind == Kind::kStrs);
+    TplClass cls; tpl_class_init(cls, param);
+    if (!buf_reserve(tpl.bytes, in.nbytes * 2 + 8)) return;   // every byte at most escaped
+    uint8_t* w = tpl.bytes.p + tpl.bytes.n;
     for (uint64_t r = 0; r < in.n; ++r) {
         const uint8_t* p = in.bytes + in.offs[r];
         const uint8_t* end = in.bytes + in.offs[r + 1];
         while (p < end) {
-            if (tpl_delim(*p, param)) { buf_u8(tpl.bytes, *p++); continue; }
-            const uint8_t* t = p; bool all_digit = true, any_digit = false;
-            while (p < end && !tpl_delim(*p, param)) {
-                const bool d = *p >= '0' && *p <= '9';
-                all_digit &= d; any_digit |= d; ++p;
-            }
+            while (p < end && (cls.c[*p] & kClsDelim)) *w++ = *p++;
+            if (p == end) break;
+            const uint8_t* t = p; uint32_t all = kClsDigit, any = 0;
+            do { const uint8_t k = cls.c[*p++]; all &= k; any |= k; } while (p < end && !(cls.c[*p] & kClsDelim));
             const uint64_t len = static_cast<uint64_t>(p - t);
-            if (all_digit && len <= 18 && (len == 1 || t[0] != '0')) {
+            if (all && len <= 18 && (len == 1 || t[0] != '0')) {
                 int64_t v = 0;
                 for (uint64_t i = 0; i < len; ++i) v = v * 10 + (t[i] - '0');
-                buf_u8(tpl.bytes, kTplInt); buf_put(ivars, &v, 8);
-            } else if (any_digit && (all_digit || !(param & kTplDigitsOnly))) {
-                buf_u8(tpl.bytes, kTplStr); buf_put(svars.bytes, t, len); strout_end(svars);
+                *w++ = kTplInt; buf_put(ivars, &v, 8);
+            } else if ((any & kClsDigit) && (all || !(param & kTplDigitsOnly))) {
+                *w++ = kTplStr; buf_put(svars.bytes, t, len); strout_end(svars);
+            } else if (!(any & kClsEsc)) {
+                std::memcpy(w, t, len); w += len;
             } else {
                 for (uint64_t i = 0; i < len; ++i) {
-                    if (t[i] >= kTplEsc && t[i] <= kTplStr) buf_u8(tpl.bytes, kTplEsc);
-                    buf_u8(tpl.bytes, t[i]);
+                    *w = kTplEsc; w += (cls.c[t[i]] & kClsEsc) != 0;
+                    *w++ = t[i];
                 }
             }
         }
+        tpl.bytes.n = static_cast<uint64_t>(w - tpl.bytes.p);
         strout_end(tpl);
     }
 }
@@ -162,7 +179,10 @@ inline bool tpl_join(const Stream& tpl, const Stream& iv, const Stream& sv, StrO
     for (uint64_t r = 0; r < tpl.n; ++r) {
         const uint8_t* p = tpl.bytes + tpl.offs[r];
         const uint8_t* end = tpl.bytes + tpl.offs[r + 1];
-        for (; p < end; ++p) {
+        while (p < end) {
+            const uint64_t run = find_below(p, end, kTplStr + 1);
+            buf_put(out.bytes, p, run); p += run;
+            if (p == end) break;
             if (*p == kTplEsc) { if (++p == end) return false; buf_u8(out.bytes, *p); }
             else if (*p == kTplInt) {
                 if (ni == iv.n || iv.ints[ni] < 0) return false;
@@ -173,6 +193,7 @@ inline bool tpl_join(const Stream& tpl, const Stream& iv, const Stream& sv, StrO
                 if (ns == sv.n) return false;
                 buf_put(out.bytes, sv.bytes + sv.offs[ns], sv.offs[ns + 1] - sv.offs[ns]); ++ns;
             } else buf_u8(out.bytes, *p);
+            ++p;
         }
         strout_end(out);
     }
@@ -185,20 +206,40 @@ inline int str_cmp(const Stream& s, uint32_t a, uint32_t b) noexcept {
     return c ? c : (la < lb ? -1 : la > lb);
 }
 
-// Sorted dictionary + codes. Returns the distinct count.
+// Sorted dictionary + codes. Returns the distinct count, or n + 1 as soon as
+// more than half the rows are distinct (the caller skips the stage). Rows are
+// grouped through a hash table; only the distinct values are sorted.
 inline uint64_t dict_build(Ctx& c, const Stream& in, StrOut& dict, int64_t* codes) noexcept {
-    auto* idx = arr<uint32_t>(c, in.n);
-    if (idx == nullptr) { dict.bytes.ok = false; return 0; }
-    for (uint64_t i = 0; i < in.n; ++i) idx[i] = static_cast<uint32_t>(i);
-    std::sort(idx, idx + in.n, [&](uint32_t a, uint32_t b) { return str_cmp(in, a, b) < 0; });
-    uint64_t ndv = 0;
+    assert(in.kind == Kind::kStrs && codes != nullptr);
+    const uint64_t limit = in.n / 2;
+    SwissTable t;
+    auto* first = arr<uint32_t>(c, limit + 1);   // first row of each distinct value
+    auto* seen = arr<uint32_t>(c, in.n);         // first-seen id of each row
+    if (first == nullptr || seen == nullptr || !SwissTable::create(&t, limit + 1, c.a)) { dict.bytes.ok = false; return 0; }
+    uint32_t ndv = 0;
     for (uint64_t i = 0; i < in.n; ++i) {
-        if (i == 0 || str_cmp(in, idx[i - 1], idx[i]) != 0) {
-            buf_put(dict.bytes, in.bytes + in.offs[idx[i]], in.offs[idx[i] + 1] - in.offs[idx[i]]);
-            strout_end(dict); ++ndv;
-        }
-        codes[idx[i]] = static_cast<int64_t>(ndv - 1);
+        const uint8_t* p = in.bytes + in.offs[i];
+        const uint32_t len = in.offs[i + 1] - in.offs[i];
+        uint64_t free_h = 0;
+        const int32_t g = gb_table_find(&t, hash_bytes(p, len), [&](uint32_t id) {
+            const uint32_t r = first[id];
+            return in.offs[r + 1] - in.offs[r] == len && std::memcmp(in.bytes + in.offs[r], p, len) == 0;
+        }, &free_h);
+        if (g >= 0) { seen[i] = static_cast<uint32_t>(g); continue; }
+        if (ndv == limit) return in.n + 1;
+        if (g == -2 || !t.insert(free_h, ndv)) { dict.bytes.ok = false; return 0; }
+        first[ndv] = static_cast<uint32_t>(i); seen[i] = ndv++;
     }
+    auto* order = arr<uint32_t>(c, ndv); auto* rank = arr<uint32_t>(c, ndv);
+    if (order == nullptr || rank == nullptr) { dict.bytes.ok = false; return 0; }
+    for (uint32_t k = 0; k < ndv; ++k) order[k] = k;
+    std::sort(order, order + ndv, [&](uint32_t a, uint32_t b) { return str_cmp(in, first[a], first[b]) < 0; });
+    for (uint32_t k = 0; k < ndv; ++k) {
+        const uint32_t r = first[order[k]];
+        rank[order[k]] = k;
+        buf_put(dict.bytes, in.bytes + in.offs[r], in.offs[r + 1] - in.offs[r]); strout_end(dict);
+    }
+    for (uint64_t i = 0; i < in.n; ++i) codes[i] = rank[seen[i]];
     return ndv;
 }
 
@@ -274,7 +315,7 @@ inline void encode_stream(Ctx& c, const Stream& s, const Chain& ch, uint32_t pos
             return;
         }
         case Stage::kRle: {
-            auto* v = arr<int64_t>(c, s.n); auto* l = arr<int64_t>(c, s.n);
+            auto* v = arr<int64_t>(c, s.n); auto* l = arr<int64_t>(c, s.n + 1);
             if (v == nullptr || l == nullptr) break;
             const uint64_t runs = rle_encode(s.ints, s.n, v, l);
             if (runs * 2 > s.n) { encode_stream(c, s, ch, next, out); return; }
@@ -298,17 +339,14 @@ inline void encode_stream(Ctx& c, const Stream& s, const Chain& ch, uint32_t pos
         case Stage::kFront: {
             auto* pre = arr<int64_t>(c, s.n); auto* suf = arr<int64_t>(c, s.n);
             Buf t; t.a = c.a;
-            if (pre == nullptr || suf == nullptr) break;
+            if (pre == nullptr || suf == nullptr || !buf_reserve(t, s.nbytes)) break;
             for (uint64_t i = 0; i < s.n; ++i) {
                 const uint8_t* cur = s.bytes + s.offs[i];
                 const uint32_t len = s.offs[i + 1] - s.offs[i];
-                uint32_t k = 0;
-                if (i) {
-                    const uint8_t* prev = s.bytes + s.offs[i - 1];
-                    const uint32_t pl = s.offs[i] - s.offs[i - 1];
-                    while (k < len && k < pl && cur[k] == prev[k]) ++k;
-                }
-                pre[i] = k; suf[i] = len - k; buf_put(t, cur + k, len - k);
+                const uint32_t pl = i ? s.offs[i] - s.offs[i - 1] : 0;
+                const uint32_t k = common_prefix(cur, cur - pl, len < pl ? len : pl);
+                pre[i] = k; suf[i] = len - k;
+                std::memcpy(t.p + t.n, cur + k, len - k); t.n += len - k;
             }
             if (!t.ok) break;
             put_head(out, sp.s, s.kind, s.n);
@@ -409,13 +447,23 @@ inline bool decode_stream(Ctx& c, Rd& r, Stream* out) noexcept {
         }
         case Stage::kDict: {
             if (!decode_child(c, r, Kind::kStrs, &a) || !decode_child(c, r, Kind::kInts, &b) || b.n != n) return false;
-            StrOut o; strout_init(o, c.a);
-            for (uint64_t i = 0; i < n; ++i) {
+            auto* offs = arr<uint32_t>(c, n + 1);
+            if (offs == nullptr) return false;
+            uint64_t total = 0, bad = 0;
+            for (uint64_t i = 0; i < n; ++i) {   // sizes first, no branch on the data
                 const uint64_t code = static_cast<uint64_t>(b.ints[i]);
-                if (code >= a.n) return false;
-                buf_put(o.bytes, a.bytes + a.offs[code], a.offs[code + 1] - a.offs[code]); strout_end(o);
+                bad |= code >= a.n;
+                const uint64_t k = code < a.n ? code : 0;
+                offs[i] = static_cast<uint32_t>(total);
+                total += a.n ? a.offs[k + 1] - a.offs[k] : 0;
             }
-            *out = strout_stream(o, kind); return strout_ok(o);
+            if (bad || total >= kMaxChunkBytes) return false;
+            offs[n] = static_cast<uint32_t>(total);
+            auto* bytes = arr<uint8_t>(c, total);
+            if (bytes == nullptr) return false;
+            for (uint64_t i = 0; i < n; ++i)
+                std::memcpy(bytes + offs[i], a.bytes + a.offs[b.ints[i]], offs[i + 1] - offs[i]);
+            *out = strs_stream(offs, bytes, n, kind); return true;
         }
         case Stage::kFront: {
             if (!decode_child(c, r, Kind::kInts, &a) || !decode_child(c, r, Kind::kInts, &b) ||

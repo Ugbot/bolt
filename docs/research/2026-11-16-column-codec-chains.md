@@ -80,7 +80,57 @@ The whole line as one string (132.5 B):
   15.42 vs 6.76). A block codec stage needs Huffman literals in it, or libzstd.
 - Chunk size matters most for `dict` and `template` (request 1.68 -> 2.76 at 4,096 rows): the dictionary is paid per
   chunk. This is the case for a dictionary wider than a page (D5's table-level symbols, or one per stripe).
-- Encode speed of `dict` / `template` (120-300 MB/s) is the prototype (`std::sort`, byte-at-a-time split), not a limit.
+- Encode speed of `dict` / `template` (120-300 MB/s) was the first version (`std::sort`, byte-at-a-time split); see the tuning pass below.
+
+## Tuning pass (same day): hashing, table-driven split, word compares, one task per chunk
+
+What changed, each a general kernel in `bolt/codec/`:
+
+- `dict`: rows are grouped through `SwissTable` (hash chain helpers), only the distinct values are sorted, and the
+  build stops as soon as more than half the rows are distinct. Was a `std::sort` of every row.
+- `template`: a 256-entry class table (delimiter / digit / needs-escape), token flags folded without branching, one
+  reservation per chunk and `memcpy` of static tokens. Was a per-byte call with a capacity check each.
+- template decode: literal runs found eight bytes at a time (SWAR) and copied whole.
+- `front`: shared prefix by 8-byte compare + count-trailing-zeros; suffixes copied into one reservation.
+- `rle`: no branch on the data. `dict` decode: sizes first, then copies into an exact allocation.
+- `encode_chunks` (`bolt_codec_parallel.h`): one task per chunk on a `bolt::Scheduler`, one scratch arena per worker,
+  nothing shared; no scheduler, one worker or one chunk runs inline on the caller.
+
+1 thread, 500k lines, 65,536-row chunks, encode MB/s of raw column bytes, before -> after (decode in brackets):
+
+| column | chain | before | after |
+|---|---|---|---|
+| line | `template,dict,for` | 288 (688) | 783 (1811) |
+| line | `template,dict,for,zstd` | 266 (639) | 628 (1517) |
+| request | `template,dict,for` | 211 (529) | 582 (1159) |
+| request | `dict,for` | 467 with zstd | 1820 (3864) |
+| clientip | `template,dict,for` | 122 (737) | 421 (853) |
+| @timestamp | `rle,delta,for` | 8351 | 13746 |
+
+Bytes per row are unchanged by the pass.
+
+Scaling, full file (2,708,746 lines, 42 chunks), encode MB/s, load average 2.3-2.6, M5 Max (6 P + 12 E cores):
+
+| threads | line `template,dict,for,zstd` | line `zstd` | line `front,for,zstd` | request `dict,for,zstd` | @timestamp `rle,delta,for` |
+|---|---|---|---|---|---|
+| 1 | 628 | 1578 | 1755 | 1572 | 12850 |
+| 2 | 1153 | 2953 | 3275 | 3072 | 24646 |
+| 4 | 2246 | 5444 | 6010 | 5850 | 46782 |
+| 6 | 3504 | 8199 | 8929 | 6353 | 67168 |
+| 8 | 3993 | 9722 | 10689 | 9851 | 81174 |
+| 12 | 5724 | 12938 | 13784 | 14328 | 106530 |
+
+Near-linear to the six performance cores, less on the efficiency cores. The `request` 6-thread point is one run.
+
+Against the rules, honestly:
+- Parallel: per chunk only. One chunk is still one thread; nothing inside a chunk is split.
+- Branch-free: `rle`, the class fold, `dict` decode sizing. The template split still branches per token and the hash
+  probe per row.
+- SIMD: none hand-written. `for` packs with the scalar FastLanes reference (NEON / AVX2 kernels are G2CHK-528); min /
+  max and `delta` are plain loops the compiler may vectorise (not checked in the disassembly); prefix compare and the
+  literal scan are 8-byte SWAR.
+- Decode is still one thread and `front` decode is unchanged.
+- bolt's zstd encoder ratio: G2CHK-1208.
 
 ## Not done
 

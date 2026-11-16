@@ -12,7 +12,8 @@
 #include <vector>
 
 #include "bolt/bolt_arena.h"
-#include "bolt/codec/bolt_column_codec.h"
+#include "bolt/bolt_scheduler.h"
+#include "bolt/codec/bolt_codec_parallel.h"
 
 using namespace bolt;
 namespace C = bolt::codec;
@@ -163,6 +164,44 @@ TEST(ColumnCodec, ABlockCodecAloneReachesStringAndIntPayloads) {
         EXPECT_LT(b.n * 10, p.n) << text;
         EXPECT_LT(bi.n * 10, pi.n) << text;
     }
+}
+
+TEST(ColumnCodec, ChunksEncodedOnFourWorkersEqualTheInlineBytes) {
+    std::mt19937_64 g(3);
+    constexpr uint32_t kChunks = 23;
+    std::vector<Strs> data(kChunks);
+    for (auto& d : data) d = gen_strs(g, 500 + g() % 1500, static_cast<int>(g() % 5));
+    C::Chain chain;
+    ASSERT_TRUE(C::chain_parse("template,dict,front,delta,for,zstd", &chain));
+    auto run = [&](Scheduler* sched, uint32_t workers, std::vector<std::vector<uint8_t>>* out) {
+        std::vector<Arena> arenas(workers); std::vector<Arena*> scratch;
+        for (auto& a : arenas) scratch.push_back(&a);
+        std::vector<C::ChunkJob> jobs(kChunks);
+        out->assign(kChunks, {});
+        for (uint32_t j = 0; j < kChunks; ++j) {
+            jobs[j].in = data[j].stream();
+            (*out)[j].resize(C::encode_bound(jobs[j].in));
+            jobs[j].dst = (*out)[j].data(); jobs[j].cap = (*out)[j].size();
+        }
+        ASSERT_TRUE(C::encode_chunks(sched, jobs.data(), kChunks, chain, scratch.data()));
+        for (uint32_t j = 0; j < kChunks; ++j) (*out)[j].resize(jobs[j].len);
+    };
+    std::vector<std::vector<uint8_t>> inline_out, pool_out;
+    run(nullptr, 1, &inline_out);
+    Scheduler sched;
+    ASSERT_TRUE(sched.init(4));
+    run(&sched, 4, &pool_out);
+    sched.shutdown();
+    EXPECT_EQ(inline_out, pool_out);
+    Arena a;
+    for (uint32_t j = 0; j < kChunks; ++j) {
+        C::Stream back;
+        ASSERT_TRUE(C::decode_column(pool_out[j].data(), pool_out[j].size(), a, &back));
+        EXPECT_TRUE(same(data[j].stream(), back)) << j;
+    }
+    C::ChunkJob small; small.in = data[0].stream(); uint8_t tiny[4]; small.dst = tiny; small.cap = 4;
+    Arena one; Arena* sc = &one;
+    EXPECT_FALSE(C::encode_chunks(nullptr, &small, 1, chain, &sc));
 }
 
 TEST(ColumnCodec, ChainParseRefusesUnknownAndMalformed) {
