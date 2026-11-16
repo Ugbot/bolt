@@ -59,6 +59,32 @@ BOLT_FORCE_INLINE size_t bitmap_to_indices(
     return out;
 }
 
+// Set-bit positions of an LSB-first byte bitmap as int32, ascending, a 64-bit
+// word at a time (zero words skipped, set bits found by ctz). Output capacity
+// must be >= popcount of input. Returns count written. Not limited to word-
+// padded bitmaps: the tail is read a byte at a time.
+BOLT_FORCE_INLINE size_t bitmap_to_selection_i32(
+    const uint8_t* BOLT_RESTRICT bm, size_t n_bits,
+    int32_t* BOLT_RESTRICT out
+) noexcept {
+    assert(bm != nullptr || n_bits == 0);
+    assert(out != nullptr || n_bits == 0);
+    assert(n_bits <= 0x7FFFFFFFu);
+    size_t n = 0;
+    size_t i = 0;
+    for (; i + 64 <= n_bits; i += 64) {                 // bounded: n_bits / 64
+        uint64_t w;
+        std::memcpy(&w, bm + (i >> 3), 8);
+        while (w != 0u) {                               // bounded: 64
+            out[n++] = static_cast<int32_t>(i) + bolt_ctz64(w);
+            w &= w - 1u;
+        }
+    }
+    for (; i < n_bits; ++i)                             // bounded: 63
+        if ((bm[i >> 3] >> (i & 7u)) & 1u) out[n++] = static_cast<int32_t>(i);
+    return n;
+}
+
 // In-place a &= b over n_bits.
 BOLT_FORCE_INLINE void bitmap_and(
     uint8_t* BOLT_RESTRICT a, const uint8_t* BOLT_RESTRICT b, size_t n_bits
