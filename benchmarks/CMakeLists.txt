@@ -330,3 +330,9 @@ if(BOLT_BUILD_COMPUTE_IDOT AND (BOLT_BUILD_ROCM OR BOLT_BUILD_VULKAN))
     bolt_apply_hardening(bench_gpu_backends)
     bolt_apply_bench_tuning(bench_gpu_backends)
 endif()
+
+# Column codec chains (prototype): bytes/row and MB/s per chain over a text / NDJSON file.
+add_executable(bench_column_codec bench_column_codec.cpp)
+target_link_libraries(bench_column_codec PRIVATE bolt::bolt)
+bolt_apply_hardening(bench_column_codec)
+bolt_apply_bench_tuning(bench_column_codec)

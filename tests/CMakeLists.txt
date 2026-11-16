@@ -3202,3 +3202,14 @@ add_executable(test_bolt_json_column test_bolt_json_column.cpp)
 target_link_libraries(test_bolt_json_column PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_json_column)
 add_test(NAME test_bolt_json_column COMMAND test_bolt_json_column)
+
+# Column codec chains (prototype): every stage and chain round-trips.
+add_executable(test_bolt_column_codec test_bolt_column_codec.cpp)
+target_link_libraries(test_bolt_column_codec
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+bolt_apply_hardening(test_bolt_column_codec)
+add_test(NAME test_bolt_column_codec COMMAND test_bolt_column_codec)
