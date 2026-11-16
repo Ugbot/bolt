@@ -3196,3 +3196,9 @@ target_link_libraries(test_bolt_u128
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_u128)
 add_test(NAME test_bolt_u128 COMMAND test_bolt_u128)
+
+# Columnar JSON path extraction with validity (G2CHK-1198).
+add_executable(test_bolt_json_column test_bolt_json_column.cpp)
+target_link_libraries(test_bolt_json_column PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_json_column)
+add_test(NAME test_bolt_json_column COMMAND test_bolt_json_column)

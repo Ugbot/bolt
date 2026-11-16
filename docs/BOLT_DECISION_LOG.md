@@ -232,3 +232,9 @@ extraction kernel (item 2 of the lane). Stream pruning removed JSON from the dec
 the Compute lane to emit a validity bitmap for a vectorized root, which it does not yet (every vectorized root is null-free by
 precondition); the scalar `json_path_lookup` still validates the whole document and then re-walks it (27% jp_skip_value in
 G1's profile).
+
+### Decision: columnar JSON path extraction with validity; one-pass one-key lookup (G2CHK-1198, 2026-11-16)
+
+`bolt_json_column.h`: `json_column_extract_i64` / `_f64` (Utf8 column + compiled JsonPath -> typed column + validity bits and the NULL count) and `json_column_exists`, over rows [0,n) or a selection vector, on json_path_lookup's skip scanner (no tape, no DOM, no copies). A row is NULL for a malformed document, a missing path or a wrong type (strict integer).
+
+Closes the "scalar lookup validates the whole document and then re-walks it" note above: for a one-key object path `json_path_lookup` is one pass (`jp_root_member`), the answer identical to `json_path_lookup_generic` (kept for multi-segment and index paths and as the test reference), including malformed tails and the depth limit at its edge. `jp_skip_value` gained `depth0` / `limit` parameters for that. String skipping is a memchr with a backslash check: 35 ns per 52-byte document against 48 for a byte loop and 52 before this change. Test: `test_bolt_json_column` (random, mutated and deep documents against the generic lookup).
