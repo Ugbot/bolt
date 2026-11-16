@@ -2562,6 +2562,13 @@ add_test(NAME test_bolt_prefix_scan COMMAND test_bolt_prefix_scan)
 # Thompson NFA: alternation / {m,n} / char-classes / (?i) inline flags —
 # the subset PromQL =~/!~ matchers need, cross-checked against the exact
 # PromQL corpus patterns (and reject-cleanly / ReDoS-safe cases).
+# Word / phrase / unanchored regex search column kernels (G2CHK-1198).
+add_executable(test_bolt_text_search test_bolt_text_search.cpp)
+target_link_libraries(test_bolt_text_search
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_search)
+add_test(NAME test_bolt_text_search COMMAND test_bolt_text_search)
+
 add_executable(test_bolt_regex_re2 test_bolt_regex_re2.cpp)
 target_link_libraries(test_bolt_regex_re2
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)

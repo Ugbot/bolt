@@ -204,3 +204,22 @@ and multi-way radix scatter (pre-computed histogram + scatter loop).
 verified by Haffner et al. "Analysis and Comparison of Database Cracking
 Kernels" (DaMoN 2018) which confirmed predicated is selectivity-independent
 while branching is up to 7x slower at 50%.
+
+---
+
+### Decision: word / phrase / regex-search column kernels (G2CHK-1198, 2026-11-16)
+
+**Problem:** logs (and tick symbol search, LIKE pushdown) need token containment
+over a Utf8 column; `LIKE '%gif%'` matches `gifs`, and `regex_search` is the
+backtracker with no alternation.
+
+**Decision:** `bolt_text_search.h`. One word rule, `[A-Za-z0-9_]` (bytes >= 0x80
+separate words). A pattern is an exact byte string whose word-byte ends sit on
+word boundaries (word = one-word phrase; separators must be the same bytes, as
+VictoriaLogs). Case-sensitive: `bytes_find` candidates then the boundary check;
+ASCII case-insensitive: first-byte (both cases) filter then a folded compare.
+Regex: `re2_search` (the Thompson NFA with a thread seeded at every position,
+first Match ends the scan; `re2_full_match` is the same loop, `search=false`),
+behind a required-literal prefilter (`regex_required_literal`: none with a
+top-level `|` or `(?`). All filters take and return selection vectors.
+**Not done:** SIMD for the case-insensitive path; Unicode word characters.
