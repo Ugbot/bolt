@@ -208,6 +208,7 @@ bolt/
 │   │   │                               counter-reset-aware, boundary extrapolation
 │   │   ├── promql_deriv.h             deriv/predict_linear + OLS linear_regression
 │   │   ├── promql_histogram.h         histogram_quantile — classic le-bucket interpolation
+│   │   ├── packed_labels.h            packed key/value set (name 0x1f value 0x1e): get one value, drop names; column kernels
 │   │   │                               (Prometheus-exact; oracle-tested test_promql_kernels)
 │   │   └── fintech/
 │   │       ├── book_types.h          Runtime-admitted exact values, scales, cuts and statuses
