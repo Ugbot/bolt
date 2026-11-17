@@ -9,11 +9,20 @@
 #include <zstd.h>
 #endif
 
+// One switch per direction puts bolt's own implementation behind this wrapper instead of libzstd
+// (decision 2026-11-17: the reference library everywhere until bolt's own is better; measured in
+// benchmarks/bench_zstd_decoders.cpp). Both default off.
+#if defined(BOLT_ZSTD_DECODE_SELF) || defined(BOLT_ZSTD_ENCODE_SELF)
+#include <cstdlib>
+#include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt/ingest/bolt_zstd_enc.h"
+#endif
+
 namespace bolt {
 namespace ingest {
 
 bool zstd_available() noexcept {
-#ifdef BOLT_HAS_ZSTD
+#if defined(BOLT_HAS_ZSTD) || (defined(BOLT_ZSTD_DECODE_SELF) && defined(BOLT_ZSTD_ENCODE_SELF))
     return true;
 #else
     return false;
@@ -37,7 +46,20 @@ int zstd_compress(const uint8_t* src, uint64_t src_len,
                   uint8_t* dst, uint64_t* dst_len, int level) noexcept {
     assert(dst_len != nullptr);
     assert(src != nullptr || src_len == 0);
-#ifdef BOLT_HAS_ZSTD
+#if defined(BOLT_ZSTD_ENCODE_SELF)
+    (void)level;
+    if (dst_len == nullptr) return kCodecBadArg;
+    static thread_local ZstdEncState* st = nullptr;   // one state per thread, kept for the process
+    if (st == nullptr) {
+        void* mem = std::aligned_alloc(64, (zstd_enc_state_size() + 63u) & ~uint64_t{63});
+        st = mem != nullptr ? zstd_enc_state_init(mem, zstd_enc_state_size()) : nullptr;
+        if (st == nullptr) return kCodecBufferSmall;
+    }
+    uint64_t out = 0;
+    if (!zstd_compress_self(src, src_len, dst, *dst_len, &out, st)) return kCodecBufferSmall;
+    *dst_len = out;
+    return kCodecOk;
+#elif defined(BOLT_HAS_ZSTD)
     if (dst_len == nullptr) return kCodecBadArg;
     if (dst == nullptr || *dst_len == 0) return kCodecBufferSmall;
     const size_t r = ZSTD_compress(dst, static_cast<size_t>(*dst_len),
@@ -55,7 +77,15 @@ int zstd_decompress(const uint8_t* src, uint64_t src_len,
                     uint8_t* dst, uint64_t dst_len) noexcept {
     assert(src != nullptr || src_len == 0);
     assert(dst != nullptr || dst_len == 0);
-#ifdef BOLT_HAS_ZSTD
+#if defined(BOLT_ZSTD_DECODE_SELF)
+    static thread_local void* scratch = nullptr;      // one scratch per thread, kept for the process
+    if (scratch == nullptr) scratch = std::aligned_alloc(64, (zstd_scratch_size() + 63u) & ~uint64_t{63});
+    if (scratch == nullptr) return kCodecBufferSmall;
+    uint64_t got = 0;
+    if (zstd_decode_raw(src, src_len, dst, dst_len, &got, scratch, zstd_scratch_size()) != kZstdOk || got != dst_len)
+        return kCodecCorrupt;
+    return kCodecOk;
+#elif defined(BOLT_HAS_ZSTD)
     const size_t r = ZSTD_decompress(dst, static_cast<size_t>(dst_len),
                                      src, static_cast<size_t>(src_len));
     if (ZSTD_isError(r)) return kCodecCorrupt;
