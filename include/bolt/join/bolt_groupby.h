@@ -676,7 +676,7 @@ struct AggSpec {
     // cell stores — it stays a true Decimal128 — so lane-1 windows, lane-0
     // windows, and per-row fallback windows compose freely.
     uint8_t  lane;
-    uint8_t  flags;      // First / Last: kGbPickIgnoreNulls
+    uint8_t  flags;      // pick: kGbPickIgnoreNulls (First/Last); kGbPickDuckBy (MaxBy/MinBy)
     uint8_t  aux;        // MaxBy / MinBy: the ByOrd companion's agg index
     uint8_t  _pad[2];    // explicit padding; POD, layout-stable
 };
@@ -1335,6 +1335,9 @@ BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
 //     flag `state->oom = true`; caller checks after _ingest.
 // ---------------------------------------------------------------------------
 struct GroupbyTypedState {
+    // MaxBy / MinBy with kGbPickFirstOfTies: the position of ingested row 0 in the caller's input order. A tie keeps
+    // the smaller position, so the answer does not depend on which partial holds a row or the order they merge in.
+    uint64_t        pick_pos_base;
     SwissTable*     table;
     GbCell16*       keys_flat;          // [cap * n_keys]
     GbCell16*       accums;             // [n_aggs * cap]
