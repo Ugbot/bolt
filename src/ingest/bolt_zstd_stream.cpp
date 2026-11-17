@@ -1,5 +1,5 @@
 #include "bolt/ingest/bolt_zstd_stream.h"
-#include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt_zstd_dec.h"
 #include <cassert>
 #include <cstring>
 #include <limits>

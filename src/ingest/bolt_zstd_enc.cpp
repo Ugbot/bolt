@@ -1,7 +1,7 @@
 // bolt_zstd_enc.cpp — self-contained zstd compressor. See the header for
 // scope and for why there is no smaller correct version.
 
-#include "bolt/ingest/bolt_zstd_enc.h"
+#include "bolt_zstd_enc.h"
 
 #include <cassert>
 #include <cstring>

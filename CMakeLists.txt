@@ -806,6 +806,38 @@ else()
     option(BOLT_WITH_ZSTD "Build bolt codecs with libzstd" OFF)
 endif()
 
+# Zstandard: ONE interface (bolt/ingest/bolt_zstd.h), implementation chosen here per direction.
+# `reference` = libzstd, `bolt` = bolt's own (src/ingest/bolt_zstd_{enc,dec}.cpp). Decision
+# 2026-11-17: the reference library everywhere until bolt's own is better. Every consumer of
+# the one bolt::ingest target (marbledb, chukonu, boltapi, Gestalt2) gets this same choice.
+set(BOLT_ZSTD_ENCODER "reference" CACHE STRING "zstd encoder behind bolt_zstd.h: reference | bolt")
+set(BOLT_ZSTD_DECODER "reference" CACHE STRING "zstd decoder behind bolt_zstd.h: reference | bolt")
+set_property(CACHE BOLT_ZSTD_ENCODER PROPERTY STRINGS reference bolt)
+set_property(CACHE BOLT_ZSTD_DECODER PROPERTY STRINGS reference bolt)
+option(BOLT_ZSTD_ALLOW_FALLBACK
+       "Use bolt's own zstd where `reference` is selected but libzstd is not available" OFF)
+foreach(_dir ENCODER DECODER)
+    if(NOT BOLT_ZSTD_${_dir} STREQUAL "reference" AND NOT BOLT_ZSTD_${_dir} STREQUAL "bolt")
+        message(FATAL_ERROR "BOLT_ZSTD_${_dir}='${BOLT_ZSTD_${_dir}}': must be reference or bolt")
+    endif()
+    set(BOLT_ZSTD_${_dir}_EFFECTIVE "${BOLT_ZSTD_${_dir}}")
+    if(BOLT_ZSTD_${_dir} STREQUAL "reference" AND NOT BOLT_WITH_ZSTD AND BOLT_BUILD_INGEST)
+        if(BOLT_ZSTD_ALLOW_FALLBACK)
+            message(WARNING "BOLT_ZSTD_${_dir}=reference but libzstd is not available "
+                            "(not found, or BOLT_WITH_ZSTD=OFF): falling back to bolt's own "
+                            "(BOLT_ZSTD_ALLOW_FALLBACK=ON)")
+            set(BOLT_ZSTD_${_dir}_EFFECTIVE "bolt")
+        else()
+            message(FATAL_ERROR "BOLT_ZSTD_${_dir}=reference needs libzstd, which is not available "
+                                "(not found by find_package / pkg-config, or BOLT_WITH_ZSTD=OFF). "
+                                "Install libzstd, or set -DBOLT_ZSTD_${_dir}=bolt, or allow the "
+                                "fallback with -DBOLT_ZSTD_ALLOW_FALLBACK=ON.")
+        endif()
+    endif()
+endforeach()
+message(STATUS "bolt zstd: encoder=${BOLT_ZSTD_ENCODER_EFFECTIVE} decoder=${BOLT_ZSTD_DECODER_EFFECTIVE} "
+               "stream-decoder=bolt libzstd=${BOLT_WITH_ZSTD}")
+
 # Prefer static archives for third-party codecs/crypto when both forms exist.
 # OFF for developer builds (system shared libs, security updates); ON for
 # redistributable artifacts, where a shared dependency either has to be
@@ -872,6 +904,13 @@ if(BOLT_BUILD_INGEST)
     bolt_apply_hardening(bolt_ingest)
     bolt_apply_simd(bolt_ingest ${BOLT_SIMD_TIER})
 
+    foreach(_dir ENCODER DECODER)
+        if(BOLT_ZSTD_${_dir}_EFFECTIVE STREQUAL "reference")
+            target_compile_definitions(bolt_ingest PRIVATE BOLT_ZSTD_${_dir}_REFERENCE=1)
+        else()
+            target_compile_definitions(bolt_ingest PRIVATE BOLT_ZSTD_${_dir}_REFERENCE=0)
+        endif()
+    endforeach()
     if(BOLT_WITH_ZSTD)
         target_compile_definitions(bolt_ingest PRIVATE BOLT_HAS_ZSTD=1)
         # BOLT_PREFER_STATIC_DEPS: link the STATIC archive when one exists, so

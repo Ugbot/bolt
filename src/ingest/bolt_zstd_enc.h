@@ -1,4 +1,4 @@
-// bolt/ingest/bolt_zstd_enc.h — self-contained ZSTD COMPRESSOR (RFC 8878).
+// src/ingest/bolt_zstd_enc.h (PRIVATE: callers use bolt/ingest/bolt_zstd.h) — self-contained ZSTD COMPRESSOR (RFC 8878).
 //
 // bolt has decoded zstd without a dependency since bolt_zstd_dec.cpp -- which
 // exists because zstd is pyiceberg's default parquet codec and a reader that

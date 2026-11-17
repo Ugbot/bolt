@@ -28,7 +28,7 @@
 #include "bolt/bolt_scheduler.h"
 #include "bolt/ingest/bolt_deflate.h"
 #include "bolt/ingest/bolt_snappy.h"
-#include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt/ingest/bolt_zstd.h"
 #include "bolt/ingest/bolt_inflate.h"
 #include "bolt_parquet_read_internal.h"
 #include "bolt/ingest/bolt_lz4.h"
@@ -1850,12 +1850,12 @@ bool decompress_page(PqCodec codec, const uint8_t* src, uint64_t src_len,
         if (op != unc_len) return false;   // page header size must match
     } else if (codec == PqCodec::Zstd) {
         if (*zscratch == nullptr) {
-            *zscratch = arena->allocate(zstd_scratch_size(), 8);
+            *zscratch = arena->allocate(zstd_decode_scratch_size(), 8);
             if (*zscratch == nullptr) return false;
         }
         uint64_t got = 0;
-        if (zstd_decode_raw(src, src_len, dst, unc_len, &got,
-                            *zscratch, zstd_scratch_size()) != kZstdOk) {
+        if (zstd_decode(src, src_len, dst, unc_len, &got,
+                        *zscratch, zstd_decode_scratch_size()) != kZstdOk) {
             return false;
         }
         if (got != unc_len) return false;      // page header size must match

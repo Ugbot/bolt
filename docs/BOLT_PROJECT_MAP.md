@@ -110,6 +110,14 @@ selected rows. [Scope and evidence](research/integer-literal-filters.md).
 decoding with explicit consumption, backpressure, frame integrity and EOF.
 [Contract and scoped native evidence](research/zstd-streaming.md).
 
+`ingest/bolt_zstd.h` is the one Zstandard interface (one-shot compress / decompress, bound,
+caller-memory `zstd_decode`); the Parquet reader and writer, MarbleDB pages and chukonu's DBN reader
+call only it. `BOLT_ZSTD_ENCODER` / `BOLT_ZSTD_DECODER` = `reference` (libzstd, default) or `bolt`
+(own, `src/ingest/bolt_zstd_{enc,dec}.*`, headers private) at configure time;
+`BOLT_ZSTD_ALLOW_FALLBACK` permits bolt's own when libzstd is missing. The streaming decoder is
+bolt's own. Guards: `scripts/zstd_iface_lint.py`, `tests/test_bolt_zstd_backends.cpp` (both
+implementations in one build).
+
 `lakehouse/object_store/s3_upload.h` provides bounded synchronous S3 multipart
 and streamed PUT for known-size objects; reconciliation and caller-memory
 budgets are explicit. [Usage, limits and evidence](research/s3-multipart-upload.md).

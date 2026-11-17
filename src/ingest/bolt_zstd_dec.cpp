@@ -20,7 +20,7 @@
 //     weight decoder. See zb_overrun's comment.
 //   * asserts state programmer invariants only — never input validity.
 
-#include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt_zstd_dec.h"
 
 #include <cassert>
 #include <cstring>

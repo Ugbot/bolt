@@ -14,7 +14,7 @@
 
 #include <zstd.h>
 
-#include "bolt/ingest/bolt_zstd_dec.h"
+#include "bolt_zstd_dec.h"   // private: bolt's own decoder
 
 #if defined(__APPLE__)
 #include <libproc.h>
