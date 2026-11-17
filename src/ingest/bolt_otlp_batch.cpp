@@ -74,6 +74,25 @@ bool begin_batch(bolt::BoltBatch* out, std::uint32_t cols, std::int64_t rows) no
 
 }  // namespace
 
+const Field* log_fields() noexcept {
+    using T = bolt::BoltType;
+    static const Field kFields[kLogCols] = {
+        {"ts", T::Int64}, {"observed_ts", T::Int64}, {"severity", T::Int64}, {"severity_text", T::Utf8},
+        {"body", T::Utf8}, {"attrs", T::Utf8}, {"stream", T::Utf8}, {"trace_id", T::Utf8}, {"span_id", T::Utf8},
+        {"event_name", T::Utf8}, {"log_key", T::Int64}};
+    return kFields;
+}
+
+const Field* span_fields() noexcept {
+    using T = bolt::BoltType;
+    static const Field kFields[kSpanCols] = {
+        {"start_ts", T::Int64}, {"duration_ns", T::Int64}, {"trace_id", T::Utf8}, {"span_id", T::Utf8},
+        {"parent_span_id", T::Utf8}, {"name", T::Utf8}, {"kind", T::Int64}, {"status_code", T::Int64},
+        {"status_msg", T::Utf8}, {"trace_state", T::Utf8}, {"attrs", T::Utf8}, {"events", T::Utf8},
+        {"links", T::Utf8}, {"stream", T::Utf8}, {"flags", T::Int64}};
+    return kFields;
+}
+
 std::uint64_t request_key(std::string_view body) noexcept {
     const std::uint64_t h = bolt::hash_bytes_wyhash3_v1(body.empty() ? "" : body.data(), body.size());
     return h != 0 ? h : 1u;
@@ -105,7 +124,6 @@ bool logs_to_batch(const LogRows* parts, const std::uint64_t* request_keys, std:
     for (std::uint32_t p = 0; p < n_parts; ++p) { counts[p] = parts[p].n; total += parts[p].n; }
     if (!begin_batch(out, kLogCols, total)) return false;
     bolt::BoltColumn* c = out->columns[out->read_epoch];
-    using T = bolt::BoltType;
     bool ok = pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return parts[p].ts[i]; }, a, &c[0]);
     ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return parts[p].observed_ts[i]; }, a, &c[1]);
     ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return std::int64_t{parts[p].severity[i]}; }, a, &c[2]);
@@ -118,11 +136,8 @@ bool logs_to_batch(const LogRows* parts, const std::uint64_t* request_keys, std:
     ok = ok && pack_text(counts, n_parts, total, false, [&](std::uint32_t p, std::uint32_t i) { return parts[p].event_name[i]; }, a, &c[9]);
     ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return log_key(request_keys[p], i); }, a, &c[10]);
     if (!ok) return false;
-    static const struct { const char* name; T type; } kFields[kLogCols] = {
-        {"ts", T::Int64}, {"observed_ts", T::Int64}, {"severity", T::Int64}, {"severity_text", T::Utf8},
-        {"body", T::Utf8}, {"attrs", T::Utf8}, {"stream", T::Utf8}, {"trace_id", T::Utf8}, {"span_id", T::Utf8},
-        {"event_name", T::Utf8}, {"log_key", T::Int64}};
-    for (const auto& f : kFields) out->schema.add_field(f.name, f.type, false);
+    const Field* kFields = log_fields();
+    for (std::uint32_t i = 0; i < kLogCols; ++i) out->schema.add_field(kFields[i].name, kFields[i].type, false);
     return out->schema.num_fields == kLogCols;
 }
 
@@ -135,7 +150,6 @@ bool spans_to_batch(const SpanRows* parts, std::uint32_t n_parts, bolt::BoltBatc
     for (std::uint32_t p = 0; p < n_parts; ++p) { counts[p] = parts[p].n; total += parts[p].n; }
     if (!begin_batch(out, kSpanCols, total)) return false;
     bolt::BoltColumn* c = out->columns[out->read_epoch];
-    using T = bolt::BoltType;
 #define BOLT_OTLP_I64(col, expr) \
     ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return std::int64_t{expr}; }, a, &c[col])
 #define BOLT_OTLP_TEXT(col, hex, field) \
@@ -159,12 +173,8 @@ bool spans_to_batch(const SpanRows* parts, std::uint32_t n_parts, bolt::BoltBatc
 #undef BOLT_OTLP_I64
 #undef BOLT_OTLP_TEXT
     if (!ok) return false;
-    static const struct { const char* name; T type; } kFields[kSpanCols] = {
-        {"start_ts", T::Int64}, {"duration_ns", T::Int64}, {"trace_id", T::Utf8}, {"span_id", T::Utf8},
-        {"parent_span_id", T::Utf8}, {"name", T::Utf8}, {"kind", T::Int64}, {"status_code", T::Int64},
-        {"status_msg", T::Utf8}, {"trace_state", T::Utf8}, {"attrs", T::Utf8}, {"events", T::Utf8},
-        {"links", T::Utf8}, {"stream", T::Utf8}, {"flags", T::Int64}};
-    for (const auto& f : kFields) out->schema.add_field(f.name, f.type, false);
+    const Field* kFields = span_fields();
+    for (std::uint32_t i = 0; i < kSpanCols; ++i) out->schema.add_field(kFields[i].name, kFields[i].type, false);
     return out->schema.num_fields == kSpanCols;
 }
 

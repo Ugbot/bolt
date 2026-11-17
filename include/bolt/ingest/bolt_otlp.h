@@ -178,6 +178,11 @@ bool logs_to_batch(const LogRows* parts, const std::uint64_t* request_keys, std:
                    bolt::BoltBatch* out) noexcept;
 bool spans_to_batch(const SpanRows* parts, std::uint32_t n_parts, bolt::BoltBatch* out) noexcept;
 
+// The fixed schemas, in column order (kLogCols / kSpanCols entries).
+struct Field { const char* name; bolt::BoltType type; };
+const Field* log_fields() noexcept;
+const Field* span_fields() noexcept;
+
 // Text cell `row` of a Utf8 column (a view into the column's bytes).
 std::string_view batch_text(const bolt::BoltColumn& col, std::int64_t row) noexcept;
 
