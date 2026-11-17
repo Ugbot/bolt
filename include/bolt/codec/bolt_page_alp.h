@@ -23,14 +23,14 @@
 namespace bolt {
 namespace pagecodec {
 
-inline constexpr uint32_t kAlpMaxExponent = 18;
+inline constexpr uint32_t kAlpTopExponent = 18;
 inline constexpr uint32_t kAlpSample = 64;
 
 namespace detail {
 
-inline constexpr double kAlpF10[kAlpMaxExponent + 1] = {
+inline constexpr double kAlpF10[kAlpTopExponent + 1] = {
     1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
-inline constexpr double kAlpIF10[kAlpMaxExponent + 1] = {
+inline constexpr double kAlpIF10[kAlpTopExponent + 1] = {
     1e-0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16,
     1e-17, 1e-18};
 inline constexpr double kAlpIntLimit = 4503599627370496.0;   // 2^52: every integer below is exact in a double
@@ -73,7 +73,7 @@ inline AlpPlan alp_plan(const double* BOLT_RESTRICT v, uint32_t n, int64_t* BOLT
     const uint32_t ns = n > kAlpSample ? kAlpSample : n;
     uint32_t be = 0, bf = 0;
     uint64_t best = UINT64_MAX;
-    for (uint32_t e = 0; e <= kAlpMaxExponent; ++e) {               // bounded: 19
+    for (uint32_t e = 0; e <= kAlpTopExponent; ++e) {               // bounded: 19
         for (uint32_t f = 0; f <= e; ++f) {                         // bounded: 19
             int64_t lo = INT64_MAX, hi = INT64_MIN;
             uint32_t ok = 0;
@@ -138,7 +138,7 @@ inline void alp_encode(const double* BOLT_RESTRICT v, uint32_t n, const int64_t*
 [[nodiscard]] inline bool alp_decode(const void* packed, uint64_t packed_len, uint32_t n, uint32_t e, uint32_t f,
                                      uint64_t ref, uint32_t width, const Exception* exc, uint64_t exc_len,
                                      double* BOLT_RESTRICT out) noexcept {
-    if (e > kAlpMaxExponent || f > e || out == nullptr || exc_len % sizeof(Exception) != 0) return false;
+    if (e > kAlpTopExponent || f > e || out == nullptr || exc_len % sizeof(Exception) != 0) return false;
     if (exc_len / sizeof(Exception) > n) return false;
     // integers decode in place: out is 8 B per row
     if (!for_decode(packed, packed_len, n, 8, ref, width, out)) return false;
