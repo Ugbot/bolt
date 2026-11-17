@@ -506,6 +506,19 @@ bolt_apply_hardening(test_promql_kernels)
 
 add_test(NAME test_promql_kernels COMMAND test_promql_kernels)
 
+add_executable(test_bolt_kv_packed test_bolt_kv_packed.cpp)
+
+target_link_libraries(test_bolt_kv_packed
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_kv_packed)
+
+add_test(NAME test_bolt_kv_packed COMMAND test_bolt_kv_packed)
+
 add_executable(test_bolt_frame_kernels test_bolt_frame_kernels.cpp)
 
 target_link_libraries(test_bolt_frame_kernels
