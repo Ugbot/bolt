@@ -241,6 +241,56 @@ TEST(PromqlHistogramQuantile, NonMonotonicClamped) {
     EXPECT_NEAR(promql_histogram_quantile(0.5, le, cum, 3, scratch, 4), 0.6, 1e-12);
 }
 
+// A count that differs from the running count only by float noise takes the
+// running count, whichever way it moved, and the noise is RELATIVE to the
+// counts (upstream util/almost.Equal, tolerance 1e-12). Each answer is what
+// Prometheus gives for histogram_quantile(1, ...) over these buckets
+// (promtool 3.14.0 `test rules`).
+TEST(PromqlHistogramQuantile, SmallDeltasAreRelativeToTheCounts) {
+    HistBucket scratch[8];
+    const double le3[3] = {5.0, 10.0, kInf};
+    // 1e-10 above 100 is noise (5e-13 of the sum): the total stays 100 and
+    // the rank is the first bucket's count. An absolute 1e-12 kept the step
+    // and answered 10.
+    const double noise[3] = {100, 100.0000000001, 100.0000000001};
+    EXPECT_EQ(promql_histogram_quantile(1.0, le3, noise, 3, scratch, 8), 5.0);
+    // 1e-3 above 100 is a step.
+    const double step[3] = {100, 100.001, 100.001};
+    EXPECT_EQ(promql_histogram_quantile(1.0, le3, step, 3, scratch, 8), 10.0);
+    // Tiny counts: 1e-13 apart in absolute terms, a factor of two in
+    // relative terms. A step (an absolute 1e-12 flattened it and answered 1).
+    const double le_small[3] = {1.0, 2.0, kInf};
+    const double small[3] = {1e-13, 2e-13, 2e-13};
+    EXPECT_EQ(promql_histogram_quantile(1.0, le_small, small, 3, scratch, 8), 2.0);
+    // Large counts: +-1e-9 around 1e6 is noise in both directions (an
+    // absolute 1e-12 kept the rise and answered 20).
+    const double le4[4] = {5.0, 10.0, 20.0, kInf};
+    const double large[4] = {1000000, 999999.999999999, 1000000.000000001,
+                             1000000.000000001};
+    EXPECT_EQ(promql_histogram_quantile(1.0, le4, large, 4, scratch, 8), 5.0);
+    // Beside a zero the bar is 1e-12 of the smallest normal double: a
+    // subnormal count is noise, so there are no observations.
+    const double sub[3] = {0, 1e-320, 1e-320};
+    EXPECT_TRUE(std::isnan(
+        promql_histogram_quantile(1.0, le_small, sub, 3, scratch, 8)));
+    const double normal[3] = {0, 1e-300, 1e-300};
+    EXPECT_EQ(promql_histogram_quantile(1.0, le_small, normal, 3, scratch, 8), 2.0);
+}
+
+TEST(PromqlHistogramQuantile, AlmostEqualIsUpstreams) {
+    using bolt::promql::detail::hist_almost_equal;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(hist_almost_equal(nan, nan, 1e-12));
+    EXPECT_FALSE(hist_almost_equal(nan, 1.0, 1e-12));
+    EXPECT_TRUE(hist_almost_equal(3.0, 3.0, 0.0));
+    EXPECT_TRUE(hist_almost_equal(1e15, 1e15 + 1.0, 1e-12));     // 5e-16 of the sum
+    EXPECT_FALSE(hist_almost_equal(1e9, 1e9 + 1.0, 1e-12));      // 5e-10 of the sum
+    EXPECT_FALSE(hist_almost_equal(0.0, 1e-300, 1e-12));
+    EXPECT_TRUE(hist_almost_equal(0.0, 1e-320, 1e-12));
+    EXPECT_TRUE(hist_almost_equal(kInf, kInf, 1e-12));
+    EXPECT_FALSE(hist_almost_equal(kInf, 1.0, 1e-12));           // Inf / max is not below epsilon
+}
+
 // Negative space: out-of-range phi, NaN phi, missing +Inf, too few buckets.
 TEST(PromqlHistogramQuantile, DegenerateCases) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
