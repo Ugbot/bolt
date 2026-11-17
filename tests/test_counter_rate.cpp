@@ -92,6 +92,57 @@ double naive(bc::RateFn fn, const std::vector<std::int64_t>& t, const std::vecto
 
 }  // namespace
 
+// The reset sum adds one term per sample whether or not it resets (G2CHK-1199); the answer must equal, bit for bit, the
+// form that adds only on a reset: same summation order, and a signed zero (a -0.0 first sample, a -0.0 delta) survives.
+double branching_reference(const std::vector<std::int64_t>& t, const std::vector<double>& v,
+                           const std::vector<std::int64_t>& st, std::int64_t range_start, std::int64_t range_end) {
+    const std::int64_t n = static_cast<std::int64_t>(t.size());
+    double result = v[n - 1] - v[0];
+    for (std::int64_t i = 1; i < n; ++i)
+        if (v[i] < v[i - 1] || bc::st_is_reset(st[i - 1], t[i - 1], st[i], t[i])) result += v[i - 1];
+    const double tps = 1000.0;
+    double dts = static_cast<double>(t[0] - range_start) / tps;
+    double dte = static_cast<double>(range_end - t[n - 1]) / tps;
+    double sampled = static_cast<double>(t[n - 1] - t[0]) / tps;
+    const double avg = sampled / static_cast<double>(n - 1);
+    const double thr = avg * 1.1;
+    if (st[0] != 0 && st[0] > range_start && st[0] < t[0]) {
+        dts = 0.0; sampled = static_cast<double>(t[n - 1] - st[0]) / tps; result += v[0];
+    } else {
+        if (dts >= thr) dts = avg / 2.0;
+        double dtz = dts;
+        if (result > 0.0 && v[0] >= 0.0) dtz = sampled * (v[0] / result);
+        if (dtz < dts) dts = dtz;
+    }
+    if (dte >= thr) dte = avg / 2.0;
+    double factor = 1.0;
+    if (sampled != 0.0) factor = (sampled + dts + dte) / sampled;
+    factor /= static_cast<double>(range_end - range_start) / tps;
+    return result * factor;
+}
+
+TEST(CounterRate, ResetSumIsBitIdenticalToTheBranchingForm) {
+    Rng rng{0x9e3779b97f4a7c15ull};
+    const double pool[] = {0.0, -0.0, 1.0, 2.5, 7.0, 1e-300, 1e300, 0.1, 0.2, 0.3, 123456789.125, 3.0, 3.0, -0.0};
+    for (int round = 0; round < 4000; ++round) {
+        const std::uint32_t n = 2 + rng.below(40);
+        std::vector<std::int64_t> t(n), st(n);
+        std::vector<double> v(n);
+        std::int64_t at = 1000;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            at += 1 + rng.below(30000);
+            t[i] = at;
+            v[i] = round % 3 == 0 ? pool[rng.below(sizeof(pool) / sizeof(pool[0]))] : static_cast<double>(rng.below(1000)) * 0.37;
+            st[i] = (round % 5 == 0 && rng.below(4) == 0) ? static_cast<std::int64_t>(t[i] - rng.below(50000)) : 0;
+        }
+        const std::int64_t lo = t[0] - 1000, hi = t[n - 1] + 1000;
+        const double got = bc::st_extrapolated_rate(t.data(), v.data(), st.data(), n, lo, hi, true, true, 1000.0);
+        if (st[0] == 0 || !(st[0] > lo && st[0] < t[0])) {
+            if (n >= 2 && t[n - 1] > t[0]) EXPECT_EQ(bits(got), bits(branching_reference(t, v, st, lo, hi))) << "round " << round;
+        }
+    }
+}
+
 TEST(CounterRate, StartInsideTheFrameExtrapolatesToTheStart) {
     // Samples at 10s, 20s, 30s in a (0, 30s] frame; the first declares a start at 4s: a zero sample sits there.
     const std::int64_t ts[3] = {10000, 20000, 30000};
