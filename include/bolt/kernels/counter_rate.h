@@ -58,8 +58,13 @@ inline double st_extrapolated_rate(const std::int64_t* BOLT_RESTRICT ts, const d
     const std::int64_t last_t = ts[n - 1];
     double result = val[n - 1] - val[0];
     if (is_counter) {
-        for (std::int64_t i = 1; i < n; ++i) {
-            if (val[i] < val[i - 1] || st_is_reset(st[i - 1], ts[i - 1], st[i], ts[i])) result += val[i - 1];
+        // One add per sample in series order, whether or not it resets: the unconditional add keeps the summation
+        // order of the branching form bit for bit (x + -0.0 == x for every x, signed zero included) and removes the
+        // mispredicted branch of a noisy series. The start test only runs when the declared starts differ.
+        for (std::int64_t i = 1; i < n; ++i) {   // bounded: n
+            const bool drop = val[i] < val[i - 1];
+            const bool start_reset = st[i] != st[i - 1] && st_is_reset(st[i - 1], ts[i - 1], st[i], ts[i]);
+            result += (drop | start_reset) ? val[i - 1] : -0.0;
         }
     }
     const std::int64_t num_minus_one = n - 1;
