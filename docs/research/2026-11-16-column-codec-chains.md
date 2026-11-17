@@ -134,6 +134,9 @@ Against the rules, honestly:
 
 ## Not done
 
+Parked 2026-11-16. Open work is tracked under epic G2CHK-1209 (children G2CHK-1210..1226, zstd encoder G2CHK-1208).
+Nothing here is wired into MarbleDB: `otel_logs` is still 360-385 bytes per line on disk.
+
 - Not an MSEG page format; no predicate evaluation on encoded data; no chooser from stats (chains are declared).
 - No ALP, FSST, Gorilla, zstd dictionary; no nulls / validity; ints are int64 only; no floats.
 - Decode is bounds-checked and truncation is tested; corrupt (bit-flipped) input is not fuzzed.
