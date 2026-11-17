@@ -1483,13 +1483,16 @@ inline void re2_add_thread(const Re2Program* p, int32_t* list, int32_t* list_n,
     assert(*list_n <= p->n_insts);
 }
 
-// Anchored FULL MATCH: true iff the entire text[0..n) is matched by `prog`.
+// One NFA pass. search=false: anchored FULL MATCH, true iff the entire
+// text[0..n) is matched by `prog`. search=true: true iff the pattern matches
+// ANY substring (a fresh thread is seeded at every position, and the first
+// Match ends the scan), RE2's unanchored PartialMatch.
 // Linear in n * program-size; no heap, no exceptions, no ReDoS. Any/Class
 // consume a whole UTF-8 character: a thread that matches a lead byte of a
 // u-byte character (u <= 4) is parked in pend[(sp + u) & 3] and joins the
 // run list when the scan reaches sp + u.
-inline bool re2_full_match(const Re2Program* prog, const char* text,
-                           int32_t n) noexcept {
+inline bool re2_run(const Re2Program* prog, const char* text,
+                    int32_t n, bool search) noexcept {
     assert(prog != nullptr && (text != nullptr || n == 0));
     assert(n >= 0 && prog->n_insts >= 1 && prog->n_insts <= kRe2MaxInsts);
     int32_t buf_a[kRe2MaxInsts];
@@ -1504,10 +1507,12 @@ inline bool re2_full_match(const Re2Program* prog, const char* text,
     int32_t gen = 0;
     re2_add_thread(prog, clist, &cn, visited, gen, 0, 0, n);
     for (int32_t sp = 0; sp <= n; ++sp) {
+        if (search && sp > 0) re2_add_thread(prog, clist, &cn, visited, gen, 0, sp, n);
         bool matched = false;
         for (int32_t i = 0; i < cn; ++i) {
             if (prog->insts[clist[i]].op == Re2Op::Match) { matched = true; break; }
         }
+        if (search && matched) return true;
         if (sp == n) return matched;     // accept only when fully consumed
         const uint8_t b = static_cast<uint8_t>(text[sp]);
         uint32_t u = (b < 0x80u) ? 1u
@@ -1542,8 +1547,19 @@ inline bool re2_full_match(const Re2Program* prog, const char* text,
         int32_t* tmp = clist; clist = nlist; nlist = tmp;
         cn = nn;
     }
-    assert(false && "re2_full_match must return at sp == n");
+    assert(false && "re2_run must return at sp == n");
     return false;
+}
+
+inline bool re2_full_match(const Re2Program* prog, const char* text,
+                           int32_t n) noexcept {
+    return re2_run(prog, text, n, false);
+}
+
+// Unanchored search: true iff some substring of text[0..n) matches `prog`.
+inline bool re2_search(const Re2Program* prog, const char* text,
+                       int32_t n) noexcept {
+    return re2_run(prog, text, n, true);
 }
 
 // Convenience: compile + match in one call (for ad-hoc/one-shot use only;

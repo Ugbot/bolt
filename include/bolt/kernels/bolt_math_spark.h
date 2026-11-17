@@ -17,6 +17,7 @@
 
 #include "bolt/kernels/bolt_fdlibm_explog.h"
 #include "bolt/kernels/bolt_fdlibm_trig.h"
+#include "bolt/kernels/bolt_libm_f64.h"
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -35,8 +36,18 @@ inline constexpr double k_rad_to_deg = 57.29577951308232;
 inline constexpr double k_deg_to_rad = 0.017453292519943295;
 
 // log1p(x) is NULL for x <= -1 (Spark's UnaryLogExpression); *is_null says so.
+// F64Op values from k_libm_f64_base are libm_f64::LibmOp (C library semantics), not Spark's fdlibm ones.
+inline constexpr std::uint8_t k_libm_f64_base = 64;
+
 inline double f64_unary(F64Op op, double x, bool* is_null) noexcept {
     *is_null = false;
+    if (static_cast<std::uint8_t>(op) >= k_libm_f64_base) {
+        const auto lo = static_cast<std::uint8_t>(static_cast<std::uint8_t>(op) - k_libm_f64_base);
+        if (lo < static_cast<std::uint8_t>(libm_f64::LibmOp::Count_))
+            return libm_f64::libm_f64(static_cast<libm_f64::LibmOp>(lo), x);
+        *is_null = true;
+        return 0.0;
+    }
     switch (op) {
         case F64Op::Acos: return fd::Acos::compute(x);
         case F64Op::Acosh: return fd::Log::compute(x + std::sqrt(x * x - 1.0));

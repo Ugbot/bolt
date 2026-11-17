@@ -204,3 +204,37 @@ and multi-way radix scatter (pre-computed histogram + scatter loop).
 verified by Haffner et al. "Analysis and Comparison of Database Cracking
 Kernels" (DaMoN 2018) which confirmed predicated is selectivity-independent
 while branching is up to 7x slower at 50%.
+
+---
+
+### Decision: word / phrase / regex-search column kernels (G2CHK-1198, 2026-11-16)
+
+**Problem:** logs (and tick symbol search, LIKE pushdown) need token containment
+over a Utf8 column; `LIKE '%gif%'` matches `gifs`, and `regex_search` is the
+backtracker with no alternation.
+
+**Decision:** `bolt_text_search.h`. One word rule, `[A-Za-z0-9_]` (bytes >= 0x80
+separate words). A pattern is an exact byte string whose word-byte ends sit on
+word boundaries (word = one-word phrase; separators must be the same bytes, as
+VictoriaLogs). Case-sensitive: `bytes_find` candidates then the boundary check;
+ASCII case-insensitive: first-byte (both cases) filter then a folded compare.
+Regex: `re2_search` (the Thompson NFA with a thread seeded at every position,
+first Match ends the scan; `re2_full_match` is the same loop, `search=false`),
+behind a required-literal prefilter (`regex_required_literal`: none with a
+top-level `|` or `(?`). All filters take and return selection vectors.
+**Not done:** SIMD for the case-insensitive path; Unicode word characters.
+
+### Decision: Int64 column % literal array kernel (G2CHK-1198, 2026-11-16)
+`mod_lit_nz_i64(a, n, d, out)` in bolt_numeric.h: `x % d` with the sign of the dividend, false for d = 0 and d = -1 (the
+caller's scalar rules). The ns-scale minute / hour / day widths join the unrolled `div_lit_i64` divisors. Why in Bolt: the
+vectorized Compute lane has no Mod arm of its own, and time_bucket lowers to `ts - ts % W`. Not done: the columnar JSON-path
+extraction kernel (item 2 of the lane). Stream pruning removed JSON from the declared-field queries, and a column kernel needs
+the Compute lane to emit a validity bitmap for a vectorized root, which it does not yet (every vectorized root is null-free by
+precondition); the scalar `json_path_lookup` still validates the whole document and then re-walks it (27% jp_skip_value in
+G1's profile).
+
+### Decision: columnar JSON path extraction with validity; one-pass one-key lookup (G2CHK-1198, 2026-11-16)
+
+`bolt_json_column.h`: `json_column_extract_i64` / `_f64` (Utf8 column + compiled JsonPath -> typed column + validity bits and the NULL count) and `json_column_exists`, over rows [0,n) or a selection vector, on json_path_lookup's skip scanner (no tape, no DOM, no copies). A row is NULL for a malformed document, a missing path or a wrong type (strict integer).
+
+Closes the "scalar lookup validates the whole document and then re-walks it" note above: for a one-key object path `json_path_lookup` is one pass (`jp_root_member`), the answer identical to `json_path_lookup_generic` (kept for multi-segment and index paths and as the test reference), including malformed tails and the depth limit at its edge. `jp_skip_value` gained `depth0` / `limit` parameters for that. String skipping is a memchr with a backslash check: 35 ns per 52-byte document against 48 for a byte loop and 52 before this change. Test: `test_bolt_json_column` (random, mutated and deep documents against the generic lookup).

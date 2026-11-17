@@ -27,6 +27,7 @@
 #include "bolt/kernels/bolt_decimal.h"
 #include "bolt/kernels/bolt_decimal_div.h"
 #include "bolt/kernels/bolt_utf8.h"
+#include "bolt/kernels/group_stats.h"   // SumComp: the Neumaier add
 #include "bolt/kernels/numeric_key.h"
 
 #include <bit>
@@ -653,6 +654,11 @@ enum class AggKind : uint8_t {
     Product   = 11,
     TrySum    = 12,
     TryAvg    = 13,
+    // Neumaier-compensated float64 sum (bolt_groupby_fold.inc): the cell holds the running sum in .a and its
+    // compensation in .b (both double bits), counts[] the folded value count. A partial merges as a row does.
+    SumComp   = 14,
+    // The same cell, its answer divided by the folded count (PromQL avg over a compensated sum).
+    AvgComp   = 15,
 };
 
 struct AggSpec {
@@ -1073,6 +1079,7 @@ BOLT_FORCE_INLINE GbCell16 agg_identity(AggKind k, BoltType t) noexcept {
         case AggKind::MaxBy: case AggKind::MinBy:
         case AggKind::ByOrd: return GbCell16{0, 0};   // unset: counts[] == 0
         case AggKind::Product: case AggKind::TrySum:
+        case AggKind::SumComp: case AggKind::AvgComp:
         case AggKind::TryAvg: return GbCell16{0, 0};  // nothing folded: counts[] == 0
     }
     return GbCell16{0, 0};
@@ -1274,7 +1281,7 @@ inline bool window_has_null_key(const BoltColumn* keys, uint32_t n_keys,
 // Decide output BoltType for one agg given its input type.
 BOLT_FORCE_INLINE BoltType out_type(AggKind k, BoltType in) noexcept {
     if (k == AggKind::CountStar || k == AggKind::Count) return BoltType::Int64;
-    if (k == AggKind::Product) return BoltType::Float64;
+    if (k == AggKind::Product || k == AggKind::SumComp || k == AggKind::AvgComp) return BoltType::Float64;
     if (k == AggKind::TrySum || k == AggKind::TryAvg)
         return (k == AggKind::TryAvg || gb_agg_cell_is_d128(in)) ? BoltType::Decimal128 : BoltType::Int64;
     if (k == AggKind::Avg) {

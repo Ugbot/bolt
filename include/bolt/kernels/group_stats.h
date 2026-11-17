@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "bolt/bolt_port.h"
 #include "bolt/kernels/bolt_argsort.h"  // sort_indirect_i64_scratch
@@ -96,6 +97,46 @@ inline double quantile_f64(const double* BOLT_RESTRICT vals, std::int64_t n,
     const double vlo = vals[perm[lo]];
     const double vhi = vals[perm[hi]];
     return vlo + (vhi - vlo) * frac;
+}
+
+// Prometheus quantile(phi, v) over `vals[0..n)`: the values sort ascending with NaN first (Go's sort.Float64s),
+// rank = phi * (n - 1), result = values[lower] * (1 - w) + values[upper] * w with lower = floor(rank),
+// upper = min(n - 1, lower + 1), w = rank - lower; so an infinite neighbour times a zero weight is NaN, as
+// upstream. phi NaN is NaN, phi < 0 is -Inf, phi > 1 is +Inf, n <= 0 is NaN. Scratch as quantile_f64.
+// Numerics (bolt::promql::PromqlNumerics): `zero_weight_exact` (a release after Prometheus 3.5) answers the lower
+// value itself when the rank is whole, so an infinite upper neighbour is not turned into NaN; `fused` computes
+// vhi * w + lower * (1 - w) as one fma, as an arm64 Go build does.
+inline double quantile_prom_f64(const double* BOLT_RESTRICT vals, std::int64_t n, double phi,
+                                std::int64_t* BOLT_RESTRICT key_scratch,
+                                std::int32_t* BOLT_RESTRICT perm,
+                                std::int32_t* BOLT_RESTRICT sort_scratch,
+                                bool zero_weight_exact = false, bool fused = false) noexcept {
+    assert(vals != nullptr || n <= 0);
+    assert(n <= 0x7FFFFFFF && "quantile group too large for int32 argsort perm");
+    constexpr double k_nan = std::numeric_limits<double>::quiet_NaN();
+    if (n <= 0 || std::isnan(phi)) return k_nan;
+    if (phi < 0.0) return -std::numeric_limits<double>::infinity();
+    if (phi > 1.0) return std::numeric_limits<double>::infinity();
+    assert(key_scratch != nullptr && perm != nullptr && sort_scratch != nullptr);
+    std::int64_t nan_count = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+        key_scratch[i] = f64_sortable_key(vals[i]);   // NaN keys sort last
+        nan_count += std::isnan(vals[i]) ? 1 : 0;
+    }
+    sort_indirect_i64_scratch(perm, key_scratch, sort_scratch, n, /*ascending=*/true);
+    const double rank = phi * static_cast<double>(n - 1);
+    const double fl = std::floor(rank);
+    const std::int64_t lo = fl > 0.0 ? static_cast<std::int64_t>(fl) : 0;
+    const std::int64_t hi = lo + 1 < n - 1 ? lo + 1 : n - 1;
+    const double w = rank - fl;
+    // position p of the NaN-first order: the first nan_count are NaN, then the sorted rest
+    const double vlo = lo < nan_count ? k_nan : vals[perm[lo - nan_count]];
+    const double vhi = hi < nan_count ? k_nan : vals[perm[hi - nan_count]];
+    if (w == 0.0 && zero_weight_exact) return vlo;
+    const double low_part = vlo * (1.0 - w);
+    if (fused) return std::fma(vhi, w, low_part);
+    const double hi_part = vhi * w;
+    return hi_part + low_part;   // separate statements: no contraction unless asked for
 }
 
 // MEDIAN == quantile 0.5.

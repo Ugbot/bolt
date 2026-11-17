@@ -548,6 +548,69 @@ BOLT_DEFINE_ARITH_LIT(mul_lit, *)
 
 #undef BOLT_DEFINE_ARITH_LIT
 
+// G2CHK-1199 — truncating division of an int64 column by a nonzero literal other than -1
+// (the time-bucket shape, `ts / 60000`). The common time-unit divisors are
+// instantiated with a compile-time constant (multiply-high, vectorised); any other
+// divisor takes the hardware divide. Both truncate toward zero, exactly as `x / y`.
+// False (nothing written) for 0 and -1: a zero divisor and INT64_MIN / -1 are the
+// caller's per-row semantics, not this kernel's.
+template <int64_t D>
+inline void div_lit_const_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
+    for (int64_t i = 0; i < n; ++i) out[i] = a[i] / D;
+}
+inline bool div_lit_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t d,
+                        int64_t* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    if (d == 0 || d == -1) return false;
+    switch (d) {
+        case 10:          div_lit_const_i64<10>(a, n, out); return true;
+        case 60:          div_lit_const_i64<60>(a, n, out); return true;
+        case 100:         div_lit_const_i64<100>(a, n, out); return true;
+        case 1000:        div_lit_const_i64<1000>(a, n, out); return true;
+        case 3600:        div_lit_const_i64<3600>(a, n, out); return true;
+        case 60000:       div_lit_const_i64<60000>(a, n, out); return true;
+        case 86400:       div_lit_const_i64<86400>(a, n, out); return true;
+        case 1000000:     div_lit_const_i64<1000000>(a, n, out); return true;
+        case 3600000:     div_lit_const_i64<3600000>(a, n, out); return true;
+        case 86400000:    div_lit_const_i64<86400000>(a, n, out); return true;
+        case 1000000000:  div_lit_const_i64<1000000000>(a, n, out); return true;
+        case 60000000000:      div_lit_const_i64<60000000000>(a, n, out); return true;
+        case 3600000000000:    div_lit_const_i64<3600000000000>(a, n, out); return true;
+        case 86400000000000:   div_lit_const_i64<86400000000000>(a, n, out); return true;
+        default: break;
+    }
+    for (int64_t i = 0; i < n; ++i) out[i] = a[i] / d;
+    return true;
+}
+
+// G2CHK-1198 — remainder of an int64 column by a nonzero literal other than -1 (`ts - ts % W`, the other
+// spelling of a time bucket): `x % d`, sign of the dividend, exactly the scalar rule. False for 0 and -1.
+template <int64_t D>
+inline void mod_lit_const_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t* BOLT_RESTRICT out) noexcept {
+    for (int64_t i = 0; i < n; ++i) out[i] = a[i] % D;
+}
+inline bool mod_lit_nz_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t d,
+                           int64_t* BOLT_RESTRICT out) noexcept {
+    assert(a != nullptr || n == 0);
+    assert(out != nullptr || n == 0);
+    assert(n >= 0);
+    if (d == 0 || d == -1) return false;
+    switch (d) {
+        case 1000:             mod_lit_const_i64<1000>(a, n, out); return true;
+        case 60000:            mod_lit_const_i64<60000>(a, n, out); return true;
+        case 1000000:          mod_lit_const_i64<1000000>(a, n, out); return true;
+        case 1000000000:       mod_lit_const_i64<1000000000>(a, n, out); return true;
+        case 60000000000:      mod_lit_const_i64<60000000000>(a, n, out); return true;
+        case 3600000000000:    mod_lit_const_i64<3600000000000>(a, n, out); return true;
+        case 86400000000000:   mod_lit_const_i64<86400000000000>(a, n, out); return true;
+        default: break;
+    }
+    for (int64_t i = 0; i < n; ++i) out[i] = a[i] % d;
+    return true;
+}
+
 // mul_lit<T> checked variant — same UB-on-overflow hazard and same fix shape
 // as mul_checked above (G2CHK-98), for the column-OP-literal broadcast form.
 template <typename T>

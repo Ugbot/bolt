@@ -22,6 +22,7 @@
 #include <cstring>
 
 #include "bolt/kernels/bolt_bignum_small.h"
+#include "bolt/kernels/bolt_float_chars_limits.h"
 #include "bolt/kernels/bolt_ryu.h"
 
 namespace bolt {
@@ -363,6 +364,62 @@ inline uint32_t f64_to_chars_fixed(char* out, uint32_t cap, double v) noexcept {
     }
     assert(n <= 400);
     return n <= cap ? n : 0;
+}
+
+// A sample value as Prometheus writes it (jsonutil.MarshalFloat): Go
+// FormatFloat(v, 'f', -1, 64) while 1e-6 <= |v| < 1e21, 'e' form outside
+// (d.ddde+XX, at least two exponent digits), NaN / +Inf / -Inf, "-0".
+// Returns the byte count, or 0 when cap is too small.
+inline uint32_t f64_to_chars_prom(char* out, uint32_t cap, double v) noexcept {
+    assert(out != nullptr);
+    assert(cap <= (1u << 20));
+    char t[k_f64_prom_max_chars];
+    uint32_t n = 0;
+    if (std::isnan(v)) {
+        std::memcpy(t, "NaN", 3);
+        n = 3;
+    } else if (std::isinf(v)) {
+        std::memcpy(t, v < 0.0 ? "-Inf" : "+Inf", 4);
+        n = 4;
+    } else {
+        if (std::signbit(v)) t[n++] = '-';
+        const double a = std::fabs(v);
+        if (a == 0.0) {
+            t[n++] = '0';
+        } else {
+            char d[20];
+            int32_t k = 0;   // a ~= 0.d1..dn * 10^k
+            const uint32_t nd = detail::shortest_digits(a, d, &k);
+            assert(nd >= 1 && nd <= 17);
+            if (a < 1e-6 || a >= 1e21) {
+                t[n++] = d[0];
+                if (nd > 1) { t[n++] = '.'; std::memcpy(t + n, d + 1, nd - 1); n += nd - 1; }
+                int32_t x = k - 1;
+                t[n++] = 'e';
+                t[n++] = x < 0 ? '-' : '+';
+                if (x < 0) x = -x;
+                if (x >= 100) t[n++] = static_cast<char>('0' + x / 100);
+                t[n++] = static_cast<char>('0' + (x / 10) % 10);
+                t[n++] = static_cast<char>('0' + x % 10);
+            } else if (k <= 0) {
+                t[n++] = '0'; t[n++] = '.';
+                for (int32_t i = 0; i < -k; ++i) t[n++] = '0';
+                std::memcpy(t + n, d, nd); n += nd;
+            } else if (static_cast<uint32_t>(k) >= nd) {
+                std::memcpy(t + n, d, nd); n += nd;
+                for (int32_t i = static_cast<int32_t>(nd); i < k; ++i) t[n++] = '0';
+            } else {
+                const uint32_t uk = static_cast<uint32_t>(k);
+                std::memcpy(t + n, d, uk); n += uk;
+                t[n++] = '.';
+                std::memcpy(t + n, d + uk, nd - uk); n += nd - uk;
+            }
+        }
+    }
+    assert(n >= 1 && n <= k_f64_prom_max_chars);
+    if (n > cap) return 0;
+    std::memcpy(out, t, n);
+    return n;
 }
 
 }  // namespace float_chars

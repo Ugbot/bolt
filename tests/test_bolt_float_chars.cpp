@@ -321,3 +321,57 @@ TEST(FloatCharsRyu, MatchesExactShortestDigits) {
     }
     EXPECT_EQ(bad, 0u);
 }
+
+// f64_to_chars_prom: Prometheus' sample text (Go 'f', -1 inside [1e-6, 1e21),
+// 'e' form outside).
+namespace {
+std::string prom(double v) {
+    char b[fc::k_f64_prom_max_chars];
+    const uint32_t n = fc::f64_to_chars_prom(b, sizeof(b), v);
+    return std::string(b, n);
+}
+}  // namespace
+
+TEST(FloatCharsProm, EdgeVectors) {
+    EXPECT_EQ(prom(0.0), "0");
+    EXPECT_EQ(prom(-0.0), "-0");
+    EXPECT_EQ(prom(1.0), "1");
+    EXPECT_EQ(prom(-1.5), "-1.5");
+    EXPECT_EQ(prom(5e-324), "5e-324");
+    EXPECT_EQ(prom(2.2250738585072014e-308), "2.2250738585072014e-308");
+    EXPECT_EQ(prom(1e-7), "1e-07");
+    EXPECT_EQ(prom(9.99e-7), "9.99e-07");
+    EXPECT_EQ(prom(1e-6), "0.000001");
+    EXPECT_EQ(prom(0.1), "0.1");
+    EXPECT_EQ(prom(123456789.125), "123456789.125");
+    EXPECT_EQ(prom(1e20), "100000000000000000000");
+    EXPECT_EQ(prom(1e21), "1e+21");
+    EXPECT_EQ(prom(-1e21), "-1e+21");
+    EXPECT_EQ(prom(1.7976931348623157e308), "1.7976931348623157e+308");
+    EXPECT_EQ(prom(0.30000000000000004), "0.30000000000000004");
+    EXPECT_EQ(prom(std::numeric_limits<double>::quiet_NaN()), "NaN");
+    EXPECT_EQ(prom(-std::numeric_limits<double>::quiet_NaN()), "NaN");
+    EXPECT_EQ(prom(from_bits(0x7ff8000000000123ull)), "NaN");
+    EXPECT_EQ(prom(from_bits(0x7ff0000000000001ull)), "NaN");
+    EXPECT_EQ(prom(std::numeric_limits<double>::infinity()), "+Inf");
+    EXPECT_EQ(prom(-std::numeric_limits<double>::infinity()), "-Inf");
+}
+
+TEST(FloatCharsProm, CapAndRoundTrip) {
+    char b[fc::k_f64_prom_max_chars];
+    char tiny[3];
+    EXPECT_EQ(fc::f64_to_chars_prom(tiny, sizeof(tiny), 1234.5), 0u);
+    EXPECT_EQ(fc::f64_to_chars_prom(tiny, sizeof(tiny), 12.0), 2u);
+    std::mt19937_64 rng(77);
+    for (int i = 0; i < 200000; ++i) {
+        const double v = from_bits(rng());
+        if (!std::isfinite(v)) continue;
+        const uint32_t n = fc::f64_to_chars_prom(b, sizeof(b), v);
+        ASSERT_GT(n, 0u);
+        ASSERT_LE(n, fc::k_f64_prom_max_chars);
+        const std::string s(b, n);
+        ASSERT_EQ(std::strtod(s.c_str(), nullptr), v) << s;
+        const bool exp_form = s.find('e') != std::string::npos;
+        ASSERT_EQ(exp_form, std::fabs(v) < 1e-6 || std::fabs(v) >= 1e21) << s;
+    }
+}

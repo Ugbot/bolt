@@ -69,6 +69,10 @@ target_link_libraries(test_bolt_nested_column PRIVATE bolt::core GTest::gtest_ma
 bolt_apply_hardening(test_bolt_nested_column)
 add_test(NAME test_bolt_nested_column COMMAND test_bolt_nested_column)
 
+add_executable(test_bolt_groupby_comp test_bolt_groupby_comp.cpp)
+target_link_libraries(test_bolt_groupby_comp PRIVATE bolt::core GTest::gtest_main)
+bolt_apply_hardening(test_bolt_groupby_comp)
+add_test(NAME test_bolt_groupby_comp COMMAND test_bolt_groupby_comp)
 add_executable(test_bolt_groupby_bool test_bolt_groupby_bool.cpp)
 target_link_libraries(test_bolt_groupby_bool PRIVATE bolt::core GTest::gtest_main)
 bolt_apply_hardening(test_bolt_groupby_bool)
@@ -496,6 +500,45 @@ target_link_libraries(test_promql_kernels
 bolt_apply_hardening(test_promql_kernels)
 
 add_test(NAME test_promql_kernels COMMAND test_promql_kernels)
+
+add_executable(test_bolt_frame_kernels test_bolt_frame_kernels.cpp)
+
+target_link_libraries(test_bolt_frame_kernels
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_bolt_frame_kernels)
+
+add_test(NAME test_bolt_frame_kernels COMMAND test_bolt_frame_kernels)
+
+add_executable(test_promql_time_fn test_promql_time_fn.cpp)
+
+target_link_libraries(test_promql_time_fn
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_promql_time_fn)
+
+add_test(NAME test_promql_time_fn COMMAND test_promql_time_fn)
+
+add_executable(test_counter_rate test_counter_rate.cpp)
+
+target_link_libraries(test_counter_rate
+    PRIVATE
+        bolt::bolt
+        GTest::gtest
+        GTest::gtest_main
+)
+
+bolt_apply_hardening(test_counter_rate)
+
+add_test(NAME test_counter_rate COMMAND test_counter_rate)
 
 add_executable(test_promql_native_histogram test_promql_native_histogram.cpp)
 
@@ -2519,6 +2562,13 @@ add_test(NAME test_bolt_prefix_scan COMMAND test_bolt_prefix_scan)
 # Thompson NFA: alternation / {m,n} / char-classes / (?i) inline flags —
 # the subset PromQL =~/!~ matchers need, cross-checked against the exact
 # PromQL corpus patterns (and reject-cleanly / ReDoS-safe cases).
+# Word / phrase / unanchored regex search column kernels (G2CHK-1198).
+add_executable(test_bolt_text_search test_bolt_text_search.cpp)
+target_link_libraries(test_bolt_text_search
+    PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_text_search)
+add_test(NAME test_bolt_text_search COMMAND test_bolt_text_search)
+
 add_executable(test_bolt_regex_re2 test_bolt_regex_re2.cpp)
 target_link_libraries(test_bolt_regex_re2
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
@@ -3146,3 +3196,9 @@ target_link_libraries(test_bolt_u128
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 bolt_apply_hardening(test_bolt_u128)
 add_test(NAME test_bolt_u128 COMMAND test_bolt_u128)
+
+# Columnar JSON path extraction with validity (G2CHK-1198).
+add_executable(test_bolt_json_column test_bolt_json_column.cpp)
+target_link_libraries(test_bolt_json_column PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_json_column)
+add_test(NAME test_bolt_json_column COMMAND test_bolt_json_column)
