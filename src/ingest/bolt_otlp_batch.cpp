@@ -1,6 +1,7 @@
 // OTLP rows packed into fixed-schema batches, and request identity. See bolt_otlp.h.
 
 #include "bolt/ingest/bolt_otlp.h"
+#include "bolt/ingest/bolt_otlp_metrics.h"
 
 #include <cassert>
 #include <cstring>
@@ -64,6 +65,20 @@ bool pack_i64(const std::uint32_t* counts, std::uint32_t n_parts, std::int64_t t
     return true;
 }
 
+template <class Get>
+bool pack_f64(const std::uint32_t* counts, std::uint32_t n_parts, std::int64_t total, Get&& get, bolt::Arena* a,
+              bolt::BoltColumn* col) noexcept {
+    assert(a != nullptr && col != nullptr && total >= 0);
+    auto* v = a->allocate_array<double>(total ? static_cast<std::uint64_t>(total) : 1u);
+    if (v == nullptr) return false;
+    std::int64_t r = 0;
+    for (std::uint32_t p = 0; p < n_parts; ++p)       // bounded: the parts' rows
+        for (std::uint32_t i = 0; i < counts[p]; ++i) v[r++] = get(p, i);
+    assert(r == total);
+    *col = bolt::BoltColumn::make_flat(v, nullptr, total, bolt::BoltType::Float64);
+    return true;
+}
+
 bool begin_batch(bolt::BoltBatch* out, std::uint32_t cols, std::int64_t rows) noexcept {
     assert(out != nullptr && out->arena != nullptr);
     if (!bolt::BoltBatch::alloc_columns(out, out->arena, cols)) return false;
@@ -90,6 +105,14 @@ const Field* span_fields() noexcept {
         {"parent_span_id", T::Utf8}, {"name", T::Utf8}, {"kind", T::Int64}, {"status_code", T::Int64},
         {"status_msg", T::Utf8}, {"trace_state", T::Utf8}, {"attrs", T::Utf8}, {"events", T::Utf8},
         {"links", T::Utf8}, {"stream", T::Utf8}, {"flags", T::Int64}};
+    return kFields;
+}
+
+const Field* metric_fields() noexcept {
+    using T = bolt::BoltType;
+    static const Field kFields[kMetricCols] = {
+        {"labels", T::Utf8}, {"ts_ms", T::Int64}, {"start_ts_ms", T::Int64}, {"value", T::Float64},
+        {"hist", T::Utf8}, {"request_key", T::Int64}};
     return kFields;
 }
 
@@ -176,6 +199,29 @@ bool spans_to_batch(const SpanRows* parts, std::uint32_t n_parts, bolt::BoltBatc
     const Field* kFields = span_fields();
     for (std::uint32_t i = 0; i < kSpanCols; ++i) out->schema.add_field(kFields[i].name, kFields[i].type, false);
     return out->schema.num_fields == kSpanCols;
+}
+
+bool metrics_to_batch(const MetricRows* parts, const std::uint64_t* request_keys, std::uint32_t n_parts,
+                      bolt::BoltBatch* out) noexcept {
+    assert(out != nullptr && out->arena != nullptr && (n_parts == 0 || (parts != nullptr && request_keys != nullptr)));
+    bolt::Arena* a = out->arena;
+    auto* counts = a->allocate_array<std::uint32_t>(n_parts ? n_parts : 1u);
+    if (counts == nullptr) return false;
+    std::int64_t total = 0;
+    for (std::uint32_t p = 0; p < n_parts; ++p) { counts[p] = parts[p].n; total += parts[p].n; }
+    if (!begin_batch(out, kMetricCols, total)) return false;
+    bolt::BoltColumn* c = out->columns[out->read_epoch];
+    bool ok = pack_text(counts, n_parts, total, false, [&](std::uint32_t p, std::uint32_t i) { return parts[p].labels[i]; }, a, &c[0]);
+    ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return parts[p].ts_ms[i]; }, a, &c[1]);
+    ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return parts[p].start_ts_ms[i]; }, a, &c[2]);
+    ok = ok && pack_f64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t i) { return parts[p].value[i]; }, a, &c[3]);
+    ok = ok && pack_text(counts, n_parts, total, true, [&](std::uint32_t p, std::uint32_t i) { return parts[p].hist[i]; }, a, &c[4]);
+    ok = ok && pack_i64(counts, n_parts, total, [&](std::uint32_t p, std::uint32_t) {
+        return static_cast<std::int64_t>(request_keys[p] & kKeyMask); }, a, &c[5]);
+    if (!ok) return false;
+    const Field* kFields = metric_fields();
+    for (std::uint32_t i = 0; i < kMetricCols; ++i) out->schema.add_field(kFields[i].name, kFields[i].type, false);
+    return out->schema.num_fields == kMetricCols;
 }
 
 }  // namespace bolt::ingest::otlp

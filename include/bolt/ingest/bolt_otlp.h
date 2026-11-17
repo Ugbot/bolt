@@ -46,7 +46,8 @@ namespace bolt::ingest::otlp {
 inline constexpr std::uint32_t kLogCols = 11;
 inline constexpr std::uint32_t kSpanCols = 15;
 
-enum class Status : std::uint8_t { kOk = 0, kMalformed = 1, kArena = 2 };
+// kDelta and kLabelBytes are metrics refusals (bolt_otlp_metrics.h).
+enum class Status : std::uint8_t { kOk = 0, kMalformed = 1, kArena = 2, kDelta = 3, kLabelBytes = 4 };
 
 // ---- shared pieces ---------------------------------------------------------
 
