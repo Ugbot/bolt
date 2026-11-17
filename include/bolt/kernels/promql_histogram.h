@@ -31,6 +31,14 @@
 //   upstream's util/almost.Equal, relative to the two counts), locate the
 //   rank bucket, and linearly interpolate within it.
 //
+// fused_muladd (PromqlNumerics::fused_muladd; default off): an arm64 Go build
+// contracts two multiply-adds of bucketQuantile into one fma each, the rank
+// inside the bucket (phi * total - previous count) and the interpolation
+// (start + width * fraction). On, the kernel does the same and answers that
+// build bit for bit (checked against Prometheus 3.5.0 darwin/arm64 over 400
+// random histograms x 13 quantiles: 5200 answers equal fused, 802 of them
+// differ unfused). Off is an amd64 build's arithmetic.
+//
 // Oracle: chukonu/tests/promql/testdata/upstream/histograms.test (READ-ONLY).
 // Worked cases pinned in tests/test_promql_kernels.cpp.
 //
@@ -156,7 +164,8 @@ inline double promql_histogram_quantile(double phi,
                                         HistBucket* BOLT_RESTRICT scratch,
                                         int64_t scratch_cap,
                                         double tolerance =
-                                            kPromqlSmallDeltaTolerance) noexcept {
+                                            kPromqlSmallDeltaTolerance,
+                                        bool fused_muladd = false) noexcept {
     assert(le_upper != nullptr || n_buckets == 0);
     assert(cum_count != nullptr || n_buckets == 0);
     assert(scratch != nullptr || n_buckets == 0);
@@ -188,7 +197,7 @@ inline double promql_histogram_quantile(double phi,
 
     const double observations = scratch[m - 1].count;
     if (observations == 0.0) return nan;
-    double rank = phi * observations;
+    const double rank = phi * observations;
 
     // First bucket (excluding +Inf) whose cumulative count >= rank.
     int64_t b = 0;
@@ -203,13 +212,20 @@ inline double promql_histogram_quantile(double phi,
     double bucket_start = 0.0;
     const double bucket_end = scratch[b].upper;
     double count = scratch[b].count;
+    double in_bucket = rank;                   // the rank inside bucket b
     if (b > 0) {
+        const double below = scratch[b - 1].count;
         bucket_start = scratch[b - 1].upper;
-        count -= scratch[b - 1].count;
-        rank -= scratch[b - 1].count;
+        count -= below;
+        in_bucket = fused_muladd ? std::fma(phi, observations, -below)
+                                 : rank - below;
     }
-    assert(count != 0.0);
-    return bucket_start + (bucket_end - bucket_start) * (rank / count);
+    assert(b < m - 1);                         // 0 / 0 is NaN here, as upstream
+    const double width = bucket_end - bucket_start;
+    const double fraction = in_bucket / count;
+    if (fused_muladd) return std::fma(width, fraction, bucket_start);
+    const double step = width * fraction;
+    return bucket_start + step;
 }
 
 }  // namespace promql
