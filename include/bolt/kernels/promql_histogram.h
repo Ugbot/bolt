@@ -26,8 +26,18 @@
 //   fewer than 2 buckets          -> NaN
 //   zero total observations       -> NaN
 //   otherwise: sort by le, coalesce equal-le buckets (sum counts), clamp to
-//   monotonic non-decreasing counts (ignoring sub-tolerance float noise),
-//   locate the rank bucket, and linearly interpolate within it.
+//   monotonic non-decreasing counts (a count that differs from the running
+//   one only by float noise takes the running one, whichever way it moved:
+//   upstream's util/almost.Equal, relative to the two counts), locate the
+//   rank bucket, and linearly interpolate within it.
+//
+// fused_muladd (PromqlNumerics::fused_muladd; default off): an arm64 Go build
+// contracts two multiply-adds of bucketQuantile into one fma each, the rank
+// inside the bucket (phi * total - previous count) and the interpolation
+// (start + width * fraction). On, the kernel does the same and answers that
+// build bit for bit (checked against Prometheus 3.5.0 darwin/arm64 over 400
+// random histograms x 13 quantiles: 5200 answers equal fused, 802 of them
+// differ unfused). Off is an amd64 build's arithmetic.
 //
 // Oracle: chukonu/tests/promql/testdata/upstream/histograms.test (READ-ONLY).
 // Worked cases pinned in tests/test_promql_kernels.cpp.
@@ -61,8 +71,9 @@ struct HistBucket {
     double count;
 };
 
-// Default tolerance for treating a tiny count decrease as float noise rather
-// than a real non-monotonicity (Prometheus smallDeltaTolerance = 1e-12).
+// Default tolerance for treating a tiny count difference as float noise rather
+// than a real step (Prometheus smallDeltaTolerance = 1e-12). It is RELATIVE:
+// the difference is held against the sum of the two counts' magnitudes.
 inline constexpr double kPromqlSmallDeltaTolerance = 1e-12;
 
 namespace detail {
@@ -103,7 +114,29 @@ inline int64_t hist_coalesce(HistBucket* BOLT_RESTRICT b, int64_t n) noexcept {
     return len;
 }
 
-// Force counts monotonic non-decreasing, ignoring sub-tolerance decreases.
+// Prometheus util/almost.Equal(a, b, epsilon): are two counts apart only by
+// float noise. Two NaNs are equal. Beside a zero (or when the magnitudes sum
+// to a subnormal) the difference is held against epsilon times the smallest
+// normal double; otherwise against the sum of the magnitudes.
+inline bool hist_almost_equal(double a, double b, double epsilon) noexcept {
+    assert(epsilon >= 0.0);
+    assert(epsilon < 1.0);
+    constexpr double k_min_normal = 2.2250738585072014e-308;
+    if (std::isnan(a) && std::isnan(b)) return true;
+    if (a == b) return true;
+    const double abs_sum = std::fabs(a) + std::fabs(b);
+    const double diff = std::fabs(a - b);
+    if (a == 0.0 || b == 0.0 || abs_sum < k_min_normal) {
+        return diff < epsilon * k_min_normal;
+    }
+    const double max = std::numeric_limits<double>::max();
+    return diff / (abs_sum < max ? abs_sum : max) < epsilon;
+}
+
+// Force counts monotonic non-decreasing (upstream
+// ensureMonotonicAndIgnoreSmallDeltas): a count within `tolerance` of the
+// running one (almost.Equal, either direction) or below it takes the running
+// one; only a real increase moves the running count.
 inline void hist_ensure_monotonic(HistBucket* BOLT_RESTRICT b, int64_t n,
                                   double tolerance) noexcept {
     assert(b != nullptr || n == 0);
@@ -111,14 +144,11 @@ inline void hist_ensure_monotonic(HistBucket* BOLT_RESTRICT b, int64_t n,
     if (n == 0) return;
     double prev = b[0].count;
     for (int64_t i = 1; i < n; ++i) {          // bounded by n
-        double curr = b[i].count;
-        if (curr != prev && std::fabs(curr - prev) < tolerance) {
-            b[i].count = prev;                 // numerically insignificant
-            curr = prev;
-        }
-        if (curr < prev) {
-            b[i].count = prev;                 // force monotonic
-            curr = prev;
+        const double curr = b[i].count;
+        if (curr == prev) continue;
+        if (hist_almost_equal(prev, curr, tolerance) || curr < prev) {
+            b[i].count = prev;                 // noise, or a dip: not a step
+            continue;
         }
         prev = curr;
     }
@@ -134,7 +164,8 @@ inline double promql_histogram_quantile(double phi,
                                         HistBucket* BOLT_RESTRICT scratch,
                                         int64_t scratch_cap,
                                         double tolerance =
-                                            kPromqlSmallDeltaTolerance) noexcept {
+                                            kPromqlSmallDeltaTolerance,
+                                        bool fused_muladd = false) noexcept {
     assert(le_upper != nullptr || n_buckets == 0);
     assert(cum_count != nullptr || n_buckets == 0);
     assert(scratch != nullptr || n_buckets == 0);
@@ -166,7 +197,7 @@ inline double promql_histogram_quantile(double phi,
 
     const double observations = scratch[m - 1].count;
     if (observations == 0.0) return nan;
-    double rank = phi * observations;
+    const double rank = phi * observations;
 
     // First bucket (excluding +Inf) whose cumulative count >= rank.
     int64_t b = 0;
@@ -181,13 +212,20 @@ inline double promql_histogram_quantile(double phi,
     double bucket_start = 0.0;
     const double bucket_end = scratch[b].upper;
     double count = scratch[b].count;
+    double in_bucket = rank;                   // the rank inside bucket b
     if (b > 0) {
+        const double below = scratch[b - 1].count;
         bucket_start = scratch[b - 1].upper;
-        count -= scratch[b - 1].count;
-        rank -= scratch[b - 1].count;
+        count -= below;
+        in_bucket = fused_muladd ? std::fma(phi, observations, -below)
+                                 : rank - below;
     }
-    assert(count != 0.0);
-    return bucket_start + (bucket_end - bucket_start) * (rank / count);
+    assert(b < m - 1);                         // 0 / 0 is NaN here, as upstream
+    const double width = bucket_end - bucket_start;
+    const double fraction = in_bucket / count;
+    if (fused_muladd) return std::fma(width, fraction, bucket_start);
+    const double step = width * fraction;
+    return bucket_start + step;
 }
 
 }  // namespace promql
