@@ -5,6 +5,10 @@
 //                           the reverse one; parallel edges count, a
 //                           self-loop counts once per direction (networkx
 //                           MultiDiGraph out_degree / in_degree).
+//   csr_simple_degree     : distinct kept neighbours per node over one CSR
+//                           view: a parallel edge counts once, a self-loop
+//                           once (the degrees of networkx's DiGraph view of
+//                           a multigraph). stamp is n_nodes scratch.
 //   csr_max_degree        : the largest kept block — sizes the similarity
 //                           scratch before the call.
 //   csr_node_similarity   : Jaccard |N(u) ∩ N(v)| / |N(u) ∪ N(v)| or overlap
@@ -48,6 +52,35 @@ inline CsrAlgoStatus csr_degree_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
             d += csr_edge_label_keep(g->edge_labels, g->want_label, j);
         out_deg[u] = d;
     }
+    return CsrAlgoStatus::Ok;
+}
+
+template <typename Nbr, typename Eid>
+inline CsrAlgoStatus csr_simple_degree_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
+                                         int64_t* BOLT_RESTRICT stamp,
+                                         int64_t* BOLT_RESTRICT out_deg) noexcept {
+    assert(g == nullptr || g->n_nodes >= 0);
+    assert(out_deg != nullptr || g == nullptr);
+    if (!csr_algo_graph_ok(g) || out_deg == nullptr || stamp == nullptr)
+        return CsrAlgoStatus::InvalidArgument;
+    const int64_t n = g->n_nodes;
+    for (int64_t v = 0; v < n; ++v) stamp[v] = -1;
+    for (int64_t u = 0; u < n; ++u) {
+        if ((u & k_csr_stop_poll_mask) == 0 && csr_stop_requested(g)) return CsrAlgoStatus::Stopped;
+        int64_t b = 0;
+        int64_t e = 0;
+        csr_graph_block(g, u, &b, &e);
+        int64_t d = 0;
+        for (int64_t j = b; j < e; ++j) {
+            if (csr_edge_label_keep(g->edge_labels, g->want_label, j) == 0) continue;
+            const int64_t v = static_cast<int64_t>(g->neighbors[j]);
+            if (v < 0 || v >= n) return CsrAlgoStatus::MalformedGraph;
+            d += static_cast<int64_t>(stamp[v] != u);
+            stamp[v] = u;
+        }
+        out_deg[u] = d;
+    }
+    assert(n == 0 || out_deg[0] >= 0);
     return CsrAlgoStatus::Ok;
 }
 
@@ -139,6 +172,11 @@ inline CsrAlgoStatus csr_node_similarity_t(
     inline CsrAlgoStatus csr_degree(const G* BOLT_RESTRICT g,                  \
                                     int64_t* BOLT_RESTRICT out_deg) noexcept { \
         return csr_degree_t(g, out_deg);                                       \
+    }                                                                          \
+    inline CsrAlgoStatus csr_simple_degree(const G* BOLT_RESTRICT g,           \
+                                           int64_t* BOLT_RESTRICT stamp,       \
+                                           int64_t* BOLT_RESTRICT out_deg) noexcept { \
+        return csr_simple_degree_t(g, stamp, out_deg);                         \
     }                                                                          \
     inline int64_t csr_max_degree(const G* BOLT_RESTRICT g) noexcept {         \
         return csr_max_degree_t(g);                                            \
