@@ -25,6 +25,15 @@ nr::NamedType named(const BoltColumn& source) {
     }
     return type;
 }
+// G2GRAPH-530 (bolt 12): the decode caps are registry budgets whose defaults
+// are the struct's.
+TEST(NestedColumnLimits, DefaultsAreTheRegistryKnobs) {
+    const nr::ColumnLimits fixed{}, knobs = nr::column_limits_default();
+    EXPECT_EQ(fixed.rows, knobs.rows);
+    EXPECT_EQ(fixed.encoded_bytes, knobs.encoded_bytes);
+    EXPECT_EQ(fixed.values, knobs.values);
+}
+
 TEST(NestedColumn, TypedCarrierOwnsBytesAndPreservesNullAndEmpty) {
     Arena input, encoded, decoded;
     const auto source = fixture(input); auto type = named(source); BoltColumn bytes{}, back{};
