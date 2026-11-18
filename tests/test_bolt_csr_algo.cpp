@@ -145,6 +145,29 @@ TEST(CsrAlgo, ComponentsLabelByMinId) {
     EXPECT_EQ(s, (std::vector<int64_t>{0, 1, 1, 3, 4, 5}));
 }
 
+TEST(CsrAlgo, EdgesWithinCountsLoopsParallelsAndLabels) {
+    // SCC labels of ComponentsLabelByMinId's graph plus a parallel 1->2.
+    Graph g(6, {{1, 2}, {1, 2}, {2, 1}, {3, 1}, {5, 4}, {4, 4}});
+    const std::vector<int64_t> comp{0, 1, 1, 3, 4, 5};
+    int64_t kept = -1, inside = -1;
+    ASSERT_EQ(bk::csr_edges_within(&g.g, comp.data(), &kept, &inside), bk::CsrAlgoStatus::Ok);
+    EXPECT_EQ(kept, 6);
+    EXPECT_EQ(inside, 4);   // 1->2 twice, 2->1, the 4->4 loop
+    std::vector<int32_t> labels(6, 7);
+    labels[static_cast<size_t>(g.off[4])] = 9;                // the loop's slot
+    g.g.edge_labels = labels.data();
+    g.g.want_label = 9;
+    ASSERT_EQ(bk::csr_edges_within(&g.g, comp.data(), &kept, &inside), bk::CsrAlgoStatus::Ok);
+    EXPECT_EQ(kept, 1);
+    EXPECT_EQ(inside, 1);
+    EXPECT_EQ(bk::csr_edges_within(&g.g, nullptr, &kept, &inside), bk::CsrAlgoStatus::InvalidArgument);
+    EXPECT_EQ(kept, 0);
+    g.g.edge_labels = nullptr;
+    g.g.want_label = -1;
+    g.nbr[0] = 99;
+    EXPECT_EQ(bk::csr_edges_within(&g.g, comp.data(), &kept, &inside), bk::CsrAlgoStatus::MalformedGraph);
+}
+
 TEST(CsrAlgo, SccDeepChainNoRecursion) {
     const int64_t n = 200000;                       // recursion would blow the stack
     std::vector<std::pair<int64_t, int64_t>> e;

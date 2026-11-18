@@ -221,6 +221,43 @@ inline CsrAlgoStatus csr_scc_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
     return CsrAlgoStatus::Ok;
 }
 
+// Kept edges (label filter honoured; self-loops and parallel edges count)
+// and how many of them join two nodes with the same comp[] label: the counts
+// behind networkx's flow_hierarchy over an SCC labelling, and any "edges
+// inside a partition" measure. comp has n_nodes entries.
+template <typename Nbr, typename Eid>
+inline CsrAlgoStatus csr_edges_within_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
+                                        const int64_t* BOLT_RESTRICT comp,
+                                        int64_t* BOLT_RESTRICT out_kept,
+                                        int64_t* BOLT_RESTRICT out_inside) noexcept {
+    assert(out_kept != nullptr && out_inside != nullptr);
+    assert(g == nullptr || g->n_nodes >= 0);
+    if (out_kept == nullptr || out_inside == nullptr) return CsrAlgoStatus::InvalidArgument;
+    *out_kept = 0;
+    *out_inside = 0;
+    if (!csr_algo_graph_ok(g) || comp == nullptr) return CsrAlgoStatus::InvalidArgument;
+    const int64_t n = g->n_nodes;
+    int64_t kept = 0;
+    int64_t inside = 0;
+    for (int64_t u = 0; u < n; ++u) {
+        if ((u & k_csr_stop_poll_mask) == 0 && csr_stop_requested(g)) return CsrAlgoStatus::Stopped;
+        int64_t b = 0;
+        int64_t e = 0;
+        csr_graph_block(g, u, &b, &e);
+        for (int64_t j = b; j < e; ++j) {
+            const int64_t keep = csr_edge_label_keep(g->edge_labels, g->want_label, j);
+            const int64_t v = static_cast<int64_t>(g->neighbors[j]);
+            if (keep != 0 && (v < 0 || v >= n)) return CsrAlgoStatus::MalformedGraph;
+            kept += keep;
+            inside += static_cast<int64_t>(keep != 0 && comp[u] == comp[v]);
+        }
+    }
+    assert(inside >= 0 && inside <= kept);
+    *out_kept = kept;
+    *out_inside = inside;
+    return CsrAlgoStatus::Ok;
+}
+
 #define BOLT_CSR_COMPONENTS_ENTRY(G)                                           \
     inline CsrAlgoStatus csr_wcc(const G* BOLT_RESTRICT g,                     \
                                  int64_t* BOLT_RESTRICT out_comp,              \
@@ -232,6 +269,12 @@ inline CsrAlgoStatus csr_scc_t(const CsrGraphT<Nbr, Eid>* BOLT_RESTRICT g,
                                  int64_t* BOLT_RESTRICT out_comp,              \
                                  int64_t* BOLT_RESTRICT out_n_comp) noexcept { \
         return csr_scc_t(g, sc, out_comp, out_n_comp);                         \
+    }                                                                          \
+    inline CsrAlgoStatus csr_edges_within(const G* BOLT_RESTRICT g,            \
+                                          const int64_t* BOLT_RESTRICT comp,   \
+                                          int64_t* BOLT_RESTRICT out_kept,     \
+                                          int64_t* BOLT_RESTRICT out_inside) noexcept { \
+        return csr_edges_within_t(g, comp, out_kept, out_inside);             \
     }
 BOLT_CSR_COMPONENTS_ENTRY(CsrGraph64)
 BOLT_CSR_COMPONENTS_ENTRY(CsrGraph32)
