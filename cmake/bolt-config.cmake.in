@@ -60,6 +60,8 @@ endif()
 # compile flags, and false for link libraries of a static archive.
 set(BOLT_BUILT_WITH_ZSTD @BOLT_WITH_ZSTD@)
 set(BOLT_BUILT_WITH_LZ4  @BOLT_WITH_LZ4@)
+set(BOLT_BUILT_ZSTD_ENCODER "@BOLT_ZSTD_ENCODER_EFFECTIVE@")
+set(BOLT_BUILT_ZSTD_DECODER "@BOLT_ZSTD_DECODER_EFFECTIVE@")
 if(BOLT_BUILT_WITH_INGEST AND BOLT_BUILT_WITH_ZSTD)
     find_dependency(zstd)
 endif()

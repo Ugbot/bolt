@@ -63,7 +63,7 @@
 #include "bolt/ingest/bolt_snappy.h"        // snappy_compress
 #include "bolt/ingest/bolt_lz4_raw.h"      // lz4_raw_compress
 #include "bolt/ingest/bolt_deflate.h"      // gzip_compress
-#include "bolt/ingest/bolt_zstd_enc.h"     // zstd_compress_self
+#include "bolt/ingest/bolt_zstd.h"
 #include "bolt/ingest/bolt_parquet_bloom.h"  // pq_xxh64 (dictionary hashing)
 #include "bolt/ingest/bolt_parquet_pageindex.h"  // kPqMaxPagesPerChunk
 
@@ -1067,17 +1067,13 @@ bool maybe_compress(const std::uint8_t* src, std::size_t src_len,
         return true;
     }
     if (codec == kPwCodecZstd) {
-        const std::size_t cap = static_cast<std::size_t>(zstd_enc_bound(src_len));
-        dst->resize(cap);
-        std::uint64_t out_len = 0;
-        // ~1.6 MB of match-finder + sequence scratch: one per thread, reused
-        // for the process. Thread-local because parallel column encoding runs
-        // this concurrently.
-        static thread_local std::vector<std::uint8_t> zs_mem(
-            static_cast<std::size_t>(zstd_enc_state_size()));
-        ZstdEncState* zst = zstd_enc_state_init(zs_mem.data(), zs_mem.size());
-        if (zst == nullptr) return false;
-        if (!zstd_compress_self(src, src_len, dst->data(), cap, &out_len, zst)) {
+        // The encoder is the build's selection (BOLT_ZSTD_ENCODER); it keeps one context per
+        // thread, which parallel column encoding needs.
+        const std::uint64_t cap = zstd_max_compressed_len(src_len);
+        if (cap == 0) return false;
+        dst->resize(static_cast<std::size_t>(cap));
+        std::uint64_t out_len = cap;
+        if (zstd_compress(src, src_len, dst->data(), &out_len, kZstdDefaultLevel) != kCodecOk) {
             return false;
         }
         dst->resize(static_cast<std::size_t>(out_len));

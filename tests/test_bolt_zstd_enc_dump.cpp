@@ -3,7 +3,7 @@
 // Separate from the gtest suite because the only evidence that settles a zstd
 // encoder is what the REFERENCE libzstd makes of its frames, and libzstd is
 // reached through ctypes on the python side rather than linked here.
-#include "bolt/ingest/bolt_zstd_enc.h"
+#include "bolt_zstd_enc.h"   // private: bolt's own encoder
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

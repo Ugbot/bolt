@@ -1,4 +1,4 @@
-// bolt/ingest/bolt_zstd_dec.h — self-contained Zstandard (RFC 8878) DECODER.
+// src/ingest/bolt_zstd_dec.h (PRIVATE: callers use bolt/ingest/bolt_zstd.h) — self-contained Zstandard (RFC 8878) DECODER.
 //
 // WHY THIS EXISTS, given bolt_zstd.h already wraps libzstd: the same two
 // reasons bolt_inflate.h exists next to bolt_gzip.h, and one more.
@@ -49,18 +49,12 @@
 
 #include <cstdint>
 
+#include "bolt/ingest/bolt_zstd.h"
+
 namespace bolt {
 namespace ingest {
 
-enum : int {
-    kZstdOk          = 0,
-    kZstdBadInput    = 1,   // malformed stream (bad magic, bad table, ...)
-    kZstdTruncSrc    = 2,   // ran off the end of the input
-    kZstdNeedMore    = 3,   // dst_cap too small to hold the output
-    kZstdUnsupported = 4,   // valid zstd we deliberately refuse (dictionary)
-    kZstdScratchSmall= 5,   // scratch buffer smaller than zstd_scratch_size()
-    kZstdChecksum    = 6,   // content checksum mismatch
-};
+// Status codes (kZstd*) are the interface's: bolt/ingest/bolt_zstd.h.
 
 // Bytes of scratch `zstd_decode_raw` needs. Allocate once (arena/heap — it is
 // ~150 KB, far too large for a stack frame) and reuse across calls.

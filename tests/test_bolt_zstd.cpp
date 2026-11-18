@@ -1,4 +1,4 @@
-// zstd codec roundtrip — skips when libzstd is not compiled in.
+// zstd interface roundtrip, whichever implementations the build selected.
 
 #include "bolt/ingest/bolt_zstd.h"
 
@@ -33,11 +33,10 @@ TEST(BoltZstd, Roundtrip) {
     EXPECT_EQ(0, std::memcmp(back.data(), s, src.size()));
 }
 
-TEST(BoltZstd, UnavailableReturnsCode) {
-    if (zstd_available()) GTEST_SKIP() << "zstd present; nothing to assert";
-    uint8_t dst[16]; uint64_t n = sizeof(dst);
-    const uint8_t in[4] = {1, 2, 3, 4};
-    EXPECT_EQ(zstd_compress(in, 4, dst, &n, 1), kCodecUnavailable);
+TEST(BoltZstd, SelectionIsReported) {
+    EXPECT_NE(zstd_encoder_name()[0], 0);
+    EXPECT_NE(zstd_decoder_name()[0], 0);
+    EXPECT_GT(zstd_decode_scratch_size(), 0u);
 }
 
 }  // namespace

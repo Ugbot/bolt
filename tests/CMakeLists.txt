@@ -1609,6 +1609,7 @@ target_link_libraries(test_bolt_zstd_dec
     PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
 target_compile_definitions(test_bolt_zstd_dec PRIVATE
     BOLT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_include_directories(test_bolt_zstd_dec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/ingest)
 bolt_apply_hardening(test_bolt_zstd_dec)
 add_test(NAME test_bolt_zstd_dec COMMAND test_bolt_zstd_dec)
 
@@ -1984,6 +1985,7 @@ add_test(NAME test_bolt_tls_scratch COMMAND test_bolt_tls_scratch)
 # Frames for scripts/zstd_ref_check.py -> the reference libzstd.
 add_executable(test_bolt_zstd_enc_dump test_bolt_zstd_enc_dump.cpp)
 target_link_libraries(test_bolt_zstd_enc_dump PRIVATE bolt::bolt)
+target_include_directories(test_bolt_zstd_enc_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/ingest)
 bolt_apply_hardening(test_bolt_zstd_enc_dump)
 
 add_executable(test_bolt_snappy_dump test_bolt_snappy_dump.cpp)
@@ -2080,6 +2082,14 @@ if(BOLT_BUILD_INGEST)
         PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
     bolt_apply_hardening(test_bolt_zstd)
     add_test(NAME test_bolt_zstd COMMAND test_bolt_zstd)
+
+    # Both implementations of each direction in one build, whatever BOLT_ZSTD_* selects.
+    add_executable(test_bolt_zstd_backends test_bolt_zstd_backends.cpp)
+    target_link_libraries(test_bolt_zstd_backends
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    target_include_directories(test_bolt_zstd_backends PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/ingest)
+    bolt_apply_hardening(test_bolt_zstd_backends)
+    add_test(NAME test_bolt_zstd_backends COMMAND test_bolt_zstd_backends)
 
     add_executable(test_bolt_gzip test_bolt_gzip.cpp)
     target_link_libraries(test_bolt_gzip
@@ -2884,6 +2894,11 @@ add_test(NAME bolt_limits_lint
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py
                  --root ${CMAKE_CURRENT_SOURCE_DIR}/.. --src include --src src
                  --baseline-dir scripts/limits_lint_baseline)
+# One zstd interface: nothing outside it includes <zstd.h> or bolt's own encoder / decoder headers.
+add_test(NAME bolt_zstd_iface_lint
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/zstd_iface_lint.py ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME bolt_zstd_iface_lint_selftest
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/zstd_iface_lint.py --self-test)
 add_test(NAME bolt_limits_lint_selftest
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py --self-test)
 

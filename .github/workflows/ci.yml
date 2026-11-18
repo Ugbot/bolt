@@ -30,6 +30,16 @@ jobs:
         if: runner.os != 'Windows'
         uses: seanmiddleditch/gha-setup-ninja@v5
 
+      # libzstd: the reference Zstandard behind bolt/ingest/bolt_zstd.h (BOLT_ZSTD_ENCODER / _DECODER =
+      # reference). Windows builds bolt's own instead (BOLT_ZSTD_ALLOW_FALLBACK defaults ON there).
+      - name: Install libzstd (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libzstd-dev pkg-config
+
+      - name: Install libzstd (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zstd pkg-config
+
       - name: Set up MSVC + Ninja (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
