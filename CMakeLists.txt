@@ -814,8 +814,17 @@ set(BOLT_ZSTD_ENCODER "reference" CACHE STRING "zstd encoder behind bolt_zstd.h:
 set(BOLT_ZSTD_DECODER "reference" CACHE STRING "zstd decoder behind bolt_zstd.h: reference | bolt")
 set_property(CACHE BOLT_ZSTD_ENCODER PROPERTY STRINGS reference bolt)
 set_property(CACHE BOLT_ZSTD_DECODER PROPERTY STRINGS reference bolt)
+# Windows has no system libzstd (vcpkg `zstd` is the route to the reference there), so the
+# fallback defaults ON for it: an MSVC build without libzstd configures and uses bolt's own.
+# Everywhere else a missing libzstd is a configure error.
+if(WIN32)
+    set(_bolt_zstd_fallback_default ON)
+else()
+    set(_bolt_zstd_fallback_default OFF)
+endif()
 option(BOLT_ZSTD_ALLOW_FALLBACK
-       "Use bolt's own zstd where `reference` is selected but libzstd is not available" OFF)
+       "Use bolt's own zstd where `reference` is selected but libzstd is not available"
+       ${_bolt_zstd_fallback_default})
 foreach(_dir ENCODER DECODER)
     if(NOT BOLT_ZSTD_${_dir} STREQUAL "reference" AND NOT BOLT_ZSTD_${_dir} STREQUAL "bolt")
         message(FATAL_ERROR "BOLT_ZSTD_${_dir}='${BOLT_ZSTD_${_dir}}': must be reference or bolt")
