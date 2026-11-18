@@ -1,15 +1,27 @@
 #pragma once
 // Typed encoded columns share MarbleDB's existing nested-row bytes. The caller
 // retains the separate immutable TypeTree/NamedType; no per-row schema copies.
+#include "bolt/bolt_budget.h"
 #include "bolt/bolt_nested_type.h"
 #include "bolt/wire/byte_reader.h"
 
 namespace bolt::nested_row {
+// The compile-time defaults are the registry knobs' defaults (bolt_budget.h
+// nested_column_rows / _bytes / _values); column_limits_default() reads the
+// knobs, so a caller sized by data takes the budget rather than a fixed cap.
 struct ColumnLimits {
     uint32_t rows = 1u << 20;
     uint32_t encoded_bytes = 64u << 20;
     uint32_t values = 16u << 20; // all decoded nodes, including children under null structs
 };
+inline ColumnLimits column_limits_default() noexcept {
+    ColumnLimits l{};
+    l.rows = static_cast<uint32_t>(bolt_limits_value(bolt_limits_id::nested_column_rows));
+    l.encoded_bytes = static_cast<uint32_t>(bolt_limits_value(bolt_limits_id::nested_column_bytes));
+    l.values = static_cast<uint32_t>(bolt_limits_value(bolt_limits_id::nested_column_values));
+    assert(l.rows > 0 && l.encoded_bytes > 0 && l.values > 0);
+    return l;
+}
 namespace column_detail {
 struct Check {
     const TypeTree* tree;

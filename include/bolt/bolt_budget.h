@@ -67,6 +67,16 @@
       "BOLT_ICEBERG_BOUND_BYTES", nullptr,                                      \
       "Iceberg data file: bytes of one lower / upper bound (full mode keeps " \
       "the whole value)")                                                     \
+    X(nested_column_rows, kBudget, "rows", 1u << 20, 1, INT32_MAX,             \
+      "BOLT_NESTED_COLUMN_ROWS", nullptr,                                       \
+      "nested column decode: rows one list / struct / map column holds")       \
+    X(nested_column_bytes, kBudget, "bytes", 64u << 20, 1, INT32_MAX,           \
+      "BOLT_NESTED_COLUMN_BYTES", nullptr,                                      \
+      "nested column decode: encoded bytes of one column")                     \
+    X(nested_column_values, kBudget, "values", 16u << 20, 1, INT32_MAX,         \
+      "BOLT_NESTED_COLUMN_VALUES", nullptr,                                     \
+      "nested column decode: values (every node, nulls included) one column " \
+      "decodes; past it the decode refuses")                                  \
     X(max_vector_dim, kInvariant, "dims", 65535, 65535, 65535, nullptr,         \
       nullptr, "vector dimension validation ceiling (bolt::kMaxVectorDim)")      \
     X(max_columns, kInvariant, "columns", 32768, 32768, 32768, nullptr,         \
