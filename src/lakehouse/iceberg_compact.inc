@@ -409,6 +409,8 @@ bool compact_rewrite(TableHandle* th, Arena* ra, CompactPlan* p, int64_t target)
     cs.n_rm_dels = p->n_rm_dels;
     const bool committed = commit_change(th, &cs);
     for (uint32_t i = 0; i < o.n_outs; ++i) data_file_complete(th, o.rels[i], committed);   // bounded by n_outs
+    if (committed && th->compact_capture != nullptr)   // the outputs and candidates live in the table arena
+        *th->compact_capture = CompactRewrite{o.outs, p->cand, p->rm_dels, o.n_outs, p->n_cand, p->n_rm_dels, 0};
     return committed;
 }
 
@@ -448,6 +450,48 @@ bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept {
     const uint8_t was = th->v1_maintenance;
     th->v1_maintenance = 1u;                                     // a v1 table is compacted as v1 (write_ready)
     const bool ok = write_ready(th) && compact_table(th, target_file_size_bytes);
+    th->v1_maintenance = was;
+    return ok;
+}
+
+bool table_compact_capture(TableHandle* th, int64_t target_file_size_bytes, CompactRewrite* out) noexcept {
+    assert(th != nullptr && out != nullptr);
+    *out = CompactRewrite{};
+    th->compact_capture = out;
+    const bool ok = table_compact(th, target_file_size_bytes);
+    th->compact_capture = nullptr;
+    assert(ok || out->n_add == 0);
+    return ok;
+}
+
+bool table_commit_rewrite(TableHandle* th, const CompactRewrite* rw) noexcept {
+    assert(th != nullptr && rw != nullptr);
+    th->last_error = CommitError::kFailed;
+    if (rw->n_add == 0 || rw->add == nullptr || (rw->n_rm_data != 0 && rw->rm_data == nullptr) ||
+        (rw->n_rm_dels != 0 && rw->rm_dels == nullptr)) return false;
+    const uint8_t was = th->v1_maintenance;
+    th->v1_maintenance = 1u;
+    bool ok = write_ready(th) && handle_is_current(th);
+    const int64_t snap = ok ? mint_snapshot_id(th) : 0;
+    auto* add = ok ? th->arena->allocate_array<DataFileRef>(rw->n_add) : nullptr;
+    ok = ok && add != nullptr;
+    for (uint32_t i = 0; ok && i < rw->n_add; ++i) {             // bounded by the compaction's outputs
+        add[i] = rw->add[i];
+        add[i].snapshot_id = snap;
+    }
+    if (ok) {
+        ChangeSet cs{};
+        cs.op = SnapshotOp::kReplace;
+        cs.merge_manifests = 1u;
+        cs.snap_id = snap;
+        cs.add_data = add;
+        cs.n_add_data = rw->n_add;
+        cs.rm_data = rw->rm_data;
+        cs.n_rm_data = rw->n_rm_data;
+        cs.rm_dels = rw->rm_dels;
+        cs.n_rm_dels = rw->n_rm_dels;
+        ok = commit_change(th, &cs);
+    }
     th->v1_maintenance = was;
     return ok;
 }

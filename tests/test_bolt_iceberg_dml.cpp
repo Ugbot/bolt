@@ -589,6 +589,57 @@ TEST(IcebergDml, ACommitOnAFileAnotherWriterRemovedConflicts) {
     EXPECT_TRUE(scan_rows(t.root).empty());
 }
 
+// G2ICE-360: a compaction planned on H is committed again on a newer head (an append landed meanwhile) without rewriting data:
+// the replace's parent is the append, the append's file stays, the inputs leave, every row survives. A later change that
+// removed an input makes the re-commit a conflict instead.
+TEST(IcebergDml, ACapturedCompactionRecommitsOnANewerHead) {
+    namespace fs = std::filesystem;
+    Table t;
+    const std::string root = fresh_root(temp_base(), "rebase");
+    create_table(&t, root);
+    std::vector<Row> all;
+    for (int f = 0; f < 4; ++f) {
+        const std::vector<Row> rows = base_rows(f * 5, f * 5 + 5);
+        append_rows(&t, rows);
+        all.insert(all.end(), rows.begin(), rows.end());
+    }
+    const std::string at_h = root + ".h";
+    fs::copy(root, at_h, fs::copy_options::recursive);            // the table at H, before the compaction
+    CompactRewrite rw{};
+    ASSERT_TRUE(table_compact_capture(t.th, 64ll << 20, &rw));
+    ASSERT_EQ(rw.n_add, 1u);
+    ASSERT_EQ(rw.n_rm_data, 4u);
+    const std::string compacted = root + ".cmp";
+    fs::rename(root, compacted);                                  // the compaction's writes, kept aside (t.th stays open)
+    fs::rename(at_h, root);
+    for (uint32_t i = 0; i < rw.n_add; ++i) {                     // its output file, at the same location under the table
+        const std::string key = store_key(root, rw.add[i].file_path);
+        fs::copy_file(compacted + "/" + key, root + "/" + key);
+    }
+    Table head;                                                   // a writer appends on H: the newer head
+    head.root = root;
+    ASSERT_TRUE(filesystem_object_store_init(&head.fs, root.c_str(), &head.os));
+    ASSERT_TRUE(table_open(&head.th, &head.arena, &head.os, root.c_str()));
+    const std::vector<Row> later = base_rows(100, 103);
+    append_rows(&head, later);
+    all.insert(all.end(), later.begin(), later.end());
+    const int64_t parent = table_metadata(head.th)->current_snapshot_id;
+    ASSERT_TRUE(table_commit_rewrite(head.th, &rw)) << static_cast<int>(table_last_commit_error(head.th));
+    const Snapshot& s = current(head.th);
+    EXPECT_EQ(s.parent_snapshot_id, parent);
+    EXPECT_EQ(op_of(root, s.snapshot_id), "replace");
+    EXPECT_EQ(scan_rows(root), model(all, [](const Row&) { return false; }));
+    const Recount rc = recount(root, s);
+    EXPECT_EQ(rc.c.at("total-data-files"), 2) << "the compaction's output and the append's file";
+    EXPECT_EQ(rc.c.at("deleted-data-files"), 4);
+    expect_summary_matches(root, s);
+    Predicate p = pred_i64("id", PredicateOp::kGe, 0);
+    ASSERT_TRUE(table_delete(head.th, &p));                       // removes the output: the inputs are gone for good
+    EXPECT_FALSE(table_commit_rewrite(head.th, &rw));
+    EXPECT_EQ(table_last_commit_error(head.th), CommitError::kConflict);
+    fs::remove_all(compacted);
+}
+
 TEST(IcebergDml, SummariesSurviveAReopenedHandle) {
     Table t;
     build_base(&t, fresh_root(temp_base(), "reopen"));

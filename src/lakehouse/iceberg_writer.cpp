@@ -122,6 +122,7 @@ struct TableHandle {
     SumRec*        sums;            // summaries of the snapshots this handle committed (G2ICE-280)
     uint32_t       n_sums;
     uint32_t       cap_sums;
+    CompactRewrite* compact_capture; // G2ICE-360: table_compact_capture's out, set for the one call
 };
 
 // iceberg_scan.cpp and iceberg_writer.cpp each define their OWN

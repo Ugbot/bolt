@@ -239,6 +239,21 @@ bool table_update_sort_order    (TableHandle* th,
 // Compaction (table_rewrite with the target in bytes).
 bool table_compact(TableHandle* th, int64_t target_file_size_bytes) noexcept;
 
+// G2ICE-360: the replace a compaction committed, as data: the output files it added and the data / delete files it removed.
+// Spans point into the handle's arena (valid while it is open). n_add == 0 when nothing was worth rewriting.
+struct CompactRewrite {
+    const DataFileRef* add;
+    const char* const* rm_data;
+    const char* const* rm_dels;
+    uint32_t           n_add, n_rm_data, n_rm_dels, _pad;
+};
+// table_compact, also reporting the replace it committed.
+bool table_compact_capture(TableHandle* th, int64_t target_file_size_bytes, CompactRewrite* out) noexcept;
+// Commits `rw` (from another handle, still open) as a replace on th's CURRENT snapshot, typically a newer one than the compaction
+// planned on: the outputs are already written, so nothing is read or rewritten. Every removed file must still be live in the
+// current snapshot (kConflict otherwise: a later change removed or deleted from it); added entries take the new snapshot's id.
+bool table_commit_rewrite(TableHandle* th, const CompactRewrite* rw) noexcept;
+
 // Snapshot lifecycle.
 bool table_expire_snapshots(TableHandle* th, uint64_t older_than_ms,
                             int32_t retain_last_n) noexcept;
