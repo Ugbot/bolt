@@ -558,6 +558,17 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     TlsConfig cfg{};
     const size_t size = std::strlen(host);
     if (size >= sizeof(cfg.server_name)) return false;
+    const uint32_t rem = remaining_ms(c->deadline);
+    const uint16_t left = rem > 0xFFFFu ? uint16_t(0xFFFFu) : static_cast<uint16_t>(rem);
+    if (req->tls != nullptr) {
+        cfg = *req->tls;
+        if (cfg.server_name[0] == '\0') std::memcpy(cfg.server_name, host, size + 1);
+        if (cfg.handshake_timeout_ms == 0 || cfg.handshake_timeout_ms > left) {
+            cfg.handshake_timeout_ms = left;
+        }
+        assert(cfg.server_name[0] != '\0');
+        return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);
+    }
     std::memcpy(cfg.server_name, host, size + 1);
     static_assert(sizeof(cfg.ca_path) == sizeof(req->ca_path));
     std::memcpy(cfg.ca_path, req->ca_path, sizeof(cfg.ca_path));
@@ -565,7 +576,7 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     if (ca >= sizeof(req->ca_path) || ca >= sizeof(cfg.ca_path)) return false;
     std::memcpy(cfg.ca_path, req->ca_path, ca + 1);
     cfg.verify_peer = true;
-    cfg.handshake_timeout_ms = static_cast<uint16_t>(remaining_ms(c->deadline));
+    cfg.handshake_timeout_ms = left;
     return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);
 }
 

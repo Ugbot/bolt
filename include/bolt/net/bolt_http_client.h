@@ -10,6 +10,8 @@
 namespace bolt {
 namespace net {
 
+struct TlsConfig;
+
 static constexpr uint32_t kHttpMaxUrl     = 2048u;
 static constexpr uint32_t kHttpMaxHeader  = 2048u;
 static constexpr uint32_t kHttpMaxHeaders = 32u;
@@ -30,6 +32,12 @@ struct HttpRequest {
     uint32_t       timeout_ms;                    // 0 → default
     uint32_t       max_response_body;             // 0 → kHttpMaxBody; otherwise <= it
     char           ca_path[512];                  // "" → system trust; else PEM file or hashed dir
+    // Non-null: the whole TLS policy of an https request (CA / client cert /
+    // key, PEM in memory, TLS 1.2 floor, verify-ca), read during connect only;
+    // ca_path is then ignored. server_name "" takes the URL host; the handshake
+    // is bounded by the smaller of its handshake_timeout_ms and the request
+    // deadline. null: verify-full against ca_path, TLS 1.3, as before.
+    const TlsConfig* tls = nullptr;
 };
 
 struct HttpResponse {
