@@ -11,16 +11,26 @@ FileIoStatus writable_allocate(int fd, uint64_t bytes) noexcept {
     assert(fd >= 0);
     assert(bytes != 0 && bytes <= static_cast<uint64_t>(INT64_MAX));
 #if defined(__APPLE__)
-    fstore_t request{};
-    request.fst_flags = F_ALLOCATECONTIG;
-    request.fst_posmode = F_PEOFPOSMODE;
-    request.fst_length = static_cast<off_t>(bytes);
-    if (::fcntl(fd, F_PREALLOCATE, &request) == -1) {
-        request.fst_flags = F_ALLOCATEALL;
-        if (::fcntl(fd, F_PREALLOCATE, &request) == -1)
-            return errno == ENOTSUP ? FileIoStatus::kUnsupported : FileIoStatus::kIoError;
+    // A contiguous request may succeed with a partial extent (APFS on a
+    // fragmented volume); the shortfall is then allocated past the new
+    // physical EOF without the contiguity hint. Bounded: each round must
+    // make progress.
+    constexpr int kAllocateRounds = 64;
+    uint64_t allocated = 0;
+    for (int round = 0; round < kAllocateRounds && allocated < bytes; ++round) {
+        fstore_t request{};
+        request.fst_flags = round == 0 ? F_ALLOCATECONTIG : F_ALLOCATEALL;
+        request.fst_posmode = F_PEOFPOSMODE;
+        request.fst_length = static_cast<off_t>(bytes - allocated);
+        if (::fcntl(fd, F_PREALLOCATE, &request) == -1) {
+            if (round != 0)
+                return errno == ENOTSUP ? FileIoStatus::kUnsupported : FileIoStatus::kIoError;
+            continue;
+        }
+        if (request.fst_bytesalloc <= 0) return FileIoStatus::kIoError;
+        allocated += static_cast<uint64_t>(request.fst_bytesalloc);
     }
-    if (request.fst_bytesalloc < static_cast<off_t>(bytes)) return FileIoStatus::kIoError;
+    if (allocated < bytes) return FileIoStatus::kIoError;
 #else
     const int error = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
     if (error != 0) return error == ENOSYS || error == EOPNOTSUPP ?
