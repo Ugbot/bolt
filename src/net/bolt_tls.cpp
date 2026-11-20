@@ -650,7 +650,7 @@ std::int64_t tls_send_all_timeout(const TlsSocket* s, const void* data,
                           std::uint32_t len, std::uint32_t timeout_ms) noexcept {
     assert(s != nullptr && "tls_send_all: null s");
     assert(data != nullptr && "tls_send_all: null data");
-    if (!s->handshake_done || !s->ssl || timeout_ms == 0 || timeout_ms > 60000u || len > INT32_MAX) return -1;
+    if (!s->handshake_done || !s->ssl || timeout_ms == 0 || timeout_ms > k_tls_io_timeout_max_ms || len > INT32_MAX) return -1;
     SSL* ssl = static_cast<SSL*>(s->ssl);
     const sock_t fd = static_cast<sock_t>(s->fd);
 
@@ -715,7 +715,7 @@ std::int32_t tls_recv_some_timeout(const TlsSocket* s, void* data,
                            std::uint32_t cap, std::uint32_t timeout_ms) noexcept {
     assert(s != nullptr && "tls_recv_some: null s");
     assert(data != nullptr && "tls_recv_some: null data");
-    if (!s->handshake_done || !s->ssl || cap == 0 || timeout_ms == 0 || timeout_ms > 60000u || cap > INT32_MAX) return -1;
+    if (!s->handshake_done || !s->ssl || cap == 0 || timeout_ms == 0 || timeout_ms > k_tls_io_timeout_max_ms || cap > INT32_MAX) return -1;
     SSL* ssl = static_cast<SSL*>(s->ssl);
     const sock_t fd = static_cast<sock_t>(s->fd);
     const std::int64_t deadline = deadline_from(static_cast<std::uint16_t>(timeout_ms), kDefaultRecvMs);

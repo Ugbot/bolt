@@ -128,9 +128,10 @@ std::int32_t tls_recv_some(const TlsSocket* s,
                            void*            data,
                            std::uint32_t    cap) noexcept;
 
-// Explicit finite per-call I/O deadline. Values 1..60000 ms are accepted;
+// Explicit finite per-call I/O deadline. Values 1..k_tls_io_timeout_max_ms are accepted;
 // zero/out-of-range/unconnected sockets return -1. TLS verification and
 // handshake behavior are unchanged. Existing APIs keep their defaults.
+constexpr std::uint32_t k_tls_io_timeout_max_ms = 60000u;
 std::int64_t tls_send_all_timeout(const TlsSocket*, const void*,
                                   std::uint32_t len, std::uint32_t timeout_ms) noexcept;
 std::int32_t tls_recv_some_timeout(const TlsSocket*, void*,

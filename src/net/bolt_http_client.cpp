@@ -219,7 +219,9 @@ int64_t conn_send_all(HttpConn* c, const void* data, uint32_t len) noexcept {
     assert(data != nullptr);
     const uint32_t left = remaining_ms(c->deadline);
     if (left == 0) return -1;
-    if (c->https) return tls_send_all_timeout(&c->tls, data, len, left);
+    // A TLS call takes at most k_tls_io_timeout_max_ms; a longer request
+    // deadline clamps the send to it rather than refusing it outright.
+    if (c->https) return tls_send_all_timeout(&c->tls, data, len, std::min(left, k_tls_io_timeout_max_ms));
     const char* p = static_cast<const char*>(data);
     uint32_t off = 0;
     while (off < len) {
@@ -242,7 +244,7 @@ int32_t conn_recv_some(HttpConn* c, void* buf, uint32_t cap) noexcept {
     assert(cap > 0 && cap <= kHttpMaxBody + kMaxWireOverhead);
     const uint32_t left = remaining_ms(c->deadline);
     if (left == 0) return -1;
-    if (c->https) return tls_recv_some_timeout(&c->tls, buf, cap, left);
+    if (c->https) return tls_recv_some_timeout(&c->tls, buf, cap, std::min(left, k_tls_io_timeout_max_ms));
     for (uint32_t attempt = 0; attempt < kMaxSocketRetries; ++attempt) {
         if (!socket_wait(c->fd, true, c->deadline)) return -1;
         const int n = static_cast<int>(recv(c->fd, static_cast<char*>(buf), static_cast<SockIoSize>(cap), 0));
@@ -521,6 +523,16 @@ const char* http_header_get(const HttpHeader* hdrs, uint32_t n,
     return find_header(hdrs, n, name);
 }
 
+uint16_t http_tls_handshake_budget_ms(uint32_t remaining_ms, uint16_t configured_ms) noexcept {
+    constexpr uint32_t kFieldMax = 0xFFFFu;
+    const uint32_t capped = remaining_ms > kFieldMax ? kFieldMax : remaining_ms;
+    const uint32_t budget = configured_ms != 0 && configured_ms < capped ? configured_ms : capped;
+    assert(budget <= kFieldMax);
+    assert(budget <= remaining_ms);
+    assert(configured_ms == 0 || budget <= configured_ms);
+    return static_cast<uint16_t>(budget);
+}
+
 bool http_request_add_header(HttpRequest* req, const char* name,
                              const char* value) noexcept {
     assert(req != nullptr);
@@ -558,6 +570,14 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     TlsConfig cfg{};
     const size_t size = std::strlen(host);
     if (size >= sizeof(cfg.server_name)) return false;
+    const uint32_t rem = remaining_ms(c->deadline);
+    if (req->tls != nullptr) {
+        cfg = *req->tls;
+        if (cfg.server_name[0] == '\0') std::memcpy(cfg.server_name, host, size + 1);
+        cfg.handshake_timeout_ms = http_tls_handshake_budget_ms(rem, cfg.handshake_timeout_ms);
+        assert(cfg.server_name[0] != '\0');
+        return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);
+    }
     std::memcpy(cfg.server_name, host, size + 1);
     static_assert(sizeof(cfg.ca_path) == sizeof(req->ca_path));
     std::memcpy(cfg.ca_path, req->ca_path, sizeof(cfg.ca_path));
@@ -565,7 +585,7 @@ bool open_connection(HttpConn* c, const HttpRequest* req, bool https,
     if (ca >= sizeof(req->ca_path) || ca >= sizeof(cfg.ca_path)) return false;
     std::memcpy(cfg.ca_path, req->ca_path, ca + 1);
     cfg.verify_peer = true;
-    cfg.handshake_timeout_ms = static_cast<uint16_t>(remaining_ms(c->deadline));
+    cfg.handshake_timeout_ms = http_tls_handshake_budget_ms(rem, 0);
     return cfg.handshake_timeout_ms != 0 && tls_client_connect(&c->tls, &cfg, ipv4, port);
 }
 

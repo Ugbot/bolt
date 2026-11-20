@@ -521,4 +521,19 @@ TEST(BoltHttpClient, StreamCallbacksCanRefuseAndAShortBodyFails) {
     EXPECT_LT(stream_once({"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"}, &shortened, 64, 10), 0);
     EXPECT_EQ(shortened.body, "abc");
 }
+
+// G2CHK-1106: the handshake field is 16-bit; a longer request budget clamps to
+// 65535 ms instead of wrapping (65536 used to become 0 and refuse the request).
+TEST(BoltHttpClient, TlsHandshakeBudgetClampsInsteadOfWrapping) {
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(65536u, 0), 65535u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(70000u, 0), 65535u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(3600000u, 0), 65535u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(65535u, 0), 65535u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(1500u, 0), 1500u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(1500u, 200), 200u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(1500u, 9000), 1500u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(70000u, 9000), 9000u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(0u, 9000), 0u);
+    EXPECT_EQ(bn::http_tls_handshake_budget_ms(0u, 0), 0u);
+}
 } // namespace
