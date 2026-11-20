@@ -75,6 +75,8 @@ struct alignas(64) QueryCtx {
     std::atomic<uint64_t>            rows{0};
     std::atomic<uint64_t>            scanned_rows{0};
     std::atomic<uint64_t>            scanned_bytes{0};
+    // Budgets operators drew from the limit before using it (bolt_query_claim.h).
+    alignas(64) std::atomic<uint64_t> mem_claimed{0};
 
     // First reason wins, so the error names what actually stopped the query.
     void request_stop(QueryStop why) noexcept {
@@ -178,6 +180,7 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->scanned_bytes.store(0u, std::memory_order_relaxed);
         q->failed.store(0u, std::memory_order_relaxed);
         q->fail_message[0] = '\0';
+        q->mem_claimed.store(0u, std::memory_order_relaxed);
         return q;
     }
     return nullptr;
