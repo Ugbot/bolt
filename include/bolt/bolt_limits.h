@@ -112,6 +112,12 @@ struct LimitTable {
 // Registry capacity: one table per repo, generous headroom.
 inline constexpr uint32_t kLimitsMaxTables = 64;
 
+// Per-query registry overrides (bolt_query_options.h QueryKnobs): invariant
+// capacity of one query's override set and of a knob name, longest registry
+// name included. A query naming more is refused, never truncated.
+inline constexpr uint32_t kQueryKnobMax = 32;
+inline constexpr uint32_t kQueryKnobNameBytes = 48;
+
 namespace detail {
 struct LimitsRegistry {
     std::atomic<LimitTable*> tables[kLimitsMaxTables];

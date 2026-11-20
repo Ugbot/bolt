@@ -36,8 +36,6 @@
 
 namespace bolt {
 
-inline constexpr uint32_t kQueryKnobMax = 32;         // registry overrides one query carries
-inline constexpr uint32_t kQueryKnobNameBytes = 48;
 inline constexpr uint64_t kQueryKnobReset = UINT64_MAX;   // RESET name: drop the override
 
 enum class QueryKnobSource : uint8_t { Unset = 0, Session = 1, Query = 2, Optimizer = 3 };
