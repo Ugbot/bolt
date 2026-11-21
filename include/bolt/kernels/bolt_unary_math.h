@@ -46,20 +46,4 @@ inline void i64_to_f64(const int64_t* BOLT_RESTRICT a, int64_t n, double* BOLT_R
     for (int64_t i = 0; i < n; ++i) out[i] = static_cast<double>(a[i]);
 }
 
-// a / lit and a % lit truncating toward zero (C++ / SQL). lit must not be 0
-// or -1 (the callers route those through their null / overflow rules).
-inline void div_lit_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t lit,
-                        int64_t* BOLT_RESTRICT out) noexcept {
-    assert(lit != 0 && lit != -1);
-    assert(n >= 0);
-    for (int64_t i = 0; i < n; ++i) out[i] = a[i] / lit;
-}
-
-inline void mod_lit_i64(const int64_t* BOLT_RESTRICT a, int64_t n, int64_t lit,
-                        int64_t* BOLT_RESTRICT out) noexcept {
-    assert(lit != 0 && lit != -1);
-    assert(n >= 0);
-    for (int64_t i = 0; i < n; ++i) out[i] = a[i] % lit;
-}
-
 }  // namespace bolt::kernels
