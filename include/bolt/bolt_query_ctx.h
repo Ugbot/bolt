@@ -60,6 +60,10 @@ inline uint64_t query_steady_now_ns() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// Why an operator failed, in words: room for a host's whole error line (chukonu's error detail is
+// 512 bytes too), so the submitting thread reads what the failing worker wrote, not a prefix of it.
+inline constexpr uint32_t kQueryFailureBytes = 512;
+
 struct alignas(64) QueryCtx {
     std::atomic<uint32_t>            stop{0};
     std::atomic<uint32_t>            generation{0};   // odd while in use
@@ -69,7 +73,7 @@ struct alignas(64) QueryCtx {
     // Why a worker failed the query, in words, for the submitting thread
     // (which reads it after the drivers return). First failure wins.
     std::atomic<uint32_t>            failed{0};      // 0 none, 1 writing, 2 set
-    char                             fail_message[160] = {};
+    char                             fail_message[kQueryFailureBytes] = {};
     alignas(64) std::atomic<uint64_t> mem_used{0};
     std::atomic<uint64_t>            mem_peak{0};
     std::atomic<uint64_t>            rows{0};
