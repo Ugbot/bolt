@@ -2600,3 +2600,8 @@ requests/s, p99 0.25-0.8x.
 Not tried: skipping the wake while another worker is searching (Go, tokio). It should win the empty-task
 flood, at the risk of the tail when the searcher is preempted. Worth it if a profile shows submit-side
 wakes in a real workload.
+
+Drills on a full gestaltd (g2 362717018): 22/22 sections in one run, 21/22 in another at load ~100. The
+failure, stale_primary's "the deposed node deleted nothing", was also seen on a binary with the old pool
+(gate-par-measure e2e-3-20261123-142431): same failure on both pools, 1 of 7 runs each at different loads,
+relative rate unknown. Forcing the suspected order on the old pool did not reproduce it in 3 runs (G2ICE-502).
