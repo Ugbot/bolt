@@ -31,6 +31,8 @@
 
 namespace bolt {
 
+struct QueryKnobs;   // bolt_query_options.h: the query's Limits-registry overrides
+
 enum class QueryStop : uint32_t {
     None      = 0,
     Cancelled = 1,
@@ -67,6 +69,7 @@ struct alignas(64) QueryCtx {
     std::atomic<uint32_t>            generation{0};   // odd while in use
     const std::atomic<uint32_t>*     cancel_flag = nullptr;
     QueryLimits                      limits{};
+    const QueryKnobs*                knobs = nullptr;   // owned by whoever acquired the slot
     // Why a worker failed the query, in words, for the submitting thread
     // (which reads it after the drivers return). First failure wins.
     std::atomic<uint32_t>            failed{0};      // 0 none, 1 writing, 2 set
@@ -76,6 +79,8 @@ struct alignas(64) QueryCtx {
     std::atomic<uint64_t>            rows{0};
     std::atomic<uint64_t>            scanned_rows{0};
     std::atomic<uint64_t>            scanned_bytes{0};
+    // Budgets operators drew from the limit before using it (bolt_query_claim.h).
+    alignas(64) std::atomic<uint64_t> mem_claimed{0};
 
     // First reason wins, so the error names what actually stopped the query.
     void request_stop(QueryStop why) noexcept {
@@ -171,6 +176,7 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->stop.store(0u, std::memory_order_relaxed);
         q->cancel_flag = cancel_flag;
         q->limits = limits;
+        q->knobs = nullptr;
         q->mem_used.store(0u, std::memory_order_relaxed);
         q->mem_peak.store(0u, std::memory_order_relaxed);
         q->rows.store(0u, std::memory_order_relaxed);
@@ -178,6 +184,7 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
         q->scanned_bytes.store(0u, std::memory_order_relaxed);
         q->failed.store(0u, std::memory_order_relaxed);
         q->fail_message[0] = '\0';
+        q->mem_claimed.store(0u, std::memory_order_relaxed);
         return q;
     }
     return nullptr;
@@ -185,6 +192,7 @@ inline QueryCtx* query_ctx_acquire(const QueryLimits& limits,
 
 inline void query_ctx_release(QueryCtx* q) noexcept {
     q->cancel_flag = nullptr;
+    q->knobs = nullptr;
     q->generation.fetch_add(1u, std::memory_order_release);
 }
 

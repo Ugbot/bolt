@@ -2897,6 +2897,18 @@ target_link_libraries(test_bolt_limits_build_override
 bolt_apply_hardening(test_bolt_limits_build_override)
 add_test(NAME test_bolt_limits_build_override COMMAND test_bolt_limits_build_override)
 
+# G2CHK-65: operators claim shares of a query's memory limit (bolt_query_claim.h).
+add_executable(test_bolt_query_claim test_bolt_query_claim.cpp)
+target_link_libraries(test_bolt_query_claim PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_query_claim)
+add_test(NAME test_bolt_query_claim COMMAND test_bolt_query_claim)
+
+# G2LAUNCH-156/143: registry knobs as query options; off/on/auto mode words.
+add_executable(test_bolt_query_knobs test_bolt_query_knobs.cpp)
+target_link_libraries(test_bolt_query_knobs PRIVATE bolt::bolt GTest::gtest GTest::gtest_main)
+bolt_apply_hardening(test_bolt_query_knobs)
+add_test(NAME test_bolt_query_knobs COMMAND test_bolt_query_knobs)
+
 # G2CHK-330 (limits L2): stack-array lint (no function-scope array > 16 KiB)
 # and the literal-cap ratchet (no new capacity literal outside *limits.h).
 # Both compare against scripts/limits_lint_baseline/, which may only shrink.
