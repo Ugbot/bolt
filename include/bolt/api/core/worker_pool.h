@@ -147,8 +147,12 @@ struct WorkerPoolConfig {
     size_t task_queue_size = 4096;    // Bounded queue capacity
     size_t blocking_workers = 2;      // Threads for blocking operations
     bool enable_work_stealing = false; // Future: work stealing between workers
-    // Polls an idle worker makes before it parks; 0 parks at once.
-    uint32_t idle_spins = 128;
+    // Polls an idle worker makes before it parks (about 2 us); 0 parks at once.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    uint32_t idle_spins = 1024;  // yield is a nop here
+#else
+    uint32_t idle_spins = 64;    // pause is 40-140 cycles
+#endif
     // Stack size for every spawned worker (main + blocking) thread. These
     // threads resume request-handling coroutines and therefore run arbitrary
     // handler code (SQL/PromQL/etc. compilation, deeply recursive plan
