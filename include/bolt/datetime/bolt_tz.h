@@ -17,6 +17,7 @@
 // inside an overlap takes the earlier offset.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cstdint>
 
 namespace bolt::tz {
@@ -25,10 +26,8 @@ using ZoneId = std::uint32_t;
 
 inline constexpr std::uint32_t kFixedFlag = 0x80000000u;
 inline constexpr std::int32_t  kFixedBias = 1 << 20;
-inline constexpr std::int32_t  kMaxFixedOffsetSec = 18 * 3600;   // java.time bound
 inline constexpr ZoneId        kUtc = kFixedFlag | static_cast<std::uint32_t>(kFixedBias);
 inline constexpr ZoneId        kInvalidZone = 0;
-inline constexpr std::uint32_t kMaxZoneIdChars = 64;
 
 constexpr bool zone_is_fixed(ZoneId z) noexcept { return (z & kFixedFlag) != 0; }
 

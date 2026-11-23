@@ -19,6 +19,7 @@
 // Tiger Style: noexcept, bounded loops, >= 2 asserts per non-trivial function.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -31,7 +32,6 @@ namespace bolt {
 namespace kernels {
 namespace variantspark {
 
-inline constexpr uint32_t kSizeLimit = 16u * 1024u * 1024u;   // Spark VARIANT_SIZE_LIMIT, value and metadata
 
 enum class Status : uint8_t { Ok = 0, Malformed, DuplicateKey, TooLarge, Budget };
 

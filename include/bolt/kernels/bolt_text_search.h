@@ -25,6 +25,7 @@
 // the surviving row ids to sel_out (may alias sel_in). No allocation.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -37,8 +38,6 @@ namespace bolt {
 namespace kernels {
 namespace text {
 
-constexpr uint32_t kTokenMaxNeedle = 255;
-constexpr uint32_t kRegexLiteralMax = 64;
 
 BOLT_FORCE_INLINE bool is_word_byte(uint8_t b) noexcept {
     return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_';

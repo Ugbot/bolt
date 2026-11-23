@@ -9,6 +9,7 @@
 //   list / map:    u32 count + that many elements (a map element is its {key, value} struct)
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -21,9 +22,6 @@
 namespace bolt {
 namespace nested_row {
 
-inline constexpr uint32_t kMaxNodes = 256;
-inline constexpr uint32_t kMaxDepth = 32;
-inline constexpr uint32_t kMaxCount = 1u << 30;     // elements of one list / map value
 
 // A type tree: node 0 is the column; a node's children are nodes[first_child .. first_child + n_children).
 struct TypeNode {

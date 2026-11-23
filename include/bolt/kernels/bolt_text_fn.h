@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -25,7 +26,6 @@ namespace text {
 constexpr int64_t kTextOverflow    = -1;   // output buffer too small
 constexpr int64_t kTextBadFormat   = -2;   // malformed / unsupported spec
 constexpr int64_t kTextBadArgument = -3;   // conversion does not fit the arg
-constexpr uint32_t kFormatMaxWidth = 4096; // width / precision ceiling
 
 // Byte offset just past the first `chars` code points of s[0..len).
 inline uint32_t utf8_prefix_bytes(const char* s, uint32_t len, int64_t chars) noexcept {

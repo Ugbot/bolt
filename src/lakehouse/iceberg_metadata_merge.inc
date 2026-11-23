@@ -6,7 +6,7 @@
 // So a commit to an OPENED table re-emits the document it read and only replaces what the commit owns:
 // the snapshot list and its bookkeeping, plus refs.main. Every other member stays byte-for-byte.
 
-constexpr uint32_t kMergeMaxMembers = 128u;   // members of one metadata document / of its refs or properties
+constexpr uint32_t kMergeMaxMembers = bolt::limits_detail::kIcebergMergeMembers;   // members of one metadata document / of its refs or properties
 
 struct JsonMember {
     const char* key;      // points into the document, past the opening quote

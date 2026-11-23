@@ -9,6 +9,7 @@
 // them. Parsing is ASCII case-insensitive and must consume the whole input.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cstdint>
 
 #include "bolt/datetime/bolt_calendar.h"
@@ -16,10 +17,6 @@
 
 namespace bolt::dtfmt {
 
-inline constexpr std::uint32_t kMaxPatternBytes = 128;
-inline constexpr std::uint32_t kMaxTokens = 64;
-inline constexpr std::uint32_t kMaxLiteralBytes = 128;
-inline constexpr std::uint32_t kMaxFormattedBytes = 256;
 
 struct Token {
     char          letter;      // 0 = literal run

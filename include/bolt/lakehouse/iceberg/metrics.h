@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cstdint>
 
 #include "bolt/lakehouse/iceberg/statistics.h"
@@ -43,7 +44,6 @@ struct MetricsModeSpec {
 };
 
 static constexpr uint32_t kIcebergDefaultTruncateLength = 16u;      // write.metadata.metrics.default: truncate(16)
-static constexpr uint32_t kIcebergDefaultMaxInferredColumns = 100u; // write.metadata.metrics.max-inferred-column-defaults
 
 // Parse a metrics mode as Iceberg-Java's MetricsModes.fromString: none / counts / full / truncate(N) with N > 0,
 // case-insensitive. False on anything else (the caller keeps its default).

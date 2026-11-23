@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/kernels/bolt_u128.h"
 #include <cassert>
 #include <cmath>
@@ -174,7 +175,6 @@ enum class NumFmtErr : int {
     CurMustBeforeDigit, WrongNumDigit, TooLong,
 };
 
-constexpr uint32_t kNumFmtMaxItems = 96;       // format items (digits, separators, the point)
 
 struct NumFmt {
     uint8_t  kind[kNumFmtMaxItems];            // 0 = '9', 1 = '0', 2 = separator, 3 = decimal point

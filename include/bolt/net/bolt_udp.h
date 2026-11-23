@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cstdint>
 
 namespace bolt::net {
@@ -191,7 +192,6 @@ UdpStampedResult udp_recv_stamped(const UdpEndpoint* ep, void* buf, std::uint32_
 // retry. Returns the number of readable endpoints, 0 on timeout, -1 on error.
 // timeout_us == 0 polls. Sub-millisecond waits round up to 1 ms.
 // Preconditions: endpoints != nullptr, 0 < count <= k_udp_wait_endpoints_max.
-constexpr std::uint32_t k_udp_wait_endpoints_max = 64u;
 std::int32_t udp_wait_readable(const UdpEndpoint* const* endpoints, std::uint32_t count,
                                std::uint32_t timeout_us) noexcept;
 

@@ -29,6 +29,7 @@
 // sector-aligned bounce buffer, then copy the requested slice out. Left as a
 // follow-on so buffered correctness ships first rather than half-aligned code.
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/api/io/file.h"
 #include "bolt/api/core/worker_pool.h"
 
@@ -170,7 +171,7 @@ struct file_io::impl {
     // completion reaper — far cheaper than malloc/free on every op.
     std::mutex             pool_mutex;
     std::vector<file_op*>  pool_free;
-    static constexpr size_t kPoolCap = 256;
+    static constexpr size_t kPoolCap = bolt::limits_detail::kIoOpPool;
 
     // stats
     std::atomic<uint64_t> stat_reads{0};

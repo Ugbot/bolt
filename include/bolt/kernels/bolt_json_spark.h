@@ -14,6 +14,7 @@
 // Tiger Style: noexcept, >=2 asserts per non-trivial function, loops bounded by input size.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -28,11 +29,6 @@ namespace bolt {
 namespace kernels {
 namespace jsonspark {
 
-inline constexpr uint32_t kMaxNesting = 1000;       // Jackson StreamReadConstraints.maxNestingDepth
-inline constexpr uint32_t kMaxNumberChars = 1000;   // StreamReadConstraints.maxNumberLength
-inline constexpr uint32_t kMaxPathInstr = 256;      // compiled path instructions (budget json_path_instructions)
-inline constexpr uint32_t kMaxPathBytes = 4096;     // bytes of names in one compiled path
-inline constexpr uint32_t kMaxEvalDepth = 256;      // path-evaluator recursion (flattened array nesting); past it: budget refusal
 
 enum class Tok : uint8_t {
     None = 0, StartObject, EndObject, StartArray, EndArray, FieldName,

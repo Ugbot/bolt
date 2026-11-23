@@ -1,5 +1,6 @@
 // bolt_parquet_variant.cpp — see bolt/ingest/bolt_parquet_variant.h (G2ICE-310).
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/ingest/bolt_parquet_variant.h"
 
 #include <cassert>
@@ -14,7 +15,7 @@ namespace parquet {
 
 namespace {
 
-constexpr uint32_t kMaxObjectFields = 1u << 16;   // keys of one rebuilt object
+constexpr uint32_t kMaxObjectFields = bolt::limits_detail::kVariantObjectFields;   // keys of one rebuilt object
 constexpr int32_t kConvUtf8 = 0, kConvDecimal = 5, kConvDate = 6;   // parquet ConvertedType
 constexpr uint32_t kMaxDepth = 2u * kPqMaxNestDepth + 2u;
 

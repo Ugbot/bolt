@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -31,7 +32,6 @@ namespace text {
 
 constexpr int64_t kTextInvalid = -4;       // input the function rejects (ANSI error / NULL)
 constexpr int64_t kTextTooLong = -6;       // an operand past a kernel's fixed working size
-constexpr uint32_t kEditMaxChars = 8192;   // levenshtein: code points of the shorter string
 constexpr uint32_t kReplacementCp = 0xFFFDu;
 
 // ---- code point helpers ---------------------------------------------------
