@@ -1,0 +1,24 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000401
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Bolt layout: isolation=64, channel slots=64
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- bolt: SIMD tier = NATIVE (toolchain: Clang)
+-- bolt zstd: encoder=reference decoder=reference stream-decoder=bolt libzstd=ON
+-- bolt: GTest not found locally, fetching via FetchContent
+-- The C compiler identification is AppleClang 21.0.0.21000401
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- bolt: ycpp not present -- bolt::ybolt will NOT be built. Install ycpp and set CMAKE_PREFIX_PATH, or add it before bolt in a superproject.
+-- bolt: compiled targets -- io=ON ribbon=ON parse=ON ingest=ON crypto=ON net=ON lakehouse=ON vulkan=OFF rocm=OFF compute_idot=ON
+-- Configuring done (7.7s)
+-- Generating done (8.3s)
+-- Build files have been written to: /Users/bengamble/g2work/wf/idle-park/bolt/build

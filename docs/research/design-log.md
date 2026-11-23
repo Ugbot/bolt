@@ -2576,3 +2576,27 @@ Session arc: 52 (CPU) -> 244 t/s = 4.7x, now 80% of llama.cpp's GPU 304.
 Sinks now: lm_head 0.64 (bandwidth-bound), fused_swiglu 0.26, down 0.22,
 attention 0.19, rmsnorm 0.18. Next: Int4 lm_head (mixed, halves the top sink),
 vectorize the Int4 kernels (Int4 240 < Int8 280 because not vectorized).
+
+## 2026-11-23 / WorkerThreadPool parks on an EventCount (G2PERF-99)
+
+Before: workers slept 200 us, blocking workers 1 ms, in a loop. Idle gestaltd (8 + 64 threads):
+51% of a core at load ~20, 102% at load ~60, ~75k context switches/s, 0.49 of the 0.51 in these loops.
+
+Kept: `bolt::EventCount` (announce, seq_cst fence, re-check, wait; notify is a fence and a load when
+nobody sleeps). The word is the one libc++/libstdc++ wait on natively; a uint64_t on macOS goes through
+a shared hash bucket where notify_one wakes every waiter (Sequence and the Scheduler still do that:
+G2CHK-448). A worker that got an item and sees more wakes another: an MPMC ring can spend a wake on a
+thread that finds the head slot claimed but unpublished. Without that rule the model and the stress test both strand
+a task; without the fence the ping-pong hangs on the M5.
+
+Submit-to-run, old -> new, interleaved, median of 5, box at load 37-56 (M5 Max, 18 cores):
+from idle p50 156 -> 19 us at 1 worker and 31 -> 17 us at 8; steady 100k/s p50 141 -> 8 us at 1 and
+9 -> 1.3 us at 8. Worse: p99 up to 2x on wide blocking pools (187 -> 305 us from idle at 8, 100 -> 208
+us steady 10k/s at 64), because dozens of pollers were a hedge against one slow wake; submit costs
+2-5 us when it has to wake someone (was 0.1-0.3); a single-producer flood of empty tasks runs at 0.4-0.7x,
+because old workers batched behind their sleeps. boltapi loopback through the blocking pool: 1.3-2.9x the
+requests/s, p99 0.25-0.8x.
+
+Not tried: skipping the wake while another worker is searching (Go, tokio). It should win the empty-task
+flood, at the risk of the tail when the searcher is preempted. Worth it if a profile shows submit-side
+wakes in a real workload.
