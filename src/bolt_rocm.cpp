@@ -8,6 +8,7 @@
 // when CMakeLists.txt finds a real hipcc (BOLT_BUILD_ROCM); until then it
 // is not part of any build and cannot break one.
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/bolt_rocm.h"
 
 #include <hip/hip_runtime.h>
@@ -40,8 +41,8 @@ constexpr int32_t kBlockSize = 256;
 // enforced), scores buffer holds the KV context length. 4096 covers decode
 // contexts up to 4K tokens at 16 KB shared; longer falls back to the online
 // kernel (which never materializes scores).
-constexpr int32_t kMaxHeadDim = 256;
-constexpr int32_t kMaxAttnSeq = 4096;
+constexpr int32_t kMaxHeadDim = bolt::limits_detail::kRocmMaxHeadDim;
+constexpr int32_t kMaxAttnSeq = bolt::limits_detail::kRocmMaxAttnSeq;
 
 // BLLM-190: sum-reduce a value across the wavefront via shuffle -- no shared
 // memory, no __syncthreads. Width-agnostic (folds `warpSize` lanes, 32 on RDNA

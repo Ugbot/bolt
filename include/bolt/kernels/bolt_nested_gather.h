@@ -1,5 +1,6 @@
 #pragma once
 // Arena-backed row selection for decoded Flat/Nested column trees.
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
 #include <cassert>
@@ -7,8 +8,6 @@
 
 namespace bolt::kernels {
 namespace nested_gather_detail {
-inline constexpr uint32_t kMaxDepth = 32;
-inline constexpr uint32_t kMaxChildren = 65536;
 inline constexpr uint32_t kMaxRows = INT32_MAX;
 
 inline bool gather(const BoltColumn&, const uint32_t*, uint32_t, Arena*, uint32_t,

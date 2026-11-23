@@ -9,6 +9,7 @@
 // Scalars: bolt_yaml_scalars.inc; collections and the document:
 // bolt_yaml_blocks.inc.
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/parse/bolt_yaml.h"
 
 #include <bit>
@@ -30,7 +31,7 @@ namespace {
 
 namespace bj = bolt::parse::json;
 
-constexpr uint32_t kMaxDepth = 256u;
+constexpr uint32_t kMaxDepth = bolt::limits_detail::kYamlDepth;
 
 // ---- stage 1: word-at-a-time line table ---------------------------------------
 

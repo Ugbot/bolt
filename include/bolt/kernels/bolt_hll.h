@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/bolt_port.h"
 #include "bolt/bolt_hash.h"
 
@@ -292,7 +293,6 @@ BOLT_FORCE_INLINE void hll_add_u64(HllPp<P>* sketch, uint64_t key) noexcept {
 // same register-max merge. Spark's HLL++ picks p per query (bolt_hll_spark.h).
 // ---------------------------------------------------------------------------
 inline constexpr uint32_t k_hll_rt_min_p = 4;
-inline constexpr uint32_t k_hll_rt_max_p = 26;
 
 BOLT_FORCE_INLINE void hll_rt_add_hash(uint8_t* regs, uint32_t p, uint64_t hash) noexcept {
     assert(regs != nullptr);

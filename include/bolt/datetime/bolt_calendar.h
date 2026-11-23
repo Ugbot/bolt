@@ -8,6 +8,7 @@
 // are month ends, else adds the (day, second) difference over a 31-day month.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -20,7 +21,6 @@ namespace bolt::cal {
 inline constexpr std::int64_t kSecPerDay = 86400;
 inline constexpr std::int64_t kMicrosPerDay = kSecPerDay * 1000000;
 // Days representable as Date32 and still convertible to micros without overflow.
-inline constexpr std::int64_t kMaxAbsDays = 106751991LL;
 
 struct LocalFields {
     std::int32_t year;

@@ -163,7 +163,6 @@ include/bolt/lakehouse/iceberg/partition.h::kIcebergMaxSpecs
 include/bolt/lakehouse/iceberg/snapshot.h::kIcebergMaxManifestPath
 include/bolt/lakehouse/iceberg/sort_order.h::kIcebergMaxSortFields
 include/bolt/lakehouse/iceberg/sort_order.h::kIcebergMaxSortOrders
-include/bolt/lakehouse/iceberg/statistics.h::kIcebergMaxStatCols
 include/bolt/lakehouse/iceberg/transform.h::kIcebergMaxTransformName
 include/bolt/lakehouse/iceberg/view.h::kIcebergMaxSql
 include/bolt/lakehouse/iceberg/view.h::kIcebergMaxSqlDialect

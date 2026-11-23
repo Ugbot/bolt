@@ -1,4 +1,5 @@
 #pragma once
+#include "bolt/bolt_kernel_limits.h"
 #include "bolt/ingest/bolt_arrow_ipc_reader.h"
 #include "bolt/bolt_column.h"
 #include "bolt/wire/byte_reader.h"
@@ -9,7 +10,7 @@
 #include <new>
 namespace bolt::ingest::ipc_read_detail {
 using Status = IpcReadStatus;
-inline constexpr std::uint32_t kMaxIpcDepth = 32;   // list/struct/map nesting
+inline constexpr std::uint32_t kMaxIpcDepth = bolt::limits_detail::kIpcReadDepth;   // list/struct/map nesting
 inline bool range(std::uint64_t p, std::uint64_t n, std::uint64_t cap) noexcept {
     return p <= cap && n <= cap-p;
 }

@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -25,8 +26,6 @@ namespace bolt {
 namespace kernels {
 namespace wkb {
 
-constexpr uint32_t k_max_depth = 64u;     // nested geometry collections
-constexpr uint32_t k_max_types = 28u;     // 7 base types x 4 dimension groups
 
 struct Range {
     double lo = 0.0;

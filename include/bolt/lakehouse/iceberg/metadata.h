@@ -4,6 +4,7 @@
 
 namespace bolt::ingest::parquet { struct PqColumn; struct PqMeta; struct PqSchemaTree; }
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cstdint>
 
 #include "bolt/lakehouse/iceberg/iceberg_limits.h"
@@ -58,7 +59,6 @@ struct SchemaField {
     uint32_t     cap_children = 0;
 };
 
-inline constexpr uint32_t kIcebergSchemaMaxDepth = 32u;
 
 // `fields` lives in an arena; a Schema copied by value shares it. Use
 // schema_copy for an independent copy.

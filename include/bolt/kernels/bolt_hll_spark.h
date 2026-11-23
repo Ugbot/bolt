@@ -12,6 +12,7 @@
 //     correction over Spark's tables for p < 19, Java Math.round.
 #pragma once
 
+#include "bolt/bolt_kernel_limits.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -25,7 +26,6 @@ namespace bolt::kernels::hll {
 
 inline constexpr uint64_t k_hll_spark_seed = 42u;
 inline constexpr uint32_t k_hll_spark_knn = 6;
-inline constexpr uint32_t k_hll_spark_bias_max_p = 18;
 
 // Spark's p for a relative standard deviation; 0 when rsd yields p < 4 (Spark
 // refuses) or the value is not finite / positive. May exceed k_hll_rt_max_p:
