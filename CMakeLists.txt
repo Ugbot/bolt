@@ -900,6 +900,12 @@ if(BOLT_BUILD_INGEST)
         src/ingest/bolt_avro.cpp
         src/ingest/bolt_inflate.cpp
         src/ingest/bolt_protobuf.cpp
+        src/ingest/bolt_otlp_common.cpp
+        src/ingest/bolt_otlp_logs.cpp
+        src/ingest/bolt_otlp_spans.cpp
+        src/ingest/bolt_otlp_batch.cpp
+        src/ingest/bolt_otlp_metrics.cpp
+        src/ingest/bolt_otlp_metric_names.cpp
         src/ingest/bolt_roaring.cpp
         src/ingest/bolt_zstd.cpp
         src/ingest/bolt_zstd_dec.cpp
