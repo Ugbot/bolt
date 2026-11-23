@@ -17,14 +17,14 @@
 // CoroPool/PooledPromise symbols are referenced here). Include severed.
 #include "bolt/api/core/coro_task.h"
 #include "bolt/api/core/stacked_thread.h"
+#include "bolt/bolt_event_count.h"
 #include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <functional>
 #include <future>
-#include <mutex>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -147,6 +147,12 @@ struct WorkerPoolConfig {
     size_t task_queue_size = 4096;    // Bounded queue capacity
     size_t blocking_workers = 2;      // Threads for blocking operations
     bool enable_work_stealing = false; // Future: work stealing between workers
+    // Polls an idle worker makes before it parks (about 2 us); 0 parks at once.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    uint32_t idle_spins = 1024;  // yield is a nop here
+#else
+    uint32_t idle_spins = 64;    // pause is 40-140 cycles
+#endif
     // Stack size for every spawned worker (main + blocking) thread. These
     // threads resume request-handling coroutines and therefore run arbitrary
     // handler code (SQL/PromQL/etc. compilation, deeply recursive plan
@@ -217,6 +223,13 @@ private:
     void worker_loop(size_t worker_id);
     void blocking_worker_loop(size_t worker_id);
 
+    // Next item, parking while the queue is empty; false once stop() asked.
+    template <typename Queue>
+    bool next_item(Queue& queue, bolt::EventCount& ready, bolt::EventCount& space,
+                   typename Queue::ValueType* out);
+    void run_task(std::coroutine_handle<> handle);
+    void run_blocking(std::function<void()>& work);
+
     WorkerPoolConfig config_;
     std::vector<StackedThread> workers_;
     std::vector<StackedThread> blocking_workers_;
@@ -226,6 +239,12 @@ private:
     // Blocking task queue (lock-free, aligns with "No Mutexes" principle)
     // Uses a function wrapper queue for blocking operations (file I/O, DNS, etc.)
     MPMCQueue<std::function<void()>, 1024> blocking_task_queue_;
+
+    // Idle workers park on *_ready_, producers facing a full queue on *_space_.
+    bolt::EventCount task_ready_;
+    bolt::EventCount task_space_;
+    bolt::EventCount blocking_ready_;
+    bolt::EventCount blocking_space_;
 
     // Control
     std::atomic<bool> running_{false};
@@ -296,7 +315,10 @@ inline void WorkerThreadPool::stop() {
         std::this_thread::yield();
     shutdown_requested_.store(true, std::memory_order_release);
 
-    // Blocking workers will detect shutdown via polling (no CV needed in lock-free design)
+    task_ready_.notify_all();
+    task_space_.notify_all();
+    blocking_ready_.notify_all();
+    blocking_space_.notify_all();
 
     // Join all workers
     for (auto& t : workers_) {
@@ -323,6 +345,7 @@ inline bool WorkerThreadPool::try_submit_blocking(std::function<void()> work) no
                          !shutdown_requested_.load(std::memory_order_acquire);
     const bool accepted = allowed && blocking_task_queue_.try_push(std::move(work));
     assert(!accepted || allowed);
+    if (accepted) blocking_ready_.notify_one();  // inside the admission stop() waits for
     blocking_admissions_.fetch_sub(1, std::memory_order_seq_cst);
     return accepted;
 }
@@ -334,18 +357,17 @@ inline bool WorkerThreadPool::submit(std::coroutine_handle<> handle) noexcept {
 
     if (task_queue_.try_push(handle)) {
         tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
+        task_ready_.notify_one();
         return true;
     }
     return false;
 }
 
 inline void WorkerThreadPool::submit_wait(std::coroutine_handle<> handle) {
-    while (!submit(handle)) {
-        if (shutdown_requested_.load(std::memory_order_relaxed)) {
-            return;
-        }
-        std::this_thread::yield();
-    }
+    if (!handle) return;
+    task_space_.await(config_.idle_spins, [&] {
+        return submit(handle) || shutdown_requested_.load(std::memory_order_acquire);
+    });
 }
 
 template <typename F>
@@ -357,20 +379,13 @@ auto WorkerThreadPool::submit_blocking(F&& func) -> std::future<std::invoke_resu
     // Use lock-free queue (no mutex, aligns with "No Mutexes" principle)
     std::function<void()> wrapped = [task]() { (*task)(); };
 
-    // Busy-wait until we can enqueue (with backoff)
-    int attempts = 0;
-    while (!blocking_task_queue_.try_push(wrapped)) {
-        if (shutdown_requested_.load(std::memory_order_relaxed)) {
-            break;
+    blocking_space_.await(config_.idle_spins, [&] {
+        if (blocking_task_queue_.try_push(wrapped)) {
+            blocking_ready_.notify_one();
+            return true;
         }
-        // Exponential backoff
-        if (attempts < 10) {
-            std::this_thread::yield();
-            attempts++;
-        } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-    }
+        return shutdown_requested_.load(std::memory_order_acquire);
+    });
 
     return future;
 }
@@ -383,83 +398,52 @@ inline WorkerThreadPool::Stats WorkerThreadPool::get_stats() const noexcept {
     };
 }
 
-inline void WorkerThreadPool::worker_loop(size_t /*worker_id*/) {
-    uint32_t idle_spins = 0;
-    while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        auto handle_opt = task_queue_.try_pop();
-        if (handle_opt) {
-            idle_spins = 0;
-            auto handle = *handle_opt;
-            if (handle && !handle.done()) {
-                handle.resume();
-                tasks_executed_.fetch_add(1, std::memory_order_relaxed);
-            }
-        } else {
-            // Backoff: a few yields for responsiveness, then sleep so idle workers
-            // don't burn a full core each. With inline_resume=true on Linux, the pool
-            // rarely gets tasks — the IO thread handles everything — so sleeping here
-            // is the right default. A futex wake-up is the ideal; 200μs is fine today.
-            ++idle_spins;
-            if (idle_spins < 4u) {
-                std::this_thread::yield();
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
-        }
-    }
+template <typename Queue>
+bool WorkerThreadPool::next_item(Queue& queue, bolt::EventCount& ready, bolt::EventCount& space,
+                                 typename Queue::ValueType* out) {
+    assert(out != nullptr);
+    bool stopping = false;
+    ready.await(config_.idle_spins, [&] {
+        stopping = shutdown_requested_.load(std::memory_order_acquire);
+        if (stopping) return true;
+        auto item = queue.try_pop();
+        if (!item) return false;
+        *out = std::move(*item);
+        return true;
+    });
+    if (stopping) return false;
+    space.notify_one();
+    // Work left behind may have spent its wake on a worker that found the slot
+    // ahead of it unpublished.
+    if (!queue.empty()) ready.notify_one();
+    return true;
+}
 
+inline void WorkerThreadPool::run_task(std::coroutine_handle<> handle) {
+    if (!handle || handle.done()) return;
+    handle.resume();
+    tasks_executed_.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void WorkerThreadPool::run_blocking(std::function<void()>& work) {
+    if (!work) return;
+    work();
+    work = nullptr;
+    blocking_tasks_executed_.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void WorkerThreadPool::worker_loop(size_t /*worker_id*/) {
+    std::coroutine_handle<> handle;
+    while (next_item(task_queue_, task_ready_, task_space_, &handle)) run_task(handle);
     // Drain remaining tasks on shutdown
-    while (auto handle_opt = task_queue_.try_pop()) {
-        auto handle = *handle_opt;
-        if (handle && !handle.done()) {
-            handle.resume();
-            tasks_executed_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
+    while (auto left = task_queue_.try_pop()) run_task(*left);
 }
 
 inline void WorkerThreadPool::blocking_worker_loop(size_t /*worker_id*/) {
-    // Lock-free blocking worker loop (no mutex, aligns with "No Mutexes" principle)
-    // Uses busy-waiting with exponential backoff instead of condition variables
-
-    int idle_count = 0;
-    while (!shutdown_requested_.load(std::memory_order_acquire)) {
-        auto task_opt = blocking_task_queue_.try_pop();
-
-        if (task_opt) {
-            // Got a task - execute it
-            auto& task = *task_opt;
-            if (task) {
-                task();
-                blocking_tasks_executed_.fetch_add(1, std::memory_order_relaxed);
-            }
-            idle_count = 0;  // Reset idle counter
-        } else {
-            // No task available - use exponential backoff
-            if (idle_count < 10) {
-                // Spin briefly for low latency
-                std::this_thread::yield();
-                idle_count++;
-            } else if (idle_count < 100) {
-                // Short sleep
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-                idle_count++;
-            } else {
-                // Longer sleep when idle
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                // Don't increment further to stay at this level
-            }
-        }
-    }
-
+    std::function<void()> work;
+    while (next_item(blocking_task_queue_, blocking_ready_, blocking_space_, &work)) run_blocking(work);
     // Drain remaining tasks on shutdown
-    while (auto task_opt = blocking_task_queue_.try_pop()) {
-        auto& task = *task_opt;
-        if (task) {
-            task();
-            blocking_tasks_executed_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
+    while (auto left = blocking_task_queue_.try_pop()) run_blocking(*left);
 }
 
 // =============================================================================

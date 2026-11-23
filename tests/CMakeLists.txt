@@ -2782,6 +2782,20 @@ if(TARGET bolt_reactor)
         RUN_SERIAL TRUE TIMEOUT 180)
 endif()
 
+# G2PERF-99 — park/notify: exhaustive protocol model, pool stress, idle CPU.
+add_executable(test_bolt_event_count test_bolt_event_count.cpp)
+target_link_libraries(test_bolt_event_count PRIVATE bolt::bolt GTest::gtest_main)
+bolt_apply_hardening(test_bolt_event_count)
+add_test(NAME test_bolt_event_count COMMAND test_bolt_event_count)
+set_tests_properties(test_bolt_event_count PROPERTIES TIMEOUT 300)
+if(TARGET bolt_reactor)
+    add_executable(test_bolt_worker_pool_park test_bolt_worker_pool_park.cpp)
+    target_link_libraries(test_bolt_worker_pool_park PRIVATE bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_worker_pool_park)
+    add_test(NAME test_bolt_worker_pool_park COMMAND test_bolt_worker_pool_park)
+    set_tests_properties(test_bolt_worker_pool_park PROPERTIES TIMEOUT 300)
+endif()
+
 # timer_queue — backend-agnostic reactor timer facility (STATION-82). Was not
 # wired into the test build at all (found while doing the G2CHK-85 Part 4
 # broader sweep); the file is self-contained (plain assert-based main(), no
