@@ -2082,6 +2082,18 @@ if(BOLT_BUILD_INGEST)
     bolt_apply_hardening(test_bolt_protobuf)
     add_test(NAME test_bolt_protobuf COMMAND test_bolt_protobuf)
 
+    add_executable(test_bolt_otlp test_bolt_otlp.cpp)
+    target_link_libraries(test_bolt_otlp
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_otlp)
+    add_test(NAME test_bolt_otlp COMMAND test_bolt_otlp)
+
+    add_executable(test_bolt_otlp_metrics test_bolt_otlp_metrics.cpp)
+    target_link_libraries(test_bolt_otlp_metrics
+        PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_otlp_metrics)
+    add_test(NAME test_bolt_otlp_metrics COMMAND test_bolt_otlp_metrics)
+
     add_executable(test_bolt_roaring test_bolt_roaring.cpp)
     target_link_libraries(test_bolt_roaring
         PRIVATE bolt::bolt bolt::ingest GTest::gtest GTest::gtest_main)
