@@ -1160,7 +1160,8 @@ if(BOLT_BUILD_CRYPTO AND BOLT_WITH_TLS AND OpenSSL_FOUND)
 endif()
 
 if(BOLT_BUILD_NET)
-add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp src/net/bolt_udp.cpp)
+add_library(bolt_net STATIC src/net/bolt_tls.cpp src/net/bolt_http_client.cpp src/net/bolt_udp.cpp
+            src/net/bolt_udp_batch.cpp)
 add_library(bolt::net ALIAS bolt_net)
 target_link_libraries(bolt_net PUBLIC bolt::core)
 target_include_directories(bolt_net PUBLIC

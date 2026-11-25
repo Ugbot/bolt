@@ -131,6 +131,22 @@ private:
 };
 
 /// Awaitable for async accept operations
+// Readiness only (G2CHK-1271): resumes when fd is readable, doing no I/O. Use
+// after a non-blocking read (udp_recv_batch, a TLS read) returned would-block.
+// Result: 0 readable, -1 closed / error.
+class ReadableAwaitable {
+public:
+    ReadableAwaitable(IODispatcher* dispatcher, int fd) noexcept : dispatcher_(dispatcher), fd_(fd) {}
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
+    int await_resume() const noexcept { return result_; }
+private:
+    friend class IODispatcher;
+    IODispatcher* dispatcher_;
+    int fd_;
+    int result_ = 0;
+};
+
 class AcceptAwaitable {
 public:
     AcceptAwaitable(IODispatcher* dispatcher, int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept
@@ -261,6 +277,9 @@ public:
     /// Async accept - returns awaitable
     /// @param listen_fd Listening socket file descriptor
     /// @return Awaitable that yields accepted fd, or -1 on error
+    ReadableAwaitable async_readable(int fd) noexcept {
+        return ReadableAwaitable(this, fd);
+    }
     AcceptAwaitable async_accept(int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept {
         return AcceptAwaitable(this, listen_fd, retirement);
     }
@@ -408,6 +427,7 @@ private:
     friend class ConnectAwaitable;
     friend class RecvFromAwaitable;
     friend class SendToAwaitable;
+    friend class ReadableAwaitable;
     friend class CoroTcpListener;
 
     void io_thread_loop(size_t thread_id);

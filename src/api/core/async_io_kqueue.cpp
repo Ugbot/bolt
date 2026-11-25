@@ -573,6 +573,19 @@ int kqueue_io::sendto_async(
     return 0;
 }
 
+int kqueue_io::readable_async(int fd, io_callback callback, void* user_data) noexcept {
+    if (!impl_->fast_ok(fd)) return impl_->read_oneshot(io_op::readable, fd, nullptr, 0, nullptr, nullptr, callback, user_data);
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
+    op->operation = io_op::readable;
+    op->fd = fd;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    return impl_->arm_fast(op, EVFILT_READ, st);
+}
+
 int kqueue_io::close_async(int fd) noexcept {
     // Complete in-flight ops with -1 before close() silently drops their
     // knotes (epoll_io/IOCP parity: UdpTransport::stop() waits on them).
@@ -613,7 +626,8 @@ void kqueue_io::impl::on_persistent(const struct kevent& kev) noexcept {
     assert(op.fd == fd);
     ssize_t n = 0;
     detail::TryResult t = detail::TryResult::would_block;
-    if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
+    if (op.operation == io_op::readable) t = detail::TryResult::done;  // n = 0: readable
+    else if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
     else if (op.operation == io_op::recvfrom) t = detail::try_recvfrom(fd, op.buffer, op.size, op.user_src, op.user_srclen, &n);
     else if (op.operation == io_op::write) t = detail::try_send(fd, op.buffer, op.size, &n);
     if (t == detail::TryResult::would_block) {

@@ -2894,6 +2894,14 @@ if(TARGET bolt_reactor)
     endforeach()
 endif()
 
+# Batched datagram I/O + reactor readiness (G2CHK-1271).
+if(NOT WIN32 AND TARGET bolt_reactor AND TARGET bolt_net)
+    add_executable(test_bolt_udp_batch test_bolt_udp_batch.cpp)
+    target_link_libraries(test_bolt_udp_batch PRIVATE bolt::net bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_udp_batch)
+    add_test(NAME test_bolt_udp_batch COMMAND test_bolt_udp_batch)
+endif()
+
 # async_io readiness backends (G2ETL-56): pooled ops, close_async completes
 # in-flight ops. kqueue/epoll only.
 if(NOT WIN32 AND TARGET bolt_reactor)

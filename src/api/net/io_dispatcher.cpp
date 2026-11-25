@@ -173,6 +173,22 @@ void SendToAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+bool ReadableAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    ReadableAwaitable* self = this;
+    const int rc = dispatcher_->current_io()->readable_async(
+        fd_,
+        [self, handle](const core::io_event& event) {
+            self->result_ = event.result < 0 ? -1 : 0;
+            self->dispatcher_->resume_on_worker(handle);
+        },
+        nullptr);
+    if (rc == 0) return true;
+    result_ = -1;
+    if (dispatcher_->config_.inline_resume || dispatcher_->worker_pool_ == nullptr) return false;
+    dispatcher_->resume_on_worker(handle);
+    return true;
+}
+
 void AcceptAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->accepts_started_.fetch_add(1, std::memory_order_relaxed);
 
