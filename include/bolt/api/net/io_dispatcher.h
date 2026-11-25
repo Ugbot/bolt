@@ -47,7 +47,7 @@ public:
         : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -66,7 +66,7 @@ public:
         : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -93,7 +93,7 @@ public:
           src_(src), srclen_(srclen) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -411,6 +411,11 @@ private:
 
     // Submit coroutine to worker pool for resumption
     void resume_on_worker(std::coroutine_handle<> handle) noexcept;
+
+    // Where an awaitable may take a try-first result and resume inline, or null
+    // when it must not (worker-pool resumption, or this turn's inline budget,
+    // limits::kMaxInlineIoStreak, is spent). G2CHK-1269.
+    ssize_t* inline_slot(ssize_t* result) noexcept;
 
     // The async_io engine the CURRENT thread should register an op on. On an IO
     // thread it returns that thread's own engine (thread-per-core: ops register

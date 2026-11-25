@@ -328,7 +328,8 @@ int iocp_io::read_async(
     void* buffer,
     size_t size,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* /*inline_result: IOCP completes through the port*/
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
     if (impl_->associate_socket(sock) != 0) {
@@ -366,7 +367,8 @@ int iocp_io::write_async(
     const void* buffer,
     size_t size,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* /*inline_result: IOCP completes through the port*/
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
     if (impl_->associate_socket(sock) != 0) {
@@ -456,7 +458,8 @@ int iocp_io::recvfrom_async(
     struct sockaddr* src,
     socklen_t* srclen,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* /*inline_result: IOCP completes through the port*/
 ) noexcept {
     SOCKET sock = (SOCKET)fd;
     if (impl_->associate_socket(sock) != 0) {

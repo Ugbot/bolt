@@ -748,11 +748,11 @@ int io_uring_io::accept_async(int listen_fd, io_callback callback, void* user_da
     return impl_->submit_accept(listen_fd, std::move(callback), user_data, retirement);
 }
 int io_uring_io::read_async(int fd, void* buffer, std::size_t size,
-                            io_callback callback, void* user_data) noexcept {
+                            io_callback callback, void* user_data, ssize_t*) noexcept {
     return impl_->submit_read(fd, buffer, size, std::move(callback), user_data);
 }
 int io_uring_io::write_async(int fd, const void* buffer, std::size_t size,
-                             io_callback callback, void* user_data) noexcept {
+                             io_callback callback, void* user_data, ssize_t*) noexcept {
     return impl_->submit_write(fd, buffer, size, std::move(callback), user_data);
 }
 int io_uring_io::connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen,
@@ -761,7 +761,7 @@ int io_uring_io::connect_async(int fd, const struct sockaddr* addr, socklen_t ad
 }
 int io_uring_io::recvfrom_async(int fd, void* buffer, std::size_t size,
                                 struct sockaddr* src, socklen_t* srclen,
-                                io_callback callback, void* user_data) noexcept {
+                                io_callback callback, void* user_data, ssize_t*) noexcept {
     return impl_->submit_recvfrom(fd, buffer, size, src, srclen, std::move(callback), user_data);
 }
 int io_uring_io::sendto_async(int fd, const void* buffer, std::size_t size,

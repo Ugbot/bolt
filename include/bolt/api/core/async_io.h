@@ -159,21 +159,38 @@ public:
     }
     
     /**
+     * Release an fd that was closed without close_async (a raw close()), so a
+     * readiness backend does not keep treating a reused fd number as
+     * registered. Every close, accept and connect through async_io already
+     * does this.
+     */
+    static void forget_fd(int fd) noexcept;
+
+    /**
      * Submit async read operation
-     * 
+     *
+     * On kqueue and epoll, a call from the thread that polls the engine tries
+     * the read first (G2CHK-1269). If it finishes and `inline_result` is
+     * non-null, the result is stored there, the callback is NOT called, and
+     * the return is 1. If it finishes and `inline_result` is null, the callback
+     * runs from the next poll(). Otherwise the op waits for readiness: 0.
+     * The same contract holds for write_async and recvfrom_async.
+     *
      * @param fd Socket FD
      * @param buffer Buffer to read into
      * @param size Buffer size
      * @param callback Callback when read completes
      * @param user_data User data
-     * @return 0 on success
+     * @param inline_result Where a result finished on the submit path goes
+     * @return 0 queued, 1 finished inline, -1 on error
      */
     virtual int read_async(
         int fd,
         void* buffer,
         size_t size,
         io_callback callback,
-        void* user_data = nullptr
+        void* user_data = nullptr,
+        ssize_t* inline_result = nullptr
     ) noexcept = 0;
     
     /**
@@ -191,7 +208,8 @@ public:
         const void* buffer,
         size_t size,
         io_callback callback,
-        void* user_data = nullptr
+        void* user_data = nullptr,
+        ssize_t* inline_result = nullptr
     ) noexcept = 0;
     
     /**
@@ -240,7 +258,8 @@ public:
         struct sockaddr* src,
         socklen_t* srclen,
         io_callback callback,
-        void* user_data = nullptr
+        void* user_data = nullptr,
+        ssize_t* inline_result = nullptr
     ) noexcept = 0;
 
     /**
@@ -340,6 +359,9 @@ public:
         uint64_t events{0};
         uint64_t errors{0};
         uint64_t wakes{0};
+        uint64_t registrations{0};       // kernel interest registrations (kevent EV_ADD, epoll_ctl, ...)
+        uint64_t inline_completions{0};  // ops finished by a try on the submit path, resumed inline
+        uint64_t deferred_completions{0};// ops finished by a try, delivered by the next poll
     };
 
     virtual stats get_stats() const noexcept = 0;
@@ -392,10 +414,10 @@ public:
 protected:
     AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
 public:
-    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
-    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
+    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
+    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
-    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
@@ -433,10 +455,10 @@ public:
 protected:
     AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
 public:
-    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
-    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
+    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
+    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
-    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
@@ -473,10 +495,10 @@ public:
 protected:
     AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
 public:
-    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
-    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
+    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
+    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
-    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
@@ -527,10 +549,10 @@ public:
 protected:
     AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept override;
 public:
-    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
-    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
+    int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
+    int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
-    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 

@@ -29,6 +29,8 @@
 #include <memory>
 #include <vector>
 
+#include "readiness_fast_path.h"
+
 namespace bolt::api {
 namespace core {
 
@@ -55,6 +57,9 @@ struct pending_op {
     struct sockaddr* user_src{nullptr};
     socklen_t*       user_srclen{nullptr};
 
+    // Result of a try made on the submit path, delivered from the deferred ring.
+    ssize_t result{0};
+
     // Stable slot in the fixed op pool; the op is never freed or relocated.
     std::uint32_t pool_index{0};
 
@@ -69,6 +74,7 @@ struct pending_op {
         addrlen = 0;
         user_src = nullptr;
         user_srclen = nullptr;
+        result = 0;
     }
 };
 
@@ -96,6 +102,9 @@ struct kqueue_io::impl {
     std::atomic<uint64_t> stat_events{0};
     std::atomic<uint64_t> stat_errors{0};
     std::atomic<uint64_t> stat_wakes{0};
+    std::atomic<uint64_t> stat_registrations{0};
+    std::atomic<uint64_t> stat_inline{0};
+    std::atomic<uint64_t> stat_deferred{0};
 
     // Fixed op pool + tagged Treiber free list (mirrors epoll_io). kevent.udata
     // carries pool_index+1. kqueue arms EVFILT_READ and EVFILT_WRITE on one fd
@@ -107,6 +116,15 @@ struct kqueue_io::impl {
     std::vector<std::atomic<std::uint32_t>> free_next{std::vector<std::atomic<std::uint32_t>>(kOpPoolSize)};
     std::atomic<std::uint64_t>              free_head{0};  // (tag<<32)|(index+1); 0=empty
     std::vector<std::atomic<std::uint32_t>> fd_slot{std::vector<std::atomic<std::uint32_t>>(2 * kMaxFds)};
+
+    // Register-once / try-first path (G2CHK-1269), owner thread only.
+    static constexpr std::uintptr_t kPersistUdata = ~std::uintptr_t{0};
+    static constexpr int kChangeBatch = static_cast<int>(net::limits::kReadinessChangeBatch);
+    detail::EngineOwner owner;
+    std::vector<detail::FdFast> fast{std::vector<detail::FdFast>(kMaxFds)};
+    detail::DeferredRing<kOpPoolSize> deferred;
+    struct kevent changes[kChangeBatch];
+    int nchanges{0};
 
     void init_op_pool() noexcept {
         for (std::uint32_t i = 0; i < kOpPoolSize; ++i) {
@@ -176,6 +194,8 @@ struct kqueue_io::impl {
         assert(op != nullptr);
         assert(filter == EVFILT_READ || filter == EVFILT_WRITE);
         const std::uint32_t idx_p1 = op->pool_index + 1;
+        if (op->fd >= 0 && op->fd < kMaxFds) detail::fd_epoch_bump(op->fd);
+        stat_registrations.fetch_add(1, std::memory_order_relaxed);
         std::atomic<std::uint32_t>* slot = slot_for(op->fd, filter);
         if (slot) {
             const std::uint32_t displaced = slot->exchange(idx_p1, std::memory_order_acq_rel);
@@ -194,6 +214,107 @@ struct kqueue_io::impl {
         }
         return 0;
     }
+
+
+    bool fast_ok(int fd) const noexcept {
+        return fd >= 0 && fd < kMaxFds && owner.on_owner();
+    }
+
+    void flush_changes() noexcept {
+        assert(nchanges >= 0 && nchanges <= kChangeBatch);
+        if (nchanges == 0) return;
+        if (kevent(kq_fd, changes, nchanges, nullptr, 0, nullptr) < 0) {
+            stat_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        nchanges = 0;
+    }
+
+    // Persistent EV_CLEAR registration, folded into the next wait's changelist.
+    void ensure_filter(int fd, detail::FdFast& st, int16_t filter) noexcept {
+        assert(filter == EVFILT_READ || filter == EVFILT_WRITE);
+        const std::uint8_t bit = filter == EVFILT_READ ? detail::kFdRegRead : detail::kFdRegWrite;
+        if ((st.flags & bit) != 0) return;
+        if (nchanges == kChangeBatch) flush_changes();
+        EV_SET(&changes[nchanges], fd, filter, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
+               reinterpret_cast<void*>(kPersistUdata));
+        ++nchanges;
+        st.flags |= bit;
+        stat_registrations.fetch_add(1, std::memory_order_relaxed);
+        assert(nchanges <= kChangeBatch);
+    }
+
+    void purge_changes(int fd) noexcept {
+        int kept = 0;
+        for (int i = 0; i < nchanges; ++i) {
+            if (static_cast<int>(changes[i].ident) != fd) changes[kept++] = changes[i];
+        }
+        nchanges = kept;
+        assert(nchanges >= 0);
+    }
+
+    int arm_fast(pending_op* op, int16_t filter, detail::FdFast& st) noexcept {
+        assert(op != nullptr);
+        std::atomic<std::uint32_t>* slot = slot_for(op->fd, filter);
+        assert(slot != nullptr);
+        const std::uint32_t displaced = slot->exchange(op->pool_index + 1, std::memory_order_acq_rel);
+        if (displaced != 0) free_index(displaced - 1);
+        ensure_filter(op->fd, st, filter);
+        return 0;
+    }
+
+    // A try on the submit path finished the op: hand the result back inline, or
+    // queue it for the next poll when the caller cannot resume inline.
+    int finish_early(io_op operation, int fd, ssize_t result, io_callback& cb,
+                     void* user_data, ssize_t* inline_result) noexcept {
+        if (inline_result != nullptr) {
+            *inline_result = result;
+            stat_inline.fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
+        pending_op* op = alloc_op();
+        if (op == nullptr) return -1;
+        op->operation = operation;
+        op->fd = fd;
+        op->callback = std::move(cb);
+        op->user_data = user_data;
+        op->result = result;
+        const bool pushed = deferred.push(op->pool_index);
+        assert(pushed && "deferred ring is sized to the op pool");
+        (void)pushed;
+        stat_deferred.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+
+    void run_deferred() noexcept {
+        std::uint32_t budget = deferred.count;
+        std::uint32_t index = 0;
+        while (budget-- > 0 && deferred.pop(&index)) {
+            pending_op& op = op_pool[index];
+            const io_event event{op.operation, op.fd, op.user_data, op.result, 0u};
+            if (op.callback) op.callback(event);
+            free_index(index);
+        }
+    }
+
+    // One-shot path: another thread's submit, a non-socket fd, or an fd past the table.
+    int read_oneshot(io_op operation, int fd, void* buffer, size_t size, struct sockaddr* src,
+                     socklen_t* srclen, io_callback& callback, void* user_data) noexcept {
+        set_nonblocking(fd);
+        pending_op* op = alloc_op();
+        if (op == nullptr) return -1;
+        op->operation = operation;
+        op->fd = fd;
+        op->buffer = buffer;
+        op->size = size;
+        op->user_src = src;
+        op->user_srclen = srclen;
+        op->callback = std::move(callback);
+        op->user_data = user_data;
+        return register_op(op, EVFILT_READ);
+    }
+
+    // A persistent filter fired: run the waiting op, or note readiness for the next arm.
+    void on_persistent(const struct kevent& kev) noexcept;
 
     // Complete a claimed in-flight op with -1 (closed / cancelled).
     void cancel_slot(int fd, int16_t filter) noexcept {
@@ -281,10 +402,30 @@ int kqueue_io::read_async(
     void* buffer,
     size_t size,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* inline_result
 ) noexcept {
-    impl_->set_nonblocking(fd);
-    
+    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
+    if (!impl_->fast_ok(fd)) {
+        return impl_->read_oneshot(io_op::read, fd, buffer, size, nullptr, nullptr,
+                                   callback, user_data);
+    }
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    if ((st.flags & detail::kFdReadDrained) == 0 && (st.flags & detail::kFdNotSocket) == 0) {
+        ssize_t n = 0;
+        const detail::TryResult t = detail::try_recv(fd, buffer, size, &n);
+        if (t == detail::TryResult::done) {
+            if (n > 0 && static_cast<size_t>(n) < size) st.flags |= detail::kFdReadDrained;
+            return impl_->finish_early(io_op::read, fd, n, callback, user_data, inline_result);
+        }
+        if (t == detail::TryResult::not_socket) st.flags |= detail::kFdNotSocket;
+        else st.flags |= detail::kFdReadDrained;
+    }
+    if ((st.flags & detail::kFdNotSocket) != 0) {
+        return impl_->read_oneshot(io_op::read, fd, buffer, size, nullptr, nullptr,
+                                   callback, user_data);
+    }
     pending_op* op = impl_->alloc_op();
     if (op == nullptr) return -1;
     op->operation = io_op::read;
@@ -293,9 +434,7 @@ int kqueue_io::read_async(
     op->size = size;
     op->callback = std::move(callback);
     op->user_data = user_data;
-
-    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(op, EVFILT_READ);
+    return impl_->arm_fast(op, EVFILT_READ, st);
 }
 
 int kqueue_io::write_async(
@@ -303,10 +442,22 @@ int kqueue_io::write_async(
     const void* buffer,
     size_t size,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* inline_result
 ) noexcept {
-    impl_->set_nonblocking(fd);
-    
+    impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
+    const bool fast = impl_->fast_ok(fd);
+    detail::FdFast* st = fast ? &detail::fd_fast_current(impl_->fast.data(), fd) : nullptr;
+    if (st != nullptr) detail::ensure_nonblocking(fd, *st);
+    if (st != nullptr && (st->flags & detail::kFdNotSocket) == 0) {
+        ssize_t n = 0;
+        const detail::TryResult t = detail::try_send(fd, buffer, size, &n);
+        if (t == detail::TryResult::done) {
+            return impl_->finish_early(io_op::write, fd, n, callback, user_data, inline_result);
+        }
+        if (t == detail::TryResult::not_socket) st->flags |= detail::kFdNotSocket;
+    }
+    if (st == nullptr || (st->flags & detail::kFdNotSocket) != 0) impl_->set_nonblocking(fd);
     pending_op* op = impl_->alloc_op();
     if (op == nullptr) return -1;
     op->operation = io_op::write;
@@ -315,9 +466,10 @@ int kqueue_io::write_async(
     op->size = size;
     op->callback = std::move(callback);
     op->user_data = user_data;
-
-    impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(op, EVFILT_WRITE);
+    if (st == nullptr || (st->flags & detail::kFdNotSocket) != 0) {
+        return impl_->register_op(op, EVFILT_WRITE);
+    }
+    return impl_->arm_fast(op, EVFILT_WRITE, *st);
 }
 
 int kqueue_io::connect_async(
@@ -356,10 +508,24 @@ int kqueue_io::recvfrom_async(
     struct sockaddr* src,
     socklen_t* srclen,
     io_callback callback,
-    void* user_data
+    void* user_data,
+    ssize_t* inline_result
 ) noexcept {
-    impl_->set_nonblocking(fd);
-
+    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
+    if (!impl_->fast_ok(fd)) {
+        return impl_->read_oneshot(io_op::recvfrom, fd, buffer, size, src, srclen,
+                                   callback, user_data);
+    }
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    if ((st.flags & detail::kFdReadDrained) == 0) {
+        ssize_t n = 0;
+        const detail::TryResult t = detail::try_recvfrom(fd, buffer, size, src, srclen, &n);
+        if (t == detail::TryResult::done) {
+            return impl_->finish_early(io_op::recvfrom, fd, n, callback, user_data, inline_result);
+        }
+        st.flags |= detail::kFdReadDrained;  // a datagram read is drained only on EAGAIN
+    }
     pending_op* op = impl_->alloc_op();
     if (op == nullptr) return -1;
     op->operation = io_op::recvfrom;
@@ -370,9 +536,7 @@ int kqueue_io::recvfrom_async(
     op->user_srclen = srclen;
     op->callback = std::move(callback);
     op->user_data = user_data;
-
-    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(op, EVFILT_READ);
+    return impl_->arm_fast(op, EVFILT_READ, st);
 }
 
 int kqueue_io::sendto_async(
@@ -384,11 +548,13 @@ int kqueue_io::sendto_async(
     io_callback callback,
     void* user_data
 ) noexcept {
-    impl_->set_nonblocking(fd);
+    if (impl_->fast_ok(fd)) detail::ensure_nonblocking(fd, detail::fd_fast_current(impl_->fast.data(), fd));
+    else impl_->set_nonblocking(fd);
 
     // UDP sendto rarely blocks: send directly in the submit path and deliver
     // the completion synchronously. `buffer`/`dst` are valid for this call.
-    ssize_t n = ::sendto(fd, buffer, size, 0, dst, dstlen);
+    // MSG_DONTWAIT replaces the per-datagram fcntl pair (G2CHK-1269).
+    ssize_t n = ::sendto(fd, buffer, size, MSG_DONTWAIT, dst, dstlen);
 
     impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
 
@@ -409,8 +575,58 @@ int kqueue_io::close_async(int fd) noexcept {
     // knotes (epoll_io/IOCP parity: UdpTransport::stop() waits on them).
     impl_->cancel_slot(fd, EVFILT_READ);
     impl_->cancel_slot(fd, EVFILT_WRITE);
+    if (fd >= 0 && fd < impl::kMaxFds) {
+        if (impl_->owner.on_owner()) impl_->purge_changes(fd);
+        detail::fd_epoch_bump(fd);
+    }
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
     return close(fd);
+}
+
+void kqueue_io::impl::on_persistent(const struct kevent& kev) noexcept {
+    const int fd = static_cast<int>(kev.ident);
+    assert(kev.filter == EVFILT_READ || kev.filter == EVFILT_WRITE);
+    std::atomic<std::uint32_t>* slot = slot_for(fd, kev.filter);
+    if (slot == nullptr) return;
+    if ((kev.flags & EV_ERROR) != 0) {
+        // The registration itself failed: forget it so the next arm registers again,
+        // and fail the waiting op rather than leave it parked on nothing.
+        detail::fd_epoch_bump(fd);
+        const std::uint32_t idx_p1 = slot->exchange(0, std::memory_order_acq_rel);
+        if (idx_p1 == 0) return;
+        pending_op& op = op_pool[idx_p1 - 1];
+        const io_event event{op.operation, op.fd, op.user_data, -1, kev.flags};
+        if (op.callback) op.callback(event);
+        free_index(idx_p1 - 1);
+        return;
+    }
+    const std::uint32_t idx_p1 = slot->exchange(0, std::memory_order_acq_rel);
+    detail::FdFast& st = detail::fd_fast_current(fast.data(), fd);
+    if (idx_p1 == 0) {
+        if (kev.filter == EVFILT_READ) st.flags &= static_cast<std::uint8_t>(~detail::kFdReadDrained);
+        return;
+    }
+    pending_op& op = op_pool[idx_p1 - 1];
+    assert(op.fd == fd);
+    ssize_t n = 0;
+    detail::TryResult t = detail::TryResult::would_block;
+    if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
+    else if (op.operation == io_op::recvfrom) t = detail::try_recvfrom(fd, op.buffer, op.size, op.user_src, op.user_srclen, &n);
+    else if (op.operation == io_op::write) t = detail::try_send(fd, op.buffer, op.size, &n);
+    if (t == detail::TryResult::would_block) {
+        slot->store(idx_p1, std::memory_order_release);  // spurious edge: keep waiting
+        return;
+    }
+    if (op.operation == io_op::read && n > 0 && static_cast<size_t>(n) < op.size) {
+        st.flags |= detail::kFdReadDrained;
+    } else if (op.operation != io_op::write) {
+        // A full read, or one datagram: more may be queued behind it.
+        st.flags &= static_cast<std::uint8_t>(~detail::kFdReadDrained);
+    }
+    if (t == detail::TryResult::not_socket) n = -1;
+    const io_event event{op.operation, op.fd, op.user_data, n, kev.flags};
+    if (op.callback) op.callback(event);
+    free_index(idx_p1 - 1);
 }
 
 int kqueue_io::poll(uint32_t timeout_us) noexcept {
@@ -418,13 +634,20 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     if (impl_->kq_fd < 0) return -1;
     
     impl_->stat_polls.fetch_add(1, std::memory_order_relaxed);
-    
+    impl_->owner.note_poll();
+    const bool fast = impl_->owner.on_owner();
+    if (fast) impl_->run_deferred();
+    if (fast && impl_->deferred.count != 0) timeout_us = 0;
+
     struct kevent events[128];
     struct timespec timeout;
     timeout.tv_sec = timeout_us / 1000000;
     timeout.tv_nsec = (timeout_us % 1000000) * 1000;
-    
-    int n = kevent(impl_->kq_fd, nullptr, 0, events, 128, &timeout);
+
+    const int nchanges = fast ? impl_->nchanges : 0;
+    int n = kevent(impl_->kq_fd, impl_->changes, nchanges, events, 128, &timeout);
+    if (fast) impl_->nchanges = 0;
+    if (n < 0 && errno == EINTR) return 0;
     if (n < 0) {
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
@@ -446,6 +669,10 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
             continue;
         }
 
+        if (reinterpret_cast<std::uintptr_t>(kev.udata) == impl::kPersistUdata) {
+            impl_->on_persistent(kev);
+            continue;
+        }
         const auto idx_p1 = static_cast<std::uint32_t>(
             reinterpret_cast<std::uintptr_t>(kev.udata));
         if (idx_p1 == 0 || idx_p1 > impl::kOpPoolSize) continue;
@@ -474,6 +701,7 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
                 struct sockaddr_storage addr;
                 socklen_t addrlen = sizeof(addr);
                 int client_fd = accept(op->fd, (struct sockaddr*)&addr, &addrlen);
+                if (client_fd >= 0 && client_fd < impl::kMaxFds) detail::fd_epoch_bump(client_fd);
                 event.result = client_fd;
                 break;
             }
@@ -594,6 +822,9 @@ async_io::stats kqueue_io::get_stats() const noexcept {
     s.events = impl_->stat_events.load(std::memory_order_relaxed);
     s.errors = impl_->stat_errors.load(std::memory_order_relaxed);
     s.wakes = impl_->stat_wakes.load(std::memory_order_relaxed);
+    s.registrations = impl_->stat_registrations.load(std::memory_order_relaxed);
+    s.inline_completions = impl_->stat_inline.load(std::memory_order_relaxed);
+    s.deferred_completions = impl_->stat_deferred.load(std::memory_order_relaxed);
     return s;
 }
 
