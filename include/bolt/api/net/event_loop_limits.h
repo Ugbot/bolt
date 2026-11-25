@@ -26,6 +26,9 @@ inline constexpr uint32_t kReactorTimersMax = 16384;
 // the write is refused with -1 (G2CHK-1273).
 inline constexpr uint32_t kCorkedFds = 64;
 inline constexpr uint32_t kCorkedWritesPerFd = 32;
+// kqueue waits up to this long also arm a one-shot non-coalesced EVFILT_TIMER
+// (XNU coalesces plain kevent timeouts by up to ~1 ms) (G2CHK-1273).
+inline constexpr uint32_t kPreciseWaitMaxUs = 100000;
 // Due timers one reactor turn fires before it polls again.
 inline constexpr uint32_t kReactorTimersPerTurn = 256;
 

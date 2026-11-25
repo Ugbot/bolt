@@ -119,7 +119,6 @@ struct kqueue_io::impl {
     // Register-once / try-first path (G2CHK-1269), owner thread only.
     static constexpr std::uintptr_t kPersistUdata = ~std::uintptr_t{0};
     static constexpr uintptr_t kTimerIdent = 1;               // EVFILT_TIMER ident of the precise wait
-    static constexpr uint32_t kPreciseTimerMaxUs = 100000;    // waits up to 100 ms use it
     static constexpr int kChangeBatch = static_cast<int>(net::limits::kReadinessChangeBatch);
     detail::EngineOwner owner;
     std::vector<detail::FdFast> fast{std::vector<detail::FdFast>(kMaxFds)};
@@ -690,7 +689,7 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     // A short wait (a reactor timer) also arms a one-shot EVFILT_TIMER with
     // NOTE_CRITICAL: the kevent timeout alone is coalesced by XNU by up to ~1 ms
     // (G2CHK-1273). The timeout stays as the backstop.
-    if (fast && timeout_us != 0 && timeout_us <= impl::kPreciseTimerMaxUs) {
+    if (fast && timeout_us != 0 && timeout_us <= net::limits::kPreciseWaitMaxUs) {
         if (impl_->nchanges == impl::kChangeBatch) impl_->flush_changes();
         EV_SET(&impl_->changes[impl_->nchanges], impl::kTimerIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
                NOTE_USECONDS | NOTE_CRITICAL, static_cast<intptr_t>(timeout_us), nullptr);
