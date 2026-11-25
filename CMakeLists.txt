@@ -106,6 +106,10 @@ target_include_directories(bolt_core INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(bolt_core INTERFACE cxx_std_20)
+# bolt_park.h waits with WaitOnAddress / WakeByAddressSingle on Windows.
+if(WIN32)
+    target_link_libraries(bolt_core INTERFACE synchronization)
+endif()
 # bolt_scheduler.h spawns std::thread, and bolt_port.h:361 calls
 # pthread_setaffinity_np directly on Linux. Neither implies a link to the
 # threading library on its own. glibc only folded libpthread into libc in

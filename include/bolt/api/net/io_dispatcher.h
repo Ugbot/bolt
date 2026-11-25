@@ -396,6 +396,11 @@ public:
 
     Stats get_stats() const noexcept;
 
+    // Counters of IO thread i's engine (shared engine: always engine 0).
+    core::async_io::stats engine_stats(size_t i) const noexcept {
+        return ios_[i < ios_.size() ? i : 0]->get_stats();
+    }
+
 private:
     friend class ReadAwaitable;
     friend class WriteAwaitable;
@@ -406,6 +411,9 @@ private:
     friend class CoroTcpListener;
 
     void io_thread_loop(size_t thread_id);
+    void reactor_wait(core::async_io* io, IoInbox* inbox) noexcept;
+    template <typename Ready>
+    bool reactor_spin(core::async_io* io, Ready& ready, const ::bolt::park::WaitPolicy& p) noexcept;
     bool try_post_impl(size_t io_thread_index, std::coroutine_handle<> h,
                        bool allow_before_start) noexcept;
 

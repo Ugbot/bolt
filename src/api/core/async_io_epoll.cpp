@@ -92,7 +92,6 @@ struct epoll_io::impl {
 
     // Wake mechanism
     async_io::wake_callback wake_cb;
-    std::atomic<bool> wake_pending{false};
 
     // --- Lock-free op management (no per-op alloc, no mutex) ----------------
     // Fixed pool of ops (stable storage). The hot path carries the op via
@@ -334,10 +333,14 @@ struct epoll_io::impl {
     }
 
     void on_persistent_side(int fd, int dir, uint32_t events) noexcept;
+
+    static void kernel_wake(void* ctx) noexcept;
 };
 
 epoll_io::epoll_io(const async_io_config& config)
     : impl_(std::make_unique<impl>(config)) {
+    park_slot_.kernel_wake = &impl::kernel_wake;
+    park_slot_.kernel_ctx = impl_.get();
 }
 
 epoll_io::~epoll_io() {
@@ -623,6 +626,7 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
     int timeout_ms = timeout_us / 1000;
 
     int n = epoll_wait(impl_->epoll_fd, events, 128, timeout_ms);
+    if (fast) park_slot_.word.store(::bolt::park::kRunning, std::memory_order_relaxed);
     if (n < 0 && errno == EINTR) return 0;
     if (n < 0) {
         if (errno != EINTR) {
@@ -641,10 +645,9 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
 
         // Wake event sentinel (data.u64 == 0; op events always have idx_p1 != 0).
         if (idx_p1 == 0) {
+            // The eventfd is edge-triggered and never drained: every write is a
+            // new edge (G2CHK-1270; the old clear-then-drain lost wakes, C1).
             impl_->stat_wakes.fetch_add(1, std::memory_order_relaxed);
-            impl_->wake_pending.store(false, std::memory_order_release);
-            uint64_t val;
-            read(impl_->wake_fd, &val, sizeof(val));  // clear eventfd
             if (impl_->wake_cb) impl_->wake_cb();
             continue;
         }
@@ -803,16 +806,21 @@ async_io::stats epoll_io::get_stats() const noexcept {
     return s;
 }
 
+// Raw backend wake; only the park::wake CAS winner calls it (G2CHK-1270).
+void epoll_io::impl::kernel_wake(void* ctx) noexcept {
+    auto* self = static_cast<epoll_io::impl*>(ctx);
+    assert(self != nullptr);
+    if (self->wake_fd < 0) return;
+    const uint64_t one = 1;
+    (void)write(self->wake_fd, &one, sizeof(one));
+}
+
 void epoll_io::wake() noexcept {
-    // Thread-safe wake using eventfd
-    // Only trigger if not already pending (avoid redundant wakes)
-    bool expected = false;
-    if (impl_->wake_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        if (impl_->wake_fd >= 0) {
-            uint64_t val = 1;
-            write(impl_->wake_fd, &val, sizeof(val));
-        }
-    }
+    (void)::bolt::park::wake(&park_slot_);
+}
+
+bool epoll_io::has_ready() const noexcept {
+    return impl_->deferred.count != 0;
 }
 
 void epoll_io::set_wake_callback(wake_callback callback) noexcept {

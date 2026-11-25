@@ -17,6 +17,7 @@
 #include <atomic>
 #include <array>
 #include "bolt/api/core/accept_retirement.h"
+#include "bolt/bolt_park.h"
 
 // Platform-specific includes
 #ifdef _WIN32
@@ -366,6 +367,18 @@ public:
 
     virtual stats get_stats() const noexcept = 0;
 
+    /**
+     * Park protocol (G2CHK-1270). The engine's reactor slot: the owner sets it
+     * kParked (then re-checks its own queues) before a blocking poll; wake()
+     * pays a kernel wake only when it moves the slot kParked -> kWoken.
+     * park_protocol() is false for engines several threads poll (IOCP), whose
+     * owners keep a bounded poll instead.
+     */
+    ::bolt::park::Slot* park_slot() noexcept { return &park_slot_; }
+    virtual bool park_protocol() const noexcept { return false; }
+    // Work the engine already holds for its next poll (deferred completions).
+    virtual bool has_ready() const noexcept { return false; }
+
 protected:
     virtual AcceptRetirementStatus advance_accept_retirement(AcceptRetirement&) noexcept = 0;
     void progress_accept_retirements() noexcept {
@@ -388,7 +401,11 @@ private:
     std::atomic<uint32_t> accept_retirement_count_{0u};
 
 protected:
-    async_io() = default;
+    async_io() noexcept {
+        park_slot_.kind = ::bolt::park::SlotKind::kReactor;
+        park_slot_.wait_class = ::bolt::park::WaitClass::kReactor;
+    }
+    ::bolt::park::Slot park_slot_;
 };
 
 /**
@@ -430,6 +447,8 @@ public:
     void set_wake_callback(wake_callback callback) noexcept override;
 
     stats get_stats() const noexcept override;
+    bool park_protocol() const noexcept override { return true; }
+    bool has_ready() const noexcept override;
 
 private:
     struct impl;
@@ -471,6 +490,8 @@ public:
     void set_wake_callback(wake_callback callback) noexcept override;
 
     stats get_stats() const noexcept override;
+    bool park_protocol() const noexcept override { return true; }
+    bool has_ready() const noexcept override;
 
 private:
     struct impl;
@@ -511,6 +532,8 @@ public:
     void set_wake_callback(wake_callback callback) noexcept override;
 
     stats get_stats() const noexcept override;
+    bool park_protocol() const noexcept override { return true; }
+    bool has_ready() const noexcept override;
 
     /// Probe whether io_uring is usable on this kernel/sandbox: true iff
     /// io_uring_setup succeeded AND the required features (IORING_FEAT_EXT_ARG,

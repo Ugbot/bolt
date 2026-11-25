@@ -90,7 +90,6 @@ struct kqueue_io::impl {
 
     // Wake mechanism
     async_io::wake_callback wake_cb;
-    std::atomic<bool> wake_pending{false};
 
     // Statistics (atomic, no locks!)
     std::atomic<uint64_t> stat_accepts{0};
@@ -316,6 +315,8 @@ struct kqueue_io::impl {
     // A persistent filter fired: run the waiting op, or note readiness for the next arm.
     void on_persistent(const struct kevent& kev) noexcept;
 
+    static void kernel_wake(void* ctx) noexcept;
+
     // Complete a claimed in-flight op with -1 (closed / cancelled).
     void cancel_slot(int fd, int16_t filter) noexcept {
         std::atomic<std::uint32_t>* slot = slot_for(fd, filter);
@@ -369,6 +370,8 @@ struct kqueue_io::impl {
 
 kqueue_io::kqueue_io(const async_io_config& config)
     : impl_(std::make_unique<impl>(config)) {
+    park_slot_.kernel_wake = &impl::kernel_wake;
+    park_slot_.kernel_ctx = impl_.get();
 }
 
 kqueue_io::~kqueue_io() {
@@ -647,6 +650,8 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     const int nchanges = fast ? impl_->nchanges : 0;
     int n = kevent(impl_->kq_fd, impl_->changes, nchanges, events, 128, &timeout);
     if (fast) impl_->nchanges = 0;
+    // Back from the kernel: posts made while this turn dispatches need no wake.
+    if (fast) park_slot_.word.store(::bolt::park::kRunning, std::memory_order_relaxed);
     if (n < 0 && errno == EINTR) return 0;
     if (n < 0) {
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
@@ -662,7 +667,6 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
         // Check for wake event (EVFILT_USER with ident=0)
         if (kev.filter == EVFILT_USER && kev.ident == 0) {
             impl_->stat_wakes.fetch_add(1, std::memory_order_relaxed);
-            impl_->wake_pending.store(false, std::memory_order_release);
             if (impl_->wake_cb) {
                 impl_->wake_cb();
             }
@@ -795,16 +799,21 @@ bool kqueue_io::is_running() const noexcept {
     return impl_->running.load(std::memory_order_acquire);
 }
 
+// Raw backend wake; only the park::wake CAS winner calls it (G2CHK-1270).
+void kqueue_io::impl::kernel_wake(void* ctx) noexcept {
+    auto* self = static_cast<kqueue_io::impl*>(ctx);
+    assert(self != nullptr && self->kq_fd >= 0);
+    struct kevent kev;
+    EV_SET(&kev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+    (void)kevent(self->kq_fd, &kev, 1, nullptr, 0, nullptr);
+}
+
 void kqueue_io::wake() noexcept {
-    // Thread-safe wake using EVFILT_USER
-    // Only trigger if not already pending (avoid redundant wakes)
-    bool expected = false;
-    if (impl_->wake_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        struct kevent kev;
-        // NOTE_TRIGGER triggers the EVFILT_USER event
-        EV_SET(&kev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
-        kevent(impl_->kq_fd, &kev, 1, nullptr, 0, nullptr);
-    }
+    (void)::bolt::park::wake(&park_slot_);
+}
+
+bool kqueue_io::has_ready() const noexcept {
+    return impl_->deferred.count != 0;
 }
 
 void kqueue_io::set_wake_callback(wake_callback callback) noexcept {

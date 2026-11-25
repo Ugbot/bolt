@@ -200,6 +200,8 @@ bolt/
 │   ├── bolt_arena.h                   Per-thread bump allocator
 │   ├── api/core/stacked_thread.h      Explicit-stack native thread; checked noexcept callback start/join (G2FEAT-248)
 │   ├── bolt_channel.h                 Lock-free SPSC/MPSC ring buffers
+│   ├── bolt_park.h                    park::Slot: one 32-bit park word per waiter, native wait-on-address, reactor kind; WaitPolicy per wait class (G2CHK-1293/1270)
+│   ├── bolt_park_limits.h             park_* Limits rows: profile, per-class mode / spin / deadline, park_max_spinners
 │   ├── bolt_column.h                  Adaptive column + BoltBatch + BitmapIndex
 │   ├── bolt_branchless.h              Branchless kernels + micro-adaptive dispatch
 │   ├── bolt_scheduler.h               Task ring, worker pool, phase barriers

@@ -367,6 +367,7 @@ void IODispatcher::stop() {
     for (auto& io : ios_) {
         if (io) {
             io->stop();
+            io->wake();  // a parked reactor re-checks shutdown_requested_
         }
     }
 
@@ -425,9 +426,7 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
         // Drain handles posted to THIS thread (e.g. accept-loop startup), resuming
         // each up to its next co_await — they run pinned to this thread thereafter.
         drain_inbox(inbox);
-        // Poll for I/O events with timeout
-        // 1ms timeout to check shutdown periodically without burning CPU
-        my_io->poll(1000);  // 1000 microseconds = 1ms
+        reactor_wait(my_io, inbox);
     }
 
     // Final drain of pending events
@@ -451,6 +450,67 @@ ssize_t* IODispatcher::inline_slot(ssize_t* result) noexcept {
     ++t_inline_streak;
     assert(t_inline_streak <= limits::kMaxInlineIoStreak);
     return result;
+}
+
+namespace {
+bool inbox_pending(const IoInbox* inbox) noexcept {
+    return inbox != nullptr && inbox->queue.approx_size() != 0;
+}
+}  // namespace
+
+// One reactor wait (G2CHK-1270): poll at once when work is waiting; otherwise
+// spin per the `reactor` wait class (zero-timeout polls every poll_every_ns,
+// slot kRunning so posts make no syscall), then park on the slot: kParked,
+// re-check, block in the backend until woken, an event, or the class deadline.
+void IODispatcher::reactor_wait(core::async_io* io, IoInbox* inbox) noexcept {
+    assert(io != nullptr);
+    if (!io->park_protocol()) {
+        io->poll(1000);  // shared engine (IOCP): bounded poll, no owner slot
+        return;
+    }
+    auto ready = [&]() noexcept {
+        return shutdown_requested_.load(std::memory_order_acquire) || inbox_pending(inbox) ||
+               io->has_ready();
+    };
+    if (ready()) {
+        io->poll(0);
+        return;
+    }
+    const ::bolt::park::WaitPolicy p = ::bolt::park::policy(::bolt::park::WaitClass::kReactor);
+    if (p.mode == ::bolt::park::WaitMode::kBusy) {
+        io->poll(0);
+        return;
+    }
+    if (p.mode == ::bolt::park::WaitMode::kSpinThenPark && p.spin_ns != 0 && ::bolt::park::spin_enter()) {
+        const bool worked = reactor_spin(io, ready, p);
+        ::bolt::park::spin_leave();
+        if (worked) return;
+    }
+    const uint64_t timeout_us = uint64_t{p.deadline_ms} * 1000u;
+    assert(timeout_us > 0 && timeout_us <= UINT32_MAX);
+    (void)::bolt::park::park_once(io->park_slot(), ready, [io](uint64_t t) noexcept {
+        io->poll(static_cast<uint32_t>(t));
+    }, timeout_us);
+}
+
+template <typename Ready>
+bool IODispatcher::reactor_spin(core::async_io* io, Ready& ready,
+                                const ::bolt::park::WaitPolicy& p) noexcept {
+    const uint64_t start = ::bolt::park::now_ns();
+    const uint64_t until = start + p.spin_ns;
+    uint64_t next_poll = start;
+    for (uint32_t i = 0;; ++i) {
+        if (ready()) return true;
+        if ((i & 15u) == 0) {
+            const uint64_t now = ::bolt::park::now_ns();
+            if (now >= next_poll) {
+                if (io->poll(0) > 0) return true;
+                next_poll = now + p.poll_every_ns;
+            }
+            if (now >= until) return false;
+        }
+        BOLT_PAUSE();
+    }
 }
 
 void IODispatcher::resume_on_worker(std::coroutine_handle<> handle) noexcept {
