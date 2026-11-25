@@ -31,6 +31,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <new>
 #include <thread>
 
 #if defined(__linux__)
@@ -124,6 +125,21 @@ inline void native_wake_one(std::atomic<uint32_t>* word) noexcept {
 
 using KernelWake = void (*)(void* ctx) noexcept;
 
+// A registered wait on a gate's progress value (G2CHK-1294). Lives in the
+// waiting thread's Slot; never allocated. Readers of the registry copy it under
+// the slot's lease_seq seqlock.
+struct Lease {
+    const void* gate = nullptr;        // the gate (opaque to the registry)
+    uint64_t target = 0;               // wake when gate value >= target
+    uint64_t deadline_ns = 0;          // 0 = none
+    uint64_t since_ns = 0;
+    uint16_t wait_class = 0;
+    uint16_t site = 0;                 // static id of the call site, for reports
+    std::atomic<bool> registered{false};  // in a gate heap (set by the owner, cleared under the gate latch)
+    std::atomic<bool> reported{false};    // the stuck report has named it once
+    std::atomic<uint64_t> handoff{0};  // optional result the waker deposits before waking
+};
+
 struct alignas(config::kCacheIsolationBytes) Slot {
     std::atomic<uint32_t> word{kRunning};
     SlotKind kind = SlotKind::kAddress;
@@ -138,6 +154,10 @@ struct alignas(config::kCacheIsolationBytes) Slot {
     uint64_t spin_hits = 0;
     // Waker-written.
     std::atomic<uint64_t> kernel_wakes{0};
+    // The thread's lease (G2CHK-1294) and its seqlock: odd while the owner writes.
+    Lease lease;
+    std::atomic<uint32_t> lease_seq{0};
+    std::atomic<uint8_t> in_use{0};    // registry slot claimed by a thread
 };
 
 // Lever for the falsifier tests: each value models one forbidden reordering
@@ -203,6 +223,67 @@ inline bool park_once(Slot* s, Ready&& ready, Block&& block, uint64_t timeout_ns
     s->word.store(kRunning, std::memory_order_relaxed);
     assert(s->word.load(std::memory_order_relaxed) == kRunning);
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread slots: one startup-sized table, so a reader can walk every live
+// lease (admin.debug.waiters, stuck report). park_slots bounds it.
+// ---------------------------------------------------------------------------
+
+namespace detail {
+struct SlotTable {
+    Slot* slots = nullptr;
+    uint32_t n = 0;
+};
+inline SlotTable& slot_table() noexcept {
+    static SlotTable t = [] {
+        SlotTable x;
+        x.n = static_cast<uint32_t>(bolt_park_limits_value(bolt_park_limits_id::park_slots));
+        x.slots = new (std::nothrow) Slot[x.n];
+        if (x.slots == nullptr) x.n = 0;
+        return x;
+    }();
+    return t;
+}
+struct SlotOwner {
+    Slot* slot = nullptr;
+    ~SlotOwner() {
+        if (slot != nullptr) slot->in_use.store(0, std::memory_order_release);
+    }
+};
+}  // namespace detail
+
+// This thread's slot from the table, or nullptr when park_slots are all taken
+// (the caller then uses a slot of its own and is not listed in the registry).
+inline Slot* slot_self() noexcept {
+    static thread_local detail::SlotOwner owner;
+    if (owner.slot != nullptr) return owner.slot;
+    detail::SlotTable& t = detail::slot_table();
+    for (uint32_t i = 0; i < t.n; ++i) {
+        uint8_t expected = 0;
+        if (t.slots[i].in_use.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+            owner.slot = &t.slots[i];
+            owner.slot->kind = SlotKind::kAddress;
+            return owner.slot;
+        }
+    }
+    return nullptr;
+}
+
+// A consistent copy of a slot's lease, or false while its owner is writing it.
+inline bool lease_snapshot(const Slot& s, Lease* out) noexcept {
+    assert(out != nullptr);
+    const uint32_t a = s.lease_seq.load(std::memory_order_acquire);
+    if ((a & 1u) != 0) return false;
+    out->gate = s.lease.gate;
+    out->target = s.lease.target;
+    out->deadline_ns = s.lease.deadline_ns;
+    out->since_ns = s.lease.since_ns;
+    out->wait_class = s.lease.wait_class;
+    out->site = s.lease.site;
+    out->registered.store(s.lease.registered.load(std::memory_order_acquire), std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return s.lease_seq.load(std::memory_order_relaxed) == a;
 }
 
 // ---------------------------------------------------------------------------
