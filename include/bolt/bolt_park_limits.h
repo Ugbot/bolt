@@ -32,6 +32,9 @@
     X(park_reactor_poll_every_ns, kBudget, "ns", 5000, 0, 1000000000,          \
       "BOLT_PARK_REACTOR_POLL_EVERY_NS", nullptr,                              \
       "zero-timeout I/O poll interval while a reactor spins")                  \
+    X(park_reactor_timer_slack_ns, kBudget, "ns", 0, 0, 100000000,             \
+      "BOLT_PARK_REACTOR_TIMER_SLACK_NS", nullptr,                             \
+      "a reactor timer may fire this early (coalesces wakeups); never late")   \
     X(park_ack_mode, kBudget, "mode", 3, 0, 3, "BOLT_PARK_ACK_MODE", nullptr,  \
       "durability / quorum ACK wait: 0 busy, 1 spin, 2 park, 3 profile")       \
     X(park_ack_spin_ns, kBudget, "ns", 10000, 0, 1000000000,                   \

@@ -54,7 +54,8 @@ enum class io_op : uint8_t {
     timer,     // Timer expiration
     recvfrom,  // Datagram receive (UDP) — fills caller's sockaddr out-params
     sendto,    // Datagram send (UDP)
-    readable   // Readiness only: the fd is readable; no I/O done (G2CHK-1271)
+    readable,  // Readiness only: the fd is readable; no I/O done (G2CHK-1271)
+    writable   // Readiness only: the fd is writable; no I/O done (G2CHK-1273)
 };
 
 /**
@@ -312,6 +313,13 @@ public:
         return -1;
     }
 
+    // Wait until `fd` is writable, doing no I/O (G2CHK-1273). Same rule as
+    // readable_async: call after a non-blocking write returned would-block.
+    virtual int writable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept {
+        (void)fd; (void)callback; (void)user_data;
+        return -1;
+    }
+
     virtual int close_async(int fd) noexcept = 0;
     
     /**
@@ -450,6 +458,7 @@ public:
     int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int readable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
+    int writable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;
@@ -494,6 +503,7 @@ public:
     int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int readable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
+    int writable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;
@@ -537,6 +547,7 @@ public:
     int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data, ssize_t* inline_result = nullptr) noexcept override;
     int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int readable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
+    int writable_async(int fd, io_callback callback, void* user_data = nullptr) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;

@@ -2894,6 +2894,18 @@ if(TARGET bolt_reactor)
     endforeach()
 endif()
 
+# Reactor timers (G2CHK-1273).
+if(NOT WIN32 AND TARGET bolt_reactor)
+    add_executable(test_bolt_reactor_timers test_bolt_reactor_timers.cpp)
+    target_link_libraries(test_bolt_reactor_timers PRIVATE bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_reactor_timers)
+    add_test(NAME test_bolt_reactor_timers COMMAND test_bolt_reactor_timers)
+    add_executable(test_bolt_write_cork test_bolt_write_cork.cpp)
+    target_link_libraries(test_bolt_write_cork PRIVATE bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_write_cork)
+    add_test(NAME test_bolt_write_cork COMMAND test_bolt_write_cork)
+endif()
+
 # Batched datagram I/O + reactor readiness (G2CHK-1271).
 if(NOT WIN32 AND TARGET bolt_reactor AND TARGET bolt_net)
     add_executable(test_bolt_udp_batch test_bolt_udp_batch.cpp)
