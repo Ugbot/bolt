@@ -125,6 +125,21 @@ struct ParallelScanPool {
 
 namespace {
 
+// G2CHK-1301: a full result ring waits for the poller instead of dropping
+// the morsel; only a stopped pool gives up. Counted only once pushed, so
+// poll's EOF (produced >= submitted) never fires with a morsel missing.
+bool emit_morsel(ParallelScanPool* pool, const Morsel* m) noexcept {
+    assert(pool != nullptr);
+    assert(m != nullptr);
+    for (uint32_t attempt = 0; !pool->results.try_push(m); ++attempt) {
+        if (pool->stopped.load(std::memory_order_acquire)) return false;
+        if (attempt < 64u) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    pool->morsels_produced.fetch_add(1u, std::memory_order_release);
+    return true;
+}
+
 void worker_loop(ParallelScanPool* pool) noexcept {
     assert(pool != nullptr);
     if (pool == nullptr) return;
@@ -149,8 +164,7 @@ void worker_loop(ParallelScanPool* pool) noexcept {
         m.batch = nullptr;
         m.sel   = nullptr;
         m.sel_len = 0;
-        (void)pool->results.try_push(&m);
-        pool->morsels_produced.fetch_add(1u, std::memory_order_relaxed);
+        if (!emit_morsel(pool, &m)) return;
     }
 }
 
@@ -235,7 +249,12 @@ bool parallel_scan_poll(
         const bool finishing = pool->finishing.load(std::memory_order_acquire);
         const uint64_t subbed = pool->tasks_submitted.load(std::memory_order_acquire);
         const uint64_t done = pool->morsels_produced.load(std::memory_order_acquire);
-        if (finishing && done >= subbed) { *out_eof = true; return false; }
+        if (finishing && done >= subbed) {
+            // A morsel pushed after the first pop failed is counted in done.
+            if (pool->results.try_pop(out)) return true;
+            *out_eof = true;
+            return false;
+        }
         if (steady_clock::now() >= deadline) return false;
         std::this_thread::yield();
     }

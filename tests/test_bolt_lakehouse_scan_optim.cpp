@@ -11,9 +11,11 @@ using bolt::BoltType;
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 using namespace bolt::lakehouse;
 
@@ -315,6 +317,52 @@ TEST(W8Parallel, WideParallelismRuns) {
     ParallelScanPool* pool = nullptr;
     ASSERT_TRUE(parallel_scan_open(&pool, &arena, nullptr, &cfg));
     parallel_scan_close(pool);
+}
+
+// G2CHK-1301: more tasks outstanding than the 64-slot result ring holds,
+// with no poll until finish. Every task must come back as a morsel.
+TEST(W8Parallel, FullResultRingDropsNoMorsel) {
+    constexpr uint32_t kTasks = 128;
+    bolt::Arena arena;
+    ParallelScanConfig cfg{};
+    parallel_scan_config_init(&cfg);
+    cfg.use_prefetch = false;
+    cfg.parallelism  = 4;
+    ParallelScanPool* pool = nullptr;
+    ASSERT_TRUE(parallel_scan_open(&pool, &arena, nullptr, &cfg));
+    for (uint32_t i = 0; i < kTasks; ++i) {
+        RowGroupTask t{};
+        t.file_path = "test/file.parquet";
+        t.row_group = i;
+        t.slot_id   = i;
+        uint32_t tries = 0;
+        while (!parallel_scan_submit(pool, &t)) {
+            ASSERT_LT(++tries, 1000000u);
+            std::this_thread::yield();
+        }
+    }
+    // Let the workers fill the result ring before anyone polls.
+    ParallelScanStats stats{};
+    for (uint32_t spins = 0; spins < 2000; ++spins) {
+        parallel_scan_stats(pool, &stats);
+        if (stats.morsels_produced >= 64) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    parallel_scan_finish(pool);
+    uint32_t got = 0;
+    bool eof = false;
+    for (uint32_t polls = 0; !eof && polls < 100000; ++polls) {
+        Morsel m{};
+        if (parallel_scan_poll(pool, &m, 1000, &eof)) ++got;
+    }
+    EXPECT_TRUE(eof);
+    EXPECT_EQ(got, kTasks);
+    parallel_scan_stats(pool, &stats);
+    EXPECT_EQ(stats.tasks_submitted, kTasks);
+    EXPECT_EQ(stats.morsels_produced, kTasks);
+    parallel_scan_close(pool);
+    arena.reset();
 }
 
 TEST(W8Parallel, OpenSubmitPollClose) {
