@@ -123,3 +123,59 @@ these runs had host load 16–73. `latency` (busy) and `efficient` (park) are on
 | /json | 1 | 143.6k | 149.2k | 655 | 500 |
 | /json | 2 | 140.3k | 168.0k | 532 | 422 |
 
+
+## Gate and leases (G2CHK-1294)
+
+**`bolt_park_gate.h`.** `park::GateT<Cap>` holds a monotone progress value and a bounded min-heap, ordered
+by target, of the waiting threads' slots.
+
+- **`advance(v)`** stores v, fences, and returns at once when nobody is registered. Otherwise it pops every
+  lease with target ≤ v under a small latch, releases the latch, and wakes exactly those slots once each.
+  It can deposit a handoff word in each lease first.
+- **`wait(target, deadline, policy, site)`:**
+  - spins on the value per the class;
+  - then registers the lease in the thread's slot and parks;
+  - returns `kDeadline` and removes its lease when the deadline passes;
+  - returns `kExhausted` when the gate is full (Limits B: `kGateWaitersDefault`).
+
+  Leases never expire on their own.
+- **Registry.** Slots come from one startup table (`park_slots`), and each lease sits under a seqlock.
+  `for_each_lease` walks every live waiter, which is the source for `admin.debug.waiters`.
+  `report_stuck` names a lease older than `park_stuck_report_ms` once and never wakes it.
+- **Tests (`test_bolt_park_gate`):**
+  - an advance wakes only the satisfied waiters (2 of 4 at v = 20, the rest at 40);
+  - the deadline removes the lease;
+  - a full gate refuses;
+  - the handoff reaches the woken waiter;
+  - the registry lists a waiter's target and site, and the stuck report fires once;
+  - a 20,000-advance lost-wake stress passes.
+
+  TSan reports no races.
+
+## IdleSet for worker pools (G2CHK-1295)
+
+**`bolt_park_idle.h`.** `park::IdleSetT<Cap>` is a set of interchangeable idle workers, with three rules:
+
+- **Spinner rule:** while a worker spins it will find the work, so `notify()` wakes nobody.
+- **LIFO:** the newest idle worker is woken first.
+- **Chained wake:** a worker that takes an item and sees more calls `notify()`.
+
+Each worker parks on its own slot. `notify_all()` is for shutdown only.
+
+**`WorkerThreadPool`.** The task and blocking queues' idle paths now use an IdleSet with the `pool` wait
+class: balanced spin 5 µs, then park, with a 30 s deadline after which it re-waits. The space-side waits
+(a producer facing a full queue) keep `EventCount`.
+
+**Bug found by the existing pool suite.** In the first cut, a `notify()` that popped a worker before the
+worker announced kParked could not wake it, and the worker then parked off the stack. With every worker
+in that state, the queue stalled until the 30 s deadline: `test_bolt_worker_pool_park` hung in
+`Doors/Park.BurstsWithIdleGapsAllRun` in park-only and spin modes. The fix: being off the stack is a
+reason not to block, so `park_once`'s re-check covers it. The suite now passes in all three pool modes,
+in about 6 s each, and under TSan.
+
+**EventCount's wake-sent dedupe was not added.** Ticket G2CHK-1295 asked for a wake-sent bit on
+`bolt::EventCount`. It was tried, and the existing `EventCountStress.PingPongNeverLosesAWake` hung. An
+EventCount can carry waiters for different conditions (the ping-pong parks both sides on one count), and
+a single in-flight bit suppresses the wake the other side needs. EventCount keeps one kernel notify per
+`notify_one` while someone sleeps, and the dedupe lives where waiters are interchangeable: the IdleSet.
+EventCount gained a `kernel_notifies()` diagnostic counter.

@@ -18,6 +18,7 @@
 #include "bolt/api/core/coro_task.h"
 #include "bolt/api/core/stacked_thread.h"
 #include "bolt/bolt_event_count.h"
+#include "bolt/bolt_park_idle.h"
 #include <atomic>
 #include <cassert>
 #include <coroutine>
@@ -224,8 +225,9 @@ private:
     void blocking_worker_loop(size_t worker_id);
 
     // Next item, parking while the queue is empty; false once stop() asked.
+    using IdleSet = ::bolt::park::IdleSetT<BOLT_MAX_WORKERS>;
     template <typename Queue>
-    bool next_item(Queue& queue, bolt::EventCount& ready, bolt::EventCount& space,
+    bool next_item(Queue& queue, IdleSet& ready, bolt::EventCount& space,
                    typename Queue::ValueType* out);
     void run_task(std::coroutine_handle<> handle);
     void run_blocking(std::function<void()>& work);
@@ -240,10 +242,11 @@ private:
     // Uses a function wrapper queue for blocking operations (file I/O, DNS, etc.)
     MPMCQueue<std::function<void()>, 1024> blocking_task_queue_;
 
-    // Idle workers park on *_ready_, producers facing a full queue on *_space_.
-    bolt::EventCount task_ready_;
+    // Idle workers park in *_ready_ (park::IdleSet: spinner rule, LIFO, chained
+    // wake; G2CHK-1295), producers facing a full queue on *_space_.
+    IdleSet task_ready_;
     bolt::EventCount task_space_;
-    bolt::EventCount blocking_ready_;
+    IdleSet blocking_ready_;
     bolt::EventCount blocking_space_;
 
     // Control
@@ -345,7 +348,7 @@ inline bool WorkerThreadPool::try_submit_blocking(std::function<void()> work) no
                          !shutdown_requested_.load(std::memory_order_acquire);
     const bool accepted = allowed && blocking_task_queue_.try_push(std::move(work));
     assert(!accepted || allowed);
-    if (accepted) blocking_ready_.notify_one();  // inside the admission stop() waits for
+    if (accepted) blocking_ready_.notify();  // inside the admission stop() waits for
     blocking_admissions_.fetch_sub(1, std::memory_order_seq_cst);
     return accepted;
 }
@@ -357,7 +360,7 @@ inline bool WorkerThreadPool::submit(std::coroutine_handle<> handle) noexcept {
 
     if (task_queue_.try_push(handle)) {
         tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
-        task_ready_.notify_one();
+        task_ready_.notify();
         return true;
     }
     return false;
@@ -381,7 +384,7 @@ auto WorkerThreadPool::submit_blocking(F&& func) -> std::future<std::invoke_resu
 
     blocking_space_.await(config_.idle_spins, [&] {
         if (blocking_task_queue_.try_push(wrapped)) {
-            blocking_ready_.notify_one();
+            blocking_ready_.notify();
             return true;
         }
         return shutdown_requested_.load(std::memory_order_acquire);
@@ -399,23 +402,29 @@ inline WorkerThreadPool::Stats WorkerThreadPool::get_stats() const noexcept {
 }
 
 template <typename Queue>
-bool WorkerThreadPool::next_item(Queue& queue, bolt::EventCount& ready, bolt::EventCount& space,
+bool WorkerThreadPool::next_item(Queue& queue, IdleSet& ready, bolt::EventCount& space,
                                  typename Queue::ValueType* out) {
     assert(out != nullptr);
+    static thread_local ::bolt::park::Slot fallback;
+    ::bolt::park::Slot* self = ::bolt::park::slot_self();
+    if (self == nullptr) self = &fallback;
     bool stopping = false;
-    ready.await(config_.idle_spins, [&] {
-        stopping = shutdown_requested_.load(std::memory_order_acquire);
-        if (stopping) return true;
-        auto item = queue.try_pop();
-        if (!item) return false;
-        *out = std::move(*item);
-        return true;
-    });
+    for (;;) {
+        const ::bolt::park::WaitResult r = ready.wait(self, [&]() noexcept {
+            stopping = shutdown_requested_.load(std::memory_order_acquire);
+            if (stopping) return true;
+            auto item = queue.try_pop();
+            if (!item) return false;
+            *out = std::move(*item);
+            return true;
+        }, ::bolt::park::policy(::bolt::park::WaitClass::kPool));
+        if (r == ::bolt::park::WaitResult::kReady) break;  // kDeadline: idle past the class deadline, wait again
+    }
     if (stopping) return false;
     space.notify_one();
-    // Work left behind may have spent its wake on a worker that found the slot
-    // ahead of it unpublished.
-    if (!queue.empty()) ready.notify_one();
+    // Chained wake: work left behind, or a slot ahead that was claimed but not
+    // yet published when this worker looked.
+    if (!queue.empty()) ready.notify();
     return true;
 }
 

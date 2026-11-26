@@ -12,6 +12,11 @@
 // sleeper sees the item. With nobody asleep notify costs a fence and a load:
 // no syscall and no shared write.
 //
+// No wake-sent dedupe here (G2CHK-1295 tried one): an EventCount may carry
+// waiters for different conditions (the ping-pong stress parks both sides on
+// one count), and a single in-flight bit then suppresses the wake the other
+// side needs. Pools of interchangeable waiters use park::IdleSet instead.
+//
 // A notify can wake a thread that finds nothing (another consumer took the
 // item, or an earlier slot of an MPMC ring is claimed and not yet published).
 // That thread parks again, so a consumer that did get an item and can see more
@@ -65,7 +70,9 @@ struct EventCount {
     }
 
     void notify_one() noexcept {
-        if (bump()) epoch_.notify_one();
+        if (!bump()) return;
+        kernel_notifies_.fetch_add(1, std::memory_order_relaxed);
+        epoch_.notify_one();
     }
 
     void notify_all() noexcept {
@@ -94,6 +101,11 @@ struct EventCount {
         return sleepers_.load(std::memory_order_relaxed);
     }
 
+    // notify_one calls that reached the kernel (diagnostic).
+    [[nodiscard]] uint64_t kernel_notifies() const noexcept {
+        return kernel_notifies_.load(std::memory_order_relaxed);
+    }
+
 private:
     // True when someone may be asleep; the epoch moves only then.
     [[nodiscard]] bool bump() noexcept {
@@ -105,6 +117,7 @@ private:
 
     alignas(config::kCacheIsolationBytes) std::atomic<ParkWord> epoch_;
     alignas(config::kCacheIsolationBytes) std::atomic<uint32_t> sleepers_;
+    std::atomic<uint64_t> kernel_notifies_{0};
 };
 
 }  // namespace bolt
