@@ -5,6 +5,7 @@
 
 #include "bolt/api/net/io_dispatcher.h"
 #include "bolt/api/net/event_loop_limits.h"
+#include "io_cork.h"
 #include "bolt/bolt_channel.h"
 #include "bolt/bolt_port.h"        // bolt_pin_current_thread
 #include "bolt/bolt_topology.h"    // CpuTopology, bolt_detect_topology
@@ -173,6 +174,22 @@ void SendToAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+bool ReadableAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    ReadableAwaitable* self = this;
+    const int rc = dispatcher_->current_io()->readable_async(
+        fd_,
+        [self, handle](const core::io_event& event) {
+            self->result_ = event.result < 0 ? -1 : 0;
+            self->dispatcher_->resume_on_worker(handle);
+        },
+        nullptr);
+    if (rc == 0) return true;
+    result_ = -1;
+    if (dispatcher_->config_.inline_resume || dispatcher_->worker_pool_ == nullptr) return false;
+    dispatcher_->resume_on_worker(handle);
+    return true;
+}
+
 void AcceptAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->accepts_started_.fetch_add(1, std::memory_order_relaxed);
 
@@ -294,6 +311,8 @@ IODispatcher::IODispatcher(core::WorkerThreadPool* pool)
 
 IODispatcher::~IODispatcher() {
     stop();
+    delete[] corks_;
+    delete[] cork_done_;
 
     if (owns_worker_pool_ && worker_pool_) {
         delete worker_pool_;
@@ -322,6 +341,19 @@ void IODispatcher::start() {
     // on the stack — bolt_scheduler's standard pattern. UINT32_MAX entries mean
     // "no pin" (e.g. when pin_io_threads is false, or topology has fewer CPUs).
     planned_cpus_.assign(config_.num_io_threads, UINT32_MAX);
+    if (corks_ == nullptr) {
+        corks_ = new (std::nothrow) CorkTable[config_.num_io_threads];
+        cork_done_ = new (std::nothrow) std::coroutine_handle<>[CorkTable::kDoneMax * config_.num_io_threads];
+        assert(corks_ != nullptr && cork_done_ != nullptr && "write cork tables");
+    }
+    if (!timers_) {
+        timers_ = std::make_unique<ReactorTimerHeap[]>(config_.num_io_threads);
+        for (size_t i = 0; i < config_.num_io_threads; ++i) {
+            const bool ok = timers_[i].init(limits::kReactorTimersMax);
+            assert(ok && "reactor timer heap allocation");
+            (void)ok;
+        }
+    }
     if (config_.pin_io_threads) {
         bolt::CpuTopology topo;
         if (bolt::bolt_detect_topology(&topo)) {
@@ -423,10 +455,14 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
 
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
         t_inline_streak = 0;  // a new reactor turn: inline budget restored
+        ReactorTimerHeap* timers = timers_ ? &timers_[thread_id] : nullptr;
+        CorkTable* cork = corks_ != nullptr ? &corks_[thread_id] : nullptr;
+        (void)fire_due_timers(timers);
         // Drain handles posted to THIS thread (e.g. accept-loop startup), resuming
         // each up to its next co_await — they run pinned to this thread thereafter.
         drain_inbox(inbox);
-        reactor_wait(my_io, inbox);
+        flush_cork(my_io, cork);  // one sendmsg per fd for the writes this turn corked
+        reactor_wait(my_io, inbox, timers, cork);
     }
 
     // Final drain of pending events
@@ -462,15 +498,20 @@ bool inbox_pending(const IoInbox* inbox) noexcept {
 // spin per the `reactor` wait class (zero-timeout polls every poll_every_ns,
 // slot kRunning so posts make no syscall), then park on the slot: kParked,
 // re-check, block in the backend until woken, an event, or the class deadline.
-void IODispatcher::reactor_wait(core::async_io* io, IoInbox* inbox) noexcept {
+void IODispatcher::reactor_wait(core::async_io* io, IoInbox* inbox, ReactorTimerHeap* timers,
+                                CorkTable* cork) noexcept {
     assert(io != nullptr);
+    const uint64_t slack = ::bolt::bolt_park_limits_value(::bolt::bolt_park_limits_id::park_reactor_timer_slack_ns);
+    auto timer_due = [&]() noexcept {
+        return timers != nullptr && !timers->empty() && timers->next_deadline() <= ::bolt::park::now_ns() + slack;
+    };
     if (!io->park_protocol()) {
-        io->poll(1000);  // shared engine (IOCP): bounded poll, no owner slot
+        io->poll(timer_due() ? 0 : 1000);  // shared engine (IOCP): bounded poll, no owner slot
         return;
     }
     auto ready = [&]() noexcept {
         return shutdown_requested_.load(std::memory_order_acquire) || inbox_pending(inbox) ||
-               io->has_ready();
+               io->has_ready() || timer_due() || (cork != nullptr && cork->pending());
     };
     if (ready()) {
         io->poll(0);
@@ -486,11 +527,76 @@ void IODispatcher::reactor_wait(core::async_io* io, IoInbox* inbox) noexcept {
         ::bolt::park::spin_leave();
         if (worked) return;
     }
-    const uint64_t timeout_us = uint64_t{p.deadline_ms} * 1000u;
+    // Wait until the earliest timer (rounded up to the next microsecond) or the
+    // class deadline, whichever is first.
+    uint64_t timeout_us = uint64_t{p.deadline_ms} * 1000u;
+    if (timers != nullptr && !timers->empty()) {
+        const uint64_t now = ::bolt::park::now_ns();
+        const uint64_t due = timers->next_deadline() > now + slack ? timers->next_deadline() - slack - now : 0;
+        const uint64_t due_us = (due + 999u) / 1000u;
+        if (due_us < timeout_us) timeout_us = due_us == 0 ? 1 : due_us;
+    }
     assert(timeout_us > 0 && timeout_us <= UINT32_MAX);
     (void)::bolt::park::park_once(io->park_slot(), ready, [io](uint64_t t) noexcept {
         io->poll(static_cast<uint32_t>(t));
     }, timeout_us);
+}
+
+// Resume the timers due now (early by at most the slack), bounded per turn.
+uint32_t IODispatcher::fire_due_timers(ReactorTimerHeap* timers) noexcept {
+    if (timers == nullptr || timers->empty()) return 0;
+    const uint64_t slack = ::bolt::bolt_park_limits_value(::bolt::bolt_park_limits_id::park_reactor_timer_slack_ns);
+    const uint64_t now = ::bolt::park::now_ns();
+    uint32_t fired = 0;
+    while (fired < limits::kReactorTimersPerTurn && !timers->empty() &&
+           timers->next_deadline() <= now + slack) {
+        std::coroutine_handle<> h = timers->pop();
+        ++fired;
+        resume_on_worker(h);
+    }
+    assert(fired <= limits::kReactorTimersPerTurn);
+    return fired;
+}
+
+CorkTable* IODispatcher::current_cork() noexcept {
+    const size_t index = current_io_thread_index();
+    if (index == SIZE_MAX || corks_ == nullptr) return nullptr;
+    return &corks_[index];
+}
+
+void IODispatcher::flush_cork(core::async_io* io, CorkTable* cork) noexcept {
+    if (cork == nullptr || !cork->pending()) return;
+    const size_t index = static_cast<size_t>(cork - corks_);
+    assert(index < config_.num_io_threads);
+    std::coroutine_handle<>* done = cork_done_ + index * CorkTable::kDoneMax;
+    const uint32_t n = cork->flush(io, done, CorkTable::kDoneMax);
+    for (uint32_t i = 0; i < n; ++i) resume_on_worker(done[i]);
+}
+
+bool CorkedWriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    CorkTable* cork = dispatcher_->current_cork();
+    if (cork == nullptr) return false;  // not on an IO thread: result -1
+    const auto* p = static_cast<const uint8_t*>(buf_);
+    if (cork->add(fd_, p, len_, handle, &result_)) return true;
+    dispatcher_->flush_cork(dispatcher_->current_io(), cork);  // full: flush now, then retry once
+    return cork->add(fd_, p, len_, handle, &result_);
+}
+
+ReactorTimerHeap* IODispatcher::current_timers() noexcept {
+    const size_t index = current_io_thread_index();
+    if (index == SIZE_MAX || !timers_) return nullptr;
+    return &timers_[index];
+}
+
+bool SleepAwaitable::await_ready() const noexcept {
+    return deadline_ns_ <= ::bolt::park::now_ns();
+}
+
+bool SleepAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    ReactorTimerHeap* timers = dispatcher_->current_timers();
+    if (timers != nullptr && timers->push(deadline_ns_, handle)) return true;
+    fired_ = false;  // not on an IO thread, or the heap is full: resume now
+    return false;
 }
 
 template <typename Ready>
@@ -624,6 +730,12 @@ void IODispatcher::async_close(int fd) noexcept {
     // Close on the engine the calling thread is pinned to: that is where this
     // fd's operations were registered. Generic io_uring close does not prove
     // pending read/write/UDP completion; tracked ACCEPT retirement is separate.
+    if (CorkTable* cork = current_cork()) {  // corked writes on fd fail (-1) before the fd goes
+        const size_t index = static_cast<size_t>(cork - corks_);
+        std::coroutine_handle<>* done = cork_done_ + index * CorkTable::kDoneMax;
+        const uint32_t n = cork->drop(fd, done, CorkTable::kDoneMax);
+        for (uint32_t i = 0; i < n; ++i) resume_on_worker(done[i]);
+    }
     if (core::async_io* io = current_io()) {
         io->close_async(fd);
     }

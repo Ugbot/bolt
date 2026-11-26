@@ -118,6 +118,7 @@ struct kqueue_io::impl {
 
     // Register-once / try-first path (G2CHK-1269), owner thread only.
     static constexpr std::uintptr_t kPersistUdata = ~std::uintptr_t{0};
+    static constexpr uintptr_t kTimerIdent = 1;               // EVFILT_TIMER ident of the precise wait
     static constexpr int kChangeBatch = static_cast<int>(net::limits::kReadinessChangeBatch);
     detail::EngineOwner owner;
     std::vector<detail::FdFast> fast{std::vector<detail::FdFast>(kMaxFds)};
@@ -573,6 +574,41 @@ int kqueue_io::sendto_async(
     return 0;
 }
 
+int kqueue_io::readable_async(int fd, io_callback callback, void* user_data) noexcept {
+    if (!impl_->fast_ok(fd)) return impl_->read_oneshot(io_op::readable, fd, nullptr, 0, nullptr, nullptr, callback, user_data);
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
+    op->operation = io_op::readable;
+    op->fd = fd;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    return impl_->arm_fast(op, EVFILT_READ, st);
+}
+
+int kqueue_io::writable_async(int fd, io_callback callback, void* user_data) noexcept {
+    if (!impl_->fast_ok(fd)) {
+        impl_->set_nonblocking(fd);
+        pending_op* op = impl_->alloc_op();
+        if (op == nullptr) return -1;
+        op->operation = io_op::writable;
+        op->fd = fd;
+        op->callback = std::move(callback);
+        op->user_data = user_data;
+        return impl_->register_op(op, EVFILT_WRITE);
+    }
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
+    op->operation = io_op::writable;
+    op->fd = fd;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    return impl_->arm_fast(op, EVFILT_WRITE, st);
+}
+
 int kqueue_io::close_async(int fd) noexcept {
     // Complete in-flight ops with -1 before close() silently drops their
     // knotes (epoll_io/IOCP parity: UdpTransport::stop() waits on them).
@@ -613,7 +649,10 @@ void kqueue_io::impl::on_persistent(const struct kevent& kev) noexcept {
     assert(op.fd == fd);
     ssize_t n = 0;
     detail::TryResult t = detail::TryResult::would_block;
-    if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
+    if (op.operation == io_op::readable || op.operation == io_op::writable) {
+        t = detail::TryResult::done;  // n = 0: ready, no I/O
+    }
+    else if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
     else if (op.operation == io_op::recvfrom) t = detail::try_recvfrom(fd, op.buffer, op.size, op.user_src, op.user_srclen, &n);
     else if (op.operation == io_op::write) t = detail::try_send(fd, op.buffer, op.size, &n);
     if (t == detail::TryResult::would_block) {
@@ -622,7 +661,7 @@ void kqueue_io::impl::on_persistent(const struct kevent& kev) noexcept {
     }
     if (op.operation == io_op::read && n > 0 && static_cast<size_t>(n) < op.size) {
         st.flags |= detail::kFdReadDrained;
-    } else if (op.operation != io_op::write) {
+    } else if (op.operation != io_op::write && op.operation != io_op::writable) {
         // A full read, or one datagram: more may be queued behind it.
         st.flags &= static_cast<std::uint8_t>(~detail::kFdReadDrained);
     }
@@ -647,6 +686,15 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     timeout.tv_sec = timeout_us / 1000000;
     timeout.tv_nsec = (timeout_us % 1000000) * 1000;
 
+    // A short wait (a reactor timer) also arms a one-shot EVFILT_TIMER with
+    // NOTE_CRITICAL: the kevent timeout alone is coalesced by XNU by up to ~1 ms
+    // (G2CHK-1273). The timeout stays as the backstop.
+    if (fast && timeout_us != 0 && timeout_us <= net::limits::kPreciseWaitMaxUs) {
+        if (impl_->nchanges == impl::kChangeBatch) impl_->flush_changes();
+        EV_SET(&impl_->changes[impl_->nchanges], impl::kTimerIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+               NOTE_USECONDS | NOTE_CRITICAL, static_cast<intptr_t>(timeout_us), nullptr);
+        ++impl_->nchanges;
+    }
     const int nchanges = fast ? impl_->nchanges : 0;
     int n = kevent(impl_->kq_fd, impl_->changes, nchanges, events, 128, &timeout);
     if (fast) impl_->nchanges = 0;
@@ -663,6 +711,8 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
     // Process events (NO MUTEX!)
     for (int i = 0; i < n; ++i) {
         const struct kevent& kev = events[i];
+
+        if (kev.filter == EVFILT_TIMER) continue;  // the precise wait timer: its job was to return
 
         // Check for wake event (EVFILT_USER with ident=0)
         if (kev.filter == EVFILT_USER && kev.ident == 0) {

@@ -457,6 +457,25 @@ struct io_uring_io::impl {
         return 0;
     }
 
+    // Readiness only (G2CHK-1271): a one-shot POLL_ADD for POLLIN.
+    int submit_readable(int fd, io_callback cb, void* udata, unsigned events = POLLIN) noexcept {
+        std::lock_guard<std::mutex> lk(submit_mu);
+        uring_pending_op* op = alloc_op();
+        if (op == nullptr) return -1;
+        op->operation = events == POLLIN ? io_op::readable : io_op::writable;
+        op->fd = fd;
+        op->callback = std::move(cb);
+        op->user_data = udata;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_POLL_ADD;
+        s->fd = fd;
+        s->poll32_events = events;
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        return 0;
+    }
+
     int submit_write(int fd, const void* buffer, std::size_t size,
                      io_callback cb, void* udata) noexcept {
         std::lock_guard<std::mutex> lk(submit_mu);
@@ -715,7 +734,7 @@ struct io_uring_io::impl {
                 op.operation,
                 op.fd,
                 op.user_data,
-                (res < 0) ? ssize_t{-1} : res,
+                (res < 0) ? ssize_t{-1} : ((op.operation == io_op::readable || op.operation == io_op::writable) ? ssize_t{0} : res),
                 0u
             };
             // Fire the callback OUTSIDE the lock — it can resume a coroutine
@@ -860,6 +879,18 @@ void io_uring_io::impl::kernel_wake(void* ctx) noexcept {
     const std::uint64_t one = 1;
     const ssize_t r = ::write(self->wake_fd, &one, sizeof(one));
     (void)r;
+}
+
+int io_uring_io::readable_async(int fd, io_callback callback, void* user_data) noexcept {
+    const int rc = impl_->submit_readable(fd, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
+}
+
+int io_uring_io::writable_async(int fd, io_callback callback, void* user_data) noexcept {
+    const int rc = impl_->submit_readable(fd, std::move(callback), user_data, POLLOUT);
+    impl_->after_submit();
+    return rc;
 }
 
 void io_uring_io::wake() noexcept {

@@ -11,6 +11,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -335,6 +337,30 @@ struct epoll_io::impl {
     void on_persistent_side(int fd, int dir, uint32_t events) noexcept;
 
     static void kernel_wake(void* ctx) noexcept;
+
+    // Microsecond waits (G2CHK-1273): epoll_pwait2 takes a timespec (Linux 5.11);
+    // without it a sub-millisecond timeout rounds UP to 1 ms, never down to a
+    // busy zero.
+    std::atomic<bool> no_pwait2{false};
+    int wait(struct epoll_event* events, int max, uint32_t timeout_us) noexcept {
+        assert(events != nullptr && max > 0);
+#if defined(SYS_epoll_pwait2) || defined(__NR_epoll_pwait2)
+        if (timeout_us % 1000u != 0 && !no_pwait2.load(std::memory_order_relaxed)) {
+            struct timespec ts;
+            ts.tv_sec = static_cast<time_t>(timeout_us / 1000000u);
+            ts.tv_nsec = static_cast<long>(timeout_us % 1000000u) * 1000;
+#  if defined(SYS_epoll_pwait2)
+            const long r = syscall(SYS_epoll_pwait2, epoll_fd, events, max, &ts, nullptr, 0);
+#  else
+            const long r = syscall(__NR_epoll_pwait2, epoll_fd, events, max, &ts, nullptr, 0);
+#  endif
+            if (r >= 0 || errno != ENOSYS) return static_cast<int>(r);
+            no_pwait2.store(true, std::memory_order_relaxed);
+        }
+#endif
+        const uint32_t ms = (timeout_us + 999u) / 1000u;
+        return epoll_wait(epoll_fd, events, max, static_cast<int>(ms));
+    }
 };
 
 epoll_io::epoll_io(const async_io_config& config)
@@ -541,6 +567,32 @@ int epoll_io::sendto_async(
     return 0;
 }
 
+int epoll_io::readable_async(int fd, io_callback callback, void* user_data) noexcept {
+    if (!impl_->fast_ok(fd)) return impl_->oneshot(io_op::readable, fd, nullptr, 0, nullptr, nullptr, callback, user_data, EPOLLIN);
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
+    op->operation = io_op::readable;
+    op->fd = fd;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    return impl_->arm_fast(op, 0, st);
+}
+
+int epoll_io::writable_async(int fd, io_callback callback, void* user_data) noexcept {
+    if (!impl_->fast_ok(fd)) return impl_->oneshot(io_op::writable, fd, nullptr, 0, nullptr, nullptr, callback, user_data, EPOLLOUT);
+    detail::FdFast& st = detail::fd_fast_current(impl_->fast.data(), fd);
+    detail::ensure_nonblocking(fd, st);
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
+    op->operation = io_op::writable;
+    op->fd = fd;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    return impl_->arm_fast(op, 1, st);
+}
+
 int epoll_io::close_async(int fd) noexcept {
     // Remove from epoll
     epoll_ctl(impl_->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
@@ -593,7 +645,10 @@ void epoll_io::impl::on_persistent_side(int fd, int dir, uint32_t events) noexce
     assert(op.fd == fd);
     ssize_t n = 0;
     detail::TryResult t = detail::TryResult::would_block;
-    if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
+    if (op.operation == io_op::readable || op.operation == io_op::writable) {
+        t = detail::TryResult::done;  // n = 0: ready, no I/O
+    }
+    else if (op.operation == io_op::read) t = detail::try_recv(fd, op.buffer, op.size, &n);
     else if (op.operation == io_op::recvfrom) t = detail::try_recvfrom(fd, op.buffer, op.size, op.user_src, op.user_srclen, &n);
     else if (op.operation == io_op::write) t = detail::try_send(fd, op.buffer, op.size, &n);
     if (t == detail::TryResult::would_block) {
@@ -602,7 +657,7 @@ void epoll_io::impl::on_persistent_side(int fd, int dir, uint32_t events) noexce
     }
     if (op.operation == io_op::read && n > 0 && static_cast<size_t>(n) < op.size) {
         st.flags |= detail::kFdReadDrained;
-    } else if (op.operation != io_op::write) {
+    } else if (op.operation != io_op::write && op.operation != io_op::writable) {
         // A full read, or one datagram: more may be queued behind it.
         st.flags &= static_cast<std::uint8_t>(~detail::kFdReadDrained);
     }
@@ -623,9 +678,7 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
     if (fast && impl_->deferred.count != 0) timeout_us = 0;
 
     struct epoll_event events[128];
-    int timeout_ms = timeout_us / 1000;
-
-    int n = epoll_wait(impl_->epoll_fd, events, 128, timeout_ms);
+    int n = impl_->wait(events, 128, timeout_us);
     if (fast) park_slot_.word.store(::bolt::park::kRunning, std::memory_order_relaxed);
     if (n < 0 && errno == EINTR) return 0;
     if (n < 0) {

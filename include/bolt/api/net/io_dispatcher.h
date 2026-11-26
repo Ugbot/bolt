@@ -16,6 +16,7 @@
 #include "bolt/api/core/coro_task.h"
 #include "bolt/api/core/stacked_thread.h"
 #include "bolt/api/core/worker_pool.h"
+#include "bolt/api/net/reactor_timers.h"
 #include <atomic>
 #include <coroutine>
 #include <memory>
@@ -131,6 +132,60 @@ private:
 };
 
 /// Awaitable for async accept operations
+// Readiness only (G2CHK-1271): resumes when fd is readable, doing no I/O. Use
+// after a non-blocking read (udp_recv_batch, a TLS read) returned would-block.
+// Result: 0 readable, -1 closed / error.
+class ReadableAwaitable {
+public:
+    ReadableAwaitable(IODispatcher* dispatcher, int fd) noexcept : dispatcher_(dispatcher), fd_(fd) {}
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
+    int await_resume() const noexcept { return result_; }
+private:
+    friend class IODispatcher;
+    IODispatcher* dispatcher_;
+    int fd_;
+    int result_ = 0;
+};
+
+// Sleep on the reactor (G2CHK-1273): resumes on this IO thread at or after the
+// deadline (early by at most park_reactor_timer_slack_ns). Result: true when
+// the timer fired; false when it could not be armed (not on an IO thread, or
+// limits::kReactorTimersMax timers already armed), resuming at once.
+class SleepAwaitable {
+public:
+    SleepAwaitable(IODispatcher* dispatcher, uint64_t deadline_ns) noexcept
+        : dispatcher_(dispatcher), deadline_ns_(deadline_ns) {}
+    bool await_ready() const noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_resume() const noexcept { return fired_; }
+private:
+    IODispatcher* dispatcher_;
+    uint64_t deadline_ns_;
+    bool fired_ = true;
+};
+
+// A write corked into this reactor turn (G2CHK-1273): writes to one fd in a
+// turn go out in one sendmsg at the turn's end. Resumes when ALL `len` bytes
+// are written (result len), or -1 on error / when queued off an IO thread or
+// past limits::kCorkedWritesPerFd. The buffer must stay valid until resumed.
+class CorkedWriteAwaitable {
+public:
+    CorkedWriteAwaitable(IODispatcher* dispatcher, int fd, const void* buf, size_t len) noexcept
+        : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len) {}
+    bool await_ready() const noexcept { return len_ == 0; }
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
+    ssize_t await_resume() const noexcept { return len_ == 0 ? 0 : result_; }
+private:
+    IODispatcher* dispatcher_;
+    int fd_;
+    const void* buf_;
+    size_t len_;
+    ssize_t result_ = -1;
+};
+
+class CorkTable;
+
 class AcceptAwaitable {
 public:
     AcceptAwaitable(IODispatcher* dispatcher, int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept
@@ -261,6 +316,17 @@ public:
     /// Async accept - returns awaitable
     /// @param listen_fd Listening socket file descriptor
     /// @return Awaitable that yields accepted fd, or -1 on error
+    // Steady-clock ns (bolt::park::now_ns) deadline / relative sleep.
+    SleepAwaitable sleep_until(uint64_t deadline_ns) noexcept { return SleepAwaitable(this, deadline_ns); }
+    SleepAwaitable sleep_for(uint64_t ns) noexcept {
+        return SleepAwaitable(this, ::bolt::park::now_ns() + ns);
+    }
+    CorkedWriteAwaitable write_corked(int fd, const void* buf, size_t len) noexcept {
+        return CorkedWriteAwaitable(this, fd, buf, len);
+    }
+    ReadableAwaitable async_readable(int fd) noexcept {
+        return ReadableAwaitable(this, fd);
+    }
     AcceptAwaitable async_accept(int listen_fd, core::AcceptRetirement* retirement = nullptr) noexcept {
         return AcceptAwaitable(this, listen_fd, retirement);
     }
@@ -408,10 +474,17 @@ private:
     friend class ConnectAwaitable;
     friend class RecvFromAwaitable;
     friend class SendToAwaitable;
+    friend class ReadableAwaitable;
+    friend class SleepAwaitable;
+    friend class CorkedWriteAwaitable;
     friend class CoroTcpListener;
 
     void io_thread_loop(size_t thread_id);
-    void reactor_wait(core::async_io* io, IoInbox* inbox) noexcept;
+    void reactor_wait(core::async_io* io, IoInbox* inbox, ReactorTimerHeap* timers, CorkTable* cork) noexcept;
+    uint32_t fire_due_timers(ReactorTimerHeap* timers) noexcept;
+    ReactorTimerHeap* current_timers() noexcept;
+    CorkTable* current_cork() noexcept;
+    void flush_cork(core::async_io* io, CorkTable* cork) noexcept;
     template <typename Ready>
     bool reactor_spin(core::async_io* io, Ready& ready, const ::bolt::park::WaitPolicy& p) noexcept;
     bool try_post_impl(size_t io_thread_index, std::coroutine_handle<> h,
@@ -438,6 +511,11 @@ private:
     int accept_admission_error(const core::AcceptRetirement& retirement) const noexcept;
 
     IODispatcherConfig config_;
+    // One timer heap per IO thread (owner thread only), sized at start().
+    std::unique_ptr<ReactorTimerHeap[]> timers_;
+    // One write-cork table per IO thread, and its completion scratch.
+    CorkTable* corks_ = nullptr;
+    std::coroutine_handle<>* cork_done_ = nullptr;
     // One async_io engine per IO thread for thread-per-core backends (epoll/
     // kqueue/io_uring): each IO thread polls ONLY ios_[i], so there is no shared
     // poll set (no thundering herd / no cross-thread op-pool contention). For a
