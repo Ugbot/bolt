@@ -60,8 +60,21 @@
       "background wait deadline (0 = stuck report only)")                     \
     X(park_max_spinners, kBudget, "threads", 0, 0, 1u << 16,                   \
       "BOLT_PARK_MAX_SPINNERS", nullptr,                                       \
-      "threads in a spin phase at once, process-wide (0 = cores / 4)")
+      "threads in a spin phase at once, process-wide (0 = cores / 4)")        \
+    X(park_slots, kFixedAtAlloc, "threads", 4096, 64, 1u << 16,                \
+      "BOLT_PARK_SLOTS", nullptr,                                              \
+      "threads that can hold a park slot (lease registry size)")              \
+    X(park_stuck_report_ms, kBudget, "ms", 10000, 1, 86400000,                 \
+      "BOLT_PARK_STUCK_REPORT_MS", nullptr,                                    \
+      "a lease older than this is reported once by the stuck-waiter report")
 
 namespace bolt {
+namespace park {
+// Kind B: waiters one Gate holds at once (a full gate refuses the next waiter
+// with kExhausted naming gate_waiters). Gates may pick a smaller capacity.
+inline constexpr uint32_t kGateWaitersDefault = 256;
+static_assert(kGateWaitersDefault > 0 && kGateWaitersDefault <= 65536);
+}  // namespace park
+
 BOLT_LIMITS_TABLE(bolt_park_limits, "bolt.park", BOLT_PARK_LIMITS)
 }  // namespace bolt
