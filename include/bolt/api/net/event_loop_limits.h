@@ -11,8 +11,17 @@ namespace bolt::api::net::limits {
 // nested dispatch beyond the pin stack is explicitly refused.
 inline constexpr uint32_t kMaxDispatchDepth = 16;
 inline constexpr size_t kEventBatchCapacity = 256;
+// Persistent kqueue registrations queued for the next wait's changelist before
+// a forced flush (G2CHK-1269).
+inline constexpr size_t kReadinessChangeBatch = 64;
+// I/O ops one reactor turn may complete inline (try-first succeeded) before the
+// next one is deferred to the following poll, so a busy socket cannot starve
+// the rest of the reactor (G2CHK-1269).
+inline constexpr uint32_t kMaxInlineIoStreak = 64;
 
 static_assert(kMaxDispatchDepth > 0);
 static_assert(kEventBatchCapacity > 0 && kEventBatchCapacity <= INT32_MAX);
+static_assert(kReadinessChangeBatch > 0 && kReadinessChangeBatch <= 1024);
+static_assert(kMaxInlineIoStreak > 0);
 
 }  // namespace bolt::api::net::limits

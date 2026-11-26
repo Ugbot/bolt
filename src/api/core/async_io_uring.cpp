@@ -171,7 +171,6 @@ struct io_uring_io::impl {
     int wake_fd{-1};
     bool wake_armed{false};
     async_io::wake_callback wake_cb;
-    std::atomic<bool> wake_pending{false};
 
     // Submit-side mutex. Three reasons it has to exist:
     //  1. io_uring's SQ ring is SINGLE-PRODUCER by design (one writer to
@@ -636,6 +635,7 @@ struct io_uring_io::impl {
             int r = -1;
             if (interrupt_enter_once) { interrupt_enter_once = false; errno = EINTR; }
             else r = io_uring_enter(ring_fd, admitted, min_complete, flags, arg_ptr, arg_sz);
+            if (slot != nullptr) slot->word.store(::bolt::park::kRunning, std::memory_order_relaxed);
             if (r < 0 && errno != EINTR && errno != ETIME) {
                 stat_errors.fetch_add(1, std::memory_order_relaxed);
                 if (errno == EBADF || errno == EINVAL || errno == EFAULT) {
@@ -670,7 +670,6 @@ struct io_uring_io::impl {
                     wake_armed = false;
                 }
                 stat_wakes.fetch_add(1, std::memory_order_relaxed);
-                wake_pending.store(false, std::memory_order_release);
                 if (wake_cb) wake_cb();
                 continue;
             }
@@ -734,40 +733,69 @@ struct io_uring_io::impl {
         __atomic_store_n(cq_head, head, __ATOMIC_RELEASE);
         return static_cast<int>(reaped);
     }
+
+    // The owning engine's reactor slot (G2CHK-1270).
+    ::bolt::park::Slot* slot = nullptr;
+    static void kernel_wake(void* ctx) noexcept;
+
+    // An SQE queued by a thread other than the owner waits for the owner's next
+    // enter: wake the owner if it is parked.
+    void after_submit() noexcept {
+        const std::thread::id owner = owner_tid.load(std::memory_order_relaxed);
+        if (owner == std::thread::id{} || owner == std::this_thread::get_id()) return;
+        assert(slot != nullptr);
+        (void)::bolt::park::wake(slot);
+    }
 };
 
 // =============================================================================
 // io_uring_io public interface
 // =============================================================================
 io_uring_io::io_uring_io(const async_io_config& config)
-    : impl_(std::make_unique<impl>(config)) {}
+    : impl_(std::make_unique<impl>(config)) {
+    park_slot_.kernel_wake = &impl::kernel_wake;
+    park_slot_.kernel_ctx = impl_.get();
+    impl_->slot = &park_slot_;
+}
 
 io_uring_io::~io_uring_io() = default;
 
 int io_uring_io::accept_async(int listen_fd, io_callback callback, void* user_data, AcceptRetirement* retirement) noexcept {
-    return impl_->submit_accept(listen_fd, std::move(callback), user_data, retirement);
+    const int rc = impl_->submit_accept(listen_fd, std::move(callback), user_data, retirement);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::read_async(int fd, void* buffer, std::size_t size,
-                            io_callback callback, void* user_data) noexcept {
-    return impl_->submit_read(fd, buffer, size, std::move(callback), user_data);
+                            io_callback callback, void* user_data, ssize_t*) noexcept {
+    const int rc = impl_->submit_read(fd, buffer, size, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::write_async(int fd, const void* buffer, std::size_t size,
-                             io_callback callback, void* user_data) noexcept {
-    return impl_->submit_write(fd, buffer, size, std::move(callback), user_data);
+                             io_callback callback, void* user_data, ssize_t*) noexcept {
+    const int rc = impl_->submit_write(fd, buffer, size, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen,
                                io_callback callback, void* user_data) noexcept {
-    return impl_->submit_connect(fd, addr, addrlen, std::move(callback), user_data);
+    const int rc = impl_->submit_connect(fd, addr, addrlen, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::recvfrom_async(int fd, void* buffer, std::size_t size,
                                 struct sockaddr* src, socklen_t* srclen,
-                                io_callback callback, void* user_data) noexcept {
-    return impl_->submit_recvfrom(fd, buffer, size, src, srclen, std::move(callback), user_data);
+                                io_callback callback, void* user_data, ssize_t*) noexcept {
+    const int rc = impl_->submit_recvfrom(fd, buffer, size, src, srclen, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::sendto_async(int fd, const void* buffer, std::size_t size,
                               const struct sockaddr* dst, socklen_t dstlen,
                               io_callback callback, void* user_data) noexcept {
-    return impl_->submit_sendto(fd, buffer, size, dst, dstlen, std::move(callback), user_data);
+    const int rc = impl_->submit_sendto(fd, buffer, size, dst, dstlen, std::move(callback), user_data);
+    impl_->after_submit();
+    return rc;
 }
 int io_uring_io::close_async(int fd) noexcept {
     return impl_->close_async_impl(fd);
@@ -824,19 +852,29 @@ void io_uring_io::stop() noexcept {
 bool io_uring_io::is_running() const noexcept {
     return impl_->running.load(std::memory_order_acquire);
 }
+// Raw backend wake; only the park::wake CAS winner calls it (G2CHK-1270).
+void io_uring_io::impl::kernel_wake(void* ctx) noexcept {
+    auto* self = static_cast<io_uring_io::impl*>(ctx);
+    assert(self != nullptr);
+    if (self->wake_fd < 0) return;
+    const std::uint64_t one = 1;
+    const ssize_t r = ::write(self->wake_fd, &one, sizeof(one));
+    (void)r;
+}
+
 void io_uring_io::wake() noexcept {
-    // Dedupe — many concurrent wakes collapse to one eventfd write.
-    bool expected = false;
-    if (!impl_->wake_pending.compare_exchange_strong(expected, true,
-                                                     std::memory_order_acq_rel)) {
-        return;
-    }
-    if (impl_->wake_fd >= 0) {
-        const std::uint64_t one = 1;
-        const ssize_t r = ::write(impl_->wake_fd, &one, sizeof(one));
-        (void)r;  // eventfd write either succeeds atomically or returns EAGAIN
-                  // (already non-zero); both are fine.
-    }
+    (void)::bolt::park::wake(&park_slot_);
+}
+
+// Queued SQEs the kernel has not taken, or completions not yet reaped: both are
+// shared-memory reads, so a spinning reactor checks them every turn and enters
+// the ring only when there is something to do (G2CHK-1270).
+bool io_uring_io::has_ready() const noexcept {
+    const unsigned sq_tail = __atomic_load_n(impl_->sq_tail, __ATOMIC_ACQUIRE);
+    const unsigned sq_head = __atomic_load_n(impl_->sq_head, __ATOMIC_ACQUIRE);
+    const unsigned cq_tail = __atomic_load_n(impl_->cq_tail, __ATOMIC_ACQUIRE);
+    const unsigned cq_head = __atomic_load_n(impl_->cq_head, __ATOMIC_RELAXED);
+    return sq_tail != sq_head || cq_tail != cq_head;
 }
 void io_uring_io::set_wake_callback(wake_callback callback) noexcept {
     impl_->wake_cb = std::move(callback);

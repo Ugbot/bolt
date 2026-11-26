@@ -2868,6 +2868,24 @@ if(NOT WIN32 AND TARGET bolt_reactor)
     add_test(NAME test_bolt_io_inbox COMMAND test_bolt_io_inbox)
 endif()
 
+# bolt::park (G2CHK-1293) + the reactor park protocol (G2CHK-1270), and the
+# falsifier twins: each lever models a forbidden reordering and must make the
+# lost-wake stress report LOST_WAKE.
+if(TARGET bolt_reactor)
+    add_executable(test_bolt_park test_bolt_park.cpp)
+    target_link_libraries(test_bolt_park PRIVATE bolt::reactor GTest::gtest GTest::gtest_main)
+    bolt_apply_hardening(test_bolt_park)
+    add_test(NAME test_bolt_park COMMAND test_bolt_park)
+    foreach(lever 2 3)
+        add_executable(test_bolt_park_falsify_${lever} test_bolt_park_falsify.cpp)
+        target_link_libraries(test_bolt_park_falsify_${lever} PRIVATE bolt::core)
+        target_compile_definitions(test_bolt_park_falsify_${lever} PRIVATE BOLT_PARK_FALSIFY=${lever})
+        add_test(NAME test_bolt_park_falsify_${lever} COMMAND test_bolt_park_falsify_${lever})
+        set_tests_properties(test_bolt_park_falsify_${lever} PROPERTIES
+            PASS_REGULAR_EXPRESSION "LOST_WAKE [1-9]" TIMEOUT 120)
+    endforeach()
+endif()
+
 # async_io readiness backends (G2ETL-56): pooled ops, close_async completes
 # in-flight ops. kqueue/epoll only.
 if(NOT WIN32 AND TARGET bolt_reactor)

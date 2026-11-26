@@ -47,7 +47,7 @@ public:
         : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -66,7 +66,7 @@ public:
         : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -93,7 +93,7 @@ public:
           src_(src), srclen_(srclen) {}
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    bool await_suspend(std::coroutine_handle<> handle) noexcept;
     ssize_t await_resume() const noexcept { return result_; }
 
 private:
@@ -396,6 +396,11 @@ public:
 
     Stats get_stats() const noexcept;
 
+    // Counters of IO thread i's engine (shared engine: always engine 0).
+    core::async_io::stats engine_stats(size_t i) const noexcept {
+        return ios_[i < ios_.size() ? i : 0]->get_stats();
+    }
+
 private:
     friend class ReadAwaitable;
     friend class WriteAwaitable;
@@ -406,11 +411,19 @@ private:
     friend class CoroTcpListener;
 
     void io_thread_loop(size_t thread_id);
+    void reactor_wait(core::async_io* io, IoInbox* inbox) noexcept;
+    template <typename Ready>
+    bool reactor_spin(core::async_io* io, Ready& ready, const ::bolt::park::WaitPolicy& p) noexcept;
     bool try_post_impl(size_t io_thread_index, std::coroutine_handle<> h,
                        bool allow_before_start) noexcept;
 
     // Submit coroutine to worker pool for resumption
     void resume_on_worker(std::coroutine_handle<> handle) noexcept;
+
+    // Where an awaitable may take a try-first result and resume inline, or null
+    // when it must not (worker-pool resumption, or this turn's inline budget,
+    // limits::kMaxInlineIoStreak, is spent). G2CHK-1269.
+    ssize_t* inline_slot(ssize_t* result) noexcept;
 
     // The async_io engine the CURRENT thread should register an op on. On an IO
     // thread it returns that thread's own engine (thread-per-core: ops register

@@ -4,6 +4,7 @@
 // worker thread pool architecture.
 
 #include "bolt/api/net/io_dispatcher.h"
+#include "bolt/api/net/event_loop_limits.h"
 #include "bolt/bolt_channel.h"
 #include "bolt/bolt_port.h"        // bolt_pin_current_thread
 #include "bolt/bolt_topology.h"    // CpuTopology, bolt_detect_topology
@@ -59,44 +60,46 @@ namespace {
 thread_local IODispatcher*    t_current_owner = nullptr;
 thread_local core::async_io*  t_current_io    = nullptr;
 thread_local size_t           t_current_index = SIZE_MAX;
+// Inline completions in this reactor turn (reset by io_thread_loop each turn).
+thread_local uint32_t         t_inline_streak = 0;
 }  // namespace
 
 // =============================================================================
 // Awaitable Implementations
 // =============================================================================
 
-void ReadAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+bool ReadAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->reads_started_.fetch_add(1, std::memory_order_relaxed);
-
-    // Capture state for callback
     ReadAwaitable* self = this;
-
-    // Submit async read to the I/O engine
+    ssize_t inline_result = 0;
     int rc = dispatcher_->current_io()->read_async(
         fd_, buf_, len_,
         [self, handle](const core::io_event& event) {
-            // Store result
             self->result_ = event.result;
             self->dispatcher_->reads_completed_.fetch_add(1, std::memory_order_relaxed);
-
-            // Resume coroutine on worker thread
             self->dispatcher_->resume_on_worker(handle);
         },
-        nullptr
+        nullptr,
+        dispatcher_->inline_slot(&inline_result)
     );
-
+    if (rc == 1) {
+        // Finished by the try on the submit path: resume without suspending.
+        result_ = inline_result;
+        dispatcher_->reads_completed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     if (rc != 0) {
-        // Error submitting - set error result and resume immediately
         result_ = -1;
+        if (dispatcher_->config_.inline_resume || dispatcher_->worker_pool_ == nullptr) return false;
         dispatcher_->resume_on_worker(handle);
     }
+    return true;
 }
 
-void WriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+bool WriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->writes_started_.fetch_add(1, std::memory_order_relaxed);
-
     WriteAwaitable* self = this;
-
+    ssize_t inline_result = 0;
     int rc = dispatcher_->current_io()->write_async(
         fd_, buf_, len_,
         [self, handle](const core::io_event& event) {
@@ -104,24 +107,27 @@ void WriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
             self->dispatcher_->writes_completed_.fetch_add(1, std::memory_order_relaxed);
             self->dispatcher_->resume_on_worker(handle);
         },
-        nullptr
+        nullptr,
+        dispatcher_->inline_slot(&inline_result)
     );
-
+    if (rc == 1) {
+        // Finished by the try on the submit path: resume without suspending.
+        result_ = inline_result;
+        dispatcher_->writes_completed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     if (rc != 0) {
         result_ = -1;
+        if (dispatcher_->config_.inline_resume || dispatcher_->worker_pool_ == nullptr) return false;
         dispatcher_->resume_on_worker(handle);
     }
+    return true;
 }
 
-void RecvFromAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+bool RecvFromAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->reads_started_.fetch_add(1, std::memory_order_relaxed);
-
     RecvFromAwaitable* self = this;
-
-    // Forward the caller-owned peer-address out-params straight to the backend.
-    // They (and `buf_`) must outlive the op — the awaitable temporary lives
-    // across the suspension point, and the caller guarantees `src_`/`srclen_`
-    // storage outlives the co_await.
+    ssize_t inline_result = 0;
     int rc = dispatcher_->current_io()->recvfrom_async(
         fd_, buf_, len_, src_, srclen_,
         [self, handle](const core::io_event& event) {
@@ -129,13 +135,21 @@ void RecvFromAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
             self->dispatcher_->reads_completed_.fetch_add(1, std::memory_order_relaxed);
             self->dispatcher_->resume_on_worker(handle);
         },
-        nullptr
+        nullptr,
+        dispatcher_->inline_slot(&inline_result)
     );
-
+    if (rc == 1) {
+        // Finished by the try on the submit path: resume without suspending.
+        result_ = inline_result;
+        dispatcher_->reads_completed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     if (rc != 0) {
         result_ = -1;
+        if (dispatcher_->config_.inline_resume || dispatcher_->worker_pool_ == nullptr) return false;
         dispatcher_->resume_on_worker(handle);
     }
+    return true;
 }
 
 void SendToAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
@@ -353,6 +367,7 @@ void IODispatcher::stop() {
     for (auto& io : ios_) {
         if (io) {
             io->stop();
+            io->wake();  // a parked reactor re-checks shutdown_requested_
         }
     }
 
@@ -407,12 +422,11 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
     IoInbox* inbox = (thread_id < inboxes_.size()) ? inboxes_[thread_id].get() : nullptr;
 
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
+        t_inline_streak = 0;  // a new reactor turn: inline budget restored
         // Drain handles posted to THIS thread (e.g. accept-loop startup), resuming
         // each up to its next co_await — they run pinned to this thread thereafter.
         drain_inbox(inbox);
-        // Poll for I/O events with timeout
-        // 1ms timeout to check shutdown periodically without burning CPU
-        my_io->poll(1000);  // 1000 microseconds = 1ms
+        reactor_wait(my_io, inbox);
     }
 
     // Final drain of pending events
@@ -424,6 +438,79 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
     t_current_index = SIZE_MAX;
 
     std::cout << "IODispatcher I/O thread " << thread_id << " stopped" << std::endl;
+}
+
+ssize_t* IODispatcher::inline_slot(ssize_t* result) noexcept {
+    assert(result != nullptr);
+    if (!config_.inline_resume && worker_pool_ != nullptr) return nullptr;
+    if (t_inline_streak >= limits::kMaxInlineIoStreak) {
+        t_inline_streak = 0;  // this op is deferred to the next poll: a yield
+        return nullptr;
+    }
+    ++t_inline_streak;
+    assert(t_inline_streak <= limits::kMaxInlineIoStreak);
+    return result;
+}
+
+namespace {
+bool inbox_pending(const IoInbox* inbox) noexcept {
+    return inbox != nullptr && inbox->queue.approx_size() != 0;
+}
+}  // namespace
+
+// One reactor wait (G2CHK-1270): poll at once when work is waiting; otherwise
+// spin per the `reactor` wait class (zero-timeout polls every poll_every_ns,
+// slot kRunning so posts make no syscall), then park on the slot: kParked,
+// re-check, block in the backend until woken, an event, or the class deadline.
+void IODispatcher::reactor_wait(core::async_io* io, IoInbox* inbox) noexcept {
+    assert(io != nullptr);
+    if (!io->park_protocol()) {
+        io->poll(1000);  // shared engine (IOCP): bounded poll, no owner slot
+        return;
+    }
+    auto ready = [&]() noexcept {
+        return shutdown_requested_.load(std::memory_order_acquire) || inbox_pending(inbox) ||
+               io->has_ready();
+    };
+    if (ready()) {
+        io->poll(0);
+        return;
+    }
+    const ::bolt::park::WaitPolicy p = ::bolt::park::policy(::bolt::park::WaitClass::kReactor);
+    if (p.mode == ::bolt::park::WaitMode::kBusy) {
+        io->poll(0);
+        return;
+    }
+    if (p.mode == ::bolt::park::WaitMode::kSpinThenPark && p.spin_ns != 0 && ::bolt::park::spin_enter()) {
+        const bool worked = reactor_spin(io, ready, p);
+        ::bolt::park::spin_leave();
+        if (worked) return;
+    }
+    const uint64_t timeout_us = uint64_t{p.deadline_ms} * 1000u;
+    assert(timeout_us > 0 && timeout_us <= UINT32_MAX);
+    (void)::bolt::park::park_once(io->park_slot(), ready, [io](uint64_t t) noexcept {
+        io->poll(static_cast<uint32_t>(t));
+    }, timeout_us);
+}
+
+template <typename Ready>
+bool IODispatcher::reactor_spin(core::async_io* io, Ready& ready,
+                                const ::bolt::park::WaitPolicy& p) noexcept {
+    const uint64_t start = ::bolt::park::now_ns();
+    const uint64_t until = start + p.spin_ns;
+    uint64_t next_poll = start;
+    for (uint32_t i = 0;; ++i) {
+        if (ready()) return true;
+        if ((i & 15u) == 0) {
+            const uint64_t now = ::bolt::park::now_ns();
+            if (now >= next_poll) {
+                if (io->poll(0) > 0) return true;
+                next_poll = now + p.poll_every_ns;
+            }
+            if (now >= until) return false;
+        }
+        BOLT_PAUSE();
+    }
 }
 
 void IODispatcher::resume_on_worker(std::coroutine_handle<> handle) noexcept {

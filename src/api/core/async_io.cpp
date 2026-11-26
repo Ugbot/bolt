@@ -6,8 +6,38 @@
 #include <iostream>
 #include <mutex>
 
+#if !defined(_WIN32)
+#include "readiness_fast_path.h"
+#endif
+
 namespace bolt::api {
 namespace core {
+
+#if !defined(_WIN32)
+namespace detail {
+namespace {
+// One close/reuse epoch per fd number, shared by every engine (G2CHK-1269).
+std::atomic<std::uint32_t> g_fd_epoch[kFastFds];
+}  // namespace
+
+std::uint32_t fd_epoch(int fd) noexcept {
+    assert(fd >= 0 && fd < kFastFds);
+    return g_fd_epoch[fd].load(std::memory_order_acquire);
+}
+
+void fd_epoch_bump(int fd) noexcept {
+    assert(fd >= 0 && fd < kFastFds);
+    const std::uint32_t before = g_fd_epoch[fd].fetch_add(1u, std::memory_order_acq_rel);
+    (void)before;
+}
+}  // namespace detail
+
+void async_io::forget_fd(int fd) noexcept {
+    if (fd >= 0 && fd < detail::kFastFds) detail::fd_epoch_bump(fd);
+}
+#else
+void async_io::forget_fd(int) noexcept {}
+#endif
 
 std::unique_ptr<async_io> async_io::create(const async_io_config& config) {
     io_backend backend = config.backend;
