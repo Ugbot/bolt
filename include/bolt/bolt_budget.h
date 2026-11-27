@@ -81,6 +81,9 @@
       "BOLT_NESTED_COLUMN_VALUES", nullptr,                                     \
       "nested column decode: values (every node, nulls included) one column " \
       "decodes; past it the decode refuses")                                  \
+    X(tls_io_timeout_max_ms, kInvariant, "ms", 60000, 60000, 60000, nullptr,   \
+      nullptr, "per-call TLS send/receive deadline ceiling "                  \
+      "(bolt::net::k_tls_io_timeout_max_ms)")                                  \
     X(max_vector_dim, kInvariant, "dims", 65535, 65535, 65535, nullptr,         \
       nullptr, "vector dimension validation ceiling (bolt::kMaxVectorDim)")      \
     X(max_columns, kInvariant, "columns", 32768, 32768, 32768, nullptr,         \

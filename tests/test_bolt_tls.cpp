@@ -350,4 +350,120 @@ TEST(BoltTls, StartNamesTheRefusal) {
     X509_free(other.cert); EVP_PKEY_free(other.key);
 }
 
+// G2CHK-1106: HttpRequest::tls carries the whole policy of an https request.
+// The server requires a client certificate; the request passes only with it.
+#include "bolt/net/bolt_http_client.h"
+#include <cstdio>
+#include <string>
+namespace {
+bool key_pem_of(EVP_PKEY* k, char* out, std::size_t cap, std::uint32_t* len) {
+    BIO* b=BIO_new(BIO_s_mem()); if (b==nullptr) return false;
+    const bool ok=PEM_write_bio_PrivateKey(b,k,nullptr,nullptr,0,nullptr,nullptr)==1;
+    const int n=ok ? BIO_read(b,out,static_cast<int>(cap)) : -1;
+    BIO_free(b); if (n<=0) return false; *len=static_cast<std::uint32_t>(n); return true;
+}
+struct MutualTlsHttpPeer {
+    const SelfSigned* server=nullptr;
+    const SelfSigned* client=nullptr;
+    int listener=-1;
+    std::uint16_t port=0;
+    std::atomic<bool> served{false};
+    std::thread thread;
+    bool start(const SelfSigned* s, const SelfSigned* c) {
+        server=s; client=c;
+        listener=::socket(AF_INET,SOCK_STREAM,0); if (listener<0) return false;
+        sockaddr_in address{}; address.sin_family=AF_INET;
+        address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        if (::bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))!=0 || ::listen(listener,1)!=0) return false;
+        socklen_t bytes=sizeof(address);
+        if (::getsockname(listener,reinterpret_cast<sockaddr*>(&address),&bytes)!=0) return false;
+        port=ntohs(address.sin_port);
+        thread=std::thread([this] { serve(); });
+        return true;
+    }
+    void serve() {
+        pollfd waiting{listener,POLLIN,0}; if (::poll(&waiting,1,3000)<=0) return;
+        const int fd=::accept(listener,nullptr,nullptr); if (fd<0) return;
+        timeval timeout{}; timeout.tv_sec=2;
+        ::setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+        ::setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+        SSL_CTX* ctx=SSL_CTX_new(TLS_server_method()); SSL* ssl=nullptr;
+        if (ctx!=nullptr && SSL_CTX_use_certificate(ctx,server->cert)==1 &&
+            SSL_CTX_use_PrivateKey(ctx,server->key)==1 &&
+            X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx),client->cert)==1) {
+            SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT,nullptr);
+            ssl=SSL_new(ctx);
+            if (ssl!=nullptr && SSL_set_fd(ssl,fd)==1 && SSL_accept(ssl)==1) respond(ssl);
+        }
+        if (ssl!=nullptr) SSL_free(ssl);
+        if (ctx!=nullptr) SSL_CTX_free(ctx);
+        ::close(fd);
+    }
+    void respond(SSL* ssl) {
+        char head[4096]; int used=0;
+        for (int i=0;i<64 && used<static_cast<int>(sizeof(head))-1;++i) {
+            const int n=SSL_read(ssl,head+used,static_cast<int>(sizeof(head))-1-used);
+            if (n<=0) return;
+            used+=n; head[used]='\0';
+            if (std::strstr(head,"\r\n\r\n")!=nullptr) break;
+        }
+        if (std::strstr(head,"\r\n\r\n")==nullptr) return;
+        static const char reply[]="HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        if (SSL_write(ssl,reply,sizeof(reply)-1)==static_cast<int>(sizeof(reply)-1)) served=true;
+        (void)SSL_shutdown(ssl);
+    }
+    ~MutualTlsHttpPeer() {
+        if (thread.joinable()) thread.join();
+        if (listener>=0) ::close(listener);
+    }
+};
+int https_get(std::uint16_t port, const bolt::net::TlsConfig* tls, bolt::Arena* arena,
+              bolt::net::HttpResponse* out) {
+    bolt::net::HttpRequest req{};
+    std::memcpy(req.method,"GET",4);
+    std::snprintf(req.url,sizeof(req.url),"https://127.0.0.1:%u/",static_cast<unsigned>(port));
+    req.timeout_ms=200000;   // past the 16-bit handshake field and the 60 s TLS call cap
+    req.tls=tls;
+    return bolt::net::http_send(arena,&req,out);
+}
+}
+TEST(BoltTls, HttpsRequestCarriesClientCertificatePolicy) {
+    SelfSigned server{}, client{};
+    ASSERT_TRUE(make_self_signed(&server)); ASSERT_TRUE(make_self_signed(&client));
+    static char ca[4096], cert[4096], key[4096];
+    std::uint32_t ca_n=0, cert_n=0, key_n=0;
+    ASSERT_TRUE(pem_of(server.cert,ca,sizeof(ca),&ca_n));
+    ASSERT_TRUE(pem_of(client.cert,cert,sizeof(cert),&cert_n));
+    ASSERT_TRUE(key_pem_of(client.key,key,sizeof(key),&key_n));
+    bolt::net::TlsConfig policy{};
+    policy.verify_peer=true; policy.skip_hostname_check=true;   // verify-ca: CN is localhost
+    policy.allow_tls12=true; policy.handshake_timeout_ms=0;     // 0: the request deadline
+    policy.ca_pem=ca; policy.ca_pem_len=ca_n;
+    {   // the full policy: trusted CA in memory plus the client certificate
+        bolt::net::TlsConfig with=policy;
+        with.cert_pem=cert; with.cert_pem_len=cert_n; with.key_pem=key; with.key_pem_len=key_n;
+        MutualTlsHttpPeer peer; ASSERT_TRUE(peer.start(&server,&client));
+        bolt::Arena arena; bolt::net::HttpResponse response{};
+        EXPECT_EQ(https_get(peer.port,&with,&arena,&response),0);
+        EXPECT_EQ(response.status,200);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(response.body),response.body_len),"ok");
+        peer.thread.join(); EXPECT_TRUE(peer.served);
+    }
+    {   // same policy without the client certificate: the server refuses
+        MutualTlsHttpPeer peer; ASSERT_TRUE(peer.start(&server,&client));
+        bolt::Arena arena; bolt::net::HttpResponse response{};
+        EXPECT_LT(https_get(peer.port,&policy,&arena,&response),0);
+        EXPECT_EQ(response.body,nullptr);
+        peer.thread.join(); EXPECT_FALSE(peer.served);
+    }
+    {   // tls == nullptr keeps verify-full against system trust: self-signed fails
+        MutualTlsHttpPeer peer; ASSERT_TRUE(peer.start(&server,&client));
+        bolt::Arena arena; bolt::net::HttpResponse response{};
+        EXPECT_LT(https_get(peer.port,nullptr,&arena,&response),0);
+        peer.thread.join(); EXPECT_FALSE(peer.served);
+    }
+    X509_free(server.cert); EVP_PKEY_free(server.key);
+    X509_free(client.cert); EVP_PKEY_free(client.key);
+}
+
 #endif  // BOLT_WITH_TLS && !_WIN32

@@ -10,6 +10,8 @@
 namespace bolt {
 namespace net {
 
+struct TlsConfig;
+
 static constexpr uint32_t kHttpMaxUrl     = 2048u;
 static constexpr uint32_t kHttpMaxHeader  = 2048u;
 static constexpr uint32_t kHttpMaxHeaders = 32u;
@@ -30,6 +32,12 @@ struct HttpRequest {
     uint32_t       timeout_ms;                    // 0 → default
     uint32_t       max_response_body;             // 0 → kHttpMaxBody; otherwise <= it
     char           ca_path[512];                  // "" → system trust; else PEM file or hashed dir
+    // Non-null: the whole TLS policy of an https request (CA / client cert /
+    // key, PEM in memory, TLS 1.2 floor, verify-ca), read during connect only;
+    // ca_path is then ignored. server_name "" takes the URL host; the handshake
+    // is bounded by the smaller of its handshake_timeout_ms and the request
+    // deadline. null: verify-full against ca_path, TLS 1.3, as before.
+    const TlsConfig* tls = nullptr;
 };
 
 struct HttpResponse {
@@ -82,6 +90,11 @@ struct HttpBodyStream {
     uint64_t max_body;
 };
 int http_send_stream(const HttpRequest* req, HttpResponse* out, const HttpBodyStream* stream) noexcept;
+
+// Handshake budget of an https request: the request time left, clamped (never
+// wrapped) to TlsConfig::handshake_timeout_ms's 65535 ms range, and at most
+// configured_ms when that is non-zero. 0 means no time is left.
+uint16_t http_tls_handshake_budget_ms(uint32_t remaining_ms, uint16_t configured_ms) noexcept;
 
 // Lookup header by case-insensitive name. Returns value or nullptr.
 const char* http_header_get(const HttpHeader* hdrs, uint32_t n,
