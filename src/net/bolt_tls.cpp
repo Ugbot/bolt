@@ -42,6 +42,8 @@
 
 #include <chrono>
 
+static_assert(bolt::net::k_tls_io_timeout_max_ms == 60000u, "update BOLT_LIMITS tls_io_timeout_max_ms");
+
 namespace bolt::net {
 
 namespace {

@@ -15,6 +15,7 @@
 #include "bolt/net/bolt_http_response_head.h"
 
 #include <algorithm>
+#include <limits>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -524,10 +525,10 @@ const char* http_header_get(const HttpHeader* hdrs, uint32_t n,
 }
 
 uint16_t http_tls_handshake_budget_ms(uint32_t remaining_ms, uint16_t configured_ms) noexcept {
-    constexpr uint32_t kFieldMax = 0xFFFFu;
-    const uint32_t capped = remaining_ms > kFieldMax ? kFieldMax : remaining_ms;
+    constexpr uint32_t kField = std::numeric_limits<uint16_t>::max();
+    const uint32_t capped = remaining_ms > kField ? kField : remaining_ms;
     const uint32_t budget = configured_ms != 0 && configured_ms < capped ? configured_ms : capped;
-    assert(budget <= kFieldMax);
+    assert(budget <= kField);
     assert(budget <= remaining_ms);
     assert(configured_ms == 0 || budget <= configured_ms);
     return static_cast<uint16_t>(budget);
